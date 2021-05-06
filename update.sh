@@ -4,125 +4,128 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+# Update the iotg-kernel.spec file based on iotg-next release
+# the things that need be updated:
+# 1. %global isrc 
+# 2. %define pkgrelease  1
+# 3. %define rpmversion  5.12.0
+# 4. %define rcversion   rc1
+# 5. %define embargoname 0513.iotg_next
+# 6. %define specrelease %{?rcversion}2021.05.13_%{pkgrelease}%{?dist}
+#
+# 7. %global kernel_repo ssh://git@gitlab...
+# 8. %global kernel_tag  iotg-next-v5.12-yocto-210427T103552Z
+# 9. %global kernel_config ssh://git@gitlab...
+# 10. %global kernel_config_tag aa1fdad0
+# 11. %global kernel_config_file spr/spr-ee-kernel-config
+
 set -e
 
-UPSTREAM_URL=https://emb-overlay-koji.ostc.intel.com/tarball/kernel-next/
-KOJI_CLIENT_CRT="${HOME}/.koji/client.crt"
-CURL_ARGS="--http1.1"
-ISRC=1
+KSRC_REPO=
+KSRC_TAG=
+BUILD_ID=
+NOT_COMMIT=
+ISRC=
+KERNEL=
+KVERSION=
+KRC=
+KDATE=
+KDATE_MMDD=
+KERNEL_FULL_VERSION=
+SPEC_FILE="SPECS/iotg-kernel.spec"
+WORKDIR=$(dirname $(realpath $0))
 
-KERNEL_JSON_URL=https://www.kernel.org/releases.json
+usage() {
+    cat <<-EOF
+    
+    usage: ${0##*/}  [OPTION]... [VALUE]...
 
-echo "######################   kernel-next   ######################"
+    OPTIONS:
+    -k <kernel-repo>  Remote repository of kernel source code.
+    -t <kernel-tag>   Tag of the kernel repository.
+    -n                Do not add changes to git commit.
+    -h                Help.
 
-MY_PATH=$(dirname $(realpath $0))
+EOF
+}
 
-if [ -e ${MY_PATH}/noupdate ]
+if [[ $# == 0 ]]; then
+  usage
+  exit 1
+fi
+
+while getopts k:t:b:nh opt
+do
+    case "$opt" in
+      k)  KSRC_REPO=$OPTARG;;
+      t)  KSRC_TAG=$OPTARG;;
+      n)  NOT_COMMIT=true;;
+      h)  usage
+          exit 0
+          ;;
+      *)  usage
+          exit 1
+          ;;
+    esac
+done
+
+echo "######################   iotg-next   ######################"
+
+if [ -e ${WORKDIR}/noupdate ]
 then
     echo "*** noupdate *** file found."
     exit
 fi
 
-# Get kernel json file
-KJSON=$(mktemp)
-if ! curl --fail --silent -o ${KJSON} ${KERNEL_JSON_URL}
-then
-    echo "Fail to download kernel json"
-    rm ${KJSON}
-    exit 1
-fi
-
-KFULL_VERSION=$(jq -r '.releases[] | select(.moniker=="mainline").version' ${KJSON})
-
-# we do not need more the json file
-rm ${KJSON}
-
-KVERSION=${KFULL_VERSION%-*}
-KRC=".${KFULL_VERSION#*-}"
-
-# Check if the kernel is not a RC
-if [ ".${KVERSION}" == "${KRC}" ]
-then
-    KRC=""
-    ISRC=0
-fi
-
 # Just one *.spec file per package
-SPEC_FILE=$(ls ${MY_PATH}/*.spec)
+if [ ! -f ${WORKDIR}/${SPEC_FILE} ]; then
+  echo "Failed. ${SPEC_FILE} no such file"
+fi
 
-parse_tag ()
-{
-    KVERSION=$2
-    KRC="${3}."
-    KDATE="$4.$5.$6"
-    KDATE_MMDD="$5$6"
-    if  [ "${KRC:0:2}" != "rc" ]
-    then
-        KRC="norc"
-        KDATE="$3.$4.$5"
-        KDATE_MMDD="$4$5"
+parse_tag() {
+    # tag example: iotg-next-v5.12-yocto-210427T103552Z
+    KTAG=${1##*/}
+    KERNEL=$(echo $KTAG | awk -F'-v' '{print $1}')
+    _KV=$(echo $KTAG | awk -F'-v' '{print $2}')
+    KVERSION=$(echo $_KV | awk -F'-' '{print $1}')
+    KRC=$(echo $_KV | awk -F'-' '{print $2}')
+    KDATE=$(echo $_KV | awk -F'-' '{print $NF}')
+    KDATE_MMDD=${KDATE:2:4}
+    ISRC=1
+    KERNEL_FULL_VERSION="v${KVERSION}-${KRC}"
+    KERNEL=${KERNEL/-/_} # need iotg_next, '-' have special meaning in .spec file
+    if [ "${KRC:0:2}" != "rc" ]; then
+      ISRC=0
+      KRC="norc."
+      KERNEL_FULL_VERSION="v${KVERSION}"
     fi
+    echo "Get the KERNEL=${KERNEL}, KVERSION=${KVERSION}, KRC=${KRC}, ISRC=${ISRC},
+          KDATE=${KDATE}, KDATE_MMDD=${KDATE_MMDD}"
 }
 
-if [ -e ${KOJI_CLIENT_CRT} ]
-then
-    CURL_ARGS+=" --cert ${KOJI_CLIENT_CRT}"
-fi
+parse_tag $KSRC_TAG
 
-if [ ${ISRC} -eq 1 ]
-then
-    TARBALL=$(curl --silent ${CURL_ARGS} ${UPSTREAM_URL} | grep intel \
-            | cut -f 2 -d \" | sort --sort=version | tail -n 1)
-else
-    TARBALL=$(curl --silent ${CURL_ARGS} ${UPSTREAM_URL} | grep intel \
-            | cut -f 2 -d \" | grep -v rc | sort --sort=version | tail -n 1)
-fi
-
-TAG=${TARBALL%*.tar.gz}
-KVERSION=""
-KRC=""
-KDATE=""
-KDATE_MMDD=""
-
-# parse tag replacing "-" with "<space>"
-parse_tag ${TAG//-/\ }
-
-# Be sure we are at latest commit
-git  -C ${MY_PATH} pull
-
-if grep --quiet "${KDATE}" ${SPEC_FILE}
-then
-    echo "No updates on date"
-    exit
-fi
-
-# Set the pkrelease
-sed -i "/define pkgrelease/c %define pkgrelease  1" ${SPEC_FILE}
 # Set the rpmversion plus .0
-sed -i "/define rpmversion/c %define rpmversion  ${KVERSION}.0" ${SPEC_FILE}
+sed -i "/define rpmversion/c %define rpmversion  ${KVERSION}" ${SPEC_FILE}
 # Set the rc version
-sed -i "/define rcversion/c %define rcversion   ${KRC}" ${SPEC_FILE}
+sed -i "/define rcversion/c %define rcversion   ${KRC}." ${SPEC_FILE}
 # Set isrc
 sed -i "/global isrc/c %global isrc ${ISRC}" ${SPEC_FILE}
 # Set embargo name
-sed -i "/define embargoname/c %define embargoname ${KDATE_MMDD}.intel_next" ${SPEC_FILE}
+sed -i "/define embargoname/c %define embargoname ${KDATE_MMDD}.${KERNEL}" ${SPEC_FILE}
 # Set spec release
 sed -i "/define specrelease/c %define specrelease %{?rcversion}${KDATE}_%{pkgrelease}%{?dist}" ${SPEC_FILE}
-# Set the Source0
-sed -i "/Source0:/c Source0: ${UPSTREAM_URL}${TARBALL}" ${SPEC_FILE}
+
+# Set the kernel src
+sed -i "/global kernel_src_tag/c %global kernel_src_tag ${KERNEL_FULL_VERSION}" ${SPEC_FILE}
+
+if [ "$NOT_COMMIT" = true ] ; then
+    exit 0
+fi
 
 # Update package if there is a change on git repo
-if ! git -C ${MY_PATH} diff --no-ext-diff --quiet
+if ! git -C ${WORKDIR} diff --no-ext-diff --quiet ${SPEC_FILE}
 then
-    CURL_OPTS=${CURL_ARGS} make -C ${MY_PATH} generateupstream
-    git  -C ${MY_PATH} commit -a -m "autoupdate to ${TAG}"
-    if test -t 1 -a -t 2
-    then
-        make -C ${MY_PATH} koji-nowait
-    else
-        # This code runs on Jenkins
-        make -C ${MY_PATH} koji
-    fi
-else
+    git  -C ${WORKDIR} commit -a -m "Autoupdate to ${KSRC_TAG}"
     echo "No updates"
 fi

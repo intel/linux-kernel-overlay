@@ -1,4 +1,4 @@
-# We have to override the new %%install behavior because, well... the kernel is special.
+# Wn have to override the new %%install behavior because, well... the kernel is special.
 %global __spec_install_pre %{___build_pre}
 
 # At the time of this writing (2019-03), RHEL8 packages use w2.xzdio
@@ -57,17 +57,17 @@
 # define buildid .local
 
 # flag used to know if is a RC
-%global isrc TAG-global-isrc
+%global isrc 0
 
-%define pkgrelease TAG-define-pkgrelease
-%define rpmversion TAG-define-rpmversion
+%define pkgrelease  1
+%define rpmversion  5.12.0
 %if %{?isrc}
-%define rcversio TAG-define-rcversion
+%define rcversion   rc1 
 %endif
-%define embargoname TAG-define-embargoname
+%define embargoname 0513.iotg_next
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}TAG-DATE_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}2021.05.13_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -464,10 +464,11 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global KER_VAR edge
-%global kernel_repo TAG-global-kernel_repo
-%global kernel_repo_tag TAG-global-kernel_tag
-%global kernel_config TAG-global-config_repo
-%global kernel_config_tag TAG-global-config_tag
+%global kernel_src_repo ssh://git@gitlab.devtools.intel.com:29418/linux-kernel-integration/iotg-next.git 
+# %global kernel_tag iotg-next-v5.12-rc8-yocto-210421T085501Z
+%global kernel_src_tag  iotg-next-v5.12-yocto-210427T103552Z
+%global kernel_config_repo ssh://git@gitlab.devtools.intel.com:29418/linux-kernel-integration/kernel-config.git
+%global kernel_config_tag aa1fdad0
 %global kernel_config_file spr/spr-ee-kernel-config
 # END OF PROJECT SPECIFIC MACROS
 
@@ -948,16 +949,16 @@ pwd
 # cd %{name}-%{rpmversion}-%{pkgrelease}
 
 %define kernel_config_dir linux-%{KVERREL}-config
-[ ! -d "%kernel_config_dir" ] && git clone %kernel_config %kernel_config_dir
+[ ! -d "%kernel_config_dir" ] && git clone %kernel_config_repo %kernel_config_dir
 cd %kernel_config_dir
 git reset --hard
 git checkout %kernel_config_tag
 cd ..
 
-[ ! -d "linux-%{KVERREL}" ] && git clone %kernel_repo linux-%{KVERREL}
+[ ! -d "linux-%{KVERREL}" ] && git clone %kernel_src_repo linux-%{KVERREL}
 cd linux-%{KVERREL}
 git reset --hard
-git checkout %kernel_repo_tag
+git checkout %kernel_src_tag
 
 # Pls. apply patches here.
 # ApplyOptionalPatch 0001-x86-microcode-Force-update-a-uCode.patch

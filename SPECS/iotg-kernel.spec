@@ -57,17 +57,17 @@
 # define buildid .local
 
 # flag used to know if is a RC
-%global isrc 1
+%global isrc 0
 
-%define pkgrelease  1
-%define rpmversion  5.12.0
+%define pkgrelease  15
+%define rpmversion  5.12
 %if %{?isrc}
-%define rcversion   rc6.
+%define rcversion norc.
 %endif
-%define embargoname 0405.iotg_next
+%define embargoname 0427.iotg_next
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}2021.04.05_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}210427T103552Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -464,13 +464,11 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global KER_VAR edge
-%global kernel_repo ssh://git@gitlab.devtools.intel.com:29418/linux-kernel-integration/iotg-next.git 
-%global kernel_config ssh://git@gitlab.devtools.intel.com:29418/linux-kernel-integration/kernel-config.git
-%global kernel_config_tag aa1fdad0
-%global kernel_config_file spr/spr-ee-kernel-config
+%global kernel_src_repo 'https://github.com/torvalds/linux.git'
+%global kernel_src_tag v5.12
 # END OF PROJECT SPECIFIC MACROS
 
-Source0: overlay.config
+
 Source11: x509.genkey
 
 # Name of the packaged file containing signing key
@@ -943,21 +941,38 @@ ApplyOptionalPatch()
 
 # clone the source code
 pwd
-# mkdir %{name}-%{rpmversion}-%{pkgrelease} -p
-# cd %{name}-%{rpmversion}-%{pkgrelease}
 
-%define kernel_config_dir linux-%{KVERREL}-config
-[ ! -d "%kernel_config_dir" ] && git clone %kernel_config %kernel_config_dir
-cd %kernel_config_dir
-git reset --hard
-git checkout %kernel_config_tag
-cd ..
-
-[ ! -d "linux-%{KVERREL}" ] && git clone %kernel_repo linux-%{KVERREL}
+[ ! -d "linux-%{KVERREL}" ] && git clone %kernel_src_repo linux-%{KVERREL}
 cd linux-%{KVERREL}
 
-# Pls. apply patches here.
+if [ -d "./patches" ]; then
+  rm .pc -rf
+  # quilt pop -a -q
+  rm ./patches -rf 
+fi
+
+git reset --hard
+git checkout %kernel_src_tag
+git clean -df
+
+
+# BEGIN OF PATCH APPLICATION
 # ApplyOptionalPatch 0001-x86-microcode-Force-update-a-uCode.patch
+
+if [ -d "${RPM_SOURCE_DIR}/patches" ]; then
+
+  cp -r ${RPM_SOURCE_DIR}/patches .
+  quilt push -a
+  res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
+  if [ "$res" = "File series fully applied" ]; then
+    echo "##### Patch file series fully applied."
+  else
+    echo "##### The patches has not been fully applied: ${res}."
+    exit 1
+  fi
+else
+  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches!!"
+fi
 # END OF PATCH APPLICATIONS
 
 # Any further pre-build tree manipulations happen here.
@@ -1016,9 +1031,8 @@ cd configs
 
 # Copy config files
 pwd
-cp ../../%kernel_config_dir/spr/spr-ee-kernel-config %{KER_VAR}.config
 
-cp $RPM_SOURCE_DIR/overlay.config .
+cp $RPM_SOURCE_DIR/overlay.config %{KER_VAR}.config
 
 # Note we need to disable these flags for cross builds because the flags
 # from redhat-rpm-config assume that host == target so target arch
@@ -1100,8 +1114,8 @@ BuildKernel() {
 
     %{make} -s %{?_smp_mflags} mrproper
     # Merge Enbargo Overlay Kernel config
-    ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-
+    # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
+    cp configs/$Config .config
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif
