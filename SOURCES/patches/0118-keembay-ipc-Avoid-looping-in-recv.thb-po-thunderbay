@@ -1,0 +1,137 @@
+From 109ecf44165d6c07a903187cbdcadc0977992732 Mon Sep 17 00:00:00 2001
+From: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+Date: Tue, 30 Jun 2020 17:14:28 +0100
+Subject: [PATCH 118/223] keembay-ipc: Avoid looping in recv()
+
+Currently, in intel_keembay_ipc_recv(), a user thread waiting on rx data
+can end up looping (possibly indefinitely) if another thread calls
+recv() (on the same channel) at the same time that the first thread is
+woken up.
+
+This is because the list_empty() check on rx_data_list is not protected
+by a spin lock.
+
+Fortunately, the "lock_irq" variant of wait_event*() can be used to
+prevent this issue and remove the loop.
+
+Signed-off-by: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+---
+ drivers/misc/keembay-ipc/keembay-ipc.c | 88 ++++++++++++--------------
+ 1 file changed, 42 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/misc/keembay-ipc/keembay-ipc.c b/drivers/misc/keembay-ipc/keembay-ipc.c
+index 7d7ba9f29a56..aae81ded982f 100644
+--- a/drivers/misc/keembay-ipc/keembay-ipc.c
++++ b/drivers/misc/keembay-ipc/keembay-ipc.c
+@@ -23,6 +23,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/wait.h>
+ 
+ #include "keembay-ipc-common.h"
+ 
+@@ -1414,59 +1415,54 @@ int intel_keembay_ipc_recv(struct device *dev, u8 node_id, u16 chan_id,
+ 		rc = -ENOENT;
+ 		goto err;
+ 	}
+-	do {
+-		/*
+-		 * Wait for RX data.
+-		 *
+-		 * Note: wait_event_interruptible_timeout() has different
+-		 * return values than wait_event_interruptible().
+-		 *
+-		 * The following if/then branch ensures that return values are
+-		 * consistent for the both cases, that is:
+-		 * - rc == 0 only if the wait was successfully (i.e., we were
+-		 *   notified of a message or of a channel closure)
+-		 * - rc < 0 if an error occurred (we got interrupted or the
+-		 *   timeout expired).
+-		 */
+-		if (timeout == U32_MAX) {
+-			rc = wait_event_interruptible(
++	/*
++	 * Get the lock protecting rx_data_list; the lock will be released by
++	 * wait_event_*_lock_irq() before going to sleep and automatically
++	 * reacquired after wake up.
++	 */
++	spin_lock_irqsave(&chan->rx_lock, flags);
++	/*
++	 * Wait for RX data.
++	 *
++	 * Note: wait_event_interruptible_lock_irq_timeout() has different
++	 * return values than wait_event_interruptible_lock_irq().
++	 *
++	 * The following if/then branch ensures that return values are
++	 * consistent for the both cases, that is:
++	 * - rc == 0 only if the wait was successfully (i.e., we were notified
++	 *   of a message or of a channel closure)
++	 * - rc < 0 if an error occurred (we got interrupted or the timeout
++	 *   expired).
++	 */
++	if (timeout == U32_MAX) {
++		rc = wait_event_interruptible_lock_irq(
+ 					chan->rx_wait_queue,
+ 					!list_empty(&chan->rx_data_list) ||
+-					chan->closing);
+-		} else {
+-			rc = wait_event_interruptible_timeout(
++					chan->closing,
++					chan->rx_lock);
++	} else {
++		rc = wait_event_interruptible_lock_irq_timeout(
+ 					chan->rx_wait_queue,
+ 					!list_empty(&chan->rx_data_list) ||
+ 					chan->closing,
++					chan->rx_lock,
+ 					msecs_to_jiffies(timeout));
+-			if (!rc)
+-				rc = -ETIME;
+-			if (rc > 0)
+-				rc = 0;
+-		}
+-		if (rc)
+-			goto err;
+-		/* Check if we the channel was closed while waiting. */
+-		if (chan->closing) {
+-			rc = -EPIPE;
+-			goto err;
+-		}
+-
+-		/* Extract RX entry. */
+-		spin_lock_irqsave(&chan->rx_lock, flags);
+-		rx_entry = list_first_entry_or_null(&chan->rx_data_list,
+-						    struct rx_data, list);
+-		/*
+-		 * The list_empty() test above can be done by two threads
+-		 * concurrently; if that happens, one of the two may get a NULL
+-		 * rx_entry. Therefore we must check if rx_entry is null before
+-		 * calling list_del(). Also, if rx_entry is NULL, we must go
+-		 * back to the start of this while loop.
+-		 */
+-		if (rx_entry)
+-			list_del(&rx_entry->list);
++		if (!rc)
++			rc = -ETIME;
++		if (rc > 0)
++			rc = 0;
++	}
++	/* Check if the channel was closed while waiting. */
++	if (chan->closing)
++		rc = -EPIPE;
++	if (rc) {
+ 		spin_unlock_irqrestore(&chan->rx_lock, flags);
+-	} while (!rx_entry);
++		goto err;
++	}
++	/* Extract RX entry. */
++	rx_entry = list_first_entry(&chan->rx_data_list, struct rx_data, list);
++	list_del(&rx_entry->list);
++	spin_unlock_irqrestore(&chan->rx_lock, flags);
+ 	/* Set output parameters. */
+ 	*vpu_addr =  rx_entry->data_vpu_addr;
+ 	*size = rx_entry->data_size;
+-- 
+2.27.0
+

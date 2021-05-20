@@ -1,0 +1,200 @@
+From 454403518a8b3e4147e2cabf426537fbdcf5eac5 Mon Sep 17 00:00:00 2001
+From: "David E. Box" <david.e.box@linux.intel.com>
+Date: Thu, 25 Mar 2021 13:43:57 -0700
+Subject: [PATCH 36/47] platform/x86: intel_pmc_core: Add option to set/clear
+ LPM mode
+
+By default the Low Power Mode (LPM or sub-state) status registers will
+latch agent status on every entry into Package C10. This is configurable in
+the PMC to allow latching on any achievable sub-state. Add a debugfs file
+to support this.
+
+Also provide a debugfs file to clear the status registers to 0. Clearing
+the status registers before testing removes ambiguity around when the
+current values were set.
+
+Signed-off-by: David E. Box <david.e.box@linux.intel.com>
+---
+ drivers/platform/x86/intel_pmc_core.c | 101 ++++++++++++++++++++++++++
+ drivers/platform/x86/intel_pmc_core.h |  20 +++++
+ 2 files changed, 121 insertions(+)
+
+diff --git a/drivers/platform/x86/intel_pmc_core.c b/drivers/platform/x86/intel_pmc_core.c
+index d5f03ce0ead5..de0af3975a3e 100644
+--- a/drivers/platform/x86/intel_pmc_core.c
++++ b/drivers/platform/x86/intel_pmc_core.c
+@@ -585,6 +585,8 @@ static const struct pmc_reg_map tgl_reg_map = {
+ 	.lpm_num_modes = TGL_LPM_NUM_MODES,
+ 	.lpm_num_maps = TGL_LPM_NUM_MAPS,
+ 	.lpm_res_counter_step_x2 = TGL_PMC_LPM_RES_COUNTER_STEP_X2,
++	.etr3_offset = TGL_ETR3_OFFSET,
++	.lpm_sts_latch_en_offset = TGL_LPM_STS_LATCH_EN_OFFSET,
+ 	.lpm_en_offset = TGL_LPM_EN_OFFSET,
+ 	.lpm_priority_offset = TGL_LPM_PRI_OFFSET,
+ 	.lpm_residency_offset = TGL_LPM_RESIDENCY_OFFSET,
+@@ -1236,6 +1238,101 @@ static int pmc_core_substate_req_regs_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(pmc_core_substate_req_regs);
+ 
++static int pmc_core_lpm_latch_mode_show(struct seq_file *s, void *unused)
++{
++	struct pmc_dev *pmcdev = s->private;
++	bool c10;
++	u32 reg;
++	int p;
++
++	reg = pmc_core_reg_read(pmcdev, pmcdev->map->lpm_sts_latch_en_offset);
++	if (reg & BIT(LPM_STS_LATCH_MODE_BIT)) {
++		seq_puts(s, "c10");
++		c10 = false;
++	} else {
++		seq_puts(s, "[c10]");
++		c10 = true;
++	}
++
++	for (p = LPM_MAX_NUM_MODES - 1; p >= 0; p--) {
++		int mode = pmcdev->lpm_mode_priority[p];
++
++		if (!pmc_core_substate_enabled(pmcdev, mode))
++			continue;
++
++		if ((BIT(mode) & reg) && !c10)
++			seq_printf(s, " [%s]", pmc_lpm_modes[mode]);
++		else
++			seq_printf(s, " %s", pmc_lpm_modes[mode]);
++
++	}
++
++	seq_puts(s, " clear\n");
++
++	return 0;
++}
++
++static ssize_t pmc_core_lpm_latch_mode_write(struct file *file,
++					     const char __user *userbuf,
++					     size_t count, loff_t *ppos)
++{
++	struct seq_file *s = file->private_data;
++	struct pmc_dev *pmcdev = s->private;
++	bool clear = false, c10 = false;
++	unsigned char buf[10] = {0};
++	size_t ret;
++	int mode;
++	u32 reg;
++
++	ret = simple_write_to_buffer(buf, 10, ppos, userbuf, count);
++	if (ret < 0)
++		return ret;
++
++	mode = sysfs_match_string(pmc_lpm_modes, buf);
++	if (mode < 0) {
++		if (strncmp("clear", buf, 5) == 0)
++			clear = true;
++		else if (strncmp("c10", buf, 3) == 0)
++			c10 = true;
++		else
++			return mode;
++	}
++
++	if (clear) {
++		mutex_lock(&pmcdev->lock);
++
++		reg = pmc_core_reg_read(pmcdev, pmcdev->map->etr3_offset);
++		reg |= BIT(ETR3_CLEAR_LPM_EVENTS_BIT);
++		pmc_core_reg_write(pmcdev, pmcdev->map->etr3_offset, reg);
++
++		mutex_unlock(&pmcdev->lock);
++
++		return count;
++	}
++
++	if (c10) {
++		mutex_lock(&pmcdev->lock);
++
++		reg = pmc_core_reg_read(pmcdev, pmcdev->map->lpm_sts_latch_en_offset);
++		reg &= ~BIT(LPM_STS_LATCH_MODE_BIT);
++		pmc_core_reg_write(pmcdev, pmcdev->map->lpm_sts_latch_en_offset, reg);
++
++		mutex_unlock(&pmcdev->lock);
++
++		return count;
++	}
++
++	/*
++	 * For LPM mode latching we set the latch enable bit and selected mode
++	 * and clear everything else.
++	 */
++	reg = BIT(LPM_STS_LATCH_MODE_BIT) | BIT(mode);
++	pmc_core_reg_write(pmcdev, pmcdev->map->lpm_sts_latch_en_offset, reg);
++
++	return count;
++}
++DEFINE_PMC_CORE_ATTR_WRITE(pmc_core_lpm_latch_mode);
++
+ static int pmc_core_pkgc_show(struct seq_file *s, void *unused)
+ {
+ 	struct pmc_dev *pmcdev = s->private;
+@@ -1337,6 +1434,10 @@ static void pmc_core_dbgfs_register(struct pmc_dev *pmcdev)
+ 		debugfs_create_file("substate_requirements", 0444,
+ 				    pmcdev->dbgfs_dir, pmcdev,
+ 				    &pmc_core_substate_req_regs_fops);
++		debugfs_create_file("lpm_latch_mode", 0644,
++				    pmcdev->dbgfs_dir, pmcdev,
++				    &pmc_core_lpm_latch_mode_fops);
++
+ 	}
+ }
+ 
+diff --git a/drivers/platform/x86/intel_pmc_core.h b/drivers/platform/x86/intel_pmc_core.h
+index 7251b5b0da10..e3294cff23c8 100644
+--- a/drivers/platform/x86/intel_pmc_core.h
++++ b/drivers/platform/x86/intel_pmc_core.h
+@@ -189,6 +189,8 @@ enum ppfear_regs {
+ 
+ #define LPM_MAX_NUM_MODES			8
+ #define GET_X2_COUNTER(v)			((v) >> 1)
++#define ETR3_CLEAR_LPM_EVENTS_BIT		28
++#define LPM_STS_LATCH_MODE_BIT			31
+ 
+ #define TGL_NUM_IP_IGN_ALLOWED			22
+ #define TGL_PMC_SLP_S0_RES_COUNTER_STEP		0x7A
+@@ -197,6 +199,8 @@ enum ppfear_regs {
+ /*
+  * Tigerlake Power Management Controller register offsets
+  */
++#define TGL_ETR3_OFFSET				0x1048
++#define TGL_LPM_STS_LATCH_EN_OFFSET		0x1C34
+ #define TGL_LPM_EN_OFFSET			0x1C78
+ #define TGL_LPM_RESIDENCY_OFFSET		0x1C80
+ 
+@@ -268,6 +272,8 @@ struct pmc_reg_map {
+ 	const int lpm_num_modes;
+ 	const int lpm_num_maps;
+ 	const int lpm_res_counter_step_x2;
++	const u32 etr3_offset;
++	const u32 lpm_sts_latch_en_offset;
+ 	const u32 lpm_en_offset;
+ 	const u32 lpm_priority_offset;
+ 	const u32 lpm_residency_offset;
+@@ -310,4 +316,18 @@ struct pmc_dev {
+ 	u32 *lpm_req_regs;
+ };
+ 
++#define DEFINE_PMC_CORE_ATTR_WRITE(__name)				\
++static int __name ## _open(struct inode *inode, struct file *file)	\
++{									\
++	return single_open(file, __name ## _show, inode->i_private);	\
++}									\
++									\
++static const struct file_operations __name ## _fops = {			\
++	.owner		= THIS_MODULE,					\
++	.open		= __name ## _open,				\
++	.read		= seq_read,					\
++	.write		= __name ## _write,				\
++	.release	= single_release,				\
++}
++
+ #endif /* PMC_CORE_H */
+-- 
+2.27.0
+

@@ -1,0 +1,116 @@
+From ea6d83980f43e32c70202898fea3e689d2cc64c8 Mon Sep 17 00:00:00 2001
+From: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date: Tue, 8 Sep 2020 15:39:28 -0700
+Subject: [PATCH 40/85] Provide back compatibility of ALLOC_SHSTK
+
+Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+---
+ arch/x86/include/asm/cet.h        |  1 +
+ arch/x86/include/uapi/asm/prctl.h |  1 +
+ arch/x86/kernel/cet.c             | 26 ++++++++++++++++++++++++++
+ arch/x86/kernel/cet_prctl.c       | 22 ++++++++++++++++++++++
+ 4 files changed, 50 insertions(+)
+
+diff --git a/arch/x86/include/asm/cet.h b/arch/x86/include/asm/cet.h
+index c20c2f671145..4e13e097b5bd 100644
+--- a/arch/x86/include/asm/cet.h
++++ b/arch/x86/include/asm/cet.h
+@@ -30,6 +30,7 @@ void cet_restore_signal(struct sc_ext *sc);
+ int cet_setup_signal(bool ia32, unsigned long rstor, struct sc_ext *sc);
+ int cet_setup_ibt(void);
+ void cet_disable_ibt(void);
++unsigned long cet_alloc_shstk(unsigned long size, int flags);
+ #else
+ static inline int prctl_cet(int option, u64 arg2) { return -EINVAL; }
+ static inline int cet_setup_thread_shstk(struct task_struct *p,
+diff --git a/arch/x86/include/uapi/asm/prctl.h b/arch/x86/include/uapi/asm/prctl.h
+index 9245bf629120..d962f0ec9ccf 100644
+--- a/arch/x86/include/uapi/asm/prctl.h
++++ b/arch/x86/include/uapi/asm/prctl.h
+@@ -17,5 +17,6 @@
+ #define ARCH_X86_CET_STATUS		0x3001
+ #define ARCH_X86_CET_DISABLE		0x3002
+ #define ARCH_X86_CET_LOCK		0x3003
++#define ARCH_X86_CET_ALLOC_SHSTK	0x3004
+ 
+ #endif /* _ASM_X86_PRCTL_H */
+diff --git a/arch/x86/kernel/cet.c b/arch/x86/kernel/cet.c
+index 34a26eb7f259..46981b7b23cf 100644
+--- a/arch/x86/kernel/cet.c
++++ b/arch/x86/kernel/cet.c
+@@ -150,6 +150,32 @@ static int create_rstor_token(bool ia32, unsigned long ssp,
+ 	return 0;
+ }
+ 
++unsigned long cet_alloc_shstk(unsigned long len, int flags)
++{
++	unsigned long token;
++	unsigned long addr, ssp;
++
++	addr = alloc_shstk(round_up(len, PAGE_SIZE), flags);
++
++	if (IS_ERR_VALUE(addr))
++		return addr;
++
++	/* Restore token is 8 bytes and aligned to 8 bytes */
++	ssp = addr + len;
++	token = ssp;
++
++	if (!in_ia32_syscall())
++		token |= TOKEN_MODE_64;
++	ssp -= 8;
++
++	if (write_user_shstk_64(ssp, token)) {
++		vm_munmap(addr, len);
++		return -EINVAL;
++	}
++
++	return addr;
++}
++
+ int cet_setup_shstk(void)
+ {
+ 	unsigned long addr, size;
+diff --git a/arch/x86/kernel/cet_prctl.c b/arch/x86/kernel/cet_prctl.c
+index 4df1eac41965..58667e45b411 100644
+--- a/arch/x86/kernel/cet_prctl.c
++++ b/arch/x86/kernel/cet_prctl.c
+@@ -28,6 +28,25 @@ static int cet_copy_status_to_user(struct cet_status *cet, u64 __user *ubuf)
+ 	return copy_to_user(ubuf, buf, sizeof(buf));
+ }
+ 
++static int handle_alloc_shstk(u64 arg2)
++{
++	unsigned long addr, size;
++
++	if (get_user(size, (unsigned long __user *)arg2))
++		return -EFAULT;
++
++	addr = cet_alloc_shstk(size, 0);
++	if (IS_ERR_VALUE(addr))
++		return PTR_ERR((void *)addr);
++
++	if (put_user((u64)addr, (u64 __user *)arg2)) {
++		vm_munmap(addr, size);
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
+ int prctl_cet(int option, u64 arg2)
+ {
+ 	struct cet_status *cet;
+@@ -59,6 +78,9 @@ int prctl_cet(int option, u64 arg2)
+ 		cet->locked = 1;
+ 		return 0;
+ 
++	case ARCH_X86_CET_ALLOC_SHSTK:
++		return handle_alloc_shstk(arg2);
++
+ 	default:
+ 		return -ENOSYS;
+ 	}
+-- 
+2.27.0
+

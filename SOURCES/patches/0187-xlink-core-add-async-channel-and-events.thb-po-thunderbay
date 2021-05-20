@@ -1,0 +1,1554 @@
+From bd8772735b0ffbf3bab917147a536d920071a819 Mon Sep 17 00:00:00 2001
+From: Seamus Kelly <seamus.kelly@intel.com>
+Date: Thu, 29 Oct 2020 13:48:51 +0000
+Subject: [PATCH 187/223] xlink-core: add async channel and events
+
+Enable asynchronous channel and event communication.
+
+    Add APIs:
+            data ready callback:
+			The xLink Data Ready Callback function is used to
+			register a callback function that is invoked when data
+			is ready to be read from a channel
+            data consumed callback:
+			The xLink Data Consumed Callback function is used to
+			register a callback function that is invoked when data
+			is consumed by the peer node on a channel
+    Add event notification handling including APIs:
+            register device event:
+			The xLink Register Device Event function is used to
+			register a callback for notification of certain system
+			events. Currently XLink supports 4 such events [0-3]
+			whose meaning is system dependent.  Registering for an
+			event means that the callback will be called when the
+			event occurs with 2 parameters the sw_device_id of the
+			device that triggered the event and the event number [0-3]
+            unregister device event
+			The xLink Unregister Device Event function is used to
+			unregister events that have previously been registered
+			by register device event API
+
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Mark Gross <mgross@linux.intel.com>
+Signed-off-by: Mark Gross <mgross@linux.intel.com>
+Signed-off-by: Seamus Kelly <seamus.kelly@intel.com>
+---
+ drivers/misc/xlink-core/xlink-core.c        | 497 ++++++++++++++++----
+ drivers/misc/xlink-core/xlink-core.h        |  11 +-
+ drivers/misc/xlink-core/xlink-defs.h        |   6 +-
+ drivers/misc/xlink-core/xlink-dispatcher.c  |  53 +--
+ drivers/misc/xlink-core/xlink-ioctl.c       | 146 +++++-
+ drivers/misc/xlink-core/xlink-ioctl.h       |   6 +
+ drivers/misc/xlink-core/xlink-multiplexer.c | 176 +++++--
+ drivers/misc/xlink-core/xlink-platform.c    |  27 ++
+ include/linux/xlink.h                       |  15 +-
+ 9 files changed, 757 insertions(+), 180 deletions(-)
+
+diff --git a/drivers/misc/xlink-core/xlink-core.c b/drivers/misc/xlink-core/xlink-core.c
+index d0a3f98d16af..23c0025f6f0d 100644
+--- a/drivers/misc/xlink-core/xlink-core.c
++++ b/drivers/misc/xlink-core/xlink-core.c
+@@ -55,6 +55,8 @@ static struct cdev xlink_cdev;
+ 
+ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+ 
++static struct mutex dev_event_lock;
++
+ static const struct file_operations fops = {
+ 		.owner		= THIS_MODULE,
+ 		.unlocked_ioctl = xlink_ioctl,
+@@ -66,14 +68,75 @@ struct xlink_link {
+ 	struct kref refcount;
+ };
+ 
++struct xlink_attr {
++	unsigned long value;
++	u32 sw_dev_id;
++};
++
+ struct keembay_xlink_dev {
+ 	struct platform_device *pdev;
+ 	struct xlink_link links[XLINK_MAX_CONNECTIONS];
+ 	u32 nmb_connected_links;
+ 	struct mutex lock;  // protect access to xlink_dev
++	struct xlink_attr eventx[4];
++};
++
++struct event_info {
++	struct list_head list;
++	u32 sw_device_id;
++	u32 event_type;
++	u32 user_flag;
++	xlink_device_event_cb event_notif_fn;
+ };
+ 
+-static u8 volbuf[XLINK_MAX_BUF_SIZE]; // buffer for volatile transactions
++// sysfs attribute functions
++
++static ssize_t eventx_show(struct device *dev, struct device_attribute *attr,
++			   int index, char *buf)
++{
++	struct keembay_xlink_dev *xlink_dev = dev_get_drvdata(dev);
++	struct xlink_attr *a = &xlink_dev->eventx[index];
++
++	return sysfs_emit(buf, "0x%x 0x%lx\n", a->sw_dev_id, a->value);
++}
++
++static ssize_t event0_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return eventx_show(dev, attr, 0, buf);
++}
++
++static ssize_t event1_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return eventx_show(dev, attr, 1, buf);
++}
++
++static ssize_t event2_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return eventx_show(dev, attr, 2, buf);
++}
++
++static ssize_t event3_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return eventx_show(dev, attr, 3, buf);
++}
++
++static DEVICE_ATTR_RO(event0);
++static DEVICE_ATTR_RO(event1);
++static DEVICE_ATTR_RO(event2);
++static DEVICE_ATTR_RO(event3);
++static struct attribute *xlink_sysfs_entries[] = {
++	&dev_attr_event0.attr,
++	&dev_attr_event1.attr,
++	&dev_attr_event2.attr,
++	&dev_attr_event3.attr,
++	NULL,
++};
++
++static const struct attribute_group xlink_sysfs_group = {
++	.attrs = xlink_sysfs_entries,
++};
++
++static struct event_info ev_info;
+ 
+ /*
+  * global variable pointing to our xlink device.
+@@ -207,7 +270,14 @@ static int kmb_xlink_probe(struct platform_device *pdev)
+ 		dev_info(&pdev->dev, "Cannot add the device to the system\n");
+ 		goto r_class;
+ 	}
++	INIT_LIST_HEAD(&ev_info.list);
+ 
++	rc = devm_device_add_group(&pdev->dev, &xlink_sysfs_group);
++	if (rc) {
++		dev_err(&pdev->dev, "failed to create sysfs entries: %d\n", rc);
++		return rc;
++	}
++	mutex_init(&dev_event_lock);
+ 	return 0;
+ 
+ r_device:
+@@ -231,7 +301,6 @@ static int kmb_xlink_remove(struct platform_device *pdev)
+ 	rc = xlink_multiplexer_destroy();
+ 	if (rc != X_LINK_SUCCESS)
+ 		pr_err("Multiplexer destroy failed\n");
+-	// stop dispatchers and destroy
+ 	rc = xlink_dispatcher_destroy();
+ 	if (rc != X_LINK_SUCCESS)
+ 		pr_err("Dispatcher destroy failed\n");
+@@ -251,7 +320,6 @@ static int kmb_xlink_remove(struct platform_device *pdev)
+  * IOCTL function for User Space access to xlink kernel functions
+  *
+  */
+-
+ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+ 	int rc;
+@@ -263,6 +331,12 @@ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case XL_OPEN_CHANNEL:
+ 		rc = ioctl_open_channel(arg);
+ 		break;
++	case XL_DATA_READY_CALLBACK:
++		rc = ioctl_data_ready_callback(arg);
++		break;
++	case XL_DATA_CONSUMED_CALLBACK:
++		rc = ioctl_data_consumed_callback(arg);
++		break;
+ 	case XL_READ_DATA:
+ 		rc = ioctl_read_data(arg);
+ 		break;
+@@ -275,6 +349,9 @@ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case XL_WRITE_VOLATILE:
+ 		rc = ioctl_write_volatile_data(arg);
+ 		break;
++	case XL_WRITE_CONTROL_DATA:
++		rc = ioctl_write_control_data(arg);
++		break;
+ 	case XL_RELEASE_DATA:
+ 		rc = ioctl_release_data(arg);
+ 		break;
+@@ -285,10 +362,10 @@ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		rc = ioctl_start_vpu(arg);
+ 		break;
+ 	case XL_STOP_VPU:
+-		rc = xlink_stop_vpu();
++		rc = ioctl_stop_vpu();
+ 		break;
+ 	case XL_RESET_VPU:
+-		rc = xlink_stop_vpu();
++		rc = ioctl_stop_vpu();
+ 		break;
+ 	case XL_DISCONNECT:
+ 		rc = ioctl_disconnect(arg);
+@@ -314,6 +391,12 @@ static long xlink_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case XL_SET_DEVICE_MODE:
+ 		rc = ioctl_set_device_mode(arg);
+ 		break;
++	case XL_REGISTER_DEV_EVENT:
++		rc = ioctl_register_device_event(arg);
++		break;
++	case XL_UNREGISTER_DEV_EVENT:
++		rc = ioctl_unregister_device_event(arg);
++		break;
+ 	}
+ 	if (rc)
+ 		return -EIO;
+@@ -387,14 +470,12 @@ enum xlink_error xlink_connect(struct xlink_handle *handle)
+ 		xlink->nmb_connected_links++;
+ 		kref_init(&link->refcount);
+ 		if (interface != IPC_INTERFACE) {
+-			// start dispatcher
+ 			rc = xlink_dispatcher_start(link->id, &link->handle);
+ 			if (rc) {
+ 				pr_err("dispatcher start failed\n");
+ 				goto r_cleanup;
+ 			}
+ 		}
+-		// initialize multiplexer connection
+ 		rc = xlink_multiplexer_connect(link->id);
+ 		if (rc) {
+ 			pr_err("multiplexer connect failed\n");
+@@ -405,7 +486,6 @@ enum xlink_error xlink_connect(struct xlink_handle *handle)
+ 			link->handle.dev_type,
+ 			xlink->nmb_connected_links);
+ 	} else {
+-		// already connected
+ 		pr_info("dev 0x%x ALREADY connected - dev_type %d\n",
+ 			link->handle.sw_device_id,
+ 			link->handle.dev_type);
+@@ -413,7 +493,6 @@ enum xlink_error xlink_connect(struct xlink_handle *handle)
+ 		*handle = link->handle;
+ 	}
+ 	mutex_unlock(&xlink->lock);
+-	// TODO: implement ping
+ 	return X_LINK_SUCCESS;
+ 
+ r_cleanup:
+@@ -423,64 +502,109 @@ enum xlink_error xlink_connect(struct xlink_handle *handle)
+ }
+ EXPORT_SYMBOL_GPL(xlink_connect);
+ 
+-enum xlink_error xlink_open_channel(struct xlink_handle *handle,
+-				    u16 chan, enum xlink_opmode mode,
+-				    u32 data_size, u32 timeout)
++enum xlink_error xlink_data_available_event(struct xlink_handle *handle,
++					    u16 chan,
++					    xlink_event data_available_event)
+ {
+ 	struct xlink_event *event;
+ 	struct xlink_link *link;
+-	int event_queued = 0;
+ 	enum xlink_error rc;
++	int event_queued = 0;
++	char origin = 'K';
+ 
+ 	if (!xlink || !handle)
+ 		return X_LINK_ERROR;
+ 
++	if (CHANNEL_USER_BIT_IS_SET(chan))
++		origin  = 'U';     // function called from user space
++	CHANNEL_CLEAR_USER_BIT(chan);  // restore proper channel value
++
+ 	link = get_link_by_sw_device_id(handle->sw_device_id);
+ 	if (!link)
+ 		return X_LINK_ERROR;
+-
+-	event = xlink_create_event(link->id, XLINK_OPEN_CHANNEL_REQ,
+-				   &link->handle, chan, data_size, timeout);
++	event = xlink_create_event(link->id, XLINK_DATA_READY_CALLBACK_REQ,
++				   &link->handle, chan, 0, 0);
+ 	if (!event)
+ 		return X_LINK_ERROR;
+-
+-	event->data = (void *)mode;
++	event->data = data_available_event;
++	event->callback_origin = origin;
++	if (!data_available_event)
++		event->calling_pid = NULL; // disable callbacks on this channel
++	else
++		event->calling_pid = current;
+ 	rc = xlink_multiplexer_tx(event, &event_queued);
+ 	if (!event_queued)
+ 		xlink_destroy_event(event);
+ 	return rc;
+ }
+-EXPORT_SYMBOL_GPL(xlink_open_channel);
+-
+-enum xlink_error xlink_close_channel(struct xlink_handle *handle,
+-				     u16 chan)
++EXPORT_SYMBOL_GPL(xlink_data_available_event);
++enum xlink_error xlink_data_consumed_event(struct xlink_handle *handle,
++					   u16 chan,
++					   xlink_event data_consumed_event)
+ {
+ 	struct xlink_event *event;
+ 	struct xlink_link *link;
+ 	enum xlink_error rc;
+ 	int event_queued = 0;
++	char origin = 'K';
+ 
+ 	if (!xlink || !handle)
+ 		return X_LINK_ERROR;
+ 
++	if (CHANNEL_USER_BIT_IS_SET(chan))
++		origin  = 'U';     // function called from user space
++	CHANNEL_CLEAR_USER_BIT(chan);  // restore proper channel value
++
+ 	link = get_link_by_sw_device_id(handle->sw_device_id);
+ 	if (!link)
+ 		return X_LINK_ERROR;
+-
+-	event = xlink_create_event(link->id, XLINK_CLOSE_CHANNEL_REQ,
++	event = xlink_create_event(link->id, XLINK_DATA_CONSUMED_CALLBACK_REQ,
+ 				   &link->handle, chan, 0, 0);
+ 	if (!event)
+ 		return X_LINK_ERROR;
++	event->data = data_consumed_event;
++	event->callback_origin = origin;
++	if (!data_consumed_event)
++		event->calling_pid = NULL; // disable callbacks on this channel
++	else
++		event->calling_pid = current;
++	rc = xlink_multiplexer_tx(event, &event_queued);
++	if (!event_queued)
++		xlink_destroy_event(event);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(xlink_data_consumed_event);
++enum xlink_error xlink_open_channel(struct xlink_handle *handle,
++				    u16 chan, enum xlink_opmode mode,
++				    u32 data_size, u32 timeout)
++{
++	struct xlink_event *event;
++	struct xlink_link *link;
++	int event_queued = 0;
++	enum xlink_error rc;
++
++	if (!xlink || !handle)
++		return X_LINK_ERROR;
++
++	link = get_link_by_sw_device_id(handle->sw_device_id);
++	if (!link)
++		return X_LINK_ERROR;
++
++	event = xlink_create_event(link->id, XLINK_OPEN_CHANNEL_REQ,
++				   &link->handle, chan, data_size, timeout);
++	if (!event)
++		return X_LINK_ERROR;
+ 
++	event->data = (void *)mode;
+ 	rc = xlink_multiplexer_tx(event, &event_queued);
+ 	if (!event_queued)
+ 		xlink_destroy_event(event);
+ 	return rc;
+ }
+-EXPORT_SYMBOL_GPL(xlink_close_channel);
++EXPORT_SYMBOL_GPL(xlink_open_channel);
+ 
+-enum xlink_error xlink_write_data(struct xlink_handle *handle,
+-				  u16 chan, u8 const *pmessage, u32 size)
++enum xlink_error xlink_close_channel(struct xlink_handle *handle,
++				     u16 chan)
+ {
+ 	struct xlink_event *event;
+ 	struct xlink_link *link;
+@@ -490,38 +614,26 @@ enum xlink_error xlink_write_data(struct xlink_handle *handle,
+ 	if (!xlink || !handle)
+ 		return X_LINK_ERROR;
+ 
+-	if (size > XLINK_MAX_DATA_SIZE)
+-		return X_LINK_ERROR;
+-
+ 	link = get_link_by_sw_device_id(handle->sw_device_id);
+ 	if (!link)
+ 		return X_LINK_ERROR;
+ 
+-	event = xlink_create_event(link->id, XLINK_WRITE_REQ, &link->handle,
+-				   chan, size, 0);
++	event = xlink_create_event(link->id, XLINK_CLOSE_CHANNEL_REQ,
++				   &link->handle, chan, 0, 0);
+ 	if (!event)
+ 		return X_LINK_ERROR;
+ 
+-	if (chan < XLINK_IPC_MAX_CHANNELS &&
+-	    event->interface == IPC_INTERFACE) {
+-		/* only passing message address across IPC interface */
+-		event->data = &pmessage;
+-		rc = xlink_multiplexer_tx(event, &event_queued);
++	rc = xlink_multiplexer_tx(event, &event_queued);
++	if (!event_queued)
+ 		xlink_destroy_event(event);
+-	} else {
+-		event->data = (u8 *)pmessage;
+-		event->paddr = 0;
+-		rc = xlink_multiplexer_tx(event, &event_queued);
+-		if (!event_queued)
+-			xlink_destroy_event(event);
+-	}
++
+ 	return rc;
+ }
+-EXPORT_SYMBOL_GPL(xlink_write_data);
++EXPORT_SYMBOL_GPL(xlink_close_channel);
+ 
+-enum xlink_error xlink_write_data_user(struct xlink_handle *handle,
+-				       u16 chan, u8 const *pmessage,
+-				       u32 size)
++static enum xlink_error do_xlink_write_data(struct xlink_handle *handle,
++					    u16 chan, u8 const *pmessage,
++					    u32 size, u32 user_flag)
+ {
+ 	struct xlink_event *event;
+ 	struct xlink_link *link;
+@@ -544,48 +656,78 @@ enum xlink_error xlink_write_data_user(struct xlink_handle *handle,
+ 				   chan, size, 0);
+ 	if (!event)
+ 		return X_LINK_ERROR;
+-	event->user_data = 1;
++	event->user_data = user_flag;
+ 
+ 	if (chan < XLINK_IPC_MAX_CHANNELS &&
+ 	    event->interface == IPC_INTERFACE) {
+ 		/* only passing message address across IPC interface */
+-		if (get_user(addr, (u32 __user *)pmessage)) {
+-			xlink_destroy_event(event);
+-			return X_LINK_ERROR;
++		if (user_flag) {
++			if (get_user(addr, (u32 __user *)pmessage)) {
++				xlink_destroy_event(event);
++				return X_LINK_ERROR;
++			}
++			event->data = &addr;
++		} else {
++			event->data = &pmessage;
+ 		}
+-		event->data = &addr;
+ 		rc = xlink_multiplexer_tx(event, &event_queued);
+ 		xlink_destroy_event(event);
+ 	} else {
+-		event->data = xlink_platform_allocate(&xlink->pdev->dev, &paddr,
+-						      size,
+-						      XLINK_PACKET_ALIGNMENT,
+-						      XLINK_NORMAL_MEMORY);
+-		if (!event->data) {
+-			xlink_destroy_event(event);
+-			return X_LINK_ERROR;
+-		}
+-		if (copy_from_user(event->data, (void __user *)pmessage, size)) {
+-			xlink_platform_deallocate(&xlink->pdev->dev,
+-						  event->data, paddr, size,
+-						  XLINK_PACKET_ALIGNMENT,
+-						  XLINK_NORMAL_MEMORY);
+-			xlink_destroy_event(event);
+-			return X_LINK_ERROR;
++		if (user_flag) {
++			event->data = xlink_platform_allocate(&xlink->pdev->dev, &paddr,
++							      size,
++							      XLINK_PACKET_ALIGNMENT,
++							      XLINK_NORMAL_MEMORY);
++			if (!event->data) {
++				xlink_destroy_event(event);
++				return X_LINK_ERROR;
++			}
++			if (copy_from_user(event->data, (void __user *)pmessage, size)) {
++				xlink_platform_deallocate(&xlink->pdev->dev,
++							  event->data, paddr, size,
++							  XLINK_PACKET_ALIGNMENT,
++							  XLINK_NORMAL_MEMORY);
++				xlink_destroy_event(event);
++				return X_LINK_ERROR;
++			}
++			event->paddr = paddr;
++		} else {
++			event->data = (u8 *)pmessage;
++			event->paddr = 0;
+ 		}
+-		event->paddr = paddr;
+ 		rc = xlink_multiplexer_tx(event, &event_queued);
+ 		if (!event_queued) {
+-			xlink_platform_deallocate(&xlink->pdev->dev,
+-						  event->data, paddr, size,
+-						  XLINK_PACKET_ALIGNMENT,
+-						  XLINK_NORMAL_MEMORY);
++			if (user_flag) {
++				xlink_platform_deallocate(&xlink->pdev->dev,
++							  event->data, paddr, size,
++							  XLINK_PACKET_ALIGNMENT,
++							  XLINK_NORMAL_MEMORY);
++			}
+ 			xlink_destroy_event(event);
+ 		}
+ 	}
+ 	return rc;
+ }
+ 
++enum xlink_error xlink_write_data(struct xlink_handle *handle,
++				  u16 chan, u8 const *pmessage, u32 size)
++{
++	enum xlink_error rc = 0;
++
++	rc = do_xlink_write_data(handle, chan, pmessage, size, 0);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(xlink_write_data);
++
++enum xlink_error xlink_write_data_user(struct xlink_handle *handle,
++				       u16 chan, u8 const *pmessage, u32 size)
++{
++	enum xlink_error rc = 0;
++
++	rc = do_xlink_write_data(handle, chan, pmessage, size, 1);
++	return rc;
++}
++
+ enum xlink_error xlink_write_control_data(struct xlink_handle *handle,
+ 					  u16 chan, u8 const *pmessage,
+ 					  u32 size)
+@@ -614,16 +756,7 @@ enum xlink_error xlink_write_control_data(struct xlink_handle *handle,
+ }
+ EXPORT_SYMBOL_GPL(xlink_write_control_data);
+ 
+-enum xlink_error xlink_write_volatile(struct xlink_handle *handle,
+-				      u16 chan, u8 const *message, u32 size)
+-{
+-	enum xlink_error rc = 0;
+-
+-	rc = do_xlink_write_volatile(handle, chan, message, size, 0);
+-	return rc;
+-}
+-
+-enum xlink_error do_xlink_write_volatile(struct xlink_handle *handle,
++static enum xlink_error do_xlink_write_volatile(struct xlink_handle *handle,
+ 					 u16 chan, u8 const *message,
+ 					 u32 size, u32 user_flag)
+ {
+@@ -668,6 +801,26 @@ enum xlink_error do_xlink_write_volatile(struct xlink_handle *handle,
+ 	return rc;
+ }
+ 
++enum xlink_error xlink_write_volatile_user(struct xlink_handle *handle,
++					   u16 chan, u8 const *message,
++					   u32 size)
++{
++	enum xlink_error rc = 0;
++
++	rc = do_xlink_write_volatile(handle, chan, message, size, 1);
++	return rc;
++}
++
++enum xlink_error xlink_write_volatile(struct xlink_handle *handle,
++				      u16 chan, u8 const *message, u32 size)
++{
++	enum xlink_error rc = 0;
++
++	rc = do_xlink_write_volatile(handle, chan, message, size, 0);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(xlink_write_volatile);
++
+ enum xlink_error xlink_read_data(struct xlink_handle *handle,
+ 				 u16 chan, u8 **pmessage, u32 *size)
+ {
+@@ -757,8 +910,8 @@ EXPORT_SYMBOL_GPL(xlink_release_data);
+ enum xlink_error xlink_disconnect(struct xlink_handle *handle)
+ {
+ 	struct xlink_link *link;
+-	int interface = NULL_INTERFACE;
+-	enum xlink_error rc = X_LINK_ERROR;
++	int interface;
++	enum xlink_error rc = 0;
+ 
+ 	if (!xlink || !handle)
+ 		return X_LINK_ERROR;
+@@ -767,7 +920,6 @@ enum xlink_error xlink_disconnect(struct xlink_handle *handle)
+ 	if (!link)
+ 		return X_LINK_ERROR;
+ 
+-	// decrement refcount, if count is 0 lock mutex and disconnect
+ 	if (kref_put_mutex(&link->refcount, release_after_kref_put,
+ 			   &xlink->lock)) {
+ 		// stop dispatcher
+@@ -946,6 +1098,179 @@ enum xlink_error xlink_get_device_mode(struct xlink_handle *handle,
+ 	return rc;
+ }
+ EXPORT_SYMBOL_GPL(xlink_get_device_mode);
++
++static int xlink_device_event_handler(u32 sw_device_id, u32 event_type)
++{
++	struct event_info *events = NULL;
++	xlink_device_event_cb event_cb;
++	bool found = false;
++	char event_attr[7];
++
++	mutex_lock(&dev_event_lock);
++	// find sw_device_id, event_type in list
++	list_for_each_entry(events, &ev_info.list, list) {
++		if (events) {
++			if (events->sw_device_id == sw_device_id &&
++			    events->event_type == event_type) {
++				event_cb = events->event_notif_fn;
++				found = true;
++				break;
++			}
++		}
++	}
++	if (found) {
++		if (events->user_flag) {
++			xlink->eventx[events->event_type].value = events->event_type;
++			xlink->eventx[events->event_type].sw_dev_id = sw_device_id;
++			sprintf(event_attr, "event%d", events->event_type);
++			sysfs_notify(&xlink->pdev->dev.kobj, NULL, event_attr);
++		} else {
++			if (event_cb) {
++				event_cb(sw_device_id, event_type);
++			} else {
++				pr_info("No callback found for sw_device_id : 0x%x event type %d\n",
++					sw_device_id, event_type);
++				mutex_unlock(&dev_event_lock);
++				return X_LINK_ERROR;
++			}
++		}
++		pr_info("sysfs_notify event %d swdev_id %xs\n",
++			events->event_type, sw_device_id);
++	}
++	mutex_unlock(&dev_event_lock);
++return X_LINK_SUCCESS;
++}
++
++static bool event_registered(u32 sw_dev_id, u32 event)
++{
++	struct event_info *events = NULL;
++
++	list_for_each_entry(events, &ev_info.list, list) {
++		if (events) {
++			if (events->sw_device_id == sw_dev_id &&
++			    events->event_type == event) {
++				return true;
++			}
++		}
++	}
++return false;
++}
++
++static enum xlink_error do_xlink_register_device_event(struct xlink_handle *handle,
++						       u32 *event_list,
++						       u32 num_events,
++						       xlink_device_event_cb event_notif_fn,
++						       u32 user_flag)
++{
++	struct event_info *events;
++	u32 interface;
++	u32 event;
++	int i;
++
++	if (num_events < 0 || num_events >= NUM_REG_EVENTS)
++		return X_LINK_ERROR;
++	for (i = 0; i < num_events; i++) {
++		events = kzalloc(sizeof(*events), GFP_KERNEL);
++		if (!events)
++			return X_LINK_ERROR;
++		event = *event_list;
++		events->sw_device_id = handle->sw_device_id;
++		events->event_notif_fn = event_notif_fn;
++		events->event_type = *event_list++;
++		events->user_flag = user_flag;
++		if (user_flag) {
++			/* only add to list once if userspace */
++			/* xlink userspace handles multi process callbacks */
++			if (event_registered(handle->sw_device_id, event)) {
++				pr_info("xlink-core: Event 0x%x - %d already registered\n",
++					handle->sw_device_id, event);
++				kfree(events);
++				continue;
++			}
++		}
++		pr_info("xlink-core:Events: sw_device_id 0x%x event %d fn %p user_flag %d\n",
++			events->sw_device_id, events->event_type,
++			events->event_notif_fn, events->user_flag);
++		list_add_tail(&events->list, &ev_info.list);
++	}
++	interface = get_interface_from_sw_device_id(handle->sw_device_id);
++	if (interface == NULL_INTERFACE)
++		return X_LINK_ERROR;
++	xlink_platform_register_for_events(interface, handle->sw_device_id,
++					   xlink_device_event_handler);
++	return X_LINK_SUCCESS;
++}
++
++enum xlink_error xlink_register_device_event_user(struct xlink_handle *handle,
++						  u32 *event_list, u32 num_events,
++						  xlink_device_event_cb event_notif_fn)
++{
++	enum xlink_error rc;
++
++	rc = do_xlink_register_device_event(handle, event_list, num_events,
++					    event_notif_fn, 1);
++	return rc;
++}
++
++enum xlink_error xlink_register_device_event(struct xlink_handle *handle,
++					     u32 *event_list, u32 num_events,
++					     xlink_device_event_cb event_notif_fn)
++{
++	enum xlink_error rc;
++
++	rc = do_xlink_register_device_event(handle, event_list, num_events,
++					    event_notif_fn, 0);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(xlink_register_device_event);
++
++enum xlink_error xlink_unregister_device_event(struct xlink_handle *handle,
++					       u32 *event_list,
++					       u32 num_events)
++{
++	struct event_info *events = NULL;
++	u32 interface;
++	int found = 0;
++	int count = 0;
++	int i;
++
++	if (num_events < 0 || num_events >= NUM_REG_EVENTS)
++		return X_LINK_ERROR;
++	for (i = 0; i < num_events; i++) {
++		list_for_each_entry(events, &ev_info.list, list) {
++			if (events->sw_device_id == handle->sw_device_id &&
++			    events->event_type == event_list[i]) {
++				found = 1;
++				break;
++			}
++		}
++		if (!events || !found)
++			return X_LINK_ERROR;
++		pr_info("removing event %d for sw_device_id 0x%x\n",
++			events->event_type, events->sw_device_id);
++		list_del(&events->list);
++		kfree(events);
++	}
++	// check if any events left for this sw_device_id
++	// are still registered ( in list )
++	list_for_each_entry(events, &ev_info.list, list) {
++		if (events) {
++			if (events->sw_device_id == handle->sw_device_id) {
++				count++;
++				break;
++			}
++		}
++	}
++	if (count == 0) {
++		interface = get_interface_from_sw_device_id(handle->sw_device_id);
++		if (interface == NULL_INTERFACE)
++			return X_LINK_ERROR;
++		xlink_platform_unregister_for_events(interface, handle->sw_device_id);
++	}
++	return X_LINK_SUCCESS;
++}
++EXPORT_SYMBOL_GPL(xlink_unregister_device_event);
++
+ /* Device tree driver match. */
+ static const struct of_device_id kmb_xlink_of_match[] = {
+ 	{
+diff --git a/drivers/misc/xlink-core/xlink-core.h b/drivers/misc/xlink-core/xlink-core.h
+index 5ba7ac653bf7..ee10058a15ac 100644
+--- a/drivers/misc/xlink-core/xlink-core.h
++++ b/drivers/misc/xlink-core/xlink-core.h
+@@ -12,11 +12,14 @@
+ 
+ #define NUM_REG_EVENTS 4
+ 
+-enum xlink_error do_xlink_write_volatile(struct xlink_handle *handle,
+-					 u16 chan, u8 const *message,
+-					 u32 size, u32 user_flag);
+-
+ enum xlink_error xlink_write_data_user(struct xlink_handle *handle,
+ 				       u16 chan, u8 const *pmessage,
+ 				       u32 size);
++enum xlink_error xlink_register_device_event_user(struct xlink_handle *handle,
++						  u32 *event_list,
++						  u32 num_events,
++						  xlink_device_event_cb event_notif_fn);
++enum xlink_error xlink_write_volatile_user(struct xlink_handle *handle,
++					   u16 chan, u8 const *message,
++					   u32 size);
+ #endif /* XLINK_CORE_H_ */
+diff --git a/drivers/misc/xlink-core/xlink-defs.h b/drivers/misc/xlink-core/xlink-defs.h
+index 8985f6631175..81aa3bfffcd3 100644
+--- a/drivers/misc/xlink-core/xlink-defs.h
++++ b/drivers/misc/xlink-core/xlink-defs.h
+@@ -35,7 +35,7 @@
+ #define CONTROL_CHANNEL_TIMEOUT_MS	0U	// wait indefinitely
+ #define SIGXLNK				44	// signal XLink uses for callback signalling
+ 
+-#define UNUSED(x) (void)(x)
++#define UNUSED(x) ((void)(x))
+ 
+ // the end of the IPC channel range (starting at zero)
+ #define XLINK_IPC_MAX_CHANNELS	1024
+@@ -102,6 +102,8 @@ enum xlink_event_type {
+ 	XLINK_CLOSE_CHANNEL_REQ,
+ 	XLINK_PING_REQ,
+ 	XLINK_WRITE_CONTROL_REQ,
++	XLINK_DATA_READY_CALLBACK_REQ,
++	XLINK_DATA_CONSUMED_CALLBACK_REQ,
+ 	XLINK_REQ_LAST,
+ 	// response events
+ 	XLINK_WRITE_RESP = 0x10,
+@@ -113,6 +115,8 @@ enum xlink_event_type {
+ 	XLINK_CLOSE_CHANNEL_RESP,
+ 	XLINK_PING_RESP,
+ 	XLINK_WRITE_CONTROL_RESP,
++	XLINK_DATA_READY_CALLBACK_RESP,
++	XLINK_DATA_CONSUMED_CALLBACK_RESP,
+ 	XLINK_RESP_LAST,
+ };
+ 
+diff --git a/drivers/misc/xlink-core/xlink-dispatcher.c b/drivers/misc/xlink-core/xlink-dispatcher.c
+index 11ef8e4110ca..bc2f184488ac 100644
+--- a/drivers/misc/xlink-core/xlink-dispatcher.c
++++ b/drivers/misc/xlink-core/xlink-dispatcher.c
+@@ -5,18 +5,18 @@
+  * Copyright (C) 2018-2019 Intel Corporation
+  *
+  */
+-#include <linux/init.h>
+-#include <linux/module.h>
++#include <linux/completion.h>
+ #include <linux/device.h>
++#include <linux/init.h>
+ #include <linux/kernel.h>
+-#include <linux/slab.h>
+ #include <linux/kthread.h>
+ #include <linux/list.h>
+-#include <linux/semaphore.h>
++#include <linux/module.h>
+ #include <linux/mutex.h>
+-#include <linux/completion.h>
+-#include <linux/sched/signal.h>
+ #include <linux/platform_device.h>
++#include <linux/sched/signal.h>
++#include <linux/semaphore.h>
++#include <linux/slab.h>
+ 
+ #include "xlink-dispatcher.h"
+ #include "xlink-multiplexer.h"
+@@ -34,18 +34,18 @@ enum dispatcher_state {
+ 
+ /* queue for dispatcher tx thread event handling */
+ struct event_queue {
++	struct list_head head;	/* head of event linked list */
+ 	u32 count;		/* number of events in the queue */
+ 	u32 capacity;		/* capacity of events in the queue */
+-	struct list_head head;	/* head of event linked list */
+ 	struct mutex lock;	/* locks queue while accessing */
+ };
+ 
+ /* dispatcher servicing a single link to a device */
+ struct dispatcher {
+ 	u32 link_id;			/* id of link being serviced */
++	int interface;			/* underlying interface of link */
+ 	enum dispatcher_state state;	/* state of the dispatcher */
+ 	struct xlink_handle *handle;	/* xlink device handle */
+-	int interface;			/* underlying interface of link */
+ 	struct task_struct *rxthread;	/* kthread servicing rx */
+ 	struct task_struct *txthread;	/* kthread servicing tx */
+ 	struct event_queue queue;	/* xlink event queue */
+@@ -82,7 +82,7 @@ static struct dispatcher *get_dispatcher_by_id(u32 id)
+ 
+ static u32 event_generate_id(void)
+ {
+-	static u32 id = 0xa; // TODO: temporary solution
++	static u32 id = 0xa;
+ 
+ 	return id++;
+ }
+@@ -142,9 +142,6 @@ static int dispatcher_event_send(struct xlink_event *event)
+ 	size_t event_header_size = sizeof(event->header);
+ 	int rc;
+ 
+-	// write event header
+-	// printk(KERN_DEBUG "Sending event: type = 0x%x, id = 0x%x\n",
+-			// event->header.type, event->header.id);
+ 	rc = xlink_platform_write(event->interface,
+ 				  event->handle->sw_device_id, &event->header,
+ 				  &event_header_size, event->header.timeout, NULL);
+@@ -159,8 +156,10 @@ static int dispatcher_event_send(struct xlink_event *event)
+ 					  event->handle->sw_device_id, event->data,
+ 					  &event->header.size, event->header.timeout,
+ 					  NULL);
+-		if (rc)
++		if (rc) {
+ 			pr_err("Write data failed %d\n", rc);
++			return rc;
++		}
+ 		if (event->user_data == 1) {
+ 			if (event->paddr != 0) {
+ 				xlink_platform_deallocate(xlinkd->dev,
+@@ -187,7 +186,6 @@ static int xlink_dispatcher_rxthread(void *context)
+ 	size_t size;
+ 	int rc;
+ 
+-	// printk(KERN_DEBUG "dispatcher rxthread started\n");
+ 	event = xlink_create_event(disp->link_id, 0, disp->handle, 0, 0, 0);
+ 	if (!event)
+ 		return -1;
+@@ -214,7 +212,6 @@ static int xlink_dispatcher_rxthread(void *context)
+ 			}
+ 		}
+ 	}
+-	// printk(KERN_INFO "dispatcher rxthread stopped\n");
+ 	complete(&disp->rx_done);
+ 	do_exit(0);
+ 	return 0;
+@@ -225,7 +222,6 @@ static int xlink_dispatcher_txthread(void *context)
+ 	struct dispatcher *disp = (struct dispatcher *)context;
+ 	struct xlink_event *event;
+ 
+-	// printk(KERN_DEBUG "dispatcher txthread started\n");
+ 	allow_signal(SIGTERM); // allow thread termination while waiting on sem
+ 	complete(&disp->tx_done);
+ 	while (!kthread_should_stop()) {
+@@ -236,7 +232,6 @@ static int xlink_dispatcher_txthread(void *context)
+ 		dispatcher_event_send(event);
+ 		xlink_destroy_event(event); // free handled event
+ 	}
+-	// printk(KERN_INFO "dispatcher txthread stopped\n");
+ 	complete(&disp->tx_done);
+ 	do_exit(0);
+ 	return 0;
+@@ -250,6 +245,7 @@ static int xlink_dispatcher_txthread(void *context)
+ enum xlink_error xlink_dispatcher_init(void *dev)
+ {
+ 	struct platform_device *plat_dev = (struct platform_device *)dev;
++	struct dispatcher *dsp;
+ 	int i;
+ 
+ 	xlinkd = kzalloc(sizeof(*xlinkd), GFP_KERNEL);
+@@ -258,16 +254,16 @@ enum xlink_error xlink_dispatcher_init(void *dev)
+ 
+ 	xlinkd->dev = &plat_dev->dev;
+ 	for (i = 0; i < XLINK_MAX_CONNECTIONS; i++) {
+-		xlinkd->dispatchers[i].link_id = i;
+-		sema_init(&xlinkd->dispatchers[i].event_sem, 0);
+-		init_completion(&xlinkd->dispatchers[i].rx_done);
+-		init_completion(&xlinkd->dispatchers[i].tx_done);
+-		INIT_LIST_HEAD(&xlinkd->dispatchers[i].queue.head);
+-		mutex_init(&xlinkd->dispatchers[i].queue.lock);
+-		xlinkd->dispatchers[i].queue.count = 0;
+-		xlinkd->dispatchers[i].queue.capacity =
+-				XLINK_EVENT_QUEUE_CAPACITY;
+-		xlinkd->dispatchers[i].state = XLINK_DISPATCHER_INIT;
++		dsp = &xlinkd->dispatchers[i];
++		dsp->link_id = i;
++		sema_init(&dsp->event_sem, 0);
++		init_completion(&dsp->rx_done);
++		init_completion(&dsp->tx_done);
++		INIT_LIST_HEAD(&dsp->queue.head);
++		mutex_init(&dsp->queue.lock);
++		dsp->queue.count = 0;
++		dsp->queue.capacity = XLINK_EVENT_QUEUE_CAPACITY;
++		dsp->state = XLINK_DISPATCHER_INIT;
+ 	}
+ 	mutex_init(&xlinkd->lock);
+ 
+@@ -329,7 +325,7 @@ enum xlink_error xlink_dispatcher_event_add(enum xlink_event_origin origin,
+ 	struct dispatcher *disp;
+ 	int rc;
+ 
+-	// get dispatcher by handle
++	// get dispatcher by link id
+ 	disp = get_dispatcher_by_id(event->link_id);
+ 	if (!disp)
+ 		return X_LINK_ERROR;
+@@ -433,7 +429,6 @@ enum xlink_error xlink_dispatcher_destroy(void)
+ 			}
+ 			xlink_destroy_event(event);
+ 		}
+-		// destroy dispatcher
+ 		mutex_destroy(&disp->queue.lock);
+ 	}
+ 	mutex_destroy(&xlinkd->lock);
+diff --git a/drivers/misc/xlink-core/xlink-ioctl.c b/drivers/misc/xlink-core/xlink-ioctl.c
+index 90947bbccfed..7822a7b35bb6 100644
+--- a/drivers/misc/xlink-core/xlink-ioctl.c
++++ b/drivers/misc/xlink-core/xlink-ioctl.c
+@@ -28,15 +28,6 @@ static int copy_result_to_user(u32 *where, int rc)
+ 	return rc;
+ }
+ 
+-static enum xlink_error xlink_write_volatile_user(struct xlink_handle *handle,
+-						  u16 chan, u8 const *message, u32 size)
+-{
+-	enum xlink_error rc = 0;
+-
+-	rc = do_xlink_write_volatile(handle, chan, message, size, 1);
+-	return rc;
+-}
+-
+ int ioctl_connect(unsigned long arg)
+ {
+ 	struct xlink_handle	devh	= {};
+@@ -158,6 +149,28 @@ int ioctl_write_data(unsigned long arg)
+ 	return copy_result_to_user(wr.return_code, rc);
+ }
+ 
++int ioctl_write_control_data(unsigned long arg)
++{
++	struct xlink_handle	devh	= {};
++	struct xlinkwritedata	wr	= {};
++	u8 volbuf[XLINK_MAX_BUF_SIZE];
++	int rc = 0;
++
++	if (copy_from_user(&wr, (void __user *)arg,
++			   sizeof(struct xlinkwritedata)))
++		return -EFAULT;
++	if (copy_from_user(&devh, (void __user *)wr.handle,
++			   sizeof(struct xlink_handle)))
++		return -EFAULT;
++	if (wr.size > XLINK_MAX_CONTROL_DATA_SIZE)
++		return -EFAULT;
++	if (copy_from_user(volbuf, (void __user *)wr.pmessage, wr.size))
++		return -EFAULT;
++	rc = xlink_write_control_data(&devh, wr.chan, volbuf, wr.size);
++
++	return copy_result_to_user(wr.return_code, rc);
++}
++
+ int ioctl_write_volatile_data(unsigned long arg)
+ {
+ 	struct xlink_handle	devh	= {};
+@@ -242,6 +255,14 @@ int ioctl_start_vpu(unsigned long arg)
+ 	return copy_result_to_user(startvpu.return_code, rc);
+ }
+ 
++int ioctl_stop_vpu(void)
++{
++	int rc = 0;
++
++	rc = xlink_stop_vpu();
++	return rc;
++}
++
+ int ioctl_disconnect(unsigned long arg)
+ {
+ 	struct xlink_handle	devh	= {};
+@@ -424,3 +445,110 @@ int ioctl_set_device_mode(unsigned long arg)
+ 
+ 	return copy_result_to_user(devm.return_code, rc);
+ }
++
++int ioctl_register_device_event(unsigned long arg)
++{
++	struct xlink_handle	devh	= {};
++	struct xlinkregdevevent	regdevevent = {};
++	u32 num_events = 0;
++	u32 *ev_list;
++	int rc = 0;
++
++	if (copy_from_user(&regdevevent, (void __user *)arg,
++			   sizeof(struct xlinkregdevevent)))
++		return -EFAULT;
++	if (copy_from_user(&devh, (void __user *)regdevevent.handle,
++			   sizeof(struct xlink_handle)))
++		return -EFAULT;
++	num_events = regdevevent.num_events;
++	if (num_events > 0 && num_events <= NUM_REG_EVENTS) {
++		ev_list = kzalloc((num_events * sizeof(u32)), GFP_KERNEL);
++		if (ev_list) {
++			if (copy_from_user(ev_list,
++					   (void __user *)regdevevent.event_list,
++					   (num_events * sizeof(u32)))) {
++				kfree(ev_list);
++				return -EFAULT;
++			}
++			rc = xlink_register_device_event_user(&devh,
++							      ev_list,
++							      num_events,
++							      NULL);
++			kfree(ev_list);
++		} else {
++			rc = X_LINK_ERROR;
++		}
++	} else {
++		rc = X_LINK_ERROR;
++	}
++
++	return copy_result_to_user(regdevevent.return_code, rc);
++}
++
++int ioctl_unregister_device_event(unsigned long arg)
++{
++	struct xlink_handle	devh	= {};
++	struct xlinkregdevevent	regdevevent = {};
++	u32 num_events = 0;
++	u32 *ev_list;
++	int rc = 0;
++
++	if (copy_from_user(&regdevevent, (void __user *)arg,
++			   sizeof(struct xlinkregdevevent)))
++		return -EFAULT;
++	if (copy_from_user(&devh, (void __user *)regdevevent.handle,
++			   sizeof(struct xlink_handle)))
++		return -EFAULT;
++	num_events = regdevevent.num_events;
++	if (num_events <= NUM_REG_EVENTS) {
++		ev_list = kzalloc((num_events * sizeof(u32)), GFP_KERNEL);
++		if (copy_from_user(ev_list,
++				   (void __user *)regdevevent.event_list,
++				   (num_events * sizeof(u32)))) {
++			kfree(ev_list);
++			return -EFAULT;
++		}
++		rc = xlink_unregister_device_event(&devh, ev_list, num_events);
++		kfree(ev_list);
++	} else {
++		rc = X_LINK_ERROR;
++	}
++
++	return copy_result_to_user(regdevevent.return_code, rc);
++}
++
++int ioctl_data_ready_callback(unsigned long arg)
++{
++	struct xlink_handle	devh	= {};
++	struct xlinkcallback	cb	= {};
++	int rc = 0;
++
++	if (copy_from_user(&cb, (void __user *)arg,
++			   sizeof(struct xlinkcallback)))
++		return -EFAULT;
++	if (copy_from_user(&devh, (void __user *)cb.handle,
++			   sizeof(struct xlink_handle)))
++		return -EFAULT;
++	CHANNEL_SET_USER_BIT(cb.chan); // set MSbit for user space call
++	rc = xlink_data_available_event(&devh, cb.chan, cb.callback);
++
++	return copy_result_to_user(cb.return_code, rc);
++}
++
++int ioctl_data_consumed_callback(unsigned long arg)
++{
++	struct xlink_handle	devh	= {};
++	struct xlinkcallback	cb	= {};
++	int rc = 0;
++
++	if (copy_from_user(&cb, (void __user *)arg,
++			   sizeof(struct xlinkcallback)))
++		return -EFAULT;
++	if (copy_from_user(&devh, (void __user *)cb.handle,
++			   sizeof(struct xlink_handle)))
++		return -EFAULT;
++	CHANNEL_SET_USER_BIT(cb.chan); // set MSbit for user space call
++	rc = xlink_data_consumed_event(&devh, cb.chan, cb.callback);
++
++	return copy_result_to_user(cb.return_code, rc);
++}
+diff --git a/drivers/misc/xlink-core/xlink-ioctl.h b/drivers/misc/xlink-core/xlink-ioctl.h
+index d016d8418f30..7818b676d488 100644
+--- a/drivers/misc/xlink-core/xlink-ioctl.h
++++ b/drivers/misc/xlink-core/xlink-ioctl.h
+@@ -14,10 +14,12 @@ int ioctl_open_channel(unsigned long arg);
+ int ioctl_read_data(unsigned long arg);
+ int ioctl_read_to_buffer(unsigned long arg);
+ int ioctl_write_data(unsigned long arg);
++int ioctl_write_control_data(unsigned long arg);
+ int ioctl_write_volatile_data(unsigned long arg);
+ int ioctl_release_data(unsigned long arg);
+ int ioctl_close_channel(unsigned long arg);
+ int ioctl_start_vpu(unsigned long arg);
++int ioctl_stop_vpu(void);
+ int ioctl_disconnect(unsigned long arg);
+ int ioctl_get_device_name(unsigned long arg);
+ int ioctl_get_device_list(unsigned long arg);
+@@ -26,5 +28,9 @@ int ioctl_boot_device(unsigned long arg);
+ int ioctl_reset_device(unsigned long arg);
+ int ioctl_get_device_mode(unsigned long arg);
+ int ioctl_set_device_mode(unsigned long arg);
++int ioctl_register_device_event(unsigned long arg);
++int ioctl_unregister_device_event(unsigned long arg);
++int ioctl_data_ready_callback(unsigned long arg);
++int ioctl_data_consumed_callback(unsigned long arg);
+ 
+ #endif /* XLINK_IOCTL_H_ */
+diff --git a/drivers/misc/xlink-core/xlink-multiplexer.c b/drivers/misc/xlink-core/xlink-multiplexer.c
+index 48451dc30712..e09458b62c45 100644
+--- a/drivers/misc/xlink-core/xlink-multiplexer.c
++++ b/drivers/misc/xlink-core/xlink-multiplexer.c
+@@ -115,6 +115,38 @@ static struct xlink_multiplexer *xmux;
+  *
+  */
+ 
++static enum xlink_error run_callback(struct open_channel *opchan,
++				     void *callback, struct task_struct *pid)
++{
++	enum xlink_error rc = X_LINK_SUCCESS;
++	struct kernel_siginfo info;
++	void (*func)(int chan);
++	int ret;
++
++	if (opchan->callback_origin == 'U') { // user-space origin
++		if (pid) {
++			memset(&info, 0, sizeof(struct kernel_siginfo));
++			info.si_signo = SIGXLNK;
++			info.si_code = SI_QUEUE;
++			info.si_errno = opchan->id;
++			info.si_ptr = (void __user *)callback;
++			ret = send_sig_info(SIGXLNK, &info, pid);
++			if (ret < 0) {
++				pr_err("Unable to send signal %d\n", ret);
++				rc = X_LINK_ERROR;
++			}
++		} else {
++			pr_err("CHAN 0x%x -- calling_pid == NULL\n",
++			       opchan->id);
++			rc = X_LINK_ERROR;
++		}
++	} else { // kernel origin
++		func = callback;
++		func(opchan->id);
++	}
++	return rc;
++}
++
+ static inline int chan_is_non_blocking_read(struct open_channel *opchan)
+ {
+ 	if (opchan->chan->mode == RXN_TXN || opchan->chan->mode == RXN_TXB)
+@@ -151,7 +183,7 @@ static int is_channel_for_device(u16 chan, u32 sw_device_id,
+ 				 enum xlink_dev_type dev_type)
+ {
+ 	struct xlink_channel_type const *chan_type = get_channel_type(chan);
+-	int interface = NULL_INTERFACE;
++	int interface;
+ 
+ 	if (chan_type) {
+ 		interface = get_interface_from_sw_device_id(sw_device_id);
+@@ -181,13 +213,9 @@ static int is_enough_space_in_channel(struct open_channel *opchan,
+ 		}
+ 	}
+ 	if (opchan->tx_up_limit == 1) {
+-		if ((opchan->tx_fill_level + size)
+-				< ((opchan->chan->size / 100) * THR_LWR)) {
+-			opchan->tx_up_limit = 0;
+-			return 1;
+-		} else {
++		if ((opchan->tx_fill_level + size) >=
++		   ((opchan->chan->size / 100) * THR_LWR))
+ 			return 0;
+-		}
+ 	}
+ 	return 1;
+ }
+@@ -231,6 +259,8 @@ static int add_packet_to_channel(struct open_channel *opchan,
+ 		list_add_tail(&pkt->list, &queue->head);
+ 		queue->count++;
+ 		opchan->rx_fill_level += pkt->length;
++	} else {
++		return X_LINK_ERROR;
+ 	}
+ 	return X_LINK_SUCCESS;
+ }
+@@ -262,9 +292,11 @@ static int release_packet_from_channel(struct open_channel *opchan,
+ 	} else {
+ 		// find packet in channel rx queue
+ 		list_for_each_entry(pkt, &queue->head, list) {
+-			if (pkt->data == addr) {
+-				packet_found = 1;
+-				break;
++			if (pkt) {
++				if (pkt->data == addr) {
++					packet_found = 1;
++					break;
++				}
+ 			}
+ 		}
+ 	}
+@@ -629,16 +661,46 @@ enum xlink_error xlink_multiplexer_tx(struct xlink_event *event,
+ 			}
+ 		} else if (xmux->channels[link_id][chan].status == CHAN_OPEN_PEER) {
+ 			/* channel already open */
+-			xmux->channels[link_id][chan].status = CHAN_OPEN; // opened locally
+-			xmux->channels[link_id][chan].size = event->header.size;
+-			xmux->channels[link_id][chan].timeout = event->header.timeout;
+-			xmux->channels[link_id][chan].mode = (uintptr_t)event->data;
+ 			rc = multiplexer_open_channel(link_id, chan);
++			if (rc == X_LINK_SUCCESS) {
++				struct channel *xchan = &xmux->channels[link_id][chan];
++
++				xchan->status	= CHAN_OPEN; // opened locally
++				xchan->size	= event->header.size;
++				xchan->timeout	= event->header.timeout;
++				xchan->mode	= (uintptr_t)event->data;
++			}
+ 		} else {
+ 			/* channel already open */
+ 			rc = X_LINK_ALREADY_OPEN;
+ 		}
+ 		break;
++	case XLINK_DATA_READY_CALLBACK_REQ:
++		opchan = get_channel(link_id, chan);
++		if (!opchan) {
++			rc = X_LINK_COMMUNICATION_FAIL;
++		} else {
++			opchan->ready_callback = event->data;
++			opchan->ready_calling_pid = event->calling_pid;
++			opchan->callback_origin = event->callback_origin;
++			pr_info("xlink ready callback process registered - %lx chan %d\n",
++				(uintptr_t)event->calling_pid, chan);
++			release_channel(opchan);
++		}
++		break;
++	case XLINK_DATA_CONSUMED_CALLBACK_REQ:
++		opchan = get_channel(link_id, chan);
++		if (!opchan) {
++			rc = X_LINK_COMMUNICATION_FAIL;
++		} else {
++			opchan->consumed_callback = event->data;
++			opchan->consumed_calling_pid = event->calling_pid;
++			opchan->callback_origin = event->callback_origin;
++			pr_info("xlink consumed callback process registered - %lx chan %d\n",
++				(uintptr_t)event->calling_pid, chan);
++			release_channel(opchan);
++		}
++		break;
+ 	case XLINK_CLOSE_CHANNEL_REQ:
+ 		if (xmux->channels[link_id][chan].status == CHAN_OPEN) {
+ 			opchan = get_channel(link_id, chan);
+@@ -709,7 +771,8 @@ enum xlink_error xlink_multiplexer_rx(struct xlink_event *event)
+ 							  XLINK_PACKET_ALIGNMENT,
+ 							  XLINK_NORMAL_MEMORY);
+ 			} else {
+-				pr_err("Fatal error: can't allocate memory in line:%d func:%s\n", __LINE__, __func__);
++				pr_err("Fatal error: can't allocate memory in line:%d func:%s\n",
++				       __LINE__, __func__);
+ 			}
+ 			rc = X_LINK_COMMUNICATION_FAIL;
+ 		} else {
+@@ -754,6 +817,14 @@ enum xlink_error xlink_multiplexer_rx(struct xlink_event *event)
+ 				xlink_dispatcher_event_add(EVENT_RX, event);
+ 				//complete regardless of mode/timeout
+ 				complete(&opchan->pkt_available);
++				// run callback
++				if (xmux->channels[link_id][chan].status == CHAN_OPEN &&
++				    chan_is_non_blocking_read(opchan) &&
++				    opchan->ready_callback) {
++					rc = run_callback(opchan, opchan->ready_callback,
++							  opchan->ready_calling_pid);
++					break;
++				}
+ 			} else {
+ 				// failed to allocate buffer
+ 				rc = X_LINK_ERROR;
+@@ -813,6 +884,13 @@ enum xlink_error xlink_multiplexer_rx(struct xlink_event *event)
+ 		xlink_dispatcher_event_add(EVENT_RX, event);
+ 		//complete regardless of mode/timeout
+ 		complete(&opchan->pkt_consumed);
++		// run callback
++		if (xmux->channels[link_id][chan].status == CHAN_OPEN &&
++		    chan_is_non_blocking_write(opchan) &&
++		    opchan->consumed_callback) {
++			rc = run_callback(opchan, opchan->consumed_callback,
++					  opchan->consumed_calling_pid);
++		}
+ 		release_channel(opchan);
+ 		break;
+ 	case XLINK_RELEASE_REQ:
+@@ -838,47 +916,47 @@ enum xlink_error xlink_multiplexer_rx(struct xlink_event *event)
+ 			rc = multiplexer_open_channel(link_id, chan);
+ 			if (rc) {
+ 				rc = X_LINK_ERROR;
+-			} else {
+-				opchan = get_channel(link_id, chan);
+-				if (!opchan) {
+-					rc = X_LINK_COMMUNICATION_FAIL;
+-				} else {
+-					xmux->channels[link_id][chan].status = CHAN_OPEN_PEER;
+-					complete(&opchan->opened);
+-					passthru_event = xlink_create_event(link_id,
+-									    XLINK_OPEN_CHANNEL_RESP,
+-									    event->handle,
+-									    chan,
+-									    0,
+-									    opchan->chan->timeout);
+-					if (!passthru_event) {
+-						rc = X_LINK_ERROR;
+-						release_channel(opchan);
+-						break;
+-					}
+-					xlink_dispatcher_event_add(EVENT_RX,
+-								   passthru_event);
+-				}
++				break;
++			}
++			opchan = get_channel(link_id, chan);
++			if (!opchan) {
++				rc = X_LINK_COMMUNICATION_FAIL;
++				break;
++			}
++			xmux->channels[link_id][chan].status = CHAN_OPEN_PEER;
++			complete(&opchan->opened);
++			passthru_event = xlink_create_event(link_id,
++							    XLINK_OPEN_CHANNEL_RESP,
++							    event->handle,
++							    chan,
++							    0,
++							    opchan->chan->timeout);
++			if (!passthru_event) {
++				rc = X_LINK_ERROR;
+ 				release_channel(opchan);
++				break;
+ 			}
++			xlink_dispatcher_event_add(EVENT_RX,
++						   passthru_event);
++			release_channel(opchan);
+ 		} else {
+ 			/* channel already open */
+ 			opchan = get_channel(link_id, chan);
+ 			if (!opchan) {
+ 				rc = X_LINK_COMMUNICATION_FAIL;
+-			} else {
+-				passthru_event = xlink_create_event(link_id,
+-								    XLINK_OPEN_CHANNEL_RESP,
+-								    event->handle,
+-								    chan, 0, 0);
+-				if (!passthru_event) {
+-					release_channel(opchan);
+-					rc = X_LINK_ERROR;
+-					break;
+-				}
+-				xlink_dispatcher_event_add(EVENT_RX,
+-							   passthru_event);
++				break;
++			}
++			passthru_event = xlink_create_event(link_id,
++							    XLINK_OPEN_CHANNEL_RESP,
++							    event->handle,
++							    chan, 0, 0);
++			if (!passthru_event) {
++				release_channel(opchan);
++				rc = X_LINK_ERROR;
++				break;
+ 			}
++			xlink_dispatcher_event_add(EVENT_RX,
++						   passthru_event);
+ 			release_channel(opchan);
+ 		}
+ 		rc = xlink_passthrough(event);
+@@ -930,7 +1008,7 @@ enum xlink_error xlink_passthrough(struct xlink_event *event)
+ #ifdef CONFIG_XLINK_LOCAL_HOST
+ 	struct xlink_ipc_context ipc = {0};
+ 	phys_addr_t physaddr = 0;
+-	dma_addr_t vpuaddr = 0;
++	static dma_addr_t vpuaddr;
+ 	u32 timeout = 0;
+ 	u32 link_id;
+ 	u16 chan;
+diff --git a/drivers/misc/xlink-core/xlink-platform.c b/drivers/misc/xlink-core/xlink-platform.c
+index 56eb8da28a5f..b0076cb3671d 100644
+--- a/drivers/misc/xlink-core/xlink-platform.c
++++ b/drivers/misc/xlink-core/xlink-platform.c
+@@ -56,6 +56,11 @@ static inline int xlink_ipc_close_channel(u32 sw_device_id,
+ 					  u32 channel)
+ { return -1; }
+ 
++static inline int xlink_ipc_register_for_events(u32 sw_device_id,
++						int (*callback)(u32 sw_device_id, u32 event))
++{ return -1; }
++static inline int xlink_ipc_unregister_for_events(u32 sw_device_id)
++{ return -1; }
+ #endif /* CONFIG_XLINK_LOCAL_HOST */
+ 
+ /*
+@@ -95,6 +100,13 @@ static int (*open_chan_fcts[NMB_OF_INTERFACES])(u32, u32) = {
+ 
+ static int (*close_chan_fcts[NMB_OF_INTERFACES])(u32, u32) = {
+ 		xlink_ipc_close_channel, NULL, NULL, NULL};
++static int (*register_for_events_fcts[NMB_OF_INTERFACES])(u32,
++						   int (*callback)(u32 sw_device_id, u32 event)) = {
++								   xlink_ipc_register_for_events,
++								   xlink_pcie_register_device_event,
++								   NULL, NULL};
++static int (*unregister_for_events_fcts[NMB_OF_INTERFACES])(u32) = {
++		xlink_ipc_unregister_for_events, xlink_pcie_unregister_device_event, NULL, NULL};
+ 
+ /*
+  * xlink low-level driver interface
+@@ -207,6 +219,21 @@ int xlink_platform_close_channel(u32 interface, u32 sw_device_id,
+ 	return close_chan_fcts[interface](sw_device_id, channel);
+ }
+ 
++int xlink_platform_register_for_events(u32 interface, u32 sw_device_id,
++				       xlink_device_event_cb event_notif_fn)
++{
++	if (interface >= NMB_OF_INTERFACES || !register_for_events_fcts[interface])
++		return -1;
++	return register_for_events_fcts[interface](sw_device_id, event_notif_fn);
++}
++
++int xlink_platform_unregister_for_events(u32 interface, u32 sw_device_id)
++{
++	if (interface >= NMB_OF_INTERFACES || !unregister_for_events_fcts[interface])
++		return -1;
++	return unregister_for_events_fcts[interface](sw_device_id);
++}
++
+ void *xlink_platform_allocate(struct device *dev, dma_addr_t *handle,
+ 			      u32 size, u32 alignment,
+ 			      enum xlink_memory_region region)
+diff --git a/include/linux/xlink.h b/include/linux/xlink.h
+index b00dbc719530..ac196ff85469 100644
+--- a/include/linux/xlink.h
++++ b/include/linux/xlink.h
+@@ -70,6 +70,12 @@ enum xlink_error xlink_open_channel(struct xlink_handle *handle,
+ 				    u16 chan, enum xlink_opmode mode,
+ 				    u32 data_size, u32 timeout);
+ 
++enum xlink_error xlink_data_available_event(struct xlink_handle *handle,
++					    u16 chan,
++					    xlink_event data_available_event);
++enum xlink_error xlink_data_consumed_event(struct xlink_handle *handle,
++					   u16 chan,
++					   xlink_event data_consumed_event);
+ enum xlink_error xlink_close_channel(struct xlink_handle *handle, u16 chan);
+ 
+ enum xlink_error xlink_write_data(struct xlink_handle *handle,
+@@ -113,9 +119,14 @@ enum xlink_error xlink_set_device_mode(struct xlink_handle *handle,
+ enum xlink_error xlink_get_device_mode(struct xlink_handle *handle,
+ 				       enum xlink_device_power_mode *power_mode);
+ 
+-enum xlink_error xlink_start_vpu(char *filename); /* depreciated */
++enum xlink_error xlink_register_device_event(struct xlink_handle *handle,
++					     u32 *event_list, u32 num_events,
++					     xlink_device_event_cb event_notif_fn);
++enum xlink_error xlink_unregister_device_event(struct xlink_handle *handle,
++					       u32 *event_list, u32 num_events);
++enum xlink_error xlink_start_vpu(char *filename); /* deprecated */
+ 
+-enum xlink_error xlink_stop_vpu(void); /* depreciated */
++enum xlink_error xlink_stop_vpu(void); /* deprecated */
+ 
+ /* API functions to be implemented
+  *
+-- 
+2.27.0
+

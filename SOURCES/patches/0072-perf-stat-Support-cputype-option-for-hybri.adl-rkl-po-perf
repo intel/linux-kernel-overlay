@@ -1,0 +1,245 @@
+From 1cac1bcf6194733e7925aad486ef529e093b07fb Mon Sep 17 00:00:00 2001
+From: Jin Yao <yao.jin@linux.intel.com>
+Date: Fri, 5 Mar 2021 02:00:32 +0800
+Subject: [PATCH 72/88] perf stat: Support --cputype option for hybrid events
+
+In previous patch, we have supported the syntax which enables
+the event on a specified pmu, such as:
+
+cpu_core/<event>/
+cpu_atom/<event>/
+
+While this syntax is not very easy for applying on a set of
+events or applying on a group. In following example, we have to
+explicitly assign the pmu prefix.
+
+  # ./perf stat -e '{cpu_core/cycles/,cpu_core/instructions/}' -- sleep 1
+
+   Performance counter stats for 'sleep 1':
+
+           1,158,545      cpu_core/cycles/
+           1,003,113      cpu_core/instructions/
+
+         1.002428712 seconds time elapsed
+
+A much easier way is:
+
+  # ./perf stat --cputype core -e '{cycles,instructions}' -- sleep 1
+
+   Performance counter stats for 'sleep 1':
+
+           1,101,071      cpu_core/cycles/
+             939,892      cpu_core/instructions/
+
+         1.002363142 seconds time elapsed
+
+The '--cputype' enables the events from specified pmu (cpu_core).
+
+If '--cputype' conflicts with pmu prefix, '--cputype' is ignored and
+a warning is displayed.
+
+  # ./perf stat --cputype atom -e '{cpu_core/cycles/}' -- sleep 1
+  WARNING: cputype (cpu_atom) conflicts with event pmu (cpu_core), use event pmu (cpu_core)
+
+   Performance counter stats for 'sleep 1':
+
+           1,111,773      cpu_core/cycles/
+
+         1.002351054 seconds time elapsed
+
+Signed-off-by: Jin Yao <yao.jin@linux.intel.com>
+---
+ tools/perf/Documentation/perf-stat.txt |  4 +++
+ tools/perf/builtin-stat.c              | 24 ++++++++++++++
+ tools/perf/util/evlist.h               |  1 +
+ tools/perf/util/parse-events.c         | 43 +++++++++++++++++++++++++-
+ tools/perf/util/parse-events.h         |  1 +
+ 5 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index d0def5c1715a..422167fb12ca 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -468,6 +468,10 @@ convenient for post processing.
+ --summary::
+ Print summary for interval mode (-I).
+ 
++--cputype::
++Only enable events on applying cpu with this type for hybrid platform
++(e.g. core or atom)"
++
+ EXAMPLES
+ --------
+ 
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 6f780a039db0..f01011b732e0 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -1176,6 +1176,26 @@ static int add_default_hybrid_events(struct evlist *evlist)
+ 	return parse_events(evlist, "cycles,instructions,branches,branch-misses", &err);
+ }
+ 
++static int parse_hybrid_type(const struct option *opt,
++			     const char *str,
++			     int unset __maybe_unused)
++{
++	struct evlist *evlist = *(struct evlist **)opt->value;
++
++	if (!list_empty(&evlist->core.entries)) {
++		fprintf(stderr, "Must define cputype before events/metrics\n");
++		return -1;
++	}
++
++	evlist->pmu_name = perf_pmu__hybrid_type_to_pmu(str);
++	if (!evlist->pmu_name) {
++		fprintf(stderr, "--cputype %s is not supported!\n", str);
++		return -1;
++	}
++
++	return 0;
++}
++
+ static struct option stat_options[] = {
+ 	OPT_BOOLEAN('T', "transaction", &transaction_run,
+ 		    "hardware transaction statistics"),
+@@ -1284,6 +1304,10 @@ static struct option stat_options[] = {
+ 		       "print summary for interval mode"),
+ 	OPT_BOOLEAN(0, "quiet", &stat_config.quiet,
+ 			"don't print output (useful with record)"),
++	OPT_CALLBACK(0, "cputype", &evsel_list, "hybrid cpu type",
++		     "Only enable events on applying cpu with this type "
++		     "for hybrid platform (e.g. core or atom)",
++		     parse_hybrid_type),
+ #ifdef HAVE_LIBPFM
+ 	OPT_CALLBACK(0, "pfm-events", &evsel_list, "event",
+ 		"libpfm4 event selector. use 'perf list' to list available events",
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 33dec3bb5739..d14768869312 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -66,6 +66,7 @@ struct evlist {
+ 	struct evsel *selected;
+ 	struct events_stats stats;
+ 	struct perf_env	*env;
++	const char *pmu_name;
+ 	void (*trace_event_sample_raw)(struct evlist *evlist,
+ 				       union perf_event *event,
+ 				       struct perf_sample *sample);
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 58c3c9531429..f6f13746e0e3 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -501,7 +501,13 @@ static int add_hybrid_cache(struct list_head *list, int *idx,
+ 	*hybrid = false;
+ 	perf_pmu__for_each_hybrid_pmu(pmu) {
+ 		*hybrid = true;
+-		 if (parse_state->pmu_name &&
++
++		if (parse_state->evlist && parse_state->evlist->pmu_name &&
++		    strcmp(parse_state->evlist->pmu_name, pmu->name)) {
++			continue;
++		}
++
++		if (parse_state->pmu_name &&
+ 		     strcmp(parse_state->pmu_name, pmu->name)) {
+ 			continue;
+ 		}
+@@ -515,6 +521,19 @@ static int add_hybrid_cache(struct list_head *list, int *idx,
+ 	return 0;
+ }
+ 
++static void warn_pmu_conflict(struct parse_events_state *parse_state)
++{
++	if (parse_state->evlist2 && parse_state->evlist2->pmu_name &&
++	    parse_state->pmu_name &&
++	    strcmp(parse_state->evlist2->pmu_name, parse_state->pmu_name)) {
++		WARN_ONCE(1, "WARNING: cputype (%s) conflicts with event "
++			  "pmu (%s), use event pmu (%s)\n",
++			  parse_state->evlist2->pmu_name,
++			  parse_state->pmu_name,
++			  parse_state->pmu_name);
++	}
++}
++
+ int parse_events_add_cache(struct list_head *list, int *idx,
+ 			   char *type, char *op_result1, char *op_result2,
+ 			   struct parse_events_error *err,
+@@ -591,6 +610,8 @@ int parse_events_add_cache(struct list_head *list, int *idx,
+ 	if (!perf_pmu__hybrid_exist())
+ 		perf_pmu__scan(NULL);
+ 
++	warn_pmu_conflict(parse_state);
++
+ 	ret = add_hybrid_cache(list, idx, &attr, config_name ? : name,
+ 			       &config_terms, &hybrid, parse_state);
+ 	if (hybrid)
+@@ -1522,6 +1543,12 @@ static int add_hybrid_numeric(struct parse_events_state *parse_state,
+ 	*hybrid = false;
+ 	perf_pmu__for_each_hybrid_pmu(pmu) {
+ 		*hybrid = true;
++
++		if (parse_state->evlist && parse_state->evlist->pmu_name &&
++		    strcmp(parse_state->evlist->pmu_name, pmu->name)) {
++			continue;
++		}
++
+ 		if (parse_state->pmu_name &&
+ 		    strcmp(parse_state->pmu_name, pmu->name)) {
+ 			continue;
+@@ -1569,6 +1596,12 @@ static int add_hybrid_raw(struct parse_events_state *parse_state,
+ 	*hybrid = false;
+ 	perf_pmu__for_each_hybrid_pmu(pmu) {
+ 		*hybrid = true;
++
++		if (parse_state->evlist && parse_state->evlist->pmu_name &&
++		    strcmp(parse_state->evlist->pmu_name, pmu->name)) {
++			continue;
++		}
++
+ 		if (parse_state->pmu_name &&
+ 		    strcmp(parse_state->pmu_name, pmu->name)) {
+ 			continue;
+@@ -1607,6 +1640,8 @@ int parse_events_add_numeric(struct parse_events_state *parse_state,
+ 			return -ENOMEM;
+ 	}
+ 
++	warn_pmu_conflict(parse_state);
++
+ 	/*
+ 	 * Skip the software dummy event.
+ 	 */
+@@ -1705,6 +1740,11 @@ int parse_events_add_pmu(struct parse_events_state *parse_state,
+ 		return -EINVAL;
+ 	}
+ 
++	if (parse_state->evlist->pmu_name && perf_pmu__is_hybrid(name) &&
++	    strcmp(parse_state->evlist->pmu_name, name)) {
++		return -EINVAL;
++	}
++
+ 	if (pmu->default_config) {
+ 		memcpy(&attr, pmu->default_config,
+ 		       sizeof(struct perf_event_attr));
+@@ -2406,6 +2446,7 @@ static int parse_events_with_hybrid_pmu(struct parse_events_state *parse_state,
+ 		.stoken		= PE_START_EVENTS,
+ 		.pmu_name	= pmu_name,
+ 		.idx		= parse_state->idx,
++		.evlist2	= parse_state->evlist,
+ 	};
+ 	int ret;
+ 
+diff --git a/tools/perf/util/parse-events.h b/tools/perf/util/parse-events.h
+index 6c91abce3220..c0d8a160d89f 100644
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@ -139,6 +139,7 @@ struct parse_events_state {
+ 	int			   stoken;
+ 	struct perf_pmu		  *fake_pmu;
+ 	char			  *pmu_name;
++	struct evlist		  *evlist2;
+ };
+ 
+ void parse_events__handle_error(struct parse_events_error *err, int idx,
+-- 
+2.27.0
+

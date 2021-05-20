@@ -1,0 +1,272 @@
+From 5e2a0264e07b25dd538134d1ee06b33597d08b42 Mon Sep 17 00:00:00 2001
+From: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+Date: Mon, 14 Oct 2019 13:40:21 +0100
+Subject: [PATCH 073/223] keembay-ipc: Rework reserved memory initialization
+
+Rework initialization of reserved memory regions in order to reduce code
+duplication.
+
+Signed-off-by: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+---
+ drivers/misc/keembay-ipc/keembay-ipc.c | 193 +++++++++++--------------
+ 1 file changed, 82 insertions(+), 111 deletions(-)
+
+diff --git a/drivers/misc/keembay-ipc/keembay-ipc.c b/drivers/misc/keembay-ipc/keembay-ipc.c
+index acda52dccef7..969d3d53e458 100644
+--- a/drivers/misc/keembay-ipc/keembay-ipc.c
++++ b/drivers/misc/keembay-ipc/keembay-ipc.c
+@@ -238,104 +238,87 @@ static struct keembay_ipc_dev *kmb_ipc_dev;
+  * Functions related to reserved-memory sub-devices.
+  */
+ 
+-/* Remove the IPC memory sub-devices. */
+-static void ipc_reserved_memory_remove(struct keembay_ipc_dev *dev)
+-{
+-	device_unregister(dev->local_ipc_mem.dev);
+-	device_unregister(dev->remote_ipc_mem.dev);
+-}
+-
+-/* Release function for the reserved memory sub-devices. */
+-static void ipc_reserved_mem_release(struct device *dev)
+-{
+-	of_reserved_mem_device_release(dev);
+-}
+-
+-/* Get the size of the specified reserved memory region. */
+-static resource_size_t get_ipc_reserved_mem_size(struct device *dev,
+-						 unsigned int idx)
++/*
++ * init_ipc_rsvd_mem() - Init the specified IPC reserved memory.
++ * @dev:	The IPC device for which the memory will be initialized.
++ * @mem:	Where to stored information about the initialized memory.
++ * @mem_name:	The name of this IPC memory.
++ * @mem_idx:	The index of the memory to initialize.
++ *
++ * Create a child device for 'dev' and use it to initialize the reserved
++ * memory region specified in the device tree at index 'mem_idx'.
++ * Also allocate DMA memory from the initialized memory region.
++ *
++ * Return:	0 on success, negative error code otherwise.
++ */
++static int init_ipc_rsvd_mem(struct device *dev, struct ipc_buf_mem *mem,
++			     const char *mem_name, unsigned int mem_idx)
+ {
+-	struct resource mem;
++	struct device *mem_dev;
+ 	struct device_node *np;
++	struct resource mem_res;
++	size_t mem_size;
++	void *vaddr;
++	dma_addr_t dma_handle;
+ 	int rc;
+ 
+-	np = of_parse_phandle(dev->of_node, "memory-region", idx);
+-	if (!np) {
+-		dev_err(dev, "Couldn't find memory-region %d\n", idx);
+-		return 0;
+-	}
+-
+-	rc = of_address_to_resource(np, 0, &mem);
+-	if (rc) {
+-		dev_err(dev, "Couldn't map address to resource %d\n", idx);
+-		return 0;
+-	}
+-
+-	return resource_size(&mem);
+-}
+-
+-/* Init a reserved memory sub-devices. */
+-static struct device *init_ipc_reserved_mem_dev(struct device *dev,
+-						const char *name,
+-						unsigned int idx)
+-{
+-	struct device *child;
+-	int rc;
+-
+-	child = devm_kzalloc(dev, sizeof(struct device), GFP_KERNEL);
+-	if (!child)
+-		return NULL;
++	/* Create a child device (of dev) to own the reserved memory. */
++	mem_dev = devm_kzalloc(dev, sizeof(struct device), GFP_KERNEL);
++	if (!mem_dev)
++		return -ENOMEM;
+ 
+-	device_initialize(child);
+-	dev_set_name(child, "%s:%s", dev_name(dev), name);
+-	child->parent = dev;
+-	child->coherent_dma_mask = dev->coherent_dma_mask;
+-	child->dma_mask = dev->dma_mask;
+-	child->release = ipc_reserved_mem_release;
++	device_initialize(mem_dev);
++	dev_set_name(mem_dev, "%s:%s", dev_name(dev), mem_name);
++	mem_dev->parent = dev;
++	mem_dev->coherent_dma_mask = dev->coherent_dma_mask;
++	mem_dev->dma_mask = dev->dma_mask;
++	mem_dev->release = of_reserved_mem_device_release;
+ 
+-	rc = device_add(child);
++	rc = device_add(mem_dev);
+ 	if (rc)
+ 		goto err;
+ 
+-	rc = of_reserved_mem_device_init_by_idx(child, dev->of_node, idx);
++	/* Initialized the device reserved memory region. */
++	rc = of_reserved_mem_device_init_by_idx(mem_dev, dev->of_node, mem_idx);
+ 	if (rc) {
+ 		dev_err(dev, "Couldn't get reserved memory with idx = %d, %d\n",
+-			idx, rc);
+-		device_del(child);
++			mem_idx, rc);
++		device_del(mem_dev);
+ 		goto err;
+ 	}
+ 
+-	return child;
+-
+-err:
+-	put_device(child);
+-	return NULL;
+-}
+-
+-/* Init reserved memory for our diver. */
+-static int ipc_reserved_memory_init(struct keembay_ipc_dev *ipc_dev)
+-{
+-	struct device *dev = &ipc_dev->plat_dev->dev;
+-
+-	ipc_dev->local_ipc_mem.dev = init_ipc_reserved_mem_dev(
+-		dev, "ipc_local_reserved", LOCAL_IPC_BUFFER_IDX);
+-	if (!ipc_dev->local_ipc_mem.dev)
+-		return -ENOMEM;
+-
+-	ipc_dev->local_ipc_mem.size =
+-		get_ipc_reserved_mem_size(dev, LOCAL_IPC_BUFFER_IDX);
++	/* Find out the size of the memory region. */
++	np = of_parse_phandle(dev->of_node, "memory-region", mem_idx);
++	if (!np) {
++		dev_err(dev, "Couldn't find memory-region %d\n", mem_idx);
++		rc = -EINVAL;
++		goto err;
++	}
++	rc = of_address_to_resource(np, 0, &mem_res);
++	if (rc) {
++		dev_err(dev, "Couldn't map address to resource %d\n", mem_idx);
++		goto err;
++	}
++	mem_size = resource_size(&mem_res);
+ 
+-	ipc_dev->remote_ipc_mem.dev = init_ipc_reserved_mem_dev(
+-		dev, "ipc_remote_reserved", REMOTE_IPC_BUFFER_IDX);
+-	if (!ipc_dev->remote_ipc_mem.dev) {
+-		device_unregister(ipc_dev->local_ipc_mem.dev);
+-		return -ENOMEM;
++	/* Allocate memory from the reserved memory regions */
++	vaddr = dmam_alloc_coherent(mem_dev, mem_size, &dma_handle, GFP_KERNEL);
++	if (!vaddr) {
++		dev_err(mem_dev, "Failed to allocate from reserved memory.\n");
++		rc = -ENOMEM;
++		goto err;
+ 	}
+ 
+-	ipc_dev->remote_ipc_mem.size =
+-		get_ipc_reserved_mem_size(dev, REMOTE_IPC_BUFFER_IDX);
++	mem->dev = mem_dev;
++	mem->vaddr = vaddr;
++	mem->dma_handle = dma_handle;
++	mem->size = mem_size;
+ 
+ 	return 0;
++
++err:
++	put_device(mem_dev);
++	return rc;
+ }
+ 
+ /*
+@@ -723,56 +706,43 @@ static int kmb_ipc_probe(struct platform_device *pdev)
+ {
+ 	int rc;
+ 	struct keembay_ipc_dev *ipc_dev;
++	struct device *dev = &pdev->dev;
+ 
+ 	dev_info(&pdev->dev, "KeemBay IPC v%d.%d\n", IPC_VERSION_MAJOR,
+ 		 IPC_VERSION_MINOR);
+ 
+-	ipc_dev = devm_kzalloc(&pdev->dev, sizeof(*ipc_dev), GFP_KERNEL);
++	ipc_dev = devm_kzalloc(dev, sizeof(*ipc_dev), GFP_KERNEL);
+ 	if (!ipc_dev)
+ 		return -ENOMEM;
+ 
+ 	ipc_dev->plat_dev = pdev;
+ 
+-	/* Grab reserved memory regions and assign to child devices */
+-	rc = ipc_reserved_memory_init(ipc_dev);
+-	if (rc < 0) {
+-		dev_err(&pdev->dev,
+-			"Failed to set up reserved memory regions.\n");
++	/* Init the memory used for local IPC buffers. */
++	rc = init_ipc_rsvd_mem(dev, &ipc_dev->local_ipc_mem,
++			       "local_rsvd_mem", LOCAL_IPC_BUFFER_IDX);
++	if (rc) {
++		dev_err(dev, "Failed to set up local reserved memory.\n");
+ 		return rc;
+ 	}
+-
+-	/* Allocate memory from the reserved memory regions */
+-	ipc_dev->local_ipc_mem.vaddr =
+-		dmam_alloc_coherent(ipc_dev->local_ipc_mem.dev,
+-				    ipc_dev->local_ipc_mem.size,
+-				    &ipc_dev->local_ipc_mem.dma_handle,
+-				    GFP_KERNEL);
+-	if (!ipc_dev->local_ipc_mem.vaddr) {
+-		dev_err(&pdev->dev,
+-			"Failed to allocate from local reserved memory.\n");
+-		ipc_reserved_memory_remove(ipc_dev);
+-		return -ENOMEM;
+-	}
+-	ipc_dev->remote_ipc_mem.vaddr = dmam_alloc_coherent(
+-		ipc_dev->remote_ipc_mem.dev, ipc_dev->remote_ipc_mem.size,
+-		&ipc_dev->remote_ipc_mem.dma_handle, GFP_KERNEL);
+-	if (!ipc_dev->remote_ipc_mem.vaddr) {
+-		dev_err(&pdev->dev,
+-			"Failed to allocate from remote reserved memory.\n");
+-		ipc_reserved_memory_remove(ipc_dev);
+-		return -ENOMEM;
++	/* Init the memory used for remote IPC buffers. */
++	rc = init_ipc_rsvd_mem(dev, &ipc_dev->remote_ipc_mem,
++			       "remote_rsvd_mem", REMOTE_IPC_BUFFER_IDX);
++	if (rc) {
++		dev_err(dev, "Failed to set up remote reserved memory.\n");
++		device_unregister(ipc_dev->local_ipc_mem.dev);
++		return rc;
+ 	}
+-
+-	dev_info(&pdev->dev, "Local vaddr 0x%p paddr 0x%pad size 0x%zX\n",
++	/* Print out some information about the configured memory. */
++	dev_info(dev, "Local vaddr 0x%p paddr 0x%pad size 0x%zX\n",
+ 		 ipc_dev->local_ipc_mem.vaddr,
+ 		 &ipc_dev->local_ipc_mem.dma_handle,
+ 		 ipc_dev->local_ipc_mem.size);
+-	dev_info(&pdev->dev, "Remote vaddr 0x%p paddr 0x%pad size 0x%zX\n",
++	dev_info(dev, "Remote vaddr 0x%p paddr 0x%pad size 0x%zX\n",
+ 		 ipc_dev->remote_ipc_mem.vaddr,
+ 		 &ipc_dev->remote_ipc_mem.dma_handle,
+ 		 ipc_dev->remote_ipc_mem.size);
+ 
+-	/* Init the pool of IPC Buffer to be used to TX. */
++	/* Init the pool of IPC Buffers to be used to TX. */
+ 	init_ipc_buf_pool(ipc_dev);
+ 	/* Init the only link we have (ARM CSS -> LEON MSS). */
+ 	rc = ipc_link_init(ipc_dev, &ipc_dev->leon_mss_link);
+@@ -804,7 +774,8 @@ static int kmb_ipc_remove(struct platform_device *pdev)
+ 	 * since it was allocated with dmam_alloc.
+ 	 */
+ 
+-	ipc_reserved_memory_remove(ipc_dev);
++	device_unregister(ipc_dev->local_ipc_mem.dev);
++	device_unregister(ipc_dev->remote_ipc_mem.dev);
+ 
+ 	return 0;
+ }
+-- 
+2.27.0
+

@@ -1,0 +1,254 @@
+From b30f42f30d24f45e0f322ea221733704057ecef3 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Tue, 15 Dec 2020 09:02:23 -0800
+Subject: [PATCH 25/33] x86/cpu: Load Key Locker internal key at boot-time
+
+Internal (Wrapping) Key is a new entity of Intel Key Locker feature. This
+internal key is loaded in a software-inaccessible CPU state and used to
+encode a data encryption key.
+
+The kernel makes random data and loads it as the internal key in each CPU.
+The data need to be invalidated as soon as the load is done.
+
+The BIOS may disable the feature. Check the dynamic CPUID bit
+(KEYLOCKER_CPUID_EBX_AESKLE) at first.
+
+Add byte code for LOADIWKEY -- an instruction to load the internal key, in
+the 'x86-opcode-map.txt' file to avoid objtool's misinterpretation.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Cc: x86@kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ arch/x86/include/asm/keylocker.h      | 11 +++++
+ arch/x86/kernel/Makefile              |  1 +
+ arch/x86/kernel/cpu/common.c          | 38 +++++++++++++-
+ arch/x86/kernel/keylocker.c           | 71 +++++++++++++++++++++++++++
+ arch/x86/kernel/smpboot.c             |  2 +
+ arch/x86/lib/x86-opcode-map.txt       |  2 +-
+ tools/arch/x86/lib/x86-opcode-map.txt |  2 +-
+ 7 files changed, 124 insertions(+), 3 deletions(-)
+ create mode 100644 arch/x86/kernel/keylocker.c
+
+Index: b/arch/x86/include/asm/keylocker.h
+===================================================================
+--- a/arch/x86/include/asm/keylocker.h	2021-05-14 11:18:30.796766167 +0800
++++ b/arch/x86/include/asm/keylocker.h	2021-05-14 11:18:30.792766167 +0800
+@@ -14,5 +14,16 @@
+ #define KEYLOCKER_CPUID_EBX_BACKUP     BIT(4)
+ #define KEYLOCKER_CPUID_ECX_RAND       BIT(1)
+ 
++bool check_keylocker_readiness(void);
++
++bool load_keylocker(void);
++
++void make_keylocker_data(void);
++#ifdef CONFIG_X86_KEYLOCKER
++void invalidate_keylocker_data(void);
++#else
++#define invalidate_keylocker_data() do { } while (0)
++#endif
++
+ #endif /*__ASSEMBLY__ */
+ #endif /* _ASM_KEYLOCKER_H */
+Index: b/arch/x86/kernel/Makefile
+===================================================================
+--- a/arch/x86/kernel/Makefile	2021-05-14 11:18:30.796766167 +0800
++++ b/arch/x86/kernel/Makefile	2021-05-14 11:18:30.792766167 +0800
+@@ -144,6 +144,7 @@
+ obj-$(CONFIG_TRACING)			+= tracepoint.o
+ obj-$(CONFIG_SCHED_MC_PRIO)		+= itmt.o
+ obj-$(CONFIG_X86_UMIP)			+= umip.o
++obj-$(CONFIG_X86_KEYLOCKER)		+= keylocker.o
+ 
+ obj-$(CONFIG_UNWINDER_ORC)		+= unwind_orc.o
+ obj-$(CONFIG_UNWINDER_FRAME_POINTER)	+= unwind_frame.o
+Index: b/arch/x86/kernel/cpu/common.c
+===================================================================
+--- a/arch/x86/kernel/cpu/common.c	2021-05-14 11:18:30.796766167 +0800
++++ b/arch/x86/kernel/cpu/common.c	2021-05-14 11:19:34.172767249 +0800
+@@ -59,6 +59,8 @@
+ #include <asm/microcode_intel.h>
+ #include <asm/intel-family.h>
+ #include <asm/cpu_device_id.h>
++#include <asm/keylocker.h>
++
+ #include <asm/uv/uv.h>
+ #include <asm/pks.h>
+ 
+@@ -480,6 +482,39 @@
+ }
+ __setup("nofsgsbase", x86_nofsgsbase_setup);
+ 
++static __always_inline void setup_keylocker(struct cpuinfo_x86 *c)
++{
++	bool keyloaded;
++
++	if (!cpu_feature_enabled(X86_FEATURE_KEYLOCKER))
++		goto out;
++
++	cr4_set_bits(X86_CR4_KEYLOCKER);
++
++	if (c == &boot_cpu_data) {
++		if (!check_keylocker_readiness())
++			goto disable_keylocker;
++
++		make_keylocker_data();
++	}
++
++	keyloaded = load_keylocker();
++	if (!keyloaded) {
++		pr_err_once("x86/keylocker: Failed to load internal key\n");
++		goto disable_keylocker;
++	}
++
++	pr_info_once("x86/keylocker: Activated\n");
++	return;
++
++disable_keylocker:
++	clear_cpu_cap(c, X86_FEATURE_KEYLOCKER);
++	pr_info_once("x86/keylocker: Disabled\n");
++out:
++	/* Make sure the feature disabled for kexec-reboot. */
++	cr4_clear_bits(X86_CR4_KEYLOCKER);
++}
++
+ /*
+  * Protection Keys are not available in 32-bit mode.
+  */
+@@ -1578,11 +1613,12 @@
+ 	/* Disable the PN if appropriate */
+ 	squash_the_stupid_serial_number(c);
+ 
+-	/* Set up SMEP/SMAP/UMIP/HRESET */
++	/* Setup various Intel-specific CPU security features */
+ 	setup_smep(c);
+ 	setup_smap(c);
+ 	setup_umip(c);
+ 	setup_hreset(c);
++	setup_keylocker(c);
+ 
+ 	/* Enable FSGSBASE instructions if available. */
+ 	if (cpu_has(c, X86_FEATURE_FSGSBASE)) {
+Index: b/arch/x86/kernel/keylocker.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/keylocker.c	2021-05-14 11:18:30.796766167 +0800
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++/*
++ * Key Locker feature check and support the internal key
++ */
++
++#include <linux/random.h>
++
++#include <asm/keylocker.h>
++#include <asm/fpu/types.h>
++#include <asm/fpu/api.h>
++
++bool check_keylocker_readiness(void)
++{
++	u32 eax, ebx, ecx, edx;
++
++	cpuid_count(KEYLOCKER_CPUID, 0, &eax, &ebx, &ecx, &edx);
++	/* BIOS may not enable it on some systems. */
++	if (!(ebx & KEYLOCKER_CPUID_EBX_AESKLE)) {
++		pr_debug("x86/keylocker: not fully enabled\n");
++		return false;
++	}
++
++	return true;
++}
++
++/* Load Internal (Wrapping) Key */
++#define LOADIWKEY		".byte 0xf3,0x0f,0x38,0xdc,0xd1"
++#define LOADIWKEY_NUM_OPERANDS	3
++
++static struct key {
++	struct reg_128_bit value[LOADIWKEY_NUM_OPERANDS];
++} keydata;
++
++void make_keylocker_data(void)
++{
++	int i;
++
++	for (i = 0; i < LOADIWKEY_NUM_OPERANDS; i++)
++		get_random_bytes(&keydata.value[i], sizeof(struct reg_128_bit));
++}
++
++void invalidate_keylocker_data(void)
++{
++	memset(&keydata.value, 0, sizeof(struct reg_128_bit) * LOADIWKEY_NUM_OPERANDS);
++}
++
++#define USE_SWKEY	0
++
++bool load_keylocker(void)
++{
++	struct reg_128_bit zeros = { 0 };
++	u32 keysrc = USE_SWKEY;
++	bool err = true;
++
++	kernel_fpu_begin();
++
++	asm volatile ("movdqu %0, %%xmm0; movdqu %1, %%xmm1; movdqu %2, %%xmm2;"
++		      :: "m"(keydata.value[0]),
++			 "m"(keydata.value[1]),
++			 "m"(keydata.value[2]));
++
++	asm volatile (LOADIWKEY CC_SET(z) : CC_OUT(z) (err) : "a"(keysrc));
++
++	asm volatile ("movdqu %0, %%xmm0; movdqu %0, %%xmm1; movdqu %0, %%xmm2;"
++		      :: "m"(zeros));
++
++	kernel_fpu_end();
++
++	return err ? false : true;
++}
+Index: b/arch/x86/kernel/smpboot.c
+===================================================================
+--- a/arch/x86/kernel/smpboot.c	2021-05-14 11:18:30.796766167 +0800
++++ b/arch/x86/kernel/smpboot.c	2021-05-14 11:18:30.796766167 +0800
+@@ -82,6 +82,7 @@
+ #include <asm/spec-ctrl.h>
+ #include <asm/hw_irq.h>
+ #include <asm/stackprotector.h>
++#include <asm/keylocker.h>
+ 
+ #ifdef CONFIG_ACPI_CPPC_LIB
+ #include <acpi/cppc_acpi.h>
+@@ -1448,6 +1449,7 @@
+ 	nmi_selftest();
+ 	impress_friends();
+ 	mtrr_aps_init();
++	invalidate_keylocker_data();
+ }
+ 
+ static int __initdata setup_possible_cpus = -1;
+Index: b/arch/x86/lib/x86-opcode-map.txt
+===================================================================
+--- a/arch/x86/lib/x86-opcode-map.txt	2021-05-14 11:18:30.796766167 +0800
++++ b/arch/x86/lib/x86-opcode-map.txt	2021-05-14 11:18:30.796766167 +0800
+@@ -795,7 +795,7 @@
+ cd: sha256msg2 Vdq,Wdq | vrsqrt28ss/d Vx,Hx,Wx (66),(ev)
+ cf: vgf2p8mulb Vx,Wx (66)
+ db: VAESIMC Vdq,Wdq (66),(v1)
+-dc: vaesenc Vx,Hx,Wx (66)
++dc: vaesenc Vx,Hx,Wx (66) | loadiwkey Vx,Hx (F3)
+ dd: vaesenclast Vx,Hx,Wx (66)
+ de: vaesdec Vx,Hx,Wx (66)
+ df: vaesdeclast Vx,Hx,Wx (66)
+Index: b/tools/arch/x86/lib/x86-opcode-map.txt
+===================================================================
+--- a/tools/arch/x86/lib/x86-opcode-map.txt	2021-05-14 11:18:30.796766167 +0800
++++ b/tools/arch/x86/lib/x86-opcode-map.txt	2021-05-14 11:18:30.796766167 +0800
+@@ -795,7 +795,7 @@
+ cd: sha256msg2 Vdq,Wdq | vrsqrt28ss/d Vx,Hx,Wx (66),(ev)
+ cf: vgf2p8mulb Vx,Wx (66)
+ db: VAESIMC Vdq,Wdq (66),(v1)
+-dc: vaesenc Vx,Hx,Wx (66)
++dc: vaesenc Vx,Hx,Wx (66) | loadiwkey Vx,Hx (F3)
+ dd: vaesenclast Vx,Hx,Wx (66)
+ de: vaesdec Vx,Hx,Wx (66)
+ df: vaesdeclast Vx,Hx,Wx (66)

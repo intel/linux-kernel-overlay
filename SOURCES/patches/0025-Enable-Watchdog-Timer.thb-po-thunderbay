@@ -1,0 +1,420 @@
+From da8661cf4b109a74910304ef15fb84c96f4057ce Mon Sep 17 00:00:00 2001
+From: ssanil <shruthi.sanil@intel.com>
+Date: Mon, 13 Jan 2020 11:44:53 +0530
+Subject: [PATCH 025/223] Enable Watchdog Timer
+
+---
+ drivers/watchdog/Kconfig          |  10 +
+ drivers/watchdog/Makefile         |   1 +
+ drivers/watchdog/thunderbay_wdt.c | 366 ++++++++++++++++++++++++++++++
+ 3 files changed, 377 insertions(+)
+ create mode 100644 drivers/watchdog/thunderbay_wdt.c
+
+diff --git a/drivers/watchdog/Kconfig b/drivers/watchdog/Kconfig
+index 1fe0042a48d2..43bc58c94362 100644
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -967,6 +967,16 @@ config VISCONTI_WATCHDOG
+ 	  Say Y here to include support for the watchdog timer in Toshiba
+ 	  Visconti SoCs.
+ 
++config THUNDERBAY_WATCHDOG
++	tristate "Intel Thunder Bay SoC non-secure watchdog"
++	depends on OF
++	select WATCHDOG_CORE
++	help
++	  Say Y here to include support for the non-secure watchdog timer
++	  in Intel Thunder Bay SoC.
++	  To compile this driver as a module, choose M here:
++	  the module will be called thunderbay_wdt.
++
+ # X86 (i386 + ia64 + x86_64) Architecture
+ 
+ config ACQUIRE_WDT
+diff --git a/drivers/watchdog/Makefile b/drivers/watchdog/Makefile
+index f3a6540e725e..577d8a21eb3f 100644
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -92,6 +92,7 @@ obj-$(CONFIG_SPRD_WATCHDOG) += sprd_wdt.o
+ obj-$(CONFIG_PM8916_WATCHDOG) += pm8916_wdt.o
+ obj-$(CONFIG_ARM_SMC_WATCHDOG) += arm_smc_wdt.o
+ obj-$(CONFIG_VISCONTI_WATCHDOG) += visconti_wdt.o
++obj-$(CONFIG_THUNDERBAY_WATCHDOG) += thunderbay_wdt.o
+ 
+ # X86 (i386 + ia64 + x86_64) Architecture
+ obj-$(CONFIG_ACQUIRE_WDT) += acquirewdt.o
+diff --git a/drivers/watchdog/thunderbay_wdt.c b/drivers/watchdog/thunderbay_wdt.c
+new file mode 100644
+index 000000000000..4c376412b660
+--- /dev/null
++++ b/drivers/watchdog/thunderbay_wdt.c
+@@ -0,0 +1,366 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Watchdog driver for Intel Thunder Bay non-secure watchdog.
++ *
++ * Copyright (C) 2019 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2, as published
++ * by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++#include <linux/watchdog.h>
++
++/* Non-secure watchdog register offsets */
++#define TIM_WATCHDOG			0x0
++#define TIM_WATCHDOG_INT_THRES	0x4
++#define TIM_WDOG_EN				0x8
++#define TIM_SAFE				0xc
++
++#define LOAD_MIN				0x00000001
++#define LOAD_MAX				0xffffffff
++#define WDT_DISABLE				0x0
++#define WDT_ENABLE				0x1
++#define WDT_UNLOCK				0xf1d0dead
++
++#define WATCHDOG_TIMEOUT		5 /* seconds */
++#define WATCHDOG_PRETIMEOUT		4 /* seconds */
++
++#define START_DEFAULT		0
++static int start_enabled = START_DEFAULT;
++module_param(start_enabled, int, 0);
++MODULE_PARM_DESC(start_enabled, "Watchdog is started on module insertion"
++				"(default = " __MODULE_STRING(START_DEFAULT)")");
++
++static unsigned int timeout = WATCHDOG_TIMEOUT;
++module_param(timeout, int, 0);
++MODULE_PARM_DESC(timeout, "Watchdog timeout period in seconds"
++				"(default = " __MODULE_STRING(WATCHDOG_TIMEOUT)")");
++
++static bool nowayout = WATCHDOG_NOWAYOUT;
++module_param(nowayout, bool, 0);
++MODULE_PARM_DESC(nowayout, "Watchdog cannot be stopped once started"
++				"(default = " __MODULE_STRING(WATCHDOG_NOWAYOUT)")");
++
++struct thunderbay_wdt {
++	void __iomem *reg_base;
++	struct watchdog_device wdd;
++	struct clk *clk;
++	u32 rate;
++	int to_irq;
++	int th_irq;
++};
++
++static inline u32 thunderbay_wdt_readl(struct thunderbay_wdt *thunderbay, u32 offset)
++{
++	return readl(thunderbay->reg_base + offset);
++}
++
++static inline void thunderbay_wdt_writel(struct thunderbay_wdt *thunderbay, u32 offset, u32 val)
++{
++	writel(WDT_UNLOCK, thunderbay->reg_base + TIM_SAFE);
++	writel(val, thunderbay->reg_base + offset);
++}
++
++static void thunderbay_wdt_set_timeout_reg(struct watchdog_device *wdog, bool ping)
++{
++	struct thunderbay_wdt *wdt = watchdog_get_drvdata(wdog);
++	u32 th_val = 0;
++
++	if (ping)
++	{
++		thunderbay_wdt_writel(wdt, TIM_WATCHDOG, wdog->timeout * wdt->rate);
++	}
++	else
++	{
++		if (wdog->pretimeout != 0)
++			th_val = wdog->timeout - wdog->pretimeout;
++		thunderbay_wdt_writel(wdt, TIM_WATCHDOG_INT_THRES, th_val * wdt->rate);
++		thunderbay_wdt_writel(wdt, TIM_WATCHDOG, wdog->timeout * wdt->rate);
++	}
++}
++
++static int thunderbay_wdt_start(struct watchdog_device *wdog)
++{
++	struct thunderbay_wdt *wdt = watchdog_get_drvdata(wdog);
++
++	thunderbay_wdt_set_timeout_reg(wdog, 0);
++	thunderbay_wdt_writel(wdt, TIM_WDOG_EN, WDT_ENABLE);
++
++	return 0;
++}
++
++static int thunderbay_wdt_stop(struct watchdog_device *wdog)
++{
++	struct thunderbay_wdt *wdt = watchdog_get_drvdata(wdog);
++
++	thunderbay_wdt_writel(wdt, TIM_WDOG_EN, WDT_DISABLE);
++
++	return 0;
++}
++
++static int thunderbay_wdt_ping(struct watchdog_device *wdog)
++{
++	thunderbay_wdt_set_timeout_reg(wdog, 1);
++
++	return 0;
++}
++
++static int thunderbay_wdt_set_timeout(struct watchdog_device *wdog, u32 t)
++{
++	u32 actual = min(t, wdog->max_timeout);
++
++	wdog->timeout = actual;
++	thunderbay_wdt_set_timeout_reg(wdog, 0);
++
++	return 0;
++}
++
++static int thunderbay_wdt_set_pretimeout(struct watchdog_device *wdog, u32 t)
++{
++	if ((t != 0) && (t < wdog->min_timeout || t >= wdog->timeout))
++		return -EINVAL;
++
++	wdog->pretimeout = t;
++	thunderbay_wdt_set_timeout_reg(wdog, 0);
++
++	return 0;
++}
++
++static unsigned int thunderbay_wdt_get_timeleft(struct watchdog_device *wdog)
++{
++	struct thunderbay_wdt *wdt = watchdog_get_drvdata(wdog);
++
++	return thunderbay_wdt_readl(wdt, TIM_WATCHDOG) / wdt->rate;
++}
++
++/*
++ * Non-secure Watchdog TO/TH interrupt handler
++ *
++ * A53SS TIM_GEN_CONFIG register is in SECURE bank. Use SMC call to clear
++ * the interrupt bits.
++ *
++ * SMC(PLATFORM_SIP_SVC_WDT_ISR_CLEAR,mask,0,0,0,0,0,0);
++ * PLATFORM_SIP_SVC_WDT_ISR_CLEAR= 0x8200FF18
++ * mask corresponds to bit position in hex
++ * 0x100: clear bit 8 (WDOG_TH_INT_CLR)
++ * 0x200: clear bit 9 (WDOG_TO_INT_CLR)
++ * 0x300: clear bit 8 and 9
++ */
++static irqreturn_t thunderbay_wdt_to_isr(int irq, void *dev_id)
++{
++	struct thunderbay_wdt *wdt = (struct thunderbay_wdt *)dev_id;
++#ifndef __ASSEMBLY__
++	struct arm_smccc_res res;
++#endif
++
++	// write a new TIM_WATCHDOG value greater than 0
++	thunderbay_wdt_writel(wdt, TIM_WATCHDOG, 0x1);
++
++#ifndef __ASSEMBLY__
++	// clear bit 9 (WDOG_TO_INT_CLR)
++	arm_smccc_smc(0x8200ff18, 0x200, 0, 0, 0, 0, 0, 0, &res);
++#endif
++
++	/*
++	 * TODO: No action defined.
++	 * Print critical log message, and reboot.
++	 */
++	pr_crit("Intel Thunder Bay non-secure watchdog timeout.\n");
++	emergency_restart();
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t thunderbay_wdt_th_isr(int irq, void *dev_id)
++{
++	struct thunderbay_wdt *wdt = (struct thunderbay_wdt *)dev_id;
++#ifndef __ASSEMBLY__
++	struct arm_smccc_res res;
++#endif
++	u32 th_val = 0;
++
++	// write a new TIM_WATCHDOG value greater than TIM_WATCHDOG_INT_THRES
++	if (wdt->wdd.pretimeout != 0)
++		th_val = wdt->wdd.timeout - wdt->wdd.pretimeout;
++	thunderbay_wdt_writel(wdt, TIM_WATCHDOG, th_val * wdt->rate + 10);
++
++#ifndef __ASSEMBLY__
++	// clear bit 8 (WDOG_TH_INT_CLR)
++	arm_smccc_smc(0x8200ff18, 0x100, 0, 0, 0, 0, 0, 0, &res);
++#endif
++
++	/*
++	 * TODO: No action defined.
++	 * Actions such as coredump collection or saving the required data, panic information before the system restarts.
++	 */
++
++	pr_crit("Intel Thunder Bay non-secure watchdog pre-timeout.\n");
++	watchdog_notify_pretimeout(&wdt->wdd);
++
++	return IRQ_HANDLED;
++}
++
++static const struct watchdog_info thunderbay_wdt_info = {
++	.identity	= "Intel Thunder Bay Watchdog Timer",
++	.options	= WDIOF_SETTIMEOUT | WDIOF_PRETIMEOUT | WDIOF_MAGICCLOSE | WDIOF_KEEPALIVEPING,
++};
++
++static const struct watchdog_ops thunderbay_wdt_ops = {
++	.owner			= THIS_MODULE,
++	.start			= thunderbay_wdt_start,
++	.stop			= thunderbay_wdt_stop,
++	.ping			= thunderbay_wdt_ping,
++	.set_timeout	= thunderbay_wdt_set_timeout,
++	.set_pretimeout	= thunderbay_wdt_set_pretimeout,
++	.get_timeleft	= thunderbay_wdt_get_timeleft,
++};
++
++static int thunderbay_wdt_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct thunderbay_wdt *wdt;
++	int ret;
++
++	wdt = devm_kzalloc(dev, sizeof(*wdt), GFP_KERNEL);
++	if (!wdt) {
++		dev_err(dev, "Failed to allocate memory.\n");
++		return -ENOMEM;
++	}
++
++	wdt->reg_base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(wdt->reg_base))
++		return PTR_ERR(wdt->reg_base);
++
++	wdt->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(wdt->clk)) {
++		dev_err(dev, "Clock not found.\n");
++		return PTR_ERR(wdt->clk);
++	}
++
++	wdt->rate = clk_get_rate(wdt->clk);
++	if (!wdt->rate) {
++		dev_err(dev, "Failed to get clock rate.\n");
++		return -EINVAL;
++	}
++
++	wdt->th_irq = platform_get_irq_byname(pdev, "threshold");
++	if (wdt->th_irq < 0) {
++		dev_err(dev, "Failed to get IRQ for threshold\n");
++		return wdt->th_irq;
++	}
++
++	ret = devm_request_irq(dev, wdt->th_irq, thunderbay_wdt_th_isr, 0, "thunderbay-wdt", wdt);
++	if (ret) {
++		dev_err(dev, "Failed to request IRQ for threshold\n");
++		return ret;
++	}
++
++	wdt->to_irq = platform_get_irq_byname(pdev, "timeout");
++	if (wdt->to_irq < 0) {
++		dev_err(dev, "Failed to get IRQ for timeout\n");
++		return wdt->to_irq;
++	}
++
++	ret = devm_request_irq(dev, wdt->to_irq, thunderbay_wdt_to_isr, 0, "thunderbay-wdt", wdt);
++	if (ret) {
++		dev_err(dev, "Failed to request IRQ for timeout\n");
++		return ret;
++	}
++
++	wdt->wdd.parent = dev;
++	wdt->wdd.info = &thunderbay_wdt_info;
++	wdt->wdd.ops = &thunderbay_wdt_ops;
++	wdt->wdd.timeout = WATCHDOG_TIMEOUT;
++	wdt->wdd.pretimeout = WATCHDOG_PRETIMEOUT;
++	wdt->wdd.min_timeout = LOAD_MIN;
++	wdt->wdd.max_timeout = LOAD_MAX / wdt->rate;
++
++	watchdog_set_drvdata(&wdt->wdd, wdt);
++	watchdog_set_nowayout(&wdt->wdd, nowayout);
++	watchdog_init_timeout(&wdt->wdd, timeout, dev);
++	thunderbay_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
++	thunderbay_wdt_set_pretimeout(&wdt->wdd, WATCHDOG_PRETIMEOUT);
++
++	ret = watchdog_register_device(&wdt->wdd);
++	if (ret) {
++		dev_err(dev, "Failed to register watchdog device.\n");
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, wdt);
++	dev_info(dev, "Initial timeout %d sec%s\n",
++		 wdt->wdd.timeout, nowayout ? ", nowayout." : ".");
++
++	if(start_enabled)
++	{
++		wdt->wdd.status = 3
++		thunderbay_wdt_writel(wdt, TIM_WATCHDOG, 30 * wdt->rate);
++		thunderbay_wdt_writel(wdt, TIM_WDOG_EN, WDT_ENABLE);
++	}
++
++	return 0;
++}
++
++static int __maybe_unused thunderbay_wdt_suspend(struct device *dev)
++{
++	struct thunderbay_wdt *wdt = dev_get_drvdata(dev);
++
++	if (watchdog_active(&wdt->wdd))
++		return thunderbay_wdt_stop(&wdt->wdd);
++
++	return 0;
++}
++
++static int __maybe_unused thunderbay_wdt_resume(struct device *dev)
++{
++	struct thunderbay_wdt *wdt = dev_get_drvdata(dev);
++
++	if (watchdog_active(&wdt->wdd))
++		return thunderbay_wdt_start(&wdt->wdd);
++
++	return 0;
++}
++
++static SIMPLE_DEV_PM_OPS(thunderbay_wdt_pm_ops, thunderbay_wdt_suspend, thunderbay_wdt_resume);
++
++#ifdef CONFIG_OF
++static const struct of_device_id thunderbay_wdt_match[] = {
++	{ .compatible = "intel,thunderbay-wdt" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, thunderbay_wdt_match);
++#endif
++
++static struct platform_driver thunderbay_wdt_driver = {
++	.probe	= thunderbay_wdt_probe,
++	.driver	= {
++			.name			= "thunderbay_wdt",
++			.pm				= &thunderbay_wdt_pm_ops,
++#ifdef CONFIG_OF
++			.of_match_table = thunderbay_wdt_match,
++#endif
++	},
++};
++
++module_platform_driver(thunderbay_wdt_driver);
++
++MODULE_DESCRIPTION("Intel Thunder Bay SoC watchdog driver");
++MODULE_AUTHOR("Shruthi Sanil <shruthi.sanil@intel.com>");
++MODULE_LICENSE("GPL v2");
+-- 
+2.27.0
+

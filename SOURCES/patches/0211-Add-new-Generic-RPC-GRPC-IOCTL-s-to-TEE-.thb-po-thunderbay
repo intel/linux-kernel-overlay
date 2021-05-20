@@ -1,0 +1,991 @@
+From e95082dae10f38906b62dc50b6bf9b40d54f5116 Mon Sep 17 00:00:00 2001
+From: hemanthk <hemanthkumar.sm@intel.com>
+Date: Fri, 22 Nov 2019 10:23:12 +0530
+Subject: [PATCH 211/223] Add new Generic RPC (GRPC) IOCTL's to TEE driver
+
+---
+ drivers/tee/optee/Makefile        |   1 +
+ drivers/tee/optee/call.c          |  32 ++--
+ drivers/tee/optee/core.c          |   4 +-
+ drivers/tee/optee/grpc.c          | 272 ++++++++++++++++++++++++++++++
+ drivers/tee/optee/optee_private.h |  42 ++++-
+ drivers/tee/optee/optee_rpc_cmd.h |  35 ++++
+ drivers/tee/optee/rpc.c           | 114 ++++++++++++-
+ drivers/tee/tee_core.c            | 103 +++++++++++
+ include/linux/tee_drv.h           |   6 +
+ include/uapi/linux/tee.h          |  52 ++++++
+ 10 files changed, 643 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/tee/optee/grpc.c
+
+diff --git a/drivers/tee/optee/Makefile b/drivers/tee/optee/Makefile
+index 56263ae3b1d7..d4874ce0703a 100644
+--- a/drivers/tee/optee/Makefile
++++ b/drivers/tee/optee/Makefile
+@@ -2,6 +2,7 @@
+ obj-$(CONFIG_OPTEE) += optee.o
+ optee-objs += core.o
+ optee-objs += call.o
++optee-objs += grpc.o
+ optee-objs += rpc.o
+ optee-objs += supp.o
+ optee-objs += shm_pool.o
+diff --git a/drivers/tee/optee/call.c b/drivers/tee/optee/call.c
+index 7a77e375b503..5357765d8ebc 100644
+--- a/drivers/tee/optee/call.c
++++ b/drivers/tee/optee/call.c
+@@ -101,8 +101,8 @@ static void optee_cq_wait_final(struct optee_call_queue *cq,
+ }
+ 
+ /* Requires the filpstate mutex to be held */
+-static struct optee_session *find_session(struct optee_context_data *ctxdata,
+-					  u32 session_id)
++struct optee_session *optee_find_session(struct optee_context_data *ctxdata,
++					 u32 session_id)
+ {
+ 	struct optee_session *sess;
+ 
+@@ -116,6 +116,7 @@ static struct optee_session *find_session(struct optee_context_data *ctxdata,
+ /**
+  * optee_do_call_with_arg() - Do an SMC to OP-TEE in secure world
+  * @ctx:	calling context
++ * @session_id:	calling session ID, if any
+  * @parg:	physical address of message to pass to secure world
+  *
+  * Does and SMC to OP-TEE in secure world and handles eventual resulting
+@@ -123,12 +124,12 @@ static struct optee_session *find_session(struct optee_context_data *ctxdata,
+  *
+  * Returns return code from secure world, 0 is OK
+  */
+-u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
++u32 optee_do_call_with_arg(struct tee_context *ctx, u32 session_id, phys_addr_t parg)
+ {
+ 	struct optee *optee = tee_get_drvdata(ctx->teedev);
+ 	struct optee_call_waiter w;
+ 	struct optee_rpc_param param = { };
+-	struct optee_call_ctx call_ctx = { };
++	struct optee_call_ctx call_ctx = { .session_id = session_id };
+ 	u32 ret;
+ 
+ 	param.a0 = OPTEE_SMC_CALL_WITH_ARG;
+@@ -251,7 +252,7 @@ int optee_open_session(struct tee_context *ctx,
+ 		goto out;
+ 	}
+ 
+-	if (optee_do_call_with_arg(ctx, msg_parg)) {
++	if (optee_do_call_with_arg(ctx, OPTEE_INVALID_SESSION_ID, msg_parg)) {
+ 		msg_arg->ret = TEEC_ERROR_COMMUNICATION;
+ 		msg_arg->ret_origin = TEEC_ORIGIN_COMMS;
+ 	}
+@@ -259,6 +260,7 @@ int optee_open_session(struct tee_context *ctx,
+ 	if (msg_arg->ret == TEEC_SUCCESS) {
+ 		/* A new session has been created, add it to the list. */
+ 		sess->session_id = msg_arg->session;
++		optee_grpc_init(&sess->grpc);
+ 		mutex_lock(&ctxdata->mutex);
+ 		list_add(&sess->list_node, &ctxdata->sess_list);
+ 		mutex_unlock(&ctxdata->mutex);
+@@ -292,9 +294,11 @@ int optee_close_session(struct tee_context *ctx, u32 session)
+ 
+ 	/* Check that the session is valid and remove it from the list */
+ 	mutex_lock(&ctxdata->mutex);
+-	sess = find_session(ctxdata, session);
+-	if (sess)
++	sess = optee_find_session(ctxdata, session);
++	if (sess) {
++		optee_grpc_uninit(&sess->grpc);
+ 		list_del(&sess->list_node);
++	}
+ 	mutex_unlock(&ctxdata->mutex);
+ 	if (!sess)
+ 		return -EINVAL;
+@@ -306,7 +310,7 @@ int optee_close_session(struct tee_context *ctx, u32 session)
+ 
+ 	msg_arg->cmd = OPTEE_MSG_CMD_CLOSE_SESSION;
+ 	msg_arg->session = session;
+-	optee_do_call_with_arg(ctx, msg_parg);
++	optee_do_call_with_arg(ctx, session, msg_parg);
+ 
+ 	tee_shm_free(shm);
+ 	return 0;
+@@ -324,7 +328,7 @@ int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
+ 
+ 	/* Check that the session is valid */
+ 	mutex_lock(&ctxdata->mutex);
+-	sess = find_session(ctxdata, arg->session);
++	sess = optee_find_session(ctxdata, arg->session);
+ 	mutex_unlock(&ctxdata->mutex);
+ 	if (!sess)
+ 		return -EINVAL;
+@@ -341,7 +345,7 @@ int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
+ 	if (rc)
+ 		goto out;
+ 
+-	if (optee_do_call_with_arg(ctx, msg_parg)) {
++	if (optee_do_call_with_arg(ctx, arg->session, msg_parg)) {
+ 		msg_arg->ret = TEEC_ERROR_COMMUNICATION;
+ 		msg_arg->ret_origin = TEEC_ORIGIN_COMMS;
+ 	}
+@@ -368,7 +372,7 @@ int optee_cancel_req(struct tee_context *ctx, u32 cancel_id, u32 session)
+ 
+ 	/* Check that the session is valid */
+ 	mutex_lock(&ctxdata->mutex);
+-	sess = find_session(ctxdata, session);
++	sess = optee_find_session(ctxdata, session);
+ 	mutex_unlock(&ctxdata->mutex);
+ 	if (!sess)
+ 		return -EINVAL;
+@@ -380,7 +384,7 @@ int optee_cancel_req(struct tee_context *ctx, u32 cancel_id, u32 session)
+ 	msg_arg->cmd = OPTEE_MSG_CMD_CANCEL;
+ 	msg_arg->session = session;
+ 	msg_arg->cancel_id = cancel_id;
+-	optee_do_call_with_arg(ctx, msg_parg);
++	optee_do_call_with_arg(ctx, session, msg_parg);
+ 
+ 	tee_shm_free(shm);
+ 	return 0;
+@@ -617,7 +621,7 @@ int optee_shm_register(struct tee_context *ctx, struct tee_shm *shm,
+ 	msg_arg->params->u.tmem.buf_ptr = virt_to_phys(pages_list) |
+ 	  (tee_shm_get_page_offset(shm) & (OPTEE_MSG_NONCONTIG_PAGE_SIZE - 1));
+ 
+-	if (optee_do_call_with_arg(ctx, msg_parg) ||
++	if (optee_do_call_with_arg(ctx, OPTEE_INVALID_SESSION_ID, msg_parg) ||
+ 	    msg_arg->ret != TEEC_SUCCESS)
+ 		rc = -EINVAL;
+ 
+@@ -643,7 +647,7 @@ int optee_shm_unregister(struct tee_context *ctx, struct tee_shm *shm)
+ 	msg_arg->params[0].attr = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT;
+ 	msg_arg->params[0].u.rmem.shm_ref = (unsigned long)shm;
+ 
+-	if (optee_do_call_with_arg(ctx, msg_parg) ||
++	if (optee_do_call_with_arg(ctx, OPTEE_INVALID_SESSION_ID, msg_parg) ||
+ 	    msg_arg->ret != TEEC_SUCCESS)
+ 		rc = -EINVAL;
+ 	tee_shm_free(shm_arg);
+diff --git a/drivers/tee/optee/core.c b/drivers/tee/optee/core.c
+index 319a1e701163..da76cac14269 100644
+--- a/drivers/tee/optee/core.c
++++ b/drivers/tee/optee/core.c
+@@ -308,7 +308,7 @@ static void optee_release(struct tee_context *ctx)
+ 			memset(arg, 0, sizeof(*arg));
+ 			arg->cmd = OPTEE_MSG_CMD_CLOSE_SESSION;
+ 			arg->session = sess->session_id;
+-			optee_do_call_with_arg(ctx, parg);
++			optee_do_call_with_arg(ctx, OPTEE_INVALID_SESSION_ID, parg);
+ 		}
+ 		kfree(sess);
+ 	}
+@@ -336,6 +336,8 @@ static const struct tee_driver_ops optee_ops = {
+ 	.close_session = optee_close_session,
+ 	.invoke_func = optee_invoke_func,
+ 	.cancel_req = optee_cancel_req,
++	.grpc_recv = optee_grpc_recv,
++	.grpc_send = optee_grpc_send,
+ 	.shm_register = optee_shm_register,
+ 	.shm_unregister = optee_shm_unregister,
+ };
+diff --git a/drivers/tee/optee/grpc.c b/drivers/tee/optee/grpc.c
+new file mode 100644
+index 000000000000..3041a3514b7a
+--- /dev/null
++++ b/drivers/tee/optee/grpc.c
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2019, Microsoft Corporation
++ */
++#include <linux/slab.h>
++#include "optee_private.h"
++
++struct optee_grpc_req {
++	struct list_head link;
++
++	u32 func;
++	u32 session_id;
++	u32 ret;
++	size_t num_params;
++	struct tee_param *param;
++
++	struct completion c;
++};
++
++void optee_grpc_init(struct optee_grpc *grpc)
++{
++	memset(grpc, 0, sizeof(*grpc));
++	mutex_init(&grpc->mutex);
++	init_completion(&grpc->reqs_c);
++	idr_init(&grpc->idr);
++	INIT_LIST_HEAD(&grpc->reqs);
++	grpc->req_id = -1;
++	grpc->closed = 0;
++}
++
++void optee_grpc_uninit(struct optee_grpc *grpc)
++{
++	int id;
++	struct optee_grpc_req *req;
++	struct optee_grpc_req *req_tmp;
++
++	mutex_lock(&grpc->mutex);
++
++	idr_for_each_entry(&grpc->idr, req, id) {
++		idr_remove(&grpc->idr, id);
++		req->ret = TEEC_ERROR_COMMUNICATION;
++		complete(&req->c);
++	}
++
++	list_for_each_entry_safe(req, req_tmp, &grpc->reqs, link) {
++		list_del(&req->link);
++		req->ret = TEEC_ERROR_COMMUNICATION;
++		complete(&req->c);
++	}
++
++	grpc->req_id = -1;
++	grpc->closed = 1;
++
++	mutex_unlock(&grpc->mutex);
++
++	complete(&grpc->reqs_c);
++
++	mutex_destroy(&grpc->mutex);
++	idr_destroy(&grpc->idr);
++}
++
++/**
++ * optee_grpc_thrd_req() - request service from host
++ * @sess:	session doing the request
++ * @func:	function requested
++ * @num_params:	number of elements in @param array
++ * @param:	parameters for function
++ *
++ * Returns result of operation to be passed to secure world
++ */
++u32 optee_grpc_thrd_req(struct optee_session *sess, u32 func, size_t num_params,
++                        struct tee_param *param)
++{
++	struct optee_grpc_req *req;
++	u32 ret;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return TEEC_ERROR_OUT_OF_MEMORY;
++
++	init_completion(&req->c);
++	req->func = func;
++	req->session_id = sess->session_id;
++	req->num_params = num_params;
++	req->param = param;
++
++	mutex_lock(&sess->grpc.mutex);
++	list_add_tail(&req->link, &sess->grpc.reqs);
++	mutex_unlock(&sess->grpc.mutex);
++
++	complete(&sess->grpc.reqs_c);
++
++	if (wait_for_completion_interruptible(&req->c))
++		req->ret = TEEC_ERROR_COMMUNICATION;
++
++	ret = req->ret;
++	kfree(req);
++
++	return ret;
++}
++
++static struct optee_grpc_req *grpc_pop_entry(struct optee_session *sess,
++					     u32 num_params, int *id)
++{
++	struct optee_grpc_req *req;
++
++	if (sess->grpc.req_id != -1)
++		return ERR_PTR(-EINVAL);
++	
++	if (list_empty(&sess->grpc.reqs))
++		return NULL;
++	
++	req = list_first_entry(&sess->grpc.reqs, struct optee_grpc_req, link);
++
++	if (num_params < req->num_params)
++		return ERR_PTR(-EINVAL);
++
++	*id = idr_alloc(&sess->grpc.idr, req, 1, 0, GFP_KERNEL);
++	if (*id < 0)
++		return ERR_PTR(-ENOMEM);
++	
++	list_del(&req->link);
++
++	return req;
++}
++
++/**
++ * optee_grpc_recv() - receive request for host
++ * @ctx:	context receiving the request
++ * @sess:	session receiving the request
++ * @func:	requested function in supplicant
++ * @num_params:	number of elements allocated in @param, updated with number
++ *		used elements
++ * @param:	space for parameters for @func
++ *
++ * Returns 0 on success or <0 on failure
++ */
++int optee_grpc_recv(struct tee_context *ctx, u32 session, u32 *func,
++		    u32 *num_params, struct tee_param *param)
++{
++	struct optee_context_data *ctxdata = ctx->data;
++	struct optee_session *sess;
++	struct optee_grpc_req *req;
++	int id;
++
++	mutex_lock(&ctxdata->mutex);
++	sess = optee_find_session(ctxdata, session);
++	mutex_unlock(&ctxdata->mutex);
++	if (!sess)
++		return -EINVAL;
++	
++	while (true) {
++		mutex_lock(&sess->grpc.mutex);
++		req = grpc_pop_entry(sess, *num_params, &id);
++		mutex_unlock(&sess->grpc.mutex);
++
++		if (req) {
++			if (IS_ERR(req))
++				return PTR_ERR(req);
++			break;
++		}
++
++		if (wait_for_completion_interruptible(&sess->grpc.reqs_c))
++			return -ERESTARTSYS;
++		
++		mutex_lock(&sess->grpc.mutex);
++		if (sess->grpc.closed)
++			id = -1;
++		mutex_unlock(&sess->grpc.mutex);
++
++		if (id == -1)
++			return -ECONNABORTED;
++	}
++
++	mutex_lock(&sess->grpc.mutex);
++	sess->grpc.req_id = id;
++	mutex_unlock(&sess->grpc.mutex);
++
++	*func = req->func;
++	*num_params = req->num_params;
++	memcpy(param, req->param,
++		   sizeof(struct tee_param) * req->num_params);
++
++	return 0;
++}
++
++static struct optee_grpc_req *grpc_pop_req(struct optee_session *sess,
++					   size_t num_params,
++					   struct tee_param *param)
++{
++	struct optee_grpc_req *req;
++
++	if (!num_params)
++		return ERR_PTR(-EINVAL);
++
++	if (sess->grpc.req_id == -1)
++		return ERR_PTR(-EINVAL);
++
++	req = idr_find(&sess->grpc.idr, sess->grpc.req_id);
++	if (!req)
++		return ERR_PTR(-EINVAL);
++
++	if (req->num_params != num_params)
++		return ERR_PTR(-EINVAL);
++
++	idr_remove(&sess->grpc.idr, sess->grpc.req_id);
++	sess->grpc.req_id = -1;
++
++	return req;
++}
++
++/**
++ * optee_grpc_send() - send result of request from host
++ * @ctx:	context sending result
++ * @sess:	session sending result
++ * @ret:	return value of request
++ * @num_params:	number of parameters returned
++ * @param:	returned parameters
++ *
++ * Returns 0 on success or <0 on failure.
++ */
++int optee_grpc_send(struct tee_context *ctx, u32 session, u32 ret,
++		    u32 num_params, struct tee_param *param)
++{
++	struct optee_context_data *ctxdata = ctx->data;
++	struct optee_session *sess;
++	struct optee_grpc_req *req;
++	size_t n;
++
++	mutex_lock(&ctxdata->mutex);
++	sess = optee_find_session(ctxdata, session);
++	mutex_unlock(&ctxdata->mutex);
++	if (!sess)
++		return -EINVAL;
++
++	mutex_lock(&sess->grpc.mutex);
++	req = grpc_pop_req(sess, num_params, param);
++	mutex_unlock(&sess->grpc.mutex);
++
++	if (IS_ERR(req))
++		return PTR_ERR(req);
++
++	for (n = 0; n < req->num_params; n++) {
++		struct tee_param *p = req->param + n;
++
++		switch (p->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK) {
++		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
++			p->attr = TEE_IOCTL_PARAM_ATTR_TYPE_NONE;
++			break;
++		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
++		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
++			p->u.value.a = param[n].u.value.a;
++			p->u.value.b = param[n].u.value.b;
++			p->u.value.c = param[n].u.value.c;
++			break;
++		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT:
++			p->attr = TEE_IOCTL_PARAM_ATTR_TYPE_NONE;
++			break;
++		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
++		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
++			p->u.memref.size = param[n].u.memref.size;
++			break;
++		default:
++			break;
++		}
++	}
++	req->ret = ret;
++
++	complete(&req->c);
++
++	return 0;
++}
+diff --git a/drivers/tee/optee/optee_private.h b/drivers/tee/optee/optee_private.h
+index e25b216a14ef..3442bb836a48 100644
+--- a/drivers/tee/optee/optee_private.h
++++ b/drivers/tee/optee/optee_private.h
+@@ -14,6 +14,8 @@
+ 
+ #define OPTEE_MAX_ARG_SIZE	1024
+ 
++#define OPTEE_INVALID_SESSION_ID	0
++
+ /* Some Global Platform error codes used in this driver */
+ #define TEEC_SUCCESS			0x00000000
+ #define TEEC_ERROR_BAD_PARAMETERS	0xFFFF0006
+@@ -66,6 +68,27 @@ struct optee_supp {
+ 	struct completion reqs_c;
+ };
+ 
++/**
++ * struct optee_gen_rpc - generic RPC synchronization struct
++ * @mutex:		held while accessing the content of this struct
++ * @req_id:		current request id if host is doing synchronous
++ *			communication, else -1
++ * @reqs:		queued requests not yet retrieved by host
++ * @idr:		IDR holding all requests currently being processed
++ *			by host
++ * @reqs_c:		completion used by host when waiting for a
++ *			request to be queued
++ */
++struct optee_grpc {
++	struct mutex mutex;
++
++	int req_id;
++	struct list_head reqs;
++	struct idr idr;
++	struct completion reqs_c;
++	int closed;
++};
++
+ /**
+  * struct optee - main service struct
+  * @supp_teedev:	supplicant device
+@@ -101,6 +124,7 @@ struct optee {
+ struct optee_session {
+ 	struct list_head list_node;
+ 	u32 session_id;
++	struct optee_grpc grpc;
+ };
+ 
+ struct optee_context_data {
+@@ -122,6 +146,8 @@ struct optee_rpc_param {
+ 
+ /* Holds context that is preserved during one STD call */
+ struct optee_call_ctx {
++	u32 session_id;
++
+ 	/* information about pages list used in last allocation */
+ 	void *pages_list;
+ 	size_t num_entries;
+@@ -148,7 +174,18 @@ int optee_supp_recv(struct tee_context *ctx, u32 *func, u32 *num_params,
+ int optee_supp_send(struct tee_context *ctx, u32 ret, u32 num_params,
+ 		    struct tee_param *param);
+ 
+-u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg);
++u32 optee_grpc_thrd_req(struct optee_session *sess, u32 func, size_t num_params,
++			struct tee_param *param);
++
++int optee_grpc_recv(struct tee_context *ctx, u32 session, u32 *func, u32 *num_params,
++		    struct tee_param *param);
++int optee_grpc_send(struct tee_context *ctx, u32 session, u32 ret, u32 num_params,
++		    struct tee_param *param);
++
++void optee_grpc_init(struct optee_grpc *grpc);
++void optee_grpc_uninit(struct optee_grpc *grpc);
++
++u32 optee_do_call_with_arg(struct tee_context *ctx, u32 session_id, phys_addr_t parg);
+ int optee_open_session(struct tee_context *ctx,
+ 		       struct tee_ioctl_open_session_arg *arg,
+ 		       struct tee_param *param);
+@@ -184,6 +221,9 @@ void optee_fill_pages_list(u64 *dst, struct page **pages, int num_pages,
+ #define PTA_CMD_GET_DEVICES_SUPP	0x1
+ int optee_enumerate_devices(u32 func);
+ 
++struct optee_session *optee_find_session(struct optee_context_data *ctxdata,
++					 u32 session_id);
++
+ /*
+  * Small helpers
+  */
+diff --git a/drivers/tee/optee/optee_rpc_cmd.h b/drivers/tee/optee/optee_rpc_cmd.h
+index b8275140cef8..5824135f2314 100644
+--- a/drivers/tee/optee/optee_rpc_cmd.h
++++ b/drivers/tee/optee/optee_rpc_cmd.h
+@@ -68,6 +68,11 @@
+ #define OPTEE_RPC_SHM_TYPE_APPL		0
+ /* Memory only shared with non-secure kernel */
+ #define OPTEE_RPC_SHM_TYPE_KERNEL	1
++/*
++ * Memory shared with the non-secure user space application that owns the
++ * current session
++ */
++#define OPTEE_RPC_SHM_TYPE_HOST    3
+ 
+ /*
+  * Free shared memory previously allocated with OPTEE_RPC_CMD_SHM_ALLOC
+@@ -78,6 +83,36 @@
+  */
+ #define OPTEE_RPC_CMD_SHM_FREE		7
+ 
++/*
++ * To support Generic RPC requests, the upper four bits of the RPC command ID
++ * are reserved to pass the function ID that a TA requests a host application to
++ * execute on its behalf.
++ */
++#define OPTEE_RPC_CMD_GENERIC_CMD_ID_MASK   0xF0000000
++#define OPTEE_RPC_CMD_GENERIC_CMD_ID_SHIFT  (32 - 4)
++
++/*
++ * Request a generic service from the host application.
++ */
++#define OPTEE_RPC_CMD_GENERIC_EXECUTE       1
++
++/*
++ * Retrieve the Generic RPC command ID (i.e., what does the kernel have to do?)
++ */
++#define OPTEE_RPC_CMD_GENERIC_GET_CMD_ID(cmd) \
++	 ((cmd) >> OPTEE_RPC_CMD_GENERIC_CMD_ID_SHIFT)
++
++/*
++ * Retrieve the Generic RPC function ID (i.e., what does the host application
++ * have to do?)
++ */
++#define OPTEE_RPC_CMD_GENERIC_GET_FUNC_ID(cmd) \
++	 ((cmd) & ~OPTEE_RPC_CMD_GENERIC_CMD_ID_MASK)
++
++#define OPTEE_RPC_CMD_GENERIC_IS_EXECUTE(cmd) \
++	 OPTEE_RPC_CMD_GENERIC_GET_CMD_ID(cmd) == \
++		 OPTEE_RPC_CMD_GENERIC_EXECUTE
++
+ /*
+  * Issue master requests (read and write operations) to an I2C chip.
+  *
+diff --git a/drivers/tee/optee/rpc.c b/drivers/tee/optee/rpc.c
+index 1849180b0278..06576d670d61 100644
+--- a/drivers/tee/optee/rpc.c
++++ b/drivers/tee/optee/rpc.c
+@@ -284,12 +284,39 @@ static struct tee_shm *cmd_alloc_suppl(struct tee_context *ctx, size_t sz)
+ 	return shm;
+ }
+ 
++static struct tee_shm *cmd_alloc_host(struct tee_context *ctx, size_t sz,
++				      struct optee_session *session)
++{
++	u32 ret;
++	struct tee_param param;
++	struct optee *optee = tee_get_drvdata(ctx->teedev);
++	struct tee_shm *shm;
++
++	param.attr = TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT;
++	param.u.value.a = OPTEE_RPC_SHM_TYPE_HOST;
++	param.u.value.b = sz;
++	param.u.value.c = 0;
++
++	ret = optee_grpc_thrd_req(session, OPTEE_RPC_CMD_SHM_ALLOC, 1,
++		&param);
++	if (ret)
++		return ERR_PTR(-ENOMEM);
++
++	mutex_lock(&optee->supp.mutex);
++	/* Increases count as secure world doesn't have a reference */
++	shm = tee_shm_get_from_id(ctx, param.u.value.c);
++	mutex_unlock(&optee->supp.mutex);
++	return shm;
++}
++
+ static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
+ 					  struct optee_msg_arg *arg,
+ 					  struct optee_call_ctx *call_ctx)
+ {
+ 	phys_addr_t pa;
+ 	struct tee_shm *shm;
++	struct optee_context_data *ctxdata = ctx->data;
++	struct optee_session *sess;
+ 	size_t sz;
+ 	size_t n;
+ 
+@@ -313,6 +340,17 @@ static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
+ 	case OPTEE_RPC_SHM_TYPE_APPL:
+ 		shm = cmd_alloc_suppl(ctx, sz);
+ 		break;
++	case OPTEE_RPC_SHM_TYPE_HOST:
++		mutex_lock(&ctxdata->mutex);
++		sess = optee_find_session(ctxdata, call_ctx->session_id);
++		mutex_unlock(&ctxdata->mutex);
++		if (!sess) {
++			arg->ret = TEEC_ERROR_BAD_PARAMETERS;
++			return;
++		}
++
++		shm = cmd_alloc_host(ctx, sz, sess);
++		break;
+ 	case OPTEE_RPC_SHM_TYPE_KERNEL:
+ 		shm = tee_shm_alloc(ctx, sz, TEE_SHM_MAPPED);
+ 		break;
+@@ -405,10 +443,27 @@ static void cmd_free_suppl(struct tee_context *ctx, struct tee_shm *shm)
+ 	optee_supp_thrd_req(ctx, OPTEE_RPC_CMD_SHM_FREE, 1, &param);
+ }
+ 
++static void cmd_free_host(struct tee_shm *shm, struct optee_session *session)
++{
++	struct tee_param param;
++
++	param.attr = TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT;
++	param.u.value.a = OPTEE_RPC_SHM_TYPE_HOST;
++	param.u.value.b = tee_shm_get_id(shm);
++	param.u.value.c = 0;
++
++	tee_shm_put(shm);
++
++	optee_grpc_thrd_req(session, OPTEE_RPC_CMD_SHM_FREE, 1, &param);
++}
++
+ static void handle_rpc_func_cmd_shm_free(struct tee_context *ctx,
+-					 struct optee_msg_arg *arg)
++					 struct optee_msg_arg *arg,
++					 struct optee_call_ctx *call_ctx)
+ {
+ 	struct tee_shm *shm;
++	struct optee_context_data *ctxdata = ctx->data;
++	struct optee_session *sess;
+ 
+ 	arg->ret_origin = TEEC_ORIGIN_COMMS;
+ 
+@@ -423,6 +478,17 @@ static void handle_rpc_func_cmd_shm_free(struct tee_context *ctx,
+ 	case OPTEE_RPC_SHM_TYPE_APPL:
+ 		cmd_free_suppl(ctx, shm);
+ 		break;
++	case OPTEE_RPC_SHM_TYPE_HOST:
++		mutex_lock(&ctxdata->mutex);
++		sess = optee_find_session(ctxdata, call_ctx->session_id);
++		mutex_unlock(&ctxdata->mutex);
++		if (!sess) {
++			arg->ret = TEEC_ERROR_BAD_PARAMETERS;
++			return;
++		}
++
++		cmd_free_host(shm, sess);
++		break;
+ 	case OPTEE_RPC_SHM_TYPE_KERNEL:
+ 		tee_shm_free(shm);
+ 		break;
+@@ -432,6 +498,45 @@ static void handle_rpc_func_cmd_shm_free(struct tee_context *ctx,
+ 	arg->ret = TEEC_SUCCESS;
+ }
+ 
++static void handle_rpc_func_cmd_generic(struct tee_context *ctx,
++					struct optee_msg_arg *arg,
++					struct optee_call_ctx *call_ctx)
++{
++	struct optee_context_data *ctxdata = ctx->data;
++	struct optee_session *sess;
++	struct tee_param *params;
++
++	u32 func_id;
++
++	params = kmalloc_array(arg->num_params, sizeof(struct tee_param),
++			       GFP_KERNEL);
++	if (!params) {
++		arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
++		return;
++	}
++
++	if (optee_from_msg_param(params, arg->num_params, arg->params)) {
++		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
++		goto out;
++	}
++
++	mutex_lock(&ctxdata->mutex);
++	sess = optee_find_session(ctxdata, call_ctx->session_id);
++	mutex_unlock(&ctxdata->mutex);
++	if (!sess) {
++		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
++		goto out;
++	}
++
++	func_id = OPTEE_RPC_CMD_GENERIC_GET_FUNC_ID(arg->cmd);
++	arg->ret = optee_grpc_thrd_req(sess, func_id, arg->num_params, params);
++
++	if (optee_to_msg_param(arg->params, arg->num_params, params))
++		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
++out:
++	kfree(params);
++}
++
+ static void free_pages_list(struct optee_call_ctx *call_ctx)
+ {
+ 	if (call_ctx->pages_list) {
+@@ -459,6 +564,11 @@ static void handle_rpc_func_cmd(struct tee_context *ctx, struct optee *optee,
+ 		return;
+ 	}
+ 
++	if (OPTEE_RPC_CMD_GENERIC_IS_EXECUTE(arg->cmd)) {
++		handle_rpc_func_cmd_generic(ctx, arg, call_ctx);
++		return;
++	}
++
+ 	switch (arg->cmd) {
+ 	case OPTEE_RPC_CMD_GET_TIME:
+ 		handle_rpc_func_cmd_get_time(arg);
+@@ -474,7 +584,7 @@ static void handle_rpc_func_cmd(struct tee_context *ctx, struct optee *optee,
+ 		handle_rpc_func_cmd_shm_alloc(ctx, arg, call_ctx);
+ 		break;
+ 	case OPTEE_RPC_CMD_SHM_FREE:
+-		handle_rpc_func_cmd_shm_free(ctx, arg);
++		handle_rpc_func_cmd_shm_free(ctx, arg, call_ctx);
+ 		break;
+ 	case OPTEE_RPC_CMD_I2C_TRANSFER:
+ 		handle_rpc_func_cmd_i2c_transfer(ctx, arg);
+diff --git a/drivers/tee/tee_core.c b/drivers/tee/tee_core.c
+index 480d294a23ab..62715c595412 100644
+--- a/drivers/tee/tee_core.c
++++ b/drivers/tee/tee_core.c
+@@ -813,6 +813,105 @@ static int tee_ioctl_supp_send(struct tee_context *ctx,
+ 	return rc;
+ }
+ 
++int tee_ioctl_grpc_recv(struct tee_context *ctx,
++			struct tee_ioctl_buf_data __user *ubuf)
++{
++	int rc;
++	struct tee_ioctl_buf_data buf;
++	struct tee_ioctl_grpc_recv_arg __user *uarg;
++	struct tee_param *params;
++	u32 session;
++	u32 func;
++	u32 num_params;
++
++	if (!ctx->teedev->desc->ops->grpc_recv)
++		return -EINVAL;
++
++	if (copy_from_user(&buf, ubuf, sizeof(buf)))
++		return -EFAULT;
++	
++	if (buf.buf_len > TEE_MAX_ARG_SIZE ||
++		buf.buf_len < sizeof(struct tee_ioctl_grpc_recv_arg))
++		return -EINVAL;
++	
++	uarg = u64_to_user_ptr(buf.buf_ptr);
++	if (get_user(num_params, &uarg->num_params) ||
++		get_user(session, &uarg->session))
++		return -EFAULT;
++	
++	if (sizeof(*uarg) + TEE_IOCTL_PARAM_SIZE(num_params) != buf.buf_len)
++		return -EINVAL;
++	
++	params = kcalloc(num_params, sizeof(struct tee_param), GFP_KERNEL);
++	if (!params)
++		return -ENOMEM;
++	
++	rc = params_from_user(ctx, params, num_params, uarg->params);
++	if (rc)
++		goto out;
++
++	rc = ctx->teedev->desc->ops->grpc_recv(ctx, session, &func, &num_params, params);
++	if (rc)
++		goto out;
++	
++	if (put_user(func, &uarg->func) ||
++	    put_user(num_params, &uarg->num_params)) {
++		rc = -EFAULT;
++		goto out;
++	}
++
++	rc = params_to_supp(ctx, uarg->params, num_params, params);
++out:
++	kfree(params);
++	return rc;
++}
++
++int tee_ioctl_grpc_send(struct tee_context *ctx,
++			       struct tee_ioctl_buf_data __user *ubuf)
++{
++	int rc;
++	struct tee_ioctl_buf_data buf;
++	struct tee_ioctl_grpc_send_arg __user *uarg;
++	struct tee_ioctl_param __user *uparams = NULL;
++	struct tee_param *params = NULL;
++	u32 session;
++	u32 ret;
++	u32 num_params;
++	
++	if (!ctx->teedev->desc->ops->grpc_recv)
++		return -EINVAL;
++
++	if (copy_from_user(&buf, ubuf, sizeof(buf)))
++		return -EFAULT;
++	
++	if (buf.buf_len > TEE_MAX_ARG_SIZE ||
++		buf.buf_len < sizeof(struct tee_ioctl_grpc_send_arg))
++		return -EINVAL;
++	
++	uarg = u64_to_user_ptr(buf.buf_ptr);
++	if (get_user(session, &uarg->session) ||
++	    get_user(ret, &uarg->ret) ||
++	    get_user(num_params, &uarg->num_params))
++		return -EFAULT;	
++	
++	if (sizeof(*uarg) + TEE_IOCTL_PARAM_SIZE(num_params) != buf.buf_len)
++		return -EINVAL;
++	
++	params = kcalloc(num_params, sizeof(struct tee_param), GFP_KERNEL);
++	if (!params)
++		return -ENOMEM;
++
++	uparams = uarg->params;
++	rc = params_from_supp(params, num_params, uarg->params);
++	if (rc)
++		goto out;
++
++	rc = ctx->teedev->desc->ops->grpc_send(ctx, session, ret, num_params, params);
++out:
++	kfree(params);
++	return rc;
++}
++
+ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct tee_context *ctx = filp->private_data;
+@@ -837,6 +936,10 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		return tee_ioctl_supp_recv(ctx, uarg);
+ 	case TEE_IOC_SUPPL_SEND:
+ 		return tee_ioctl_supp_send(ctx, uarg);
++	case TEE_IOC_GRPC_RECV:
++		return tee_ioctl_grpc_recv(ctx, uarg);
++	case TEE_IOC_GRPC_SEND:
++		return tee_ioctl_grpc_send(ctx, uarg);
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
+index 54269e47ac9a..a5f68a922bcc 100644
+--- a/include/linux/tee_drv.h
++++ b/include/linux/tee_drv.h
+@@ -90,6 +90,8 @@ struct tee_param {
+  * @cancel_req:		request cancel of an ongoing invoke or open
+  * @supp_recv:		called for supplicant to get a command
+  * @supp_send:		called for supplicant to send a response
++ * @grpc_recv:		called for a host application to get a command
++ * @grpc_send:		called for a host application to send a response
+  * @shm_register:	register shared memory buffer in TEE
+  * @shm_unregister:	unregister shared memory buffer in TEE
+  */
+@@ -110,6 +112,10 @@ struct tee_driver_ops {
+ 			 struct tee_param *param);
+ 	int (*supp_send)(struct tee_context *ctx, u32 ret, u32 num_params,
+ 			 struct tee_param *param);
++	int (*grpc_recv)(struct tee_context *ctx, u32 session, u32 *func, u32 *num_params,
++			 struct tee_param *param);
++	int (*grpc_send)(struct tee_context *ctx, u32 session, u32 ret, u32 num_params,
++			 struct tee_param *param);
+ 	int (*shm_register)(struct tee_context *ctx, struct tee_shm *shm,
+ 			    struct page **pages, size_t num_pages,
+ 			    unsigned long start);
+diff --git a/include/uapi/linux/tee.h b/include/uapi/linux/tee.h
+index 25a6c534beb1..b13728d1551b 100644
+--- a/include/uapi/linux/tee.h
++++ b/include/uapi/linux/tee.h
+@@ -392,6 +392,58 @@ struct tee_ioctl_shm_register_data {
+  */
+ #define TEE_IOC_SHM_REGISTER   _IOWR(TEE_IOC_MAGIC, TEE_IOC_BASE + 9, \
+ 				     struct tee_ioctl_shm_register_data)
++
++/**
++ * struct tee_ioctl_grpc_recv_arg - Receive a request for a generic RPC function
++ * @func:	[in] generic RPC function
++ * @session:	[in] session ID
++ * @num_params	[in/out] number of parameters following this struct
++ *
++ * @num_params is the number of params that host application has room to
++ * receive when input, @num_params is the number of actual params
++ * host application receives when output.
++ */
++struct tee_ioctl_grpc_recv_arg {
++	__u32 func;
++	__u32 session;
++	__u32 num_params;
++	
++	/* num_params tells the actual number of element in params */
++	struct tee_ioctl_param params[];
++};
++
++/**
++ * TEE_IOC_GRPC_RECV - Receive a request for a generic RPC function
++ *
++ * Takes a struct tee_ioctl_buf_data which contains a struct
++ * tee_ioctl_grpc_recv_arg followed by any array of struct tee_param
++ */
++#define TEE_IOC_GRPC_RECV	_IOR(TEE_IOC_MAGIC, TEE_IOC_BASE + 10, \
++				     struct tee_ioctl_buf_data)
++
++/**
++ * struct tee_ioctl_grpc_send_arg - Send a response to a received request
++ * @ret:	[out] return value
++ * @session:	[in] session ID
++ * @num_params	[in] number of parameters following this struct
++ */
++struct tee_ioctl_grpc_send_arg {
++	__u32 ret;
++	__u32 session;
++	__u32 num_params;
++
++	/* num_params tells the actual number of element in params */
++	struct tee_ioctl_param params[];
++};
++
++/**
++ * TEE_IOC_GRPC_SEND - Receive a request for a generic RPC function
++ *
++ * Takes a struct tee_ioctl_buf_data which contains a struct
++ * tee_ioctl_grpc_send_arg followed by any array of struct tee_param
++ */
++#define TEE_IOC_GRPC_SEND	_IOR(TEE_IOC_MAGIC, TEE_IOC_BASE + 11, \
++				     struct tee_ioctl_buf_data)
+ /*
+  * Five syscalls are used when communicating with the TEE driver.
+  * open(): opens the device associated with the driver
+-- 
+2.27.0
+

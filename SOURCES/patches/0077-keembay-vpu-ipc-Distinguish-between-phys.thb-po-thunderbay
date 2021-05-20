@@ -1,0 +1,216 @@
+From d60e32403040aa0a558788e580c2c170055a833b Mon Sep 17 00:00:00 2001
+From: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+Date: Mon, 21 Oct 2019 16:54:38 +0100
+Subject: [PATCH 077/223] keembay-vpu-ipc: Distinguish between physical and VPU
+ addresses
+
+Current code assumes that VPU and physical addresses matches (i.e., VPU
+address space is mapped 1:1 to CPU physical address space). This is not
+always true, so update the code to distinguish between the two.
+
+Signed-off-by: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+---
+ drivers/firmware/keembay-vpu-ipc.c | 98 +++++++++++++++++++++---------
+ 1 file changed, 70 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/firmware/keembay-vpu-ipc.c b/drivers/firmware/keembay-vpu-ipc.c
+index 70f3c7b5ebcf..06990889c328 100644
+--- a/drivers/firmware/keembay-vpu-ipc.c
++++ b/drivers/firmware/keembay-vpu-ipc.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
++#include <linux/dma-direct.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/firmware.h>
+ #include <linux/interrupt.h>
+@@ -158,17 +159,38 @@ struct firmware_header {
+ 	uint64_t configuration_data_load_address;
+ } __packed;
+ 
++
++/**
++ * struct vpu_mem - Information about reserved memory shared with VPU.
++ * @vaddr:	The virtual address of the memory region.
++ * @paddr:	The (CPU) physical address of the memory region.
++ * @vpu_adr:	The VPU address of the memory region.
++ * @size:	The size of the memory region.
++ */
+ struct vpu_mem {
+-	void *vaddr; /* The virtual address of the memory region. */
+-	dma_addr_t dma_handle; /* The physical address of the memory region. */
+-	size_t size; /* The size of the memory region. */
++	void *vaddr;
++	phys_addr_t paddr;
++	dma_addr_t vpu_addr;
++	size_t size;
++};
++
++/**
++ * struct vpu_mem - Information about reserved memory shared with ATF.
++ * @vaddr:	The virtual address of the memory region.
++ * @paddr:	The physical address of the memory region.
++ * @size:	The size of the memory region.
++ */
++struct atf_mem {
++	void *vaddr;
++	phys_addr_t paddr;
++	size_t size;
+ };
+ 
+ struct vpu_ipc_dev {
+ 	struct platform_device *pdev;
+ 	enum intel_keembay_vpu_state state;
+ 	struct vpu_mem reserved_mem;
+-	struct vpu_mem x509_mem;
++	struct atf_mem x509_mem;
+ 	struct vpu_mem mss_ipc_mem;
+ 	uint64_t boot_vec_paddr;
+ 	struct boot_parameters *boot_params;
+@@ -362,6 +384,7 @@ static resource_size_t get_reserved_mem_size(struct device *dev,
+ static int setup_vpu_fw_region(struct vpu_ipc_dev *vpu_dev)
+ {
+ 	struct device *dev = &vpu_dev->pdev->dev;
++	struct vpu_mem *rsvd_mem = &vpu_dev->reserved_mem;
+ 	int rc;
+ 
+ 	rc = of_reserved_mem_device_init(dev);
+@@ -370,26 +393,40 @@ static int setup_vpu_fw_region(struct vpu_ipc_dev *vpu_dev)
+ 		return rc;
+ 	}
+ 
+-	vpu_dev->reserved_mem.size =
+-		get_reserved_mem_size(dev, VPU_IPC_FW_AREA_IDX);
+-	if (vpu_dev->reserved_mem.size == 0) {
++	rsvd_mem->size = get_reserved_mem_size(dev, VPU_IPC_FW_AREA_IDX);
++	if (rsvd_mem->size == 0) {
+ 		dev_err(dev, "Couldn't get size of reserved memory region.\n");
+ 		rc = -ENODEV;
+ 		goto setup_vpu_fw_fail;
+ 	}
+ 
+-	vpu_dev->reserved_mem.vaddr =
+-		dmam_alloc_coherent(dev, vpu_dev->reserved_mem.size,
+-				    &vpu_dev->reserved_mem.dma_handle,
+-				    GFP_KERNEL);
+-	if (!vpu_dev->reserved_mem.vaddr) {
++	rsvd_mem->vaddr = dmam_alloc_coherent(dev, rsvd_mem->size,
++					      &rsvd_mem->vpu_addr, GFP_KERNEL);
++	/*
++	 * Fix up DMA handle value.
++	 *
++	 * dma_alloc_coherent() does not take into account the address
++	 * translation described by the dma-ranges properties in the device
++	 * tree; this seems to be a bug of the Linux kernel:
++	 * https://lists.linuxfoundation.org/pipermail/iommu/2019-October/039417.html
++	 *
++	 * As a workaround, we fix the DMA handle manually, by subtracting the
++	 * device DMA offset.
++	 *
++	 * TODO: remove this once/if the DMA kernel code is fixed.
++	 */
++	rsvd_mem->vpu_addr -= dev->dma_pfn_offset << PAGE_SHIFT;
++	/* Get the physical address of the reserved memory region. */
++	rsvd_mem->paddr = dma_to_phys(dev, vpu_dev->reserved_mem.vpu_addr);
++
++	if (!rsvd_mem->vaddr) {
+ 		dev_err(dev, "Failed to allocate memory for firmware.\n");
+ 		rc = -ENOMEM;
+ 		goto setup_vpu_fw_fail;
+ 	}
+ 
+-	dev_info(dev, "Memory region (firmware): paddr 0x%pad size 0x%zX\n",
+-		 &vpu_dev->reserved_mem.dma_handle, vpu_dev->reserved_mem.size);
++	dev_info(dev, "Memory region (firmware): vpu_addr 0x%pad size 0x%zX\n",
++		 &rsvd_mem->vpu_addr, rsvd_mem->size);
+ 
+ 	return 0;
+ 
+@@ -430,11 +467,11 @@ static int setup_x509_region(struct vpu_ipc_dev *vpu_dev)
+ 		return -EADDRNOTAVAIL;
+ 	}
+ 
+-	vpu_dev->x509_mem.dma_handle = res.start;
++	vpu_dev->x509_mem.paddr = res.start;
+ 	vpu_dev->x509_mem.size = resource_size(&res);
+ 
+ 	dev_info(dev, "Memory region (X509) paddr 0x%pad size 0x%zX\n",
+-		 &vpu_dev->x509_mem.dma_handle, vpu_dev->x509_mem.size);
++		 &vpu_dev->x509_mem.paddr, vpu_dev->x509_mem.size);
+ 
+ 	return 0;
+ }
+@@ -460,11 +497,14 @@ static int setup_mss_ipc_region(struct vpu_ipc_dev *vpu_dev)
+ 	}
+ 	of_node_put(node);
+ 
+-	vpu_dev->mss_ipc_mem.dma_handle = res.start;
++	vpu_dev->mss_ipc_mem.paddr = res.start;
++	vpu_dev->mss_ipc_mem.vpu_addr = phys_to_dma(dev, res.start);
+ 	vpu_dev->mss_ipc_mem.size = resource_size(&res);
+ 
+-	dev_info(dev, "Memory region (MSS IPC) paddr 0x%pad size 0x%zX\n",
+-		 &vpu_dev->mss_ipc_mem.dma_handle, vpu_dev->mss_ipc_mem.size);
++	dev_info(dev,
++		 "Memory region (MSS IPC) vpu_addr %pad paddr %pa size 0x%zX\n",
++		 &vpu_dev->mss_ipc_mem.vpu_addr, &vpu_dev->mss_ipc_mem.paddr,
++		 vpu_dev->mss_ipc_mem.size);
+ 
+ 	return 0;
+ }
+@@ -668,7 +708,7 @@ static int setup_boot_parameters(struct vpu_ipc_dev *vpu_dev)
+ 
+ 	/* Fill in IPC buffer information */
+ 	vpu_dev->boot_params->mss_ipc_header_address =
+-		vpu_dev->mss_ipc_mem.dma_handle;
++		vpu_dev->mss_ipc_mem.vpu_addr;
+ 	vpu_dev->boot_params->mss_ipc_header_area_size =
+ 		vpu_dev->mss_ipc_mem.size;
+ 
+@@ -698,12 +738,14 @@ static int request_vpu_boot(struct vpu_ipc_dev *vpu_dev)
+ 	 * 5. Entry point for VPU
+ 	 * 6. X509 certificate location
+ 	 * 7. IMR driver number
++	 *
++	 * FIXME: fw_res addresses are VPU addresses; convert them to CPU
++	 * physical addresses.
+ 	 */
+-	arm_smccc_smc(function_id, vpu_dev->reserved_mem.dma_handle,
++	arm_smccc_smc(function_id, vpu_dev->reserved_mem.paddr,
+ 		      vpu_dev->reserved_mem.size, vpu_dev->fw_res.start,
+-		      vpu_dev->fw_res.end - vpu_dev->fw_res.start,
+-		      vpu_dev->boot_vec_paddr, vpu_dev->x509_mem.dma_handle,
+-		      vpu_dev->imr, &res);
++		      resource_size(&vpu_dev->fw_res), vpu_dev->boot_vec_paddr,
++		      vpu_dev->x509_mem.paddr, vpu_dev->imr, &res);
+ 
+ 	if (res.a0) {
+ 		dev_info(&vpu_dev->pdev->dev, "Boot failed: 0x%lx.\n", res.a0);
+@@ -763,10 +805,10 @@ static void *get_vpu_dev_vaddr(struct vpu_ipc_dev *vpu_dev,
+ 	unsigned long offset = 0;
+ 
+ 	/* Given the calculation below, this must not be true. */
+-	if (res->start < vpu_dev->reserved_mem.dma_handle)
++	if (res->start < vpu_dev->reserved_mem.vpu_addr)
+ 		return NULL;
+ 
+-	offset = res->start - vpu_dev->reserved_mem.dma_handle;
++	offset = res->start - vpu_dev->reserved_mem.vpu_addr;
+ 
+ 	return vpu_dev->reserved_mem.vaddr + offset;
+ }
+@@ -855,8 +897,8 @@ static int parse_fw_header(struct vpu_ipc_dev *vpu_dev,
+ 	 * Generate the resource describing the region of memory
+ 	 * completely dedicated to the VPU.
+ 	 */
+-	total_reserved_res.start = vpu_dev->reserved_mem.dma_handle;
+-	total_reserved_res.end = vpu_dev->reserved_mem.dma_handle +
++	total_reserved_res.start = vpu_dev->reserved_mem.vpu_addr;
++	total_reserved_res.end = vpu_dev->reserved_mem.vpu_addr +
+ 		vpu_dev->reserved_mem.size - 1;
+ 	total_reserved_res.flags = IORESOURCE_MEM;
+ 
+-- 
+2.27.0
+

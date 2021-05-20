@@ -1,0 +1,500 @@
+From 015520cab5fabc5044ea9e8754cad3fa654e59e4 Mon Sep 17 00:00:00 2001
+From: Sreedhar Kundella <sreedhar.kundella@intel.com>
+Date: Tue, 9 Feb 2021 12:08:50 +0530
+Subject: [PATCH 223/223] THB:DDR Profiling Kernel Module.
+
+DDR BW Profiling Kernel Module
+Changes.
+
+Signed-off-by: Sreedhar Kundella <sreedhar.kundella@intel.com>
+Signed-off-by: Thekkade, Akshatha <akshatha.thekkade@intel.com>
+Signed-off-by: Sreedhar Kundella <sreedhar.kundella@intel.com>
+---
+ drivers/misc/Kconfig             |   1 +
+ drivers/misc/Makefile            |   1 +
+ drivers/misc/ddr_prof/Kconfig    |   4 +
+ drivers/misc/ddr_prof/Makefile   |   4 +
+ drivers/misc/ddr_prof/ddr_prof.c | 393 +++++++++++++++++++++++++++++++
+ drivers/misc/ddr_prof/ddr_prof.h |  29 +++
+ 6 files changed, 432 insertions(+)
+ create mode 100644 drivers/misc/ddr_prof/Kconfig
+ create mode 100644 drivers/misc/ddr_prof/Makefile
+ create mode 100644 drivers/misc/ddr_prof/ddr_prof.c
+ create mode 100644 drivers/misc/ddr_prof/ddr_prof.h
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 5d44051a15a5..d1cc077166ab 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -485,4 +485,5 @@ source "drivers/misc/xlink-core/Kconfig"
+ source "drivers/misc/xlink-ipc/Kconfig"
+ source "drivers/misc/xlink-secure/Kconfig"
+ source "drivers/misc/xlink-net/Kconfig"
++source "drivers/misc/ddr_prof/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 79a73dcd12ba..01ee12e9d45f 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -70,3 +70,4 @@ obj-$(CONFIG_XLINK_CORE)        += xlink-core/
+ obj-$(CONFIG_XLINK_IPC)		+= xlink-ipc/
+ obj-$(CONFIG_XLINK_SECURE)      += xlink-secure/
+ obj-$(CONFIG_XLINK_NET)		+= xlink-net/
++obj-$(CONFIG_DDR_PROF)		+= ddr_prof/
+diff --git a/drivers/misc/ddr_prof/Kconfig b/drivers/misc/ddr_prof/Kconfig
+new file mode 100644
+index 000000000000..6b434ee0ecb5
+--- /dev/null
++++ b/drivers/misc/ddr_prof/Kconfig
+@@ -0,0 +1,4 @@
++config DDR_PROF
++	tristate "Support for DDR PROFILING"
++	help
++	  DDR_PROF enables measuring of DDR memory bandwidth.
+diff --git a/drivers/misc/ddr_prof/Makefile b/drivers/misc/ddr_prof/Makefile
+new file mode 100644
+index 000000000000..74aa890f4864
+--- /dev/null
++++ b/drivers/misc/ddr_prof/Makefile
+@@ -0,0 +1,4 @@
++#
++# Makefile for DDR Profiling Linux Driver
++#
++obj-$(CONFIG_DDR_PROF) += ddr_prof.o
+diff --git a/drivers/misc/ddr_prof/ddr_prof.c b/drivers/misc/ddr_prof/ddr_prof.c
+new file mode 100644
+index 000000000000..e74145a0ca92
+--- /dev/null
++++ b/drivers/misc/ddr_prof/ddr_prof.c
+@@ -0,0 +1,393 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * DDR Bandwidth Profiling driver.
++ *
++ * Copyright (C) 2021 Intel Corporation
++ *
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/kobject.h>
++#include <linux/sysfs.h>
++#include <linux/string.h>
++#include <linux/jiffies.h>
++#include <linux/timer.h>
++#include <linux/io.h>
++#include "ddr_prof.h"
++
++#define NUM_SLICES	  4
++#define DRV_NAME	  "ddr_prof"
++#define DDR_PROF_STAT_LEN 32
++
++static dev_t ddr_no;
++
++struct ddrprof_dev {
++	struct platform_device *pdev;
++};
++
++static struct kobject *ddrprof_kobject;
++
++void __iomem *reg[NUM_SLICES];
++
++static u64 ddr_trans[NUM_SLICES];
++
++static u64 tot_trans;
++static u64 bw_trans;
++static u64 first_trans;
++
++static struct timer_list my_timer;
++static struct timer_list sys_timer;
++
++static unsigned long control;
++static char *ddr_str = NULL;
++static unsigned long capture_time;
++static unsigned long time_msec;
++static unsigned long show_time;
++static unsigned long start_cmd;
++
++void ddrprof_release(struct device *dev) { return; }
++
++/* Read Total Memory Bandwidth */
++static void ddrprof_read_count(struct timer_list *timer)
++{
++	int i;
++
++	for (i = 0; i < NUM_SLICES; i++) {
++		ddr_trans[i] = (readl(reg[i] + DDRSS_MEM0_MCA_SUB_STAT_OFFSET) +
++				readl(reg[i] + DDRSS_MEM0_MCB_SUB_STAT_OFFSET) +
++				readl(reg[i] + DDRSS_MEM0_MCC_SUB_STAT_OFFSET) +
++				readl(reg[i] + DDRSS_MEM0_MCD_SUB_STAT_OFFSET));
++	}
++
++	tot_trans = ddr_trans[0] + ddr_trans[1] + ddr_trans[2] + ddr_trans[3];
++
++	/* Each bit change in Memory Glue Register corresponds to 32 bytes
++	 * Read/Write request sent to DDR */
++	tot_trans = tot_trans * 32;
++}
++
++static ssize_t ddrprof_ctrl_show(struct kobject *kobj, struct kobj_attribute *attr,
++				char *buf)
++{
++	if ((control == 1) || (control == 0))
++		return snprintf(buf, DDR_PROF_STAT_LEN, "%lu -> %s\n", control, ddr_str);
++	else
++		return -EINVAL;
++}
++
++static ssize_t ddrprof_ctrl_store(struct kobject *kobj, struct kobj_attribute *attr,
++				const char *buf, size_t count)
++{
++	int i;
++	int rc;
++
++	rc = kstrtoul(buf, 10, &control);
++
++	if (!rc) {
++		if (control == 1) {
++			ddr_str = "enabled";
++			for (i = 0; i < NUM_SLICES; i++) {
++				/* Resume Glue Register Counter */
++				writel((readl(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) | (1 << DDRSS_MEM_MC_CNT_EN_SHIFT)),						(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++				writel((readl(reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) |							(1 << DDRSS_MEM_MC_CNT_EN_SHIFT)), (reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++			}
++		}
++
++		else if (control == 0) {
++			ddr_str = "disabled";
++			for (i = 0; i < NUM_SLICES; i++) {
++				/* Halt Glue Register Counter */
++				writel((readl(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) & (~(1 << DDRSS_MEM_MC_CNT_EN_SHIFT))),						(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++				writel((readl(reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) &							(~(1 << DDRSS_MEM_MC_CNT_EN_SHIFT))), (reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++			}
++		}
++
++		else {
++			return -EINVAL;
++		}
++	}
++
++	else {
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static ssize_t ddrprof_start_show(struct kobject *kobj, struct kobj_attribute *attr,
++			char *buf)
++{
++	if (start_cmd == 1)
++		return snprintf(buf, DDR_PROF_STAT_LEN, "%s -> %lu\n", ddr_str, start_cmd);
++	else
++		return -EINVAL;
++}
++
++static ssize_t ddrprof_start_store(struct kobject *kobj, struct kobj_attribute *attr,
++			const char *buf, size_t count)
++{
++	int i;
++	int rc;
++
++	rc = kstrtoul(buf, 10, &start_cmd);
++
++	if (!rc) {
++		if (start_cmd == 1) {
++			ddr_str = "start cmd";
++			for (i = 0; i < NUM_SLICES; i++) {
++				/* Clear and Wrap Enable Glue Register counter */
++				writel((readl(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) | (1 << DDRSS_MEM_MC_CNT_CLR_SHIFT)),							(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++				writel((readl(reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) |								(1 << DDRSS_MEM_MC_CNT_CLR_SHIFT)), (reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++				writel((readl(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) | (1 << DDRSS_MEM_MC_CNT_WRAP_EN_SHIFT)),							(reg[i] + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));									writel((readl(reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET) |								(1 << DDRSS_MEM_MC_CNT_WRAP_EN_SHIFT)), (reg[i] + DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MC_SUB_CTRL_OFFSET));
++			}
++		} else
++			return -EINVAL;
++	} else
++		return -EINVAL;
++
++	return count;
++}
++
++static ssize_t ddrprof_capbw_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf)
++{
++	return snprintf(buf, DDR_PROF_STAT_LEN, "%llu Bytes\n", bw_trans);
++}
++
++static ssize_t ddrprof_capbw_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count)
++{
++	return count;
++}
++
++static ssize_t ddrprof_captot_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf)
++{
++	return snprintf(buf, DDR_PROF_STAT_LEN, "%llu Bytes\n", tot_trans);
++}
++
++static ssize_t ddrprof_captot_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count)
++{
++	return count;
++}
++
++
++static ssize_t ddrprof_captime_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf)
++{
++	return snprintf(buf, DDR_PROF_STAT_LEN, "%lus\n", show_time);
++}
++
++static ssize_t ddrprof_captime_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count)
++{
++	int rc;
++	int ret;
++
++	bw_trans = 0;
++
++	ret = kstrtoul(buf, 10, &capture_time);
++
++	if (!ret) {
++		time_msec = capture_time * 1000;
++
++		ddrprof_read_count(&sys_timer);
++
++		first_trans = tot_trans;
++
++		/* Modify timer based on user input */
++		rc = mod_timer(&sys_timer, jiffies + msecs_to_jiffies(time_msec));
++		if (rc)
++			return rc;
++
++		show_time = capture_time;
++	} else {
++		show_time = 0;
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static struct kobj_attribute ddrprof_ctrl_attribute = __ATTR(capture_ctrl, 0664,
++		ddrprof_ctrl_show, ddrprof_ctrl_store);
++
++static struct kobj_attribute ddrprof_start_attribute = __ATTR(capture_start, 0664,
++		ddrprof_start_show, ddrprof_start_store);
++
++static struct kobj_attribute ddrprof_captot_attribute = __ATTR(total_bw, 0444,
++		ddrprof_captot_show, ddrprof_captot_store);
++
++static struct kobj_attribute ddrprof_capbw_attribute = __ATTR(capture_bw, 0444,
++		ddrprof_capbw_show, ddrprof_capbw_store);
++
++static struct kobj_attribute ddrprof_captime_attribute = __ATTR(capture_time, 0664,
++		ddrprof_captime_show, ddrprof_captime_store);
++
++
++/*
++ * Create a group of attributes so that we can create and destroy them all
++ * at once.
++ */
++static struct attribute *attrs[] = {
++	&ddrprof_ctrl_attribute.attr,
++	&ddrprof_start_attribute.attr,
++	&ddrprof_captot_attribute.attr,
++	&ddrprof_capbw_attribute.attr,
++	&ddrprof_captime_attribute.attr,
++	NULL,   /* need to NULL terminate the list of attributes */
++};
++
++static struct attribute_group ddrprof_attr_group = {
++	.attrs = attrs,
++};
++
++static void ddrprof_read_bw_count(struct timer_list *timer)
++{
++	ddrprof_read_count(&sys_timer);
++
++	/* Read memory bandwidth for specific window */
++	bw_trans = tot_trans - first_trans;
++
++	/* Each bit change in Memory Glue Register corresponds to 32 bytes
++	 * Read/Write request sent to DDR */
++	bw_trans = bw_trans * 32;
++}
++
++/* Function to make timer periodic */
++static void ddrprof_reset_timer(struct timer_list *timer)
++{
++	int rc;
++
++	rc = mod_timer(&my_timer, jiffies + msecs_to_jiffies(1000));
++	if (rc)
++		pr_err("Failed to reset periodic timer for driver: %s\n", DRV_NAME);
++
++	ddrprof_read_count(&my_timer);
++}
++
++/* Driver probing. */
++static int ddrprof_probe(struct platform_device *pdev)
++{
++	int i, rc;
++
++	struct ddrprof_dev *ddr_dev;
++
++	dev_info(&pdev->dev, "Allocating Kernel Memory\n");
++
++	/* Allocate kernel memory */
++	ddr_dev = devm_kzalloc(&pdev->dev, sizeof(*ddr_dev), GFP_KERNEL);
++	if (!ddr_dev)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, ddr_dev);
++
++	/*Allocating Major and Minor number*/
++	if ((alloc_chrdev_region(&ddr_no, 0, 1, "ddrprof-dev")) < 0) {
++		dev_err(&pdev->dev, "Cannot allocate major number\n");
++		return -1;
++	}
++
++	dev_info(&pdev->dev, "Major = %d Minor = %d\n", MAJOR(ddr_no), MINOR(ddr_no));
++
++	/* Register kobject structure with sysfs */
++	ddrprof_kobject = kobject_create_and_add("ddrprof",
++						kernel_kobj);
++
++	if (!ddrprof_kobject)
++		return -ENOMEM;
++
++	dev_info(&pdev->dev, "Creating sysfs attributes\n");
++
++	/* Create sysfs attribute group */
++	rc = sysfs_create_group(ddrprof_kobject, &ddrprof_attr_group);
++	if (rc)
++		dev_info(&pdev->dev, "failed to create the debug file\n");
++
++	for (i = 0 ; i < NUM_SLICES; i++)
++		reg[i] = ioremap(DDRSS_MEM0_GLUE_BASE_ADDR + (i * DDRSS_MEM_GLUE_OFFSET), DDRSS_MEM0_GLUE_REG_SZ);
++
++	dev_info(&pdev->dev, "Timer Initialization\n");
++
++	/* Init timer */
++	timer_setup(&my_timer, ddrprof_reset_timer, 0);
++	timer_setup(&sys_timer, ddrprof_read_bw_count, 0);
++
++	dev_info(&pdev->dev, "Setup timer for 1sec\n");
++
++	/* Setup timer for 1 second */
++	rc = mod_timer(&my_timer, jiffies + msecs_to_jiffies(1000));
++	if (rc)
++		dev_info(&pdev->dev, "Timer firing failed\n");
++
++	return rc;
++
++}
++
++/* Driver removal. */
++static int ddrprof_remove(struct platform_device *pdev)
++{
++	pr_debug("Removal of driver: %s\n", DRV_NAME);
++
++	/* Remove timer from list */
++	pr_debug("Deleting timers of driver: %s\n", DRV_NAME);
++	del_timer(&my_timer);
++	del_timer(&sys_timer);
++
++	/* Free koject */
++	pr_debug("Free koject of driver: %s\n", DRV_NAME);
++	kobject_put(ddrprof_kobject);
++	return 0;
++}
++
++static struct platform_driver ddrprof_driver = {
++	.probe = ddrprof_probe,
++	.remove = ddrprof_remove,
++	.driver = {
++			.name = DRV_NAME,
++		},
++};
++
++static struct platform_device pdev;
++
++static int ddrprof_init(void)
++{
++	int rc = 0;
++
++	pr_debug("Register platform driver and device for: %s\n", DRV_NAME);
++
++	/*Register platform driver */
++	rc = platform_driver_register(&ddrprof_driver);
++	pdev.dev.release = ddrprof_release;
++	pdev.name = DRV_NAME;
++	if (!rc) {
++		/* Add platform device */
++		rc = platform_device_register(&pdev);
++		if (rc)
++			platform_driver_unregister(&ddrprof_driver);
++	}
++
++	return rc;
++}
++
++module_init(ddrprof_init);
++
++static void ddrprof_exit(void)
++{
++	pr_debug("Exit of driver: %s\n", DRV_NAME);
++	/* Unregister platform device and driver */
++	platform_device_unregister(&pdev);
++	platform_driver_unregister(&ddrprof_driver);
++
++}
++module_exit(ddrprof_exit);
++
++MODULE_DESCRIPTION("DDR Bandwidth Profiling Kernel Driver");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_VERSION("0.2");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/misc/ddr_prof/ddr_prof.h b/drivers/misc/ddr_prof/ddr_prof.h
+new file mode 100644
+index 000000000000..21a36928b927
+--- /dev/null
++++ b/drivers/misc/ddr_prof/ddr_prof.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * DDR Profiling Defines.
++ *
++ * Copyright (C) 2021 Intel Corporation
++ *
++ */
++#ifndef __DDR_PROF_DEFS_H
++#define __DDR_PROF_DEFS_H
++
++#define DDRSS_MEM0_GLUE_BASE_ADDR		0x184420000
++#define DDRSS_MEM_GLUE_OFFSET			0x100000000
++#define DDRSS_MEM_MC_CTRL_OFFSET		0x10000
++#define DDRSS_MEM0_GLUE_REG_SZ			0x102B8
++#define DDRSS_MEM0_MC_SUB_CTRL_OFFSET		0x04
++#define DDRSS_MEM0_MCA_SUB_STAT_OFFSET		0x40
++#define DDRSS_MEM0_MCB_SUB_STAT_OFFSET		0x160
++#define DDRSS_MEM0_MCC_SUB_STAT_OFFSET		(DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MCA_SUB_STAT_OFFSET)
++#define DDRSS_MEM0_MCD_SUB_STAT_OFFSET		(DDRSS_MEM_MC_CTRL_OFFSET + DDRSS_MEM0_MCB_SUB_STAT_OFFSET)
++#define DDRSS_MEM_MC_CNT_EN_SHIFT		(0)
++#define DDRSS_MEM_MC_CNT_EN_BIT_POS		(0x01)
++#define DDRSS_MEM_MC_CNT_EN_MASK		(DDRSS_MEM_MC_CNT_EN_BIT_POS << DDRSS_MEM_MC_CNT_EN_SHIFT)
++#define DDRSS_MEM_MC_CNT_CLR_SHIFT		(1)
++#define DDRSS_MEM_MC_CNT_CLR_BIT_POS		(0x01)
++#define DDRSS_MEM_MC_CNT_CLR_MASK		(DDRSS_MEM_MC_CNT_CLR_BIT_POS << DDRSS_MEM_MC_CNT_CLR_SHIFT)
++#define DDRSS_MEM_MC_CNT_WRAP_EN_SHIFT		(2)
++#define DDRSS_MEM_MC_CNT_WRAP_EN_BIT_POS	(0x01)
++#define DDRSS_MEM_MC_CNT_WRAP_EN_MASK		(DDRSS_MEM_MC_CNT_WRAP_EN_BIT_POS << DDRSS_MEM_MC_CNT_WRAP_EN_SHIFT)
++#endif /* __DDR_PROF_DEFS_H */
+-- 
+2.27.0
+

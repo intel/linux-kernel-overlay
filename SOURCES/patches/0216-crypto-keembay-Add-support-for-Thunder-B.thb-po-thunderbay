@@ -1,0 +1,259 @@
+From ae925e686c46445d78a37a70623b2ce19b115020 Mon Sep 17 00:00:00 2001
+From: hemanthk <hemanthkumar.sm@intel.com>
+Date: Fri, 12 Mar 2021 07:48:49 +0530
+Subject: [PATCH 216/223] crypto: keembay - Add support for Thunder Bay OCS ECC
+
+    Extends the Keem Bay OCS ECC driver to support Thunder Bay Soc.
+
+Signed-off-by: hemanthk <hemanthkumar.sm@intel.com>
+---
+ drivers/crypto/keembay/Kconfig           | 32 ++++++++++
+ drivers/crypto/keembay/Makefile          |  2 +
+ drivers/crypto/keembay/keembay-ocs-ecc.c | 79 ++++++++++++++++++++----
+ 3 files changed, 100 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/crypto/keembay/Kconfig b/drivers/crypto/keembay/Kconfig
+index 1cca445f48f1..8815050c0a8d 100644
+--- a/drivers/crypto/keembay/Kconfig
++++ b/drivers/crypto/keembay/Kconfig
+@@ -184,3 +184,35 @@ config CRYPTO_DEV_THUNDERBAY_OCS_HCU_HMAC_SHA224
+ 	  Provides OCS HCU hardware acceleration of sha224 and hmac(224).
+ 
+ 	  If unsure, say N.
++
++config CRYPTO_DEV_THUNDERBAY_OCS_ECC
++	tristate "Support for Intel Thunder Bay OCS ECC HW acceleration"
++	depends on ARCH_THUNDERBAY || COMPILE_TEST
++	depends on OF || COMPILE_TEST
++	depends on HAS_IOMEM
++	depends on CRYPTO_DEV_OCS_WRAPPER
++	select CRYPTO_ECDH
++	select CRYPTO_ENGINE
++	help
++	  Support for Intel Thunder Bay Offload and Crypto Subsystem (OCS)
++	  Elliptic Curve Cryptography (ECC) hardware acceleration for use with
++	  Crypto API.
++
++	  Provides OCS acceleration for ECDH-256, ECDH-384.
++
++	  Say Y or M if you are compiling for the Intel Thunder Bay SoC. The
++	  module will be called thunderbay-ocs-ecc.
++
++	  If unsure, say N.
++
++config CRYPTO_DEV_THUNDERBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++	bool "Add ECDH private key generation in Thunder Bay OCS ECC driver"
++	depends on CRYPTO_DEV_THUNDERBAY_OCS_ECC
++	help
++	  Add ECDH private key generation in the Intel Thunder Bay OCS ECC driver.
++
++	  Intel does not recommend use of private key generation for ECDH
++	  computations, which, however, is required to pass crypto self-tests.
++
++	  Say Y if you need the driver to pass crypto self-tests. If unsure,
++	  say N.
+diff --git a/drivers/crypto/keembay/Makefile b/drivers/crypto/keembay/Makefile
+index 96cade43b629..1b14a6e05968 100644
+--- a/drivers/crypto/keembay/Makefile
++++ b/drivers/crypto/keembay/Makefile
+@@ -16,3 +16,5 @@ thunderbay-ocs-aes-objs := keembay-ocs-aes-core.o ocs-aes.o
+ 
+ obj-$(CONFIG_CRYPTO_DEV_THUNDERBAY_OCS_HCU) += thunderbay-ocs-hcu.o
+ thunderbay-ocs-hcu-objs := keembay-ocs-hcu-core.o ocs-hcu.o
++
++obj-$(CONFIG_CRYPTO_DEV_THUNDERBAY_OCS_ECC) += keembay-ocs-ecc.o
+diff --git a/drivers/crypto/keembay/keembay-ocs-ecc.c b/drivers/crypto/keembay/keembay-ocs-ecc.c
+index 7775ac864fff..4fb50648684c 100644
+--- a/drivers/crypto/keembay/keembay-ocs-ecc.c
++++ b/drivers/crypto/keembay/keembay-ocs-ecc.c
+@@ -35,6 +35,14 @@
+ 
+ #define DRV_NAME			"keembay-ocs-ecc"
+ 
++#ifdef CONFIG_CRYPTO_DEV_KEEMBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++#define ENABLE_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++#endif
++
++#ifdef CONFIG_CRYPTO_DEV_THUNDERBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++#define ENABLE_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++#endif
++
+ #define KMB_OCS_ECC_PRIORITY		350
+ 
+ #define HW_OFFS_OCS_ECC_COMMAND		0x00000000
+@@ -85,6 +93,9 @@
+  * @engine: Crypto engine for the device
+  * @irq_done: IRQ done completion.
+  * @irq: IRQ number
++ * @algs: Address to kpp_alg algorithm configuration.
++ * @priority: Crypto algorithm priority
++ * @driver_name: Identifier for OCS instance
+  */
+ struct ocs_ecc_dev {
+ 	struct list_head list;
+@@ -93,6 +104,9 @@ struct ocs_ecc_dev {
+ 	struct crypto_engine *engine;
+ 	struct completion irq_done;
+ 	int irq;
++	struct kpp_alg *algs;
++	int priority;
++	char driver_name[64];
+ };
+ 
+ /**
+@@ -181,7 +195,7 @@ static void ocs_ecc_write_cmd_and_data(struct ocs_ecc_dev *dev,
+ 
+ /* Start OCS ECC operation and wait for its completion. */
+ static int ocs_ecc_trigger_op(struct ocs_ecc_dev *ecc_dev, u32 op_size,
+-			       u32 inst)
++			      u32 inst)
+ {
+ 	reinit_completion(&ecc_dev->irq_done);
+ 
+@@ -219,17 +233,29 @@ static inline void ocs_ecc_read_cy_out(struct ocs_ecc_dev *dev, void *cy_out,
+ 		      byte_count);
+ }
+ 
+-static struct ocs_ecc_dev *kmb_ocs_ecc_find_dev(struct ocs_ecc_ctx *tctx)
++static struct ocs_ecc_dev *kmb_ocs_ecc_find_dev(struct crypto_kpp *tfm)
+ {
++	struct ocs_ecc_ctx *tctx = kpp_tfm_ctx(tfm);
++	struct ocs_ecc_dev *ecc_dev;
++	struct list_head *p = NULL;
++	const char *driver_name = NULL;
++
+ 	if (tctx->ecc_dev)
+ 		return tctx->ecc_dev;
+ 
++	driver_name = crypto_tfm_alg_driver_name(crypto_kpp_tfm(tfm));
++
+ 	spin_lock(&ocs_ecc.lock);
+ 
+-	/* Only a single OCS device available. */
+-	tctx->ecc_dev = list_first_entry(&ocs_ecc.dev_list, struct ocs_ecc_dev,
+-					 list);
++	list_for_each(p, &ocs_ecc.dev_list) {
++		ecc_dev = list_entry(p, struct ocs_ecc_dev, list);
++		if (strstr(driver_name, ecc_dev->driver_name)) {
++			tctx->ecc_dev = ecc_dev;
++			goto exit;
++		}
++	}
+ 
++exit:
+ 	spin_unlock(&ocs_ecc.lock);
+ 
+ 	return tctx->ecc_dev;
+@@ -499,7 +525,7 @@ static int kmb_ecc_is_key_valid(const struct ecc_curve *curve,
+ 	return 0;
+ }
+ 
+-#ifdef	CONFIG_CRYPTO_DEV_KEEMBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
++#ifdef	ENABLE_OCS_ECDH_GEN_PRIV_KEY_SUPPORT
+ /*
+  * ECC private keys are generated using the method of extra random bits,
+  * equivalent to that described in FIPS 186-4, Appendix B.4.1.
+@@ -555,13 +581,13 @@ static int kmb_ecc_gen_privkey(const struct ecc_curve *curve, u64 *privkey)
+ 
+ 	return rc;
+ }
+-#else /* !CONFIG_CRYPTO_DEV_KEEMBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT */
++#else /* !ENABLEOCS_ECDH_GEN_PRIV_KEY_SUPPORT */
+ /* If key generation is not enabled, always return error. */
+ static int kmb_ecc_gen_privkey(const struct ecc_curve *curve, u64 *privkey)
+ {
+ 	return -EINVAL;
+ }
+-#endif  /* !CONFIG_CRYPTO_DEV_KEEMBAY_OCS_ECDH_GEN_PRIV_KEY_SUPPORT */
++#endif  /* !ENABLE_OCS_ECDH_GEN_PRIV_KEY_SUPPORT */
+ 
+ static int kmb_ocs_ecdh_set_secret(struct crypto_kpp *tfm, const void *buf,
+ 				   unsigned int len)
+@@ -815,7 +841,7 @@ static int kmb_ocs_ecdh_init_tfm(struct crypto_kpp *tfm)
+ 
+ 	memset(tctx, 0, sizeof(*tctx));
+ 
+-	tctx->ecc_dev = kmb_ocs_ecc_find_dev(tctx);
++	tctx->ecc_dev = kmb_ocs_ecc_find_dev(tfm);
+ 
+ 	if (IS_ERR(tctx->ecc_dev)) {
+ 		pr_err("Failed to find the device : %ld\n",
+@@ -854,7 +880,7 @@ static struct kpp_alg ocs_ecc_algs = {
+ 	.max_size = kmb_ocs_ecdh_max_size,
+ 	.base = {
+ 		.cra_name = "ecdh",
+-		.cra_driver_name = "ecdh-keembay-ocs",
++		.cra_driver_name = "ecdh-",
+ 		.cra_priority = KMB_OCS_ECC_PRIORITY,
+ 		.cra_module = THIS_MODULE,
+ 		.cra_ctxsize = sizeof(struct ocs_ecc_ctx),
+@@ -886,6 +912,7 @@ static int kmb_ocs_ecc_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct ocs_ecc_dev *ecc_dev;
+ 	int rc;
++	const char *driver_name = NULL;
+ 
+ 	ecc_dev = devm_kzalloc(dev, sizeof(*ecc_dev), GFP_KERNEL);
+ 	if (!ecc_dev)
+@@ -920,6 +947,27 @@ static int kmb_ocs_ecc_probe(struct platform_device *pdev)
+ 		goto list_del;
+ 	}
+ 
++	rc = of_property_read_string(pdev->dev.of_node, "driver-name", &driver_name);
++	if (rc < 0) {
++		dev_err(dev, "Could not get driver-name\n");
++		return rc;
++	}
++	strcpy(ecc_dev->driver_name, driver_name);
++
++	rc = of_property_read_u32(pdev->dev.of_node, "priority",
++				  (u32 *)&ecc_dev->priority);
++	if (rc < 0) {
++		dev_err(dev, "Could not get priority\n");
++		return rc;
++	}
++
++	ecc_dev->algs = devm_kzalloc(dev, sizeof(ocs_ecc_algs), GFP_KERNEL);
++	if (!ecc_dev->algs)
++		return -ENOMEM;
++	memcpy(ecc_dev->algs, &ocs_ecc_algs, sizeof(ocs_ecc_algs));
++	strcat(ecc_dev->algs->base.cra_driver_name, ecc_dev->driver_name);
++	ecc_dev->algs->base.cra_priority = ecc_dev->priority;
++
+ 	/* Add device to the list of OCS ECC devices. */
+ 	spin_lock(&ocs_ecc.lock);
+ 	list_add_tail(&ecc_dev->list, &ocs_ecc.dev_list);
+@@ -939,7 +987,7 @@ static int kmb_ocs_ecc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* Register the KPP algo. */
+-	rc = crypto_register_kpp(&ocs_ecc_algs);
++	rc = crypto_register_kpp(ecc_dev->algs);
+ 	if (rc) {
+ 		dev_err(dev,
+ 			"Could not register OCS algorithms with Crypto API\n");
+@@ -967,7 +1015,7 @@ static int kmb_ocs_ecc_remove(struct platform_device *pdev)
+ 	if (!ecc_dev)
+ 		return -ENODEV;
+ 
+-	crypto_unregister_kpp(&ocs_ecc_algs);
++	crypto_unregister_kpp(ecc_dev->algs);
+ 
+ 	spin_lock(&ocs_ecc.lock);
+ 	list_del(&ecc_dev->list);
+@@ -998,6 +1046,11 @@ static struct platform_driver kmb_ocs_ecc_driver = {
+ module_platform_driver(kmb_ocs_ecc_driver);
+ 
+ MODULE_LICENSE("GPL");
++#ifdef CONFIG_ARCH_THUNDERBAY
++MODULE_DESCRIPTION("Intel Thunder Bay OCS ECC Driver");
++MODULE_ALIAS_CRYPTO("ecdh-thunderbay-ocs");
++#else
+ MODULE_DESCRIPTION("Intel Keem Bay OCS ECC Driver");
+-MODULE_ALIAS_CRYPTO("ecdh");
+ MODULE_ALIAS_CRYPTO("ecdh-keembay-ocs");
++#endif
++MODULE_ALIAS_CRYPTO("ecdh");
+-- 
+2.27.0
+

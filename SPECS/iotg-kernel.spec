@@ -60,7 +60,7 @@
 %global isrc 0
 
 %define pkgrelease  15
-%define rpmversion  5.12
+%define rpmversion  5.12.0
 %if %{?isrc}
 %define rcversion norc.
 %endif

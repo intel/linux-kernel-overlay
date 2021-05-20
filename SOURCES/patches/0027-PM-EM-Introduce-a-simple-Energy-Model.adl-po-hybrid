@@ -1,0 +1,175 @@
+From 88b08cf595ab8f469a73453bc4bd7a9c925e959d Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Sat, 13 Jun 2020 15:24:31 -0700
+Subject: [PATCH 27/68] PM / EM: Introduce a simple Energy Model.
+
+The existing Energy Model (referred here as the full Energy Model) computes
+the energy consumed by a performance domain at a given capacity state. For
+this, the Energy Model populates a table of energy costs using a set of
+<Hz, mW> tuples as returned from the active_power() callback.
+
+The previous description assumes that the kernel has full knowledge of the
+CPUs' power consumption at each OPerating Performance Points (OPPs). It
+also assumes that the kernel can control the OPPs.
+
+In x86 platforms this is not necesarily the case. Intel platforms, for
+instance, offer autonomous selection of OPPs without intervetion of the
+kernel. Likewise, the Intel Hardware Feedback Interface does not deliver
+information about the energy consumption per OPP. Instead, it only gives a
+per-CPU energy efficiency rating. More energy efficient CPUs have higher
+efficiency ratings.
+
+Implement a simplified energy model. In this simple model, each performance
+domain is associated only with an energy rating and not a full table of
+costs per OPP.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ include/linux/energy_model.h | 21 +++++++++++-
+ kernel/power/energy_model.c  | 63 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/energy_model.h b/include/linux/energy_model.h
+index 757fc60658fa..d37353e70f6d 100644
+--- a/include/linux/energy_model.h
++++ b/include/linux/energy_model.h
+@@ -10,6 +10,11 @@
+ #include <linux/sched/topology.h>
+ #include <linux/types.h>
+ 
++enum em_type {
++	EM_TYPE_FULL,	/* With a table of capacities */
++	EM_TYPE_SIMPLE,	/* With a single overall energy rating */
++};
++
+ /**
+  * em_perf_state - Performance state of a performance domain
+  * @frequency:	The frequency in KHz, for consistency with CPUFreq
+@@ -27,6 +32,8 @@ struct em_perf_state {
+ /**
+  * em_perf_domain - Performance domain
+  * @table:		List of performance states, in ascending order
++ * @energy_rating:	Efficiency rating of a performance domain with simple
++ *			energy model
+  * @nr_perf_states:	Number of performance states
+  * @milliwatts:		Flag indicating the power values are in milli-Watts
+  *			or some other scale.
+@@ -42,7 +49,11 @@ struct em_perf_state {
+  * field is unused.
+  */
+ struct em_perf_domain {
+-	struct em_perf_state *table;
++	enum em_type type;
++	union {
++		struct em_perf_state *table;
++		unsigned long energy_rating;
++	};
+ 	int nr_perf_states;
+ 	int milliwatts;
+ 	unsigned long cpus[];
+@@ -83,6 +94,8 @@ struct em_perf_domain *em_pd_get(struct device *dev);
+ int em_dev_register_perf_domain(struct device *dev, unsigned int nr_states,
+ 				struct em_data_callback *cb, cpumask_t *span,
+ 				bool milliwatts);
++int em_dev_register_perf_domain_simple(struct device *dev, cpumask_t *cpus,
++				       unsigned long energy_rating);
+ void em_dev_unregister_perf_domain(struct device *dev);
+ 
+ /**
+@@ -200,6 +213,12 @@ int em_dev_register_perf_domain(struct device *dev, unsigned int nr_states,
+ static inline void em_dev_unregister_perf_domain(struct device *dev)
+ {
+ }
++static inline int em_dev_register_perf_domain_simple(struct device *dev,
++						     cpumask_t *cpus,
++						     unsigned long energy_rating)
++{
++	return -EINVAL;
++}
+ static inline struct em_perf_domain *em_cpu_get(int cpu)
+ {
+ 	return NULL;
+diff --git a/kernel/power/energy_model.c b/kernel/power/energy_model.c
+index 5e6479d68165..6cb6b3bc5e98 100644
+--- a/kernel/power/energy_model.c
++++ b/kernel/power/energy_model.c
+@@ -205,6 +205,7 @@ static int em_create_perf_table(struct device *dev, struct em_perf_domain *pd,
+ 
+ 	pd->table = table;
+ 	pd->nr_perf_states = nr_states;
++	pd->type = EM_TYPE_FULL;
+ 
+ 	return 0;
+ 
+@@ -284,6 +285,68 @@ struct em_perf_domain *em_cpu_get(int cpu)
+ }
+ EXPORT_SYMBOL_GPL(em_cpu_get);
+ 
++/**
++ * em_dev_register_perf_domain_simple() - Register a simple Energy Model for CPUs
++ * @dev			: CPU device for which the EM is to register
++ * @cpus		: Pointer to a cpumask_t including the CPUs covered by this performance
++ *			  domain.
++ * @energy_rating	: Energy efficiency rating of the domain
++ *
++ * Create a simple Energy Model for a performance domain. In this model, the
++ * whole performance domain given by @cpus has a architecture-specific
++ * rating. Higher ratings are more energy efficient. Unlike the full performance
++ * domain, energy costs are not determined by OPP. It is expected that the
++ * energy rating reflects the autonomous OPP selected by hardware. Only CPU devices
++ *
++ *
++ * If multiple clients register the same performance domain, all but the first
++ * registration will be ignored.
++ *
++ * Return 0 on success
++ */
++int em_dev_register_perf_domain_simple(struct device *dev, cpumask_t *cpus,
++				       unsigned long energy_rating)
++{
++	struct em_perf_domain *pd;
++	struct device *cpu_dev;
++	int cpu, ret = 0;
++
++	/* A rating of 0 would mean that the span uses no energy. */
++	if (!cpus || !energy_rating)
++		return -EINVAL;
++
++	if (!_is_cpu_device(dev))
++		return -EINVAL;
++
++	mutex_lock(&em_pd_mutex);
++
++	ret = check_domain_span(dev, cpus);
++	if (ret) {
++		pr_err("Sanity check failed!\n");
++		goto unlock;
++	}
++
++	pd = kzalloc(sizeof(*pd) + cpumask_size(), GFP_KERNEL);
++	if (!pd) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++
++	pd->energy_rating = energy_rating;
++	pd->type = EM_TYPE_SIMPLE;
++	cpumask_copy(em_span_cpus(pd), cpus);
++
++	for_each_cpu(cpu, cpus) {
++		cpu_dev = get_cpu_device(cpu);
++		cpu_dev->em_pd = pd;
++	}
++
++	em_debug_create_pd(dev);
++unlock:
++	mutex_unlock(&em_pd_mutex);
++	return ret;
++}
++
+ /**
+  * em_dev_register_perf_domain() - Register the Energy Model (EM) for a device
+  * @dev		: Device for which the EM is to register
+-- 
+2.27.0
+

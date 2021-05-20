@@ -1,0 +1,156 @@
+From 10d6da4fbd7c73d7294f536baf6eacf8a593ab38 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 14 Oct 2020 09:42:35 -0700
+Subject: [PATCH 55/68] x86/entry: Save EHFI classification when entering
+ kernel mode
+
+EHFI provides functionality to classify the most recent thread running on
+the system. We enter into kernel mode from a task running in user space
+via system call or interrupt. Save the classification of the previously
+running task very early after entering into kernel mode. In this manner,
+we don't lose the classification value due to pollution from kernel
+activity.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ arch/x86/entry/entry_64.S        |  8 ++++++
+ arch/x86/entry/entry_64_compat.S |  6 +++++
+ arch/x86/include/asm/hfi.h       | 46 ++++++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index a50097dd1b5c..b931cf65ea7f 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -28,6 +28,7 @@
+ #include <asm/thread_info.h>
+ #include <asm/hreset.h>
+ #include <asm/hw_irq.h>
++#include <asm/hfi.h>
+ #include <asm/page_types.h>
+ #include <asm/irqflags.h>
+ #include <asm/paravirt.h>
+@@ -94,6 +95,8 @@ SYM_CODE_START(entry_SYSCALL_64)
+ 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ 
++	EHFI_SAVE_CLASSID
++
+ SYM_INNER_LABEL(entry_SYSCALL_64_safe_stack, SYM_L_GLOBAL)
+ 
+ 	/* Construct struct pt_regs on stack */
+@@ -995,6 +998,11 @@ SYM_CODE_START_LOCAL(error_entry)
+ 	/* We have user CR3.  Change to kernel CR3. */
+ 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+ 
++	/*
++	 * We may not get the correct classification if we entered here from
++	 * IRET fault but that is OK as it should be a rare case.
++	 */
++	EHFI_SAVE_CLASSID
+ .Lerror_entry_from_usermode_after_swapgs:
+ 	/* Put us onto the real thread stack. */
+ 	popq	%r12				/* save return addr in %12 */
+diff --git a/arch/x86/entry/entry_64_compat.S b/arch/x86/entry/entry_64_compat.S
+index 677df51b5e81..561f28229a78 100644
+--- a/arch/x86/entry/entry_64_compat.S
++++ b/arch/x86/entry/entry_64_compat.S
+@@ -10,6 +10,7 @@
+ #include <asm/errno.h>
+ #include <asm/ia32_unistd.h>
+ #include <asm/hreset.h>
++#include <asm/hfi.h>
+ #include <asm/thread_info.h>
+ #include <asm/segment.h>
+ #include <asm/irqflags.h>
+@@ -56,6 +57,8 @@ SYM_CODE_START(entry_SYSENTER_compat)
+ 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+ 	popq	%rax
+ 
++	EHFI_SAVE_CLASSID
++
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ 
+ 	/* Construct struct pt_regs on stack */
+@@ -212,6 +215,7 @@ SYM_CODE_START(entry_SYSCALL_compat)
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ 
+ SYM_INNER_LABEL(entry_SYSCALL_compat_safe_stack, SYM_L_GLOBAL)
++	EHFI_SAVE_CLASSID
+ 
+ 	/* Construct struct pt_regs on stack */
+ 	pushq	$__USER32_DS		/* pt_regs->ss */
+@@ -375,6 +379,8 @@ SYM_CODE_START(entry_INT80_compat)
+ 	movq	%rsp, %rdi
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ 
++	EHFI_SAVE_CLASSID
++
+ 	pushq	6*8(%rdi)		/* regs->ss */
+ 	pushq	5*8(%rdi)		/* regs->rsp */
+ 	pushq	4*8(%rdi)		/* regs->eflags */
+diff --git a/arch/x86/include/asm/hfi.h b/arch/x86/include/asm/hfi.h
+index 153b9ec634af..6b30e4c9ff0b 100644
+--- a/arch/x86/include/asm/hfi.h
++++ b/arch/x86/include/asm/hfi.h
+@@ -3,6 +3,9 @@
+ #ifndef _ASM_X86_INTEL_HFI_H
+ #define _ASM_X86_INTEL_HFI_H
+ 
++#include <asm/cpufeatures.h>
++
++#ifndef __ASSEMBLY__
+ /* Hardware Feedback Interface Enumeration */
+ #define CPUID_HFI_LEAF			6
+ #define CPUID_HFI_CAP_MASK		0xff
+@@ -44,4 +47,47 @@ static inline bool hfi_has_hw_sched_feedback(void)
+ { return false; }
+ #endif
+ 
++#else /* __ASSEMBLY__ */
++
++#include <linux/bits.h>
++
++#include <asm/msr-index.h>
++
++#define EHFI_CHAR_VALID			BIT(31)
++
++#ifdef CONFIG_X86_64
++.macro	EHFI_SAVE_CLASSID
++		/*
++		 * Task classification:
++		 * A) read the classification result of the current task.
++		 * B) call HRESET to reset the classification hardware.
++		 *
++		 */
++		ALTERNATIVE "jmp 1f", "", X86_FEATURE_INTEL_EHFI
++		push %rdx
++		push %rcx
++		push %rax
++		movl	$MSR_IA32_HW_FEEDBACK_CHAR, %ecx
++		rdmsr
++		/*
++		 * Only update the classification result if it is valid (i.e.,
++		 * MSR_IA32_HW_FEEDBACK_CHAR[63]). Such valid bit is loaded in
++		 * %edx[31].
++		 */
++		test	$EHFI_CHAR_VALID, %edx
++		jz 2f
++		movq	PER_CPU_VAR(current_task), %rdx
++		movl	%eax, TASK_classid(%rdx)
++	2:
++		pop %rax
++		pop %rcx
++		pop %rdx
++	1:
++.endm
++#else /* CONFIG_X86_64 */
++#define EHFI_SAVE_CLASSID
++#endif /* CONFIG_X86_64 */
++
++#endif /* __ASSEMBLY__ */
++
+ #endif /* _ASM_X86_INTEL_HFI_H */
+-- 
+2.27.0
+

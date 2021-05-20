@@ -1,0 +1,423 @@
+From b2ce2291f3ae2e2a10443aa81be8b43b07101590 Mon Sep 17 00:00:00 2001
+From: "David E. Box" <david.e.box@linux.intel.com>
+Date: Sun, 21 Mar 2021 09:50:42 -0700
+Subject: [PATCH 16/17] platform/x86: Add Intel Software Defined Silicon driver
+
+Intel Software Defined Silicon (SDSI) is a technoloy that allows
+configuring silicon features with a license. The SDSI provides the
+application interface to the mailbox mechanism used to transmit,
+validate, and enable licenses in the silicon.
+
+Signed-off-by: David E. Box <david.e.box@linux.intel.com>
+---
+ MAINTAINERS                       |   5 +
+ drivers/platform/x86/Kconfig      |  10 +
+ drivers/platform/x86/Makefile     |   1 +
+ drivers/platform/x86/intel_sdsi.c | 346 ++++++++++++++++++++++++++++++
+ 4 files changed, 362 insertions(+)
+ create mode 100644 drivers/platform/x86/intel_sdsi.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 9450e052f1b1..cb03fe6014d3 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9191,6 +9191,11 @@ S:	Maintained
+ F:	arch/x86/include/asm/intel_scu_ipc.h
+ F:	drivers/platform/x86/intel_scu_*
+ 
++INTEL SDSI DRIVER
++M:	"David E. Box" <david.e.box@linux.intel.com>
++S:	Maintained
++F:	drivers/platform/x86/intel_sdsi.c
++
+ INTEL SPEED SELECT TECHNOLOGY
+ M:	Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+ L:	platform-driver-x86@vger.kernel.org
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 74a00f95363e..8fc8547bfb74 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -725,6 +725,16 @@ config INTEL_OAKTRAIL
+ 	  enable/disable the Camera, WiFi, BT etc. devices. If in doubt, say Y
+ 	  here; it will only load on supported platforms.
+ 
++config INTEL_SDSI
++	tristate "INTEL SDSI"
++	select MFD_INTEL_PMT
++	help
++	  This driver provides support for the Intel Software Defined Silicon
++	  mailbox mechanism.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called intel_sdsi.
++
+ config INTEL_VBTN
+ 	tristate "INTEL VIRTUAL BUTTON"
+ 	depends on ACPI
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index 1f100f7b4f4d..18c66a79f75b 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -72,6 +72,7 @@ obj-$(CONFIG_INTEL_HID_EVENT)		+= intel-hid.o
+ obj-$(CONFIG_INTEL_INT0002_VGPIO)	+= intel_int0002_vgpio.o
+ obj-$(CONFIG_INTEL_MENLOW)		+= intel_menlow.o
+ obj-$(CONFIG_INTEL_OAKTRAIL)		+= intel_oaktrail.o
++obj-$(CONFIG_INTEL_SDSI)		+= intel_sdsi.o
+ obj-$(CONFIG_INTEL_VBTN)		+= intel-vbtn.o
+ 
+ # MSI
+diff --git a/drivers/platform/x86/intel_sdsi.c b/drivers/platform/x86/intel_sdsi.c
+new file mode 100644
+index 000000000000..b71b0b1706ef
+--- /dev/null
++++ b/drivers/platform/x86/intel_sdsi.c
+@@ -0,0 +1,346 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel Software Defined Silicon driver
++ *
++ * Copyright (c) 2021, Intel Corporation.
++ * All Rights Reserved.
++ *
++ * Author: "David E. Box" <david.e.box@linux.intel.com>
++ */
++
++#include <linux/device.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++//#include <linux/sysfs.h>
++#include <linux/uaccess.h>
++
++#define SDSI_DEV_NAME		"intel-vsec-41"
++#define ACCESS_TYPE_BARID	2
++
++#define SDSI_XA_START		0
++#define SDSI_XA_MAX		INT_MAX
++#define SDSI_XA_LIMIT		XA_LIMIT(SDSI_XA_START, SDSI_XA_MAX)
++#define SDSI_SIZE_INBOX		264
++#define SDSI_SIZE_OUTBOX	264
++#define SDSI_GET_OFFSET(v)	((v) << 3)
++#define SDSI_SIZE_REGS(v)	(((v) * 4) - SDSI_SIZE_INBOX - SDSI_SIZE_OUTBOX)
++
++static DEFINE_XARRAY_ALLOC(sdsi_xa);
++
++struct intel_sdsi_disc_table {
++	u32	access_type:4;
++	u32	sdsi_type:8;
++	u32	size:16;
++	u32	reserved:4;
++	u32	guid:32;
++	u32	tbir:3;
++	u32	offset:29;
++} __attribute((packed))__;
++
++struct intel_sdsi_priv {
++	struct intel_sdsi_disc_table	disc_table;
++	struct mutex			mutex;
++	void __iomem			*sdsi_addr;
++	struct bin_attribute		inbox_bin_attr;
++	struct bin_attribute		outbox_bin_attr;
++	struct bin_attribute		regs_bin_attr;
++	struct device			*dev;
++	int				reg_size;
++	int				devid;
++};
++
++static ssize_t version_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct intel_sdsi_priv *priv = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%d\n", priv->disc_table.guid);
++}
++static DEVICE_ATTR_RO(version);
++
++static struct attribute *intel_sdsi_attrs[] = {
++	&dev_attr_version.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(intel_sdsi);
++
++static struct class intel_sdsi_class = {
++	.name = "intel_sdsi",
++	.owner = THIS_MODULE,
++	.dev_groups = intel_sdsi_groups,
++};
++
++ssize_t intel_sdsi_inbox_read(struct file *filp, struct kobject *kobj,
++			      struct bin_attribute *attr, char *buf, loff_t off,
++			      size_t count)
++{
++	struct intel_sdsi_priv *priv = container_of(attr,
++						    struct intel_sdsi_priv,
++						    inbox_bin_attr);
++
++	if (off < 0)
++		return -EINVAL;
++
++	if (off >= attr->size)
++		return 0;
++
++	if (count > attr->size - off)
++		count = attr->size - off;
++
++	memcpy_fromio(buf, priv->sdsi_addr + off, count);
++
++	return count;
++}
++
++ssize_t intel_sdsi_inbox_write(struct file *filp, struct kobject *kobj,
++			       struct bin_attribute *attr, char *buf, loff_t off,
++			       size_t count)
++{
++	struct intel_sdsi_priv *priv = container_of(attr,
++						    struct intel_sdsi_priv,
++						    inbox_bin_attr);
++
++	if (off < 0)
++		return -EINVAL;
++
++	if (off >= attr->size)
++		return 0;
++
++	if (count > attr->size - off)
++		count = attr->size - off;
++
++	memcpy_toio(priv->sdsi_addr + off, buf, count);
++
++	return count;
++}
++
++ssize_t intel_sdsi_outbox_read(struct file *filp, struct kobject *kobj,
++			       struct bin_attribute *attr, char *buf, loff_t off,
++			       size_t count)
++{
++	struct intel_sdsi_priv *priv = container_of(attr,
++						    struct intel_sdsi_priv,
++						    outbox_bin_attr);
++	void __iomem *outbox_addr = priv->sdsi_addr + SDSI_SIZE_INBOX;
++
++	if (off < 0)
++		return -EINVAL;
++
++	if (off >= attr->size)
++		return 0;
++
++	if (count > attr->size - off)
++		count = attr->size - off;
++
++	memcpy_fromio(buf, outbox_addr + off, count);
++
++	return count;
++}
++
++ssize_t intel_sdsi_registers_read(struct file *filp, struct kobject *kobj,
++				  struct bin_attribute *attr, char *buf, loff_t off,
++				  size_t count)
++{
++	struct intel_sdsi_priv *priv = container_of(attr,
++						    struct intel_sdsi_priv,
++						    regs_bin_attr);
++	void __iomem *regs_addr = priv->sdsi_addr + SDSI_SIZE_INBOX + SDSI_SIZE_OUTBOX;
++
++	if (off < 0)
++		return -EINVAL;
++
++	if (off >= attr->size)
++		return 0;
++
++	if (count > attr->size - off)
++		count = attr->size - off;
++
++	memcpy_fromio(buf, regs_addr + off, count);
++
++	return count;
++}
++
++static int intel_sdsi_sysfs_register(struct platform_device *pdev)
++{
++	struct intel_sdsi_priv *priv = platform_get_drvdata(pdev);
++	struct intel_sdsi_disc_table *table = &priv->disc_table;
++	struct pci_dev *pci_dev = to_pci_dev(pdev->dev.parent);
++	struct resource res = {0};
++	struct device *dev;
++	u32 offset = SDSI_GET_OFFSET(table->offset);
++	int tbir = table->tbir;
++	int ret;
++
++	ret = xa_alloc(&sdsi_xa, &priv->devid, NULL, SDSI_XA_LIMIT, GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	dev = device_create(&intel_sdsi_class, &pdev->dev, MKDEV(0, 0), priv,
++			    "socket-%d", priv->devid);
++
++	if (IS_ERR(dev)) {
++		dev_err(&pdev->dev, "Could not create socket-%d device node\n",
++			priv->devid);
++		ret = PTR_ERR(dev);
++		goto fail_dev_create;
++	}
++	priv->dev = dev;
++
++	res.start = pci_resource_start(pci_dev, tbir) + offset;
++	res.end = res.start + table->size - 1;
++	res.flags = IORESOURCE_MEM;
++
++	priv->sdsi_addr = devm_ioremap_resource(&pdev->dev, &res);
++	if (IS_ERR(priv->sdsi_addr)) {
++		ret = PTR_ERR(priv->sdsi_addr);
++		goto fail_ioremap;
++	}
++
++	sysfs_bin_attr_init(&priv->inbox_bin_attr);
++	priv->inbox_bin_attr.attr.name = "inbox";
++	priv->inbox_bin_attr.attr.mode = 0600;
++	priv->inbox_bin_attr.read = intel_sdsi_inbox_read;
++	priv->inbox_bin_attr.write = intel_sdsi_inbox_write;
++	priv->inbox_bin_attr.size = SDSI_SIZE_INBOX;
++	ret = sysfs_create_bin_file(&dev->kobj, &priv->inbox_bin_attr);
++	if (ret)
++		goto fail_ioremap;
++
++	sysfs_bin_attr_init(&priv->outbox_bin_attr);
++	priv->outbox_bin_attr.attr.name = "outbox";
++	priv->outbox_bin_attr.attr.mode = 0400;
++	priv->outbox_bin_attr.read = intel_sdsi_outbox_read;
++	priv->outbox_bin_attr.size = SDSI_SIZE_OUTBOX;
++	ret = sysfs_create_bin_file(&dev->kobj, &priv->outbox_bin_attr);
++	if (ret)
++		goto fail_sysfs_outbox;
++
++	sysfs_bin_attr_init(&priv->regs_bin_attr);
++	priv->regs_bin_attr.attr.name = "registers";
++	priv->regs_bin_attr.attr.mode = 0400;
++	priv->regs_bin_attr.read = intel_sdsi_registers_read;
++	priv->regs_bin_attr.size = priv->reg_size;
++	ret = sysfs_create_bin_file(&dev->kobj, &priv->regs_bin_attr);
++	if (ret)
++		goto fail_sysfs_registers;
++
++	return 0;
++
++fail_sysfs_registers:
++	sysfs_remove_bin_file(&priv->dev->kobj, &priv->outbox_bin_attr);
++fail_sysfs_outbox:
++	sysfs_remove_bin_file(&priv->dev->kobj, &priv->inbox_bin_attr);
++fail_ioremap:
++	device_unregister(dev);
++fail_dev_create:
++	xa_erase(&sdsi_xa, priv->devid);
++
++	return ret;
++}
++
++static int intel_sdsi_header_decode(struct platform_device *pdev,
++				    void __iomem *disc_addr)
++{
++	struct intel_sdsi_priv *priv = platform_get_drvdata(pdev);
++	u32 *table = (u32 *)&priv->disc_table;
++
++	table[0] = readl(disc_addr);
++	table[1] = readl(disc_addr + 4);
++	table[2] = readl(disc_addr + 8);
++
++	if (priv->disc_table.access_type != ACCESS_TYPE_BARID) {
++		dev_err(&pdev->dev, "Expected access_type %d, got %d\n",
++			ACCESS_TYPE_BARID, priv->disc_table.access_type);
++		return -EINVAL;
++	}
++
++	if (!priv->disc_table.size) {
++		dev_err(&pdev->dev, "size is 0\n");
++		return -EINVAL;
++	}
++
++	priv->reg_size = SDSI_SIZE_REGS(priv->disc_table.size);
++	if (priv->reg_size < 0) {
++		dev_err(&pdev->dev, "Error accessing registers\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int intel_sdsi_probe(struct platform_device *pdev)
++{
++	struct intel_sdsi_priv *priv;
++	void __iomem *disc_addr;
++	int ret;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, priv);
++
++	mutex_init(&priv->mutex);
++
++	disc_addr = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
++	if (IS_ERR(disc_addr))
++		return PTR_ERR(disc_addr);
++
++	ret = intel_sdsi_header_decode(pdev, disc_addr);
++	if (ret)
++		return ret;
++
++	ret = intel_sdsi_sysfs_register(pdev);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int intel_sdsi_remove(struct platform_device *pdev)
++{
++	struct intel_sdsi_priv *priv = platform_get_drvdata(pdev);
++
++	sysfs_remove_bin_file(&priv->dev->kobj, &priv->regs_bin_attr);
++	sysfs_remove_bin_file(&priv->dev->kobj, &priv->outbox_bin_attr);
++	sysfs_remove_bin_file(&priv->dev->kobj, &priv->inbox_bin_attr);
++	device_unregister(priv->dev);
++	xa_erase(&sdsi_xa, priv->devid);
++
++	return 0;
++}
++
++static struct platform_driver intel_sdsi_driver = {
++	.driver = {
++		.name   = SDSI_DEV_NAME,
++	},
++	.remove = intel_sdsi_remove,
++	.probe  = intel_sdsi_probe,
++};
++
++static int __init intel_sdsi_init(void)
++{
++	int err;
++
++	err = class_register(&intel_sdsi_class);
++	if (err)
++		return err;
++
++	return platform_driver_register(&intel_sdsi_driver);
++}
++module_init(intel_sdsi_init);
++
++static void __exit intel_sdsi_exit(void)
++{
++	platform_driver_unregister(&intel_sdsi_driver);
++	class_unregister(&intel_sdsi_class);
++	xa_destroy(&sdsi_xa);
++}
++module_exit(intel_sdsi_exit);
++
++MODULE_AUTHOR("David E. Box <david.e.box@linux.intel.com>");
++MODULE_DESCRIPTION("Intel Software Defined Silicon driver");
++MODULE_ALIAS("platform:intel_sdsi");
++MODULE_LICENSE("GPL v2");
+-- 
+2.27.0
+

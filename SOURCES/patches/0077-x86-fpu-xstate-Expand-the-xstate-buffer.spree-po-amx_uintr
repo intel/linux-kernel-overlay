@@ -1,0 +1,353 @@
+From 920aeae2228d2f2499c9e9b35b56154b792aafcf Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Wed, 30 Sep 2020 09:11:04 -0700
+Subject: [PATCH 77/85] x86/fpu/xstate: Expand the xstate buffer on the first
+ use of dynamic user state
+
+Intel's Extended Feature Disable (XFD) feature is an extension of the XSAVE
+architecture. XFD allows the kernel to enable a feature state in XCR0 and
+to receive a #NM trap when a task uses instructions accessing that state.
+In this way, Linux can defer allocating the large XSAVE buffer until tasks
+need it.
+
+XFD introduces two MSRs: IA32_XFD to enable/disable the feature and
+IA32_XFD_ERR to assist the #NM trap handler. Both use the same
+state-component bitmap format, used by XCR0.
+
+Use this hardware capability to find the right time to expand the xstate
+buffer. Introduce two sets of helper functions for that:
+
+1. The first set is primarily for interacting with the XFD hardware:
+	xdisable_setbits()
+	xdisable_getbits()
+	xdisable_switch()
+
+2. The second set is for managing the first-use status and handling #NM
+   trap:
+	xfirstuse_enabled()
+	xfirstuse_not_detected()
+
+The #NM handler induces the xstate buffer expansion to save the first-used
+states.
+
+The XFD feature is enabled only for the compacted format. If the kernel
+uses the standard format, the buffer has to be always enough for all the
+states.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Reviewed-by: Len Brown <len.brown@intel.com>
+Cc: x86@kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+Changes for intel-next:
+* Rebased on CET and user interrupt CPUID enumeration.
+
+Changes from v3:
+* Removed 'no functional change' in the changelog. (Borislav Petkov)
+
+Changes from v2:
+* Changed to enable XFD only when the compacted format is used.
+* Updated the changelog with task->fpu removed. (Borislav Petkov)
+
+Changes from v1:
+* Inlined the XFD-induced #NM handling code (Andy Lutomirski)
+---
+ arch/x86/include/asm/cpufeatures.h  |  1 +
+ arch/x86/include/asm/fpu/internal.h | 51 ++++++++++++++++++++++++++++-
+ arch/x86/include/asm/msr-index.h    |  2 ++
+ arch/x86/kernel/cpu/cpuid-deps.c    |  1 +
+ arch/x86/kernel/fpu/xstate.c        | 37 +++++++++++++++++++--
+ arch/x86/kernel/process.c           |  5 +++
+ arch/x86/kernel/process_32.c        |  2 +-
+ arch/x86/kernel/process_64.c        |  2 +-
+ arch/x86/kernel/traps.c             | 40 ++++++++++++++++++++++
+ 9 files changed, 135 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 990ec9c9af70..4a4403749066 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -275,6 +275,7 @@
+ #define X86_FEATURE_XSAVEC		(10*32+ 1) /* XSAVEC instruction */
+ #define X86_FEATURE_XGETBV1		(10*32+ 2) /* XGETBV with ECX = 1 instruction */
+ #define X86_FEATURE_XSAVES		(10*32+ 3) /* XSAVES/XRSTORS instructions */
++#define X86_FEATURE_XFD			(10*32+ 4) /* eXtended Feature Disabling */
+ 
+ /*
+  * Extended auxiliary flags: Linux defined - for features scattered in various
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 9093fb66137e..149425ae0502 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -567,11 +567,58 @@ static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+  * Misc helper functions:
+  */
+ 
++/* The first-use detection helpers: */
++
++static inline void xdisable_setbits(u64 value)
++{
++	wrmsrl_safe(MSR_IA32_XFD, value);
++}
++
++static inline u64 xdisable_getbits(void)
++{
++	u64 value;
++
++	rdmsrl_safe(MSR_IA32_XFD, &value);
++	return value;
++}
++
++static inline u64 xfirstuse_enabled(void)
++{
++	/* All the dynamic user components are first-use enabled. */
++	return xfeatures_mask_user_dynamic;
++}
++
++/*
++ * Convert fpu->state_mask to the xdisable configuration to be written to
++ * MSR IA32_XFD.  So, xdisable_setbits() only uses this outcome.
++ */
++static inline u64 xfirstuse_not_detected(struct fpu *fpu)
++{
++	u64 firstuse_bv = (fpu->state_mask & xfirstuse_enabled());
++
++	/*
++	 * If first-use is not detected, set the bit. If the detection is
++	 * not enabled, the bit is always zero in firstuse_bv. So, make
++	 * following conversion:
++	 */
++	return  (xfirstuse_enabled() ^ firstuse_bv);
++}
++
++/* Update MSR IA32_XFD with xfirstuse_not_detected() if needed. */
++static inline void xdisable_switch(struct fpu *prev, struct fpu *next)
++{
++	if (!static_cpu_has(X86_FEATURE_XFD) || !xfirstuse_enabled())
++		return;
++
++	if (unlikely(prev->state_mask != next->state_mask))
++		xdisable_setbits(xfirstuse_not_detected(next));
++}
++
+ /*
+  * Load PKRU from the FPU context if available. Delay loading of the
+  * complete FPU state until the return to userland.
+  */
+-static inline void switch_fpu_finish(struct fpu *new_fpu)
++static inline void switch_fpu_finish(struct fpu *old_fpu, struct fpu *new_fpu)
+ {
+ 	u32 pkru_val = init_pkru_value;
+ 	struct pkru_state *pk;
+@@ -581,6 +628,8 @@ static inline void switch_fpu_finish(struct fpu *new_fpu)
+ 
+ 	set_thread_flag(TIF_NEED_FPU_LOAD);
+ 
++	xdisable_switch(old_fpu, new_fpu);
++
+ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return;
+ 
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 1649c267b5b7..a31bd46848df 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -630,6 +630,8 @@
+ #define MSR_IA32_BNDCFGS_RSVD		0x00000ffc
+ 
+ #define MSR_IA32_XSS			0x00000da0
++#define MSR_IA32_XFD			0x000001c4
++#define MSR_IA32_XFD_ERR		0x000001c5
+ 
+ #define MSR_IA32_APICBASE		0x0000001b
+ #define MSR_IA32_APICBASE_BSP		(1<<8)
+diff --git a/arch/x86/kernel/cpu/cpuid-deps.c b/arch/x86/kernel/cpu/cpuid-deps.c
+index fa80eae26477..1f9349576438 100644
+--- a/arch/x86/kernel/cpu/cpuid-deps.c
++++ b/arch/x86/kernel/cpu/cpuid-deps.c
+@@ -75,6 +75,7 @@ static const struct cpuid_dep cpuid_deps[] = {
+ 	{ X86_FEATURE_SHSTK,			X86_FEATURE_XSAVES    },
+ 	{ X86_FEATURE_IBT,			X86_FEATURE_XSAVES    },
+ 	{ X86_FEATURE_UINTR,			X86_FEATURE_XSAVES    },
++	{ X86_FEATURE_XFD,			X86_FEATURE_XSAVES    },
+ 	{}
+ };
+ 
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index ad7246ed9fb9..abcc9f9ee929 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -183,6 +183,21 @@ static bool xfeature_is_supervisor(int xfeature_nr)
+ 	return ecx & 1;
+ }
+ 
++static bool xfeature_disable_supported(int xfeature_nr)
++{
++	u32 eax, ebx, ecx, edx;
++
++	if (!boot_cpu_has(X86_FEATURE_XFD))
++		return false;
++
++	/*
++	 * If state component 'i' supports xfeature disable (first-use
++	 * detection), ECX[2] return 1; otherwise, 0.
++	 */
++	cpuid_count(XSTATE_CPUID, xfeature_nr, &eax, &ebx, &ecx, &edx);
++	return ecx & 4;
++}
++
+ /**
+  * get_xstate_comp_offset() - Find the feature's offset in the compacted format
+  * @mask:	This bitmap tells which components reserved in the format.
+@@ -374,6 +389,9 @@ void fpu__init_cpu_xstate(void)
+ 		wrmsrl(MSR_IA32_XSS, xfeatures_mask_supervisor() |
+ 				     xfeatures_mask_supervisor_dynamic());
+ 	}
++
++	if (boot_cpu_has(X86_FEATURE_XFD))
++		xdisable_setbits(xfirstuse_enabled());
+ }
+ 
+ static bool xfeature_enabled(enum xfeature xfeature)
+@@ -576,8 +594,9 @@ static void __init print_xstate_offset_size(void)
+ 	for (i = FIRST_EXTENDED_XFEATURE; i < XFEATURE_MAX; i++) {
+ 		if (!xfeature_enabled(i))
+ 			continue;
+-		pr_info("x86/fpu: xstate_offset[%d]: %4d, xstate_sizes[%d]: %4d\n",
+-			 i, xstate_comp_offsets[i], i, xstate_sizes[i]);
++		pr_info("x86/fpu: xstate_offset[%d]: %4d, xstate_sizes[%d]: %4d (%s)\n",
++			i, xstate_comp_offsets[i], i, xstate_sizes[i],
++			(xfeatures_mask_user_dynamic & BIT_ULL(i)) ? "on-demand" : "default");
+ 	}
+ }
+ 
+@@ -1014,9 +1033,18 @@ void __init fpu__init_system_xstate(void)
+ 	}
+ 
+ 	xfeatures_mask_all &= fpu__get_supported_xfeatures_mask();
+-	/* Do not support the dynamically allocated buffer yet. */
+ 	xfeatures_mask_user_dynamic = 0;
+ 
++	for (i = FIRST_EXTENDED_XFEATURE; i < XFEATURE_MAX; i++) {
++		u64 feature_mask = BIT_ULL(i);
++
++		if (!(xfeatures_mask_user() & feature_mask))
++			continue;
++
++		if (xfeature_disable_supported(i))
++			xfeatures_mask_user_dynamic |= feature_mask;
++	}
++
+ 	/* Enable xstate instructions to be able to continue with initialization: */
+ 	fpu__init_cpu_xstate();
+ 	err = init_xstate_size();
+@@ -1068,6 +1096,9 @@ void fpu__resume_cpu(void)
+ 		wrmsrl(MSR_IA32_XSS, xfeatures_mask_supervisor()  |
+ 				     xfeatures_mask_supervisor_dynamic());
+ 	}
++
++	if (boot_cpu_has(X86_FEATURE_XFD))
++		xdisable_setbits(xfirstuse_not_detected(&current->thread.fpu));
+ }
+ 
+ /*
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 4e3f041d61fc..6ce2f07eb27a 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -111,6 +111,11 @@ void arch_thread_struct_whitelist(unsigned long *offset, unsigned long *size)
+ 	*size = get_xstate_config(XSTATE_MIN_SIZE);
+ }
+ 
++void arch_release_task_struct(struct task_struct *tsk)
++{
++	free_xstate_buffer(&tsk->thread.fpu);
++}
++
+ /*
+  * Free thread data structures etc..
+  */
+diff --git a/arch/x86/kernel/process_32.c b/arch/x86/kernel/process_32.c
+index 4f2f54e1281c..7bd5d08eeb41 100644
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@ -213,7 +213,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 
+ 	this_cpu_write(current_task, next_p);
+ 
+-	switch_fpu_finish(next_fpu);
++	switch_fpu_finish(prev_fpu, next_fpu);
+ 
+ 	/* Load the Intel cache allocation PQR MSR. */
+ 	resctrl_sched_in();
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index e9b64e40293e..dce32049506e 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -598,7 +598,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	this_cpu_write(current_task, next_p);
+ 	this_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+ 
+-	switch_fpu_finish(next_fpu);
++	switch_fpu_finish(prev_fpu, next_fpu);
+ 
+ 	/* Reload sp0. */
+ 	update_task_stack(next_p);
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index e2f821e96c5e..0dadc3e47e19 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -1168,10 +1168,50 @@ DEFINE_IDTENTRY(exc_spurious_interrupt_bug)
+ 	 */
+ }
+ 
++static __always_inline bool handle_xfirstuse_event(struct fpu *fpu)
++{
++	bool handled = false;
++	u64 event_mask;
++
++	/* Check whether the first-use detection is running. */
++	if (!static_cpu_has(X86_FEATURE_XFD) || !xfirstuse_enabled())
++		return handled;
++
++	rdmsrl_safe(MSR_IA32_XFD_ERR, &event_mask);
++
++	/* The trap event should happen to one of first-use enabled features */
++	WARN_ON(!(event_mask & xfirstuse_enabled()));
++
++	/* If IA32_XFD_ERR is empty, the current trap has nothing to do with. */
++	if (!event_mask)
++		return handled;
++
++	/*
++	 * The first-use event is presumed to be from userspace, so it should have
++	 * nothing to do with interrupt context.
++	 */
++	if (WARN_ON(in_interrupt()))
++		return handled;
++
++	if (alloc_xstate_buffer(fpu, event_mask))
++		return handled;
++
++	xdisable_setbits(xfirstuse_not_detected(fpu));
++
++	/* Clear the trap record. */
++	wrmsrl_safe(MSR_IA32_XFD_ERR, 0);
++	handled = true;
++
++	return handled;
++}
++
+ DEFINE_IDTENTRY(exc_device_not_available)
+ {
+ 	unsigned long cr0 = read_cr0();
+ 
++	if (handle_xfirstuse_event(&current->thread.fpu))
++		return;
++
+ #ifdef CONFIG_MATH_EMULATION
+ 	if (!boot_cpu_has(X86_FEATURE_FPU) && (cr0 & X86_CR0_EM)) {
+ 		struct math_emu_info info = { };
+-- 
+2.27.0
+

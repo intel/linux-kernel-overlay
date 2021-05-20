@@ -1,0 +1,168 @@
+From 8c49faed875592468201f8ad8e317a7d9db0f989 Mon Sep 17 00:00:00 2001
+From: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+Date: Mon, 15 Jun 2020 13:49:12 +0100
+Subject: [PATCH 116/223] keembay-ipc: Make RX circular buffer private to each
+ device
+
+Make RX circular buffer private to each device
+
+Signed-off-by: Daniele Alessandrelli <daniele.alessandrelli@intel.com>
+---
+ drivers/misc/keembay-ipc/keembay-ipc.c | 68 +++++++++++++-------------
+ 1 file changed, 35 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/misc/keembay-ipc/keembay-ipc.c b/drivers/misc/keembay-ipc/keembay-ipc.c
+index f36a713ba291..7d7ba9f29a56 100644
+--- a/drivers/misc/keembay-ipc/keembay-ipc.c
++++ b/drivers/misc/keembay-ipc/keembay-ipc.c
+@@ -142,6 +142,19 @@ struct ipc_link {
+ 	bool tx_stopping;
+ };
+ 
++/*
++ * RX Circular Buffer struct.
++ *
++ * The producer inserts elements to the head and the consumers extracts
++ * elements from the tail. See Documentation/circular-buffers.txt for usage
++ * details.
++ */
++struct rx_circ_buf {
++	u32 buf[RX_SW_FIFO_LEN];
++	int head;
++	int tail;
++};
++
+ /**
+  * struct keembay_ipc_dev - IPC private data.
+  *
+@@ -152,12 +165,14 @@ struct ipc_link {
+  * @leon_mss_link:	    The ARM_CSS-Leon_MSS link.
+  * @local_fifo_irq:	    The IRQ line used by the local hardware FIFO.
+  * @local_fifo_irq_enabled: Whether or not the local hardware FIFO IRQ is
+- *			    enabled.
++ *                          enabled.
+  * @local_fifo_irq_lock:    The spinlock to protect the enabled status of the
+- *			    local FIFO IRQ.
++ *                          local FIFO IRQ.
+  * @local_fifo_reg:	    The base address of the local HW FIFO.
+  * @remote_fifo_reg:	    The base address of the remote HW FIFO (i.e., the
+- *			    Leon MSS FIFO).
++ *                          Leon MSS FIFO).
++ * @rx_sw_fifo:		The RX SW FIFO. The RX ISR writes to this FIFO and
++ *                  the RX tasklet reads from it.
+  */
+ struct keembay_ipc_dev {
+ 	struct platform_device *plat_dev;
+@@ -171,6 +186,7 @@ struct keembay_ipc_dev {
+ 	void __iomem *local_fifo_reg;
+ 	void __iomem *remote_fifo_reg;
+ 	struct tasklet_struct rx_tasklet;
++	struct rx_circ_buf rx_sw_fifo;
+ };
+ 
+ /*
+@@ -188,19 +204,6 @@ struct rx_data {
+ 	struct list_head list;
+ };
+ 
+-/*
+- * RX Circular Buffer struct.
+- *
+- * The producer inserts elements to the head and the consumers extracts
+- * elements from the tail. See Documentation/circular-buffers.txt for usage
+- * details.
+- */
+-struct rx_circ_buf {
+-	u32 buf[RX_SW_FIFO_LEN];
+-	int head;
+-	int tail;
+-};
+-
+ /* Forward declaration of TX thread function. */
+ static int tx_thread_fn(void *data);
+ /* Forward declaration of ISR function. */
+@@ -208,12 +211,6 @@ static irqreturn_t local_fifo_irq_handler(int irq, void *dev_id);
+ /* Forward declaration of RX tasklet function. */
+ static void rx_tasklet_func(unsigned long);
+ 
+-/*
+- * The RX SW FIFO.
+- *
+- * The RX ISR writes to this FIFO and the RX tasklet reads from it.
+- */
+-static struct rx_circ_buf rx_sw_fifo;
+ 
+ /*
+  * Functions related to reserved-memory sub-devices.
+@@ -918,25 +915,28 @@ static void process_rx_fifo_entry(u32 entry,
+ static void rx_tasklet_func(unsigned long ipc_dev_ptr)
+ {
+ 	u32 entry;
++	struct keembay_ipc_dev *ipc_dev = (struct keembay_ipc_dev *)ipc_dev_ptr;
++	struct rx_circ_buf *rx_sw_fifo = &ipc_dev->rx_sw_fifo;
+ 	/*
+ 	 * Memory barrier: make sure that we get buffer head before any other
+ 	 * operation on the circular buffer.
+ 	 */
+-	const unsigned int head = smp_load_acquire(&rx_sw_fifo.head);
+-	unsigned long tail = rx_sw_fifo.tail;
+-	const size_t size = ARRAY_SIZE(rx_sw_fifo.buf);
+-	struct keembay_ipc_dev *ipc_dev = (struct keembay_ipc_dev *)ipc_dev_ptr;
++	const unsigned int head =
++		smp_load_acquire(&rx_sw_fifo->head); /* memory barrier */
++
++	unsigned long tail = rx_sw_fifo->tail;
++	const size_t size = ARRAY_SIZE(rx_sw_fifo->buf);
+ 
+ 	while (CIRC_CNT(head, tail, size)) {
+ 		/* Extract one item from the buffer. */
+-		entry = rx_sw_fifo.buf[tail];
++		entry = rx_sw_fifo->buf[tail];
+ 		/* Consume the item. */
+ 		process_rx_fifo_entry(entry, ipc_dev);
+ 		/* Update tail index (wrapping it if needed) */
+ 		tail = (tail + 1) & (size - 1);
+ 	}
+ 	/* Memory barrier ensuring tail is updated only at the end. */
+-	smp_store_release(&rx_sw_fifo.tail, tail);
++	smp_store_release(&rx_sw_fifo->tail, tail);  /* memory barrier */
+ 	/* Enable Local FIFO interrupt. */
+ 	local_fifo_irq_enable(ipc_dev);
+ }
+@@ -960,10 +960,11 @@ static void rx_tasklet_func(unsigned long ipc_dev_ptr)
+  */
+ static irqreturn_t local_fifo_irq_handler(int irq, void *ptr)
+ {
+-	unsigned int head = rx_sw_fifo.head;
+-	const unsigned int tail = READ_ONCE(rx_sw_fifo.tail);
+-	const size_t size = ARRAY_SIZE(rx_sw_fifo.buf);
+ 	struct keembay_ipc_dev *ipc_dev = ptr;
++	struct rx_circ_buf *rx_sw_fifo = &ipc_dev->rx_sw_fifo;
++	unsigned int head = rx_sw_fifo->head;
++	const unsigned int tail = READ_ONCE(rx_sw_fifo->tail);
++	const size_t size = ARRAY_SIZE(rx_sw_fifo->buf);
+ 
+ 	/* Copy entries to internal SW FIFO. */
+ 	while (likely(local_fifo_cnt(ipc_dev))) {
+@@ -972,7 +973,8 @@ static irqreturn_t local_fifo_irq_handler(int irq, void *ptr)
+ 			local_fifo_irq_disable(ipc_dev);
+ 			goto exit;
+ 		}
+-		rx_sw_fifo.buf[head] = local_fifo_get(ipc_dev);
++		rx_sw_fifo->buf[head] = local_fifo_get(ipc_dev);
++
+ 		/* Update head index (wrapping it if needed). */
+ 		head = (head + 1) & (size - 1);
+ 	}
+@@ -981,7 +983,7 @@ static irqreturn_t local_fifo_irq_handler(int irq, void *ptr)
+ 	 * Memory barrier: make sure that updating the buffer head is the last
+ 	 * operation done on the circular buffer.
+ 	 */
+-	smp_store_release(&rx_sw_fifo.head, head);
++	smp_store_release(&rx_sw_fifo->head, head); /* memory barrier */
+ 	tasklet_schedule(&ipc_dev->rx_tasklet);
+ 	return IRQ_HANDLED;
+ }
+-- 
+2.27.0
+

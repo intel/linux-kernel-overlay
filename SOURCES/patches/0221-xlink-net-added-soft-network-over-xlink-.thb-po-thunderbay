@@ -1,0 +1,582 @@
+From f3c7aa0ec9fc5a97e79a70615ac4f8ab4dd93d83 Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tamal.saha@intel.com>
+Date: Mon, 8 Feb 2021 19:53:13 +0530
+Subject: [PATCH 221/223] xlink-net: added soft network over xlink-pcie
+
+	Softnet Framework to create a virtual channel on the PCIe and
+	expose that as a network adapter in both device and host
+
+Signed-off-by: Tamal Saha <tamal.saha@intel.com>
+---
+ drivers/misc/Kconfig               |   1 +
+ drivers/misc/Makefile              |   1 +
+ drivers/misc/xlink-net/Kconfig     |  21 ++
+ drivers/misc/xlink-net/Makefile    |   4 +
+ drivers/misc/xlink-net/xlink-net.c | 497 +++++++++++++++++++++++++++++
+ 5 files changed, 524 insertions(+)
+ create mode 100644 drivers/misc/xlink-net/Kconfig
+ create mode 100644 drivers/misc/xlink-net/Makefile
+ create mode 100644 drivers/misc/xlink-net/xlink-net.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 359636934596..5d44051a15a5 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -484,4 +484,5 @@ source "drivers/misc/xlink-pcie/Kconfig"
+ source "drivers/misc/xlink-core/Kconfig"
+ source "drivers/misc/xlink-ipc/Kconfig"
+ source "drivers/misc/xlink-secure/Kconfig"
++source "drivers/misc/xlink-net/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 3fe577324920..79a73dcd12ba 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -69,3 +69,4 @@ obj-y				+= xlink-pcie/
+ obj-$(CONFIG_XLINK_CORE)        += xlink-core/
+ obj-$(CONFIG_XLINK_IPC)		+= xlink-ipc/
+ obj-$(CONFIG_XLINK_SECURE)      += xlink-secure/
++obj-$(CONFIG_XLINK_NET)		+= xlink-net/
+diff --git a/drivers/misc/xlink-net/Kconfig b/drivers/misc/xlink-net/Kconfig
+new file mode 100644
+index 000000000000..c68abbedf2b9
+--- /dev/null
++++ b/drivers/misc/xlink-net/Kconfig
+@@ -0,0 +1,21 @@
++config XLINK_NET
++	tristate "Support for XLINKNET"
++	default m
++	depends on XLINK_CORE
++	help
++		XLINK_NET enables the network interface over xlink pcie module.
++		Choose M here to compile this driver as a module,
++		name is xlink_net.
++		Choose Y here to compile this driver as a default module in build.
++
++
++config XLINKNET_REMOTEHOST
++	tristate "Support for XLINKNET for remote host"
++	depends on XLINK_CORE && XLINK_NET=n
++	help
++		XLINKNET_REMOTEHOST enables the network interface over
++		xlink pcie in the host side.
++
++		Choose M here to compile this driver as a module.
++		Choose Y here to compile this driver
++		as a default module in build.
+diff --git a/drivers/misc/xlink-net/Makefile b/drivers/misc/xlink-net/Makefile
+new file mode 100644
+index 000000000000..a4e98709b827
+--- /dev/null
++++ b/drivers/misc/xlink-net/Makefile
+@@ -0,0 +1,4 @@
++#
++# Makefile for KeemBay xlink Linux driver
++#
++obj-m += xlink-net.o
+diff --git a/drivers/misc/xlink-net/xlink-net.c b/drivers/misc/xlink-net/xlink-net.c
+new file mode 100644
+index 000000000000..e8e6b09f0086
+--- /dev/null
++++ b/drivers/misc/xlink-net/xlink-net.c
+@@ -0,0 +1,497 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Intel Network Interface over xlink support
++ * xlink-net provides a virtual network layered
++ * on top of the xlink communication layer.
++ *
++ * Copyright (C) 2020 Intel Corporation
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/kthread.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/xlink.h>
++
++/* Print Payload
++ * Enable = 1 , Disable = 0
++ */
++#define PAYLOAD_DUMP 0
++
++struct xlink_msg {
++	struct sk_buff *skb;
++	struct list_head node;
++};
++
++struct xlinknet {
++	struct xlink_handle  xhandle;
++	struct task_struct *task_recv;
++	struct task_struct *task_send;
++	struct net_device *dev;
++	struct completion pkt_available;
++	struct list_head head;
++	spinlock_t lock; /* spin lock */
++	u32 sw_device_id;
++};
++
++#define XLINKNET_DEVICE_NAME		"xn%d"
++#define XLINKNET_DRIVER_NAME		"xndrv"
++
++/* 68 comes from min TCP+IP+MAC header */
++#define XLINKNET_MIN_MTU 68
++
++#define XLINKNET_MAX_MTU (64 * 1024)
++#define XLINKNET_DEF_MTU (32 * 1024)
++
++/*
++ * The partid (board + soc) is encapsulated in the MAC
++ * address beginning in the following octet and it
++ * consists of two octets.
++ */
++#define XLINKNET_PARTID_OCTET	3
++
++#define XLINKNET_XLINK_CHANNEL	1090
++
++/* Define the xlinknet debug device structures to be
++ * used with dev_dbg() et al
++ */
++
++struct device_driver xlinknet_dbg_name = {
++	.name = "xlinknet"
++};
++
++struct device xlinknet_dbg_subname = {
++	.init_name = "xlinknet",	/* set to "" */
++	.driver = &xlinknet_dbg_name
++};
++
++static struct device *dbgxnet = &xlinknet_dbg_subname;
++
++#define XLINK_MAX_DEVICE_NAME_SIZE 128
++#define SW_DEVICE_ID_INTERFACE_SHIFT 24U
++#define SW_DEVICE_ID_INTERFACE_MASK  0x7
++#define GET_INTERFACE_FROM_SW_DEVICE_ID(id) \
++		(((id) >> SW_DEVICE_ID_INTERFACE_SHIFT) &\
++				SW_DEVICE_ID_INTERFACE_MASK)
++#define SW_DEVICE_ID_IPC_INTERFACE  0x0
++#define SW_DEVICE_ID_PCIE_INTERFACE 0x1
++#define GET_INTERFACE_NO_SW_DEVICE_ID(id) \
++			(((id) >> 16) & 0xFF)
++
++static int receive_thread(void *thread_param)
++{
++	struct xlinknet *xnet = (struct xlinknet *)thread_param;
++	struct sk_buff *skb = NULL;
++	enum xlink_error xerr;
++	u8 *message;
++	u32 size;
++
++	dev_info(dbgxnet, "xlinknet receive thread started [%p].\n", xnet);
++	while (!kthread_should_stop()) {
++		xerr = xlink_read_data(&xnet->xhandle,
++				       XLINKNET_XLINK_CHANNEL,
++				       &message,
++				       &size);
++
++		if (xerr != X_LINK_SUCCESS && xerr != X_LINK_TIMEOUT) {
++			xnet->dev->stats.rx_errors++;
++			dev_warn(dbgxnet,
++				 "xlink_read_data failed (%d) dropping pkt Rx error[%lu].\n",
++				xerr, xnet->dev->stats.rx_errors);
++			continue;
++		}
++#if PAYLOAD_DUMP
++		print_hex_dump(KERN_ERR, "receive_thread", 0, 16, 1,
++			       ((void *)message), (32), 0);
++#endif
++		skb = __netdev_alloc_skb(xnet->dev, XLINKNET_MAX_MTU, GFP_KERNEL);
++		if (!skb) {
++			xnet->dev->stats.rx_errors++;
++			return -1;
++		}
++		skb_put_data(skb, message, size);
++
++#if PAYLOAD_DUMP
++		print_hex_dump(KERN_ERR, "%s>head", __func__, 0, 16, 1,
++			       ((void *)skb->head), (32), 0);
++
++		print_hex_dump(KERN_ERR, "%s>data", __func__, 0, 16, 1,
++			       ((void *)skb->data), (skb->len), 0);
++#endif
++
++		/* release the data from xlink */
++		xlink_release_data(&xnet->xhandle,
++				   XLINKNET_XLINK_CHANNEL, message);
++		message = NULL;
++		size = 0;
++
++		/* fill up rest of the parameters */
++		skb->protocol = eth_type_trans(skb, xnet->dev);
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++
++		/* participate in statistics */
++		xnet->dev->stats.rx_packets++;
++		xnet->dev->stats.rx_bytes += skb->len;
++
++		/* inform upper layers */
++		netif_rx_ni(skb);
++	}
++	dev_info(dbgxnet, "xlinknet receive thread exited [%p].\n", xnet);
++	return 0;
++}
++
++static int sender_thread(void *thread_param)
++{
++	struct xlinknet *xnet = (struct xlinknet *)thread_param;
++	struct sk_buff *skb = NULL;
++	enum xlink_error xerr;
++	struct xlink_msg *msg;
++	unsigned long flags;
++
++	dev_info(dbgxnet, "xlinknet %s started [%p].\n", __func__, xnet);
++	while (!kthread_should_stop()) {
++		wait_for_completion_interruptible(&xnet->pkt_available);
++
++		spin_lock_irqsave(&xnet->lock, flags);
++		{
++			msg = (list_first_entry(&xnet->head, struct xlink_msg, node));
++			list_del(&msg->node);
++		}
++		spin_unlock_irqrestore(&xnet->lock, flags);
++		skb = msg->skb;
++
++#if PAYLOAD_DUMP
++		print_hex_dump(KERN_ERR, "%s>head", __func__, 0, 16, 1,
++			       ((void *)skb->head), (32), 0);
++
++		print_hex_dump(KERN_ERR, "%s>data", __func__, 0, 16, 1,
++			       ((void *)skb->data), (skb->len), 0);
++#endif
++		xerr = xlink_write_data(&xnet->xhandle, XLINKNET_XLINK_CHANNEL,
++					skb->data, skb->len);
++		if (xerr != X_LINK_SUCCESS) {
++			dev_warn(dbgxnet,
++				 "failed %d to xlink_write_data %d bytes;dropping packet\n",
++				xerr, skb->len);
++			xnet->dev->stats.tx_errors++;
++		} else {
++			/* participate in statistics */
++			xnet->dev->stats.tx_packets++;
++			xnet->dev->stats.tx_bytes += skb->len;
++		}
++		dev_kfree_skb(skb);
++		kfree(msg);
++	}
++
++	dev_info(dbgxnet, "xlinknet %s exited [%p].\n", __func__, xnet);
++	return 0;
++}
++
++/*
++ * Network layer has formatted a packet (skb) and is ready to place it
++ * "on the wire".
++ *
++ * MAC-NOTE:  For the xlinknet driver, the MAC address contains the
++ * unique board and soc in a host.
++ */
++static netdev_tx_t
++xlinknet_dev_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct xlinknet *xnet = netdev_priv(dev);
++	struct xlink_msg *msg;
++	unsigned long flags;
++
++	msg = kzalloc(sizeof(*msg), GFP_NOWAIT);
++	if (!msg)
++		return X_LINK_ERROR;
++
++	if (skb->len >= XLINKNET_MAX_MTU)
++		dev_warn(dbgxnet, "skb_len %d\n", skb->len);
++
++	msg->skb = skb;
++	spin_lock_irqsave(&xnet->lock, flags);
++	list_add_tail(&msg->node, &xnet->head);
++	spin_unlock_irqrestore(&xnet->lock, flags);
++
++	complete(&xnet->pkt_available);
++
++	return NETDEV_TX_OK;
++}
++
++/*
++ * Deal with transmit timeouts coming from the network layer.
++ */
++static void
++#if defined(CONFIG_XLINKNET_REMOTEHOST)
++xlinknet_dev_tx_timeout(struct net_device *dev)
++#else
++xlinknet_dev_tx_timeout(struct net_device *dev, unsigned int txqueue)
++#endif
++{
++	dev->stats.tx_errors++;
++}
++
++int xlinknet_eth_init(void *thread_param)
++{
++	char device_name[XLINK_MAX_DEVICE_NAME_SIZE] = {0};
++	struct xlinknet *xnet;
++	u32 stat = 0xFF;
++	u32 rc = 0;
++
++	struct net_device *dev = (struct net_device *)thread_param;
++
++	xnet = netdev_priv(dev);	/* allocated in alloc_netdev */
++
++	netdev_dbg(dev, "%s = %p\n", __func__, xnet);
++
++	xnet->xhandle.dev_type = HOST_DEVICE;
++	xnet->xhandle.sw_device_id = xnet->sw_device_id;
++	xnet->dev = dev;
++	xlink_get_device_name(&xnet->xhandle, device_name,
++			      XLINK_MAX_DEVICE_NAME_SIZE);
++	netdev_dbg(dev, "xlink-net Device name: %d %s\n",
++		   xnet->xhandle.sw_device_id, device_name);
++
++	rc = X_LINK_ERROR;
++	while (rc != X_LINK_SUCCESS) {
++		rc = xlink_boot_device(&xnet->xhandle, device_name);
++		msleep_interruptible(1000);
++	}
++	dev_info(dbgxnet, "BootDevice %s:%d\n", device_name,
++		 xnet->xhandle.sw_device_id);
++
++	rc = X_LINK_ERROR;
++
++	while (rc != X_LINK_SUCCESS)
++		rc = xlink_get_device_status(&xnet->xhandle, &stat);
++
++	rc = X_LINK_ERROR;
++	while (rc  != X_LINK_SUCCESS)
++		rc = xlink_connect(&xnet->xhandle);
++	dev_info(dbgxnet, "xlink_connect done with %s:%d\n",
++		 device_name, xnet->xhandle.sw_device_id);
++
++	while ((rc = xlink_open_channel(&xnet->xhandle,
++					XLINKNET_XLINK_CHANNEL,
++					RXB_TXB, /* mode */
++					(XLINKNET_MAX_MTU),
++					0 /* timeout */)) != 0) {
++	}
++
++	/* create receiver thread */
++	xnet->task_recv = kthread_run(receive_thread, (void *)xnet,
++				      "xlinknet_recv");
++	if (!xnet->task_recv) {
++		dev_err(dbgxnet, "thread creation failure.\n");
++		free_netdev(dev);
++		return -ENOMEM;
++	}
++
++	xnet->task_send = kthread_run(sender_thread, (void *)xnet,
++				      "xlinknet_send");
++	if (!xnet->task_send) {
++		dev_err(dbgxnet, "task_send: thread creation failure.\n");
++		free_netdev(dev);
++		return -ENOMEM;
++	}
++
++	netif_carrier_on(dev);
++	netif_start_queue(dev);
++
++	return rc;
++}
++
++static int
++xlinknet_dev_open(struct net_device *dev)
++{
++	netdev_priv(dev);
++	return 0;
++}
++
++static int xlinknet_eth_uninit(struct net_device *dev)
++{
++	struct xlinknet *xnet;
++
++	xnet = netdev_priv(dev);	/* allocated in alloc_netdev */
++
++	/* printk(KERN_INFO "%s = %p\n",__func__, xnet);*/
++	netdev_dbg(dev, "%s = %p\n", __func__, xnet);
++
++	/* delete the sender/receiver thread */
++	if (xnet->task_send) {
++		kthread_stop(xnet->task_send);
++		xnet->task_send = NULL;
++	}
++	if (xnet->task_recv) {
++		kthread_stop(xnet->task_recv);
++		xnet->task_recv = NULL;
++	}
++	xlink_disconnect(&xnet->xhandle);
++	return 0;
++}
++
++static int
++xlinknet_dev_stop(struct net_device *dev)
++{
++	netdev_priv(dev);
++	dev_dbg(dbgxnet, "ifconfig down of %s; xlink disconnected\n", dev->name);
++	return 0;
++}
++
++static const struct net_device_ops xlinknet_netdev_ops = {
++	 /* ifconfig XLINKNET_DEVICE_NAME up */
++	.ndo_open		= xlinknet_dev_open,
++	 /* ifconfig XLINKNET_DEVICE_NAME down */
++	.ndo_stop		= xlinknet_dev_stop,
++	.ndo_start_xmit		= xlinknet_dev_xmit,
++	.ndo_tx_timeout		= xlinknet_dev_tx_timeout,
++	.ndo_set_mac_address	= eth_mac_addr,
++	/* ifconfig XLINKNET_DEVICE_NAME hw ether 02:01:02:03:04:08*/
++	.ndo_validate_addr	= eth_validate_addr,
++};
++
++static int xlinknet_eth_probe(struct platform_device *ofdev)
++{
++	struct device *device = &ofdev->dev;
++	struct net_device *dev;
++	struct xlinknet *xnet;
++	int result;
++
++	dev_info(dbgxnet, "register network device %s\n", XLINKNET_DEVICE_NAME);
++
++	/*
++	 * use ether_setup() to init the majority of our device
++	 * structure and then override the  necessary pieces.
++	 */
++	dev = alloc_netdev(sizeof(struct xlinknet), XLINKNET_DEVICE_NAME,
++			   NET_NAME_UNKNOWN,
++			   ether_setup);
++	if (!dev)
++		return -ENOMEM;
++
++	dev_set_drvdata(device, dev);
++	SET_NETDEV_DEV(dev, device);	/* setup the parent */
++
++	xnet = netdev_priv(dev);	/* allocated in alloc_netdev */
++
++	xnet->sw_device_id = ofdev->id;
++
++	init_completion(&xnet->pkt_available);
++	INIT_LIST_HEAD(&xnet->head);
++	spin_lock_init(&xnet->lock);
++
++	/* perform network related stuffs */
++
++	netif_carrier_off(dev);
++
++	dev->netdev_ops = &xlinknet_netdev_ops;
++	dev->mtu = XLINKNET_DEF_MTU;
++	dev->min_mtu = XLINKNET_MIN_MTU;
++	dev->max_mtu = XLINKNET_MAX_MTU;
++
++	/*
++	 * We chose the first octet of the MAC to be unlikely
++	 * to collide with any vendor's officially issued MAC.
++	 */
++	dev->dev_addr[0] = 0x02;     /* locally administered, no OUI */
++
++#if defined(CONFIG_XLINKNET_REMOTEHOST)
++	/* MAC address for remote host will be having 0xFF @ 2 */
++	dev->dev_addr[1] = 0xFF;
++#else
++	/* MAC address for remote host will be having 0xFF @ */
++	dev->dev_addr[1] = 0x00;
++#endif	/* XLINKNET_REMOTEHOST */
++	memcpy(&dev->dev_addr[2], &ofdev->id, sizeof(ofdev->id));
++
++	/*
++	 * ether_setup() sets this to a multicast device.  We are
++	 * really not supporting multicast at this time.
++	 */
++	dev->flags &= ~IFF_MULTICAST;
++
++	result = register_netdev(dev);
++	if (result != 0) {
++		dev_err(dbgxnet, "network device registration failed.\n");
++		free_netdev(dev);
++		return -ENOMEM;
++	}
++
++	netif_carrier_off(dev);
++
++	kthread_run(xlinknet_eth_init, (void *)dev, "xlinknet_eth_init");
++
++	netdev_dbg(dev, "%s = %p\n", __func__, xnet);
++
++	return result;
++}
++
++static int xlinknet_eth_remove(struct platform_device *ofdev)
++{
++	struct net_device *dev = platform_get_drvdata(ofdev);
++
++	dev_info(dbgxnet, "unregistering network device %s\n",
++		 dev->name);
++
++	xlinknet_eth_uninit(dev);
++
++	unregister_netdev(dev);
++	free_netdev(dev);
++	return 0;
++}
++
++static struct platform_driver xlinknet_eth_driver = {
++	.driver = {
++		.name = XLINKNET_DRIVER_NAME,
++	},
++	.probe          = xlinknet_eth_probe,
++	.remove         = xlinknet_eth_remove,
++};
++
++static int __init xlinknet_init(void)
++{
++	struct platform_device_info xlink_net_info[8] = {0};
++	u32 num_devices = 0, i = 0, rc = 0;
++	u32 sw_device_id_list[12];
++	int ret;
++
++	dev_info(dbgxnet, "Loading xlinknet module...\n");
++	ret = platform_driver_register(&xlinknet_eth_driver);
++
++	rc = xlink_get_device_list(sw_device_id_list, &num_devices);
++	if (rc) {
++		dev_info(dbgxnet, "Failed to get device list = %x\n", rc);
++		return 0;
++	}
++	dev_info(dbgxnet, "xlinknet: %d devices found\n", num_devices);
++	if (num_devices == 0) {
++		dev_info(dbgxnet, "HDDL:No devices found\n");
++		return 0;
++	}
++
++	for (i = 0; i < num_devices; i++) {
++		if (GET_INTERFACE_FROM_SW_DEVICE_ID(sw_device_id_list[i])
++						== SW_DEVICE_ID_PCIE_INTERFACE) {
++			xlink_net_info[i].name = XLINKNET_DRIVER_NAME;
++			xlink_net_info[i].id =  sw_device_id_list[i];
++			platform_device_register_full(&xlink_net_info[i]);
++		}
++	}
++
++	return ret;
++}
++
++static void __exit xlinknet_exit(void)
++{
++	dev_info(dbgxnet, "Unloading xlinknet module...\n");
++	platform_driver_unregister(&xlinknet_eth_driver);
++}
++
++module_init(xlinknet_init);
++module_exit(xlinknet_exit);
++
++MODULE_AUTHOR("Raja Subramanian, Lakshmi Bai <lakshmi.bai.raja.subramanian@intel.com>");
++MODULE_AUTHOR("Thalaiappan, Rathina <rathina.thalaiappan@intel.com>");
++MODULE_DESCRIPTION("Network adapter over xlink");
++MODULE_LICENSE("GPL");
+-- 
+2.27.0
+

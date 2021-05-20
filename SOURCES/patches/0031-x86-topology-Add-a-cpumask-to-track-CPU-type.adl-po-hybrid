@@ -1,0 +1,145 @@
+From 3d8d239de210a5eed9e769da852db1db354dd34e Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Sun, 16 Feb 2020 16:30:33 -0800
+Subject: [PATCH 31/68] x86/topology: Add a cpumask to track CPU type
+
+In systems with hybrid CPUs (i.e., systems in which more than one type
+of CPU exist in the same package), these attributes are populated from
+the information exposed by the hardware via CPUID. In non-hybrid systems,
+the CPU type topology attributes are visible and will reflect that all
+CPUs are the same type.
+
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Aubrey Li <aubrey.li@intel.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Suggested-by: Len Brown <len.brown@intel.com>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ arch/x86/include/asm/smp.h      |  1 +
+ arch/x86/include/asm/topology.h |  2 ++
+ arch/x86/kernel/smpboot.c       | 24 ++++++++++++++++++++++++
+ arch/x86/xen/smp_pv.c           |  1 +
+ 4 files changed, 28 insertions(+)
+
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index 630ff08532be..b080d15e3824 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -13,6 +13,7 @@ extern unsigned int num_processors;
+ 
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_map);
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_map);
++DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_type_map);
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_die_map);
+ /* cpus sharing the last level cache: */
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 599789c7f2cb..8d08991e2cdd 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -111,12 +111,14 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #define topology_logical_die_id(cpu)		(cpu_data(cpu).logical_die_id)
+ #define topology_die_id(cpu)			(cpu_data(cpu).cpu_die_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
++#define topology_core_type_id(cpu)		(cpu_data(cpu).x86_cpu_type)
+ 
+ extern unsigned int __max_die_per_package;
+ 
+ #ifdef CONFIG_SMP
+ #define topology_die_cpumask(cpu)		(per_cpu(cpu_die_map, cpu))
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
++#define topology_type_cpumask(cpu)		(per_cpu(cpu_type_map, cpu))
+ #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ 
+ extern unsigned int __max_logical_packages;
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 16703c35a944..c718b7729d7a 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -95,6 +95,10 @@ EXPORT_PER_CPU_SYMBOL(cpu_sibling_map);
+ DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_map);
+ EXPORT_PER_CPU_SYMBOL(cpu_core_map);
+ 
++/* representing CPU type siblings of each logical CPU */
++DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_type_map);
++EXPORT_PER_CPU_SYMBOL(cpu_type_map);
++
+ /* representing HT, core, and die siblings of each logical CPU */
+ DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_die_map);
+ EXPORT_PER_CPU_SYMBOL(cpu_die_map);
+@@ -513,6 +517,19 @@ static bool match_pkg(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
+ 	return false;
+ }
+ 
++static bool match_cpu_type(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
++{
++	u8 type_c, type_o;
++
++	type_c = get_hybrid_cpu_type(c->cpu_index);
++	type_o = get_hybrid_cpu_type(o->cpu_index);
++
++	if (type_c == type_o)
++		return true;
++
++	return 0;
++}
++
+ static bool match_die(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
+ {
+ 	if ((c->phys_proc_id == o->phys_proc_id) &&
+@@ -584,6 +601,7 @@ void set_cpu_sibling_map(int cpu)
+ 		cpumask_set_cpu(cpu, topology_sibling_cpumask(cpu));
+ 		cpumask_set_cpu(cpu, cpu_llc_shared_mask(cpu));
+ 		cpumask_set_cpu(cpu, topology_core_cpumask(cpu));
++		cpumask_set_cpu(cpu, topology_type_cpumask(cpu));
+ 		cpumask_set_cpu(cpu, topology_die_cpumask(cpu));
+ 		c->booted_cores = 1;
+ 		return;
+@@ -598,6 +616,8 @@ void set_cpu_sibling_map(int cpu)
+ 		if ((i == cpu) || (has_mp && match_llc(c, o)))
+ 			link_mask(cpu_llc_shared_mask, cpu, i);
+ 
++		if ((i == cpu) || (has_mp && match_cpu_type(c, o)))
++			link_mask(topology_type_cpumask, cpu, i);
+ 	}
+ 
+ 	/*
+@@ -1330,6 +1350,7 @@ void __init native_smp_prepare_cpus(unsigned int max_cpus)
+ 	for_each_possible_cpu(i) {
+ 		zalloc_cpumask_var(&per_cpu(cpu_sibling_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_core_map, i), GFP_KERNEL);
++		zalloc_cpumask_var(&per_cpu(cpu_type_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_die_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_llc_shared_map, i), GFP_KERNEL);
+ 	}
+@@ -1554,11 +1575,14 @@ static void remove_siblinginfo(int cpu)
+ 		cpumask_clear_cpu(cpu, topology_die_cpumask(sibling));
+ 	for_each_cpu(sibling, topology_sibling_cpumask(cpu))
+ 		cpumask_clear_cpu(cpu, topology_sibling_cpumask(sibling));
++	for_each_cpu(sibling, topology_type_cpumask(cpu))
++		cpumask_clear_cpu(cpu, topology_type_cpumask(sibling));
+ 	for_each_cpu(sibling, cpu_llc_shared_mask(cpu))
+ 		cpumask_clear_cpu(cpu, cpu_llc_shared_mask(sibling));
+ 	cpumask_clear(cpu_llc_shared_mask(cpu));
+ 	cpumask_clear(topology_sibling_cpumask(cpu));
+ 	cpumask_clear(topology_core_cpumask(cpu));
++	cpumask_clear(topology_type_cpumask(cpu));
+ 	cpumask_clear(topology_die_cpumask(cpu));
+ 	c->cpu_core_id = 0;
+ 	c->booted_cores = 0;
+diff --git a/arch/x86/xen/smp_pv.c b/arch/x86/xen/smp_pv.c
+index c2ac319f11a4..348619a9c7b6 100644
+--- a/arch/x86/xen/smp_pv.c
++++ b/arch/x86/xen/smp_pv.c
+@@ -245,6 +245,7 @@ static void __init xen_pv_smp_prepare_cpus(unsigned int max_cpus)
+ 	for_each_possible_cpu(i) {
+ 		zalloc_cpumask_var(&per_cpu(cpu_sibling_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_core_map, i), GFP_KERNEL);
++		zalloc_cpumask_var(&per_cpu(cpu_type_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_die_map, i), GFP_KERNEL);
+ 		zalloc_cpumask_var(&per_cpu(cpu_llc_shared_map, i), GFP_KERNEL);
+ 	}
+-- 
+2.27.0
+

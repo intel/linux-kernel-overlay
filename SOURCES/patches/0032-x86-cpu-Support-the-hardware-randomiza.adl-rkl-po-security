@@ -1,0 +1,192 @@
+From 25b0026cdb978cd7f7e5253b2f3ed64c4ed20c44 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Tue, 15 Dec 2020 09:07:57 -0800
+Subject: [PATCH 32/33] x86/cpu: Support the hardware randomization option for
+ Key Locker internal key
+
+Hardware can load the internal key with randomization. random.trust_cpu
+determines the use of the CPU's random number generator. Take the parameter
+to use the CPU's internal key randomization.
+
+The backup mechanism is required to distribute the key. It is the only
+way to copy the (unknown) key value to other CPUs.
+
+This randomization option is disabled when hardware does not support the
+key backup.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: x86@kernel.org
+Cc: linux-doc@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ arch/x86/include/asm/keylocker.h |  2 +-
+ arch/x86/kernel/cpu/common.c     |  4 +++-
+ arch/x86/kernel/keylocker.c      | 31 ++++++++++++++++++++++++++++---
+ drivers/char/random.c            |  6 ++++++
+ include/linux/random.h           |  2 ++
+ 5 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/include/asm/keylocker.h b/arch/x86/include/asm/keylocker.h
+index 722574c305c2..a6774ced916a 100644
+--- a/arch/x86/include/asm/keylocker.h
++++ b/arch/x86/include/asm/keylocker.h
+@@ -19,7 +19,7 @@ bool check_keylocker_readiness(void);
+ 
+ bool load_keylocker(void);
+ 
+-void make_keylocker_data(void);
++void make_keylocker_data(bool use_hwrand);
+ #ifdef CONFIG_X86_KEYLOCKER
+ void invalidate_keylocker_data(void);
+ #else
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index b2c0ccabb630..4fd867b8c0a4 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -22,6 +22,7 @@
+ #include <linux/io.h>
+ #include <linux/syscore_ops.h>
+ #include <linux/pgtable.h>
++#include <linux/random.h>
+ 
+ #include <asm/cmdline.h>
+ #include <asm/stackprotector.h>
+@@ -485,12 +486,13 @@ static __always_inline void setup_keylocker(struct cpuinfo_x86 *c)
+ 	cr4_set_bits(X86_CR4_KEYLOCKER);
+ 
+ 	if (c == &boot_cpu_data) {
++		bool use_hwrand = check_random_trust_cpu();
+ 		bool keyloaded;
+ 
+ 		if (!check_keylocker_readiness())
+ 			goto disable_keylocker;
+ 
+-		make_keylocker_data();
++		make_keylocker_data(use_hwrand);
+ 
+ 		keyloaded = load_keylocker();
+ 		if (!keyloaded) {
+diff --git a/arch/x86/kernel/keylocker.c b/arch/x86/kernel/keylocker.c
+index 229875ac80d5..e77e4c3d785e 100644
+--- a/arch/x86/kernel/keylocker.c
++++ b/arch/x86/kernel/keylocker.c
+@@ -13,6 +13,7 @@
+ #include <asm/fpu/api.h>
+ 
+ static bool keybackup_available;
++static bool keyhwrand_available;
+ 
+ bool check_keylocker_readiness(void)
+ {
+@@ -33,25 +34,33 @@ bool check_keylocker_readiness(void)
+ 		pr_debug("x86/keylocker: no key backup support with possible S3/4\n");
+ 		return false;
+ 	}
++
++	keyhwrand_available = (ecx & KEYLOCKER_CPUID_ECX_RAND);
+ 	return true;
+ }
+ 
+ /* Load Internal (Wrapping) Key */
+ #define LOADIWKEY		".byte 0xf3,0x0f,0x38,0xdc,0xd1"
+ #define LOADIWKEY_NUM_OPERANDS	3
++#define LOADIWKEY_HWRAND_RETRY	10
+ 
+ static struct key {
+ 	bool valid;
++	bool hwrand;
+ 	struct reg_128_bit value[LOADIWKEY_NUM_OPERANDS];
+ } keydata;
+ 
+-void make_keylocker_data(void)
++void make_keylocker_data(bool use_hwrand)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < LOADIWKEY_NUM_OPERANDS; i++)
+ 		get_random_bytes(&keydata.value[i], sizeof(struct reg_128_bit));
+ 
++	keydata.hwrand = (use_hwrand && keyhwrand_available && keybackup_available);
++	if (use_hwrand && !keydata.hwrand)
++		pr_warn("x86/keylocker: hardware random key not fully supported\n");
++
+ 	keydata.valid = true;
+ }
+ 
+@@ -63,12 +72,22 @@ void invalidate_keylocker_data(void)
+ }
+ 
+ #define USE_SWKEY	0
++#define USE_HWRANDKEY	BIT(1)
+ 
+ bool load_keylocker(void)
+ {
+ 	struct reg_128_bit zeros = { 0 };
+-	u32 keysrc = USE_SWKEY;
+ 	bool err = true;
++	u32 keysrc;
++	int retry;
++
++	if (keydata.hwrand) {
++		keysrc = USE_HWRANDKEY;
++		retry = LOADIWKEY_HWRAND_RETRY;
++	} else {
++		keysrc = USE_SWKEY;
++		retry = 0;
++	}
+ 
+ 	kernel_fpu_begin();
+ 
+@@ -77,13 +96,19 @@ bool load_keylocker(void)
+ 			 "m"(keydata.value[1]),
+ 			 "m"(keydata.value[2]));
+ 
+-	asm volatile (LOADIWKEY CC_SET(z) : CC_OUT(z) (err) : "a"(keysrc));
++	do {
++		asm volatile (LOADIWKEY CC_SET(z) : CC_OUT(z) (err) : "a"(keysrc));
++		retry--;
++	} while (err && retry >= 0);
+ 
+ 	asm volatile ("movdqu %0, %%xmm0; movdqu %0, %%xmm1; movdqu %0, %%xmm2;"
+ 		      :: "m"(zeros));
+ 
+ 	kernel_fpu_end();
+ 
++	if (keydata.hwrand)
++		invalidate_keylocker_data();
++
+ 	return err ? false : true;
+ }
+ 
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 0fe9e200e4c8..098039e0a488 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -781,6 +781,12 @@ static int __init parse_trust_cpu(char *arg)
+ }
+ early_param("random.trust_cpu", parse_trust_cpu);
+ 
++bool check_random_trust_cpu(void)
++{
++	return trust_cpu;
++}
++EXPORT_SYMBOL(check_random_trust_cpu);
++
+ static bool crng_init_try_arch(struct crng_state *crng)
+ {
+ 	int		i;
+diff --git a/include/linux/random.h b/include/linux/random.h
+index f45b8be3e3c4..f08f44988b13 100644
+--- a/include/linux/random.h
++++ b/include/linux/random.h
+@@ -158,4 +158,6 @@ static inline bool __init arch_get_random_long_early(unsigned long *v)
+ }
+ #endif
+ 
++extern bool check_random_trust_cpu(void);
++
+ #endif /* _LINUX_RANDOM_H */
+-- 
+2.27.0
+

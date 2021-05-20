@@ -1,0 +1,413 @@
+From 1d263e41528073d9543f2110f33a5d91c036374c Mon Sep 17 00:00:00 2001
+From: Ira Weiny <ira.weiny@intel.com>
+Date: Mon, 30 Mar 2020 15:18:54 -0700
+Subject: [PATCH 37/63] memremap: Add zone device access protection
+
+Device managed memory exposes itself to the kernel direct map which
+allows stray pointers to access these device memories.
+
+Stray pointers to normal memory may result in a crash or other
+undesirable behavior which, while unfortunate, are usually recoverable
+with a reboot.  Stray access, specifically stray writes, to areas such
+as non-volatile memory are permanent in nature and thus are more likely
+to result in permanent user data loss vs stray access to other memory
+areas.
+
+Furthermore, reads to poison can cause fatal errors which are difficult
+to recover from.
+
+Set up an infrastructure for extra device access protection. Then
+implement the new protection using the new Protection Keys Supervisor
+(PKS) on architectures which support it.
+
+To enable this extra protection kernel code specifies a new flag
+(PGMAP_PROT_ENABLED) in (struct dev_pagemap)->flags to indicate that
+these pages have additional protection.
+
+Kernel code which then intends to access this memory can do so through
+the dev_mk_readwrite() and dev_mk_noaccess() calls.
+
+All changes in the protections must be through the dev_mk_*() calls.
+They are optimized to be low overhead especially if device protection is
+not in use.  Furthermore, They are nestable by the use of a per task
+reference count.  This reference count is critical to allows a thread to
+nest calls to disable protection such that the first call to re-enable
+protection does not 'break' the last access of the pmem device memory.
+
+In addition, the reference count must be preserved across an exception.
+Use the reserved space in extended_pt_regs to store this reference
+count.
+
+The following shows how this works through an exception:
+
+    ...
+            // ref == 0
+            dev_mk_readwrite()  // ref += 1 ==> disable protection
+                    irq()
+                            // enable protection
+                            // ref = 0
+                            _handler()
+                                    dev_mk_readwrite()  // ref += 1
+                                    dev_mk_noaccess() // ref -= 1
+                            // WARN_ON(ref != 0)
+                            // disable protection
+            do_pmem_thing()  // all good here
+            dev_mk_noaccess() // ref -= 1 ==> 0 ==> enable protection
+    ...
+
+Nested exceptions operate the same way with each exception storing the
+interrupted exception state all the way down.
+
+NOTE That the reference counting for device access should be done at
+this level to allow dev_mk_[readwrite|noaccess]() to interoperate
+with the kmap calls.
+
+More specifically, dax_iomap_actor() must enable device access while
+dax_copy_from_iter() is running.  dax_copy_from_iter() can (depending on
+the underlying calls) call kmap_atomic().  While the code in
+dax_iomap_actor() could be modified to interleave calls to pks_mk_*() it
+is much better to allow this to be generally safe by placing the
+reference counting in the lower level dev_mk_*() calls.
+
+Finally the pkey value is never free'ed as this optimizes the
+implementation to be either on or off using a static branch conditional
+in the fast paths.
+
+Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+---
+ arch/x86/entry/common.c    | 22 ++++++++++
+ arch/x86/include/asm/pks.h |  3 +-
+ include/linux/memremap.h   |  1 +
+ include/linux/mm.h         | 43 ++++++++++++++++++++
+ include/linux/sched.h      |  3 ++
+ init/init_task.c           |  3 ++
+ kernel/fork.c              |  3 ++
+ mm/Kconfig                 | 15 ++++++-
+ mm/memremap.c              | 82 ++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 172 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index 29ecf828c1f9..d27d96d57512 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -238,6 +238,12 @@ void show_extended_regs_oops(struct pt_regs *regs, unsigned error_code)
+  * To protect against exceptions having access to this memory we save the
+  * current running value and sets the PKRS value to be used during the
+  * exception.
++ *
++ * Zone Device Access Protection maintains access in a re-entrant manner
++ * through a reference count which also needs to be maintained should exception
++ * handlers use those interfaces for memory access.  Here we start off the
++ * exception handler ref count to 0 and ensure it is 0 when the exception is
++ * done.  Then restore it for the interrupted task.
+  */
+ void pkrs_save_set_irq(struct pt_regs *regs, u32 val)
+ {
+@@ -252,6 +258,16 @@ void pkrs_save_set_irq(struct pt_regs *regs, u32 val)
+ 
+ 	ept_regs = extended_pt_regs(regs);
+ 	ept_regs->thread_pkrs = current->thread.saved_pkrs;
++
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++	/*
++	 * Save the ref count of the current running process and set it to 0
++	 * for any irq users to properly track re-entrance
++	 */
++	ept_regs->pkrs_ref = current->dev_page_access_ref;
++	current->dev_page_access_ref = 0;
++#endif
++
+ 	write_pkrs(val);
+ }
+ 
+@@ -265,6 +281,12 @@ void pkrs_restore_irq(struct pt_regs *regs)
+ 	ept_regs = extended_pt_regs(regs);
+ 	write_pkrs(ept_regs->thread_pkrs);
+ 	current->thread.saved_pkrs = ept_regs->thread_pkrs;
++
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++	WARN_ON_ONCE(current->dev_page_access_ref != 0);
++	/* Restore the interrupted process reference */
++	current->dev_page_access_ref = ept_regs->pkrs_ref;
++#endif
+ }
+ 
+ #endif /* CONFIG_ARCH_ENABLE_SUPERVISOR_PKEYS */
+diff --git a/arch/x86/include/asm/pks.h b/arch/x86/include/asm/pks.h
+index 9e71322b0cf2..ac2965830e07 100644
+--- a/arch/x86/include/asm/pks.h
++++ b/arch/x86/include/asm/pks.h
+@@ -10,8 +10,7 @@
+ 
+ struct extended_pt_regs {
+ 	u32 thread_pkrs;
+-	/* Keep stack 8 byte aligned */
+-	u32 pad;
++	u32 pkrs_ref;
+ 	struct pt_regs pt_regs;
+ };
+ 
+diff --git a/include/linux/memremap.h b/include/linux/memremap.h
+index f5b464daeeca..25a2429c2d87 100644
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@ -90,6 +90,7 @@ struct dev_pagemap_ops {
+ };
+ 
+ #define PGMAP_ALTMAP_VALID	(1 << 0)
++#define PGMAP_PROT_ENABLED	(1 << 1)
+ 
+ /**
+  * struct dev_pagemap - metadata for ZONE_DEVICE mappings
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 8ba434287387..0b7107279098 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1171,6 +1171,49 @@ static inline bool is_pci_p2pdma_page(const struct page *page)
+ 		page->pgmap->type == MEMORY_DEVICE_PCI_P2PDMA;
+ }
+ 
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++DECLARE_STATIC_KEY_FALSE(dev_protection_static_key);
++
++/*
++ * Make page_is_access_protected() as quick as possible.
++ *    1) If no mappings have been enabled with extra protection we skip this
++ *       entirely
++ *    2) Skip pages which are not ZONE_DEVICE
++ *    3) Only then check if this particular page was mapped with extra
++ *       protections.
++ */
++static inline bool page_is_access_protected(struct page *page)
++{
++	if (!static_branch_unlikely(&dev_protection_static_key))
++		return false;
++	if (!is_zone_device_page(page))
++		return false;
++	if (page->pgmap->flags & PGMAP_PROT_ENABLED)
++		return true;
++	return false;
++}
++
++void __dev_mk_readwrite(void);
++void __dev_mk_noaccess(void);
++static __always_inline void dev_mk_readwrite(void)
++{
++	if (static_branch_unlikely(&dev_protection_static_key))
++		__dev_mk_readwrite();
++}
++static __always_inline void dev_mk_noaccess(void)
++{
++	if (static_branch_unlikely(&dev_protection_static_key))
++		__dev_mk_noaccess();
++}
++#else
++static inline bool page_is_access_protected(struct page *page)
++{
++	return false;
++}
++static inline void dev_mk_readwrite(void) { }
++static inline void dev_mk_noaccess(void) { }
++#endif /* CONFIG_ZONE_DEVICE_ACCESS_PROTECTION */
++
+ /* 127: arbitrary random number, small enough to assemble well */
+ #define page_ref_zero_or_close_to_overflow(page) \
+ 	((unsigned int) page_ref_count(page) + 127u <= 127u)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ef00bb22164c..4ff9d081ab29 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1371,6 +1371,9 @@ struct task_struct {
+ 	struct llist_head               kretprobe_instances;
+ #endif
+ 
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++	u32                             dev_page_access_ref;
++#endif
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+ 	 * they are included in the randomized portion of task_struct.
+diff --git a/init/init_task.c b/init/init_task.c
+index 3711cdaafed2..6e2ef6c34959 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -213,6 +213,9 @@ struct task_struct init_task
+ #ifdef CONFIG_SECCOMP
+ 	.seccomp	= { .filter_count = ATOMIC_INIT(0) },
+ #endif
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++	.dev_page_access_ref = 0,
++#endif
+ };
+ EXPORT_SYMBOL(init_task);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 426cd0c51f9e..88c55903eef2 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -944,6 +944,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 
+ #ifdef CONFIG_MEMCG
+ 	tsk->active_memcg = NULL;
++#endif
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++	tsk->dev_page_access_ref = 0;
+ #endif
+ 	return tsk;
+ 
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 463e95ea0df1..8bd7c4900141 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -780,6 +780,19 @@ config ZONE_DEVICE
+ 
+ 	  If FS_DAX is enabled, then say Y.
+ 
++config ZONE_DEVICE_ACCESS_PROTECTION
++	bool "Device memory access protection"
++	depends on ZONE_DEVICE
++	depends on ARCH_HAS_SUPERVISOR_PKEYS
++
++	help
++	  Enable extra protections on device memory.  This protects against
++	  unintended access to device such as a stray write.  This feature is
++	  particularly useful to protect against corruption of persistent
++	  memory.
++
++	  If in doubt, say 'Y'.
++
+ config DEV_PAGEMAP_OPS
+ 	bool
+ 
+@@ -812,7 +825,7 @@ config ARCH_HAS_SUPERVISOR_PKEYS
+ 	bool
+ config ARCH_ENABLE_SUPERVISOR_PKEYS
+ 	def_bool y
+-	depends on PKS_TEST
++	depends on (PKS_TEST || ZONE_DEVICE_ACCESS_PROTECTION)
+ 
+ config PERCPU_STATS
+ 	bool "Collect percpu memory statistics"
+diff --git a/mm/memremap.c b/mm/memremap.c
+index 7aa7d6e80ee5..49da759facd9 100644
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -6,12 +6,16 @@
+ #include <linux/memory_hotplug.h>
+ #include <linux/mm.h>
+ #include <linux/pfn_t.h>
++#include <linux/pkeys.h>
+ #include <linux/swap.h>
+ #include <linux/mmzone.h>
+ #include <linux/swapops.h>
+ #include <linux/types.h>
+ #include <linux/wait_bit.h>
+ #include <linux/xarray.h>
++#include <uapi/asm-generic/mman-common.h>
++
++#define PKEY_INVALID (INT_MIN)
+ 
+ static DEFINE_XARRAY(pgmap_array);
+ 
+@@ -63,6 +67,81 @@ static void devmap_managed_enable_put(struct dev_pagemap *pgmap)
+ }
+ #endif /* CONFIG_DEV_PAGEMAP_OPS */
+ 
++#ifdef CONFIG_ZONE_DEVICE_ACCESS_PROTECTION
++/*
++ * Note; all devices which have asked for protections share the same key.  The
++ * key may, or may not, have been provided by the core.  If not, protection
++ * will remain disabled.  The key acquisition is attempted at init time and
++ * never again.  So we don't have to worry about dev_page_pkey changing.
++ */
++static int dev_page_pkey = PKEY_INVALID;
++DEFINE_STATIC_KEY_FALSE(dev_protection_static_key);
++EXPORT_SYMBOL(dev_protection_static_key);
++
++static pgprot_t dev_pgprot_get(struct dev_pagemap *pgmap, pgprot_t prot)
++{
++	if (pgmap->flags & PGMAP_PROT_ENABLED && dev_page_pkey != PKEY_INVALID) {
++		pgprotval_t val = pgprot_val(prot);
++
++		static_branch_inc(&dev_protection_static_key);
++		prot = __pgprot(val | _PAGE_PKEY(dev_page_pkey));
++	}
++	return prot;
++}
++
++static void dev_pgprot_put(struct dev_pagemap *pgmap)
++{
++	if (pgmap->flags & PGMAP_PROT_ENABLED && dev_page_pkey != PKEY_INVALID)
++		static_branch_dec(&dev_protection_static_key);
++}
++
++void __dev_mk_noaccess(void)
++{
++	if (!--current->dev_page_access_ref)
++		pks_mk_noaccess(dev_page_pkey);
++}
++EXPORT_SYMBOL_GPL(__dev_mk_noaccess);
++
++void __dev_mk_readwrite(void)
++{
++	if (!current->dev_page_access_ref++)
++		pks_mk_readwrite(dev_page_pkey);
++}
++EXPORT_SYMBOL_GPL(__dev_mk_readwrite);
++
++/**
++ * dev_access_protection_init: Configure a PKS key domain for device pages
++ *
++ * The domain defaults to the protected state.  Device page mappings should set
++ * the PGMAP_PROT_ENABLED flag when mapping pages.
++ *
++ * Note the pkey is never free'ed.  This is run at init time and we either get
++ * the key or we do not.  We need to do this to maintian a constant key (or
++ * not) as device memory is added or removed.
++ */
++static int __init __dev_access_protection_init(void)
++{
++	int pkey = pks_key_alloc("Device Memory");
++
++	if (pkey < 0)
++		return 0;
++
++	dev_page_pkey = pkey;
++
++	return 0;
++}
++subsys_initcall(__dev_access_protection_init);
++#else
++static pgprot_t dev_pgprot_get(struct dev_pagemap *pgmap, pgprot_t prot)
++{
++	return prot;
++}
++
++static void dev_pgprot_put(struct dev_pagemap *pgmap)
++{
++}
++#endif /* CONFIG_ZONE_DEVICE_ACCESS_PROTECTION */
++
+ static void pgmap_array_delete(struct range *range)
+ {
+ 	xa_store_range(&pgmap_array, PHYS_PFN(range->start), PHYS_PFN(range->end),
+@@ -181,6 +260,7 @@ void memunmap_pages(struct dev_pagemap *pgmap)
+ 
+ 	WARN_ONCE(pgmap->altmap.alloc, "failed to free all reserved pages\n");
+ 	devmap_managed_enable_put(pgmap);
++	dev_pgprot_put(pgmap);
+ }
+ EXPORT_SYMBOL_GPL(memunmap_pages);
+ 
+@@ -329,6 +409,8 @@ void *memremap_pages(struct dev_pagemap *pgmap, int nid)
+ 	if (WARN_ONCE(!nr_range, "nr_range must be specified\n"))
+ 		return ERR_PTR(-EINVAL);
+ 
++	params.pgprot = dev_pgprot_get(pgmap, params.pgprot);
++
+ 	switch (pgmap->type) {
+ 	case MEMORY_DEVICE_PRIVATE:
+ 		if (!IS_ENABLED(CONFIG_DEVICE_PRIVATE)) {
+-- 
+2.27.0
+

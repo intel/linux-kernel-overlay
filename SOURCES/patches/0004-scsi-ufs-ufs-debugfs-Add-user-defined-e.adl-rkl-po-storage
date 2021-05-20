@@ -1,0 +1,163 @@
+From f9f242a47a07c92c11c0791550af35b8e19c07ea Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Tue, 9 Feb 2021 08:24:37 +0200
+Subject: [PATCH 04/10] scsi: ufs: ufs-debugfs: Add user-defined exception
+ event rate limiting
+
+An enabled user-specified exception event that does not clear quickly will
+repeatedly cause the handler to run. That could unduly disturb the driver
+behaviour being tested or debugged. To prevent that add debugfs file
+exception_event_rate_limit_ms. When a exception event happens, it is
+disabled, and then after a period of time (default 20ms) the exception
+event is enabled again.
+
+Note that if the driver also has that exception event enabled, it will not
+be disabled.
+
+Link: https://lore.kernel.org/r/20210209062437.6954-5-adrian.hunter@intel.com
+Acked-by: Bean Huo <beanhuo@micron.com>
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+---
+ drivers/scsi/ufs/ufs-debugfs.c | 44 ++++++++++++++++++++++++++++++++++
+ drivers/scsi/ufs/ufs-debugfs.h |  2 ++
+ drivers/scsi/ufs/ufshcd.c      |  5 ++--
+ drivers/scsi/ufs/ufshcd.h      |  4 ++++
+ 4 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/ufs/ufs-debugfs.c b/drivers/scsi/ufs/ufs-debugfs.c
+index 59729073b569..ced9ef4d7c78 100644
+--- a/drivers/scsi/ufs/ufs-debugfs.c
++++ b/drivers/scsi/ufs/ufs-debugfs.c
+@@ -88,15 +88,59 @@ static int ee_usr_mask_set(void *data, u64 val)
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(ee_usr_mask_fops, ee_usr_mask_get, ee_usr_mask_set, "%#llx\n");
+ 
++void ufs_debugfs_exception_event(struct ufs_hba *hba, u16 status)
++{
++	bool chgd = false;
++	u16 ee_ctrl_mask;
++	int err = 0;
++
++	if (!hba->debugfs_ee_rate_limit_ms || !status)
++		return;
++
++	mutex_lock(&hba->ee_ctrl_mutex);
++	ee_ctrl_mask = hba->ee_drv_mask | (hba->ee_usr_mask & ~status);
++	chgd = ee_ctrl_mask != hba->ee_ctrl_mask;
++	if (chgd) {
++		err = __ufshcd_write_ee_control(hba, ee_ctrl_mask);
++		if (err)
++			dev_err(hba->dev, "%s: failed to write ee control %d\n",
++				__func__, err);
++	}
++	mutex_unlock(&hba->ee_ctrl_mutex);
++
++	if (chgd && !err) {
++		unsigned long delay = msecs_to_jiffies(hba->debugfs_ee_rate_limit_ms);
++
++		queue_delayed_work(system_freezable_wq, &hba->debugfs_ee_work, delay);
++	}
++}
++
++static void ufs_debugfs_restart_ee(struct work_struct *work)
++{
++	struct ufs_hba *hba = container_of(work, struct ufs_hba, debugfs_ee_work.work);
++
++	if (!hba->ee_usr_mask || pm_runtime_suspended(hba->dev) ||
++	    ufs_debugfs_get_user_access(hba))
++		return;
++	ufshcd_write_ee_control(hba);
++	ufs_debugfs_put_user_access(hba);
++}
++
+ void ufs_debugfs_hba_init(struct ufs_hba *hba)
+ {
++	/* Set default exception event rate limit period to 20ms */
++	hba->debugfs_ee_rate_limit_ms = 20;
++	INIT_DELAYED_WORK(&hba->debugfs_ee_work, ufs_debugfs_restart_ee);
+ 	hba->debugfs_root = debugfs_create_dir(dev_name(hba->dev), ufs_debugfs_root);
+ 	debugfs_create_file("stats", 0400, hba->debugfs_root, hba, &ufs_debugfs_stats_fops);
+ 	debugfs_create_file("exception_event_mask", 0600, hba->debugfs_root,
+ 			    hba, &ee_usr_mask_fops);
++	debugfs_create_u32("exception_event_rate_limit_ms", 0600, hba->debugfs_root,
++			   &hba->debugfs_ee_rate_limit_ms);
+ }
+ 
+ void ufs_debugfs_hba_exit(struct ufs_hba *hba)
+ {
+ 	debugfs_remove_recursive(hba->debugfs_root);
++	cancel_delayed_work_sync(&hba->debugfs_ee_work);
+ }
+diff --git a/drivers/scsi/ufs/ufs-debugfs.h b/drivers/scsi/ufs/ufs-debugfs.h
+index f35b39c4b4f5..3ca29d30460a 100644
+--- a/drivers/scsi/ufs/ufs-debugfs.h
++++ b/drivers/scsi/ufs/ufs-debugfs.h
+@@ -12,11 +12,13 @@ void __init ufs_debugfs_init(void);
+ void __exit ufs_debugfs_exit(void);
+ void ufs_debugfs_hba_init(struct ufs_hba *hba);
+ void ufs_debugfs_hba_exit(struct ufs_hba *hba);
++void ufs_debugfs_exception_event(struct ufs_hba *hba, u16 status);
+ #else
+ static inline void ufs_debugfs_init(void) {}
+ static inline void ufs_debugfs_exit(void) {}
+ static inline void ufs_debugfs_hba_init(struct ufs_hba *hba) {}
+ static inline void ufs_debugfs_hba_exit(struct ufs_hba *hba) {}
++static inline void ufs_debugfs_exception_event(struct ufs_hba *hba, u16 status) {}
+ #endif
+ 
+ #endif
+diff --git a/drivers/scsi/ufs/ufshcd.c b/drivers/scsi/ufs/ufshcd.c
+index 6870b6618db5..adb1bbc05f7c 100644
+--- a/drivers/scsi/ufs/ufshcd.c
++++ b/drivers/scsi/ufs/ufshcd.c
+@@ -5161,14 +5161,14 @@ static irqreturn_t ufshcd_transfer_req_compl(struct ufs_hba *hba)
+ 	}
+ }
+ 
+-static int __ufshcd_write_ee_control(struct ufs_hba *hba, u32 ee_ctrl_mask)
++int __ufshcd_write_ee_control(struct ufs_hba *hba, u32 ee_ctrl_mask)
+ {
+ 	return ufshcd_query_attr_retry(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
+ 				       QUERY_ATTR_IDN_EE_CONTROL, 0, 0,
+ 				       &ee_ctrl_mask);
+ }
+ 
+-static int ufshcd_write_ee_control(struct ufs_hba *hba)
++int ufshcd_write_ee_control(struct ufs_hba *hba)
+ {
+ 	int err;
+ 
+@@ -5636,6 +5636,7 @@ static void ufshcd_exception_event_handler(struct work_struct *work)
+ 	if (status & hba->ee_drv_mask & MASK_EE_URGENT_BKOPS)
+ 		ufshcd_bkops_exception_event_handler(hba);
+ 
++	ufs_debugfs_exception_event(hba, status);
+ out:
+ 	ufshcd_scsi_unblock_requests(hba);
+ 	/*
+diff --git a/drivers/scsi/ufs/ufshcd.h b/drivers/scsi/ufs/ufshcd.h
+index 9011a6dee16e..1af91661dc83 100644
+--- a/drivers/scsi/ufs/ufshcd.h
++++ b/drivers/scsi/ufs/ufshcd.h
+@@ -843,6 +843,8 @@ struct ufs_hba {
+ #endif
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs_root;
++	struct delayed_work debugfs_ee_work;
++	u32 debugfs_ee_rate_limit_ms;
+ #endif
+ };
+ 
+@@ -1288,6 +1290,8 @@ static inline u8 ufshcd_scsi_to_upiu_lun(unsigned int scsi_lun)
+ int ufshcd_dump_regs(struct ufs_hba *hba, size_t offset, size_t len,
+ 		     const char *prefix);
+ 
++int __ufshcd_write_ee_control(struct ufs_hba *hba, u32 ee_ctrl_mask);
++int ufshcd_write_ee_control(struct ufs_hba *hba);
+ int ufshcd_update_ee_control(struct ufs_hba *hba, u16 *mask, u16 *other_mask,
+ 			     u16 set, u16 clr);
+ 
+-- 
+2.27.0
+

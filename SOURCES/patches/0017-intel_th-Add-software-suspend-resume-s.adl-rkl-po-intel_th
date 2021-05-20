@@ -1,0 +1,147 @@
+From 0c7105dd8189f8aae460e04447f221f678d1e958 Mon Sep 17 00:00:00 2001
+From: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Date: Thu, 9 Apr 2020 10:57:35 +0300
+Subject: [PATCH 17/23] intel_th: Add software suspend/resume support
+
+Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+---
+ drivers/hwtracing/intel_th/core.c     | 28 +++++++++++++++++
+ drivers/hwtracing/intel_th/intel_th.h |  5 +++
+ drivers/hwtracing/intel_th/pci.c      | 45 +++++++++++++++++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/drivers/hwtracing/intel_th/core.c b/drivers/hwtracing/intel_th/core.c
+index f5c0863a6b73..59de5d367ffe 100644
+--- a/drivers/hwtracing/intel_th/core.c
++++ b/drivers/hwtracing/intel_th/core.c
+@@ -293,6 +293,34 @@ static void intel_th_output_deactivate(struct intel_th_device *thdev)
+ 	module_put(thdrv->driver.owner);
+ }
+ 
++void intel_th_suspend(struct intel_th *th)
++{
++	int i;
++
++	for (i = 0; i < th->num_thdevs; i++) {
++		struct intel_th_device *thdev = th->thdev[i];
++
++		if (thdev->type == INTEL_TH_OUTPUT && thdev->output.active) {
++			intel_th_output_deactivate(thdev);
++			th->suspended |= BIT(i);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(intel_th_suspend);
++
++void intel_th_resume(struct intel_th *th)
++{
++	int i;
++
++	for_each_set_bit(i, &th->suspended, th->num_thdevs) {
++		struct intel_th_device *thdev = th->thdev[i];
++
++		intel_th_output_activate(thdev);
++		th->suspended ^= BIT(i);
++	}
++}
++EXPORT_SYMBOL_GPL(intel_th_resume);
++
+ static ssize_t active_show(struct device *dev, struct device_attribute *attr,
+ 			   char *buf)
+ {
+diff --git a/drivers/hwtracing/intel_th/intel_th.h b/drivers/hwtracing/intel_th/intel_th.h
+index 3b7b0a87e701..c31bb130de39 100644
+--- a/drivers/hwtracing/intel_th/intel_th.h
++++ b/drivers/hwtracing/intel_th/intel_th.h
+@@ -56,6 +56,7 @@ struct intel_th_drvdata {
+ 	unsigned int	tscu_enable        : 1,
+ 			multi_is_broken    : 1,
+ 			reset_on_probe     : 1,
++			sw_suspend         : 1,
+ 			has_mintctl        : 1,
+ 			host_mode_only     : 1,
+ 			does_d3            : 1;
+@@ -283,6 +284,7 @@ struct intel_th {
+ 	struct resource		resource[TH_MMIO_END];
+ 	int			(*activate)(struct intel_th *);
+ 	void			(*deactivate)(struct intel_th *);
++	unsigned long		suspended;
+ 	unsigned int		num_thdevs;
+ 	unsigned int		num_resources;
+ 	int			irq;
+@@ -298,6 +300,9 @@ struct intel_th {
+ #endif
+ };
+ 
++void intel_th_suspend(struct intel_th *th);
++void intel_th_resume(struct intel_th *th);
++
+ static inline struct intel_th_device *
+ to_intel_th_hub(struct intel_th_device *thdev)
+ {
+diff --git a/drivers/hwtracing/intel_th/pci.c b/drivers/hwtracing/intel_th/pci.c
+index c3b5240f3050..2e2424260bd7 100644
+--- a/drivers/hwtracing/intel_th/pci.c
++++ b/drivers/hwtracing/intel_th/pci.c
+@@ -320,6 +320,49 @@ static const struct pci_device_id intel_th_pci_id_table[] = {
+ MODULE_DEVICE_TABLE(pci, intel_th_pci_id_table);
+ 
+ #ifdef CONFIG_PM
++static int intel_th_system_suspend(struct device *dev)
++{
++	struct intel_th *th = dev_get_drvdata(dev);
++	struct pci_dev *pdev = to_pci_dev(dev);
++
++	if (!INTEL_TH_CAP(th, sw_suspend))
++		return 0;
++
++	intel_th_suspend(th);
++	pci_save_state(pdev);
++	pci_disable_device(pdev);
++	pci_set_power_state(pdev, PCI_D3hot);
++
++	return 0;
++}
++
++static int intel_th_system_resume(struct device *dev)
++{
++	struct intel_th *th = dev_get_drvdata(dev);
++	struct pci_dev *pdev = to_pci_dev(dev);
++	int ret;
++
++	if (!INTEL_TH_CAP(th, sw_suspend))
++		return 0;
++
++	pci_set_power_state(pdev, PCI_D0);
++
++	if (INTEL_TH_CAP(th, reset_on_probe))
++		intel_th_pci_reset(pdev);
++
++	pci_restore_state(pdev);
++	ret = pcim_enable_device(pdev);
++	if (ret) {
++		dev_err(dev, "failed to enable after resume (%d)\n", ret);
++		return ret;
++	}
++
++	pci_set_master(pdev);
++	intel_th_resume(th);
++
++	return 0;
++}
++
+ static int intel_th_runtime_suspend(struct device *dev)
+ {
+ 	struct intel_th *th = dev_get_drvdata(dev);
+@@ -358,6 +401,8 @@ static int intel_th_runtime_resume(struct device *dev)
+ }
+ 
+ static const struct dev_pm_ops intel_th_pm = {
++	SET_SYSTEM_SLEEP_PM_OPS(intel_th_system_suspend,
++				intel_th_system_resume)
+ 	SET_RUNTIME_PM_OPS(intel_th_runtime_suspend,
+ 			   intel_th_runtime_resume,
+ 			   NULL)
+-- 
+2.27.0
+
