@@ -99,6 +99,12 @@ parse_tag() {
       KRC="norc."
       KERNEL_FULL_VERSION="v${KVERSION}"
     fi
+
+    # Add minor version number to $KVERSION
+    if [ $(echo $KVERSION | awk -F'.' '{print NF}') == "2" ]; then
+    	KVERSION=${KVERSION}.0
+    fi
+
     echo "Get the KERNEL=${KERNEL}, KVERSION=${KVERSION}, KRC=${KRC}, ISRC=${ISRC},
           KDATE=${KDATE}, KDATE_MMDD=${KDATE_MMDD}"
 }
