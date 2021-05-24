@@ -19,6 +19,9 @@ Below are detailed information of each file.
 	.
 	├── README.md				# Readme file
 	├── SOURCES
+	│   ├── patches/ 			# Include OOT kernel patches
+	│   │ 	├── xxxx 			# Linux kernel patch files
+	│   │ 	├── series 			# Quilt series files 
 	│   ├── centos-ca-secureboot.der        # CA Certificate for secure boot
 	│   ├── centossecureboot001.crt		# Key for secure boot
 	│   ├── cpupower.config			# kernel config for cpupower
@@ -62,7 +65,9 @@ files in SPECS into the RPM SPECS directory. After that. Pls. run below command.
 	rpmbuild -ba ./iotg-kernel.spec --nodeps --verbose
 
 This command builds the Linux kernel RPM packages based on the SPECS/iotg-kernel.spec.
-And output the the RPM packages to RPMS directory. 
+It clones the base kernel (Specified in iotg-kernel.spec), and apply the OOT Linux kernel 
+patches (in SOURCES/patches) automatically. After build successfully, it output the the 
+RPM packages to RPMS directory. 
 
 Normally we prefer you can build it in CentOS environment. Pls. follow below steps if 
 you want to do it in Ubuntu. 
