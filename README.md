@@ -1,31 +1,51 @@
-iotg-kernel-overlay
+
+WARNING:
+-------------------------------------------------------------------------------
+THIS REPOSITORY INCLUDES THE INTEL EMBARGOED LINUX KERNEL PATCHES AND CONFIDENTIAL
+CONFIDENTIAL INFORMATION, PLS. FOLLOWING INTEL POLICIES WHEN YOU DISTRUBUTING IT. 
+
+
+Overview
 -------------------------------------------------------------------------------
 This is the IoTG Linux kernel overlay. it include the Out-Of-Tree(OOT) IoTG 
 Linux kernel patches and related kernel configuratoins. With it, user can build
 the Linux kernel RPM packages.
 
+Content
+-------------------------------------------------------------------------------
+This repository has source files (certificate file, kernel config, scripts) and 
+spec file (iotg-kernel.spec) which are used to build RPM packages. 
+
+Below are the explannation of each files.
+
+.
+├── README.md				# Readme file
+├── SOURCES	
+│   ├── centos-ca-secureboot.der	# CA Certificate for secure boot
+│   ├── centossecureboot001.crt		# Key for security boot
+│   ├── cpupower.config			# kernel config for cpupower
+│   ├── cpupower.service		# cpupower service file
+│   ├── generate_bls_conf.sh		# Script for creating boot entry 
+│   ├── Makefile			# A simple make file
+│   ├── mod-sign.sh		   	# Script for signing kernel modules	
+│   ├── overlay.config			# Linux kernel configuration 
+│   ├── parallel_xz.sh			# Script for compressing (xz) files	
+│   ├── process_configs.sh		# Script for processing kernel config
+│   └── x509.genkey		        # Key generation configuration file	
+├── SPECS
+│   └── iotg-kernel.spec		# SPEC files for building RPM packages
+├── update-build-id.sh			# For updating pkgrelease in SPEC file 
+└── update.sh				# For updating kernel info in SPEC file
+
+
 How to build the iotg linux kernel overlay
 -------------------------------------------------------------------------------
 After clone this repository, you can find it has below file structure.
+
 	.
 	├── README.md
 	├── SOURCES
-	│   ├── centos-ca-secureboot.der
-	│   ├── centossecureboot001.crt
-	│   ├── cpupower.config
-	│   ├── cpupower.service
-	│   ├── generate_bls_conf.sh
-	│   ├── iotg-kernel.spec
-	│   ├── Makefile
-	│   ├── mod-sign.sh
-	│   ├── overlay.config
-	│   ├── parallel_xz.sh
-	│   ├── process_configs.sh
-	│   ├── securebootca.cer
-	│   ├── secureboot.cer
-	│   └── x509.genkey
 	├── SPECS
-	│   └── iotg-kernel.spec
 	├── update-build-id.sh
 	└── update.sh
 
@@ -44,16 +64,11 @@ files in SPECS into the RPM SPECS directory. After that. Pls. run below command.
 
 	rpmbuild -ba ./iotg-kernel.spec --nodeps --verbose
 
-Then you can get the RPM packages in RPMS directory. 
+This command will build the Linux kernel RPM packages based on the iotg-kernel.spec.
+And save the the RPM packages in RPMS directory. 
 
 Normally we prefer you can build it in CentOS environment. Pls. follow below steps if 
 you want to do it in Ubuntu. 
-
-Files
--------------------------------------------------------------------------------
-iotg-kernel.spec 
-x509.genkey: Used to create the public key which are used to verify the signed kernel & modules.
-...
 
 Adapt to Ubuntu OS
 -------------------------------------------------------------------------------
@@ -93,13 +108,6 @@ Install RPM package in RHEL/CentOS:
 Extract RPM package: 
 	rpm2cpio <RPM package> | cpio -idmv
 
-Reference
--------------------------------------------------------------------------------
-https://www.cnblogs.com/michael-xiang/p/10480809.html
-
-https://docs.fedoraproject.org/en-US/Fedora_Draft_Documentation/0.1/html/RPM_Guide/ch10s04.html
-
-https://rpm-packaging-guide.github.io/#_references
 
 SUPPORT
 -------------------------------------------------------------------------------
