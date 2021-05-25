@@ -96,7 +96,7 @@ parse_tag() {
     KERNEL=${KERNEL/-/_} # need iotg_next, '-' have special meaning in .spec file
     if [ "${KRC:0:2}" != "rc" ]; then
       ISRC=0
-      KRC="norc."
+      KRC="norc"
       KERNEL_FULL_VERSION="v${KVERSION}"
     fi
 
@@ -123,7 +123,8 @@ sed -i "/define embargoname/c %define embargoname ${KDATE_MMDD}.${KERNEL}" ${SPE
 sed -i "/define specrelease/c %define specrelease %{?rcversion}${KDATE}_%{pkgrelease}%{?dist}" ${SPEC_FILE}
 
 # Set the kernel src
-sed -i "/global kernel_src_tag/c %global kernel_src_tag ${KERNEL_FULL_VERSION}" ${SPEC_FILE}
+sed -i "/global kernel_src_repo/c %global kernel_src_repo ${KSRC_REPO}" ${SPEC_FILE}
+sed -i "/global kernel_src_tag/c %global kernel_src_tag ${KSRC_TAG}" ${SPEC_FILE}
 
 if [ "$NOT_COMMIT" = true ] ; then
     exit 0
