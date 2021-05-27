@@ -1,0 +1,257 @@
+From 938b04715f81604d9885e5d33d1e37f1cd650133 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Sun, 21 Feb 2021 21:17:10 -0800
+Subject: [PATCH 39/72] DEBUG: x86/platform/hfi: Add debug verbosity
+
+This is to monitor that the HFI has been configured correctly and that
+thermal interrupts are received and processed accordingly.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ arch/x86/platform/intel/hfi.c       | 73 ++++++++++++++++++++++++++---
+ drivers/thermal/intel/therm_throt.c |  1 +
+ 2 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/platform/intel/hfi.c b/arch/x86/platform/intel/hfi.c
+index 4dbf1d48bd30..461e470a092c 100644
+--- a/arch/x86/platform/intel/hfi.c
++++ b/arch/x86/platform/intel/hfi.c
+@@ -16,6 +16,7 @@
+  * seen by the scheduler.
+  */
+ 
++#define DEBUG
+ #define pr_fmt(fmt)  "intel-hfi: " fmt
+ 
+ #include <linux/cpu.h>
+@@ -82,6 +83,20 @@ static struct hfi_params hfi_params;
+ static u64 hfi_timestamp;
+ static u32 *raw_data;
+ 
++static bool hfi_debug_enable;
++
++#define hfi_debug(s, a...) do {	\
++		if (hfi_debug_enable)	\
++			pr_debug(s, ##a);\
++	} while (0)
++
++static int __init hfi_enable_debug(char *arg)
++{
++	hfi_debug_enable = true;
++        return 1;
++}
++__setup("hfi_debug", hfi_enable_debug);
++
+ #ifdef CONFIG_DEBUG_FS
+ static int cpu_capacities_show(struct seq_file *m, void *data)
+ {
+@@ -227,10 +242,14 @@ static void scale_energy_efficiency(void)
+ 	for_each_online_cpu(cpu)
+ 		ee_scale = max(raw_data[cpu], ee_scale);
+ 
++	hfi_debug("ee_scale = %u\n", ee_scale);
++
+ 	for_each_online_cpu(cpu) {
+ 		ee = raw_data[cpu];
+ 		ee <<= HFI_EFFICIENCY_SHIFT;
+ 		do_div(ee, ee_scale);
++		hfi_debug("cpu%d original:%u new:%u\n",
++			 cpu, raw_data[cpu], ee);
+ 		raw_data[cpu] = ee;
+ 	}
+ }
+@@ -240,8 +259,10 @@ static void update_energy_efficiency(void)
+ 	struct hfi_hdr *hdr = hfi_params.hdr;
+ 	int cpu;
+ 
+-	if (!hdr->ee_updated)
++	if (!hdr->ee_updated) {
++		hfi_debug("efficiency did not change, skip update\n");
+ 		return;
++	}
+ 
+ 	/* Get data from the HFI table */
+ 	for_each_online_cpu(cpu) {
+@@ -267,13 +288,22 @@ static void update_energy_efficiency(void)
+ 		eff = (SCHED_CAPACITY_SCALE << 1) -  raw_data[cpu];
+ 
+ 		em_pd = em_cpu_get(cpu);
+-		if (!em_pd)
++		if (!em_pd) {
++			hfi_debug("em_pd for cpu%d null, create it. cpumask:%*pbl, ee: %ld\n",
++				 cpu,
++				 cpumask_pr_args(topology_type_cpumask(cpu)),
++				 eff);
+ 			em_dev_register_perf_domain_simple(get_cpu_device(cpu),
+ 							   topology_type_cpumask(cpu),
+ 							   eff);
+-		else
++		} else {
++			hfi_debug("update em_pd CPU%d span:%*pbl, ee:%ld >> %ld\n",
++				 cpu,
++				 cpumask_pr_args(to_cpumask(em_pd->cpus)),
++				 em_pd->energy_rating, eff);
+ 			em_dev_perf_domain_update_energy_rating(get_cpu_device(cpu),
+ 								eff);
++		}
+ 	}
+ 
+ 	hdr->ee_updated = 0;
+@@ -302,13 +332,17 @@ static int get_hfi_performance_cap(void)
+ 		/* Find the performance data of @cpu */
+ 		data = hfi_params.data + index * hfi_params.cpu_stride;
+ 		raw_data[cpu] = data->perf_cap;
++		hfi_debug("CPU:%d idx%d perf: %d >>>> %d\n", cpu, index,
++			 raw_data[cpu], data->perf_cap);
+ 
+ 		max_perf = max(max_perf, raw_data[cpu]);
+ 	}
+ 
+ 	/* If the HFI table has all zeros, ignore this update. */
+-	if (!max_perf)
++	if (!max_perf) {
++		hfi_debug("HFI reported all capacities as 0\n");
+ 		return -EINVAL;
++	}
+ 
+ 	return 0;
+ }
+@@ -320,8 +354,10 @@ static void update_capacity(void)
+ {
+ 	struct hfi_hdr *hdr = hfi_params.hdr;
+ 
+-	if (!hdr->perf_updated)
++	if (!hdr->perf_updated) {
++		hfi_debug("perf did not change, skip update\n");
+ 		return;
++	}
+ 
+ 	/* Read data from the HFI table. */
+ 	if (get_hfi_performance_cap())
+@@ -337,6 +373,7 @@ static void hfi_update_work_fn(struct work_struct *work)
+ {
+ 	u64 msr_val;
+ 
++	hfi_debug("Doing HFI work from CPU %d\n", smp_processor_id());
+ 	rdmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
+ 
+ 	/*
+@@ -344,8 +381,10 @@ static void hfi_update_work_fn(struct work_struct *work)
+ 	 * possible that a CPU scheduled work too late and some other CPU has
+ 	 * already processed the HFI update.
+ 	 */
+-	if (!(msr_val & PACKAGE_THERM_STATUS_HFI_UPDATED))
++	if (!(msr_val & PACKAGE_THERM_STATUS_HFI_UPDATED)){
++		hfi_debug("update already processed. Did we get here too late?\n");
+ 		return;
++	}
+ 
+ 	/*
+ 	 * Sanity check that the timestamp moved forward before consuming
+@@ -379,20 +418,27 @@ static void hfi_update_work_fn(struct work_struct *work)
+ 		x86_topology_update = true;
+ 		rebuild_sched_domains();
+ 		asym_capacity_initialized = true;
++		hfi_debug("Updated CPU capacities for the first time\n");
+ 	}
+ 
+ 	/*
+ 	 * Let hardware and other CPUs know that we are done reading the HFI
+ 	 * table and it is free to update it again.
+ 	 */
++	hfi_debug("Will clear HFI thermal status. msr_val=%llx\n", msr_val);
+ 	msr_val &= THERM_STATUS_CLEAR_PKG_MASK &
+ 		   ~PACKAGE_THERM_STATUS_HFI_UPDATED;
+ 	wrmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
++
++	hfi_debug("Cleared HFI thermal status. msr_val=%llx\n", msr_val);
++	hfi_debug("Done with HFI work in CPU%d\n", smp_processor_id());
+ }
+ DECLARE_DELAYED_WORK(hfi_update_work, hfi_update_work_fn);
+ 
+ void intel_hfi_check_event(__u64 pkg_therm_status_msr_val)
+ {
++	hfi_debug("Received interrupt in CPU%d\n", smp_processor_id());
++
+ 	if (!pkg_therm_status_msr_val)
+ 		return;
+ 
+@@ -402,6 +448,7 @@ void intel_hfi_check_event(__u64 pkg_therm_status_msr_val)
+ 	 * will succeed. Thus, no locking is needed to process the HFI
+ 	 * update from delayed work.
+ 	 */
++	hfi_debug("Will schedule work to update HFI from CPU %d\n", smp_processor_id());
+ 	schedule_delayed_work(&hfi_update_work, HFI_UPDATE_DELAY);
+ }
+ 
+@@ -419,6 +466,7 @@ static void __init init_energy_model(void)
+ 	 */
+ 	hdr->ee_updated = 1;
+ 	update_energy_efficiency();
++	hfi_debug("Initial update of energy efficiency\n");
+ }
+ 
+ void enable_hfi(void)
+@@ -428,8 +476,12 @@ void enable_hfi(void)
+ 	if (!static_cpu_has(X86_FEATURE_INTEL_HFI))
+ 		return;
+ 
+-	if (hfi_params.enabled)
++	if (hfi_params.enabled) {
++		hfi_debug("Already initialized HFI\n");
+ 		return;
++	}
++
++	hfi_debug("Initializing HFI\n");
+ 
+ 	/* Clear status bit to let hadware update the feedback interface. */
+ 	rdmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
+@@ -443,6 +495,7 @@ void enable_hfi(void)
+ 	wrmsrl(MSR_IA32_HW_FEEDBACK_CONFIG, msr_val);
+ 
+ 	hfi_params.enabled = true;
++	hfi_debug("Done initializing HFI\n");
+ }
+ 
+ /**
+@@ -516,9 +569,12 @@ static void __init intel_hfi_init(void)
+ 	void *table_base;
+ 	u64 msr_val;
+ 
++	hfi_debug("Initializing...\n");
+ 	if (!boot_cpu_has(X86_FEATURE_INTEL_HFI))
+ 		return;
+ 
++	hfi_debug("CPU has HFI...\n");
++
+ 	/*
+ 	 * At this point we know that CPUID_HFI_LEAF exists since
+ 	 * X86_FEATURE_INTEL_HFI was detected. Parse the supported capabilities,
+@@ -565,9 +621,12 @@ static void __init intel_hfi_init(void)
+ 
+ 	hfi_dbgfs_register();
+ 
++	hfi_debug("Hardware Feedback Interface enabled\n");
++
+ 	return;
+ 
+ free_raw_data:
+ 	kfree(raw_data);
++	hfi_debug("Failed to initialize HFI\n");
+ }
+ device_initcall(intel_hfi_init);
+diff --git a/drivers/thermal/intel/therm_throt.c b/drivers/thermal/intel/therm_throt.c
+index 6c833be09c41..0d0d8f6feca1 100644
+--- a/drivers/thermal/intel/therm_throt.c
++++ b/drivers/thermal/intel/therm_throt.c
+@@ -714,6 +714,7 @@ void intel_init_thermal(struct cpuinfo_x86 *c)
+ 				| PACKAGE_THERM_INT_HIGH_ENABLE), h);
+ 
+ 		if (cpu_has(c, X86_FEATURE_INTEL_HFI)) {
++			pr_debug("Enabling HFI interrupt\n");
+ 			rdmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT, l, h);
+ 			wrmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT,
+ 			      l | PACKAGE_THERM_INT_HFI_ENABLE, h);
+-- 
+2.27.0
+

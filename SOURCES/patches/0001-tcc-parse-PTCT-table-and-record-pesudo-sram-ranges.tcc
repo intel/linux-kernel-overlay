@@ -1,4 +1,4 @@
-From 1cd920c734ee8fda90c79555bba922913d96fe27 Mon Sep 17 00:00:00 2001
+From 49090fc7b06b1cd59f3d830de1487c00cd6e4bab Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 14:43:41 +0800
 Subject: [PATCH 1/9] tcc: parse PTCT table and record pesudo sram ranges
@@ -16,7 +16,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 14cd3186dc77..369f7dff3f6b 100644
+index e90310cbe73a..6f7af786d41e 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1232,6 +1232,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -129,18 +129,18 @@ index 14cd3186dc77..369f7dff3f6b 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index d6478c430c99..f99b90c51d7d 100644
+index 18cafe3ebddc..fbdd8428e487 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
-@@ -38,6 +38,7 @@
- #define ACPI_SIG_PDTT           "PDTT"	/* Platform Debug Trigger Table */
+@@ -39,6 +39,7 @@
+ #define ACPI_SIG_PHAT           "PHAT"	/* Platform Health Assessment Table */
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
 +#define ACPI_SIG_PTCT           "PTCT"	/* Platform Tuning Configuration Table */
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
  #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
-@@ -1528,6 +1529,59 @@ struct acpi_pptt_id {
+@@ -1673,6 +1674,59 @@ struct acpi_pptt_id {
  	u16 spin_rev;
  };
  
