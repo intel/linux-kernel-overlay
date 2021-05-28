@@ -1,0 +1,405 @@
+From a9dd35b08c6572a18965d0e037538b9a63fcf161 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Fri, 28 Aug 2020 15:55:30 -0700
+Subject: [PATCH 10/72] drivers core: Introduce CPU type sysfs interface
+
+Hybrid CPU topologies combine CPUs of different microarchitectures in the
+same die. Thus, even though the instruction set is compatible among all
+CPUs, there may still be differences in features (e.g., some CPUs may
+have counters that others CPU do not). There may be applications
+interested in knowing the type of micro-architecture topology of the
+system to make decisions about process affinity.
+
+While the existing sysfs for capacity (/sys/devices/system/cpu/cpuX/
+cpu_capacity) may be used to infer the types of micro-architecture of the
+CPUs in the platform, it may not be entirely accurate. For instance, two
+subsets of CPUs with different types of micro-architecture may have the
+same capacity due to power or thermal constraints.
+
+Create the new directory /sys/devices/system/cpu/types. Under such
+directory, create individual subdirectories for each type of CPU micro-
+architecture. Each subdirectory will have cpulist and cpumap files. This
+makes it convenient for user space to read all the CPUs of the same type
+at once without having to inspect each CPU individually.
+
+Implement a generic interface using weak functions that architectures can
+override to indicate a) support for CPU types, b) the number of supported
+CPU types, c) the CPU type number, and d) a string to identify the CPU
+vendor and type.
+
+In a system with five CPUs, where cpu[0-3] are of one type and cpu4 is of
+a different type, the topology would look like this:
+
+user@host:~$: ls /sys/devices/system/cpu/types
+vendor_typea vendor_typeb
+
+user@host:~$ ls /sys/devices/system/cpu/types/vendor_type_a
+cpulist cpumap
+
+user@host:~$ ls /sys/devices/system/cpu/types/vendor_type_b
+cpulist cpumap
+
+user@host:~$ cat /sys/devices/system/cpu/types/vendor_typea/cpumap
+f
+
+user@host:~$ cat /sys/devices/system/cpu/types/vendor_typea/cpulist
+0-3
+
+user@ihost:~$ cat /sys/devices/system/cpu/types/vendor_typeb/cpumap
+10
+
+user@host:~$ cat /sys/devices/system/cpu/types/vendor_typeb/cpulist
+4
+
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Andy Shevchenko <andriy.shevchenko@intel.com>
+Cc: Aubrey Li <aubrey.li@linux.intel.com>
+Cc: Chen Yu <yu.c.chen@intel.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Kan Liang <kan.liang@linux.intel.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Tony Luck <tony.luck@intel.com>
+Suggested-by: Len Brown <len.brown@intel.com> # Necessity of the interface
+Suggested-by: Dave Hansen <dave.hansen@intel.com> # Details of the interface
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+Changes since v1:
+ * Increased the CPU type identifier from u8 to u32 to accommodate a
+   larger variety of types.
+
+----
+Changes before submitting this series independently:
+
+Changes since v4:
+ * Changed the return type of cpu_type_sysfs_register() to void, as its
+   caller does not handle errors.
+
+Changes since v3:
+ * Introduced this patch.
+ * Generalized the implementation of the cpu_type interfaces and relocated
+   to drivers/base/cpu.c (Dave)
+ * Use an array of devices instead of a list of custom data structures.
+   (Dave)
+ * Remove superflous cpu_type member. Instead, check the CPU type from the
+   map of CPUs of the same type. (Dave)
+ * Improved comments to reflect the rationale of the implementation.
+   (Dave)
+ * Implemented a new CPUHP_AP_BASE_CPUTYPE_ONLINE hotplug entry. (Dave)
+
+Changes since v2:
+ * N/A
+
+Changes since v1:
+ * N/A
+---
+ .../ABI/testing/sysfs-devices-system-cpu      |  13 +
+ drivers/base/cpu.c                            | 229 ++++++++++++++++++
+ include/linux/cpu.h                           |  12 +
+ include/linux/cpuhotplug.h                    |   1 +
+ 4 files changed, 255 insertions(+)
+
+diff --git a/Documentation/ABI/testing/sysfs-devices-system-cpu b/Documentation/ABI/testing/sysfs-devices-system-cpu
+index fe13baa53c59..55bb411e453c 100644
+--- a/Documentation/ABI/testing/sysfs-devices-system-cpu
++++ b/Documentation/ABI/testing/sysfs-devices-system-cpu
+@@ -640,3 +640,16 @@ Description:	SPURR ticks for cpuX when it was idle.
+ 
+ 		This sysfs interface exposes the number of SPURR ticks
+ 		for cpuX when it was idle.
++
++What:		/sys/devices/system/cpu/types
++		/sys/devices/system/cpu/types/<vendor>_<cpu_type>/cpumap
++		/sys/devices/system/cpu/types/<vendor>_<cpu_type>/cpulist
++Date:		Sep 2020
++Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
++Description:	Types of CPUs in hybrid systems
++
++		If a platform has CPUs with more than one type of micro-
++		architecture, there is one directory for each type of CPU.
++		Inside each directory, the files cpumap and cpulist contain
++		a mask and a list representing CPUs of the same type of micro-
++		architecture. These files only contain CPUs currently online.
+diff --git a/drivers/base/cpu.c b/drivers/base/cpu.c
+index 2b9e41377a07..aec620e9fbfc 100644
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@ -603,11 +603,240 @@ static void __init cpu_register_vulnerabilities(void)
+ static inline void cpu_register_vulnerabilities(void) { }
+ #endif
+ 
++static ssize_t cpulist_show(struct device *device,
++			    struct device_attribute *attr,
++			    char *buf)
++{
++	struct cpumask *mask = dev_get_drvdata(device);
++
++	if (!mask)
++		return -EINVAL;
++
++	return cpumap_print_to_pagebuf(true, buf, mask);
++}
++
++static ssize_t cpumap_show(struct device *device,
++			   struct device_attribute *attr,
++			   char *buf)
++{
++	struct cpumask *mask = dev_get_drvdata(device);
++
++	if (!mask)
++		return -EINVAL;
++
++	return cpumap_print_to_pagebuf(false, buf, mask);
++}
++
++static DEVICE_ATTR_RO(cpumap);
++static DEVICE_ATTR_RO(cpulist);
++
++static struct attribute *cpu_type_attrs[] = {
++	&dev_attr_cpumap.attr,
++	&dev_attr_cpulist.attr,
++	NULL
++};
++
++static const struct attribute_group cpu_type_attr_group = {
++	.attrs = cpu_type_attrs,
++};
++
++static const struct attribute_group *cpu_type_attr_groups[] = {
++	&cpu_type_attr_group,
++	NULL,
++};
++
++/* Root device for the cpu_type sysfs entries */
++static struct device *cpu_type_device;
++/*
++ * An array of cpu_type devices. One per each type of supported CPU micro-
++ * architecture.
++ */
++static struct device *cpu_type_devices[CPUTYPES_MAX_NR];
++
++/**
++ * arch_get_cpu_type() - Get the CPU type number
++ * @cpu:	Index of the CPU of which the index is needed
++ *
++ * Get the CPU type number of @cpu, a non-zero unsigned 32-bit number that
++ * uniquely identifies a type of CPU micro-architecture. All CPUs of the same
++ * type have the same type number. Type numbers are defined by each CPU
++ * architecture.
++ */
++u32 __weak arch_get_cpu_type(int cpu)
++{
++	return 0;
++}
++
++/**
++ * arch_has_cpu_type() - Check if CPU types are supported
++ *
++ * Returns true if the running platform supports CPU types. This is true if the
++ * platform has CPUs of more than one type of micro-architecture. Otherwise,
++ * returns false.
++ */
++bool __weak arch_has_cpu_type(void)
++{
++	return false;
++}
++
++/**
++ * arch_get_cpu_type_name() - Get the CPU type name
++ * @cpu_type:	Type of CPU micro-architecture.
++ *
++ * Returns a string name associated with the CPU micro-architecture type as
++ * indicated in @cpu_type. The format shall be <vendor>_<cpu_type>. Returns
++ * NULL if the CPU type is not known.
++ */
++const char __weak *arch_get_cpu_type_name(u32 cpu_type)
++{
++	return NULL;
++}
++
++static int cpu_type_create_device(int cpu, int idx)
++{
++	u32 cpu_type = arch_get_cpu_type(cpu);
++	struct cpumask *mask;
++	const char *name;
++	char buf[64];
++
++	mask = kzalloc(cpumask_size(), GFP_KERNEL);
++	if (!mask)
++		return -ENOMEM;
++
++	name = arch_get_cpu_type_name(cpu_type);
++	if (!name) {
++		snprintf(buf, sizeof(buf), "unknown_%u", cpu_type);
++		name = buf;
++	}
++
++	cpu_type_devices[idx] = cpu_device_create(cpu_type_device, mask,
++						  cpu_type_attr_groups, name);
++	if (IS_ERR(cpu_type_devices[idx]))
++		goto free_cpumask;
++
++	cpumask_set_cpu(cpu, mask);
++	return 0;
++
++free_cpumask:
++	kfree(mask);
++	return -ENOMEM;
++}
++
++static int cpu_type_sysfs_online(unsigned int cpu)
++{
++	u32 cpu_type = arch_get_cpu_type(cpu);
++	struct cpumask *mask;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cpu_type_devices); i++) {
++		u32 this_cpu_type;
++
++		/*
++		 * The first devices in the array are used first. Thus, create
++		 * a new device as well as sysfs directory and for the type of
++		 * @cpu.
++		 */
++		if (!cpu_type_devices[i])
++			return cpu_type_create_device(cpu, i);
++
++		mask = dev_get_drvdata(cpu_type_devices[i]);
++		if (!mask) {
++			/*
++			 * We should not be here. Be paranoid about
++			 * NULL pointers.
++			 */
++			dev_err(cpu_type_devices[i], "CPU mask is invalid");
++			return -EINVAL;
++		}
++
++		/*
++		 * If all the CPUs of a given type are offline, reuse this
++		 * device for @cpu.
++		 */
++		if (!cpumask_weight(mask)) {
++			const char *name;
++
++			this_cpu_type = arch_get_cpu_type(cpu);
++			name = arch_get_cpu_type_name(this_cpu_type);
++			dev_set_name(cpu_type_devices[i], name);
++
++			cpumask_set_cpu(cpu, mask);
++			return 0;
++		}
++
++		this_cpu_type = arch_get_cpu_type(cpumask_first(mask));
++		if (cpu_type == this_cpu_type) {
++			cpumask_set_cpu(cpu, mask);
++			return 0;
++		}
++	}
++
++	return -ENODEV;
++}
++
++static int cpu_type_sysfs_offline(unsigned int cpu)
++{
++	u32 cpu_type = arch_get_cpu_type(cpu);
++	struct cpumask *mask;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cpu_type_devices); i++) {
++		u32 this_cpu_type;
++
++		if (!cpu_type_devices[i])
++			continue;
++
++		mask = dev_get_drvdata(cpu_type_devices[i]);
++		if (!mask && !cpumask_weight(mask)) {
++			/*
++			 * We should not be here. Be paranoid about
++			 * NULL pointers.
++			 */
++			dev_err(cpu_type_devices[i], "CPU mask is invalid");
++			continue;
++		}
++
++		this_cpu_type = arch_get_cpu_type(cpumask_first(mask));
++		if (cpu_type == this_cpu_type) {
++			cpumask_clear_cpu(cpu, mask);
++			return 0;
++		}
++	}
++
++	/*
++	 * If we are here, no matching cpu_type was found. This CPU was not
++	 * accounted for at hotplug online.
++	 */
++	pr_warn("Unexpected CPU offline!\n");
++
++	return -ENODEV;
++}
++
++static void __init cpu_type_sysfs_register(void)
++{
++	struct device *dev = cpu_subsys.dev_root;
++	int ret;
++
++	if (!arch_has_cpu_type())
++		return;
++
++	cpu_type_device = cpu_device_create(dev, NULL, NULL, "types");
++	if (IS_ERR(cpu_type_device))
++		return;
++
++	ret = cpuhp_setup_state(CPUHP_AP_BASE_CPUTYPE_ONLINE,
++				"base/cpu_type_sysfs:online",
++				cpu_type_sysfs_online, cpu_type_sysfs_offline);
++	if (ret)
++		dev_warn(dev, "failed to CPU type sysfs\n");
++}
++
+ void __init cpu_dev_init(void)
+ {
+ 	if (subsys_system_register(&cpu_subsys, cpu_root_attr_groups))
+ 		panic("Failed to register CPU subsystem");
+ 
+ 	cpu_dev_register_generic();
++	cpu_type_sysfs_register();
+ 	cpu_register_vulnerabilities();
+ }
+diff --git a/include/linux/cpu.h b/include/linux/cpu.h
+index 522e94b30939..1acb7c1b3daa 100644
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -231,4 +231,16 @@ static inline int cpuhp_smt_disable(enum cpuhp_smt_control ctrlval) { return 0;
+ extern bool cpu_mitigations_off(void);
+ extern bool cpu_mitigations_auto_nosmt(void);
+ 
++#ifndef CPUTYPES_MAX_NR
++/*
++ * The maximum number of types of cpus. Architecture-specific implementations
++ * shall override this value.
++ */
++#define CPUTYPES_MAX_NR 0
++#endif
++
++extern u32 arch_get_cpu_type(int cpu);
++extern bool arch_has_cpu_type(void);
++extern const char *arch_get_cpu_type_name(u32 cpu_type);
++
+ #endif /* _LINUX_CPU_H_ */
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 4a62b3980642..2a372ef183b6 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -195,6 +195,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_WATCHDOG_ONLINE,
+ 	CPUHP_AP_WORKQUEUE_ONLINE,
+ 	CPUHP_AP_RCUTREE_ONLINE,
++	CPUHP_AP_BASE_CPUTYPE_ONLINE,
+ 	CPUHP_AP_BASE_CACHEINFO_ONLINE,
+ 	CPUHP_AP_ONLINE_DYN,
+ 	CPUHP_AP_ONLINE_DYN_END		= CPUHP_AP_ONLINE_DYN + 30,
+-- 
+2.27.0
+

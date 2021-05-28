@@ -1,0 +1,140 @@
+From 84dbc16ffd1c5feb2d6b4554a96029808ac92f37 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Mon, 2 Nov 2020 10:48:43 -0800
+Subject: [PATCH 65/72] x86/hfi: Scale capacities of classes
+
+Capacities among classes should reflect asymmetry between classes.
+Since class 0 is the default class, the rest of the classes'
+capacities shall reflect boots or losses among capacities. Thus,
+values above below SCHED_CAPACITY_SCALE are correct.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ arch/x86/platform/intel/hfi.c | 80 +++++++++++++++++++++++++++--------
+ 1 file changed, 63 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/platform/intel/hfi.c b/arch/x86/platform/intel/hfi.c
+index 228f5eda312b..edd099d8c9f8 100644
+--- a/arch/x86/platform/intel/hfi.c
++++ b/arch/x86/platform/intel/hfi.c
+@@ -88,6 +88,12 @@ static bool asym_capacity_initialized;
+ static struct hfi_params hfi_params;
+ static u64 hfi_timestamp;
+ static u32 *raw_data;
++/*
++ * Highest performance capability in the HFI table. Needed to scale
++ * the performance capabilities of the other HFI classes.
++ */
++static u32 class0_max_perf_cap;
++
+ 
+ static bool hfi_debug_enable;
+ 
+@@ -331,7 +337,32 @@ static void update_energy_efficiency(void)
+ 	hdr->ee_updated = 0;
+ }
+ 
+-static int get_hfi_performance_cap(void)
++/*
++ * Class capacities are scaled with respect to the default class (i.e., class
++ * 0), which is scaled in the range [1, SCHED_CAPACITY_SCALE]. In this manner,
++ * special classes that offer higher performance will be represented as a
++ * performance boost: a capacity greater than SCHED_CAPACITY_SCALE. This is
++ * OK as class capacities are not used in the scheduler's capacity and
++ * utilization accounting.
++ */
++static void scale_one_class_capacity(unsigned int classid)
++{
++	unsigned long capacity;
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		capacity = div64_u64(raw_data[cpu] << SCHED_CAPACITY_SHIFT,
++				     class0_max_perf_cap);
++		if (!capacity)
++			capacity = 1;
++
++		hfi_debug("cpu%02d class:%u raw:%u cap:%04lu\n",
++			  cpu, classid, raw_data[cpu], capacity);
++		topology_set_class_cpu_scale(cpu, classid, capacity);
++	}
++}
++
++static int get_hfi_performance_cap(unsigned int classid)
+ {
+ 	u32 max_perf = 0;
+ 	int cpu;
+@@ -352,10 +383,11 @@ static int get_hfi_performance_cap(void)
+ 		index = per_cpu(hfi_cpu_index, cpu);
+ 
+ 		/* Find the performance data of @cpu */
+-		data = hfi_params.data + index * hfi_params.cpu_stride;
++		data = hfi_params.data + index * hfi_params.cpu_stride +
++		       classid * hfi_params.class_stride;
+ 		raw_data[cpu] = data->perf_cap;
+-		hfi_debug("CPU:%d idx%d perf: %d >>>> %d\n", cpu, index,
+-			 raw_data[cpu], data->perf_cap);
++		hfi_debug("CPU:%d idx%d class:%d perf: %d >>>> %d\n", cpu, index,
++			  classid, raw_data[cpu], data->perf_cap);
+ 
+ 		max_perf = max(max_perf, raw_data[cpu]);
+ 	}
+@@ -366,6 +398,9 @@ static int get_hfi_performance_cap(void)
+ 		return -EINVAL;
+ 	}
+ 
++	if (classid == 0)
++		class0_max_perf_cap = max_perf;
++
+ 	return 0;
+ }
+ 
+@@ -384,21 +419,32 @@ static int get_hfi_performance_cap(void)
+  */
+ static void update_capacity(void)
+ {
+-	struct hfi_hdr *hdr = hfi_params.hdr;
++	struct hfi_hdr *hdr;
++	int i;
++
++	for (i = 0; i < hfi_params.nr_classes; i++) {
++		hdr = hfi_params.hdr + i * hfi_params.class_stride;
++		if (!hdr->perf_updated) {
++			hfi_debug("class%d perf did not change, skip update\n", i);
++			continue;
++		}
+ 
+-	if (!hdr->perf_updated) {
+-		hfi_debug("perf did not change, skip update\n");
+-		return;
++		/* Read data from the HFI table. */
++		if (get_hfi_performance_cap(i))
++			continue;
++
++		/* We use class 0 to define topology */
++		if (!i)
++			/*
++			 * Scale capacities to the range
++			 * [1, SCHED_CAPACITY_SCALE]
++			 */
++			do_topology_normalize_cpu_scale(raw_data);
++		else
++			scale_one_class_capacity(i);
++
++		hdr->perf_updated = 0;
+ 	}
+-
+-	/* Read data from the HFI table. */
+-	if (get_hfi_performance_cap())
+-		return;
+-
+-	/* Now scale capacities to the range [1, SCHED_CAPACITY_SCALE] */
+-	do_topology_normalize_cpu_scale(raw_data, 0);
+-
+-	hdr->perf_updated = 0;
+ }
+ 
+ static void hfi_update_work_fn(struct work_struct *work)
+-- 
+2.27.0
+
