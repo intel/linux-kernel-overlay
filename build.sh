@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -x
 
 # Global configurations
 KVERSION=5
@@ -7,17 +7,14 @@ KSUBLEVEL=0
 KEXTRAVERSION=-rc3
 
 KSRC_REPO=https://github.com/torvalds/linux.git
-KSRC_TAG=v5.13-rc3
 
-DPKG_REPO=https://salsa.debian.org/kernel-team/linux.git
-DPKG_TAG=1c443439e
+KSRC_TAG=v$KVERSION.$KPATCHLEVEL$KEXTRAVERSION
 
 KSRC_MIRROR=
 
 # Local macros
 CUR_DIR=$PWD
-DPKG_DIR=$CUR_DIR/dpkg
-DPKG_OVERLAY_DIR=$CUR_DIR/dpkg.overlay/
+DEBIAN_DIR=$CUR_DIR/debian
 KSRC_DIR=$CUR_DIR/kernel
 KSRC_OVERLAY_DIR=$CUR_DIR/kernel.overlay/
 
@@ -38,39 +35,22 @@ else
 	rsync --delete --exclude .svk --exclude .svn --exclude .git --link-dest=$KSRC_MIRROR -a $KSRC_MIRROR $KSRC_DIR
 fi
 
-# Clone and apply the debian repository.
-echo "Cloning the debian kernel package to $DPKG_DIR, tag: $DPKG_TAG"
-git submodule update --init $DPKG_DIR
-git submodule update --remote $DPKG_DIR
-pushd $DPKG_DIR
-rm * -rf && git reset --hard
-git pull
-git checkout $DPKG_TAG
-
-# Update the debian overlay patches
-echo "Appying the debian overlay patches (to $DPKG_DIR)"
-git am $DPKG_OVERLAY_DIR/*.patch
-git add debian/rules
-
-
 # Update the kernel overlay patches
-echo "Updating the Linux kernel overlay patches (to $KSRC_DIR)"
-rm $DPKG_DIR/debian/patches/* -rf
-cp $KSRC_OVERLAY_DIR/patches/* $DPKG_DIR/debian/patches/
-git add debian/patches/
+echo "Applying the Linux kernel overlay patches (to $KSRC_DIR)"
+rm $KSRC_DIR/.pc -rf
+rm $KSRC_DIR/patches -rf
+cp $KSRC_OVERLAY_DIR/patches  $KSRC_DIR -r
 
-git commit -m "Auto applied overlay patches for debian & kernel"  
+pushd $KSRC_DIR
+quilt push -a
 
-# Start build
-debian/rules kernel
+echo "Updating the kernel config"
+cp $CUR_DIR/overlay.config $KSRC_DIR/.config
+make olddefconfig
 
-# debian/rules debian/control
-fakeroot debian/rules source
-
-fakeroot make -f debian/rules.gen binary-arch_amd64_none_amd64
-
+echo "Building the .deb package"
+nice make -j`nproc` bindeb-pkg
 popd
 
-
-# fakeroot make -f debian/rules.gen binary-arch_amd64_none_amd64
+ls -lah *.deb
 
