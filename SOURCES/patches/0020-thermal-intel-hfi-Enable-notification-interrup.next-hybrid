@@ -1,0 +1,341 @@
+From 5bd3614a231b03f3fee9499c16bf15ca9e74a0f5 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Thu, 20 May 2021 07:42:56 -0700
+Subject: [PATCH 20/76] thermal: intel: hfi: Enable notification interrupt
+
+When hardware wants to inform the operating system about updates in the
+performance and efficiency capabilities of CPUs, it issues a package-level
+thermal event interrupt. For this, hardware has a new interrupt and status
+bits in the IA32_PACKAGE_THERM_INTERRUPT and IA32_PACKAGE_THERM_STATUS
+registers. Reuse the existing thermal throttle driver to enable the new
+HFI interrupt.
+
+The frequency of the thermal HFI interrupt depends on hardware in use. On
+some processors, a single interrupt happens as soon as the HFI is enabled
+and hardware will never update HFI capabilities afterwards. In other
+processors, thermal and power constraints may cause thermal HFI interrupts
+as frequently as every 15ms. Use delayed work to throttle the rate of HFI
+updates.
+
+A second reason to schedule a delayed work to consume HFI updates using
+delayed work is that all CPUs in the package may receive the HFI thermal
+interrupt. However, only one designated CPU per package needs to consume
+the HFI updates. Scheduling a delayed work ensures that the designated CPU
+consumes the update only once.
+
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Aubrey Li <aubrey.li@linux.intel.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+
+---
+Changes since v5:
+  * Enable the HFI from thermal thottle CPU hotplug online callback.
+  * Schedule the delayed work on a designed CPU per package.
+  * When hadling the HFI event, make a local copy of the updated table
+    and acknowledge the interrupt. All processing is done in a delayed
+    work unit.
+  * Take care of the case in which there there are not CPUs with a local
+    APIC ready to receive the HFI thermal interrupt.
+
+Changes since v4:
+  * Avoid handling the HFI update it the delayed work was scheduled too
+    late and a different CPU has already processed it. (Len)
+  * Add placeholder for capacity update for clarity. (Len)
+  * Remove unnecessary locking when scheduling delayed work to process
+    the HFI table update. (Srinivas, Len, Tim)
+  * Reworked intel_hfi_check_event() to get the HFI package-level thermal
+    status bit as argument. (Srinivas)
+  * Relocated enable_hfi_interrupt() to this patch, where it belongs.
+
+Changes since v3:
+  * Added a spinlock to coordinate reads on the HFI table.
+
+Changes since v2:
+  * Removed code to update CPU priority.
+  * Relocated initialization of CPU index into the workqueue function.
+
+Changes since v1:
+  * Relocated function intel_hfi_check_event() to this patch as it makes
+    more logical sense (Peter Z).
+  * Added a spinlock to coordinate HFI table updates upon interrupt. Update
+    ITMT CPU priority in a work function.
+  * Added a new member initialized to struct hfi_info. This is needed
+    HFI interrupt may happen before a CPU has completed its CPU hotplug
+    online initialization.
+  * Implemented a safety mask to protect the read-only bits of
+    IA32_PACKAGE_THERM_STATUS. (Srinivas)
+  * Replace a spin_unlock_irqrestore()/return with a goto. (Andi)
+  * Enable the HFI interrupt from intel_init_thermal(). (Srinivas)
+  * Update CPU priorities from a delayed work queue. (Srinivas)
+---
+ arch/x86/include/asm/hfi.h          |   2 +
+ drivers/thermal/intel/intel_hfi.c   | 146 +++++++++++++++++++++++++++-
+ drivers/thermal/intel/therm_throt.c |  10 ++
+ 3 files changed, 157 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/hfi.h b/arch/x86/include/asm/hfi.h
+index d218a917dcc4..d7e4ea620a29 100644
+--- a/arch/x86/include/asm/hfi.h
++++ b/arch/x86/include/asm/hfi.h
+@@ -28,10 +28,12 @@
+ void __init intel_hfi_init(void);
+ int enable_hfi(unsigned int cpu);
+ int disable_hfi(unsigned int cpu);
++void intel_hfi_check_event(__u64 pkg_therm_status_msr_val);
+ #else
+ static inline void intel_hfi_init(void) { }
+ static inline int enable_hfi(unsigned int cpu) { return 0; }
+ static inline int disable_hfi(unsigned int cpu) { return 0; }
++static inline void intel_hfi_check_event(__u64 pkg_therm_status_msr_val) { }
+ #endif
+ 
+ #endif /* _ASM_X86_HFI_H */
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index 4c6ed4be75e7..1e6cce55d790 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -23,6 +23,12 @@
+ 
+ #include <asm/hfi.h>
+ 
++#define THERM_STATUS_CLEAR_PKG_MASK (BIT(1) | BIT(3) | BIT(5) | BIT(7) | \
++				     BIT(9) | BIT(11) | BIT(26))
++
++/* Delay reading HFI updates a few milliseconds */
++#define HFI_UPDATE_DELAY (1000 / HZ)
++
+ /**
+  * struct hfi_cpu_data - Capabilities of a logical processor in the HFI table.
+  *			 These capabilities are unitless.
+@@ -56,6 +62,10 @@ struct hfi_hdr {
+  * @cpus:		CPUs represented in this HFI table instance
+  * @initialized:	True if this HFI instance has bee initialized
+  * @hw_table:		Pointer to the HFI table of this instance
++ * @update_work:	Delayed work to process HFI updates
++ * @hfi_event_lock:	Lock to protect HFI updates
++ * @processing_update:	True if we are processing an HFI update
++ * @timestamp:		Time-stamp of the last HFI update
+  */
+ struct hfi_params {
+ 	void			*table_base;
+@@ -67,6 +77,10 @@ struct hfi_params {
+ 	cpumask_var_t		cpus;
+ 	bool			initialized;
+ 	void			*hw_table;
++	struct delayed_work	update_work;
++	raw_spinlock_t		hfi_event_lock;
++	bool			processing_update;
++	u64			timestamp;
+ };
+ 
+ /**
+@@ -104,6 +118,82 @@ static struct hfi_params *hfi_param_instances;
+ static struct hfi_features hfi_features;
+ static DEFINE_MUTEX(hfi_lock);
+ 
++static void hfi_update_work_fn(struct work_struct *work)
++{
++	struct hfi_cpu_info *info = &per_cpu(hfi_cpu_info, smp_processor_id());
++	struct hfi_params *params;
++	unsigned long flags;
++
++	if (!info)
++		return;
++
++	if (!info->params)
++		return;
++
++	params = info->params;
++
++	/*
++	 * Sanity check that the timestamp moved forward before consuming
++	 * the table update.
++	 */
++	if (params->timestamp >= *params->ts_counter) {
++		pr_err_once("Updated HFI timestamp is in the past. FW bug?\n");
++		return;
++	}
++
++	params->timestamp = *params->ts_counter;
++
++	/* TODO: Update capacity here. */
++
++	raw_spin_lock_irqsave(&params->hfi_event_lock, flags);
++	params->processing_update = false;
++	raw_spin_unlock_irqrestore(&params->hfi_event_lock, flags);
++}
++DECLARE_DELAYED_WORK(hfi_update_work, hfi_update_work_fn);
++
++void intel_hfi_check_event(__u64 pkg_therm_status_msr_val)
++{
++	struct hfi_cpu_info *info;
++	struct hfi_params *params;
++	unsigned long flags;
++
++	if (!pkg_therm_status_msr_val)
++		return;
++
++	info = &per_cpu(hfi_cpu_info, smp_processor_id());
++	if (!info)
++		return;
++
++	/*
++	 * It is possible that we get an HFI thermal interrupt on this CPU
++	 * before its HFI parameters are initialized. This is not a problem.
++	 * The CPU that enabled the interrupt for this package will also
++	 * get the interrupt and is fuily initialized.
++	 */
++	params = info->params;
++	if (!params)
++		return;
++	/*
++	 * With the exception of certain systems, all CPUs receive the package-
++	 * level thermal interrupt and all of them will try to schedule delayed
++	 * work. However, only the first CPU will succeed.
++	 */
++	raw_spin_lock_irqsave(&params->hfi_event_lock, flags);
++	memcpy(params->table_base, params->hw_table,
++	       hfi_features.nr_table_pages << PAGE_SHIFT);
++	/*
++	 * Let hardware and other CPUs know that we are done reading the HFI
++	 * table and it is free to update it again.
++	 */
++	pkg_therm_status_msr_val &= THERM_STATUS_CLEAR_PKG_MASK &
++				    ~PACKAGE_THERM_STATUS_HFI_UPDATED;
++	wrmsrl(MSR_IA32_PACKAGE_THERM_STATUS, pkg_therm_status_msr_val);
++	params->processing_update = true;
++	schedule_delayed_work_on(params->handling_cpu,
++				 &hfi_update_work, HFI_UPDATE_DELAY);
++	raw_spin_unlock_irqrestore(&params->hfi_event_lock, flags);
++}
++
+ static void get_hfi_cpu_index(unsigned int cpu)
+ {
+ 	s16 hfi_idx;
+@@ -150,6 +240,7 @@ int enable_hfi(unsigned int cpu)
+ 	u16 die_id = topology_logical_die_id(cpu);
+ 	struct hfi_params *params;
+ 	phys_addr_t hw_table_pa;
++	unsigned long flags;
+ 	u64 msr_val;
+ 
+ 	if (!static_cpu_has(X86_FEATURE_INTEL_HFI))
+@@ -190,7 +281,46 @@ int enable_hfi(unsigned int cpu)
+ 
+ 		info->params = params;
+ 
+-		return 0;
++		/*
++		 * Both the HFI thermal interrupt and the local APIC thermal LVT
++		 * are enabled when a CPU comes online. On some systems, all
++		 * CPUs get the package thermak interrupt. On others, however,
++		 * only a subset of CPU gets it. In the former case, we always
++		 * get the interrupt as we enable the HFI after having enabled
++		 * the thermal interrupt in the local APIC. However, in the
++		 * latter case, we may miss the interrupt if hardware issues the
++		 * interrupt to a CPU in which the thermal vector has not been
++		 * enabled in the local APIC. We know that this is the case as
++		 * the status bit will be set. In such a case, handle the
++		 * interrupt.
++		 */
++		rdmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
++		if (msr_val & PACKAGE_THERM_STATUS_HFI_UPDATED) {
++			mutex_lock(&hfi_lock);
++			raw_spin_lock_irqsave(&params->hfi_event_lock, flags);
++			memcpy(params->table_base, params->hw_table,
++			       hfi_features.nr_table_pages << PAGE_SHIFT);
++
++			params->processing_update = true;
++			raw_spin_unlock_irqrestore(&params->hfi_event_lock,
++						   flags);
++			msr_val &= THERM_STATUS_CLEAR_PKG_MASK &
++				   ~PACKAGE_THERM_STATUS_HFI_UPDATED;
++			wrmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
++
++			mutex_unlock(&hfi_lock);
++
++			if (params->handling_cpu < nr_cpu_ids)
++				schedule_delayed_work_on(params->handling_cpu,
++							 &params->update_work,
++							 HFI_UPDATE_DELAY);
++			else
++				pr_err_once("No handling CPU for package %d",
++					    params->die_id);
++
++			return 0;
++		}
++
+ 	}
+ 
+ 	/* The HFI has not been initialized for @cpu. Initialize it. */
+@@ -219,6 +349,9 @@ int enable_hfi(unsigned int cpu)
+ 
+ 	init_hfi_params(params);
+ 
++	INIT_DELAYED_WORK(&params->update_work, hfi_update_work_fn);
++	raw_spin_lock_init(&params->hfi_event_lock);
++
+ 	cpumask_set_cpu(cpu, params->cpus);
+ 	params->initialized = true;
+ 	mutex_lock(&hfi_lock);
+@@ -227,6 +360,11 @@ int enable_hfi(unsigned int cpu)
+ 	params->die_id = die_id;
+ 	info->params = params;
+ 
++	/* Enable the hardware feedback interface. */
++	rdmsrl(MSR_IA32_HW_FEEDBACK_CONFIG, msr_val);
++	msr_val |= HFI_CONFIG_ENABLE_BIT;
++	wrmsrl(MSR_IA32_HW_FEEDBACK_CONFIG, msr_val);
++
+ 	return 0;
+ 
+ free_hw_table:
+@@ -278,7 +416,13 @@ int disable_hfi(unsigned int cpu)
+ 			goto out;
+ 		}
+ 
++		if (params->processing_update) {
++			cancel_delayed_work_sync(&params->update_work);
++			params->processing_update = false;
++		}
++
+ 		params->handling_cpu = new_cpu;
++
+ 	}
+ 
+ out:
+diff --git a/drivers/thermal/intel/therm_throt.c b/drivers/thermal/intel/therm_throt.c
+index 41fea6e6e801..1a195880be4a 100644
+--- a/drivers/thermal/intel/therm_throt.c
++++ b/drivers/thermal/intel/therm_throt.c
+@@ -614,6 +614,10 @@ void intel_thermal_interrupt(void)
+ 					PACKAGE_THERM_STATUS_POWER_LIMIT,
+ 					POWER_LIMIT_EVENT,
+ 					PACKAGE_LEVEL);
++
++		if (this_cpu_has(X86_FEATURE_INTEL_HFI))
++			intel_hfi_check_event(msr_val &
++					      PACKAGE_THERM_STATUS_HFI_UPDATED);
+ 	}
+ }
+ 
+@@ -716,6 +720,12 @@ void intel_init_thermal(struct cpuinfo_x86 *c)
+ 			wrmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT,
+ 			      l | (PACKAGE_THERM_INT_LOW_ENABLE
+ 				| PACKAGE_THERM_INT_HIGH_ENABLE), h);
++
++		if (cpu_has(c, X86_FEATURE_INTEL_HFI)) {
++			rdmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT, l, h);
++			wrmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT,
++			      l | PACKAGE_THERM_INT_HFI_ENABLE, h);
++		}
+ 	}
+ 
+ 	rdmsr(MSR_IA32_MISC_ENABLE, l, h);
+-- 
+2.27.0
+

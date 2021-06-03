@@ -1,0 +1,335 @@
+From 8897fa91534176e9c76997be1ea2b89bfd24583e Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Mon, 2 Nov 2020 14:49:36 -0800
+Subject: [PATCH 61/76] thermal: intel: hfi: Introduce Hardware Feedback
+ Interface classes
+
+On Intel hybrid parts, CPUs have asymmetric performance properties.
+However, such asymmetry depends not only on the type of CPU but also
+on the type of instructions a task executes. This means that different
+types of tasks will have different instructions-per-cycle (IPC) ratios.
+
+The Enhanced Hardware Feedback (EHFI) interface provides classification
+of tasks based on the instructions they execute. In other words, hardware
+can identify specific types of tasks with higher or lower IPC ratios.
+
+Tasks are classified into several classes. Hardware defines the number
+of supported classes.
+
+Class 0 denotes tasks for which hardware did not find a suitable class.
+The IPC ratio of class 0 is the average of all classes. Thus, use it
+to define CPU capacity.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ drivers/thermal/intel/intel_hfi.c | 120 ++++++++++++++++++++----------
+ 1 file changed, 82 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index a2fb4dbfb0a4..c5678229debf 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -39,7 +39,8 @@
+ 
+ /**
+  * struct hfi_cpu_data - Capabilities of a logical processor in the HFI table.
+- *			 These capabilities are unitless.
++ *			 These capabilities are specific to each HFI class and
++ *			 are unitless.
+  * @perf_cap:		Performance capability
+  * @ee_cap:		Energy efficiency capability
+  */
+@@ -50,7 +51,7 @@ struct hfi_cpu_data {
+ 
+ /**
+  * struct hfi_hdr - Header of the HFI table. Indicates if hardware updated
+- *		    data in the table.
++ *		    data in the table. A header is specific to each HFI class.
+  * @perf_updated:	Hardware updated performance capabilities
+  * @ee_updated:		Hardware updated energy efficiency capabilities
+  */
+@@ -93,17 +94,22 @@ struct hfi_params {
+ 
+ /**
+  * struct hfi_features - Capabilities supported in all dies/pacakges
++ * @nr_classes:		Number of classes supported
+  * @capabilities:	Bitmask of supported capabilities per class
+  * @nr_table_pages:	Size of the HFI table in 4KB pages
+  * @cpu_stride:		Stride size to locate capability data of a logical
+  *			processor within the table (i.e., row stride)
++ * @class_stride:	Stride size to locate a class within the capability
++ *			data of a logical processor or the HFI table header
+  * @hdr_size:		Size of table header
+  * @parsed:		True if HFI features have been parsed
+  */
+ struct hfi_features {
++	unsigned int	nr_classes;
+ 	unsigned long	capabilities;
+ 	unsigned int	nr_table_pages;
+ 	unsigned int	cpu_stride;
++	unsigned int	class_stride;
+ 	unsigned int	hdr_size;
+ 	bool		parsed;
+ };
+@@ -330,7 +336,8 @@ static void register_perf_domain_cpu(int cpu, unsigned long eff)
+ }
+ 
+ /* must be called with hfi_lock */
+-static void update_efficiency_cpu(unsigned long eff, int cpu)
++static void update_one_class_efficiency_cpu(unsigned long eff, int cpu,
++					    int classid)
+ {
+ 	struct em_perf_domain *em_pd;
+ 
+@@ -354,10 +361,14 @@ static void update_efficiency_cpu(unsigned long eff, int cpu)
+ 	register_perf_domain_cpu(cpu, eff);
+ }
+ 
+-static void scale_efficiency_cpu(u8 ee_cap, int cpu)
++static void scale_one_class_efficiency_cpu(u8 ee_cap, int cpu, int classid)
+ {
+ 	unsigned long efficiency;
+ 
++	/* Ignore non-zero classes for now. */
++	if (classid)
++		return;
++
+ 	/*
+ 	 * The CPU with highest performance has not been found. This can
+ 	 * happen if a CPU comes online before the first HFI interrupt
+@@ -371,11 +382,11 @@ static void scale_efficiency_cpu(u8 ee_cap, int cpu)
+ 
+ 	efficiency = 2048 - efficiency;
+ 
+-	update_efficiency_cpu(efficiency, cpu);
++	update_one_class_efficiency_cpu(efficiency, cpu, classid);
+ }
+ 
+ static void get_one_hfi_cap(struct hfi_params *params, int cpu,
+-			    struct hfi_cpu_data *hfi_caps)
++			    struct hfi_cpu_data *hfi_caps, int classid)
+ {
+ 	struct hfi_cpu_data *caps;
+ 	unsigned long flags;
+@@ -387,13 +398,14 @@ static void get_one_hfi_cap(struct hfi_params *params, int cpu,
+ 
+ 	/* Find the performance data of @cpu */
+ 	raw_spin_lock_irqsave(&params->hfi_event_lock, flags);
+-	caps = params->data + index * hfi_features.cpu_stride;
++	caps = params->data + index * hfi_features.cpu_stride +
++	       classid * hfi_features.class_stride;
+ 	memcpy(hfi_caps, caps, sizeof(*hfi_caps));
+ 	raw_spin_unlock_irqrestore(&params->hfi_event_lock, flags);
+ }
+ 
+ static void get_hfi_max_cap(struct hfi_params *params,
+-			    struct hfi_cpu_data *max_caps)
++			    struct hfi_cpu_data *max_caps, int classid)
+ {
+ 	struct hfi_cpu_data caps;
+ 	int cpu;
+@@ -401,13 +413,13 @@ static void get_hfi_max_cap(struct hfi_params *params,
+ 	memset(max_caps, 0, sizeof(*max_caps));
+ 
+ 	for_each_cpu(cpu, params->cpus) {
+-		get_one_hfi_cap(params, cpu, &caps);
++		get_one_hfi_cap(params, cpu, &caps, classid);
+ 		max_caps->perf_cap = max(max_caps->perf_cap, caps.perf_cap);
+ 		max_caps->ee_cap = max(max_caps->ee_cap, caps.ee_cap);
+ 	}
+ }
+ 
+-static void scale_capacity_cpu(u8 perf_cap, int cpu)
++static void scale_one_class_capacity_cpu(u8 perf_cap, int cpu, int classid)
+ {
+ 	unsigned long capacity;
+ 
+@@ -422,19 +434,22 @@ static void scale_capacity_cpu(u8 perf_cap, int cpu)
+ 	capacity = div64_u64(perf_cap << SCHED_CAPACITY_SHIFT,
+ 			     class0_max_caps.perf_cap);
+ 
+-	topology_set_cpu_scale(cpu, capacity);
++	if (!classid)
++		topology_set_cpu_scale(cpu, capacity);
++
++	/* TODO: Add class-specific capacity scaling here. */
+ }
+ 
+-static void scale_capabilities(struct hfi_params *params)
++static void scale_one_class_capabilities(struct hfi_params *params, int classid)
+ {
+ 	int cpu;
+ 
+ 	for_each_cpu(cpu, params->cpus) {
+ 		struct hfi_cpu_data caps;
+ 
+-		get_one_hfi_cap(params, cpu, &caps);
+-		scale_capacity_cpu(caps.perf_cap, cpu);
+-		scale_efficiency_cpu(caps.ee_cap, cpu);
++		get_one_hfi_cap(params, cpu, &caps, classid);
++		scale_one_class_capacity_cpu(caps.perf_cap, cpu, classid);
++		scale_one_class_efficiency_cpu(caps.ee_cap, cpu, classid);
+ 	}
+ }
+ 
+@@ -453,6 +468,7 @@ static void rescale_all_capabilities(struct hfi_cpu_data *new_max_caps)
+ 	for_each_possible_cpu(cpu) {
+ 		struct hfi_cpu_info *info;
+ 		struct hfi_params *params;
++		int classid;
+ 
+ 		info = &per_cpu(hfi_cpu_info, cpu);
+ 		/*
+@@ -466,9 +482,11 @@ static void rescale_all_capabilities(struct hfi_cpu_data *new_max_caps)
+ 		if (!params->initialized)
+ 			continue;
+ 
+-		get_one_hfi_cap(params, cpu, &caps);
+-		scale_capacity_cpu(caps.perf_cap, cpu);
+-		scale_efficiency_cpu(caps.ee_cap, cpu);
++		for (classid = 0; classid < hfi_features.nr_classes; classid++) {
++			get_one_hfi_cap(params, cpu, &caps, classid);
++			scale_one_class_capacity_cpu(caps.perf_cap, cpu, classid);
++			scale_one_class_efficiency_cpu(caps.ee_cap, cpu, classid);
++		}
+ 	}
+ }
+ 
+@@ -530,18 +548,19 @@ static DECLARE_WORK(hfi_asym_capacity_work, hfi_asym_capacity_work_fn);
+  */
+ static void update_capabilities(struct hfi_params *params)
+ {
+-	struct hfi_hdr *hdr = params->hdr;
++	struct hfi_hdr *hdr;
+ 	struct hfi_cpu_data max_caps;
++	int classid;
+ 
+ 	mutex_lock(&hfi_lock);
+ 	/*
+-	 * Check if a new CPU with higher capacity came online
++	 * For class 0, check if a new CPU with higher capacity came online
+ 	 * or became more performant after a thermal interrupt. If no more
+ 	 * performant CPU was found, simply keep the performance of the
+ 	 * most performant CPU. It may come online later in the future and
+ 	 * we can avoid expensive full capacity re-scaling.
+ 	 */
+-	get_hfi_max_cap(params, &max_caps);
++	get_hfi_max_cap(params, &max_caps, 0);
+ 
+ 	if (max_caps.perf_cap > class0_max_caps.perf_cap ||
+ 	    max_caps.ee_cap > class0_max_caps.ee_cap) {
+@@ -549,24 +568,30 @@ static void update_capabilities(struct hfi_params *params)
+ 		 * Acknowledge updates to all classes. We will do a full
+ 		 * capacity rescale.
+ 		 */
+-		hdr->perf_updated = 0;
+-		hdr->ee_updated = 0;
++		for (classid = 0; classid < hfi_features.nr_classes; classid++) {
++			hdr = params->hdr + classid * hfi_features.class_stride;
++			hdr->perf_updated = 0;
++			hdr->ee_updated = 0;
++		}
+ 
+ 		rescale_all_capabilities(&max_caps);
+ 		goto out;
+ 	}
+ 
+-	if (!hdr->perf_updated && !hdr->ee_updated)
+-		goto out;
++	for (classid = 0; classid < hfi_features.nr_classes; classid++) {
++		hdr = params->hdr + classid * hfi_features.class_stride;
++		if (!hdr->perf_updated && !hdr->ee_updated)
++			continue;
+ 
+-	hdr->perf_updated = 0;
+-	hdr->ee_updated = 0;
++		hdr->perf_updated = 0;
++		hdr->ee_updated = 0;
+ 
+-	/* If the HFI table has all zeros, ignore this update. */
+-	if (!max_caps.perf_cap && !max_caps.ee_cap)
+-		goto out;
++		/* If the HFI table has all zeros, ignore this update. */
++		if (!max_caps.perf_cap && !max_caps.ee_cap)
++			continue;
+ 
+-	scale_capabilities(params);
++		scale_one_class_capabilities(params, classid);
++	}
+ 
+ out:
+ 	mutex_unlock(&hfi_lock);
+@@ -681,8 +706,8 @@ static void get_hfi_cpu_index(unsigned int cpu)
+ }
+ 
+ /*
+- * The format of the HFI table depends on the number of capabilities that the
+- * hardware supports. Keep a data structure to navigate the table.
++ * The format of the HFI table depends on the number of capabilities and classes
++ * that the hardware supports. Keep a data structure to navigate the table.
+  */
+ static void  init_hfi_params(struct hfi_params *params)
+ {
+@@ -799,7 +824,7 @@ int enable_hfi(unsigned int cpu)
+ 		 * @cpu.
+ 		 */
+ 		mutex_lock(&hfi_lock);
+-		get_one_hfi_cap(params, cpu, &caps);
++		get_one_hfi_cap(params, cpu, &caps, 0);
+ 		class0_min_caps.perf_cap = min(class0_min_caps.perf_cap,
+ 					       caps.perf_cap);
+ 
+@@ -808,8 +833,15 @@ int enable_hfi(unsigned int cpu)
+ 		    caps.ee_cap > class0_max_caps.ee_cap) {
+ 			rescale_all_capabilities(&caps);
+ 		} else {
+-			scale_capacity_cpu(caps.perf_cap, cpu);
+-			scale_efficiency_cpu(caps.ee_cap, cpu);
++			int classid;
++
++			for (classid = 0; classid < hfi_features.nr_classes; classid++) {
++				get_one_hfi_cap(params, cpu, &caps, classid);
++				scale_one_class_capacity_cpu(caps.perf_cap, cpu,
++							     classid);
++				scale_one_class_efficiency_cpu(caps.ee_cap, cpu,
++							       classid);
++			}
+ 		}
+ 
+ 		schedule_work(&hfi_asym_capacity_work);
+@@ -969,18 +1001,30 @@ static __init int hfi_parse_features(void)
+ 	nr_capabilities = bitmap_weight(&hfi_features.capabilities,
+ 					HFI_CAPABILITIES_NR);
+ 
++	/*
++	 * Capability fields of an HFI class are grouped together. Classes are
++	 * continuous.  Hence, use the number of supported features to locate
++	 * a specific class.
++	 */
++	hfi_features.class_stride = nr_capabilities;
++
++	/* For now, use only one class of the HFI table */
++	hfi_features.nr_classes = 1;
++
+ 	/*
+ 	 * The header contains change indications for each supported feature.
+ 	 * The size of the table header is rounded up to be a multiple of 8
+ 	 * bytes.
+ 	 */
+-	hfi_features.hdr_size = DIV_ROUND_UP(nr_capabilities, 8) * 8;
++	hfi_features.hdr_size = DIV_ROUND_UP(nr_capabilities *
++					     hfi_features.nr_classes, 8) * 8;
+ 
+ 	/*
+ 	 * Data of each logical processor is also rounded up to be a multiple
+ 	 * of 8 bytes.
+ 	 */
+-	hfi_features.cpu_stride = DIV_ROUND_UP(nr_capabilities, 8) * 8;
++	hfi_features.cpu_stride = DIV_ROUND_UP(nr_capabilities *
++					       hfi_features.nr_classes, 8) * 8;
+ 
+ 	hfi_features.parsed = true;
+ 	return 0;
+-- 
+2.27.0
+

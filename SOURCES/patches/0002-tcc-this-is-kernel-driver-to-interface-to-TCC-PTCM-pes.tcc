@@ -1,4 +1,4 @@
-From 6381448f342accf6beba1c3ff2486a7a8da31c09 Mon Sep 17 00:00:00 2001
+From 31c92b69d2825252601c146fb39b249ee944ec52 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
 Subject: [PATCH 2/9] tcc: this is kernel driver to interface to TCC PTCM

@@ -1,4 +1,4 @@
-From 5aa3f6cdcfd269a6a317c11f89634c91c231c89c Mon Sep 17 00:00:00 2001
+From acc7ba3e157d2275720634a2dd1df97ccb426758 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 15 Jun 2020 09:55:13 +0800
 Subject: [PATCH 5/9] tcc: driver should exit if no psram entry found in PTCT.

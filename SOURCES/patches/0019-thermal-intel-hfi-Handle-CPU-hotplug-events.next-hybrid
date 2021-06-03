@@ -1,0 +1,338 @@
+From e5cd11106ae679120e2eb08409fce3465e46b663 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Tue, 5 Jan 2021 18:06:11 -0800
+Subject: [PATCH 19/76] thermal: intel: hfi: Handle CPU hotplug events
+
+Since there is an HFI instance per package, CPUs shall coordinate access
+to it. Designate a single CPU per package to configure the HFI hardware.
+Such CPU is the first one that comes online on each package. Subsequent
+CPUs in the package need only to register or unregister themselves in the
+existing per-package data structure as the come online or offline.
+
+HFI depends on both the package-level thermal management and the local APIC
+thermal local vector. Thus, ensure that both are properly configured before
+calling enable_hfi(). Likewise, only disable HFI before disabling the local
+thermal vector. The CPU hotplug callbacks of the thermal throttle events
+code already meets the mentioned conditions. Enable and disable HFI from
+such callbacks.
+
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Aubrey Li <aubrey.li@linux.intel.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Suggested-by: Len Brown <len.brown@intel.com>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+Changes since v5:
+  * Introduced this patch.
+
+Changes since v4:
+  * N/A
+
+Changes since v3:
+  * N/A
+
+Changes since v2:
+  * N/A
+
+Changes since v1:
+  * N/A
+---
+ arch/x86/include/asm/hfi.h          |   4 +
+ drivers/thermal/intel/intel_hfi.c   | 208 ++++++++++++++++++++++++++++
+ drivers/thermal/intel/therm_throt.c |   8 ++
+ 3 files changed, 220 insertions(+)
+
+diff --git a/arch/x86/include/asm/hfi.h b/arch/x86/include/asm/hfi.h
+index 2c72f24c734e..d218a917dcc4 100644
+--- a/arch/x86/include/asm/hfi.h
++++ b/arch/x86/include/asm/hfi.h
+@@ -26,8 +26,12 @@
+ 
+ #if defined(CONFIG_INTEL_HFI)
+ void __init intel_hfi_init(void);
++int enable_hfi(unsigned int cpu);
++int disable_hfi(unsigned int cpu);
+ #else
+ static inline void intel_hfi_init(void) { }
++static inline int enable_hfi(unsigned int cpu) { return 0; }
++static inline int disable_hfi(unsigned int cpu) { return 0; }
+ #endif
+ 
+ #endif /* _ASM_X86_HFI_H */
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index 0f0a48d72ebc..4c6ed4be75e7 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -18,6 +18,7 @@
+ 
+ #define pr_fmt(fmt)  "intel-hfi: " fmt
+ 
++#include <linux/io.h>
+ #include <linux/slab.h>
+ 
+ #include <asm/hfi.h>
+@@ -46,14 +47,26 @@ struct hfi_hdr {
+ 
+ /**
+  * struct hfi_params - Parameters needed to parse and navigate the HFI table
++ * @table_base:		Base of the local copy of the HFI table
+  * @ts_counter:		Time stamp of the last update of the table
+  * @hdr:		Base address of the table header
+  * @data:		Base address of the table data
++ * @die_id:		Logical die ID this HFI table instance
++ * @handling_cpu:	CPU handling the HFI interrupts of this package
++ * @cpus:		CPUs represented in this HFI table instance
++ * @initialized:	True if this HFI instance has bee initialized
++ * @hw_table:		Pointer to the HFI table of this instance
+  */
+ struct hfi_params {
++	void			*table_base;
+ 	u64			*ts_counter;
+ 	void			*hdr;
+ 	void			*data;
++	u16			die_id;
++	int			handling_cpu;
++	cpumask_var_t		cpus;
++	bool			initialized;
++	void			*hw_table;
+ };
+ 
+ /**
+@@ -73,10 +86,205 @@ struct hfi_features {
+ 	bool		parsed;
+ };
+ 
++/**
++ * struct hfi_cpu_info - Per-CPU attributes to consume HFI data
++ * @index:		Row of this CPU in its HFI table
++ * @params:		Parameters of the HFI table to which this CPU belongs
++ */
++struct hfi_cpu_info {
++	s16			index;
++	struct hfi_params	*params;
++};
++
++static DEFINE_PER_CPU(struct hfi_cpu_info, hfi_cpu_info) = { .index = -1 };
++
+ static int max_hfi_param_instances;
+ static struct hfi_params *hfi_param_instances;
+ 
+ static struct hfi_features hfi_features;
++static DEFINE_MUTEX(hfi_lock);
++
++static void get_hfi_cpu_index(unsigned int cpu)
++{
++	s16 hfi_idx;
++	u32 edx;
++
++	/* Do not re-read this CPU's index if it has been initialized. */
++	if (per_cpu(hfi_cpu_info, cpu).index > -1)
++		return;
++
++	edx = cpuid_edx(CPUID_HFI_LEAF);
++	hfi_idx = (edx & CPUID_HFI_CPU_INDEX_MASK) >> CPUID_HFI_CPU_INDEX_SHIFT;
++
++	per_cpu(hfi_cpu_info, cpu).index = hfi_idx;
++}
++
++/*
++ * The format of the HFI table depends on the number of capabilities that the
++ * hardware supports. Keep a data structure to navigate the table.
++ */
++static void  init_hfi_params(struct hfi_params *params)
++{
++	/* The HFI time-stamp is located at the base of the table. */
++	params->ts_counter = params->table_base;
++
++	/* The HFI header is below the time-stamp. */
++	params->hdr = params->table_base + sizeof(*params->ts_counter);
++
++	/* The HFI data starts below the header. */
++	params->data = params->hdr + hfi_features.hdr_size;
++}
++
++/** enable_hfi() - Enable HFI on @cpu
++ * @cpu:	CPU in which the HFI will be enabled
++ *
++ * Enable the HFI to be used in @cpu. The HFI is enabled at the package level.
++ * If a CPU has previously configured the HFI, just add itself to the CPUs
++ * serviced by the same HFI instance.
++ *
++ * Returns 0 on success; a non-zero value on failure.
++ */
++int enable_hfi(unsigned int cpu)
++{
++	struct hfi_cpu_info *info = &per_cpu(hfi_cpu_info, cpu);
++	u16 die_id = topology_logical_die_id(cpu);
++	struct hfi_params *params;
++	phys_addr_t hw_table_pa;
++	u64 msr_val;
++
++	if (!static_cpu_has(X86_FEATURE_INTEL_HFI))
++		return 0;
++
++	get_hfi_cpu_index(cpu);
++
++	/*
++	 * HFI parameters for this @cpu may exist already but they have not
++	 * been linked to @cpu.
++	 */
++	params = info->params;
++	if (!params) {
++		if (die_id >= 0 && die_id < max_hfi_param_instances)
++			params = &hfi_param_instances[die_id];
++
++		if (!params)
++			return -ENXIO;
++	}
++
++	/*
++	 * Now check if the HFI parameters for the package/die of this CPU have
++	 * been initialized. In such case, all we have to do is add @cpu to the
++	 * cpumask of this HFI instance.
++	 */
++	if (params->initialized) {
++		mutex_lock(&hfi_lock);
++
++		/*
++		 * If nobody is handling the HFI updates for this package, let
++		 * @cpu do it.
++		 */
++		if (params->handling_cpu == nr_cpu_ids)
++			params->handling_cpu = cpu;
++
++		cpumask_set_cpu(cpu, params->cpus);
++		mutex_unlock(&hfi_lock);
++
++		info->params = params;
++
++		return 0;
++	}
++
++	/* The HFI has not been initialized for @cpu. Initialize it. */
++	if (!zalloc_cpumask_var(&params->cpus, GFP_KERNEL))
++		return -ENOMEM;
++
++	/*
++	 * Hardware is programmed with the physical address of the first page
++	 * frame of the table. Hence, the allocated memory must be page-aligned.
++	 */
++	params->hw_table = alloc_pages_exact(hfi_features.nr_table_pages,
++					     GFP_KERNEL | __GFP_ZERO);
++	if (!params->hw_table)
++		goto free_cpumask;
++
++	hw_table_pa = virt_to_phys(params->hw_table);
++
++	params->table_base = kzalloc(hfi_features.nr_table_pages << PAGE_SHIFT,
++				     GFP_KERNEL);
++	if (!params->table_base)
++		goto free_hw_table;
++
++	/* Program address of the feedback table of this die/package */
++	msr_val = hw_table_pa | HFI_PTR_VALID_BIT;
++	wrmsrl(MSR_IA32_HW_FEEDBACK_PTR, msr_val);
++
++	init_hfi_params(params);
++
++	cpumask_set_cpu(cpu, params->cpus);
++	params->initialized = true;
++	mutex_lock(&hfi_lock);
++	params->handling_cpu = cpu;
++	mutex_unlock(&hfi_lock);
++	params->die_id = die_id;
++	info->params = params;
++
++	return 0;
++
++free_hw_table:
++	free_pages_exact(params->hw_table, hfi_features.nr_table_pages);
++free_cpumask:
++	free_cpumask_var(params->cpus);
++	return -ENOMEM;
++}
++
++/** disable_hfi() - Disable HFI on @cpu
++ * @cpu:	CPU in which the HFI will be disabled
++ *
++ * Remove @cpu from those covered by its HFI instance. If @cpu is the handling
++ * CPU, assign other CPU to handle the HFI updates.
++ *
++ * Returns 0 on success; a non-zero value on failure.
++ */
++int disable_hfi(unsigned int cpu)
++{
++	struct hfi_cpu_info *info = &per_cpu(hfi_cpu_info, cpu);
++	struct hfi_params *params;
++	int ret = 0;
++
++	if (!static_cpu_has(X86_FEATURE_INTEL_HFI))
++		return 0;
++
++	params = info->params;
++	if (!params)
++		return 0;
++
++	if (!params->initialized)
++		return 0;
++
++	mutex_lock(&hfi_lock);
++	cpumask_clear_cpu(cpu, params->cpus);
++
++	/* No CPUs left in this package to handle interrupts. */
++	if (!cpumask_weight(params->cpus)) {
++		params->handling_cpu = nr_cpu_ids;
++		goto out;
++	}
++
++	if (params->handling_cpu == cpu) {
++		int new_cpu = cpumask_any_but(params->cpus, cpu);
++
++		if (new_cpu >= nr_cpu_ids) {
++			params->handling_cpu = nr_cpu_ids;
++			ret = -ENODEV;
++			goto out;
++		}
++
++		params->handling_cpu = new_cpu;
++	}
++
++out:
++	mutex_unlock(&hfi_lock);
++	return ret;
++}
+ 
+ static __init int hfi_parse_features(void)
+ {
+diff --git a/drivers/thermal/intel/therm_throt.c b/drivers/thermal/intel/therm_throt.c
+index 581a276dcf60..41fea6e6e801 100644
+--- a/drivers/thermal/intel/therm_throt.c
++++ b/drivers/thermal/intel/therm_throt.c
+@@ -480,6 +480,12 @@ static int thermal_throttle_online(unsigned int cpu)
+ 	l = apic_read(APIC_LVTTHMR);
+ 	apic_write(APIC_LVTTHMR, l & ~APIC_LVT_MASKED);
+ 
++	/*
++	 * Enable the package-level HFI interrupt. Thus, make sure the local
++	 * APIC is ready to get thermal interrupts.
++	 */
++	enable_hfi(cpu);
++
+ 	return thermal_throttle_add_dev(dev, cpu);
+ }
+ 
+@@ -489,6 +495,8 @@ static int thermal_throttle_offline(unsigned int cpu)
+ 	struct device *dev = get_cpu_device(cpu);
+ 	u32 l;
+ 
++	disable_hfi(cpu);
++
+ 	/* Mask the thermal vector before draining evtl. pending work */
+ 	l = apic_read(APIC_LVTTHMR);
+ 	apic_write(APIC_LVTTHMR, l | APIC_LVT_MASKED);
+-- 
+2.27.0
+
