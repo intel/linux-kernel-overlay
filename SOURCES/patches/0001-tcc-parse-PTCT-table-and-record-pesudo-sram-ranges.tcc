@@ -1,4 +1,4 @@
-From c2dbe615349469246977dbfe411627ecc886e759 Mon Sep 17 00:00:00 2001
+From 2d92745506642781b64e4a7f2e294a684cf1a0d3 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 14:43:41 +0800
 Subject: [PATCH 1/9] tcc: parse PTCT table and record pesudo sram ranges

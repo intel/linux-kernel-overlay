@@ -1,0 +1,160 @@
+From e4db3bd5ee30a8221c3e95501097110a3e9110d8 Mon Sep 17 00:00:00 2001
+From: Jin Yao <yao.jin@linux.intel.com>
+Date: Mon, 19 Apr 2021 15:06:51 +0800
+Subject: [PATCH 20/49] perf annotate: Update the LBR event occurrences
+
+The LBR event logging can indicate the precise event occurrences in LBRs,
+which is useful for user to understand what causes long latency in program
+(what events cause the long latency).
+
+For each "LBR block", user would know that the selected counter(s)
+incremented 0, 1, 2, or more times.
+
+The max event occurrences will be exported through sysfs by kernel. But
+at this moment, we just use a macro for max event occurrences definition.
+
+We use event_occurs[] to sum the event occurrences per event and then we
+will report the computed average number in next patch. But if the max event
+occurrences is anywhere, it means we may lost some occurrences, so record
+the status in max_occurs[]. In next patch, we will report '+' after the
+average number to indicate we may lost track essentially.
+
+Signed-off-by: Jin Yao <yao.jin@linux.intel.com>
+---
+ tools/perf/builtin-report.c   | 13 +++++++++++++
+ tools/perf/util/annotate.c    | 24 ++++++++++++++++++++++++
+ tools/perf/util/annotate.h    |  5 +++++
+ tools/perf/util/symbol_conf.h |  1 +
+ 4 files changed, 43 insertions(+)
+
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 36f9ccfeb38a..308939502359 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -144,6 +144,15 @@ static int report__config(const char *var, const char *value, void *cb)
+ 	return 0;
+ }
+ 
++static int lbr_event_config(void)
++{
++	/*
++	 * Will read the value from sysfs when kernel supports.
++	 */
++	symbol_conf.lbr_max_occur = LBR_EVENT_MAX_OCCUR;
++	return 0;
++}
++
+ static int hist_iter__report_callback(struct hist_entry_iter *iter,
+ 				      struct addr_location *al, bool single,
+ 				      void *arg)
+@@ -1342,6 +1351,10 @@ int cmd_report(int argc, const char **argv)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = lbr_event_config();
++	if (ret)
++		return ret;
++
+ 	argc = parse_options(argc, argv, options, report_usage, 0);
+ 	if (argc) {
+ 		/*
+diff --git a/tools/perf/util/annotate.c b/tools/perf/util/annotate.c
+index 51a449550cfa..f1f02fc35c60 100644
+--- a/tools/perf/util/annotate.c
++++ b/tools/perf/util/annotate.c
+@@ -827,12 +827,26 @@ void symbol__annotate_zero_histograms(struct symbol *sym)
+ 	pthread_mutex_unlock(&notes->lock);
+ }
+ 
++static void update_event_occur(u32 *event_occurs, u8 *max_occurs, u32 events)
++{
++	for (int i = 0; i < PERF_MAX_BRANCH_EVENTS; i++) {
++		int value = events & 0x3;
++
++		if (value == symbol_conf.lbr_max_occur)
++			max_occurs[i] = 1;
++
++		event_occurs[i] += value;
++		events >>= 2;
++	}
++}
++
+ static int __symbol__account_cycles(struct cyc_hist *ch,
+ 				    u64 start,
+ 				    unsigned offset, struct branch_flags *flags,
+ 				    unsigned have_start)
+ {
+ 	unsigned cycles = flags->cycles;
++	unsigned events = flags->events;
+ 
+ 	/*
+ 	 * For now we can only account one basic block per
+@@ -864,6 +878,10 @@ static int __symbol__account_cycles(struct cyc_hist *ch,
+ 			ch[offset].num = 0;
+ 			if (ch[offset].reset < 0xffff)
+ 				ch[offset].reset++;
++			memset(ch[offset].event_occurs, 0,
++			       sizeof(ch[offset].event_occurs));
++			memset(ch[offset].max_occurs, 0,
++			       sizeof(ch[offset].max_occurs));
+ 		} else if (have_start &&
+ 			   ch[offset].start < start)
+ 			return 0;
+@@ -876,6 +894,12 @@ static int __symbol__account_cycles(struct cyc_hist *ch,
+ 	ch[offset].start = start;
+ 	ch[offset].cycles += cycles;
+ 	ch[offset].num++;
++
++	if (events) {
++		update_event_occur(ch[offset].event_occurs,
++				   ch[offset].max_occurs, events);
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/tools/perf/util/annotate.h b/tools/perf/util/annotate.h
+index b8c9fda71311..9d085fd398db 100644
+--- a/tools/perf/util/annotate.h
++++ b/tools/perf/util/annotate.h
+@@ -10,6 +10,7 @@
+ #include <linux/rbtree.h>
+ #include <pthread.h>
+ #include <asm/bug.h>
++#include <linux/perf_event.h>
+ #include "symbol_conf.h"
+ #include "spark.h"
+ 
+@@ -25,6 +26,8 @@ struct evsel;
+ struct symbol;
+ struct branch_flags;
+ 
++#define LBR_EVENT_MAX_OCCUR	3
++
+ struct ins {
+ 	const char     *name;
+ 	struct ins_ops *ops;
+@@ -243,6 +246,8 @@ struct cyc_hist {
+ 	s64	cycles_spark[NUM_SPARKS];
+ 	u32	num;
+ 	u32	num_aggr;
++	u32	event_occurs[PERF_MAX_BRANCH_EVENTS];
++	u8	max_occurs[PERF_MAX_BRANCH_EVENTS];
+ 	u8	have_start;
+ 	/* 1 byte padding */
+ 	u16	reset;
+diff --git a/tools/perf/util/symbol_conf.h b/tools/perf/util/symbol_conf.h
+index a70b3ec09dac..13ce65fbeb0d 100644
+--- a/tools/perf/util/symbol_conf.h
++++ b/tools/perf/util/symbol_conf.h
+@@ -77,6 +77,7 @@ struct symbol_conf {
+ 	int		pad_output_len_dso;
+ 	int		group_sort_idx;
+ 	int		addr_range;
++	int		lbr_max_occur;
+ };
+ 
+ extern struct symbol_conf symbol_conf;
+-- 
+2.27.0
+
