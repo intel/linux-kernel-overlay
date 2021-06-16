@@ -137,7 +137,6 @@
 %define with_release   %{?_with_release:      1} %{?!_with_release:      0}
 
 # The kernel tarball/base version
-%define kversion 5.9
 
 %define with_gcov %{?_with_gcov:1}%{?!_with_gcov:0}
 
@@ -371,8 +370,7 @@ ExclusiveArch: i386 i686 x86_64 s390x aarch64 ppc64le
 %endif
 ExclusiveOS: Linux
 %ifnarch %{nobuildarches}
-Requires: intel-next-server
-Requires: intel-next-client
+Requires: %{name}-core-uname-r = %{KVERREL}%{?variant}
 %endif
 
 
@@ -463,7 +461,6 @@ BuildRequires: asciidoc
 %endif
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global KER_VAR edge
 %global kernel_src_repo 'https://github.com/torvalds/linux.git'
 %global kernel_src_tag v5.13-rc5
 # END OF PROJECT SPECIFIC MACROS
@@ -852,11 +849,6 @@ zfcpdump infrastructure.
 # with_zfcpdump
 %endif
 
-%ifnarch %nobuildarches
-%define variant_summary The Linux kernel client
-%kernel_variant_package %{KER_VAR}
-%description %{KER_VAR}-core
-The kernel package contains the Linux kernel
 
 %define variant_summary The Linux kernel compiled with extra debugging enabled
 %kernel_variant_package debug
@@ -879,7 +871,6 @@ The kernel package contains the Linux kernel (vmlinuz), the core of any
 Linux operating system.  The kernel handles the basic functions
 of the operating system: memory allocation, process allocation, device
 input and output, etc.
-%endif
 
 %if %{with_ipaclones}
 %kernel_ipaclones_package
@@ -1034,7 +1025,7 @@ cd configs
 # Copy config files
 pwd
 
-cp $RPM_SOURCE_DIR/overlay.config %{KER_VAR}.config
+cp $RPM_SOURCE_DIR/overlay.config overlay.config
 
 # Note we need to disable these flags for cross builds because the flags
 # from redhat-rpm-config assume that host == target so target arch
@@ -1117,7 +1108,7 @@ BuildKernel() {
     %{make} -s %{?_smp_mflags} mrproper
     # Merge Enbargo Overlay Kernel config
     # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-    cp configs/$Config .config
+    cp configs/overlay.config .config
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif
@@ -1581,7 +1572,7 @@ BuildKernel %make_target %kernel_image %{with_vdso_install} zfcpdump
 %endif
 
 %if %{with_up}
-BuildKernel %make_target %kernel_image %{KER_VAR}
+BuildKernel %make_target %kernel_image
 %endif
 
 %global perf_make \
@@ -2091,8 +2082,6 @@ fi\
 %kernel_kvm_post debug
 %endif
 
-%kernel_variant_preun %{KER_VAR}
-%kernel_variant_post -v %{KER_VAR}
 
 if [ -x /sbin/ldconfig ]
 then
@@ -2322,7 +2311,7 @@ fi
 %{nil}
 
 %ifnarch %nobuildarches
-%kernel_variant_files 0 1 %{KER_VAR}
+%kernel_variant_files 0 1
 %endif
 
 # plz don't put in a version string unless you're going to tag
