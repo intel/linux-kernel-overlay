@@ -19,7 +19,7 @@ Below are detailed information of each file.
 	.
 	├── README.md				# Readme file
 	├── SOURCES
-	│   ├── patches/ 			# Include OOT kernel patches
+	│   ├── patches.tar 			# Include OOT kernel patches
 	│   │ 	├── xxxx 			# Linux kernel patch files
 	│   │ 	├── series 			# Quilt series files 
 	│   ├── centos-ca-secureboot.der        # CA Certificate for secure boot
