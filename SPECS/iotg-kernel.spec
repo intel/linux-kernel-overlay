@@ -500,6 +500,8 @@ Source400: mod-kvm.list
 # Sources for kernel-tools
 Source2000: cpupower.service
 Source2001: cpupower.config
+Source2002: overlay.config
+Source2003: patches.tar
 
 ## Patches needed for building this package
 
@@ -959,9 +961,9 @@ git clean -df
 # BEGIN OF PATCH APPLICATION
 # ApplyOptionalPatch 0001-x86-microcode-Force-update-a-uCode.patch
 
-if [ -d "${RPM_SOURCE_DIR}/patches" ]; then
+if [ -f "${RPM_SOURCE_DIR}/patches.tar" ]; then
 
-  cp -r ${RPM_SOURCE_DIR}/patches .
+  tar -xf ${RPM_SOURCE_DIR}/patches.tar -C .
   quilt push -a
   res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
   if [ "$res" = "File series fully applied" ]; then
@@ -971,7 +973,7 @@ if [ -d "${RPM_SOURCE_DIR}/patches" ]; then
     exit 1
   fi
 else
-  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches!!"
+  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches.tar !"
 fi
 # END OF PATCH APPLICATIONS
 
