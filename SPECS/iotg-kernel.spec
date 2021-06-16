@@ -59,15 +59,15 @@
 # flag used to know if is a RC
 %global isrc 1
 
-%define pkgrelease  9
+%define pkgrelease  14
 %define rpmversion  5.13.0
 %if %{?isrc}
-%define rcversion   rc5.
+%define rcversion   rc6.
 %endif
-%define embargoname 0609.iotg_next
+%define embargoname 0616.iotg_next
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210609T014755Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}210616T015924Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -462,7 +462,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo 'https://github.com/torvalds/linux.git'
-%global kernel_src_tag v5.13-rc5
+%global kernel_src_tag v5.13-rc6
 # END OF PROJECT SPECIFIC MACROS
 
 
