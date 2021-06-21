@@ -57,17 +57,17 @@
 # define buildid .local
 
 # flag used to know if is a RC
-%global isrc 0
+%global isrc 1
 
-%define pkgrelease  15
-%define rpmversion  5.12
+%define pkgrelease  14
+%define rpmversion  5.13.0
 %if %{?isrc}
-%define rcversion norc.
+%define rcversion   rc6.
 %endif
-%define embargoname 0427.iotg_next
+%define embargoname 0616.iotg_next
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210427T103552Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}210616T015924Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -137,7 +137,6 @@
 %define with_release   %{?_with_release:      1} %{?!_with_release:      0}
 
 # The kernel tarball/base version
-%define kversion 5.9
 
 %define with_gcov %{?_with_gcov:1}%{?!_with_gcov:0}
 
@@ -371,8 +370,7 @@ ExclusiveArch: i386 i686 x86_64 s390x aarch64 ppc64le
 %endif
 ExclusiveOS: Linux
 %ifnarch %{nobuildarches}
-Requires: intel-next-server
-Requires: intel-next-client
+Requires: %{name}-core-uname-r = %{KVERREL}%{?variant}
 %endif
 
 
@@ -463,9 +461,8 @@ BuildRequires: asciidoc
 %endif
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global KER_VAR edge
 %global kernel_src_repo 'https://github.com/torvalds/linux.git'
-%global kernel_src_tag v5.12
+%global kernel_src_tag v5.13-rc6
 # END OF PROJECT SPECIFIC MACROS
 
 
@@ -500,6 +497,8 @@ Source400: mod-kvm.list
 # Sources for kernel-tools
 Source2000: cpupower.service
 Source2001: cpupower.config
+Source2002: overlay.config
+Source2003: patches.tar
 
 ## Patches needed for building this package
 
@@ -850,11 +849,6 @@ zfcpdump infrastructure.
 # with_zfcpdump
 %endif
 
-%ifnarch %nobuildarches
-%define variant_summary The Linux kernel client
-%kernel_variant_package %{KER_VAR}
-%description %{KER_VAR}-core
-The kernel package contains the Linux kernel
 
 %define variant_summary The Linux kernel compiled with extra debugging enabled
 %kernel_variant_package debug
@@ -877,7 +871,6 @@ The kernel package contains the Linux kernel (vmlinuz), the core of any
 Linux operating system.  The kernel handles the basic functions
 of the operating system: memory allocation, process allocation, device
 input and output, etc.
-%endif
 
 %if %{with_ipaclones}
 %kernel_ipaclones_package
@@ -959,9 +952,9 @@ git clean -df
 # BEGIN OF PATCH APPLICATION
 # ApplyOptionalPatch 0001-x86-microcode-Force-update-a-uCode.patch
 
-if [ -d "${RPM_SOURCE_DIR}/patches" ]; then
+if [ -f "${RPM_SOURCE_DIR}/patches.tar" ]; then
 
-  cp -r ${RPM_SOURCE_DIR}/patches .
+  tar -xf ${RPM_SOURCE_DIR}/patches.tar -C .
   quilt push -a
   res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
   if [ "$res" = "File series fully applied" ]; then
@@ -971,7 +964,7 @@ if [ -d "${RPM_SOURCE_DIR}/patches" ]; then
     exit 1
   fi
 else
-  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches!!"
+  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches.tar !"
 fi
 # END OF PATCH APPLICATIONS
 
@@ -1032,7 +1025,7 @@ cd configs
 # Copy config files
 pwd
 
-cp $RPM_SOURCE_DIR/overlay.config %{KER_VAR}.config
+cp $RPM_SOURCE_DIR/overlay.config overlay.config
 
 # Note we need to disable these flags for cross builds because the flags
 # from redhat-rpm-config assume that host == target so target arch
@@ -1115,7 +1108,7 @@ BuildKernel() {
     %{make} -s %{?_smp_mflags} mrproper
     # Merge Enbargo Overlay Kernel config
     # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-    cp configs/$Config .config
+    cp configs/overlay.config .config
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif
@@ -1579,7 +1572,7 @@ BuildKernel %make_target %kernel_image %{with_vdso_install} zfcpdump
 %endif
 
 %if %{with_up}
-BuildKernel %make_target %kernel_image %{KER_VAR}
+BuildKernel %make_target %kernel_image
 %endif
 
 %global perf_make \
@@ -2089,8 +2082,6 @@ fi\
 %kernel_kvm_post debug
 %endif
 
-%kernel_variant_preun %{KER_VAR}
-%kernel_variant_post -v %{KER_VAR}
 
 if [ -x /sbin/ldconfig ]
 then
@@ -2320,7 +2311,7 @@ fi
 %{nil}
 
 %ifnarch %nobuildarches
-%kernel_variant_files 0 1 %{KER_VAR}
+%kernel_variant_files 0 1
 %endif
 
 # plz don't put in a version string unless you're going to tag
