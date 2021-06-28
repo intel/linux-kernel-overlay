@@ -43,6 +43,13 @@ cp $KSRC_OVERLAY_DIR/patches  $KSRC_DIR -r
 
 pushd $KSRC_DIR
 quilt push -a
+res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
+if [ "$res" = "File series fully applied" ]; then
+	echo "##### Patch file series fully applied."
+else
+	echo "##### The patches has not been fully applied: ${res}."
+	exit 1
+fi
 
 echo "Updating the kernel config"
 cp $CUR_DIR/overlay.config $KSRC_DIR/.config
