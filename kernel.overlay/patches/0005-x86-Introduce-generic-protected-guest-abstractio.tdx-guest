@@ -1,0 +1,235 @@
+From cd093c1d80fa3b0bb120907f89b00a7e23c3e7bc Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Date: Wed, 12 May 2021 11:35:13 -0700
+Subject: [PATCH 05/78] x86: Introduce generic protected guest abstraction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a generic way to check if we run with an encrypted guest,
+without requiring x86 specific ifdefs. This can then be used in
+non architecture specific code. 
+
+prot_guest_has() is used to check for protected guest feature
+flags.
+
+Originally-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+---
+ arch/Kconfig                           |  3 +++
+ arch/x86/Kconfig                       |  2 ++
+ arch/x86/include/asm/protected_guest.h | 20 +++++++++++++++++
+ arch/x86/include/asm/sev.h             |  3 +++
+ arch/x86/include/asm/tdx.h             |  4 ++++
+ arch/x86/kernel/sev.c                  | 17 +++++++++++++++
+ arch/x86/kernel/tdx.c                  | 17 +++++++++++++++
+ include/linux/protected_guest.h        | 30 ++++++++++++++++++++++++++
+ 8 files changed, 96 insertions(+)
+ create mode 100644 arch/x86/include/asm/protected_guest.h
+ create mode 100644 include/linux/protected_guest.h
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index c45b770d3579..3c5bf55ee752 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1011,6 +1011,9 @@ config HAVE_ARCH_NVRAM_OPS
+ config ISA_BUS_API
+ 	def_bool ISA
+ 
++config ARCH_HAS_PROTECTED_GUEST
++	bool
++
+ #
+ # ABI hall of shame
+ #
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index ff79263aebd1..d506aae29dd9 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -883,6 +883,7 @@ config INTEL_TDX_GUEST
+ 	select PARAVIRT_XL
+ 	select X86_X2APIC
+ 	select SECURITY_LOCKDOWN_LSM
++	select ARCH_HAS_PROTECTED_GUEST
+ 	help
+ 	  Provide support for running in a trusted domain on Intel processors
+ 	  equipped with Trusted Domain eXtenstions. TDX is a new Intel
+@@ -1539,6 +1540,7 @@ config AMD_MEM_ENCRYPT
+ 	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+ 	select INSTRUCTION_DECODER
+ 	select ARCH_HAS_RESTRICTED_VIRTIO_MEMORY_ACCESS
++	select ARCH_HAS_PROTECTED_GUEST
+ 	help
+ 	  Say yes to enable support for the encryption of system memory.
+ 	  This requires an AMD processor that supports Secure Memory
+diff --git a/arch/x86/include/asm/protected_guest.h b/arch/x86/include/asm/protected_guest.h
+new file mode 100644
+index 000000000000..d47668dee6c2
+--- /dev/null
++++ b/arch/x86/include/asm/protected_guest.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (C) 2020 Intel Corporation */
++#ifndef _ASM_PROTECTED_GUEST_H
++#define _ASM_PROTECTED_GUEST_H 1
++
++#include <asm/processor.h>
++#include <asm/tdx.h>
++#include <asm/sev.h>
++
++static inline bool prot_guest_has(unsigned long flag)
++{
++	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL)
++		return tdx_protected_guest_has(flag);
++	else if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD)
++		return sev_protected_guest_has(flag);
++
++	return false;
++}
++
++#endif /* _ASM_PROTECTED_GUEST_H */
+diff --git a/arch/x86/include/asm/sev.h b/arch/x86/include/asm/sev.h
+index fa5cd05d3b5b..e9b0b93a3157 100644
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@ -81,12 +81,15 @@ static __always_inline void sev_es_nmi_complete(void)
+ 		__sev_es_nmi_complete();
+ }
+ extern int __init sev_es_efi_map_ghcbs(pgd_t *pgd);
++bool sev_protected_guest_has(unsigned long flag);
++
+ #else
+ static inline void sev_es_ist_enter(struct pt_regs *regs) { }
+ static inline void sev_es_ist_exit(void) { }
+ static inline int sev_es_setup_ap_jump_table(struct real_mode_header *rmh) { return 0; }
+ static inline void sev_es_nmi_complete(void) { }
+ static inline int sev_es_efi_map_ghcbs(pgd_t *pgd) { return 0; }
++static inline bool sev_protected_guest_has(unsigned long flag) { return false; }
+ #endif
+ 
+ #endif
+diff --git a/arch/x86/include/asm/tdx.h b/arch/x86/include/asm/tdx.h
+index c738bde944d1..1c17c9080a2c 100644
+--- a/arch/x86/include/asm/tdx.h
++++ b/arch/x86/include/asm/tdx.h
+@@ -11,10 +11,14 @@
+ 
+ void __init tdx_early_init(void);
+ 
++bool tdx_protected_guest_has(unsigned long flag);
++
+ #else
+ 
+ static inline void tdx_early_init(void) { };
+ 
++static inline bool tdx_protected_guest_has(unsigned long flag) { return false; }
++
+ #endif /* CONFIG_INTEL_TDX_GUEST */
+ 
+ #endif /* _ASM_X86_TDX_H */
+diff --git a/arch/x86/kernel/sev.c b/arch/x86/kernel/sev.c
+index 651b81cd648e..3e88576555d2 100644
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@ -19,6 +19,7 @@
+ #include <linux/memblock.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
++#include <linux/protected_guest.h>
+ 
+ #include <asm/cpu_entry_area.h>
+ #include <asm/stacktrace.h>
+@@ -1493,3 +1494,19 @@ bool __init handle_vc_boot_ghcb(struct pt_regs *regs)
+ 	while (true)
+ 		halt();
+ }
++
++bool sev_protected_guest_has(unsigned long flag)
++{
++	switch (flag) {
++	case PR_GUEST_MEM_ENCRYPT:
++	case PR_GUEST_MEM_ENCRYPT_ACTIVE:
++	case PR_GUEST_UNROLL_STRING_IO:
++	case PR_GUEST_HOST_MEM_ENCRYPT:
++		return true;
++	case PR_GUEST_SEV:
++		return sev_active();
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(sev_protected_guest_has);
+diff --git a/arch/x86/kernel/tdx.c b/arch/x86/kernel/tdx.c
+index 70494b465392..14b0fb8c0f3d 100644
+--- a/arch/x86/kernel/tdx.c
++++ b/arch/x86/kernel/tdx.c
+@@ -4,6 +4,8 @@
+ #undef pr_fmt
+ #define pr_fmt(fmt)     "x86/tdx: " fmt
+ 
++#include <linux/protected_guest.h>
++
+ #include <asm/tdx.h>
+ 
+ static inline bool cpuid_has_tdx_guest(void)
+@@ -18,6 +20,21 @@ static inline bool cpuid_has_tdx_guest(void)
+ 	return !memcmp("IntelTDX    ", sig, 12);
+ }
+ 
++bool tdx_protected_guest_has(unsigned long flag)
++{
++	switch (flag) {
++	case PR_GUEST_MEM_ENCRYPT:
++	case PR_GUEST_MEM_ENCRYPT_ACTIVE:
++	case PR_GUEST_UNROLL_STRING_IO:
++	case PR_GUEST_SHARED_MAPPING_INIT:
++	case PR_GUEST_TDX:
++		return static_cpu_has(X86_FEATURE_TDX_GUEST);
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(tdx_protected_guest_has);
++
+ void __init tdx_early_init(void)
+ {
+ 	if (!cpuid_has_tdx_guest())
+diff --git a/include/linux/protected_guest.h b/include/linux/protected_guest.h
+new file mode 100644
+index 000000000000..c5b7547e5a68
+--- /dev/null
++++ b/include/linux/protected_guest.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_PROTECTED_GUEST_H
++#define _LINUX_PROTECTED_GUEST_H 1
++
++/* Protected Guest Feature Flags (leave 0-0xfff for vendor specific flags) */
++
++/* 0-ff is reserved for Intel specific flags */
++#define PR_GUEST_TDX				0x0000
++
++/* 100-1ff is reserved for AMD specific flags */
++#define PR_GUEST_SEV				0x0100
++
++/* Support for guest encryption */
++#define PR_GUEST_MEM_ENCRYPT			0x1000
++/* Encryption support is active */
++#define PR_GUEST_MEM_ENCRYPT_ACTIVE		0x1001
++/* Support for unrolled string IO */
++#define PR_GUEST_UNROLL_STRING_IO		0x1002
++/* Support for host memory encryption */
++#define PR_GUEST_HOST_MEM_ENCRYPT		0x1003
++/* Support for shared mapping initialization (after early init) */
++#define PR_GUEST_SHARED_MAPPING_INIT		0x1004
++
++#ifdef CONFIG_ARCH_HAS_PROTECTED_GUEST
++#include <asm/protected_guest.h>
++#else
++static inline bool prot_guest_has(unsigned long flag) { return false; }
++#endif
++
++#endif /* _LINUX_PROTECTED_GUEST_H */
+-- 
+2.27.0
+

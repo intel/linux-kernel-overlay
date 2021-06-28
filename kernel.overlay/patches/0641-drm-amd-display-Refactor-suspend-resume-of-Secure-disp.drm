@@ -1,0 +1,183 @@
+From c04ead856ea89aa2fe15e3dc5d39e826f3406807 Mon Sep 17 00:00:00 2001
+From: Wayne Lin <Wayne.Lin@amd.com>
+Date: Tue, 27 Apr 2021 12:00:40 +0800
+Subject: [PATCH 0641/1247] drm/amd/display: Refactor suspend/resume of Secure
+ display
+
+[Why]
+Once set ROI and do suspend/resume, current flow will not enable
+OTG_CRC_CTL again due to we'll defer crc configuration when stream
+is enabled.
+
+[How]
+Remove current suspend/resume function and have logic implemented into
+amdgpu_dm_atomic_commit_tail()
+
+Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+Reviewed-by: Chao-kai Wang <Stylon.Wang@amd.com>
+Acked-by: Stylon Wang <stylon.wang@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 27 ++++----
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c | 61 -------------------
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h |  4 --
+ 3 files changed, 15 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index c3b73723f8af..32e56b3742e4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1988,9 +1988,6 @@ static int dm_suspend(void *handle)
+ 		return ret;
+ 	}
+ 
+-#ifdef CONFIG_DRM_AMD_SECURE_DISPLAY
+-	amdgpu_dm_crtc_secure_display_suspend(adev);
+-#endif
+ 	WARN_ON(adev->dm.cached_state);
+ 	adev->dm.cached_state = drm_atomic_helper_suspend(adev_to_drm(adev));
+ 
+@@ -2314,10 +2311,6 @@ static int dm_resume(void *handle)
+ 
+ 	dm->cached_state = NULL;
+ 
+-#ifdef CONFIG_DRM_AMD_SECURE_DISPLAY
+-	amdgpu_dm_crtc_secure_display_resume(adev);
+-#endif
+-
+ 	amdgpu_dm_irq_resume_late(adev);
+ 
+ 	amdgpu_dm_smu_write_watermarks_table(adev);
+@@ -8983,6 +8976,12 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ #ifdef CONFIG_DEBUG_FS
+ 		bool configure_crc = false;
+ 		enum amdgpu_dm_pipe_crc_source cur_crc_src;
++#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
++		struct crc_rd_work *crc_rd_wrk = dm->crc_rd_wrk;
++#endif
++		spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
++		cur_crc_src = acrtc->dm_irq_params.crc_src;
++		spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
+ #endif
+ 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+ 
+@@ -8999,15 +8998,19 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 			 * settings for the stream.
+ 			 */
+ 			dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+-			spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+-			cur_crc_src = acrtc->dm_irq_params.crc_src;
+-			spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
+ 
+ 			if (amdgpu_dm_is_valid_crc_source(cur_crc_src)) {
+ 				configure_crc = true;
+ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+-				if (amdgpu_dm_crc_window_is_activated(crtc))
+-					configure_crc = false;
++				if (amdgpu_dm_crc_window_is_activated(crtc)) {
++					spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
++					acrtc->dm_irq_params.crc_window.update_win = true;
++					acrtc->dm_irq_params.crc_window.skip_frame_cnt = 2;
++					spin_lock_irq(&crc_rd_wrk->crc_rd_work_lock);
++					crc_rd_wrk->crtc = crtc;
++					spin_unlock_irq(&crc_rd_wrk->crc_rd_work_lock);
++					spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
++				}
+ #endif
+ 			}
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index 5cd788b20c21..7f36b2bbbeae 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -525,67 +525,6 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ 	spin_unlock_irqrestore(&drm_dev->event_lock, flags1);
+ }
+ 
+-void amdgpu_dm_crtc_secure_display_resume(struct amdgpu_device *adev)
+-{
+-	struct drm_crtc *crtc;
+-	enum amdgpu_dm_pipe_crc_source cur_crc_src;
+-	struct crc_rd_work *crc_rd_wrk = adev->dm.crc_rd_wrk;
+-	struct crc_window_parm cur_crc_window;
+-	struct amdgpu_crtc *acrtc = NULL;
+-
+-	drm_for_each_crtc(crtc, &adev->ddev) {
+-		acrtc = to_amdgpu_crtc(crtc);
+-
+-		spin_lock_irq(&adev_to_drm(adev)->event_lock);
+-		cur_crc_src = acrtc->dm_irq_params.crc_src;
+-		cur_crc_window = acrtc->dm_irq_params.crc_window;
+-		spin_unlock_irq(&adev_to_drm(adev)->event_lock);
+-
+-		if (amdgpu_dm_is_valid_crc_source(cur_crc_src)) {
+-			amdgpu_dm_crtc_set_crc_source(crtc,
+-				pipe_crc_sources[cur_crc_src]);
+-			spin_lock_irq(&adev_to_drm(adev)->event_lock);
+-			acrtc->dm_irq_params.crc_window = cur_crc_window;
+-			if (acrtc->dm_irq_params.crc_window.activated) {
+-				acrtc->dm_irq_params.crc_window.update_win = true;
+-				acrtc->dm_irq_params.crc_window.skip_frame_cnt = 1;
+-				spin_lock_irq(&crc_rd_wrk->crc_rd_work_lock);
+-				crc_rd_wrk->crtc = crtc;
+-				spin_unlock_irq(&crc_rd_wrk->crc_rd_work_lock);
+-			}
+-			spin_unlock_irq(&adev_to_drm(adev)->event_lock);
+-		}
+-	}
+-}
+-
+-void amdgpu_dm_crtc_secure_display_suspend(struct amdgpu_device *adev)
+-{
+-	struct drm_crtc *crtc;
+-	struct crc_window_parm cur_crc_window;
+-	enum amdgpu_dm_pipe_crc_source cur_crc_src;
+-	struct amdgpu_crtc *acrtc = NULL;
+-
+-	drm_for_each_crtc(crtc, &adev->ddev) {
+-		acrtc = to_amdgpu_crtc(crtc);
+-
+-		spin_lock_irq(&adev_to_drm(adev)->event_lock);
+-		cur_crc_src = acrtc->dm_irq_params.crc_src;
+-		cur_crc_window = acrtc->dm_irq_params.crc_window;
+-		cur_crc_window.update_win = false;
+-		spin_unlock_irq(&adev_to_drm(adev)->event_lock);
+-
+-		if (amdgpu_dm_is_valid_crc_source(cur_crc_src)) {
+-			amdgpu_dm_crtc_set_crc_source(crtc, NULL);
+-			spin_lock_irq(&adev_to_drm(adev)->event_lock);
+-			/* For resume to set back crc source*/
+-			acrtc->dm_irq_params.crc_src = cur_crc_src;
+-			acrtc->dm_irq_params.crc_window = cur_crc_window;
+-			spin_unlock_irq(&adev_to_drm(adev)->event_lock);
+-		}
+-	}
+-
+-}
+-
+ struct crc_rd_work *amdgpu_dm_crtc_secure_display_create_work(void)
+ {
+ 	struct crc_rd_work *crc_rd_wrk = NULL;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+index 737e701fb0f0..f07850db60a6 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+@@ -91,14 +91,10 @@ void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc);
+ bool amdgpu_dm_crc_window_is_activated(struct drm_crtc *crtc);
+ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc);
+ struct crc_rd_work *amdgpu_dm_crtc_secure_display_create_work(void);
+-void amdgpu_dm_crtc_secure_display_resume(struct amdgpu_device *adev);
+-void amdgpu_dm_crtc_secure_display_suspend(struct amdgpu_device *adev);
+ #else
+ #define amdgpu_dm_crc_window_is_activated(x)
+ #define amdgpu_dm_crtc_handle_crc_window_irq(x)
+ #define amdgpu_dm_crtc_secure_display_create_work()
+-#define amdgpu_dm_crtc_secure_display_resume(x)
+-#define amdgpu_dm_crtc_secure_display_suspend(x)
+ #endif
+ 
+ #endif /* AMD_DAL_DEV_AMDGPU_DM_AMDGPU_DM_CRC_H_ */
+-- 
+2.27.0
+

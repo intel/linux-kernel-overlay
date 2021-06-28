@@ -1,0 +1,186 @@
+From 168ed3324b83ae972fd29cb373f6a5d75782e97a Mon Sep 17 00:00:00 2001
+From: Srikanth Thokala <srikanth.thokala@intel.com>
+Date: Wed, 19 May 2021 23:47:01 +0530
+Subject: [PATCH 136/170] misc: xlink-pcie: Optimize PCIe MMIO reads to reduce
+ CPU utilization
+
+Remove redundant PCIe MMIO reads to reduce CPU utilization
+
+Signed-off-by: Srikanth Thokala <srikanth.thokala@intel.com>
+---
+ drivers/misc/xlink-pcie/common/util.c      | 14 ++++-----
+ drivers/misc/xlink-pcie/local_host/core.c  | 15 ++--------
+ drivers/misc/xlink-pcie/remote_host/core.c | 34 ++++++----------------
+ 3 files changed, 16 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/misc/xlink-pcie/common/util.c b/drivers/misc/xlink-pcie/common/util.c
+index a15f922f8615..d1b4c521a193 100644
+--- a/drivers/misc/xlink-pcie/common/util.c
++++ b/drivers/misc/xlink-pcie/common/util.c
+@@ -265,13 +265,10 @@ bool intel_xpcie_list_empty(struct xpcie_list *list)
+ int intel_xpcie_list_put(struct xpcie_list *list,
+ 			 struct xpcie_buf_desc *bd)
+ {
+-#ifdef XLINK_PCIE_REMOTE
+-	unsigned long flags = 0;
+-#endif
+ 	if (!bd)
+ 		return -EINVAL;
+ #ifdef XLINK_PCIE_REMOTE
+-	spin_lock_irqsave(&list->lock, flags);
++	spin_lock_bh(&list->lock);
+ #else
+ 	spin_lock(&list->lock);
+ #endif
+@@ -287,7 +284,7 @@ int intel_xpcie_list_put(struct xpcie_list *list,
+ 		bd = bd->next;
+ 	}
+ #ifdef XLINK_PCIE_REMOTE
+-	spin_unlock_irqrestore(&list->lock, flags);
++	spin_unlock_bh(&list->lock);
+ #else
+ 	spin_unlock(&list->lock);
+ #endif
+@@ -323,10 +320,9 @@ int intel_xpcie_list_put_head(struct xpcie_list *list,
+ struct xpcie_buf_desc *intel_xpcie_list_get(struct xpcie_list *list)
+ {
+ 	struct xpcie_buf_desc *bd;
+-#ifdef XLINK_PCIE_REMOTE
+-	unsigned long flags = 0;
+ 
+-	spin_lock_irqsave(&list->lock, flags);
++#ifdef XLINK_PCIE_REMOTE
++	spin_lock_bh(&list->lock);
+ #else
+ 	spin_lock(&list->lock);
+ #endif
+@@ -341,7 +337,7 @@ struct xpcie_buf_desc *intel_xpcie_list_get(struct xpcie_list *list)
+ 		list->buffers--;
+ 	}
+ #ifdef XLINK_PCIE_REMOTE
+-	spin_unlock_irqrestore(&list->lock, flags);
++	spin_unlock_bh(&list->lock);
+ #else
+ 	spin_unlock(&list->lock);
+ #endif
+diff --git a/drivers/misc/xlink-pcie/local_host/core.c b/drivers/misc/xlink-pcie/local_host/core.c
+index ca1fe960e7d5..19febec664f9 100644
+--- a/drivers/misc/xlink-pcie/local_host/core.c
++++ b/drivers/misc/xlink-pcie/local_host/core.c
+@@ -258,7 +258,7 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 	struct xpcie_dma_ll_desc *desc;
+ 	struct xpcie_transfer_desc *td;
+ 	bool reset_work = false;
+-	u16 interface;
++	u16 interface = 0;
+ 	u64 address;
+ 
+ 	if (intel_xpcie_get_host_status(xpcie) != XPCIE_STATUS_RUN)
+@@ -284,7 +284,6 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 			break;
+ 		}
+ 
+-		interface = intel_xpcie_get_td_interface(td);
+ 		length = intel_xpcie_get_td_length(td);
+ 		address = intel_xpcie_get_td_address(td);
+ 
+@@ -339,17 +338,7 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 		bd_head = bd_head->next;
+ 		bd->next = NULL;
+ 
+-		if (likely(bd->interface < XPCIE_NUM_INTERFACES)) {
+-			intel_xpcie_set_td_status(td,
+-						  XPCIE_DESC_STATUS_SUCCESS);
+-			intel_xpcie_add_bd_to_interface(xpcie, bd);
+-		} else {
+-			dev_err(xpcie_to_dev(xpcie),
+-				"detected rx desc interface failure (%u)\n",
+-				bd->interface);
+-			intel_xpcie_set_td_status(td, XPCIE_DESC_STATUS_ERROR);
+-			intel_xpcie_free_rx_bd(xpcie, bd);
+-		}
++		intel_xpcie_add_bd_to_interface(xpcie, bd);
+ 
+ 		bd = bd_head;
+ 		head = XPCIE_CIRCULAR_INC(head, ndesc);
+diff --git a/drivers/misc/xlink-pcie/remote_host/core.c b/drivers/misc/xlink-pcie/remote_host/core.c
+index e85b50694ad5..7881ce951a24 100644
+--- a/drivers/misc/xlink-pcie/remote_host/core.c
++++ b/drivers/misc/xlink-pcie/remote_host/core.c
+@@ -255,8 +255,8 @@ static void intel_xpcie_rx_tasklet_func(unsigned long xpcie_ptr)
+ 	u32 head, tail, ndesc, length;
+ 	struct xpcie_interface *inf;
+ 	struct xpcie_dev *xdev;
+-	u16 status, interface;
+ 	ktime_t free_rx_bd_tp;
++	u16 interface = 0;
+ 	int rc;
+ 
+ 	xdev = container_of(xpcie, struct xpcie_dev, xpcie);
+@@ -292,28 +292,18 @@ static void intel_xpcie_rx_tasklet_func(unsigned long xpcie_ptr)
+ 			break;
+ 		}
+ 
+-		status = intel_xpcie_get_td_status(td);
+-		interface = intel_xpcie_get_td_interface(td);
+ 		length = intel_xpcie_get_td_length(td);
+ 		intel_xpcie_unmap_dma(xpcie, bd, DMA_FROM_DEVICE);
+ 
+-		if (unlikely(status != XPCIE_DESC_STATUS_SUCCESS) ||
+-		    unlikely(interface >= XPCIE_NUM_INTERFACES)) {
+-			dev_err(xpcie_to_dev(xpcie),
+-				"rx desc failure, status(%u), interface(%u)\n",
+-			status, interface);
+-			intel_xpcie_free_rx_bd(xpcie, bd);
+-		} else {
+-			bd->interface = interface;
+-			bd->length = length;
+-			bd->next = NULL;
+-
+-			intel_xpcie_add_bd_to_interface(xpcie, bd);
+-			intel_xpcie_update_device_flwctl(xpcie,
+-							 TO_DEVICE,
+-							 RX_BD_COUNT,
++		bd->interface = interface;
++		bd->length = length;
++		bd->next = NULL;
++
++		intel_xpcie_add_bd_to_interface(xpcie, bd);
++		intel_xpcie_update_device_flwctl(xpcie,
++						 TO_DEVICE,
++						 RX_BD_COUNT,
+ 				atomic_read(&inf->available_bd_cnt));
+-		}
+ 
+ 		rx->ddr[head] = replacement;
+ 		intel_xpcie_set_td_address(td, replacement->phys);
+@@ -340,7 +330,6 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 	u32 head, tail, old, ndesc;
+ 	struct xpcie_buf_desc *bd;
+ 	size_t bytes, buffers;
+-	u16 status;
+ 
+ 	if (intel_xpcie_get_device_status(xpcie) != XPCIE_STATUS_RUN)
+ 		return;
+@@ -354,10 +343,6 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 	while (old != head) {
+ 		bd = tx->ddr[old];
+ 		td = tx->pipe.tdr + old;
+-		status = intel_xpcie_get_td_status(td);
+-		if (status != XPCIE_DESC_STATUS_SUCCESS)
+-			dev_err(xpcie_to_dev(xpcie),
+-				"detected tx desc failure (%u)\n", status);
+ 
+ 		intel_xpcie_unmap_dma(xpcie, bd, DMA_TO_DEVICE);
+ 		intel_xpcie_free_tx_bd(xpcie, bd);
+@@ -553,7 +538,6 @@ int intel_xpcie_core_read(struct xpcie *xpcie, void *buffer, size_t *length,
+ 			}
+ 			if (ret < 0 || xpcie->stop_flag)
+ 				return -EINTR;
+-
+ 		}
+ 
+ 		bd = (inf->partial_read) ? inf->partial_read :
+-- 
+2.27.0
+

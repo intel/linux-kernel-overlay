@@ -1,0 +1,97 @@
+From ab698bdb03248301c83fa544afac5a74a46fc2e3 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Sat, 19 Jun 2021 18:17:42 -0700
+Subject: [PATCH 70/80] x86/hfi: Use Idle inject for zero capacity
+
+Due to some thermal condition or remote request when HFI CPU capacity
+drops to zero, use idle injection to inject 95% idle.
+
+This is optional feature only enabled with kernel command line:
+intel_hfi=force_idle
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+---
+Changes since v1:
+  * Removed command-line argument intel_hfi=force_idle. (Len)
+---
+ drivers/thermal/intel/intel_hfi.c | 43 +++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index 936bb2b83574..4a3215497160 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -23,6 +23,7 @@
+ #include <linux/cpuset.h>
+ #include <linux/debugfs.h>
+ #include <linux/gfp.h>
++#include <linux/idle_inject.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ 
+@@ -131,6 +132,8 @@ struct hfi_features {
+ struct hfi_cpu_info {
+ 	s16			index;
+ 	struct hfi_params	*params;
++	struct idle_inject_device *ii_dev;
++	bool			was_idle;
+ };
+ 
+ static DEFINE_PER_CPU(struct hfi_cpu_info, hfi_cpu_info) = { .index = -1 };
+@@ -433,6 +436,43 @@ static void get_hfi_max_cap(struct hfi_params *params,
+ 	}
+ }
+ 
++#define IDLE_DURATION	10000
++#define IDLE_LATENCY	5000
++#define TARGET_IDLE	95
++static void process_zero_capacity(int cpu, int perf_cap)
++{
++	struct hfi_cpu_info *info;
++
++	info = &per_cpu(hfi_cpu_info, cpu);
++	if (info->was_idle && perf_cap) {
++		pr_info("%s cpu:%d was_idle, now cap:%d\n", __func__, cpu, perf_cap);
++		idle_inject_stop(info->ii_dev);
++		info->was_idle = false;
++		return;
++	}
++
++	if (!perf_cap && !info->was_idle) {
++		unsigned int runtime_us, idle_duration_us;
++
++		pr_info("%s cpu:%d going to idle cap:%d\n", __func__, cpu, perf_cap);
++		if (!info->ii_dev) {
++			info->ii_dev = idle_inject_register((struct cpumask *)cpumask_of(cpu));
++			if (!info->ii_dev) {
++				pr_info("%s cpu:%d indle_inject reg failed\n", __func__, cpu);
++				return;
++			}
++			idle_inject_set_latency(info->ii_dev, IDLE_LATENCY);
++			idle_duration_us = IDLE_DURATION;
++			runtime_us = ((idle_duration_us * 100) / TARGET_IDLE) - idle_duration_us;
++			pr_info("%s cpu:%d runtime:%u idle:%u\n", __func__, cpu, runtime_us, idle_duration_us);
++			idle_inject_set_duration(info->ii_dev, runtime_us, idle_duration_us);
++		}
++
++		idle_inject_start(info->ii_dev);
++		info->was_idle = true;
++	}
++}
++
+ static void scale_one_class_capacity_cpu(u8 perf_cap, int cpu, int classid)
+ {
+ 	unsigned long capacity;
+@@ -452,6 +492,9 @@ static void scale_one_class_capacity_cpu(u8 perf_cap, int cpu, int classid)
+ 		topology_set_cpu_scale(cpu, capacity);
+ 
+ 	topology_set_class_cpu_scale(cpu, classid, capacity);
++
++	if (!classid)
++		process_zero_capacity(cpu, capacity);
+ }
+ 
+ static void scale_one_class_capabilities(struct hfi_params *params, int classid)
+-- 
+2.27.0
+

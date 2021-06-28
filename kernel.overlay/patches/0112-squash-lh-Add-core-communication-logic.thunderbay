@@ -1,0 +1,272 @@
+From 21131e8370c9a38e616287d665b5c954f3822b0c Mon Sep 17 00:00:00 2001
+From: Srikanth Thokala <srikanth.thokala@intel.com>
+Date: Thu, 10 Dec 2020 23:15:07 +0530
+Subject: [PATCH 112/170] squash: lh: Add core communication logic
+
+Address v1 comments:
+ - Remove redundant driver version information
+ - Remove unused kernel module parameters
+
+Signed-off-by: Srikanth Thokala <srikanth.thokala@intel.com>
+---
+ drivers/misc/xlink-pcie/local_host/core.c | 140 +++++-----------------
+ drivers/misc/xlink-pcie/local_host/epf.h  |   3 -
+ 2 files changed, 27 insertions(+), 116 deletions(-)
+
+diff --git a/drivers/misc/xlink-pcie/local_host/core.c b/drivers/misc/xlink-pcie/local_host/core.c
+index 628c383113ca..a343e30d8b45 100644
+--- a/drivers/misc/xlink-pcie/local_host/core.c
++++ b/drivers/misc/xlink-pcie/local_host/core.c
+@@ -15,28 +15,6 @@
+ 
+ static struct xpcie *global_xpcie;
+ 
+-static int rx_pool_size = SZ_32M;
+-module_param(rx_pool_size, int, 0664);
+-MODULE_PARM_DESC(rx_pool_size, "receiving pool size (default 32 MiB)");
+-
+-static int tx_pool_size = SZ_32M;
+-module_param(tx_pool_size, int, 0664);
+-MODULE_PARM_DESC(tx_pool_size, "transmitting pool size (default 32 MiB)");
+-
+-static int fragment_size = XPCIE_FRAGMENT_SIZE;
+-module_param(fragment_size, int, 0664);
+-MODULE_PARM_DESC(fragment_size, "transfer descriptor size (default 128 KiB)");
+-
+-static bool tx_pool_coherent = true;
+-module_param(tx_pool_coherent, bool, 0664);
+-MODULE_PARM_DESC(tx_pool_coherent,
+-		 "transmitting pool using coherent memory (default true)");
+-
+-static bool rx_pool_coherent;
+-module_param(rx_pool_coherent, bool, 0664);
+-MODULE_PARM_DESC(rx_pool_coherent,
+-		 "receiving pool using coherent memory (default false)");
+-
+ static struct xpcie *intel_xpcie_core_get_by_id(u32 sw_device_id)
+ {
+ 	return (sw_device_id == xlink_sw_id) ? global_xpcie : NULL;
+@@ -84,7 +62,7 @@ static void intel_xpcie_set_cap_txrx(struct xpcie *xpcie)
+ 	memset(cap, 0, sizeof(struct xpcie_cap_txrx));
+ 	cap->hdr.id = XPCIE_CAP_TXRX;
+ 	cap->hdr.next = next;
+-	cap->fragment_size = fragment_size;
++	cap->fragment_size = XPCIE_FRAGMENT_SIZE;
+ 	cap->tx.ring = start + hdr_len;
+ 	cap->tx.ndesc = XPCIE_NUM_TX_DESCS;
+ 	cap->rx.ring = start + hdr_len + tx_len;
+@@ -94,22 +72,6 @@ static void intel_xpcie_set_cap_txrx(struct xpcie *xpcie)
+ 	hdr->id = XPCIE_CAP_NULL;
+ }
+ 
+-static int intel_xpcie_set_version(struct xpcie *xpcie)
+-{
+-	struct xpcie_version version;
+-
+-	version.major = XPCIE_VERSION_MAJOR;
+-	version.minor = XPCIE_VERSION_MINOR;
+-	version.build = XPCIE_VERSION_BUILD;
+-
+-	memcpy(xpcie->mmio + XPCIE_MMIO_VERSION, &version, sizeof(version));
+-
+-	dev_dbg(xpcie_to_dev(xpcie), "ver: device %u.%u.%u\n",
+-		version.major, version.minor, version.build);
+-
+-	return 0;
+-}
+-
+ static void intel_xpcie_txrx_cleanup(struct xpcie *xpcie)
+ {
+ 	struct xpcie_epf *xpcie_epf = container_of(xpcie,
+@@ -143,12 +105,7 @@ static void intel_xpcie_txrx_cleanup(struct xpcie *xpcie)
+ 	intel_xpcie_list_cleanup(&xpcie->tx_pool);
+ 	intel_xpcie_list_cleanup(&xpcie->rx_pool);
+ 
+-	if (rx_pool_coherent && xpcie_epf->rx_virt) {
+-		dma_free_coherent(dma_dev, xpcie_epf->rx_size,
+-				  xpcie_epf->rx_virt, xpcie_epf->rx_phys);
+-	}
+-
+-	if (tx_pool_coherent && xpcie_epf->tx_virt) {
++	if (xpcie_epf->tx_virt) {
+ 		dma_free_coherent(dma_dev, xpcie_epf->tx_size,
+ 				  xpcie_epf->tx_virt, xpcie_epf->tx_phys);
+ 	}
+@@ -169,6 +126,7 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 	struct device *dma_dev = xpcie_epf->epf->epc->dev.parent;
+ 	struct xpcie_stream *tx = &xpcie->tx;
+ 	struct xpcie_stream *rx = &xpcie->rx;
++	int tx_pool_size, rx_pool_size;
+ 	struct xpcie_buf_desc *bd;
+ 	int index, ndesc, rc;
+ 
+@@ -187,7 +145,7 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 	tx->pipe.tdr = (void *)xpcie->mmio + cap->rx.ring;
+ 
+ 	intel_xpcie_list_init(&xpcie->rx_pool);
+-	rx_pool_size = roundup(rx_pool_size, xpcie->fragment_size);
++	rx_pool_size = roundup(SZ_32M, xpcie->fragment_size);
+ 	ndesc = rx_pool_size / xpcie->fragment_size;
+ 
+ 	/* Initialize reserved memory resources */
+@@ -197,29 +155,8 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 		goto error;
+ 	}
+ 
+-	if (rx_pool_coherent) {
+-		xpcie_epf->rx_size = rx_pool_size;
+-		xpcie_epf->rx_virt = dma_alloc_coherent(dma_dev,
+-							xpcie_epf->rx_size,
+-							&xpcie_epf->rx_phys,
+-							GFP_KERNEL);
+-		if (!xpcie_epf->rx_virt)
+-			goto error;
+-	}
+-
+ 	for (index = 0; index < ndesc; index++) {
+-		if (rx_pool_coherent) {
+-			bd =
+-			intel_xpcie_alloc_bd_reuse(xpcie->fragment_size,
+-						   xpcie_epf->rx_virt +
+-						   (index *
+-							xpcie->fragment_size),
+-						   xpcie_epf->rx_phys +
+-						   (index *
+-							xpcie->fragment_size));
+-		} else {
+-			bd = intel_xpcie_alloc_bd(xpcie->fragment_size);
+-		}
++		bd = intel_xpcie_alloc_bd(xpcie->fragment_size);
+ 		if (bd) {
+ 			intel_xpcie_list_put(&xpcie->rx_pool, bd);
+ 		} else {
+@@ -230,32 +167,25 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 	}
+ 
+ 	intel_xpcie_list_init(&xpcie->tx_pool);
+-	tx_pool_size = roundup(tx_pool_size, xpcie->fragment_size);
++	tx_pool_size = roundup(SZ_32M, xpcie->fragment_size);
+ 	ndesc = tx_pool_size / xpcie->fragment_size;
+ 
+-	if (tx_pool_coherent) {
+-		xpcie_epf->tx_size = tx_pool_size;
+-		xpcie_epf->tx_virt = dma_alloc_coherent(dma_dev,
+-							xpcie_epf->tx_size,
+-							&xpcie_epf->tx_phys,
+-							GFP_KERNEL);
+-		if (!xpcie_epf->tx_virt)
+-			goto error;
+-	}
++	xpcie_epf->tx_size = tx_pool_size;
++	xpcie_epf->tx_virt = dma_alloc_coherent(dma_dev,
++						xpcie_epf->tx_size,
++						&xpcie_epf->tx_phys,
++						GFP_KERNEL);
++	if (!xpcie_epf->tx_virt)
++		goto error;
+ 
+ 	for (index = 0; index < ndesc; index++) {
+-		if (tx_pool_coherent) {
+-			bd =
+-			intel_xpcie_alloc_bd_reuse(xpcie->fragment_size,
+-						   xpcie_epf->tx_virt +
+-						   (index *
+-							xpcie->fragment_size),
+-						   xpcie_epf->tx_phys +
+-						   (index *
+-							xpcie->fragment_size));
+-		} else {
+-			bd = intel_xpcie_alloc_bd(xpcie->fragment_size);
+-		}
++		bd = intel_xpcie_alloc_bd_reuse(xpcie->fragment_size,
++						xpcie_epf->tx_virt +
++						(index *
++						 xpcie->fragment_size),
++						xpcie_epf->tx_phys +
++						(index *
++						 xpcie->fragment_size));
+ 		if (bd) {
+ 			intel_xpcie_list_put(&xpcie->tx_pool, bd);
+ 		} else {
+@@ -353,14 +283,12 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 
+ 		bd->length = length;
+ 		bd->interface = interface;
+-		if (!rx_pool_coherent) {
+-			rc = intel_xpcie_map_dma(xpcie, bd, DMA_FROM_DEVICE);
+-			if (rc) {
+-				dev_err(xpcie_to_dev(xpcie),
+-					"failed to map rx bd (%d)\n", rc);
+-				intel_xpcie_free_rx_bd(xpcie, bd);
+-				break;
+-			}
++		rc = intel_xpcie_map_dma(xpcie, bd, DMA_FROM_DEVICE);
++		if (rc) {
++			dev_err(xpcie_to_dev(xpcie),
++				"failed to map rx bd (%d)\n", rc);
++			intel_xpcie_free_rx_bd(xpcie, bd);
++			break;
+ 		}
+ 
+ 		desc = &xpcie_epf->rx_desc_buf[chan].virt[descs_num++];
+@@ -383,7 +311,7 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 	rc = intel_xpcie_copy_from_host_ll(xpcie, chan, descs_num);
+ 
+ 	bd = bd_head;
+-	while (bd && !rx_pool_coherent) {
++	while (bd) {
+ 		intel_xpcie_unmap_dma(xpcie, bd, DMA_FROM_DEVICE);
+ 		bd = bd->next;
+ 	}
+@@ -460,16 +388,6 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 		if (!bd)
+ 			break;
+ 
+-		if (!tx_pool_coherent) {
+-			if (intel_xpcie_map_dma(xpcie, bd, DMA_TO_DEVICE)) {
+-				dev_err(xpcie_to_dev(xpcie),
+-					"dma map error bd addr %p, size %zu\n",
+-				bd->data, bd->length);
+-				intel_xpcie_list_put_head(&xpcie->write, bd);
+-				break;
+-			}
+-		}
+-
+ 		td = tx->pipe.tdr + tail;
+ 		address = intel_xpcie_get_td_address(td);
+ 
+@@ -495,9 +413,6 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 	tail = initial_tail;
+ 	bd = bd_head;
+ 	while (bd) {
+-		if (!tx_pool_coherent)
+-			intel_xpcie_unmap_dma(xpcie, bd, DMA_TO_DEVICE);
+-
+ 		if (rc) {
+ 			bd = bd->next;
+ 			continue;
+@@ -598,7 +513,6 @@ int intel_xpcie_core_init(struct xpcie *xpcie)
+ 
+ 	global_xpcie = xpcie;
+ 
+-	intel_xpcie_set_version(xpcie);
+ 	intel_xpcie_set_cap_txrx(xpcie);
+ 
+ 	error = intel_xpcie_events_init(xpcie);
+diff --git a/drivers/misc/xlink-pcie/local_host/epf.h b/drivers/misc/xlink-pcie/local_host/epf.h
+index 9cfd96923c6f..ad79416476d5 100644
+--- a/drivers/misc/xlink-pcie/local_host/epf.h
++++ b/drivers/misc/xlink-pcie/local_host/epf.h
+@@ -73,9 +73,6 @@ struct xpcie_epf {
+ 	dma_addr_t			tx_phys;
+ 	void				*tx_virt;
+ 	size_t				tx_size;
+-	dma_addr_t			rx_phys;
+-	void				*rx_virt;
+-	size_t				rx_size;
+ 
+ 	struct xpcie_dma_ll_desc_buf	tx_desc_buf[DMA_CHAN_NUM];
+ 	struct xpcie_dma_ll_desc_buf	rx_desc_buf[DMA_CHAN_NUM];
+-- 
+2.27.0
+

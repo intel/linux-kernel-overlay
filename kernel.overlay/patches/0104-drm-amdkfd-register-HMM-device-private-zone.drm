@@ -1,0 +1,261 @@
+From 4f3a30333c06eed785e152c895e1623e90827735 Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Fri, 7 Feb 2020 15:34:33 -0500
+Subject: [PATCH 0104/1247] drm/amdkfd: register HMM device private zone
+
+Register vram memory as MEMORY_DEVICE_PRIVATE type resource, to
+allocate vram backing pages for page migration.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/Kconfig       |   2 +
+ drivers/gpu/drm/amd/amdkfd/Makefile      |   3 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  |   4 +
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.c | 104 +++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.h |  49 +++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |   3 +
+ 6 files changed, 164 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+ create mode 100644 drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/Kconfig b/drivers/gpu/drm/amd/amdkfd/Kconfig
+index f02c938f75da..fb8d85716599 100644
+--- a/drivers/gpu/drm/amd/amdkfd/Kconfig
++++ b/drivers/gpu/drm/amd/amdkfd/Kconfig
+@@ -8,6 +8,8 @@ config HSA_AMD
+ 	depends on DRM_AMDGPU && (X86_64 || ARM64 || PPC64)
+ 	imply AMD_IOMMU_V2 if X86_64
+ 	select HMM_MIRROR
++	select ZONE_DEVICE
++	select DEVICE_PRIVATE
+ 	select MMU_NOTIFIER
+ 	select DRM_AMDGPU_USERPTR
+ 	help
+diff --git a/drivers/gpu/drm/amd/amdkfd/Makefile b/drivers/gpu/drm/amd/amdkfd/Makefile
+index 387ce0217d35..a93301dbc464 100644
+--- a/drivers/gpu/drm/amd/amdkfd/Makefile
++++ b/drivers/gpu/drm/amd/amdkfd/Makefile
+@@ -55,7 +55,8 @@ AMDKFD_FILES	:= $(AMDKFD_PATH)/kfd_module.o \
+ 		$(AMDKFD_PATH)/kfd_dbgmgr.o \
+ 		$(AMDKFD_PATH)/kfd_smi_events.o \
+ 		$(AMDKFD_PATH)/kfd_crat.o \
+-		$(AMDKFD_PATH)/kfd_svm.o
++		$(AMDKFD_PATH)/kfd_svm.o \
++		$(AMDKFD_PATH)/kfd_migrate.o
+ 
+ ifneq ($(CONFIG_AMD_IOMMU_V2),)
+ AMDKFD_FILES += $(AMDKFD_PATH)/kfd_iommu.o
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 357b9bf62a1c..b31bae91fbd0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -30,6 +30,7 @@
+ #include "kfd_iommu.h"
+ #include "amdgpu_amdkfd.h"
+ #include "kfd_smi_events.h"
++#include "kfd_migrate.h"
+ 
+ #define MQD_SIZE_ALIGNED 768
+ 
+@@ -814,6 +815,8 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
+ 
+ 	kfd_cwsr_init(kfd);
+ 
++	svm_migrate_init((struct amdgpu_device *)kfd->kgd);
++
+ 	if (kfd_resume(kfd))
+ 		goto kfd_resume_error;
+ 
+@@ -862,6 +865,7 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ {
+ 	if (kfd->init_complete) {
+ 		kgd2kfd_suspend(kfd, false);
++		svm_migrate_fini((struct amdgpu_device *)kfd->kgd);
+ 		device_queue_manager_uninit(kfd->dqm);
+ 		kfd_interrupt_exit(kfd);
+ 		kfd_topology_remove_device(kfd);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+new file mode 100644
+index 000000000000..b32d8fdfe8e9
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * Copyright 2020-2021 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include <linux/types.h>
++#include <linux/hmm.h>
++#include <linux/dma-direction.h>
++#include <linux/dma-mapping.h>
++#include "amdgpu_sync.h"
++#include "amdgpu_object.h"
++#include "amdgpu_vm.h"
++#include "amdgpu_mn.h"
++#include "kfd_priv.h"
++#include "kfd_svm.h"
++#include "kfd_migrate.h"
++
++static void svm_migrate_page_free(struct page *page)
++{
++}
++
++/**
++ * svm_migrate_to_ram - CPU page fault handler
++ * @vmf: CPU vm fault vma, address
++ *
++ * Context: vm fault handler, mm->mmap_sem is taken
++ *
++ * Return:
++ * 0 - OK
++ * VM_FAULT_SIGBUS - notice application to have SIGBUS page fault
++ */
++static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
++{
++	return VM_FAULT_SIGBUS;
++}
++
++static const struct dev_pagemap_ops svm_migrate_pgmap_ops = {
++	.page_free		= svm_migrate_page_free,
++	.migrate_to_ram		= svm_migrate_to_ram,
++};
++
++int svm_migrate_init(struct amdgpu_device *adev)
++{
++	struct kfd_dev *kfddev = adev->kfd.dev;
++	struct dev_pagemap *pgmap;
++	struct resource *res;
++	unsigned long size;
++	void *r;
++
++	/* Page migration works on Vega10 or newer */
++	if (kfddev->device_info->asic_family < CHIP_VEGA10)
++		return -EINVAL;
++
++	pgmap = &kfddev->pgmap;
++	memset(pgmap, 0, sizeof(*pgmap));
++
++	/* TODO: register all vram to HMM for now.
++	 * should remove reserved size
++	 */
++	size = ALIGN(adev->gmc.real_vram_size, 2ULL << 20);
++	res = devm_request_free_mem_region(adev->dev, &iomem_resource, size);
++	if (IS_ERR(res))
++		return -ENOMEM;
++
++	pgmap->type = MEMORY_DEVICE_PRIVATE;
++	pgmap->nr_range = 1;
++	pgmap->range.start = res->start;
++	pgmap->range.end = res->end;
++	pgmap->ops = &svm_migrate_pgmap_ops;
++	pgmap->owner = adev;
++	pgmap->flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
++	r = devm_memremap_pages(adev->dev, pgmap);
++	if (IS_ERR(r)) {
++		pr_err("failed to register HMM device memory\n");
++		return PTR_ERR(r);
++	}
++
++	pr_info("HMM registered %ldMB device memory\n", size >> 20);
++
++	return 0;
++}
++
++void svm_migrate_fini(struct amdgpu_device *adev)
++{
++	memunmap_pages(&adev->kfd.dev->pgmap);
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+new file mode 100644
+index 000000000000..89392548ec44
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/*
++ * Copyright 2020-2021 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef KFD_MIGRATE_H_
++#define KFD_MIGRATE_H_
++
++#include <linux/rwsem.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/sched/mm.h>
++#include <linux/hmm.h>
++#include "kfd_priv.h"
++#include "kfd_svm.h"
++
++#if defined(CONFIG_DEVICE_PRIVATE)
++int svm_migrate_init(struct amdgpu_device *adev);
++void svm_migrate_fini(struct amdgpu_device *adev);
++
++#else
++static inline int svm_migrate_init(struct amdgpu_device *adev)
++{
++	DRM_WARN_ONCE("DEVICE_PRIVATE kernel config option is not enabled, "
++		      "add CONFIG_DEVICE_PRIVATE=y in config file to fix\n");
++	return -ENODEV;
++}
++static inline void svm_migrate_fini(struct amdgpu_device *adev) {}
++#endif
++#endif /* KFD_MIGRATE_H_ */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 59423c886930..a58bea31e23c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -322,6 +322,9 @@ struct kfd_dev {
+ 	unsigned int max_doorbell_slices;
+ 
+ 	int noretry;
++
++	/* HMM page migration MEMORY_DEVICE_PRIVATE mapping */
++	struct dev_pagemap pgmap;
+ };
+ 
+ enum kfd_mempool {
+-- 
+2.27.0
+

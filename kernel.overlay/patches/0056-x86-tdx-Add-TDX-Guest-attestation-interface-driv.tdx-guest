@@ -1,0 +1,318 @@
+From c3a2e345c0c4237f4ed0a8c2800182f2bbfe6b00 Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Date: Tue, 17 Nov 2020 04:17:05 +0000
+Subject: [PATCH 56/78] x86/tdx: Add TDX Guest attestation interface driver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TDX guest supports encrypted disk as root or secondary drives.
+Decryption keys required to access such drives are usually maintained
+by 3rd party key servers. Attestation is required by 3rd party key
+servers to get the key for an encrypted disk volume, or possibly other
+encrypted services. Attestation is used to prove to the key server that
+the TD guest is running in a valid TD and the kernel and virtual BIOS
+and other environment are secure.  After checking the hashes the key
+server will securely release the keys.
+
+The actual details of the attestation protocol depend on the particular
+key server configuration, but some parts are common and need to
+communicate with the TDX module.
+
+This communication is implemented in the attestation driver.
+
+The supported steps are:
+
+  1. TD guest generates the TDREPORT that contains version information
+     about the Intel TDX module, measurement of the TD, along with a
+     TD-specified nonce.
+  2. TD guest shares the TDREPORT with TD host via GetQuote hypercall
+     which is used by the host to generate a quote via quoting
+     enclave (QE).
+  3. Quote generation completion notification is sent to TD OS via
+     callback interrupt vector configured by TD using
+     SetupEventNotifyInterrupt hypercall.
+  4. After receiving the generated TDQUOTE, a remote verifier can be
+     used to verify the quote and confirm the trustworthiness of the
+     TD.
+
+Attestation agent uses IOCTLs implemented by the attestation driver to
+complete the various steps of the attestation process.
+
+Also note that, explicit access permissions are not enforced in this
+driver because the quote and measurements are not a secret. However
+the access permissions of the device node can be used to set any
+desired access policy.
+
+TDX_CMD_GEN_QUOTE IOCTL can be used to create an computation on the
+host, but we assume that the host is able to deal with malicious
+guests flooding it anyways.
+
+Currently MMAP is used to share the Quote data with user app. This
+model is adapted to avoid multiple copies in kernel/user-space.
+
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+---
+ drivers/platform/x86/Kconfig            |   9 ++
+ drivers/platform/x86/Makefile           |   1 +
+ drivers/platform/x86/intel_tdx_attest.c | 188 ++++++++++++++++++++++++
+ include/uapi/misc/tdx.h                 |  20 +++
+ 4 files changed, 218 insertions(+)
+ create mode 100644 drivers/platform/x86/intel_tdx_attest.c
+ create mode 100644 include/uapi/misc/tdx.h
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 60592fb88e7a..3868ddf0d959 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -1301,6 +1301,15 @@ config INTEL_SCU_IPC_UTIL
+ 	  low level access for debug work and updating the firmware. Say
+ 	  N unless you will be doing this on an Intel MID platform.
+ 
++config INTEL_TDX_ATTESTATION
++	tristate "Intel TDX attestation driver"
++	depends on INTEL_TDX_GUEST
++	help
++	  The TDX attestation driver provides IOCTL or MMAP interfaces to
++	  the user to request TDREPORT from the TDX module or request quote
++	  from VMM. It is mainly used to get secure disk decryption keys from
++	  the key server. Say N if you are not sure.
++
+ config INTEL_TELEMETRY
+ 	tristate "Intel SoC Telemetry Driver"
+ 	depends on X86_64
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index dcc8cdb95b4d..83439990ae47 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -138,6 +138,7 @@ obj-$(CONFIG_INTEL_SCU_PCI)		+= intel_scu_pcidrv.o
+ obj-$(CONFIG_INTEL_SCU_PLATFORM)	+= intel_scu_pltdrv.o
+ obj-$(CONFIG_INTEL_SCU_WDT)		+= intel_scu_wdt.o
+ obj-$(CONFIG_INTEL_SCU_IPC_UTIL)	+= intel_scu_ipcutil.o
++obj-$(CONFIG_INTEL_TDX_ATTESTATION)	+= intel_tdx_attest.o
+ obj-$(CONFIG_INTEL_TELEMETRY)		+= intel_telemetry_core.o \
+ 					   intel_telemetry_pltdrv.o \
+ 					   intel_telemetry_debugfs.o
+diff --git a/drivers/platform/x86/intel_tdx_attest.c b/drivers/platform/x86/intel_tdx_attest.c
+new file mode 100644
+index 000000000000..97cb7f7b8d1a
+--- /dev/null
++++ b/drivers/platform/x86/intel_tdx_attest.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * intel_tdx_attest.c - TDX guest attestation interface driver.
++ *
++ * Implements user interface to trigger attestation process and
++ * read the TD Quote result.
++ *
++ * Copyright (C) 2020 Intel Corporation
++ *
++ * Author:
++ *     Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
++ */
++
++#define pr_fmt(fmt) "x86/tdx: attest: " fmt
++
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/uaccess.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/set_memory.h>
++#include <linux/io.h>
++#include <asm/apic.h>
++#include <asm/tdx.h>
++#include <asm/irq_vectors.h>
++#include <uapi/misc/tdx.h>
++
++#define VERSION				"1.0"
++
++/* Used in Quote memory allocation */
++#define QUOTE_SIZE			(2 * PAGE_SIZE)
++
++/* Mutex to synchronize attestation requests */
++static DEFINE_MUTEX(attestation_lock);
++/* Completion object to track attestation status */
++static DECLARE_COMPLETION(attestation_done);
++
++static void attestation_callback_handler(void)
++{
++	complete(&attestation_done);
++}
++
++static long tdg_attest_ioctl(struct file *file, unsigned int cmd,
++			     unsigned long arg)
++{
++	u8 *reportdata;
++	long ret = 0;
++	u64 data = virt_to_phys(file->private_data);
++	void __user *argp = (void __user *)arg;
++
++	if (!data)
++		return -EINVAL;
++
++	reportdata = kzalloc(TDX_TDREPORT_LEN, GFP_KERNEL);
++	if (!reportdata)
++		return -ENOMEM;
++
++	mutex_lock(&attestation_lock);
++
++	switch (cmd) {
++	case TDX_CMD_GET_TDREPORT:
++		if (copy_from_user(reportdata, argp, TDX_REPORT_DATA_LEN)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		/* Generate TDREPORT_STRUCT */
++		if (tdx_mcall_tdreport(data, virt_to_phys(reportdata))) {
++			ret = -EIO;
++			break;
++		}
++
++		if (copy_to_user(argp, file->private_data, TDX_TDREPORT_LEN))
++			ret = -EFAULT;
++		break;
++	case TDX_CMD_GEN_QUOTE:
++		if (copy_from_user(reportdata, argp, TDX_REPORT_DATA_LEN)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		/* Generate TDREPORT_STRUCT */
++		if (tdx_mcall_tdreport(data, virt_to_phys(reportdata))) {
++			ret = -EIO;
++			break;
++		}
++
++		ret = set_memory_decrypted((unsigned long)file->private_data,
++					   1UL << get_order(QUOTE_SIZE));
++		if (ret)
++			break;
++
++		/* Submit GetQuote Request */
++		if (tdx_hcall_get_quote(data)) {
++			ret = -EIO;
++			break;
++		}
++
++		/* Wait for attestation completion */
++		wait_for_completion_interruptible(&attestation_done);
++
++		ret = set_memory_encrypted((unsigned long)file->private_data,
++					   1UL << get_order(QUOTE_SIZE));
++
++		break;
++	case TDX_CMD_GET_QUOTE_SIZE:
++		if (put_user(QUOTE_SIZE, (u64 __user *)argp))
++			ret = -EFAULT;
++
++		break;
++	default:
++		pr_err("cmd %d not supported\n", cmd);
++		break;
++	}
++
++	mutex_unlock(&attestation_lock);
++
++	kfree(reportdata);
++
++	return ret;
++}
++
++static vm_fault_t tdg_attest_vm_fault(struct vm_fault *vmf)
++{
++	struct page *page;
++
++	if (vmf->vma->vm_private_data) {
++		page = virt_to_page(vmf->vma->vm_private_data);
++		get_page(page);
++		vmf->page = page;
++	}
++
++	return 0;
++}
++
++static const struct vm_operations_struct tdg_attest_vm_ops = {
++	.fault = tdg_attest_vm_fault,
++};
++
++static int tdg_attest_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	vma->vm_ops = &tdg_attest_vm_ops;
++	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
++	vma->vm_private_data = file->private_data;
++
++	return 0;
++}
++
++static int tdg_attest_open(struct inode *inode, struct file *file)
++{
++	tdg_event_notify_handler = attestation_callback_handler;
++
++	file->private_data = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
++						      get_order(QUOTE_SIZE));
++
++	return !file->private_data ? -ENOMEM : 0;
++}
++
++static int tdg_attest_release(struct inode *inode, struct file *file)
++{
++	tdg_event_notify_handler = NULL;
++	free_pages((unsigned long)file->private_data, get_order(QUOTE_SIZE));
++	file->private_data = NULL;
++
++	return 0;
++}
++
++static const struct file_operations tdg_attest_fops = {
++	.owner		= THIS_MODULE,
++	.open		= tdg_attest_open,
++	.release	= tdg_attest_release,
++	.mmap		= tdg_attest_mmap,
++	.unlocked_ioctl	= tdg_attest_ioctl,
++	.llseek		= no_llseek,
++};
++
++static struct miscdevice tdg_attest_device = {
++	.minor          = MISC_DYNAMIC_MINOR,
++	.name           = "tdx-attest",
++	.fops           = &tdg_attest_fops,
++};
++module_misc_device(tdg_attest_device);
++
++MODULE_AUTHOR("Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>");
++MODULE_DESCRIPTION("TDX attestation driver ver " VERSION);
++MODULE_VERSION(VERSION);
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/misc/tdx.h b/include/uapi/misc/tdx.h
+new file mode 100644
+index 000000000000..9afbef9079c1
+--- /dev/null
++++ b/include/uapi/misc/tdx.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_MISC_TDX_H
++#define _UAPI_MISC_TDX_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/* Input report data length for TDX_CMD_GET_TDREPORT IOCTL request */
++#define TDX_REPORT_DATA_LEN		64
++/* Output report data length after TDX_CMD_GET_TDREPORT IOCTL execution */
++#define TDX_TDREPORT_LEN		1024
++
++/* IOCTL to request TDREPORT data from TDX Module */
++#define TDX_CMD_GET_TDREPORT		_IOWR('T', 0x01, __u64)
++/* IOCTL to request Quote from VMM using report data */
++#define TDX_CMD_GEN_QUOTE		_IOR('T', 0x02, __u64)
++/* Get current size of quote */
++#define TDX_CMD_GET_QUOTE_SIZE		_IOR('T', 0x03, __u64)
++
++#endif /* _UAPI_MISC_TDX_H */
+-- 
+2.27.0
+

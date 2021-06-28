@@ -1,0 +1,170 @@
+From 66b84ae05843112bf83c49dac894fa2d5cc892fa Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 3 Feb 2021 12:08:47 -0800
+Subject: [PATCH 23/80] sched/fair: Consider topologies with SMT groups in
+ misfit load balancing
+
+Currently, the load balancer pulls misfit tasks from the busiest queue if
+the local group has CPUs of bigger capacity and has spare capacity.
+
+In a physical CPU with support for SMT, siblings share computing resources.
+Thus, even if any single of the SMT siblings has bigger capacity than
+smaller CPUs, if the rest of the siblings are overutilized, not all of that
+capacity is available for a misfit task being pulled from such smaller CPU.
+
+Add logic to determine if:
+  a) A local scheduling group composed of bigger CPU that are SMT siblings
+     can pull misfit tasks from a candidate busiest group with smaller
+     CPUs. Pull tasks only if none of the SMT siblings is overutilized.
+  b) A local scheduling group composed of a single small CPU can pull
+     tasks from a candidate busiest group composed of bigger CPUs that are
+     SMT siblings.  Pull misfit tasks if the group utilization of the
+     candidate busiest group is 80% bigger than the group capacity. In such
+     case, more than one SMT siblings will be overutilized.
+
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Aubrey Li <aubrey.li@linux.intel.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+Changes since v5:
+  * Introduced this patch.
+
+Changes since v4:
+  * N/A
+
+Changes since v3:
+  * N/A
+
+Changes since v2:
+  * N/A
+
+Changes since v1:
+  * N/A
+---
+ kernel/sched/fair.c | 89 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 8aa6b77b2c09..bdd6833fda05 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8706,6 +8706,49 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 				sgs->group_capacity;
+ }
+ 
++#ifdef CONFIG_SCHED_SMT
++/**
++ * smt_group_overutilized - Check if any of the SMT CPUs in @sg are overutilized
++ *
++ * @sg:	Scheduling groiup composed of SMT-sibling CPUs
++ * @sgs	Load-balancing statistics of @sg
++ *
++ * Check if CPUs in @sg are SMT siblings. In such case, check if any of the
++ * CPUs in the group are overutilized.
++ */
++static bool smt_group_overutilized(struct sched_group *sg,
++				   struct sg_lb_stats *sgs)
++{
++	int sibling, cpu = group_first_cpu(sg);
++
++	if (sg->group_weight == 1)
++		return false;
++
++	/* Check if this is a group of SMT siblings */
++	if (!cpumask_equal(sched_group_span(sg), cpu_smt_mask(cpu)))
++		return false;
++
++	/*
++	 * SMT siblings share CPU resources. Thus, if any of the SMT siblings
++	 * of a CPU is overutilized, regard @sg as overutilized.
++	 */
++	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
++		if (cpu_overutilized(sibling))
++			return true;
++	}
++
++	/*
++	 * Also, check if the total group utilization can fit in single CPU. This
++	 * detects the case in which utilization is migrating among SMT siblings
++	 * in the group.
++	 */
++	if (fits_capacity(sgs->group_util, sg->sgc->max_capacity))
++		return false;
++
++	return true;
++}
++#endif /* CONFIG_SCHED_SMT */
++
+ /**
+  * can_pull_misfit_tasks - Check if the local group can pull misfit tasks
+  *
+@@ -8723,12 +8766,49 @@ static bool can_pull_misfit_tasks(struct lb_env *env,
+ 				  struct sg_lb_stats *candidate_sgs,
+ 				  struct sd_lb_stats *sds)
+ {
++	/* Do we have sprare capacity */
+ 	if (sds->local_stat.group_type != group_has_spare)
+ 		return false;
+ 
+-	/* If the local group has bigger CPUs, it can pull tasks. */
+-	return capacity_greater(capacity_of(env->dst_cpu),
+-				candidate->sgc->max_capacity);
++	/*
++	 * If the local group has bigger CPUs, it can pull tasks, except when
++	 * CPUs in the group are SMT siblings and are overutilized. In such
++	 * case, the SMT siblings share computing resources and bigger
++	 * throughput may be obtained using a small CPU instead.
++	 */
++	if (capacity_greater(capacity_of(env->dst_cpu),
++			     candidate->sgc->max_capacity)) {
++#ifndef CONFIG_SCHED_SMT
++		return true;
++	}
++#else
++		return !smt_group_overutilized(sds->local, &sds->local_stat);
++
++	/*
++	 * If the local group has CPUs of less or equal capacity than those of
++	 * @candidate, the local group may still help by pulling tasks if the
++	 * CPUs in @candidate are SMT sibings and all are overutilized.
++	 */
++	} else {
++		int cpu = group_first_cpu(candidate);
++
++		/* Bigger CPUs without SMT siblings should be left alone */
++		if (candidate->group_weight == 1)
++			return false;
++
++		if (!cpumask_equal(sched_group_span(candidate),
++				   cpu_smt_mask(cpu)))
++			return false;
++
++		/*
++		 * If the group utilization cannot fit the group's capacity,
++		 * all CPUs in the group will be overutilized.
++		 */
++		return !fits_capacity(candidate_sgs->group_util,
++				      candidate_sgs->group_capacity);
++	}
++#endif
++	return false;
+ }
+ 
+ /**
+@@ -9645,6 +9725,9 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		 * average load.
+ 		 */
+ 		if (env->sd->flags & SD_ASYM_CPUCAPACITY &&
++#ifdef CONFIG_SCHED_SMT
++		    !static_branch_likely(&sched_smt_present) &&
++#endif
+ 		    !capacity_greater(capacity_of(env->dst_cpu), capacity) &&
+ 		    nr_running == 1)
+ 			continue;
+-- 
+2.27.0
+

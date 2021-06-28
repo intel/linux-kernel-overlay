@@ -1,0 +1,620 @@
+From 272008105ed94bad263a7765f2b1e3bc05c21cf3 Mon Sep 17 00:00:00 2001
+From: kadarlax <raghuveerx.kadarla@intel.com>
+Date: Thu, 15 Apr 2021 16:51:07 +0530
+Subject: [PATCH 128/170] misc: xlink-pcie: Changes to improve overall
+ performance
+
+Following changes improve end-to-end XLink performance:
+- Change Rx processing thread to Tasklet implementation on Remote Host
+- Implement Flow control at Local Host
+
+Signed-off-by: kadarlax <raghuveerx.kadarla@intel.com>
+---
+ drivers/misc/xlink-pcie/common/core.h      |   6 +
+ drivers/misc/xlink-pcie/common/util.c      |  65 ++++++++++-
+ drivers/misc/xlink-pcie/common/util.h      |  14 ++-
+ drivers/misc/xlink-pcie/common/xpcie.h     |  13 ++-
+ drivers/misc/xlink-pcie/local_host/core.c  |  31 ++++-
+ drivers/misc/xlink-pcie/remote_host/core.c | 127 +++++++++++++++------
+ 6 files changed, 213 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/misc/xlink-pcie/common/core.h b/drivers/misc/xlink-pcie/common/core.h
+index 3400a4838fb2..5d73793b6268 100644
+--- a/drivers/misc/xlink-pcie/common/core.h
++++ b/drivers/misc/xlink-pcie/common/core.h
+@@ -30,6 +30,9 @@
+ #define XPCIE_DESC_STATUS_SUCCESS	(0)
+ #define XPCIE_DESC_STATUS_ERROR		(0xFFFF)
+ 
++#define HOST_RX_BD_COUNT_THRESHOLD	(64)
++#define MAX_HOST_RX_BD_COUNT		(3 * HOST_RX_BD_COUNT_THRESHOLD)
++
+ /* Layout transfer descriptors used by device and host */
+ struct xpcie_transfer_desc {
+ 	u64 address;
+@@ -78,6 +81,9 @@ struct xpcie_interface {
+ 	struct xpcie_list read;
+ 	struct xpcie_buf_desc *partial_read;
+ 	bool data_avail;
++#ifdef XLINK_PCIE_REMOTE
++	atomic_t available_bd_cnt;
++#endif
+ 	wait_queue_head_t rx_waitq;
+ };
+ 
+diff --git a/drivers/misc/xlink-pcie/common/util.c b/drivers/misc/xlink-pcie/common/util.c
+index dd1c36a79e6b..a15f922f8615 100644
+--- a/drivers/misc/xlink-pcie/common/util.c
++++ b/drivers/misc/xlink-pcie/common/util.c
+@@ -39,6 +39,10 @@ static size_t intel_xpcie_doorbell_offset(struct xpcie *xpcie,
+ 		return XPCIE_MMIO_DTOH_RX_DOORBELL;
+ 	if (dirt == FROM_DEVICE && type == DEV_EVENT)
+ 		return XPCIE_MMIO_DTOH_EVENT_DOORBELL;
++	if (dirt == TO_DEVICE && type == PARTIAL_DATA_RECEIVED)
++		return XPCIE_MMIO_HTOD_PARTIAL_RX_DOORBELL;
++	if (dirt == TO_DEVICE && type == RX_BD_COUNT)
++		return XPCIE_MMIO_HTOD_RX_BD_LIST_COUNT;
+ #if (IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	if (dirt == TO_DEVICE && type == PHY_ID_UPDATED)
+ 		return XPCIE_MMIO_HTOD_PHY_ID_DOORBELL_STATUS;
+@@ -46,6 +50,30 @@ static size_t intel_xpcie_doorbell_offset(struct xpcie *xpcie,
+ 	return 0;
+ }
+ 
++void intel_xpcie_update_device_flwctl(struct xpcie *xpcie,
++				      enum xpcie_doorbell_direction dirt,
++				      enum xpcie_doorbell_type type,
++				      int value)
++{
++	size_t offset = intel_xpcie_doorbell_offset(xpcie, dirt, type);
++
++	if (dirt == TO_DEVICE && type == RX_BD_COUNT)
++		intel_xpcie_iowrite32(value, xpcie->mmio + offset);
++}
++
++u32 intel_xpcie_get_device_flwctl(struct xpcie *xpcie,
++				  enum xpcie_doorbell_direction dirt,
++				  enum xpcie_doorbell_type type)
++{
++	size_t offset = intel_xpcie_doorbell_offset(xpcie, dirt, type);
++	u32 ret = 0;
++
++	if (dirt == TO_DEVICE && type == RX_BD_COUNT)
++		ret = intel_xpcie_ioread32(xpcie->mmio + offset);
++
++	return ret;
++}
++
+ void intel_xpcie_set_doorbell(struct xpcie *xpcie,
+ 			      enum xpcie_doorbell_direction dirt,
+ 			      enum xpcie_doorbell_type type, u8 value)
+@@ -226,13 +254,27 @@ void intel_xpcie_list_cleanup(struct xpcie_list *list)
+ 	spin_unlock(&list->lock);
+ }
+ 
++bool intel_xpcie_list_empty(struct xpcie_list *list)
++{
++	if (list && !list->head && !list->tail)
++		return false;
++
++	return true;
++}
++
+ int intel_xpcie_list_put(struct xpcie_list *list,
+ 			 struct xpcie_buf_desc *bd)
+ {
++#ifdef XLINK_PCIE_REMOTE
++	unsigned long flags = 0;
++#endif
+ 	if (!bd)
+ 		return -EINVAL;
+-
++#ifdef XLINK_PCIE_REMOTE
++	spin_lock_irqsave(&list->lock, flags);
++#else
+ 	spin_lock(&list->lock);
++#endif
+ 	if (list->head)
+ 		list->tail->next = bd;
+ 	else
+@@ -244,8 +286,11 @@ int intel_xpcie_list_put(struct xpcie_list *list,
+ 		list->buffers++;
+ 		bd = bd->next;
+ 	}
++#ifdef XLINK_PCIE_REMOTE
++	spin_unlock_irqrestore(&list->lock, flags);
++#else
+ 	spin_unlock(&list->lock);
+-
++#endif
+ 	return 0;
+ }
+ 
+@@ -278,8 +323,14 @@ int intel_xpcie_list_put_head(struct xpcie_list *list,
+ struct xpcie_buf_desc *intel_xpcie_list_get(struct xpcie_list *list)
+ {
+ 	struct xpcie_buf_desc *bd;
++#ifdef XLINK_PCIE_REMOTE
++	unsigned long flags = 0;
+ 
++	spin_lock_irqsave(&list->lock, flags);
++#else
+ 	spin_lock(&list->lock);
++#endif
++
+ 	bd = list->head;
+ 	if (list->head) {
+ 		list->head = list->head->next;
+@@ -289,7 +340,11 @@ struct xpcie_buf_desc *intel_xpcie_list_get(struct xpcie_list *list)
+ 		list->bytes -= bd->length;
+ 		list->buffers--;
+ 	}
++#ifdef XLINK_PCIE_REMOTE
++	spin_unlock_irqrestore(&list->lock, flags);
++#else
+ 	spin_unlock(&list->lock);
++#endif
+ 
+ 	return bd;
+ }
+@@ -413,10 +468,14 @@ void intel_xpcie_add_bd_to_interface(struct xpcie *xpcie,
+ 	inf = xpcie->interfaces + bd->interface;
+ 
+ 	intel_xpcie_list_put(&inf->read, bd);
+-
++#ifdef XLINK_PCIE_REMOTE
++	atomic_inc(&inf->available_bd_cnt);
++	inf->data_avail = true;
++#else
+ 	mutex_lock(&inf->rlock);
+ 	inf->data_avail = true;
+ 	mutex_unlock(&inf->rlock);
++#endif
+ 	wake_up_interruptible(&inf->rx_waitq);
+ }
+ 
+diff --git a/drivers/misc/xlink-pcie/common/util.h b/drivers/misc/xlink-pcie/common/util.h
+index 1300779f8b63..59a81460cc5e 100644
+--- a/drivers/misc/xlink-pcie/common/util.h
++++ b/drivers/misc/xlink-pcie/common/util.h
+@@ -10,6 +10,7 @@
+ #ifndef XPCIE_UTIL_HEADER_
+ #define XPCIE_UTIL_HEADER_
+ 
++#include <linux/atomic.h>
+ #include "xpcie.h"
+ 
+ enum xpcie_doorbell_direction {
+@@ -21,7 +22,9 @@ enum xpcie_doorbell_type {
+ 	DATA_SENT,
+ 	DATA_RECEIVED,
+ 	PHY_ID_UPDATED,
+-	DEV_EVENT
++	DEV_EVENT,
++	PARTIAL_DATA_RECEIVED,
++	RX_BD_COUNT,
+ };
+ 
+ enum xpcie_event_type {
+@@ -37,6 +40,14 @@ u8 intel_xpcie_get_doorbell(struct xpcie *xpcie,
+ 			    enum xpcie_doorbell_direction dirt,
+ 			    enum xpcie_doorbell_type type);
+ 
++void intel_xpcie_update_device_flwctl(struct xpcie *xpcie,
++				      enum xpcie_doorbell_direction dirt,
++				      enum xpcie_doorbell_type type,
++				      int value);
++u32 intel_xpcie_get_device_flwctl(struct xpcie *xpcie,
++				  enum xpcie_doorbell_direction dirt,
++				  enum xpcie_doorbell_type type);
++
+ void intel_xpcie_set_device_status(struct xpcie *xpcie, u32 status);
+ u32 intel_xpcie_get_device_status(struct xpcie *xpcie);
+ u32 intel_xpcie_get_host_status(struct xpcie *xpcie);
+@@ -64,6 +75,7 @@ int intel_xpcie_list_put_head(struct xpcie_list *list,
+ struct xpcie_buf_desc *intel_xpcie_list_get(struct xpcie_list *list);
+ void intel_xpcie_list_info(struct xpcie_list *list, size_t *bytes,
+ 			   size_t *buffers);
++bool intel_xpcie_list_empty(struct xpcie_list *list);
+ 
+ struct xpcie_buf_desc *intel_xpcie_alloc_rx_bd(struct xpcie *xpcie);
+ void intel_xpcie_free_rx_bd(struct xpcie *xpcie, struct xpcie_buf_desc *bd);
+diff --git a/drivers/misc/xlink-pcie/common/xpcie.h b/drivers/misc/xlink-pcie/common/xpcie.h
+index ace2778efc04..3d44325bd15b 100644
+--- a/drivers/misc/xlink-pcie/common/xpcie.h
++++ b/drivers/misc/xlink-pcie/common/xpcie.h
+@@ -10,6 +10,7 @@
+ #ifndef XPCIE_HEADER_
+ #define XPCIE_HEADER_
+ 
++#include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/pci_ids.h>
+@@ -54,6 +55,7 @@ struct xpcie_mmio {
+ 	u8 legacy_a0;
+ 	u8 htod_tx_doorbell;
+ 	u8 htod_rx_doorbell;
++	u8 htod_partial_rx_doorbell;
+ 	u8 htod_event_doorbell;
+ 	u8 dtoh_tx_doorbell;
+ 	u8 dtoh_rx_doorbell;
+@@ -61,8 +63,9 @@ struct xpcie_mmio {
+ #if (IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	u8 htod_phy_id_doorbell_status;
+ #endif
+-	u8 reserved;
+ 	u32 cap_offset;
++	u32 htod_rx_bd_list_count;
++	u32 dummy;
+ } __packed;
+ 
+ #define XPCIE_MMIO_LEGACY_A0	(offsetof(struct xpcie_mmio, legacy_a0))
+@@ -76,12 +79,16 @@ struct xpcie_mmio {
+ 	(offsetof(struct xpcie_mmio, htod_rx_doorbell))
+ #define XPCIE_MMIO_HTOD_EVENT_DOORBELL \
+ 	(offsetof(struct xpcie_mmio, htod_event_doorbell))
++#define XPCIE_MMIO_HTOD_PARTIAL_RX_DOORBELL \
++	(offsetof(struct xpcie_mmio, htod_partial_rx_doorbell))
+ #define XPCIE_MMIO_DTOH_TX_DOORBELL \
+ 	(offsetof(struct xpcie_mmio, dtoh_tx_doorbell))
+ #define XPCIE_MMIO_DTOH_RX_DOORBELL \
+ 	(offsetof(struct xpcie_mmio, dtoh_rx_doorbell))
+ #define XPCIE_MMIO_DTOH_EVENT_DOORBELL \
+ 	(offsetof(struct xpcie_mmio, dtoh_event_doorbell))
++#define XPCIE_MMIO_HTOD_RX_BD_LIST_COUNT \
++	(offsetof(struct xpcie_mmio, htod_rx_bd_list_count))
+ #define XPCIE_MMIO_CAP_OFF	(offsetof(struct xpcie_mmio, cap_offset))
+ #define XPCIE_MMIO_MAGIC_OFF	(offsetof(struct xpcie_mmio, magic))
+ 
+@@ -127,6 +134,10 @@ struct xpcie {
+ 
+ 	struct delayed_work rx_event;
+ 	struct delayed_work tx_event;
++#ifdef XLINK_PCIE_REMOTE
++	struct tasklet_struct rx_tasklet;
++	struct hrtimer free_rx_bd_timer;
++#endif
+ };
+ 
+ #endif /* XPCIE_HEADER_ */
+diff --git a/drivers/misc/xlink-pcie/local_host/core.c b/drivers/misc/xlink-pcie/local_host/core.c
+index b01183484556..fd894ca37884 100644
+--- a/drivers/misc/xlink-pcie/local_host/core.c
++++ b/drivers/misc/xlink-pcie/local_host/core.c
+@@ -377,6 +377,7 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 	struct xpcie_transfer_desc *td;
+ 	int descs_num = 0, chan = 0, rc;
+ 	size_t buffers = 0, bytes = 0;
++	int bd_val = 0;
+ 	u64 address;
+ 
+ 	if (intel_xpcie_get_host_status(xpcie) != XPCIE_STATUS_RUN)
+@@ -391,6 +392,16 @@ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+ 
+ 	/* add new entries */
+ 	while (XPCIE_CIRCULAR_INC(tail, ndesc) != head) {
++		/*
++		 * Tx flow control
++		 * Check remote host Rx bd count is more than threshold.
++		 */
++		bd_val = intel_xpcie_get_device_flwctl(xpcie, TO_DEVICE,
++						       RX_BD_COUNT);
++		if (bd_val < MAX_HOST_RX_BD_COUNT &&
++		    bd_val >= HOST_RX_BD_COUNT_THRESHOLD)
++			continue;
++
+ 		bd = intel_xpcie_list_get(&xpcie->write);
+ 		if (!bd)
+ 			break;
+@@ -467,7 +478,7 @@ static irqreturn_t intel_xpcie_core_irq_cb(int irq, void *args)
+ 	u16 phy_id = 0;
+ 	u8 max_functions = 0, func_no = 0;
+ 	struct xpcie_epf *xpcie_epf =
+-				container_of(xpcie, struct xpcie_epf, xpcie);
++		container_of(xpcie, struct xpcie_epf, xpcie);
+ 	/*clear the interrupt*/
+ 	writel(0x1, xpcie->doorbell_clear);
+ #endif
+@@ -487,15 +498,25 @@ static irqreturn_t intel_xpcie_core_irq_cb(int irq, void *args)
+ 			phy_id = intel_xpcie_get_physical_device_id(xpcie);
+ 			max_functions = intel_xpcie_get_max_functions(xpcie);
+ 			func_no = xpcie_epf->epf->func_no;
+-		xpcie_epf->sw_devid =
+-		intel_xpcie_create_sw_device_id(func_no, phy_id, max_functions);
++			xpcie_epf->sw_devid =
++				intel_xpcie_create_sw_device_id(func_no, phy_id, max_functions);
+ 			xpcie_epf->sw_dev_id_updated = true;
+ 			dev_info(xpcie_to_dev(xpcie),
+-				 "pcie: func_no=%x swid updated=%x phy_id=%x\n",
+-				 func_no, xpcie_epf->sw_devid, phy_id);
++					"pcie: func_no=%x swid updated=%x phy_id=%x\n",
++					func_no, xpcie_epf->sw_devid, phy_id);
+ 		}
+ 	}
+ #endif
++	if (intel_xpcie_get_doorbell(xpcie, TO_DEVICE,
++				     PARTIAL_DATA_RECEIVED)) {
++		intel_xpcie_set_doorbell(xpcie, TO_DEVICE,
++					 PARTIAL_DATA_RECEIVED, 0);
++		if (xpcie->tx_pending)
++			intel_xpcie_start_tx(xpcie, 0);
++		else
++			intel_xpcie_raise_irq(xpcie, DATA_SENT);
++	}
++
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/misc/xlink-pcie/remote_host/core.c b/drivers/misc/xlink-pcie/remote_host/core.c
+index 786dfa78ca7b..e85b50694ad5 100644
+--- a/drivers/misc/xlink-pcie/remote_host/core.c
++++ b/drivers/misc/xlink-pcie/remote_host/core.c
+@@ -7,11 +7,15 @@
+  *
+  ****************************************************************************/
+ 
++#include <linux/atomic.h>
++#include <linux/jiffies.h>
+ #include "pci.h"
+ 
+ #include "../common/core.h"
+ #include "../common/util.h"
+ 
++#define RX_BD_HRTIMER_DELAY_USEC	(4000 * 1000) /* 4 sec delay */
++
+ static int intel_xpcie_map_dma(struct xpcie *xpcie, struct xpcie_buf_desc *bd,
+ 			       int direction)
+ {
+@@ -93,9 +97,12 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 	struct xpcie_stream *tx = &xpcie->tx;
+ 	struct xpcie_stream *rx = &xpcie->rx;
+ 	int tx_pool_size, rx_pool_size;
++	struct xpcie_interface *inf;
+ 	struct xpcie_buf_desc *bd;
+ 	int rc, index, ndesc;
+ 
++	inf = &xpcie->interfaces[0];
++
+ 	xpcie->txrx = cap;
+ 	xpcie->fragment_size = intel_xpcie_ioread32(&cap->fragment_size);
+ 	xpcie->stop_flag = false;
+@@ -176,6 +183,9 @@ static int intel_xpcie_txrx_init(struct xpcie *xpcie,
+ 		intel_xpcie_set_td_length(td, bd->length);
+ 	}
+ 
++	atomic_set(&inf->available_bd_cnt, 0);
++	intel_xpcie_update_device_flwctl(xpcie, TO_DEVICE, RX_BD_COUNT, 0);
++
+ 	return 0;
+ 
+ error:
+@@ -203,23 +213,55 @@ static void intel_xpcie_start_tx(struct xpcie *xpcie, unsigned long delay)
+ 	queue_delayed_work(xpcie->tx_wq, &xpcie->tx_event, delay);
+ }
+ 
+-static void intel_xpcie_start_rx(struct xpcie *xpcie, unsigned long delay)
++static enum
++hrtimer_restart free_rx_bd_timer_cb(struct hrtimer *free_rx_bd_timer)
+ {
+-	queue_delayed_work(xpcie->rx_wq, &xpcie->rx_event, delay);
++	struct xpcie *xpcie = container_of(free_rx_bd_timer,
++					   struct xpcie, free_rx_bd_timer);
++	struct xpcie_dev *xdev = container_of(xpcie, struct xpcie_dev, xpcie);
++	struct xpcie_interface *inf = &xpcie->interfaces[0];
++	struct xpcie_stream *rx = &xpcie->rx;
++	struct xpcie_buf_desc *bd;
++	int count = 0;
++
++	bd = (inf->partial_read) ?
++				  inf->partial_read :
++				  intel_xpcie_list_get(&inf->read);
++	while (bd) {
++		intel_xpcie_free_rx_bd(xpcie, bd);
++		bd = intel_xpcie_list_get(&inf->read);
++		count++;
++	}
++
++	inf->partial_read = bd;
++	inf->data_avail = false;
++
++	intel_xpcie_set_tdr_head(&rx->pipe, 0);
++	intel_xpcie_set_tdr_tail(&rx->pipe, 0);
++	intel_xpcie_set_doorbell(xpcie, FROM_DEVICE, DATA_SENT, 0);
++	intel_xpcie_set_doorbell(xpcie, TO_DEVICE, DATA_RECEIVED, 1);
++	intel_xpcie_pci_raise_irq(xdev, DATA_RECEIVED, 1);
++
++	return HRTIMER_NORESTART;
+ }
+ 
+-static void intel_xpcie_rx_event_handler(struct work_struct *work)
++static void intel_xpcie_rx_tasklet_func(unsigned long xpcie_ptr)
+ {
+-	struct xpcie *xpcie = container_of(work, struct xpcie, rx_event.work);
+-	struct xpcie_dev *xdev = container_of(xpcie, struct xpcie_dev, xpcie);
++	unsigned long period_us = RX_BD_HRTIMER_DELAY_USEC;
++	struct xpcie *xpcie = (struct xpcie *)xpcie_ptr;
+ 	struct xpcie_buf_desc *bd, *replacement = NULL;
+-	unsigned long delay = msecs_to_jiffies(1);
+ 	struct xpcie_stream *rx = &xpcie->rx;
+ 	struct xpcie_transfer_desc *td;
+ 	u32 head, tail, ndesc, length;
++	struct xpcie_interface *inf;
++	struct xpcie_dev *xdev;
+ 	u16 status, interface;
++	ktime_t free_rx_bd_tp;
+ 	int rc;
+ 
++	xdev = container_of(xpcie, struct xpcie_dev, xpcie);
++	inf = &xpcie->interfaces[0];
++
+ 	if (intel_xpcie_get_device_status(xpcie) != XPCIE_STATUS_RUN)
+ 		return;
+ 
+@@ -233,7 +275,12 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 
+ 		replacement = intel_xpcie_alloc_rx_bd(xpcie);
+ 		if (!replacement) {
+-			delay = msecs_to_jiffies(20);
++			if (!hrtimer_active(&xpcie->free_rx_bd_timer)) {
++				free_rx_bd_tp =
++					ktime_set(0, period_us * 1000ULL);
++				hrtimer_start(&xpcie->free_rx_bd_timer,
++					      free_rx_bd_tp, HRTIMER_MODE_REL);
++			}
+ 			break;
+ 		}
+ 
+@@ -262,6 +309,10 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 			bd->next = NULL;
+ 
+ 			intel_xpcie_add_bd_to_interface(xpcie, bd);
++			intel_xpcie_update_device_flwctl(xpcie,
++							 TO_DEVICE,
++							 RX_BD_COUNT,
++				atomic_read(&inf->available_bd_cnt));
+ 		}
+ 
+ 		rx->ddr[head] = replacement;
+@@ -272,11 +323,12 @@ static void intel_xpcie_rx_event_handler(struct work_struct *work)
+ 
+ 	if (intel_xpcie_get_tdr_head(&rx->pipe) != head) {
+ 		intel_xpcie_set_tdr_head(&rx->pipe, head);
+-		intel_xpcie_pci_raise_irq(xdev, DATA_RECEIVED, 1);
++		if (head != tail)
++			intel_xpcie_pci_raise_irq(xdev,
++						  PARTIAL_DATA_RECEIVED, 1);
++		else
++			intel_xpcie_pci_raise_irq(xdev, DATA_RECEIVED, 1);
+ 	}
+-
+-	if (!replacement)
+-		intel_xpcie_start_rx(xpcie, delay);
+ }
+ 
+ static void intel_xpcie_tx_event_handler(struct work_struct *work)
+@@ -359,7 +411,7 @@ static irqreturn_t intel_xpcie_interrupt(int irq, void *args)
+ 
+ 	if (intel_xpcie_get_doorbell(xpcie, FROM_DEVICE, DATA_SENT)) {
+ 		intel_xpcie_set_doorbell(xpcie, FROM_DEVICE, DATA_SENT, 0);
+-		intel_xpcie_start_rx(xpcie, 0);
++		tasklet_schedule(&xpcie->rx_tasklet);
+ 	}
+ 	if (intel_xpcie_get_doorbell(xpcie, FROM_DEVICE, DATA_RECEIVED)) {
+ 		intel_xpcie_set_doorbell(xpcie, FROM_DEVICE, DATA_RECEIVED, 0);
+@@ -387,19 +439,26 @@ static int intel_xpcie_events_init(struct xpcie *xpcie)
+ 		return -ENOMEM;
+ 	}
+ 
+-	INIT_DELAYED_WORK(&xpcie->rx_event, intel_xpcie_rx_event_handler);
++	tasklet_init(&xpcie->rx_tasklet, intel_xpcie_rx_tasklet_func,
++		     (uintptr_t)xpcie);
+ 	INIT_DELAYED_WORK(&xpcie->tx_event, intel_xpcie_tx_event_handler);
+ 
++	hrtimer_init(&xpcie->free_rx_bd_timer, CLOCK_MONOTONIC,
++		     HRTIMER_MODE_REL);
++	xpcie->free_rx_bd_timer.function = free_rx_bd_timer_cb;
++
+ 	return 0;
+ }
+ 
+ static void intel_xpcie_events_cleanup(struct xpcie *xpcie)
+ {
+-	cancel_delayed_work_sync(&xpcie->rx_event);
++	tasklet_kill(&xpcie->rx_tasklet);
+ 	cancel_delayed_work_sync(&xpcie->tx_event);
+ 
+ 	destroy_workqueue(xpcie->rx_wq);
+ 	destroy_workqueue(xpcie->tx_wq);
++
++	hrtimer_cancel(&xpcie->free_rx_bd_timer);
+ }
+ 
+ int intel_xpcie_core_init(struct xpcie *xpcie)
+@@ -462,6 +521,7 @@ int intel_xpcie_core_read(struct xpcie *xpcie, void *buffer, size_t *length,
+ 	struct xpcie_buf_desc *bd;
+ 	size_t remaining, len;
+ 	long jiffies_passed = 0;
++	int bd_val;
+ 	int ret;
+ 
+ 	if (*length == 0)
+@@ -474,31 +534,26 @@ int intel_xpcie_core_read(struct xpcie *xpcie, void *buffer, size_t *length,
+ 	remaining = len;
+ 	*length = 0;
+ 
+-	ret = mutex_lock_interruptible(&inf->rlock);
+-	if (ret < 0)
+-		return -EINTR;
+-
+ 	do {
+-		while (!inf->data_avail) {
+-			mutex_unlock(&inf->rlock);
++		if (!inf->partial_read &&
++		    (!intel_xpcie_list_empty(&inf->read))) {
+ 			if (timeout_ms == 0) {
+-				ret = wait_event_interruptible(inf->rx_waitq,
+-							       inf->data_avail);
++				ret =
++			wait_event_interruptible(inf->rx_waitq,
++						 (intel_xpcie_list_empty(&inf->read) ||
++						 atomic_read(&inf->available_bd_cnt)));
+ 			} else {
+ 				ret =
+ 			wait_event_interruptible_timeout(inf->rx_waitq,
+-							 inf->data_avail,
+-							 jiffies_timeout -
+-							 jiffies_passed);
++							 (intel_xpcie_list_empty(&inf->read) ||
++							 atomic_read(&inf->available_bd_cnt)),
++							 jiffies_timeout - jiffies_passed);
+ 				if (ret == 0)
+ 					return -ETIME;
+ 			}
+ 			if (ret < 0 || xpcie->stop_flag)
+ 				return -EINTR;
+ 
+-			ret = mutex_lock_interruptible(&inf->rlock);
+-			if (ret < 0)
+-				return -EINTR;
+ 		}
+ 
+ 		bd = (inf->partial_read) ? inf->partial_read :
+@@ -517,23 +572,29 @@ int intel_xpcie_core_read(struct xpcie *xpcie, void *buffer, size_t *length,
+ 			if (bd->length == 0) {
+ 				intel_xpcie_free_rx_bd(xpcie, bd);
+ 				bd = intel_xpcie_list_get(&inf->read);
++				bd_val =
++				atomic_dec_return(&inf->available_bd_cnt);
++				intel_xpcie_update_device_flwctl(xpcie,
++								 TO_DEVICE,
++								 RX_BD_COUNT,
++								 bd_val);
++
++				if (hrtimer_active(&xpcie->free_rx_bd_timer)) {
++					hrtimer_cancel
++					(&xpcie->free_rx_bd_timer);
++				}
+ 			}
+ 		}
+ 
+ 		/* save for next time */
+ 		inf->partial_read = bd;
+ 
+-		if (!bd)
+-			inf->data_avail = false;
+-
+ 		*length = len - remaining;
+ 
+ 		jiffies_passed = (long)jiffies - (long)jiffies_start;
+ 	} while (remaining > 0 && (jiffies_passed < jiffies_timeout ||
+ 				   timeout_ms == 0));
+ 
+-	mutex_unlock(&inf->rlock);
+-
+ 	return 0;
+ }
+ 
+-- 
+2.27.0
+

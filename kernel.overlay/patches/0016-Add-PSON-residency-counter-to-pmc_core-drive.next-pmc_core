@@ -1,0 +1,142 @@
+From bb48300229a69eba76d8b0ed1bcef22a919eb91d Mon Sep 17 00:00:00 2001
+From: Michael Bottini <michael.a.bottini@intel.com>
+Date: Mon, 21 Jun 2021 16:43:27 -0700
+Subject: [PATCH 16/16] Add PSON residency counter to pmc_core driver
+
+---
+ drivers/platform/x86/intel_pmc_core.c | 52 +++++++++++++++++++++++++++
+ drivers/platform/x86/intel_pmc_core.h |  8 +++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/drivers/platform/x86/intel_pmc_core.c b/drivers/platform/x86/intel_pmc_core.c
+index ad9f074053eb..76886fc4ae99 100644
+--- a/drivers/platform/x86/intel_pmc_core.c
++++ b/drivers/platform/x86/intel_pmc_core.c
+@@ -595,6 +595,8 @@ static const struct pmc_reg_map tgl_reg_map = {
+ 	.lpm_sts = tgl_lpm_maps,
+ 	.lpm_status_offset = TGL_LPM_STATUS_OFFSET,
+ 	.lpm_live_status_offset = TGL_LPM_LIVE_STATUS_OFFSET,
++	.pson_residency_offset = TGL_PSON_RESIDENCY_OFFSET,
++	.pson_residency_counter_step = TGL_PSON_RES_COUNTER_STEP,
+ 	.etr3_offset = ETR3_OFFSET,
+ };
+ 
+@@ -1136,6 +1138,20 @@ static int pmc_core_dev_state_get(void *data, u64 *val)
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(pmc_core_dev_state, pmc_core_dev_state_get, NULL, "%llu\n");
+ 
++static int pmc_core_pson_residency_get(void *data, u64 *val)
++{
++	struct pmc_dev *pmcdev = data;
++	const struct pmc_reg_map *map = pmcdev->map;
++	u32 value;
++
++	value = pmc_core_reg_read(pmcdev, map->pson_residency_offset);
++	*val = (u64)value * pmcdev->map->pson_residency_counter_step;
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(pmc_core_pson_residency, pmc_core_pson_residency_get, NULL, "%llu\n");
++
+ static int pmc_core_check_read_lock_bit(struct pmc_dev *pmcdev)
+ {
+ 	u32 value;
+@@ -1851,6 +1867,33 @@ static void pmc_core_dbgfs_unregister(struct pmc_dev *pmcdev)
+ 	debugfs_remove_recursive(pmcdev->dbgfs_dir);
+ }
+ 
++static bool pmc_core_is_pson_residency_enabled(struct pmc_dev *pmcdev)
++{
++	struct platform_device *pdev = pmcdev->pdev;
++	struct acpi_device *adev = ACPI_COMPANION(&pdev->dev);
++	acpi_status status;
++	u8 val;
++	if(!adev) {
++		return false;
++	}
++
++	acpi_init_properties(adev);
++
++	status = acpi_evaluate_object(adev->handle, "PSOP", NULL, NULL);
++        if (ACPI_FAILURE(status)) {
++                pr_err("Unable to evaluate PSOP\n");
++                return false;
++        } 
++
++	if(fwnode_property_read_u8(acpi_fwnode_handle(adev),
++				   "intel-cec-pson-switching-enabled-in-s0",
++				   &val)) {
++		return false;
++	}
++
++	return val == 1;
++}
++
+ static void pmc_core_dbgfs_register(struct pmc_dev *pmcdev)
+ {
+ 	struct dentry *dir;
+@@ -1914,6 +1957,13 @@ static void pmc_core_dbgfs_register(struct pmc_dev *pmcdev)
+ 				    pmcdev->dbgfs_dir, pmcdev,
+ 				    &pmc_core_substate_req_regs_fops);
+ 	}
++
++	// add `and` condition containing DSD enabled of pson_residency offset?
++	if (pmcdev->map->pson_residency_offset && pmc_core_is_pson_residency_enabled(pmcdev)) {
++		debugfs_create_file("pson_residency", 0444,
++				    pmcdev->dbgfs_dir, pmcdev, &pmc_core_pson_residency);
++	}
++
+ }
+ 
+ static const struct x86_cpu_id intel_pmc_core_ids[] = {
+@@ -2052,11 +2102,13 @@ static int pmc_core_probe(struct platform_device *pdev)
+ 		pmc_core_send_ltr_ignore(pmcdev, 3);
+ 	}
+ 
++	pmcdev->pdev = pdev;
+ 	pmc_core_dbgfs_register(pmcdev);
+ 
+ 	device_initialized = true;
+ 	dev_info(&pdev->dev, " initialized\n");
+ 
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/platform/x86/intel_pmc_core.h b/drivers/platform/x86/intel_pmc_core.h
+index 907a5aa89df5..776892dfa755 100644
+--- a/drivers/platform/x86/intel_pmc_core.h
++++ b/drivers/platform/x86/intel_pmc_core.h
+@@ -245,6 +245,10 @@ enum ppfear_regs {
+ #define MTL_LPM_STATUS_OFFSET			0x1700
+ #define MTL_LPM_LIVE_STATUS_OFFSET		0x175C
+ 
++/* Tigerlake PSON residency register */
++#define TGL_PSON_RESIDENCY_OFFSET               0x18f8
++#define TGL_PSON_RES_COUNTER_STEP               0x7A
++
+ const char *pmc_lpm_modes[] = {
+ 	"S0i2.0",
+ 	"S0i2.1",
+@@ -312,6 +316,8 @@ struct pmc_reg_map {
+ 	const u32 lpm_residency_offset;
+ 	const u32 lpm_status_offset;
+ 	const u32 lpm_live_status_offset;
++	const u32 pson_residency_offset;
++	const u32 pson_residency_counter_step;
+ 	const u32 etr3_offset;
+ };
+ 
+@@ -348,6 +354,8 @@ struct pmc_dev {
+ 	int num_lpm_modes;
+ 	int lpm_en_modes[LPM_MAX_NUM_MODES];
+ 	u32 *lpm_req_regs;
++
++	struct platform_device *pdev;
+ };
+ 
+ #define pmc_for_each_mode(i, mode, pmcdev)		\
+-- 
+2.27.0
+

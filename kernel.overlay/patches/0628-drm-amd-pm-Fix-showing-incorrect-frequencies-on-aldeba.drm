@@ -1,0 +1,231 @@
+From abe4ab2505c218f2080f16607957cad2c8d428e9 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Thu, 13 May 2021 15:51:18 +0800
+Subject: [PATCH 0628/1247] drm/amd/pm: Fix showing incorrect frequencies on
+ aldebaran
+
+v1: Use the current and custom pstate frequencies to track the current and
+user-set min/max values in manual and determinism mode. Previously, only
+actual_* value was used to track the currrent and user requested value.
+The value will get reassigned whenever user requests a new value with
+pp_od_clk_voltage node. Hence it will show incorrect values when user
+requests an invalid value or tries a partial request without committing
+the values. Separating out to custom and current variable fixes such
+issues.
+
+v2: Remove redundant if-else check
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Kevin Wang <kevin1.wang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/pm/swsmu/smu13/aldebaran_ppt.c    | 71 ++++++++++++-------
+ .../gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c    |  9 +++
+ 2 files changed, 55 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+index 5d04a1dfdfd8..b14e587186c9 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+@@ -78,8 +78,6 @@
+ 
+ #define smnPCIE_ESM_CTRL			0x111003D0
+ 
+-#define CLOCK_VALID (1 << 31)
+-
+ static const struct cmn2asic_msg_mapping aldebaran_message_map[SMU_MSG_MAX_COUNT] = {
+ 	MSG_MAP(TestMessage,			     PPSMC_MSG_TestMessage,			0),
+ 	MSG_MAP(GetSmuVersion,			     PPSMC_MSG_GetSmuVersion,			1),
+@@ -455,12 +453,18 @@ static int aldebaran_populate_umd_state_clk(struct smu_context *smu)
+ 
+ 	pstate_table->gfxclk_pstate.min = gfx_table->min;
+ 	pstate_table->gfxclk_pstate.peak = gfx_table->max;
++	pstate_table->gfxclk_pstate.curr.min = gfx_table->min;
++	pstate_table->gfxclk_pstate.curr.max = gfx_table->max;
+ 
+ 	pstate_table->uclk_pstate.min = mem_table->min;
+ 	pstate_table->uclk_pstate.peak = mem_table->max;
++	pstate_table->uclk_pstate.curr.min = mem_table->min;
++	pstate_table->uclk_pstate.curr.max = mem_table->max;
+ 
+ 	pstate_table->socclk_pstate.min = soc_table->min;
+ 	pstate_table->socclk_pstate.peak = soc_table->max;
++	pstate_table->socclk_pstate.curr.min = soc_table->min;
++	pstate_table->socclk_pstate.curr.max = soc_table->max;
+ 
+ 	if (gfx_table->count > ALDEBARAN_UMD_PSTATE_GFXCLK_LEVEL &&
+ 	    mem_table->count > ALDEBARAN_UMD_PSTATE_MCLK_LEVEL &&
+@@ -669,6 +673,7 @@ static int aldebaran_print_clk_levels(struct smu_context *smu,
+ {
+ 	int i, now, size = 0;
+ 	int ret = 0;
++	struct smu_umd_pstate_table *pstate_table = &smu->pstate_table;
+ 	struct pp_clock_levels_with_latency clocks;
+ 	struct smu_13_0_dpm_table *single_dpm_table;
+ 	struct smu_dpm_context *smu_dpm = &smu->smu_dpm;
+@@ -703,12 +708,8 @@ static int aldebaran_print_clk_levels(struct smu_context *smu,
+ 
+ 		display_levels = clocks.num_levels;
+ 
+-		min_clk = smu->gfx_actual_hard_min_freq & CLOCK_VALID ?
+-				  smu->gfx_actual_hard_min_freq & ~CLOCK_VALID :
+-				  single_dpm_table->dpm_levels[0].value;
+-		max_clk = smu->gfx_actual_soft_max_freq & CLOCK_VALID ?
+-				  smu->gfx_actual_soft_max_freq & ~CLOCK_VALID :
+-				  single_dpm_table->dpm_levels[1].value;
++		min_clk = pstate_table->gfxclk_pstate.curr.min;
++		max_clk = pstate_table->gfxclk_pstate.curr.max;
+ 
+ 		freq_values[0] = min_clk;
+ 		freq_values[1] = max_clk;
+@@ -1134,9 +1135,6 @@ static int aldebaran_set_performance_level(struct smu_context *smu,
+ 			&& (level != AMD_DPM_FORCED_LEVEL_PERF_DETERMINISM))
+ 		smu_cmn_send_smc_msg(smu, SMU_MSG_DisableDeterminism, NULL);
+ 
+-	/* Reset user min/max gfx clock */
+-	smu->gfx_actual_hard_min_freq = 0;
+-	smu->gfx_actual_soft_max_freq = 0;
+ 
+ 	switch (level) {
+ 
+@@ -1163,6 +1161,7 @@ static int aldebaran_set_soft_freq_limited_range(struct smu_context *smu,
+ {
+ 	struct smu_dpm_context *smu_dpm = &(smu->smu_dpm);
+ 	struct smu_13_0_dpm_context *dpm_context = smu_dpm->dpm_context;
++	struct smu_umd_pstate_table *pstate_table = &smu->pstate_table;
+ 	struct amdgpu_device *adev = smu->adev;
+ 	uint32_t min_clk;
+ 	uint32_t max_clk;
+@@ -1176,15 +1175,23 @@ static int aldebaran_set_soft_freq_limited_range(struct smu_context *smu,
+ 		return -EINVAL;
+ 
+ 	if (smu_dpm->dpm_level == AMD_DPM_FORCED_LEVEL_MANUAL) {
+-		min_clk = max(min, dpm_context->dpm_tables.gfx_table.min);
+-		max_clk = min(max, dpm_context->dpm_tables.gfx_table.max);
+-		ret = smu_v13_0_set_soft_freq_limited_range(smu, SMU_GFXCLK,
+-							    min_clk, max_clk);
++		if (min >= max) {
++			dev_err(smu->adev->dev,
++				"Minimum GFX clk should be less than the maximum allowed clock\n");
++			return -EINVAL;
++		}
++
++		if ((min == pstate_table->gfxclk_pstate.curr.min) &&
++		    (max == pstate_table->gfxclk_pstate.curr.max))
++			return 0;
+ 
++		ret = smu_v13_0_set_soft_freq_limited_range(smu, SMU_GFXCLK,
++							    min, max);
+ 		if (!ret) {
+-			smu->gfx_actual_hard_min_freq = min_clk | CLOCK_VALID;
+-			smu->gfx_actual_soft_max_freq = max_clk | CLOCK_VALID;
++			pstate_table->gfxclk_pstate.curr.min = min;
++			pstate_table->gfxclk_pstate.curr.max = max;
+ 		}
++
+ 		return ret;
+ 	}
+ 
+@@ -1209,10 +1216,8 @@ static int aldebaran_set_soft_freq_limited_range(struct smu_context *smu,
+ 				dev_err(adev->dev,
+ 						"Failed to enable determinism at GFX clock %d MHz\n", max);
+ 			} else {
+-				smu->gfx_actual_hard_min_freq =
+-					min_clk | CLOCK_VALID;
+-				smu->gfx_actual_soft_max_freq =
+-					max | CLOCK_VALID;
++				pstate_table->gfxclk_pstate.curr.min = min_clk;
++				pstate_table->gfxclk_pstate.curr.max = max;
+ 			}
+ 		}
+ 	}
+@@ -1225,6 +1230,7 @@ static int aldebaran_usr_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_
+ {
+ 	struct smu_dpm_context *smu_dpm = &(smu->smu_dpm);
+ 	struct smu_13_0_dpm_context *dpm_context = smu_dpm->dpm_context;
++	struct smu_umd_pstate_table *pstate_table = &smu->pstate_table;
+ 	uint32_t min_clk;
+ 	uint32_t max_clk;
+ 	int ret = 0;
+@@ -1245,16 +1251,22 @@ static int aldebaran_usr_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_
+ 			if (input[1] < dpm_context->dpm_tables.gfx_table.min) {
+ 				dev_warn(smu->adev->dev, "Minimum GFX clk (%ld) MHz specified is less than the minimum allowed (%d) MHz\n",
+ 					input[1], dpm_context->dpm_tables.gfx_table.min);
++				pstate_table->gfxclk_pstate.custom.min =
++					pstate_table->gfxclk_pstate.curr.min;
+ 				return -EINVAL;
+ 			}
+-			smu->gfx_actual_hard_min_freq = input[1];
++
++			pstate_table->gfxclk_pstate.custom.min = input[1];
+ 		} else if (input[0] == 1) {
+ 			if (input[1] > dpm_context->dpm_tables.gfx_table.max) {
+ 				dev_warn(smu->adev->dev, "Maximum GFX clk (%ld) MHz specified is greater than the maximum allowed (%d) MHz\n",
+ 					input[1], dpm_context->dpm_tables.gfx_table.max);
++				pstate_table->gfxclk_pstate.custom.max =
++					pstate_table->gfxclk_pstate.curr.max;
+ 				return -EINVAL;
+ 			}
+-			smu->gfx_actual_soft_max_freq = input[1];
++
++			pstate_table->gfxclk_pstate.custom.max = input[1];
+ 		} else {
+ 			return -EINVAL;
+ 		}
+@@ -1276,8 +1288,17 @@ static int aldebaran_usr_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_
+ 			dev_err(smu->adev->dev, "Input parameter number not correct\n");
+ 			return -EINVAL;
+ 		} else {
+-			min_clk = smu->gfx_actual_hard_min_freq;
+-			max_clk = smu->gfx_actual_soft_max_freq;
++			if (!pstate_table->gfxclk_pstate.custom.min)
++				pstate_table->gfxclk_pstate.custom.min =
++					pstate_table->gfxclk_pstate.curr.min;
++
++			if (!pstate_table->gfxclk_pstate.custom.max)
++				pstate_table->gfxclk_pstate.custom.max =
++					pstate_table->gfxclk_pstate.curr.max;
++
++			min_clk = pstate_table->gfxclk_pstate.custom.min;
++			max_clk = pstate_table->gfxclk_pstate.custom.max;
++
+ 			return aldebaran_set_soft_freq_limited_range(smu, SMU_GFXCLK, min_clk, max_clk);
+ 		}
+ 		break;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c
+index 0864083e7435..a3dc7194aaf8 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c
+@@ -1626,6 +1626,9 @@ int smu_v13_0_set_performance_level(struct smu_context *smu,
+ 							    sclk_max);
+ 		if (ret)
+ 			return ret;
++
++		pstate_table->gfxclk_pstate.curr.min = sclk_min;
++		pstate_table->gfxclk_pstate.curr.max = sclk_max;
+ 	}
+ 
+ 	if (mclk_min && mclk_max) {
+@@ -1635,6 +1638,9 @@ int smu_v13_0_set_performance_level(struct smu_context *smu,
+ 							    mclk_max);
+ 		if (ret)
+ 			return ret;
++
++		pstate_table->uclk_pstate.curr.min = mclk_min;
++		pstate_table->uclk_pstate.curr.max = mclk_max;
+ 	}
+ 
+ 	if (socclk_min && socclk_max) {
+@@ -1644,6 +1650,9 @@ int smu_v13_0_set_performance_level(struct smu_context *smu,
+ 							    socclk_max);
+ 		if (ret)
+ 			return ret;
++
++		pstate_table->socclk_pstate.curr.min = socclk_min;
++		pstate_table->socclk_pstate.curr.max = socclk_max;
+ 	}
+ 
+ 	return ret;
+-- 
+2.27.0
+

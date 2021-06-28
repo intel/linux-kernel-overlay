@@ -1,7 +1,7 @@
-From 78af01bd2dcf592ba69c8ed9255ee236f03436e6 Mon Sep 17 00:00:00 2001
+From e92d788d238177e51279926470e595a49492fe28 Mon Sep 17 00:00:00 2001
 From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
 Date: Fri, 26 Mar 2021 16:19:20 -0700
-Subject: [PATCH 05/72] sched/fair: Consider SMT in ASYM_PACKING load balance
+Subject: [PATCH 05/80] sched/fair: Consider SMT in ASYM_PACKING load balance
 
 When deciding to pull tasks in ASYM_PACKING, it is necessary not only to
 check for the idle state of the destination CPU, dst_cpu, but also of
@@ -31,6 +31,14 @@ Cc: Tim Chen <tim.c.chen@linux.intel.com>
 Reviewed-by: Len Brown <len.brown@intel.com>
 Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
 ---
+Changes since v3:
+  * Removed the arch_asym_check_smt_siblings() hook. Discussions with the
+    powerpc folks showed that this patch should not impact them. Also, more
+    recent powerpc processor no longer use asym_packing. (PeterZ)
+  * Removed unnecessary local variable in asym_can_pull_tasks(). (Dietmar)
+  * Removed unnecessary check for local CPUs when the local group has zero
+    utilization. (Joel)
+
 Changes since v2:
   * Reworded the commit message to reflect updates in code.
   * Corrected misrepresentation of dst_cpu as the CPU doing the load
@@ -46,43 +54,14 @@ Changes since v1:
     determining if a sched_group is comprised of SMT siblings.
     (PeterZ).
 ---
- include/linux/sched/topology.h |   1 +
- kernel/sched/fair.c            | 101 +++++++++++++++++++++++++++++++++
- 2 files changed, 102 insertions(+)
+ kernel/sched/fair.c | 93 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
 
-diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
-index 8f0f778b7c91..43bdb8b1e1df 100644
---- a/include/linux/sched/topology.h
-+++ b/include/linux/sched/topology.h
-@@ -57,6 +57,7 @@ static inline int cpu_numa_flags(void)
- #endif
- 
- extern int arch_asym_cpu_priority(int cpu);
-+extern bool arch_asym_check_smt_siblings(void);
- 
- struct sched_domain_attr {
- 	int relax_domain_level;
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 62f206209295..cc1e16e790dd 100644
+index 2b541084f3c0..2d700bba66ad 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -106,6 +106,15 @@ int __weak arch_asym_cpu_priority(int cpu)
- 	return -cpu;
- }
- 
-+/*
-+ * For asym packing, first check the state of SMT siblings before deciding to
-+ * pull tasks.
-+ */
-+bool __weak arch_asym_check_smt_siblings(void)
-+{
-+	return false;
-+}
-+
- /*
-  * The margin used when comparing utilization with CPU capacity.
-  *
-@@ -8430,6 +8439,89 @@ group_type group_classify(unsigned int imbalance_pct,
+@@ -8470,10 +8470,97 @@ group_type group_classify(unsigned int imbalance_pct,
  	return group_has_spare;
  }
  
@@ -109,10 +88,9 @@ index 62f206209295..cc1e16e790dd 100644
 +				struct sg_lb_stats *sgs, struct sched_group *sg)
 +{
 +#ifdef CONFIG_SCHED_SMT
-+	int cpu, local_busy_cpus, sg_busy_cpus;
 +	bool local_is_smt, sg_is_smt;
++	int sg_busy_cpus;
 +
-+	cpu = group_first_cpu(sg);
 +	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
 +	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
 +
@@ -138,9 +116,9 @@ index 62f206209295..cc1e16e790dd 100644
 +
 +	/* @dst_cpu has SMT siblings. */
 +
-+	local_busy_cpus = sds->local->group_weight - sds->local_stat.idle_cpus;
-+
 +	if (sg_is_smt) {
++		int local_busy_cpus = sds->local->group_weight -
++				      sds->local_stat.idle_cpus;
 +		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
 +
 +		/* Local can always help to even the number busy CPUs. */
@@ -160,7 +138,7 @@ index 62f206209295..cc1e16e790dd 100644
 +	 * are not busy CPUs. As CPUs move in and out of idle state frequently,
 +	 * also check the group utilization to smoother the decision.
 +	 */
-+	if (!local_busy_cpus && !sds->local_stat.group_util)
++	if (!sds->local_stat.group_util)
 +		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
 +
 +	return false;
@@ -172,17 +150,16 @@ index 62f206209295..cc1e16e790dd 100644
  static inline bool
  sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs,
  	   struct sched_group *group)
-@@ -8441,6 +8533,9 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
- 	if (group == sds->local)
- 		return false;
- 
-+	if (arch_asym_check_smt_siblings())
+ {
++	/* Only do SMT checks if either local or candidate have SMT siblings */
++	if ((sds->local->flags & SD_SHARE_CPUCAPACITY) ||
++	    (group->flags & SD_SHARE_CPUCAPACITY))
 +		return asym_can_pull_tasks(env->dst_cpu, sds, sgs, group);
 +
  	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
  }
  
-@@ -9442,6 +9537,12 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+@@ -9475,6 +9562,12 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  		    nr_running == 1)
  			continue;
  

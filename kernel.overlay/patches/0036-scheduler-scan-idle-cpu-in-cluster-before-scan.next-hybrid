@@ -1,0 +1,222 @@
+From a8a0a31522b4145713d1750ac9a12af8e600da97 Mon Sep 17 00:00:00 2001
+From: Barry Song <song.bao.hua@hisilicon.com>
+Date: Fri, 19 Mar 2021 17:16:17 +1300
+Subject: [PATCH 36/80] scheduler: scan idle cpu in cluster before scanning the
+ whole llc
+
+On kunpeng920, cpus within one cluster can communicate wit each other
+much faster than cpus across different clusters. A simple hackbench
+can prove that.
+hackbench running on 4 cpus in single one cluster and 4 cpus in
+different clusters shows a large contrast:
+(1) within a cluster:
+root@ubuntu:~# taskset -c 0,1,2,3 hackbench -p -T -l 20000 -g 1
+Running in threaded mode with 1 groups using 40 file descriptors each
+(== 40 tasks)
+Each sender will pass 20000 messages of 100 bytes
+Time: 4.285
+
+(2) across clusters:
+root@ubuntu:~# taskset -c 0,4,8,12 hackbench -p -T -l 20000 -g 1
+Running in threaded mode with 1 groups using 40 file descriptors each
+(== 40 tasks)
+Each sender will pass 20000 messages of 100 bytes
+Time: 5.524
+
+This inspires us to change the wake_affine path to scan cluster before
+scanning the whole LLC to try to gatter related tasks in one cluster,
+which is done by this patch.
+
+To evaluate the performance impact to related tasks talking with each
+other, we run the below hackbench with different -g parameter from 2
+to 14, for each different g, we run the command 10 times and get the
+average time:
+$ numactl -N 0 hackbench -p -T -l 20000 -g $1
+
+hackbench will report the time which is needed to complete a certain number
+of messages transmissions between a certain number of tasks, for example:
+$ numactl -N 0 hackbench -p -T -l 20000 -g 10
+Running in threaded mode with 10 groups using 40 file descriptors each
+(== 400 tasks)
+Each sender will pass 20000 messages of 100 bytes
+
+The below is the result of hackbench w/ and w/o cluster patch:
+g=    2      4     6       8      10     12      14
+w/o: 1.8151 3.8499 5.5142 7.2491 9.0340 10.7345 12.0929
+w/ : 1.7881 3.7371 5.3301 6.9747 8.6909  9.9235 11.2608
+
+Obviously some recent commits have improved the hackbench. So the change
+in wake_affine path brings less increase on hackbench compared to what
+we got in RFC v4.
+And obviously it is much more tricky to leverage wake_affine compared to
+leveraging the scatter of tasks in the previous patch as load balance
+might pull tasks which have been compact in a cluster so alternative
+suggestions welcome.
+
+In order to figure out how many times cpu is picked from the cluster and
+how many times cpu is picked out of the cluster, a tracepoint for debug
+purpose is added in this patch. And an userspace bcc script to print the
+histogram of the result of select_idle_cpu():
+
+from __future__ import print_function
+from bcc import BPF
+from time import sleep
+
+b = BPF(text="""
+
+BPF_HISTOGRAM(dist);
+
+TRACEPOINT_PROBE(sched, sched_select_idle_cpu)
+{
+	u32 e;
+	if (args->idle / 4 == args->target/4)
+		e = 0; /* idle cpu from same cluster */
+	else if (args->idle != -1)
+		e = 1; /* idle cpu from different clusters */
+	else
+		e = 2; /* no idle cpu */
+
+	dist.increment(e);
+	return 0;
+}
+""")
+
+print("Tracing... Hit Ctrl-C to end.")
+
+try:
+	sleep(99999999)
+except KeyboardInterrupt:
+	print()
+
+print("\nlinear histogram")
+print("~~~~~~~~~~~~~~~~")
+b["dist"].print_linear_hist("idle")
+
+Even while g=14 and the system is quite busy, we can see there are some
+chances idle cpu is picked from local cluster:
+linear histogram
+~~~~~~~~~~~~~~
+     idle          : count     distribution
+        0          : 15234281 |***********                             |
+        1          : 18494    |                                        |
+        2          : 53066152 |****************************************|
+
+0: local cluster
+1: out of the cluster
+2: select_idle_cpu() returns -1
+
+[   Ricardo: I rebased this patch on v5.13-rc1. Commit 9fe1f127b913
+    ("sched/fair: Merge select_idle_core/cpu()") introduced a local
+    variable in select_idle_cpu() to look for idle cores. Commit
+    c722f35b513f ("sched/fair: Bring back select_idle_smt(), but
+    differently") reworked the function furher and gave it a new
+    has_idle_core. Use it.                                          ]
+
+Signed-off-by: Barry Song <song.bao.hua@hisilicon.com>
+---
+ include/trace/events/sched.h | 22 ++++++++++++++++++++++
+ kernel/sched/fair.c          | 34 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index 1eca2305ca42..71d82c6dd4e9 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -135,6 +135,28 @@ TRACE_EVENT(sched_kthread_work_execute_end,
+ 	TP_printk("work struct %p: function %ps", __entry->work, __entry->function)
+ );
+ 
++/*
++ * Tracepoint for select_idle_cpu:
++ */
++TRACE_EVENT(sched_select_idle_cpu,
++
++	TP_PROTO(int target, int idle),
++
++	TP_ARGS(target, idle),
++
++	TP_STRUCT__entry(
++		__field(	int,	target			)
++		__field(	int,	idle			)
++	),
++
++	TP_fast_assign(
++		__entry->target	= target;
++		__entry->idle = idle;
++	),
++
++	TP_printk("target=%d idle=%d", __entry->target, __entry->idle)
++);
++
+ /*
+  * Tracepoint for waking up a task:
+  */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e5290c1b44fa..68f035fa718e 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6241,7 +6241,12 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	if (!this_sd)
+ 		return -1;
+ 
+-	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
++	if (!sched_cluster_active())
++		cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
++#ifdef CONFIG_SCHED_CLUSTER
++	if (sched_cluster_active())
++		cpumask_and(cpus, cpu_cluster_mask(target), p->cpus_ptr);
++#endif
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		u64 avg_cost, avg_idle, span_avg;
+@@ -6262,6 +6267,29 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		time = cpu_clock(this);
+ 	}
+ 
++#ifdef CONFIG_SCHED_CLUSTER
++	if (sched_cluster_active()) {
++		for_each_cpu_wrap(cpu, cpus, target) {
++			if (has_idle_core) {
++				i = select_idle_core(p, cpu, cpus, &idle_cpu);
++				if ((unsigned int)i < nr_cpumask_bits)
++					return i;
++
++			} else {
++				if (!--nr)
++					return -1;
++				idle_cpu = __select_idle_cpu(cpu);
++				if ((unsigned int)idle_cpu < nr_cpumask_bits) {
++					goto done;
++				}
++			}
++		}
++
++		cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
++		cpumask_andnot(cpus, cpus, cpu_cluster_mask(target));
++	}
++#endif
++
+ 	for_each_cpu_wrap(cpu, cpus, target) {
+ 		if (has_idle_core) {
+ 			i = select_idle_core(p, cpu, cpus, &idle_cpu);
+@@ -6277,6 +6305,9 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		}
+ 	}
+ 
++#ifdef CONFIG_SCHED_CLUSTER
++done:
++#endif
+ 	if (has_idle_core)
+ 		set_idle_cores(target, false);
+ 
+@@ -6426,6 +6457,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	}
+ 
+ 	i = select_idle_cpu(p, sd, has_idle_core, target);
++	trace_sched_select_idle_cpu(target, i);
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
+-- 
+2.27.0
+

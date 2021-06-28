@@ -1,0 +1,156 @@
+From 1dfac83d65c79ea0686bfb6a21829c0a20ed0a04 Mon Sep 17 00:00:00 2001
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Fri, 25 Sep 2020 14:57:01 +0300
+Subject: [PATCH 44/78] x86/tdx: Add command line option to disable kernel
+ lockdown
+
+In TDX the host is an untrusted entity. So, to make it harder to attack
+the guest kernel from the host there are various settings to lock down
+the guest. But add a command line option to control the whole locking
+down, so that it can be disabled in debugging situations. This is only
+allowed when the TD is in "debug mode", which is declared at the time
+when TD is created on the host. By default even debug mode does lock
+down to not change any behavior, but with this command line option the
+extra lock down steps can then be disabled.
+
+Add a new kernel option "tdg_disable_lockdown" to disable lockdown.
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  4 ++++
+ arch/x86/kernel/Makefile                      |  1 +
+ arch/x86/kernel/head64.c                      |  4 ++--
+ arch/x86/kernel/tdx.c                         | 23 +++++++++++++++++++
+ include/linux/security.h                      |  1 +
+ security/lockdown/lockdown.c                  |  2 +-
+ 6 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index d721c6cf42e4..0882d49b9db3 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -5487,6 +5487,10 @@
+ 
+ 	tdfx=		[HW,DRM]
+ 
++	tdx_disable_lockdown
++			Disable automatic kernel lockdown for TD guest.
++			Only allowed for debug TD.
++
+ 	test_suspend=	[SUSPEND][,N]
+ 			Specify "mem" (for Suspend-to-RAM) or "standby" (for
+ 			standby suspend) or "freeze" (for suspend type freeze)
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 3410f03ef7aa..2d365fc6f32c 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -29,6 +29,7 @@ KASAN_SANITIZE_dumpstack_$(BITS).o			:= n
+ KASAN_SANITIZE_stacktrace.o				:= n
+ KASAN_SANITIZE_paravirt.o				:= n
+ KASAN_SANITIZE_sev.o					:= n
++KASAN_SANITIZE_tdx.o					:= n
+ 
+ # With some compiler versions the generated code results in boot hangs, caused
+ # by several compilation units. To be safe, disable all instrumentation.
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index 323ce7f156f5..dc4f1edb03df 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -495,12 +495,12 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
+ 
+ 	kasan_early_init();
+ 
+-	tdx_early_init();
+-
+ 	idt_setup_early_handler();
+ 
+ 	copy_bootdata(__va(real_mode_data));
+ 
++	tdx_early_init();
++
+ 	/*
+ 	 * Load microcode early on BSP.
+ 	 */
+diff --git a/arch/x86/kernel/tdx.c b/arch/x86/kernel/tdx.c
+index f7859d430ded..f223ffe809e7 100644
+--- a/arch/x86/kernel/tdx.c
++++ b/arch/x86/kernel/tdx.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/protected_guest.h>
+ #include <linux/cpuhotplug.h>
++#include <linux/security.h>
+ 
+ #include <asm/tdx.h>
+ #include <asm/cmdline.h>
+@@ -142,6 +143,11 @@ bool tdg_debug_enabled(void)
+ 	return td_info.attributes & BIT(0);
+ }
+ 
++static bool tdg_perfmon_enabled(void)
++{
++	return td_info.attributes & BIT(63);
++}
++
+ static void tdg_get_info(void)
+ {
+ 	u64 ret;
+@@ -562,6 +568,7 @@ __init bool tdg_early_handle_ve(struct pt_regs *regs)
+ 
+ void __init tdx_early_init(void)
+ {
++	enum lockdown_reason lockdown_reason;
+ 	bool tdg_forced;
+ 
+ 	tdg_forced = cmdline_find_option_bool(boot_command_line,
+@@ -588,5 +595,21 @@ void __init tdx_early_init(void)
+ 	cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "tdg:cpu_hotplug",
+ 			  NULL, tdg_cpu_offline_prepare);
+ 
++	/*
++	 * Do not lockdown perf/bpf/kprobe/... if performance
++	 * monitoring is enabled.
++	 */
++	if (tdg_perfmon_enabled())
++		lockdown_reason = LOCKDOWN_INTEGRITY_MAX;
++	else
++		lockdown_reason = LOCKDOWN_CONFIDENTIALITY_MAX;
++
++	/* Do not enable lockdown for debug TD if tdx_disable_lockdown in cmdline */
++	if (!tdg_debug_enabled() ||
++	    !cmdline_find_option_bool(boot_command_line,
++	    "tdx_disable_lockdown")) {
++		lock_kernel_down("TDX guest init", lockdown_reason);
++	}
++
+ 	pr_info("Guest is initialized\n");
+ }
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 06f7c50ce77f..5cd8e63d5eb8 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -132,6 +132,7 @@ enum lockdown_reason {
+ };
+ 
+ extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
++extern int lock_kernel_down(const char *where, enum lockdown_reason level);
+ 
+ /* These functions are in security/commoncap.c */
+ extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
+diff --git a/security/lockdown/lockdown.c b/security/lockdown/lockdown.c
+index 87cbdc64d272..f669cc680fca 100644
+--- a/security/lockdown/lockdown.c
++++ b/security/lockdown/lockdown.c
+@@ -23,7 +23,7 @@ static const enum lockdown_reason lockdown_levels[] = {LOCKDOWN_NONE,
+ /*
+  * Put the kernel into lock-down mode.
+  */
+-static int lock_kernel_down(const char *where, enum lockdown_reason level)
++int lock_kernel_down(const char *where, enum lockdown_reason level)
+ {
+ 	if (kernel_locked_down >= level)
+ 		return -EPERM;
+-- 
+2.27.0
+

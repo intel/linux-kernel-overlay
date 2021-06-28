@@ -1,0 +1,444 @@
+From 4fee3f1fc5873edc59fda0ba0e00cb40f21aafae Mon Sep 17 00:00:00 2001
+From: "Li, Tingqian" <tingqian.li@intel.com>
+Date: Fri, 27 Nov 2020 12:57:54 +0800
+Subject: [PATCH 082/170] misc: vpumgr: add vpu firmware management
+
+vpumgr will boot-up VPU with specified firmware when:
+ 1. fwname sysfs entry has been set to a valid firmware file name.
+ 2. the first user-space application opens a vpumgr device file.
+
+Signed-off-by: Li, Tingqian <tingqian.li@intel.com>
+---
+ drivers/misc/vpumgr/vpu_common.h |   4 +
+ drivers/misc/vpumgr/vpu_mgr.c    |  43 ++++++-
+ drivers/misc/vpumgr/vpu_vcm.c    | 211 ++++++++++++++++++++-----------
+ drivers/misc/vpumgr/vpu_vcm.h    |   3 +
+ 4 files changed, 185 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/misc/vpumgr/vpu_common.h b/drivers/misc/vpumgr/vpu_common.h
+index 481c062ca78c..1cb7bfc7b82c 100644
+--- a/drivers/misc/vpumgr/vpu_common.h
++++ b/drivers/misc/vpumgr/vpu_common.h
+@@ -11,6 +11,8 @@
+ 
+ #include "vpu_vcm.h"
+ 
++#define FWNAME_MAX_LENGTH  128
++
+ /* there will be one such device for each HW instance */
+ struct vpumgr_device {
+ 	struct device *sdev;
+@@ -24,6 +26,8 @@ struct vpumgr_device {
+ 
+ 	struct mutex client_mutex; /* protect client_list */
+ 	struct list_head client_list;
++
++	char fwname[FWNAME_MAX_LENGTH];
+ };
+ 
+ #define XLINK_INVALID_SW_DEVID  0xDEADBEEF
+diff --git a/drivers/misc/vpumgr/vpu_mgr.c b/drivers/misc/vpumgr/vpu_mgr.c
+index 75be64ebc3b0..f7ce6ef5a15e 100644
+--- a/drivers/misc/vpumgr/vpu_mgr.c
++++ b/drivers/misc/vpumgr/vpu_mgr.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2020-2021 Intel Corporation
+  *
+  */
++#include <linux/ctype.h>
+ #include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -216,6 +217,38 @@ static int vpumgr_debugfs_stats_show(struct seq_file *file, void *offset)
+ 	return 0;
+ }
+ 
++static ssize_t fwname_show(struct device *device,
++			   struct device_attribute *attr,
++			   char *buf)
++{
++	struct vpumgr_device *vdev = dev_get_drvdata(device);
++
++	return scnprintf(buf, PAGE_SIZE, "%s", vdev->fwname);
++}
++
++static ssize_t fwname_store(struct device *device,
++			    struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct vpumgr_device *vdev = dev_get_drvdata(device);
++	int i;
++
++	if (count > sizeof(vdev->fwname) - 1)
++		return -EINVAL;
++
++	for (i = 0; i < count; i++) {
++		if (buf[i] == '\r' || buf[i] == '\n')
++			break;
++		vdev->fwname[i] = buf[i];
++	}
++	vdev->fwname[i] = '\0';
++
++	return count;
++}
++
++static const char *default_fwname = "vpu_nvr.bin";
++static struct device_attribute fwname_attr = __ATTR_RW(fwname);
++
+ static const struct of_device_id keembay_vpumgr_of_match[] = {
+ 	{ .compatible = "intel,keembay-vpu-mgr"},
+ 	{ .compatible = "intel,keembay-vpusmm"},
+@@ -251,6 +284,7 @@ static int vpumgr_driver_probe(struct platform_device *pdev)
+ 	vdev->devnum = MKDEV(MAJOR(vpumgr_devnum), vpu_ipc_id);
+ 	vdev->pdev = pdev;
+ 	vdev->dev = dev;
++	scnprintf(vdev->fwname, sizeof(vdev->fwname), "%s", default_fwname);
+ 
+ 	dev_dbg(dev, "dev->devnum %u, id %u, major %u\n",
+ 		vdev->devnum, vpu_ipc_id,  MAJOR(vdev->devnum));
+@@ -275,10 +309,14 @@ static int vpumgr_driver_probe(struct platform_device *pdev)
+ 	debugfs_create_devm_seqfile(dev, "stats", vdev->debugfs_root,
+ 				    vpumgr_debugfs_stats_show);
+ 
+-	rc = smm_init(vdev);
++	rc = device_create_file(dev, &fwname_attr);
+ 	if (rc)
+ 		goto remove_debugfs;
+ 
++	rc = smm_init(vdev);
++	if (rc)
++		goto remove_sysfs;
++
+ 	rc = vcm_init(vdev, ipc_sw_device_id);
+ 	if (rc)
+ 		goto fini_smm;
+@@ -291,6 +329,8 @@ static int vpumgr_driver_probe(struct platform_device *pdev)
+ 
+ fini_smm:
+ 	smm_fini(vdev);
++remove_sysfs:
++	device_remove_file(dev, &fwname_attr);
+ remove_debugfs:
+ 	debugfs_remove_recursive(vdev->debugfs_root);
+ 	cdev_del(&vdev->cdev);
+@@ -306,6 +346,7 @@ static int vpumgr_driver_remove(struct platform_device *pdev)
+ 	mutex_destroy(&vdev->client_mutex);
+ 	vcm_fini(vdev);
+ 	smm_fini(vdev);
++	device_remove_file(vdev->dev, &fwname_attr);
+ 	debugfs_remove_recursive(vdev->debugfs_root);
+ 	cdev_del(&vdev->cdev);
+ 	device_destroy(vpumgr_class, vdev->devnum);
+diff --git a/drivers/misc/vpumgr/vpu_vcm.c b/drivers/misc/vpumgr/vpu_vcm.c
+index db19538fa75e..25adc37009d9 100644
+--- a/drivers/misc/vpumgr/vpu_vcm.c
++++ b/drivers/misc/vpumgr/vpu_vcm.c
+@@ -49,13 +49,6 @@ static int vcm_vpu_link_init(struct vcm_dev *pvcm)
+ 	if (rc != X_LINK_SUCCESS)
+ 		goto exit;
+ 
+-	rc = xlink_open_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL,
+-				RXB_TXB, VCM_XLINK_CHAN_SIZE, XLINK_IPC_TIMEOUT);
+-	if (rc != X_LINK_SUCCESS && rc != X_LINK_ALREADY_OPEN) {
+-		xlink_disconnect(&pvcm->ipc_xlink_handle);
+-		goto exit;
+-	}
+-
+ 	rc = 0;
+ exit:
+ 	dev_info(vdev->dev, "%s: rc = %d\n", __func__, rc);
+@@ -64,7 +57,6 @@ static int vcm_vpu_link_init(struct vcm_dev *pvcm)
+ 
+ static int vcm_vpu_link_fini(struct vcm_dev *pvcm)
+ {
+-	xlink_close_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL);
+ 	xlink_disconnect(&pvcm->ipc_xlink_handle);
+ 	return 0;
+ }
+@@ -422,6 +414,118 @@ static int vcm_call(struct vpumgr_ctx *v,
+ 	return vcm_wait(v, submit_id, res_rc, data_out, p_out_len, 1000);
+ }
+ 
++static int vcm_rxthread(void *param)
++{
++	struct vpumgr_device *vdev = param;
++	struct device *dev = vdev->sdev;
++	struct vcm_dev *pvcm = &vdev->vcm;
++	struct vcm_msg *msg = &pvcm->rxmsg;
++	struct vpu_cmd *vcmd;
++	int rc;
++
++	while (!kthread_should_stop()) {
++		rc = vcm_recv(&pvcm->ipc_xlink_handle, msg);
++		if (rc == -EPIPE)
++			break;
++		if (rc)
++			continue;
++
++		switch (msg->cmd) {
++		case VCTX_MSG_REPLY:
++			/* find local data associated with that msg id */
++			vcmd = vcmd_get(pvcm, (unsigned long)msg->id);
++			if (!vcmd)
++				break;
++
++			if (msg->ctx != vcmd->msg.ctx)
++				dev_warn(dev, "reply msg #%u's ctx (%u) mismatches vcmd ctx (%u)\n",
++					 msg->id, msg->ctx, vcmd->msg.ctx);
++
++			vcmd->submit_err = 0;
++
++			/* submit corresponding to msg->id is done, do post process */
++			memcpy(&vcmd->msg, msg, msg->size);
++			complete(&vcmd->complete);
++
++			vcmd_put(vcmd);
++		break;
++		default:
++		break;
++		}
++	}
++	return rc;
++}
++
++static int vpu_connection_up(struct vpumgr_device *vdev)
++{
++	struct vcm_dev *pvcm = &vdev->vcm;
++	struct task_struct *rxthread;
++	struct device *dev = vdev->dev;
++	enum xlink_error xlink_err;
++	int rc;
++
++	mutex_lock(&pvcm->fwboot_mutex);
++	if (pvcm->fwuser_cnt == 0) {
++		/* boot-up firmware under protection of fwboot_mutex */
++		if (vdev->fwname[0] != '\0') {
++			xlink_err = xlink_boot_device(&pvcm->ipc_xlink_handle, vdev->fwname);
++			if (xlink_err != X_LINK_SUCCESS) {
++				dev_err(dev, "%s: failed to boot-up VPU with firmware %s, rc %d\n",
++					__func__, vdev->fwname, (int)xlink_err);
++				rc = -EFAULT;
++				goto exit;
++			}
++		}
++
++		/* try to (re)open xlink channel after firmware boot-up */
++		xlink_err = xlink_open_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL,
++					       RXB_TXB, VCM_XLINK_CHAN_SIZE, XLINK_IPC_TIMEOUT);
++		if (xlink_err != X_LINK_SUCCESS && xlink_err != X_LINK_ALREADY_OPEN) {
++			dev_err(dev, "%s: failed to open xlink channel %d, rc %d\n",
++				__func__, VCM_XLINK_CHANNEL, (int)xlink_err);
++			rc = -EFAULT;
++			goto exit;
++		}
++
++		rxthread = kthread_run(vcm_rxthread, (void *)vdev, "vcmrx");
++		if (IS_ERR(rxthread)) {
++			rc = PTR_ERR(rxthread);
++			goto error_close_channel;
++		}
++
++		pvcm->rxthread = get_task_struct(rxthread);
++
++		dev_info(dev, "%s: success\n", __func__);
++	}
++	pvcm->fwuser_cnt++;
++	mutex_unlock(&pvcm->fwboot_mutex);
++	return 0;
++
++error_close_channel:
++	xlink_close_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL);
++exit:
++	mutex_unlock(&pvcm->fwboot_mutex);
++	return rc;
++}
++
++static void vpu_connection_down(struct vpumgr_device *vdev)
++{
++	struct vcm_dev *pvcm = &vdev->vcm;
++	struct device *dev = vdev->dev;
++
++	mutex_lock(&pvcm->fwboot_mutex);
++	pvcm->fwuser_cnt--;
++	if (pvcm->fwuser_cnt == 0) {
++		xlink_close_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL);
++		kthread_stop(pvcm->rxthread);
++		put_task_struct(pvcm->rxthread);
++		pvcm->rxthread = NULL;
++
++		dev_info(dev, "%s: success\n", __func__);
++	}
++	mutex_unlock(&pvcm->fwboot_mutex);
++}
++
+ int vcm_open(struct vpumgr_ctx *v, struct vpumgr_device *vdev)
+ {
+ 	struct device *dev = vdev->sdev;
+@@ -432,27 +536,38 @@ int vcm_open(struct vpumgr_ctx *v, struct vpumgr_device *vdev)
+ 	if (!vdev->vcm.enabled)
+ 		return 0;
+ 
++	rc = vpu_connection_up(vdev);
++	if (rc)
++		return rc;
++
+ 	rc = vcm_call(v, VCTX_MSG_CREATE, NULL, 0, &rep_rc, NULL, NULL);
+ 
+ 	if (rc != 0 || rep_rc < 0)
+ 		dev_err(dev, "%s: Vpu context create with rc:%d and vpu reply rc:%d\n",
+ 			__func__, rc, rep_rc);
+ 	if (rc)
+-		return rc;
+-	if (rep_rc < 0)
+-		return -ENXIO;
++		goto connection_down;
++	if (rep_rc < 0) {
++		rc = -ENXIO;
++		goto connection_down;
++	}
+ 
+ 	v->vpu_ctx_id = rep_rc;
+ 	v->total_vcmds = 0;
+ 	return 0;
++
++connection_down:
++	vpu_connection_down(vdev);
++	return rc;
+ }
+ 
+ int vcm_close(struct vpumgr_ctx *v)
+ {
+-	struct device *dev = v->vdev->sdev;
+-	int rep_rc, rc;
++	struct vpumgr_device *vdev = v->vdev;
++	struct device *dev = vdev->sdev;
++	int rep_rc = 0, rc;
+ 
+-	if (!v->vdev->vcm.enabled)
++	if (!vdev->vcm.enabled)
+ 		return 0;
+ 
+ 	rc = vcm_call(v, VCTX_MSG_DESTROY, NULL, 0, &rep_rc, NULL, NULL);
+@@ -460,7 +575,9 @@ int vcm_close(struct vpumgr_ctx *v)
+ 		v->vpu_ctx_id, rc, rep_rc);
+ 
+ 	/* remove submit belongs to this context */
+-	vcmd_clean_ctx(&v->vdev->vcm, v);
++	vcmd_clean_ctx(&vdev->vcm, v);
++
++	vpu_connection_down(vdev);
+ 	return 0;
+ }
+ 
+@@ -474,52 +591,9 @@ int vcm_debugfs_stats_show(struct seq_file *file, struct vpumgr_ctx *v)
+ 	return 0;
+ }
+ 
+-static int vcm_rxthread(void *param)
+-{
+-	struct vpumgr_device *vdev = param;
+-	struct device *dev = vdev->sdev;
+-	struct vcm_dev *pvcm = &vdev->vcm;
+-	struct vcm_msg *msg = &pvcm->rxmsg;
+-	struct vpu_cmd *vcmd;
+-	int rc;
+-
+-	while (!kthread_should_stop()) {
+-		rc = vcm_recv(&pvcm->ipc_xlink_handle, msg);
+-		if (rc == -EPIPE)
+-			break;
+-		if (rc)
+-			continue;
+-
+-		switch (msg->cmd) {
+-		case VCTX_MSG_REPLY:
+-			/* find local data associated with that msg id */
+-			vcmd = vcmd_get(pvcm, (unsigned long)msg->id);
+-			if (!vcmd)
+-				break;
+-
+-			if (msg->ctx != vcmd->msg.ctx)
+-				dev_warn(dev, "reply msg #%u's ctx (%u) mismatches vcmd ctx (%u)\n",
+-					 msg->id, msg->ctx, vcmd->msg.ctx);
+-
+-			vcmd->submit_err = 0;
+-
+-			/* submit corresponding to msg->id is done, do post process */
+-			memcpy(&vcmd->msg, msg, msg->size);
+-			complete(&vcmd->complete);
+-
+-			vcmd_put(vcmd);
+-		break;
+-		default:
+-		break;
+-		}
+-	}
+-	return rc;
+-}
+-
+ int vcm_init(struct vpumgr_device *vdev, u32 sw_dev_id)
+ {
+ 	struct vcm_dev *pvcm = &vdev->vcm;
+-	struct task_struct *rxthread;
+ 	int rc = 0;
+ 
+ 	if (sw_dev_id == XLINK_INVALID_SW_DEVID) {
+@@ -541,23 +615,13 @@ int vcm_init(struct vpumgr_device *vdev, u32 sw_dev_id)
+ 	}
+ 
+ 	mutex_init(&pvcm->msg_idr_lock);
++	mutex_init(&pvcm->fwboot_mutex);
+ 	idr_init(&pvcm->msg_idr);
+ 
+-	rxthread = kthread_run(vcm_rxthread,
+-			       (void *)vdev, "vcmrx");
+-	if (IS_ERR(rxthread)) {
+-		rc = PTR_ERR(rxthread);
+-		goto destroy_idr;
+-	}
+-
+-	pvcm->rxthread = get_task_struct(rxthread);
+-
++	pvcm->fwuser_cnt = 0;
+ 	pvcm->enabled = true;
+ 	return 0;
+ 
+-destroy_idr:
+-	idr_destroy(&pvcm->msg_idr);
+-	destroy_workqueue(pvcm->wq);
+ vpu_link_fini:
+ 	vcm_vpu_link_fini(pvcm);
+ exit:
+@@ -572,13 +636,10 @@ int vcm_fini(struct vpumgr_device *vdev)
+ 	if (!pvcm->enabled)
+ 		return 0;
+ 
+-	vcm_vpu_link_fini(pvcm);
+-
+-	kthread_stop(pvcm->rxthread);
+-	put_task_struct(pvcm->rxthread);
+-
+ 	idr_destroy(&pvcm->msg_idr);
+ 	destroy_workqueue(pvcm->wq);
++	mutex_destroy(&pvcm->fwboot_mutex);
+ 	mutex_destroy(&pvcm->msg_idr_lock);
++	vcm_vpu_link_fini(pvcm);
+ 	return 0;
+ }
+diff --git a/drivers/misc/vpumgr/vpu_vcm.h b/drivers/misc/vpumgr/vpu_vcm.h
+index 9e89c281092b..90a797a648f8 100644
+--- a/drivers/misc/vpumgr/vpu_vcm.h
++++ b/drivers/misc/vpumgr/vpu_vcm.h
+@@ -61,6 +61,9 @@ struct vcm_dev {
+ 
+ 	struct mutex msg_idr_lock; /* protects msg_idr */
+ 	struct idr msg_idr;
++
++	struct mutex fwboot_mutex; /* protect firmware boot-up */
++	int fwuser_cnt;
+ };
+ 
+ struct vpumgr_ctx {
+-- 
+2.27.0
+

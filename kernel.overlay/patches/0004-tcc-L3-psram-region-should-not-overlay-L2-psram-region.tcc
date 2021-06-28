@@ -1,4 +1,4 @@
-From 141c165032d57a072fd6cc06ae0e3517bf356f75 Mon Sep 17 00:00:00 2001
+From 6af4b6f15186e8af63c657a6157c1cf614c3ca6f Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 11 Jun 2020 02:09:09 +0800
 Subject: [PATCH 4/9] tcc: L3 psram region should not overlay L2 psram region.

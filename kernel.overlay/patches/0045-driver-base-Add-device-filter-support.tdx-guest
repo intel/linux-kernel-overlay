@@ -1,0 +1,338 @@
+From 63ca15742c6b9a5c7eba9bd72e20f7f1898a63f2 Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Date: Tue, 21 Jul 2020 21:49:26 -0700
+Subject: [PATCH 45/78] driver: base: Add device filter support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Intel's Trust Domain Extensions (TDX) is a new Intel technology that
+adds support for VMs to work with untrusted VMM. So, for such a type
+of VM guest, since VMM is an untrusted entity, any device drivers
+that consume data from VMM had to be audited and hardened against
+attack from the host. But, it is not feasible to do this hardening for
+all drivers in the tree, and also not useful since nearly all of them
+will never be virtualized. But we want to prevent a malicious VMM
+cherry-picking a vulnerable driver and triggers its load by presenting
+its PCI IDs in config space. So in TDX, only permit device probes for
+devices that have been allow-listed.
+
+Device filter framework adds a filter hook (is_device_allowed()) in
+device_add() interface. It will called for every device added by the
+platform and which will be used to check whether a given device to be
+allowed or blocked based on platform specific allow list. If the device
+is blocked, it will fail device_add() and return -EACCESS error. Device
+filter also has support to register bus specific filter hooks. It will
+be useful to filter PCI devices based on device and vendor ID.
+
+Current device filter policy is to allow all devices. It will filter
+devices only when platform registers allow list for the given bus.
+
+Another way to prevent probes of untrusted drivers is to use a custom
+kernel config for TDX. But this approach will not work for TDX guests,
+because it breaks the binary compatibility. We expect TDX to work with
+all cloud distributions without any changes.
+
+Also the reason for filtering during the device registration instead of
+driver binding is to prevent user access to disallowed devices via the
+sysfs interface. If filternation is done based on the driver name, the
+user will be able to see the device nodes for dis-allowed devices which
+is not desirable for TDX guests.
+
+NOTE: This device filter only covers drivers that are using the
+standard enumeration mechanisms. Other drivers will need to be handled
+separately through other mechanisms.
+
+You can find details about TDX technology in following link:
+
+https://software.intel.com/content/www/br/pt/develop/articles/intel-trust-domain-extensions.html
+
+Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+---
+ drivers/base/Makefile           |   2 +-
+ drivers/base/base.h             |   2 +
+ drivers/base/core.c             |   5 ++
+ drivers/base/filter.c           | 133 ++++++++++++++++++++++++++++++++
+ include/linux/device/bus.h      |   4 +
+ include/linux/device/filter.h   |  53 +++++++++++++
+ include/linux/protected_guest.h |   2 +
+ 7 files changed, 200 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/base/filter.c
+ create mode 100644 include/linux/device/filter.h
+
+diff --git a/drivers/base/Makefile b/drivers/base/Makefile
+index 8b93a7f291ec..9e63bd7ecb1d 100644
+--- a/drivers/base/Makefile
++++ b/drivers/base/Makefile
+@@ -6,7 +6,7 @@ obj-y			:= component.o core.o bus.o dd.o syscore.o \
+ 			   cpu.o firmware.o init.o map.o devres.o \
+ 			   attribute_container.o transport_class.o \
+ 			   topology.o container.o property.o cacheinfo.o \
+-			   swnode.o
++			   swnode.o filter.o
+ obj-$(CONFIG_AUXILIARY_BUS) += auxiliary.o
+ obj-$(CONFIG_DEVTMPFS)	+= devtmpfs.o
+ obj-y			+= power/
+diff --git a/drivers/base/base.h b/drivers/base/base.h
+index e5f9b7e656c3..49b4cce20f2f 100644
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -203,3 +203,5 @@ int devtmpfs_delete_node(struct device *dev);
+ static inline int devtmpfs_create_node(struct device *dev) { return 0; }
+ static inline int devtmpfs_delete_node(struct device *dev) { return 0; }
+ #endif
++
++bool is_device_allowed(struct device *dev);
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 54ba506e5a89..02a1aea454f4 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -3237,6 +3237,11 @@ int device_add(struct device *dev)
+ 		goto name_error;
+ 	}
+ 
++	if (!is_device_allowed(dev)) {
++		error = -EACCES;
++		goto name_error;
++	}
++
+ 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
+ 
+ 	parent = get_device(dev->parent);
+diff --git a/drivers/base/filter.c b/drivers/base/filter.c
+new file mode 100644
+index 000000000000..88eac252143f
+--- /dev/null
++++ b/drivers/base/filter.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * filter.c - Add device filter framework.
++ *
++ * Implements APIs required for registering platform specific
++ * device filter.
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ * Author: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
++ */
++#include <linux/init.h>
++#include <linux/device/filter.h>
++#include <linux/acpi.h>
++#include <linux/protected_guest.h>
++
++#include "base.h"
++
++/* List of filter allow list */
++static LIST_HEAD(device_filter_list);
++
++/* Protects device_filter_list add/read operations*/
++static DEFINE_SPINLOCK(device_filter_lock);
++
++/*
++ * Compares the device name with given filter data allow list.
++ *
++ * If the BUS driver does not register bus specific filter hook
++ * default_device_filter() will be used.
++ *
++ * Return true if device name matches with allow list.
++ */
++static bool default_device_filter(struct device *dev,
++				  struct dev_filter_data *data)
++{
++	int i;
++	char **allow_list;
++	const char *name = dev_name(dev);
++
++	if (!name || !data || !data->allow_list)
++		return false;
++
++	allow_list = data->allow_list;
++
++	for (i = 0; i < data->len; i++)
++		if (!strncmp(allow_list[i], name, strlen(allow_list[i])))
++			return true;
++
++	return false;
++}
++
++/*
++ * is_device_allowed() - Allow or block device based on filter
++ *			 list registered by platform.
++ *
++ * This filter is currently only enabled for protected guests.
++ *
++ * Return true to allow given device or false to block it.
++ */
++bool is_device_allowed(struct device *dev)
++{
++	struct dev_filter_node *node;
++	bool status = false, filter_attempted = false;
++
++	/*
++	 * Make sure device filter support is enabled, if not
++	 * just allow the device and return.
++	 */
++	if (!prot_guest_has(PR_GUEST_DEVICE_FILTER))
++		return true;
++
++	spin_lock(&device_filter_lock);
++
++	/*
++	 * If the device is not part of standard bus, skip rest
++	 * of the checks and just allow it.
++	 */
++	if (!dev->bus) {
++		status = true;
++		goto done;
++	}
++
++	/* If platform did not register any allow list, allow all */
++	if (list_empty(&device_filter_list)) {
++		status = true;
++		goto done;
++	}
++
++	list_for_each_entry(node, &device_filter_list, list) {
++		/*
++		 * For every matching filter node, check with device
++		 * filter hook and return true if allowed.
++		 */
++		if (!strcmp(dev->bus->name, node->name)) {
++			filter_attempted = true;
++			/* If custom bus specific filter exist, use it*/
++			if (dev->bus->device_filter) {
++				if (dev->bus->device_filter(dev, node->data)) {
++					status = true;
++					goto done;
++				}
++			} else {
++				if (default_device_filter(dev, node->data)) {
++					status = true;
++					goto done;
++				}
++			}
++		}
++	}
++
++	/*
++	 * If platform did not register allow list for given bus
++	 * allow all devices.
++	 */
++	if (!filter_attempted)
++		status = true;
++
++done:
++	pr_filter_dbg("bus:%s device:%s %s\n",
++		      dev->bus ? dev->bus->name : "null",
++		      dev_name(dev),
++		      status ? "allowed" : "blocked");
++
++	spin_unlock(&device_filter_lock);
++	return status;
++}
++
++void register_dev_filter(struct dev_filter_node *node)
++{
++	spin_lock(&device_filter_lock);
++	list_add_tail(&node->list, &device_filter_list);
++	spin_unlock(&device_filter_lock);
++}
+diff --git a/include/linux/device/bus.h b/include/linux/device/bus.h
+index 1ea5e1d1545b..de59d4fd140c 100644
+--- a/include/linux/device/bus.h
++++ b/include/linux/device/bus.h
+@@ -59,6 +59,8 @@ struct fwnode_handle;
+  *		bus supports.
+  * @dma_configure:	Called to setup DMA configuration on a device on
+  *			this bus.
++ * @device_filter:	Called to check whether given device is allowed or
++ *			blocked.
+  * @pm:		Power management operations of this bus, callback the specific
+  *		device driver's pm-ops.
+  * @iommu_ops:  IOMMU specific operations for this bus, used to attach IOMMU
+@@ -104,6 +106,8 @@ struct bus_type {
+ 
+ 	int (*dma_configure)(struct device *dev);
+ 
++	bool (*device_filter)(struct device *dev, void *data);
++
+ 	const struct dev_pm_ops *pm;
+ 
+ 	const struct iommu_ops *iommu_ops;
+diff --git a/include/linux/device/filter.h b/include/linux/device/filter.h
+new file mode 100644
+index 000000000000..e62e6a146763
+--- /dev/null
++++ b/include/linux/device/filter.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * filter.h - Device filter specific header
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ * Author: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
++ */
++
++#ifndef _DEVICE_FILTER_H_
++#define _DEVICE_FILTER_H_
++
++#include <linux/device/bus.h>
++#include <linux/device/driver.h>
++#include <linux/device.h>
++
++#define FILTER_TAG	"filter: "
++
++#define pr_filter_dbg(fmt, ...) \
++	pr_debug(FILTER_TAG fmt, ##__VA_ARGS__)
++#define pr_filter_info(fmt, ...) \
++	pr_info(FILTER_TAG fmt, ##__VA_ARGS__)
++#define pr_filter_crit(fmt, ...) \
++	pr_crit(FILTER_TAG fmt, ##__VA_ARGS__)
++
++enum filter_policy {
++	BLOCK_ALL = 0, /* Block all devices */
++	ALLOW_ALL = 1  /* Allow all devices */
++};
++
++/* Filter data type for filter types > 0 */
++struct dev_filter_data {
++	char **allow_list;
++	unsigned int len; /* Length of allow list */
++};
++
++/**
++ * struct dev_filter_node - device filter node
++ *
++ * @name		: Name of the filter.
++ * @data		: Allow list of filter.
++ * @default_status	: Default status if allow list is empty.
++ */
++struct dev_filter_node {
++	char *name;
++	void *data;
++	bool default_status;
++	struct list_head list;
++};
++
++/* Register platform specific filter allow list */
++void register_dev_filter(struct dev_filter_node *node);
++#endif
+diff --git a/include/linux/protected_guest.h b/include/linux/protected_guest.h
+index a58894ea249c..8f9cb3e72de3 100644
+--- a/include/linux/protected_guest.h
++++ b/include/linux/protected_guest.h
+@@ -22,6 +22,8 @@
+ #define PR_GUEST_SHARED_MAPPING_INIT		0x1004
+ /* Disable uncore frequency support */
+ #define PR_GUEST_DISABLE_UNCORE_SUPPORT		0x1005
++/* Support for device filter */
++#define PR_GUEST_DEVICE_FILTER			0x1006
+ 
+ #ifdef CONFIG_ARCH_HAS_PROTECTED_GUEST
+ #include <asm/protected_guest.h>
+-- 
+2.27.0
+

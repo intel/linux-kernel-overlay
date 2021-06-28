@@ -1,0 +1,110 @@
+From 3439edde88645bf2780f701b6592c18037ba52e7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 1 Jun 2021 19:47:50 +0200
+Subject: [PATCH 1192/1247] drm/ttm: nuke VM_MIXEDMAP on BO mappings v3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We discussed if that is really the right approach for quite a while now, but
+digging deeper into a bug report on arm turned out that this is actually
+horrible broken right now.
+
+The reason for this is that vmf_insert_mixed_prot() always tries to grab
+a reference to the underlaying page on architectures without
+ARCH_HAS_PTE_SPECIAL and as far as I can see also enabled GUP.
+
+So nuke using VM_MIXEDMAP here and use VM_PFNMAP instead.
+
+Also make sure to reject mappings without VM_SHARED.
+
+v2: reject COW mappings, merge function with only caller
+v3: adjust comment as suggested by Thomas
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Bugs: https://gitlab.freedesktop.org/drm/amd/-/issues/1606#note_936174
+Link: https://patchwork.freedesktop.org/patch/msgid/20210607135830.8574-1-christian.koenig@amd.com
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+---
+ drivers/gpu/drm/ttm/ttm_bo_vm.c | 42 ++++++++++-----------------------
+ 1 file changed, 12 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index 61828488ae2b..f56be5bc0861 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -359,12 +359,7 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 		 * at arbitrary times while the data is mmap'ed.
+ 		 * See vmf_insert_mixed_prot() for a discussion.
+ 		 */
+-		if (vma->vm_flags & VM_MIXEDMAP)
+-			ret = vmf_insert_mixed_prot(vma, address,
+-						    __pfn_to_pfn_t(pfn, PFN_DEV),
+-						    prot);
+-		else
+-			ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
++		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
+ 
+ 		/* Never error on prefaulted PTEs */
+ 		if (unlikely((ret & VM_FAULT_ERROR))) {
+@@ -411,15 +406,9 @@ vm_fault_t ttm_bo_vm_dummy_page(struct vm_fault *vmf, pgprot_t prot)
+ 	pfn = page_to_pfn(page);
+ 
+ 	/* Prefault the entire VMA range right away to avoid further faults */
+-	for (address = vma->vm_start; address < vma->vm_end; address += PAGE_SIZE) {
+-
+-		if (vma->vm_flags & VM_MIXEDMAP)
+-			ret = vmf_insert_mixed_prot(vma, address,
+-						    __pfn_to_pfn_t(pfn, PFN_DEV),
+-						    prot);
+-		else
+-			ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
+-	}
++	for (address = vma->vm_start; address < vma->vm_end;
++	     address += PAGE_SIZE)
++		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
+ 
+ 	return ret;
+ }
+@@ -560,8 +549,14 @@ static const struct vm_operations_struct ttm_bo_vm_ops = {
+ 	.access = ttm_bo_vm_access,
+ };
+ 
+-static void ttm_bo_mmap_vma_setup(struct ttm_buffer_object *bo, struct vm_area_struct *vma)
++int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
+ {
++	/* Enforce no COW since would have really strange behavior with it. */
++	if (is_cow_mapping(vma->vm_flags))
++		return -EINVAL;
++
++	ttm_bo_get(bo);
++
+ 	/*
+ 	 * Drivers may want to override the vm_ops field. Otherwise we
+ 	 * use TTM's default callbacks.
+@@ -576,21 +571,8 @@ static void ttm_bo_mmap_vma_setup(struct ttm_buffer_object *bo, struct vm_area_s
+ 
+ 	vma->vm_private_data = bo;
+ 
+-	/*
+-	 * We'd like to use VM_PFNMAP on shared mappings, where
+-	 * (vma->vm_flags & VM_SHARED) != 0, for performance reasons,
+-	 * but for some reason VM_PFNMAP + x86 PAT + write-combine is very
+-	 * bad for performance. Until that has been sorted out, use
+-	 * VM_MIXEDMAP on all mappings. See freedesktop.org bug #75719
+-	 */
+-	vma->vm_flags |= VM_MIXEDMAP;
++	vma->vm_flags |= VM_PFNMAP;
+ 	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+-}
+-
+-int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
+-{
+-	ttm_bo_get(bo);
+-	ttm_bo_mmap_vma_setup(bo, vma);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ttm_bo_mmap_obj);
+-- 
+2.27.0
+

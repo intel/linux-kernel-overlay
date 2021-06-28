@@ -1,0 +1,194 @@
+From fe56845bd3bcf31575aaf232cacfb0b4837e11e7 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Tue, 18 May 2021 13:03:16 -0700
+Subject: [PATCH 61/94] x86/signal: Introduce helpers to get the maximum signal
+ frame size
+
+Signal frames do not have a fixed format and can vary in size when a number
+of things change: supported XSAVE features, 32 vs. 64-bit apps, etc.
+
+Add support for a runtime method for userspace to dynamically discover
+how large a signal stack needs to be.
+
+Introduce a new variable, max_frame_size, and helper functions for the
+calculation to be used in a new user interface. Set max_frame_size to a
+system-wide worst-case value, instead of storing multiple app-specific
+values.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Len Brown <len.brown@intel.com>
+Acked-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: H.J. Lu <hjl.tools@gmail.com>
+Link: https://lkml.kernel.org/r/20210518200320.17239-3-chang.seok.bae@intel.com
+---
+ arch/x86/include/asm/fpu/signal.h |  2 ++
+ arch/x86/include/asm/sigframe.h   |  2 ++
+ arch/x86/kernel/cpu/common.c      |  3 ++
+ arch/x86/kernel/fpu/signal.c      | 19 ++++++++++
+ arch/x86/kernel/signal.c          | 59 +++++++++++++++++++++++++++++--
+ 5 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/signal.h b/arch/x86/include/asm/fpu/signal.h
+index 7fb516b6893a..8b6631dffefd 100644
+--- a/arch/x86/include/asm/fpu/signal.h
++++ b/arch/x86/include/asm/fpu/signal.h
+@@ -29,6 +29,8 @@ unsigned long
+ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+ 		     unsigned long *buf_fx, unsigned long *size);
+ 
++unsigned long fpu__get_fpstate_size(void);
++
+ extern void fpu__init_prepare_fx_sw_frame(void);
+ 
+ #endif /* _ASM_X86_FPU_SIGNAL_H */
+diff --git a/arch/x86/include/asm/sigframe.h b/arch/x86/include/asm/sigframe.h
+index 84eab2724875..5b1ed650b124 100644
+--- a/arch/x86/include/asm/sigframe.h
++++ b/arch/x86/include/asm/sigframe.h
+@@ -85,4 +85,6 @@ struct rt_sigframe_x32 {
+ 
+ #endif /* CONFIG_X86_64 */
+ 
++void __init init_sigframe_size(void);
++
+ #endif /* _ASM_X86_SIGFRAME_H */
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index c630df800927..f7ab7f993ceb 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -58,6 +58,7 @@
+ #include <asm/intel-family.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/uv/uv.h>
++#include <asm/sigframe.h>
+ 
+ #include "cpu.h"
+ 
+@@ -1391,6 +1392,8 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	fpu__init_system(c);
+ 
++	init_sigframe_size();
++
+ #ifdef CONFIG_X86_32
+ 	/*
+ 	 * Regardless of whether PCID is enumerated, the SDM says
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index b7b92cdf3add..888c8e0d2ff1 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -513,6 +513,25 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+ 
+ 	return sp;
+ }
++
++unsigned long fpu__get_fpstate_size(void)
++{
++	unsigned long ret = xstate_sigframe_size();
++
++	/*
++	 * This space is needed on (most) 32-bit kernels, or when a 32-bit
++	 * app is running on a 64-bit kernel. To keep things simple, just
++	 * assume the worst case and always include space for 'freg_state',
++	 * even for 64-bit apps on 64-bit kernels. This wastes a bit of
++	 * space, but keeps the code simple.
++	 */
++	if ((IS_ENABLED(CONFIG_IA32_EMULATION) ||
++	     IS_ENABLED(CONFIG_X86_32)) && use_fxsr())
++		ret += sizeof(struct fregs_state);
++
++	return ret;
++}
++
+ /*
+  * Prepare the SW reserved portion of the fxsave memory layout, indicating
+  * the presence of the extended state information in the memory layout
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index 903b10965cbe..f034ac789610 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -216,6 +216,11 @@ do {									\
+  * Set up a signal frame.
+  */
+ 
++/* x86 ABI requires 16-byte alignment */
++#define FRAME_ALIGNMENT	16UL
++
++#define MAX_FRAME_PADDING	(FRAME_ALIGNMENT - 1)
++
+ /*
+  * Determine which stack to use..
+  */
+@@ -226,9 +231,9 @@ static unsigned long align_sigframe(unsigned long sp)
+ 	 * Align the stack pointer according to the i386 ABI,
+ 	 * i.e. so that on function entry ((sp + 4) & 15) == 0.
+ 	 */
+-	sp = ((sp + 4) & -16ul) - 4;
++	sp = ((sp + 4) & -FRAME_ALIGNMENT) - 4;
+ #else /* !CONFIG_X86_32 */
+-	sp = round_down(sp, 16) - 8;
++	sp = round_down(sp, FRAME_ALIGNMENT) - 8;
+ #endif
+ 	return sp;
+ }
+@@ -679,6 +684,56 @@ SYSCALL_DEFINE0(rt_sigreturn)
+ 	return 0;
+ }
+ 
++/*
++ * There are four different struct types for signal frame: sigframe_ia32,
++ * rt_sigframe_ia32, rt_sigframe_x32, and rt_sigframe. Use the worst case
++ * -- the largest size. It means the size for 64-bit apps is a bit more
++ * than needed, but this keeps the code simple.
++ */
++#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
++# define MAX_FRAME_SIGINFO_UCTXT_SIZE	sizeof(struct sigframe_ia32)
++#else
++# define MAX_FRAME_SIGINFO_UCTXT_SIZE	sizeof(struct rt_sigframe)
++#endif
++
++/*
++ * The FP state frame contains an XSAVE buffer which must be 64-byte aligned.
++ * If a signal frame starts at an unaligned address, extra space is required.
++ * This is the max alignment padding, conservatively.
++ */
++#define MAX_XSAVE_PADDING	63UL
++
++/*
++ * The frame data is composed of the following areas and laid out as:
++ *
++ * -------------------------
++ * | alignment padding     |
++ * -------------------------
++ * | (f)xsave frame        |
++ * -------------------------
++ * | fsave header          |
++ * -------------------------
++ * | alignment padding     |
++ * -------------------------
++ * | siginfo + ucontext    |
++ * -------------------------
++ */
++
++/* max_frame_size tells userspace the worst case signal stack size. */
++static unsigned long __ro_after_init max_frame_size;
++
++void __init init_sigframe_size(void)
++{
++	max_frame_size = MAX_FRAME_SIGINFO_UCTXT_SIZE + MAX_FRAME_PADDING;
++
++	max_frame_size += fpu__get_fpstate_size() + MAX_XSAVE_PADDING;
++
++	/* Userspace expects an aligned size. */
++	max_frame_size = round_up(max_frame_size, FRAME_ALIGNMENT);
++
++	pr_info("max sigframe size: %lu\n", max_frame_size);
++}
++
+ static inline int is_ia32_compat_frame(struct ksignal *ksig)
+ {
+ 	return IS_ENABLED(CONFIG_IA32_EMULATION) &&
+-- 
+2.27.0
+
