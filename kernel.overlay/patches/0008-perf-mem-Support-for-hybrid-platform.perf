@@ -1,0 +1,476 @@
+From a84c6c23536bce380c9bebec22c15c203aaf9231 Mon Sep 17 00:00:00 2001
+From: Jin Yao <yao.jin@linux.intel.com>
+Date: Tue, 11 May 2021 14:43:41 +0800
+Subject: [PATCH 08/19] perf mem: Support for hybrid platform
+
+On alderlake, the 'mem-loads' event is required to use together with
+'mem-loads-aux' within a group and 'mem-loads-aux' must be the group
+leader. Before reporting, we disable the grouping because 'mem-loads-aux'
+is just an auxiliary event. It actually doesn't carry valid load latency
+information. If we show the 'mem-loads-aux' + 'mem-loads' as a group in
+perf report, it needs many of changes but they are totally unnecessary.
+
+If we execute 'perf mem record', it actually calls:
+record -e {cpu_core/mem-loads-aux/,cpu_core/mem-loads,ldlat=30/}:P
+       -e cpu_atom/mem-loads,ldlat=30/P
+       -e cpu_core/mem-stores/P
+       -e cpu_atom/mem-stores/P
+
+Signed-off-by: Jin Yao <yao.jin@linux.intel.com>
+---
+ tools/perf/arch/arm64/util/mem-events.c   |   2 +-
+ tools/perf/arch/powerpc/util/mem-events.c |   2 +-
+ tools/perf/arch/x86/util/mem-events.c     |  32 +++---
+ tools/perf/builtin-c2c.c                  |   4 +-
+ tools/perf/builtin-mem.c                  |  38 +++---
+ tools/perf/builtin-report.c               |   2 +
+ tools/perf/util/evlist.c                  |  10 ++
+ tools/perf/util/evlist.h                  |   1 +
+ tools/perf/util/mem-events.c              | 134 +++++++++++++++++++---
+ tools/perf/util/mem-events.h              |   4 +-
+ 10 files changed, 178 insertions(+), 51 deletions(-)
+
+diff --git a/tools/perf/arch/arm64/util/mem-events.c b/tools/perf/arch/arm64/util/mem-events.c
+index 2a2497372671..be41721b9aa1 100644
+--- a/tools/perf/arch/arm64/util/mem-events.c
++++ b/tools/perf/arch/arm64/util/mem-events.c
+@@ -20,7 +20,7 @@ struct perf_mem_event *perf_mem_events__ptr(int i)
+ 	return &perf_mem_events[i];
+ }
+ 
+-char *perf_mem_events__name(int i)
++char *perf_mem_events__name(int i, char *pmu_name __maybe_unused)
+ {
+ 	struct perf_mem_event *e = perf_mem_events__ptr(i);
+ 
+diff --git a/tools/perf/arch/powerpc/util/mem-events.c b/tools/perf/arch/powerpc/util/mem-events.c
+index 07fb5e049488..4120fafe0be4 100644
+--- a/tools/perf/arch/powerpc/util/mem-events.c
++++ b/tools/perf/arch/powerpc/util/mem-events.c
+@@ -3,7 +3,7 @@
+ #include "mem-events.h"
+ 
+ /* PowerPC does not support 'ldlat' parameter. */
+-char *perf_mem_events__name(int i)
++char *perf_mem_events__name(int i, char *pmu_name __maybe_unused)
+ {
+ 	if (i == PERF_MEM_EVENTS__LOAD)
+ 		return (char *) "cpu/mem-loads/";
+diff --git a/tools/perf/arch/x86/util/mem-events.c b/tools/perf/arch/x86/util/mem-events.c
+index e79232e3f2a0..384216df4896 100644
+--- a/tools/perf/arch/x86/util/mem-events.c
++++ b/tools/perf/arch/x86/util/mem-events.c
+@@ -4,10 +4,10 @@
+ #include "mem-events.h"
+ 
+ static char mem_loads_name[100];
+-static bool mem_loads_name__init;
++static char mem_stores_name[100];
+ 
+ #define MEM_LOADS_AUX		0x8203
+-#define MEM_LOADS_AUX_NAME	"{cpu/mem-loads-aux/,cpu/mem-loads,ldlat=%u/pp}:S"
++#define MEM_LOADS_AUX_NAME     "{%s/mem-loads-aux/,%s/mem-loads,ldlat=%u/}:P"
+ 
+ bool is_mem_loads_aux_event(struct evsel *leader)
+ {
+@@ -22,28 +22,34 @@ bool is_mem_loads_aux_event(struct evsel *leader)
+ 	return leader->core.attr.config == MEM_LOADS_AUX;
+ }
+ 
+-char *perf_mem_events__name(int i)
++char *perf_mem_events__name(int i, char *pmu_name)
+ {
+ 	struct perf_mem_event *e = perf_mem_events__ptr(i);
+ 
+ 	if (!e)
+ 		return NULL;
+ 
+-	if (i == PERF_MEM_EVENTS__LOAD) {
+-		if (mem_loads_name__init)
+-			return mem_loads_name;
+-
+-		mem_loads_name__init = true;
++	if (!pmu_name)
++		pmu_name = (char *)"cpu";
+ 
+-		if (pmu_have_event("cpu", "mem-loads-aux")) {
+-			scnprintf(mem_loads_name, sizeof(mem_loads_name),
+-				  MEM_LOADS_AUX_NAME, perf_mem_events__loads_ldlat);
+-		} else {
++	if (i == PERF_MEM_EVENTS__LOAD) {
++		if (pmu_have_event(pmu_name, "mem-loads-aux")) {
+ 			scnprintf(mem_loads_name, sizeof(mem_loads_name),
+-				  e->name, perf_mem_events__loads_ldlat);
++				  MEM_LOADS_AUX_NAME, pmu_name, pmu_name,
++				  perf_mem_events__loads_ldlat);
++                } else {
++                        scnprintf(mem_loads_name, sizeof(mem_loads_name),
++				  e->name, pmu_name,
++				  perf_mem_events__loads_ldlat);
+ 		}
+ 		return mem_loads_name;
+ 	}
+ 
++	if (i == PERF_MEM_EVENTS__STORE) {
++		scnprintf(mem_stores_name, sizeof(mem_stores_name),
++			  e->name, pmu_name);
++		return mem_stores_name;
++	}
++
+ 	return (char *)e->name;
+ }
+diff --git a/tools/perf/builtin-c2c.c b/tools/perf/builtin-c2c.c
+index e3b9d63077ef..a4fd375acdd1 100644
+--- a/tools/perf/builtin-c2c.c
++++ b/tools/perf/builtin-c2c.c
+@@ -2971,13 +2971,13 @@ static int perf_c2c__record(int argc, const char **argv)
+ 
+ 		if (!e->supported) {
+ 			pr_err("failed: event '%s' not supported\n",
+-			       perf_mem_events__name(j));
++			       perf_mem_events__name(j, NULL));
+ 			free(rec_argv);
+ 			return -1;
+ 		}
+ 
+ 		rec_argv[i++] = "-e";
+-		rec_argv[i++] = perf_mem_events__name(j);
++		rec_argv[i++] = perf_mem_events__name(j, NULL);
+ 	}
+ 
+ 	if (all_user)
+diff --git a/tools/perf/builtin-mem.c b/tools/perf/builtin-mem.c
+index cdd2b9f643f6..2bc4031e6a16 100644
+--- a/tools/perf/builtin-mem.c
++++ b/tools/perf/builtin-mem.c
+@@ -62,9 +62,10 @@ static const char * const *record_mem_usage = __usage;
+ 
+ static int __cmd_record(int argc, const char **argv, struct perf_mem *mem)
+ {
+-	int rec_argc, i = 0, j;
++	int rec_argc, i = 0, j, rec_tmp_nr = 0;
+ 	const char **rec_argv;
+-	int ret;
++	char **rec_tmp;
++	int ret = -1;
+ 	bool all_user = false, all_kernel = false;
+ 	struct perf_mem_event *e;
+ 	struct option options[] = {
+@@ -87,11 +88,17 @@ static int __cmd_record(int argc, const char **argv, struct perf_mem *mem)
+ 	argc = parse_options(argc, argv, options, record_mem_usage,
+ 			     PARSE_OPT_KEEP_UNKNOWN);
+ 
+-	rec_argc = argc + 9; /* max number of arguments */
++	rec_argc = argc + 18; /* max number of arguments */
+ 	rec_argv = calloc(rec_argc + 1, sizeof(char *));
+ 	if (!rec_argv)
+ 		return -1;
+ 
++	rec_tmp = calloc(rec_argc + 1, sizeof(char *));
++	if (!rec_tmp) {
++		free(rec_argv);
++		return -1;
++	}
++
+ 	rec_argv[i++] = "record";
+ 
+ 	e = perf_mem_events__ptr(PERF_MEM_EVENTS__LOAD_STORE);
+@@ -128,21 +135,9 @@ static int __cmd_record(int argc, const char **argv, struct perf_mem *mem)
+ 	if (mem->data_page_size)
+ 		rec_argv[i++] = "--data-page-size";
+ 
+-	for (j = 0; j < PERF_MEM_EVENTS__MAX; j++) {
+-		e = perf_mem_events__ptr(j);
+-		if (!e->record)
+-			continue;
+-
+-		if (!e->supported) {
+-			pr_err("failed: event '%s' not supported\n",
+-			       perf_mem_events__name(j));
+-			free(rec_argv);
+-			return -1;
+-		}
+-
+-		rec_argv[i++] = "-e";
+-		rec_argv[i++] = perf_mem_events__name(j);
+-	}
++	ret = perf_mem_events__rec_args(rec_argv, &i, rec_tmp, &rec_tmp_nr);
++	if (ret)
++		goto out;
+ 
+ 	if (all_user)
+ 		rec_argv[i++] = "--all-user";
+@@ -164,6 +159,13 @@ static int __cmd_record(int argc, const char **argv, struct perf_mem *mem)
+ 	}
+ 
+ 	ret = cmd_record(i, rec_argv);
++out:
++	for (i = 0; i < rec_tmp_nr; i++) {
++		if (rec_tmp[i])
++			free(rec_tmp[i]);
++	}
++
++	free(rec_tmp);
+ 	free(rec_argv);
+ 	return ret;
+ }
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 36f9ccfeb38a..bc5c393021dc 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -934,6 +934,8 @@ static int __cmd_report(struct report *rep)
+ 		return ret;
+ 	}
+ 
++	evlist__check_mem_load_aux(session->evlist);
++
+ 	if (rep->stats_mode)
+ 		return stats_print(rep);
+ 
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 6ea3e677dc1e..d65866e04615 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -2161,3 +2161,13 @@ int evlist__scnprintf_evsels(struct evlist *evlist, size_t size, char *bf)
+ 
+ 	return printed;
+ }
++
++void evlist__check_mem_load_aux(struct evlist *evlist)
++{
++	struct evsel *evsel = evlist__first(evlist);
++
++	if (evsel__is_group_event(evsel) && evsel->name &&
++	    strstr(evsel->name, "mem-loads-aux")) {
++		symbol_conf.event_group = false;
++	}
++}
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 2fcc17ad419e..6805f66aa313 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -368,4 +368,5 @@ int evlist__ctlfd_ack(struct evlist *evlist);
+ struct evsel *evlist__find_evsel(struct evlist *evlist, int idx);
+ 
+ int evlist__scnprintf_evsels(struct evlist *evlist, size_t size, char *bf);
++void evlist__check_mem_load_aux(struct evlist *evlist);
+ #endif /* __PERF_EVLIST_H */
+diff --git a/tools/perf/util/mem-events.c b/tools/perf/util/mem-events.c
+index f93a852ad838..ce2406b5b44a 100644
+--- a/tools/perf/util/mem-events.c
++++ b/tools/perf/util/mem-events.c
+@@ -12,16 +12,19 @@
+ #include "mem-events.h"
+ #include "debug.h"
+ #include "symbol.h"
++#include "pmu.h"
++#include "pmu-hybrid.h"
+ 
+ unsigned int perf_mem_events__loads_ldlat = 30;
+ 
+ #define E(t, n, s) { .tag = t, .name = n, .sysfs_name = s }
+ 
+ static struct perf_mem_event perf_mem_events[PERF_MEM_EVENTS__MAX] = {
+-	E("ldlat-loads",	"cpu/mem-loads,ldlat=%u/P",	"cpu/events/mem-loads"),
+-	E("ldlat-stores",	"cpu/mem-stores/P",		"cpu/events/mem-stores"),
++	E("ldlat-loads",	"%s/mem-loads,ldlat=%u/P",	"%s/events/mem-loads"),
++	E("ldlat-stores",	"%s/mem-stores/P",		"%s/events/mem-stores"),
+ 	E(NULL,			NULL,				NULL),
+ };
++
+ #undef E
+ 
+ #undef E
+@@ -37,7 +40,7 @@ struct perf_mem_event * __weak perf_mem_events__ptr(int i)
+ 	return &perf_mem_events[i];
+ }
+ 
+-char * __weak perf_mem_events__name(int i)
++char * __weak perf_mem_events__name(int i, char *pmu_name __maybe_unused)
+ {
+ 	struct perf_mem_event *e = perf_mem_events__ptr(i);
+ 
+@@ -100,6 +103,18 @@ int perf_mem_events__parse(const char *str)
+ 	return -1;
+ }
+ 
++static bool perf_mem_events__supported(const char *mnt, char *sysfs_name)
++{
++	char path[PATH_MAX];
++	struct stat st;
++
++	scnprintf(path, PATH_MAX, "%s/devices/%s", mnt, sysfs_name);
++	if (!stat(path, &st))
++		return true;
++
++	return false;
++}
++
+ int perf_mem_events__init(void)
+ {
+ 	const char *mnt = sysfs__mount();
+@@ -109,10 +124,12 @@ int perf_mem_events__init(void)
+ 	if (!mnt)
+ 		return -ENOENT;
+ 
++	perf_pmu__scan(NULL);
++
+ 	for (j = 0; j < PERF_MEM_EVENTS__MAX; j++) {
+-		char path[PATH_MAX];
++		char sysfs_name[100];
+ 		struct perf_mem_event *e = perf_mem_events__ptr(j);
+-		struct stat st;
++		struct perf_pmu *pmu;
+ 
+ 		/*
+ 		 * If the event entry isn't valid, skip initialization
+@@ -121,11 +138,21 @@ int perf_mem_events__init(void)
+ 		if (!e->tag)
+ 			continue;
+ 
+-		scnprintf(path, PATH_MAX, "%s/devices/%s",
+-			  mnt, e->sysfs_name);
+-
+-		if (!stat(path, &st))
+-			e->supported = found = true;
++		if (!perf_pmu__has_hybrid()) {
++			scnprintf(sysfs_name, sizeof(sysfs_name),
++				  e->sysfs_name, "cpu");
++			e->supported = found = perf_mem_events__supported(mnt, sysfs_name);
++		} else {
++			/*
++			 * For hybrid, the mem-loads and mem-stores should
++			 * be available on all PMUs
++			 */
++			perf_pmu__for_each_hybrid_pmu(pmu) {
++				scnprintf(sysfs_name, sizeof(sysfs_name),
++					  e->sysfs_name, pmu->name);
++				e->supported = found = perf_mem_events__supported(mnt, sysfs_name);
++			}
++		}
+ 	}
+ 
+ 	return found ? 0 : -ENOENT;
+@@ -134,18 +161,95 @@ int perf_mem_events__init(void)
+ void perf_mem_events__list(void)
+ {
+ 	int j;
++	struct perf_pmu *pmu;
+ 
+ 	for (j = 0; j < PERF_MEM_EVENTS__MAX; j++) {
+ 		struct perf_mem_event *e = perf_mem_events__ptr(j);
+ 
+-		fprintf(stderr, "%-13s%-*s%s\n",
+-			e->tag ?: "",
+-			verbose > 0 ? 25 : 0,
+-			verbose > 0 ? perf_mem_events__name(j) : "",
+-			e->supported ? ": available" : "");
++		if (!perf_pmu__has_hybrid()) {
++			fprintf(stderr, "%-13s%-*s%s\n",
++				e->tag ?: "",
++				verbose > 0 ? 25 : 0,
++				verbose > 0 ? perf_mem_events__name(j, NULL) : "",
++				e->supported ? ": available" : "");
++		} else {
++			perf_pmu__for_each_hybrid_pmu(pmu) {
++				fprintf(stderr, "%-13s%-*s%s\n",
++					e->tag ?: "",
++					verbose > 0 ? 25 : 0,
++					verbose > 0 ? perf_mem_events__name(j, pmu->name) : "",
++					e->supported ? ": available" : "");
++			}
++		}
++	}
++}
++
++static void perf_mem_events__hybrid_unsupport(struct perf_mem_event *e, int idx)
++{
++	const char *mnt = sysfs__mount();
++	char sysfs_name[100];
++	struct perf_pmu *pmu;
++
++	perf_pmu__for_each_hybrid_pmu(pmu) {
++		scnprintf(sysfs_name, sizeof(sysfs_name), e->sysfs_name, pmu->name);
++		if (!perf_mem_events__supported(mnt, sysfs_name)) {
++			pr_err("failed: event '%s' not supported\n",
++			       perf_mem_events__name(idx, pmu->name));
++		}
+ 	}
+ }
+ 
++int perf_mem_events__rec_args(const char **rec_argv, int *argv_num,
++			      char **rec_tmp, int *tmp_num)
++{
++	int i = *argv_num, k = *tmp_num;
++	struct perf_mem_event *e;
++	struct perf_pmu *pmu;
++	char *s;
++
++	for (int j = 0; j < PERF_MEM_EVENTS__MAX; j++) {
++		e = perf_mem_events__ptr(j);
++		if (!e->record)
++			continue;
++
++		if (!perf_pmu__has_hybrid()) {
++			if (!e->supported) {
++				pr_err("failed: event '%s' not supported\n",
++				       perf_mem_events__name(j, NULL));
++				return -1;
++			}
++
++			rec_argv[i++] = "-e";
++			rec_argv[i++] = perf_mem_events__name(j, NULL);
++		} else {
++			perf_pmu__for_each_hybrid_pmu(pmu) {
++				if (!e->supported) {
++					perf_mem_events__hybrid_unsupport(e, j);
++					return -1;
++				}
++
++				rec_argv[i++] = "-e";
++				s = perf_mem_events__name(j, pmu->name);
++				if (s) {
++					s = strdup(s);
++					if (!s)
++						return -1;
++
++					rec_argv[i++] = s;
++					rec_tmp[k++] = s;
++				} else {
++					i--;
++					rec_argv[i] = NULL;
++				}
++			}
++		}
++	}
++
++	*argv_num = i;
++	*tmp_num = k;
++	return 0;
++}
++
+ static const char * const tlb_access[] = {
+ 	"N/A",
+ 	"HIT",
+diff --git a/tools/perf/util/mem-events.h b/tools/perf/util/mem-events.h
+index cacdebd65b8a..efd9af7b5fa0 100644
+--- a/tools/perf/util/mem-events.h
++++ b/tools/perf/util/mem-events.h
+@@ -38,11 +38,13 @@ extern unsigned int perf_mem_events__loads_ldlat;
+ int perf_mem_events__parse(const char *str);
+ int perf_mem_events__init(void);
+ 
+-char *perf_mem_events__name(int i);
++char *perf_mem_events__name(int i, char *pmu_name);
+ struct perf_mem_event *perf_mem_events__ptr(int i);
+ bool is_mem_loads_aux_event(struct evsel *leader);
+ 
+ void perf_mem_events__list(void);
++int perf_mem_events__rec_args(const char **rec_argv, int *argv_num,
++			      char **rec_tmp, int *tmp_num);
+ 
+ int perf_mem__tlb_scnprintf(char *out, size_t sz, struct mem_info *mem_info);
+ int perf_mem__lvl_scnprintf(char *out, size_t sz, struct mem_info *mem_info);
+-- 
+2.27.0
+

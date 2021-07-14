@@ -1,0 +1,179 @@
+From f705430c4a4dcfe99183111fb1fa809ce4d8d473 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 24 Feb 2021 22:34:11 -0500
+Subject: [PATCH 0111/1247] drm/amdkfd: invalidate tables on page retry fault
+
+GPU page tables are invalidated by unmapping prange directly at
+the mmu notifier, when page fault retry is enabled through
+amdgpu_noretry global parameter. The restore page table is
+performed at the page fault handler.
+
+If xnack is on, we update GPU mappings after migration to avoid
+unnecessary GPUVM faults.
+
+Signed-off-by: Alex Sierra <alex.sierra@amd.com>
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.c |  6 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c     | 77 +++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.h     |  4 +-
+ 3 files changed, 70 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+index 73c10dad0489..2a32c423a393 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+@@ -808,7 +808,11 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
+ 		pr_debug("failed %d migrate 0x%p [0x%lx 0x%lx] to ram\n", r,
+ 			 prange, prange->start, prange->last);
+ 
+-	op = SVM_OP_UPDATE_RANGE_NOTIFIER;
++	/* xnack on, update mapping on GPUs with ACCESS_IN_PLACE */
++	if (p->xnack_enabled && parent == prange)
++		op = SVM_OP_UPDATE_RANGE_NOTIFIER_AND_MAP;
++	else
++		op = SVM_OP_UPDATE_RANGE_NOTIFIER;
+ 	svm_range_add_list_work(&p->svms, parent, mm, op);
+ 	schedule_deferred_list_work(&p->svms);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index 6fcfb9fa1b37..6d3ed1957496 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -912,6 +912,13 @@ svm_range_split_by_granularity(struct kfd_process *p, struct mm_struct *mm,
+ 		svm_range_add_child(parent, mm, tail, SVM_OP_ADD_RANGE);
+ 	}
+ 
++	/* xnack on, update mapping on GPUs with ACCESS_IN_PLACE */
++	if (p->xnack_enabled && prange->work_item.op == SVM_OP_ADD_RANGE) {
++		prange->work_item.op = SVM_OP_ADD_RANGE_AND_MAP;
++		pr_debug("change prange 0x%p [0x%lx 0x%lx] op %d\n",
++			 prange, prange->start, prange->last,
++			 SVM_OP_ADD_RANGE_AND_MAP);
++	}
+ 	return 0;
+ }
+ 
+@@ -1452,25 +1459,52 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
+ 		unsigned long start, unsigned long last)
+ {
+ 	struct svm_range_list *svms = prange->svms;
+-	int evicted_ranges;
++	struct kfd_process *p;
+ 	int r = 0;
+ 
+-	atomic_inc(&prange->invalid);
+-	evicted_ranges = atomic_inc_return(&svms->evicted_ranges);
+-	if (evicted_ranges != 1)
+-		return r;
++	p = container_of(svms, struct kfd_process, svms);
+ 
+-	pr_debug("evicting svms 0x%p range [0x%lx 0x%lx]\n",
+-		 prange->svms, prange->start, prange->last);
++	pr_debug("invalidate svms 0x%p prange [0x%lx 0x%lx] [0x%lx 0x%lx]\n",
++		 svms, prange->start, prange->last, start, last);
+ 
+-	/* First eviction, stop the queues */
+-	r = kgd2kfd_quiesce_mm(mm);
+-	if (r)
+-		pr_debug("failed to quiesce KFD\n");
++	if (!p->xnack_enabled) {
++		int evicted_ranges;
+ 
+-	pr_debug("schedule to restore svm %p ranges\n", svms);
+-	schedule_delayed_work(&svms->restore_work,
+-		msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
++		atomic_inc(&prange->invalid);
++		evicted_ranges = atomic_inc_return(&svms->evicted_ranges);
++		if (evicted_ranges != 1)
++			return r;
++
++		pr_debug("evicting svms 0x%p range [0x%lx 0x%lx]\n",
++			 prange->svms, prange->start, prange->last);
++
++		/* First eviction, stop the queues */
++		r = kgd2kfd_quiesce_mm(mm);
++		if (r)
++			pr_debug("failed to quiesce KFD\n");
++
++		pr_debug("schedule to restore svm %p ranges\n", svms);
++		schedule_delayed_work(&svms->restore_work,
++			msecs_to_jiffies(AMDGPU_SVM_RANGE_RESTORE_DELAY_MS));
++	} else {
++		struct svm_range *pchild;
++		unsigned long s, l;
++
++		pr_debug("invalidate unmap svms 0x%p [0x%lx 0x%lx] from GPUs\n",
++			 prange->svms, start, last);
++		list_for_each_entry(pchild, &prange->child_list, child_list) {
++			mutex_lock_nested(&pchild->lock, 1);
++			s = max(start, pchild->start);
++			l = min(last, pchild->last);
++			if (l >= s)
++				svm_range_unmap_from_gpus(pchild, s, l);
++			mutex_unlock(&pchild->lock);
++		}
++		s = max(start, prange->start);
++		l = min(last, prange->last);
++		if (l >= s)
++			svm_range_unmap_from_gpus(prange, s, l);
++	}
+ 
+ 	return r;
+ }
+@@ -1673,12 +1707,25 @@ svm_range_handle_list_op(struct svm_range_list *svms, struct svm_range *prange)
+ 			 svms, prange, prange->start, prange->last);
+ 		svm_range_update_notifier_and_interval_tree(mm, prange);
+ 		break;
++	case SVM_OP_UPDATE_RANGE_NOTIFIER_AND_MAP:
++		pr_debug("update and map 0x%p prange 0x%p [0x%lx 0x%lx]\n",
++			 svms, prange, prange->start, prange->last);
++		svm_range_update_notifier_and_interval_tree(mm, prange);
++		/* TODO: implement deferred validation and mapping */
++		break;
+ 	case SVM_OP_ADD_RANGE:
+ 		pr_debug("add 0x%p prange 0x%p [0x%lx 0x%lx]\n", svms, prange,
+ 			 prange->start, prange->last);
+ 		svm_range_add_to_svms(prange);
+ 		svm_range_add_notifier_locked(mm, prange);
+ 		break;
++	case SVM_OP_ADD_RANGE_AND_MAP:
++		pr_debug("add and map 0x%p prange 0x%p [0x%lx 0x%lx]\n", svms,
++			 prange, prange->start, prange->last);
++		svm_range_add_to_svms(prange);
++		svm_range_add_notifier_locked(mm, prange);
++		/* TODO: implement deferred validation and mapping */
++		break;
+ 	default:
+ 		WARN_ONCE(1, "Unknown prange 0x%p work op %d\n", prange,
+ 			 prange->work_item.op);
+@@ -2301,7 +2348,7 @@ svm_range_set_attr(struct kfd_process *p, uint64_t start, uint64_t size,
+ 		if (r)
+ 			goto out_unlock_range;
+ 
+-		if (migrated) {
++		if (migrated && !p->xnack_enabled) {
+ 			pr_debug("restore_work will update mappings of GPUs\n");
+ 			mutex_unlock(&prange->migrate_mutex);
+ 			continue;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+index 37cfa1689c4f..d88926d2855f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+@@ -44,7 +44,9 @@ enum svm_work_list_ops {
+ 	SVM_OP_NULL,
+ 	SVM_OP_UNMAP_RANGE,
+ 	SVM_OP_UPDATE_RANGE_NOTIFIER,
+-	SVM_OP_ADD_RANGE
++	SVM_OP_UPDATE_RANGE_NOTIFIER_AND_MAP,
++	SVM_OP_ADD_RANGE,
++	SVM_OP_ADD_RANGE_AND_MAP
+ };
+ 
+ struct svm_work_list_item {
+-- 
+2.27.0
+

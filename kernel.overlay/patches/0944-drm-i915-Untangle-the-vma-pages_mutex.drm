@@ -1,0 +1,78 @@
+From 11d0f56c4d2c16bbb7de87a88404e1f3eafe7bae Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
+Date: Tue, 1 Jun 2021 09:46:40 +0200
+Subject: [PATCH 0944/1247] drm/i915: Untangle the vma pages_mutex
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Any sleeping dma_resv lock taken while the vma pages_mutex is held
+will cause a lockdep splat.
+Move the i915_gem_object_pin_pages() call out of the pages_mutex
+critical section.
+
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210601074654.3103-2-thomas.hellstrom@linux.intel.com
+---
+ drivers/gpu/drm/i915/i915_vma.c | 29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index b319fd3f91cc..0f227f28b280 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -800,32 +800,37 @@ static bool try_qad_pin(struct i915_vma *vma, unsigned int flags)
+ static int vma_get_pages(struct i915_vma *vma)
+ {
+ 	int err = 0;
++	bool pinned_pages = false;
+ 
+ 	if (atomic_add_unless(&vma->pages_count, 1, 0))
+ 		return 0;
+ 
++	if (vma->obj) {
++		err = i915_gem_object_pin_pages(vma->obj);
++		if (err)
++			return err;
++		pinned_pages = true;
++	}
++
+ 	/* Allocations ahoy! */
+-	if (mutex_lock_interruptible(&vma->pages_mutex))
+-		return -EINTR;
++	if (mutex_lock_interruptible(&vma->pages_mutex)) {
++		err = -EINTR;
++		goto unpin;
++	}
+ 
+ 	if (!atomic_read(&vma->pages_count)) {
+-		if (vma->obj) {
+-			err = i915_gem_object_pin_pages(vma->obj);
+-			if (err)
+-				goto unlock;
+-		}
+-
+ 		err = vma->ops->set_pages(vma);
+-		if (err) {
+-			if (vma->obj)
+-				i915_gem_object_unpin_pages(vma->obj);
++		if (err)
+ 			goto unlock;
+-		}
++		pinned_pages = false;
+ 	}
+ 	atomic_inc(&vma->pages_count);
+ 
+ unlock:
+ 	mutex_unlock(&vma->pages_mutex);
++unpin:
++	if (pinned_pages)
++		__i915_gem_object_unpin_pages(vma->obj);
+ 
+ 	return err;
+ }
+-- 
+2.27.0
+

@@ -1,0 +1,446 @@
+From 8813f39a883d9df3239f43f964ec80799d9a60f0 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 7 Apr 2021 18:19:58 -0400
+Subject: [PATCH 0087/1247] drm/amdkfd: Use drm_priv to pass VM from KFD to
+ amdgpu
+
+amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu needs the drm_priv to allow mmap
+to access the BO through the corresponding file descriptor. The VM can
+also be extracted from drm_priv, so drm_priv can replace the vm parameter
+in the kfd2kgd interface.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Philip Yang <philip.yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h    | 14 ++--
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 69 +++++++++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c      |  8 +--
+ .../drm/amd/amdkfd/kfd_device_queue_manager.c |  6 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h         |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c      | 23 +++----
+ 6 files changed, 67 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 5ffb07b02810..0d59bebd92af 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -236,20 +236,20 @@ uint8_t amdgpu_amdkfd_get_xgmi_hops_count(struct kgd_dev *dst, struct kgd_dev *s
+ /* GPUVM API */
+ int amdgpu_amdkfd_gpuvm_acquire_process_vm(struct kgd_dev *kgd,
+ 					struct file *filp, u32 pasid,
+-					void **vm, void **process_info,
++					void **process_info,
+ 					struct dma_fence **ef);
+-void amdgpu_amdkfd_gpuvm_release_process_vm(struct kgd_dev *kgd, void *vm);
+-uint64_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *vm);
++void amdgpu_amdkfd_gpuvm_release_process_vm(struct kgd_dev *kgd, void *drm_priv);
++uint64_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *drm_priv);
+ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		struct kgd_dev *kgd, uint64_t va, uint64_t size,
+-		void *vm, struct kgd_mem **mem,
++		void *drm_priv, struct kgd_mem **mem,
+ 		uint64_t *offset, uint32_t flags);
+ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 		struct kgd_dev *kgd, struct kgd_mem *mem, uint64_t *size);
+ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+-		struct kgd_dev *kgd, struct kgd_mem *mem, void *vm);
++		struct kgd_dev *kgd, struct kgd_mem *mem, void *drm_priv);
+ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+-		struct kgd_dev *kgd, struct kgd_mem *mem, void *vm);
++		struct kgd_dev *kgd, struct kgd_mem *mem, void *drm_priv);
+ int amdgpu_amdkfd_gpuvm_sync_memory(
+ 		struct kgd_dev *kgd, struct kgd_mem *mem, bool intr);
+ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_dev *kgd,
+@@ -260,7 +260,7 @@ int amdgpu_amdkfd_gpuvm_get_vm_fault_info(struct kgd_dev *kgd,
+ 					      struct kfd_vm_fault_info *info);
+ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct kgd_dev *kgd,
+ 				      struct dma_buf *dmabuf,
+-				      uint64_t va, void *vm,
++				      uint64_t va, void *drm_priv,
+ 				      struct kgd_mem **mem, uint64_t *size,
+ 				      uint64_t *mmap_offset);
+ int amdgpu_amdkfd_get_tile_config(struct kgd_dev *kgd,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 7d4118c8128a..dc86faa03b88 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -948,6 +948,13 @@ static int process_update_pds(struct amdkfd_process_info *process_info,
+ 	return 0;
+ }
+ 
++static struct amdgpu_vm *drm_priv_to_vm(struct drm_file *drm_priv)
++{
++	struct amdgpu_fpriv *fpriv = drm_priv->driver_priv;
++
++	return &fpriv->vm;
++}
++
+ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 		       struct dma_fence **ef)
+ {
+@@ -1036,15 +1043,19 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 
+ int amdgpu_amdkfd_gpuvm_acquire_process_vm(struct kgd_dev *kgd,
+ 					   struct file *filp, u32 pasid,
+-					   void **vm, void **process_info,
++					   void **process_info,
+ 					   struct dma_fence **ef)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-	struct drm_file *drm_priv = filp->private_data;
+-	struct amdgpu_fpriv *drv_priv = drm_priv->driver_priv;
+-	struct amdgpu_vm *avm = &drv_priv->vm;
++	struct amdgpu_fpriv *drv_priv;
++	struct amdgpu_vm *avm;
+ 	int ret;
+ 
++	ret = amdgpu_file_to_fpriv(filp, &drv_priv);
++	if (ret)
++		return ret;
++	avm = &drv_priv->vm;
++
+ 	/* Already a compute VM? */
+ 	if (avm->process_info)
+ 		return -EINVAL;
+@@ -1059,7 +1070,7 @@ int amdgpu_amdkfd_gpuvm_acquire_process_vm(struct kgd_dev *kgd,
+ 	if (ret)
+ 		return ret;
+ 
+-	*vm = (void *)avm;
++	amdgpu_vm_set_task_info(avm);
+ 
+ 	return 0;
+ }
+@@ -1100,15 +1111,17 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
+ 	}
+ }
+ 
+-void amdgpu_amdkfd_gpuvm_release_process_vm(struct kgd_dev *kgd, void *vm)
++void amdgpu_amdkfd_gpuvm_release_process_vm(struct kgd_dev *kgd, void *drm_priv)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-	struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
++	struct amdgpu_vm *avm;
+ 
+-	if (WARN_ON(!kgd || !vm))
++	if (WARN_ON(!kgd || !drm_priv))
+ 		return;
+ 
+-	pr_debug("Releasing process vm %p\n", vm);
++	avm = drm_priv_to_vm(drm_priv);
++
++	pr_debug("Releasing process vm %p\n", avm);
+ 
+ 	/* The original pasid of amdgpu vm has already been
+ 	 * released during making a amdgpu vm to a compute vm
+@@ -1119,9 +1132,9 @@ void amdgpu_amdkfd_gpuvm_release_process_vm(struct kgd_dev *kgd, void *vm)
+ 	amdgpu_vm_release_compute(adev, avm);
+ }
+ 
+-uint64_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *vm)
++uint64_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *drm_priv)
+ {
+-	struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
++	struct amdgpu_vm *avm = drm_priv_to_vm(drm_priv);
+ 	struct amdgpu_bo *pd = avm->root.base.bo;
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(pd->tbo.bdev);
+ 
+@@ -1132,11 +1145,11 @@ uint64_t amdgpu_amdkfd_gpuvm_get_process_page_dir(void *vm)
+ 
+ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		struct kgd_dev *kgd, uint64_t va, uint64_t size,
+-		void *vm, struct kgd_mem **mem,
++		void *drm_priv, struct kgd_mem **mem,
+ 		uint64_t *offset, uint32_t flags)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-	struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
++	struct amdgpu_vm *avm = drm_priv_to_vm(drm_priv);
+ 	enum ttm_bo_type bo_type = ttm_bo_type_device;
+ 	struct sg_table *sg = NULL;
+ 	uint64_t user_addr = 0;
+@@ -1347,10 +1360,10 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ }
+ 
+ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+-		struct kgd_dev *kgd, struct kgd_mem *mem, void *vm)
++		struct kgd_dev *kgd, struct kgd_mem *mem, void *drm_priv)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-	struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
++	struct amdgpu_vm *avm = drm_priv_to_vm(drm_priv);
+ 	int ret;
+ 	struct amdgpu_bo *bo;
+ 	uint32_t domain;
+@@ -1391,9 +1404,9 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 	pr_debug("Map VA 0x%llx - 0x%llx to vm %p domain %s\n",
+ 			mem->va,
+ 			mem->va + bo_size * (1 + mem->aql_queue),
+-			vm, domain_string(domain));
++			avm, domain_string(domain));
+ 
+-	ret = reserve_bo_and_vm(mem, vm, &ctx);
++	ret = reserve_bo_and_vm(mem, avm, &ctx);
+ 	if (unlikely(ret))
+ 		goto out;
+ 
+@@ -1437,7 +1450,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 	}
+ 
+ 	list_for_each_entry(entry, &mem->bo_va_list, bo_list) {
+-		if (entry->bo_va->base.vm == vm && !entry->is_mapped) {
++		if (entry->bo_va->base.vm == avm && !entry->is_mapped) {
+ 			pr_debug("\t map VA 0x%llx - 0x%llx in entry %p\n",
+ 					entry->va, entry->va + bo_size,
+ 					entry);
+@@ -1449,7 +1462,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 				goto map_bo_to_gpuvm_failed;
+ 			}
+ 
+-			ret = vm_update_pds(vm, ctx.sync);
++			ret = vm_update_pds(avm, ctx.sync);
+ 			if (ret) {
+ 				pr_err("Failed to update page directories\n");
+ 				goto map_bo_to_gpuvm_failed;
+@@ -1485,11 +1498,11 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ }
+ 
+ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+-		struct kgd_dev *kgd, struct kgd_mem *mem, void *vm)
++		struct kgd_dev *kgd, struct kgd_mem *mem, void *drm_priv)
+ {
+ 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
+-	struct amdkfd_process_info *process_info =
+-		((struct amdgpu_vm *)vm)->process_info;
++	struct amdgpu_vm *avm = drm_priv_to_vm(drm_priv);
++	struct amdkfd_process_info *process_info = avm->process_info;
+ 	unsigned long bo_size = mem->bo->tbo.base.size;
+ 	struct kfd_bo_va_list *entry;
+ 	struct bo_vm_reservation_context ctx;
+@@ -1497,7 +1510,7 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 
+ 	mutex_lock(&mem->lock);
+ 
+-	ret = reserve_bo_and_cond_vms(mem, vm, BO_VM_MAPPED, &ctx);
++	ret = reserve_bo_and_cond_vms(mem, avm, BO_VM_MAPPED, &ctx);
+ 	if (unlikely(ret))
+ 		goto out;
+ 	/* If no VMs were reserved, it means the BO wasn't actually mapped */
+@@ -1506,17 +1519,17 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 		goto unreserve_out;
+ 	}
+ 
+-	ret = vm_validate_pt_pd_bos((struct amdgpu_vm *)vm);
++	ret = vm_validate_pt_pd_bos(avm);
+ 	if (unlikely(ret))
+ 		goto unreserve_out;
+ 
+ 	pr_debug("Unmap VA 0x%llx - 0x%llx from vm %p\n",
+ 		mem->va,
+ 		mem->va + bo_size * (1 + mem->aql_queue),
+-		vm);
++		avm);
+ 
+ 	list_for_each_entry(entry, &mem->bo_va_list, bo_list) {
+-		if (entry->bo_va->base.vm == vm && entry->is_mapped) {
++		if (entry->bo_va->base.vm == avm && entry->is_mapped) {
+ 			pr_debug("\t unmap VA 0x%llx - 0x%llx from entry %p\n",
+ 					entry->va,
+ 					entry->va + bo_size,
+@@ -1642,14 +1655,14 @@ int amdgpu_amdkfd_gpuvm_get_vm_fault_info(struct kgd_dev *kgd,
+ 
+ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct kgd_dev *kgd,
+ 				      struct dma_buf *dma_buf,
+-				      uint64_t va, void *vm,
++				      uint64_t va, void *drm_priv,
+ 				      struct kgd_mem **mem, uint64_t *size,
+ 				      uint64_t *mmap_offset)
+ {
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)kgd;
++	struct amdgpu_vm *avm = drm_priv_to_vm(drm_priv);
+ 	struct drm_gem_object *obj;
+ 	struct amdgpu_bo *bo;
+-	struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
+ 
+ 	if (dma_buf->ops != &amdgpu_dmabuf_ops)
+ 		/* Can't handle non-graphics buffers */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 43de260b2230..97da1632f504 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1297,7 +1297,7 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 
+ 	err = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		dev->kgd, args->va_addr, args->size,
+-		pdd->vm, (struct kgd_mem **) &mem, &offset,
++		pdd->drm_priv, (struct kgd_mem **) &mem, &offset,
+ 		flags);
+ 
+ 	if (err)
+@@ -1448,7 +1448,7 @@ static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+ 			goto get_mem_obj_from_handle_failed;
+ 		}
+ 		err = amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+-			peer->kgd, (struct kgd_mem *)mem, peer_pdd->vm);
++			peer->kgd, (struct kgd_mem *)mem, peer_pdd->drm_priv);
+ 		if (err) {
+ 			pr_err("Failed to map to gpu %d/%d\n",
+ 			       i, args->n_devices);
+@@ -1555,7 +1555,7 @@ static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
+ 			goto get_mem_obj_from_handle_failed;
+ 		}
+ 		err = amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+-			peer->kgd, (struct kgd_mem *)mem, peer_pdd->vm);
++			peer->kgd, (struct kgd_mem *)mem, peer_pdd->drm_priv);
+ 		if (err) {
+ 			pr_err("Failed to unmap from gpu %d/%d\n",
+ 			       i, args->n_devices);
+@@ -1701,7 +1701,7 @@ static int kfd_ioctl_import_dmabuf(struct file *filep,
+ 	}
+ 
+ 	r = amdgpu_amdkfd_gpuvm_import_dmabuf(dev->kgd, dmabuf,
+-					      args->va_addr, pdd->vm,
++					      args->va_addr, pdd->drm_priv,
+ 					      (struct kgd_mem **)&mem, &size,
+ 					      NULL);
+ 	if (r)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index d3eaa1549bd7..98c2046c7331 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -738,7 +738,7 @@ static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
+ 
+ 	pdd = qpd_to_pdd(qpd);
+ 	/* Retrieve PD base */
+-	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->vm);
++	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->drm_priv);
+ 
+ 	dqm_lock(dqm);
+ 	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
+@@ -821,7 +821,7 @@ static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
+ 
+ 	pdd = qpd_to_pdd(qpd);
+ 	/* Retrieve PD base */
+-	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->vm);
++	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->drm_priv);
+ 
+ 	dqm_lock(dqm);
+ 	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
+@@ -873,7 +873,7 @@ static int register_process(struct device_queue_manager *dqm,
+ 
+ 	pdd = qpd_to_pdd(qpd);
+ 	/* Retrieve PD base */
+-	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->vm);
++	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->drm_priv);
+ 
+ 	dqm_lock(dqm);
+ 	list_add(&n->list, &dqm->queues);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 0b6595f7acda..c6357ceb247d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -669,7 +669,7 @@ struct kfd_process_device {
+ 
+ 	/* VM context for GPUVM allocations */
+ 	struct file *drm_file;
+-	void *vm;
++	void *drm_priv;
+ 
+ 	/* GPUVM allocations storage */
+ 	struct idr alloc_idr;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index d97e330a5022..209e9edd6ddd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -647,7 +647,7 @@ static void kfd_process_free_gpuvm(struct kgd_mem *mem,
+ {
+ 	struct kfd_dev *dev = pdd->dev;
+ 
+-	amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(dev->kgd, mem, pdd->vm);
++	amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(dev->kgd, mem, pdd->drm_priv);
+ 	amdgpu_amdkfd_gpuvm_free_memory_of_gpu(dev->kgd, mem, NULL);
+ }
+ 
+@@ -667,11 +667,11 @@ static int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
+ 	int err;
+ 
+ 	err = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(kdev->kgd, gpu_va, size,
+-						 pdd->vm, &mem, NULL, flags);
++						 pdd->drm_priv, &mem, NULL, flags);
+ 	if (err)
+ 		goto err_alloc_mem;
+ 
+-	err = amdgpu_amdkfd_gpuvm_map_memory_to_gpu(kdev->kgd, mem, pdd->vm);
++	err = amdgpu_amdkfd_gpuvm_map_memory_to_gpu(kdev->kgd, mem, pdd->drm_priv);
+ 	if (err)
+ 		goto err_map_mem;
+ 
+@@ -901,10 +901,10 @@ static void kfd_process_device_free_bos(struct kfd_process_device *pdd)
+ 		for (i = 0; i < p->n_pdds; i++) {
+ 			struct kfd_process_device *peer_pdd = p->pdds[i];
+ 
+-			if (!peer_pdd->vm)
++			if (!peer_pdd->drm_priv)
+ 				continue;
+ 			amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+-				peer_pdd->dev->kgd, mem, peer_pdd->vm);
++				peer_pdd->dev->kgd, mem, peer_pdd->drm_priv);
+ 		}
+ 
+ 		amdgpu_amdkfd_gpuvm_free_memory_of_gpu(pdd->dev->kgd, mem, NULL);
+@@ -932,7 +932,7 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
+ 
+ 		if (pdd->drm_file) {
+ 			amdgpu_amdkfd_gpuvm_release_process_vm(
+-					pdd->dev->kgd, pdd->vm);
++					pdd->dev->kgd, pdd->drm_priv);
+ 			fput(pdd->drm_file);
+ 		}
+ 
+@@ -1375,7 +1375,7 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ 	if (!drm_file)
+ 		return -EINVAL;
+ 
+-	if (pdd->vm)
++	if (pdd->drm_priv)
+ 		return -EBUSY;
+ 
+ 	p = pdd->process;
+@@ -1383,13 +1383,12 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ 
+ 	ret = amdgpu_amdkfd_gpuvm_acquire_process_vm(
+ 		dev->kgd, drm_file, p->pasid,
+-		&pdd->vm, &p->kgd_process_info, &p->ef);
++		&p->kgd_process_info, &p->ef);
+ 	if (ret) {
+ 		pr_err("Failed to create process VM object\n");
+ 		return ret;
+ 	}
+-
+-	amdgpu_vm_set_task_info(pdd->vm);
++	pdd->drm_priv = drm_file->private_data;
+ 
+ 	ret = kfd_process_device_reserve_ib_mem(pdd);
+ 	if (ret)
+@@ -1405,7 +1404,7 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ err_init_cwsr:
+ err_reserve_ib_mem:
+ 	kfd_process_device_free_bos(pdd);
+-	pdd->vm = NULL;
++	pdd->drm_priv = NULL;
+ 
+ 	return ret;
+ }
+@@ -1429,7 +1428,7 @@ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	if (!pdd->vm)
++	if (!pdd->drm_priv)
+ 		return ERR_PTR(-ENODEV);
+ 
+ 	/*
+-- 
+2.27.0
+

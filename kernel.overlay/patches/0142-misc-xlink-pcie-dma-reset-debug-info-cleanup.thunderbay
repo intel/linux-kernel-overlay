@@ -1,0 +1,343 @@
+From 2388fce02f7d2df529d057e45a3e6f0533c2d268 Mon Sep 17 00:00:00 2001
+From: Srikanth Thokala <srikanth.thokala@intel.com>
+Date: Tue, 22 Jun 2021 04:27:06 +0530
+Subject: [PATCH 142/170] misc: xlink-pcie: dma reset debug info cleanup
+
+Remove debug info from dma reset call backs.
+
+Signed-off-by: Srikanth Thokala <srikanth.thokala@intel.com>
+---
+ drivers/misc/xlink-pcie/local_host/dma.c | 166 +++++++++++++++++++++--
+ drivers/misc/xlink-pcie/local_host/epf.h |  12 ++
+ 2 files changed, 168 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/xlink-pcie/local_host/dma.c b/drivers/misc/xlink-pcie/local_host/dma.c
+index e841c7f6a29d..67d8f27416ce 100644
+--- a/drivers/misc/xlink-pcie/local_host/dma.c
++++ b/drivers/misc/xlink-pcie/local_host/dma.c
+@@ -86,8 +86,8 @@
+ #define PM_LINKST_IN_L1			BIT(10)
+ 
+ #define DMA_POLLING_TIMEOUT		1000000
+-#define DMA_ENABLE_TIMEOUT		1000
+ #define DMA_PCIE_PM_L1_TIMEOUT		20
++#define DMA_HRTIMER_PERIOD		(5000 * 1000)
+ 
+ struct __packed pcie_dma_reg {
+ 	u32 dma_ctrl_data_arb_prior;
+@@ -124,6 +124,7 @@ struct __packed pcie_dma_reg {
+ 	u32 dma_read_int_clear;
+ 	u32 reserved10;
+ 	u32 dma_read_err_status_low;
++	u32 dma_read_err_status_high;
+ 	u32 dma_rd_err_sts_h;
+ 	u32 reserved11[2];
+ 	u32 dma_read_linked_list_err_en;
+@@ -209,11 +210,10 @@ static int intel_xpcie_ep_dma_disable(void __iomem *dma_base,
+ 	iowrite32(0, ll_err);
+ 
+ 	/* Wait until the engine is disabled. */
+-	for (i = 0; i < DMA_ENABLE_TIMEOUT; i++) {
++	for (i = 0; i < DMA_POLLING_TIMEOUT; i++)
+ 		if (!(ioread32(engine_en) & DMA_ENGINE_EN_MASK))
+ 			return 0;
+-		msleep(20);
+-	}
++
+ 
+ 	return -EBUSY;
+ }
+@@ -364,12 +364,14 @@ intel_xpcie_ep_dma_setup_ll_descs(struct __iomem pcie_dma_chan * dma_chan,
+ 
+ int intel_xpcie_ep_dma_write_ll(struct pci_epf *epf, int chan, int descs_num)
+ {
++	unsigned long dma_time_period_us = DMA_HRTIMER_PERIOD;
+ 	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
+ 	void __iomem *dma_base = xpcie_epf->dma_base;
+ 	struct __iomem pcie_dma_chan * dma_chan;
+ 	struct xpcie_dma_ll_desc_buf *desc_buf;
+ 	struct __iomem pcie_dma_reg * dma_reg =
+ 				(struct __iomem pcie_dma_reg *)(dma_base);
++	ktime_t free_tx_dma_tp;
+ 	int rc;
+ #if (!IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	int i;
+@@ -396,6 +398,11 @@ int intel_xpcie_ep_dma_write_ll(struct pci_epf *epf, int chan, int descs_num)
+ 	xpcie_epf->dma_wr_done = false;
+ #endif
+ 
++	if (!hrtimer_active(&xpcie_epf->free_tx_dma_timer)) {
++		free_tx_dma_tp = ktime_set(0, dma_time_period_us * 1000ULL);
++		hrtimer_start(&xpcie_epf->free_tx_dma_timer, free_tx_dma_tp, HRTIMER_MODE_REL);
++	}
++
+ 	/* Start DMA transfer. */
+ 	rc = intel_xpcie_ep_dma_doorbell(xpcie_epf, chan,
+ 					 (void __iomem *)
+@@ -421,6 +428,23 @@ int intel_xpcie_ep_dma_write_ll(struct pci_epf *epf, int chan, int descs_num)
+ 	/* Wait for DMA transfer to complete. */
+ 	rc = wait_event_interruptible(xpcie_epf->dma_wr_wq,
+ 				      xpcie_epf->dma_wr_done);
++	if (atomic_read(&xpcie_epf->dma_wr_eng_reset_cnt)) {
++		atomic_set(&xpcie_epf->dma_wr_eng_reset_cnt, 0);
++		dev_info(&xpcie_epf->epf->dev,
++			 "[TX_DMA_TIMER_CB] dma write engine reset\n");
++		if (xpcie_epf->dma_wr_rc & 0xffff)
++			dev_info(&xpcie_epf->epf->dev,
++				 "[TX_DMA_TIMER_CB]: dma err -EIO\n");
++		if (xpcie_epf->dma_wr_rc & 0xffff0000)
++			dev_info(&xpcie_epf->epf->dev,
++				 "[TX_DMA_TIMER_CB]: dma reset -EBUSY\n");
++
++		dev_info(&xpcie_epf->epf->dev,
++			 "[TX_DMA_TIMER_CB] dma_write_int_status: 0x%x\n",
++			 xpcie_epf->dma_wr_int_status);
++		dev_info(&xpcie_epf->epf->dev, "dma_write_err_status: 0x%x\n",
++			 xpcie_epf->dma_wr_err_status);
++	}
+ #endif
+ 
+ 	rc = intel_xpcie_ep_dma_err_status((void __iomem *)
+@@ -449,12 +473,14 @@ int intel_xpcie_ep_dma_write_ll(struct pci_epf *epf, int chan, int descs_num)
+ 
+ int intel_xpcie_ep_dma_read_ll(struct pci_epf *epf, int chan, int descs_num)
+ {
++	unsigned long dma_time_period_us = DMA_HRTIMER_PERIOD;
+ 	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
+ 	void __iomem *dma_base = xpcie_epf->dma_base;
+ 	struct xpcie_dma_ll_desc_buf *desc_buf;
+ 	struct __iomem pcie_dma_reg * dma_reg =
+ 				(struct __iomem pcie_dma_reg *)(dma_base);
+ 	struct __iomem pcie_dma_chan * dma_chan;
++	ktime_t free_rx_dma_tp;
+ 	int rc;
+ #if (!IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	int i;
+@@ -481,6 +507,11 @@ int intel_xpcie_ep_dma_read_ll(struct pci_epf *epf, int chan, int descs_num)
+ 	xpcie_epf->dma_rd_done = false;
+ #endif
+ 
++	if (!hrtimer_active(&xpcie_epf->free_rx_dma_timer)) {
++		free_rx_dma_tp = ktime_set(0, dma_time_period_us * 1000ULL);
++		hrtimer_start(&xpcie_epf->free_rx_dma_timer, free_rx_dma_tp, HRTIMER_MODE_REL);
++	}
++
+ 	/* Start DMA transfer. */
+ 	rc = intel_xpcie_ep_dma_doorbell(xpcie_epf, chan,
+ 					 (void __iomem *)
+@@ -506,6 +537,24 @@ int intel_xpcie_ep_dma_read_ll(struct pci_epf *epf, int chan, int descs_num)
+ 	/* Wait for DMA transfer to complete. */
+ 	rc = wait_event_interruptible(xpcie_epf->dma_rd_wq,
+ 				      xpcie_epf->dma_rd_done);
++	if (atomic_read(&xpcie_epf->dma_rd_eng_reset_cnt)) {
++		atomic_set(&xpcie_epf->dma_rd_eng_reset_cnt, 0);
++		dev_info(&xpcie_epf->epf->dev,
++			 "[RX_DMA_TIMER_CB] dma read engine reset\n");
++		if (xpcie_epf->dma_rd_rc)
++			dev_info(&xpcie_epf->epf->dev,
++				 "[RX_DMA_TIMER_CB]: dma reset -EBUSY\n");
++
++		dev_info(&xpcie_epf->epf->dev,
++			 "[RX_DMA_TIMER_CB] dma_read_int_status: 0x%x\n",
++			 xpcie_epf->dma_rd_int_status);
++		dev_info(&xpcie_epf->epf->dev,
++			 "[RX_DMA_TIMER_CB] dma_read_err_status_low: 0x%x\n",
++			 xpcie_epf->dma_rd_err_status_low);
++		dev_info(&xpcie_epf->epf->dev,
++			 "[RX_DMA_TIMER_CB] dma_read_err_status_high: 0x%x\n",
++			 xpcie_epf->dma_rd_err_status_high);
++	}
+ #endif
+ 
+ 	rc = intel_xpcie_ep_dma_err_status((void __iomem *)
+@@ -598,6 +647,32 @@ static int intel_xpcie_ep_dma_alloc_ll_descs_mem(struct xpcie_epf *xpcie_epf)
+ 	return 0;
+ }
+ 
++static int intel_xpcie_ep_dma_reset_read_engine(struct pci_epf *epf)
++{
++	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
++
++	/* Disable the DMA read engine. */
++	if (intel_xpcie_ep_dma_disable(xpcie_epf->dma_base, READ_ENGINE))
++		return -EBUSY;
++
++	intel_xpcie_ep_dma_enable(xpcie_epf->dma_base, READ_ENGINE);
++
++	return 0;
++}
++
++static int intel_xpcie_ep_dma_reset_write_engine(struct pci_epf *epf)
++{
++	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
++
++	/* Disable the DMA write engine. */
++	if (intel_xpcie_ep_dma_disable(xpcie_epf->dma_base, WRITE_ENGINE))
++		return -EBUSY;
++
++	intel_xpcie_ep_dma_enable(xpcie_epf->dma_base, WRITE_ENGINE);
++
++	return 0;
++}
++
+ void intel_xpcie_ep_stop_dma(struct pci_epf *epf)
+ {
+ 	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
+@@ -640,11 +715,8 @@ static irqreturn_t intel_xpcie_ep_dma_wr_interrupt(int irq, void *args)
+ 	struct xpcie_epf *xpcie_epf = args;
+ 	void __iomem *dma_base = xpcie_epf->dma_base;
+ 	struct pcie_dma_reg *dma_reg = (struct pcie_dma_reg *)dma_base;
+-	struct pcie_dma_chan *dma_chan;
+ #if (IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	int chan = xpcie_epf->epf->func_no;
+-	dma_chan = (struct pcie_dma_chan *)
+-		(dma_base + dma_chan_offset[WRITE_ENGINE][chan]);
+ 
+ 	if (ioread32(&dma_reg->dma_write_int_status) &
+ 		(DMA_ABORT_INTERRUPT_CH_MASK(chan) |
+@@ -652,6 +724,8 @@ static irqreturn_t intel_xpcie_ep_dma_wr_interrupt(int irq, void *args)
+ 		iowrite32(DMA_DONE_INTERRUPT_CH_MASK(chan),
+ 			  &dma_reg->dma_write_int_clear);
+ 
++		if (hrtimer_active(&xpcie_epf->free_tx_dma_timer))
++			hrtimer_cancel(&xpcie_epf->free_tx_dma_timer);
+ 		xpcie_epf->dma_wr_done = true;
+ 		wake_up_interruptible(&xpcie_epf->dma_wr_wq);
+ 	}
+@@ -664,18 +738,17 @@ static irqreturn_t intel_xpcie_ep_dma_rd_interrupt(int irq, void *args)
+ 	struct xpcie_epf *xpcie_epf = args;
+ 	void __iomem *dma_base = xpcie_epf->dma_base;
+ 	struct pcie_dma_reg *dma_reg = (struct pcie_dma_reg *)dma_base;
+-	struct pcie_dma_chan *dma_chan;
+ #if (IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ 	int chan = xpcie_epf->epf->func_no;
+ 
+-	dma_chan = (struct pcie_dma_chan *)
+-		(dma_base + dma_chan_offset[READ_ENGINE][chan]);
+ 	if (ioread32(&dma_reg->dma_read_int_status) &
+ 		(DMA_ABORT_INTERRUPT_CH_MASK(chan) |
+ 		 DMA_DONE_INTERRUPT_CH_MASK(chan))) {
+ 		iowrite32(DMA_DONE_INTERRUPT_CH_MASK(chan),
+ 			  &dma_reg->dma_read_int_clear);
+ 
++		if (hrtimer_active(&xpcie_epf->free_rx_dma_timer))
++			hrtimer_cancel(&xpcie_epf->free_rx_dma_timer);
+ 		xpcie_epf->dma_rd_done = true;
+ 		wake_up_interruptible(&xpcie_epf->dma_rd_wq);
+ 	}
+@@ -683,10 +756,75 @@ static irqreturn_t intel_xpcie_ep_dma_rd_interrupt(int irq, void *args)
+ 	return IRQ_HANDLED;
+ }
+ 
++static enum hrtimer_restart
++free_rx_dma_timer_cb(struct hrtimer *free_rx_dma_timer)
++{
++	struct xpcie_epf *xpcie_epf =
++		container_of(free_rx_dma_timer,
++			     struct xpcie_epf, free_rx_dma_timer);
++	void __iomem *dma_base = xpcie_epf->dma_base;
++	struct pcie_dma_reg *dma_reg = (struct pcie_dma_reg *)dma_base;
++	void __iomem *err_status;
++
++	atomic_inc(&xpcie_epf->dma_rd_eng_reset_cnt);
++
++	err_status = &dma_reg->dma_read_int_status;
++	xpcie_epf->dma_rd_int_status = ioread32(err_status);
++
++	err_status = &dma_reg->dma_read_err_status_low;
++	xpcie_epf->dma_rd_err_status_low = ioread32(err_status);
++	err_status = &dma_reg->dma_read_err_status_high;
++	xpcie_epf->dma_rd_err_status_high = ioread32(err_status);
++
++	/* RESET DMA READ_ENGINE */
++	xpcie_epf->dma_rd_rc =
++			intel_xpcie_ep_dma_reset_read_engine(xpcie_epf->epf);
++	xpcie_epf->dma_rd_done = true;
++	wake_up_interruptible(&xpcie_epf->dma_rd_wq);
++
++	return HRTIMER_NORESTART;
++}
++
++static enum hrtimer_restart
++free_tx_dma_timer_cb(struct hrtimer *free_tx_dma_timer)
++{
++	struct xpcie_epf *xpcie_epf =
++		container_of(free_tx_dma_timer,
++			     struct xpcie_epf, free_tx_dma_timer);
++	void __iomem *dma_base = xpcie_epf->dma_base;
++	struct pcie_dma_reg *dma_reg = (struct pcie_dma_reg *)dma_base;
++	int func_no = xpcie_epf->epf->func_no;
++	void __iomem *err_status;
++	int ret1 = 0, ret2 = 0;
++
++	atomic_inc(&xpcie_epf->dma_wr_eng_reset_cnt);
++
++	err_status = &dma_reg->dma_write_int_status;
++	xpcie_epf->dma_wr_int_status = ioread32(err_status);
++
++	ret1 = intel_xpcie_ep_dma_err_status(&dma_reg->dma_write_err_status, func_no);
++
++	err_status = &dma_reg->dma_write_err_status;
++	xpcie_epf->dma_wr_err_status = ioread32(err_status);
++
++	/* RESET DMA WRITE_ENGINE */
++	ret2 = intel_xpcie_ep_dma_reset_write_engine(xpcie_epf->epf);
++
++	xpcie_epf->dma_wr_rc = ret1 | (ret2 << 16);
++
++	xpcie_epf->dma_wr_done = true;
++	wake_up_interruptible(&xpcie_epf->dma_wr_wq);
++
++	return HRTIMER_NORESTART;
++}
++
+ int intel_xpcie_ep_dma_uninit(struct pci_epf *epf)
+ {
+ 	struct xpcie_epf *xpcie_epf = epf_get_drvdata(epf);
+ 
++	hrtimer_cancel(&xpcie_epf->free_tx_dma_timer);
++	hrtimer_cancel(&xpcie_epf->free_rx_dma_timer);
++
+ 	if (intel_xpcie_ep_dma_disable(xpcie_epf->dma_base, WRITE_ENGINE) ||
+ 	    intel_xpcie_ep_dma_disable(xpcie_epf->dma_base, READ_ENGINE))
+ 		return -EBUSY;
+@@ -736,5 +874,13 @@ int intel_xpcie_ep_dma_init(struct pci_epf *epf)
+ 	}
+ #endif
+ 
++	hrtimer_init(&xpcie_epf->free_tx_dma_timer,
++		     CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	xpcie_epf->free_tx_dma_timer.function = free_tx_dma_timer_cb;
++
++	hrtimer_init(&xpcie_epf->free_rx_dma_timer,
++		     CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	xpcie_epf->free_rx_dma_timer.function = free_rx_dma_timer_cb;
++
+ 	return intel_xpcie_ep_dma_reset(epf);
+ }
+diff --git a/drivers/misc/xlink-pcie/local_host/epf.h b/drivers/misc/xlink-pcie/local_host/epf.h
+index 4288c7fec43b..8dadfe8e6ac4 100644
+--- a/drivers/misc/xlink-pcie/local_host/epf.h
++++ b/drivers/misc/xlink-pcie/local_host/epf.h
+@@ -104,6 +104,18 @@ struct xpcie_epf {
+ 	struct xpcie_dma_ll_desc_buf     tx_desc_buf;
+ 	struct xpcie_dma_ll_desc_buf     rx_desc_buf;
+ 
++	struct hrtimer			free_tx_dma_timer;
++	struct hrtimer			free_rx_dma_timer;
++	atomic_t			dma_wr_eng_reset_cnt;
++	u32				dma_wr_int_status;
++	u32				dma_wr_err_status;
++	int				dma_wr_rc;
++	atomic_t			dma_rd_eng_reset_cnt;
++	u32				dma_rd_int_status;
++	u32				dma_rd_err_status_low;
++	u32				dma_rd_err_status_high;
++	int				dma_rd_rc;
++
+ #if (IS_ENABLED(CONFIG_ARCH_THUNDERBAY))
+ #define MXLK_MAX_NAME_LEN (32)
+ 	char				name[MXLK_MAX_NAME_LEN];
+-- 
+2.27.0
+

@@ -1,0 +1,118 @@
+From 3113e90eef2e8a4333b7c5d846690cf7756e123a Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Wed, 16 Dec 2020 17:21:27 +0800
+Subject: [PATCH 1084/1247] drm/amdgpu: introduce a stolen reserved buffer to
+ protect specific buffer region (v2)
+
+Some ASICs such as Yellow Carp needs to reserve a region of video memory
+to avoid access from driver. So this patch is to introduce a stolen
+reserved buffer to protect specific buffer region.
+
+v2: free this buffer in amdgpu_ttm_fini.
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Acked-and-Tested-by: Aaron Liu <aaron.liu@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 16 ++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 10 ++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c  |  1 +
+ 5 files changed, 32 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 85b8bfb8857b..b89018ef6bd3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -785,3 +785,19 @@ uint64_t amdgpu_gmc_vram_cpu_pa(struct amdgpu_device *adev, struct amdgpu_bo *bo
+ {
+ 	return amdgpu_bo_gpu_offset(bo) - adev->gmc.vram_start + adev->gmc.aper_base;
+ }
++
++void amdgpu_gmc_get_reserved_allocation(struct amdgpu_device *adev)
++{
++	/* Some ASICs need to reserve a region of video memory to avoid access
++	 * from driver */
++	switch (adev->asic_type) {
++	case CHIP_YELLOW_CARP:
++		adev->mman.stolen_reserved_offset = 0x1ffb0000;
++		adev->mman.stolen_reserved_size = 64 * PAGE_SIZE;
++		break;
++	default:
++		adev->mman.stolen_reserved_offset = 0;
++		adev->mman.stolen_reserved_size = 0;
++		break;
++	}
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 6aa1d52d3aee..e55201134a01 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -332,6 +332,7 @@ amdgpu_gmc_set_vm_fault_masks(struct amdgpu_device *adev, int hub_type,
+ 			      bool enable);
+ 
+ void amdgpu_gmc_get_vbios_allocations(struct amdgpu_device *adev);
++void amdgpu_gmc_get_reserved_allocation(struct amdgpu_device *adev);
+ 
+ void amdgpu_gmc_init_pdb0(struct amdgpu_device *adev);
+ uint64_t amdgpu_gmc_vram_mc2pa(struct amdgpu_device *adev, uint64_t mc_addr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index cf8eea33bcdd..390fe413aeab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1719,6 +1719,13 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 				       NULL);
+ 	if (r)
+ 		return r;
++	r = amdgpu_bo_create_kernel_at(adev, adev->mman.stolen_reserved_offset,
++				       adev->mman.stolen_reserved_size,
++				       AMDGPU_GEM_DOMAIN_VRAM,
++				       &adev->mman.stolen_reserved_memory,
++				       NULL);
++	if (r)
++		return r;
+ 
+ 	DRM_INFO("amdgpu: %uM of VRAM memory ready\n",
+ 		 (unsigned) (adev->gmc.real_vram_size / (1024 * 1024)));
+@@ -1788,6 +1795,9 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 	amdgpu_bo_free_kernel(&adev->mman.stolen_extended_memory, NULL, NULL);
+ 	/* return the IP Discovery TMR memory back to VRAM */
+ 	amdgpu_bo_free_kernel(&adev->mman.discovery_memory, NULL, NULL);
++	if (adev->mman.stolen_reserved_size)
++		amdgpu_bo_free_kernel(&adev->mman.stolen_reserved_memory,
++				      NULL, NULL);
+ 	amdgpu_ttm_fw_reserve_vram_fini(adev);
+ 
+ 	amdgpu_vram_mgr_fini(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 74a7021592c3..e69f3e8e06e5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -84,6 +84,10 @@ struct amdgpu_mman {
+ 	struct amdgpu_bo	*stolen_extended_memory;
+ 	bool			keep_stolen_vga_memory;
+ 
++	struct amdgpu_bo	*stolen_reserved_memory;
++	uint64_t		stolen_reserved_offset;
++	uint64_t		stolen_reserved_size;
++
+ 	/* discovery */
+ 	uint8_t				*discovery_bin;
+ 	uint32_t			discovery_tmr_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+index 719a7dcd37d1..439513ed0dd3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+@@ -936,6 +936,7 @@ static int gmc_v10_0_sw_init(void *handle)
+ 		return r;
+ 
+ 	amdgpu_gmc_get_vbios_allocations(adev);
++	amdgpu_gmc_get_reserved_allocation(adev);
+ 
+ 	/* Memory manager */
+ 	r = amdgpu_bo_init(adev);
+-- 
+2.27.0
+

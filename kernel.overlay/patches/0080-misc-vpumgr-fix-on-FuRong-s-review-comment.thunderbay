@@ -1,0 +1,523 @@
+From b9c8e1f3eb5f30cd7634357736db4aea9ade6113 Mon Sep 17 00:00:00 2001
+From: "Li, Tingqian" <tingqian.li@intel.com>
+Date: Thu, 12 Nov 2020 08:36:41 +0800
+Subject: [PATCH 080/170] misc: vpumgr: fix on FuRong's review comment
+
+* use offsetof
+* use dev_xxx instead of pr_xxx
+* change vcm msg payload size to fit page size
+* add function description to few important functions
+* add checks on in_len in vcm_submit()
+* add idr_destroy() in error of vcm_init
+* changed smm_xxx ioctl handler return type as int
+* add check for not found case in smm_unimport
+
+Signed-off-by: Li, Tingqian <tingqian.li@intel.com>
+---
+ drivers/misc/vpumgr/vpu_mgr.c |  16 ++--
+ drivers/misc/vpumgr/vpu_smm.c |  47 +++++------
+ drivers/misc/vpumgr/vpu_smm.h |   8 +-
+ drivers/misc/vpumgr/vpu_vcm.c | 154 ++++++++++++++++++++++------------
+ drivers/misc/vpumgr/vpu_vcm.h |   2 +-
+ 5 files changed, 137 insertions(+), 90 deletions(-)
+
+diff --git a/drivers/misc/vpumgr/vpu_mgr.c b/drivers/misc/vpumgr/vpu_mgr.c
+index 00dee1ae8eb4..75be64ebc3b0 100644
+--- a/drivers/misc/vpumgr/vpu_mgr.c
++++ b/drivers/misc/vpumgr/vpu_mgr.c
+@@ -57,6 +57,7 @@ static u32 get_sw_device_id(int vpu_ipc_id)
+ 	u32 sw_id_list[MAX_SW_DEV_CNT];
+ 	enum xlink_error rc;
+ 	u32 num = 0;
++	u32 swid;
+ 	int i;
+ 
+ 	rc = xlink_get_device_list(sw_id_list, &num);
+@@ -66,10 +67,10 @@ static u32 get_sw_device_id(int vpu_ipc_id)
+ 	}
+ 
+ 	for (i = 0; i < num; i++) {
+-		pr_debug("sw_id_list[%d] 0x%08x\n", i, sw_id_list[i]);
+-		if (SWDEVID_INTERFACE(sw_id_list[i]) == IPC_INTERFACE &&
+-		    SWDEVID_VPU_IPC_ID(sw_id_list[i]) ==  vpu_ipc_id)
+-			return sw_id_list[i];
++		swid = sw_id_list[i];
++		if (SWDEVID_INTERFACE(swid) == IPC_INTERFACE &&
++		    SWDEVID_VPU_IPC_ID(swid) ==  vpu_ipc_id)
++			return swid;
+ 	}
+ 	return XLINK_INVALID_SW_DEVID;
+ }
+@@ -80,11 +81,11 @@ static int vpumgr_open(struct inode *inode, struct file *filp)
+ 	struct vpumgr_device *vdev;
+ 	int rc;
+ 
+-	vdev = container_of(inode->i_cdev, struct vpumgr_device, cdev);
+ 	vpriv = kzalloc(sizeof(*vpriv), GFP_KERNEL);
+ 	if (!vpriv)
+ 		return -ENOMEM;
+ 
++	vdev = container_of(inode->i_cdev, struct vpumgr_device, cdev);
+ 	rc = smm_open(&vpriv->smm, vdev);
+ 	if (rc)
+ 		goto free_priv;
+@@ -102,7 +103,7 @@ static int vpumgr_open(struct inode *inode, struct file *filp)
+ 	mutex_unlock(&vdev->client_mutex);
+ 
+ 	filp->private_data = vpriv;
+-	return rc;
++	return 0;
+ 
+ close_smm:
+ 	smm_close(&vpriv->smm);
+@@ -124,6 +125,7 @@ static int vpumgr_release(struct inode *inode, struct file *filp)
+ 	mutex_unlock(&vdev->client_mutex);
+ 
+ 	kfree(vpriv);
++	filp->private_data = NULL;
+ 	return 0;
+ }
+ 
+@@ -135,7 +137,7 @@ static long vpumgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	struct vpumgr_vcm_submit *vs;
+ 	struct vpumgr_vcm_wait *vw;
+ 	char tmp[128];
+-	long rc = 0;
++	int rc = 0;
+ 
+ 	if (_IOC_TYPE(cmd) != VPUMGR_MAGIC || _IOC_NR(cmd) >= _IOC_NR(VPUMGR_IOCTL_END))
+ 		return -EINVAL;
+diff --git a/drivers/misc/vpumgr/vpu_smm.c b/drivers/misc/vpumgr/vpu_smm.c
+index de367702b092..7f2caa27d12d 100644
+--- a/drivers/misc/vpumgr/vpu_smm.c
++++ b/drivers/misc/vpumgr/vpu_smm.c
+@@ -63,7 +63,6 @@ struct vpusmm_impbuf {
+ static void vpusmm_insert_impbuf(struct vpumgr_smm *sess,
+ 				 struct vpusmm_impbuf *new_item)
+ {
+-	struct device *dev = sess->vdev->sdev;
+ 	struct rb_root *root = &sess->imp_rb;
+ 	struct rb_node **iter = &root->rb_node, *parent = NULL;
+ 	struct dma_buf *value = new_item->dmabuf;
+@@ -73,9 +72,6 @@ static void vpusmm_insert_impbuf(struct vpumgr_smm *sess,
+ 		parent = *iter;
+ 		item = rb_entry(parent, struct vpusmm_impbuf, node);
+ 
+-		if (item->dmabuf == value)
+-			dev_err(dev, " %s error: insert exist dmabuf!\n", __func__);
+-
+ 		if (item->dmabuf > value)
+ 			iter = &(*iter)->rb_left;
+ 		else
+@@ -260,7 +256,6 @@ static int mmap_vpusmm(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+ {
+ 	struct vpusmm_buffer *buff = dmabuf->priv;
+ 	unsigned long vm_size;
+-	int rc;
+ 
+ 	vm_size = vma->vm_end - vma->vm_start;
+ 	if (vm_size > PAGE_ALIGN(buff->size))
+@@ -269,12 +264,8 @@ static int mmap_vpusmm(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+ 	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+ 	vma->vm_pgoff = 0;
+ 
+-	rc = dma_mmap_attrs(buff->dev, vma, buff->cookie, buff->dma_addr,
++	return dma_mmap_attrs(buff->dev, vma, buff->cookie, buff->dma_addr,
+ 			    buff->size, buff->dma_attrs);
+-	if (rc < 0)
+-		return rc;
+-
+-	return 0;
+ }
+ 
+ static void *vmap_vpusmm(struct dma_buf *dmabuf)
+@@ -299,7 +290,7 @@ static const struct dma_buf_ops vpusmm_dmabuf_ops =  {
+  * sess will hold additional refcount to the dmabuf
+  * on request of passing it to VPU side for processing
+  */
+-long smm_alloc(struct vpumgr_smm *sess, struct vpumgr_args_alloc *arg)
++int smm_alloc(struct vpumgr_smm *sess, struct vpumgr_args_alloc *arg)
+ {
+ 	struct vpumgr_device *vdev = sess->vdev;
+ 	const int flags = O_RDWR | O_CLOEXEC;
+@@ -369,7 +360,7 @@ long smm_alloc(struct vpumgr_smm *sess, struct vpumgr_args_alloc *arg)
+ 	return retval;
+ }
+ 
+-long smm_import(struct vpumgr_smm *sess, struct vpumgr_args_import *arg)
++int smm_import(struct vpumgr_smm *sess, struct vpumgr_args_import *arg)
+ {
+ 	struct device *dev = sess->vdev->sdev;
+ 	enum dma_data_direction direction;
+@@ -400,10 +391,11 @@ long smm_import(struct vpumgr_smm *sess, struct vpumgr_args_import *arg)
+ 	return 0;
+ }
+ 
+-long smm_unimport(struct vpumgr_smm *sess, int *p_dmabuf_fd)
++int smm_unimport(struct vpumgr_smm *sess, int *p_dmabuf_fd)
+ {
+-	struct vpusmm_impbuf *item = NULL;
++	struct vpusmm_impbuf *item;
+ 	struct dma_buf *dmabuf;
++	int rc = 0;
+ 
+ 	dmabuf = dma_buf_get(*p_dmabuf_fd);
+ 	if (IS_ERR(dmabuf))
+@@ -411,23 +403,26 @@ long smm_unimport(struct vpumgr_smm *sess, int *p_dmabuf_fd)
+ 
+ 	mutex_lock(&sess->imp_rb_lock);
+ 	item = vpusmm_find_impbuf(sess, dmabuf);
+-	if (item) {
+-		item->refcount--;
+-		if (item->refcount <= 0) {
+-			rb_erase(&item->node, &sess->imp_rb);
+-			dma_buf_unmap_attachment(item->attach, item->sgt, item->direction);
+-			dma_buf_detach(item->dmabuf, item->attach);
+-			dma_buf_put(item->dmabuf);
+-			kfree(item);
+-		}
++	if (!item) {
++		rc = -EINVAL;
++		goto exit;
+ 	}
+-	mutex_unlock(&sess->imp_rb_lock);
+ 
++	item->refcount--;
++	if (item->refcount <= 0) {
++		rb_erase(&item->node, &sess->imp_rb);
++		dma_buf_unmap_attachment(item->attach, item->sgt, item->direction);
++		dma_buf_detach(item->dmabuf, item->attach);
++		dma_buf_put(item->dmabuf);
++		kfree(item);
++	}
++exit:
++	mutex_unlock(&sess->imp_rb_lock);
+ 	dma_buf_put(dmabuf);
+-	return 0;
++	return rc;
+ }
+ 
+-long smm_ptr2vpu(struct vpumgr_smm *sess, unsigned long *arg)
++int smm_ptr2vpu(struct vpumgr_smm *sess, unsigned long *arg)
+ {
+ 	struct device *dev = sess->vdev->sdev;
+ 	struct task_struct *task = current;
+diff --git a/drivers/misc/vpumgr/vpu_smm.h b/drivers/misc/vpumgr/vpu_smm.h
+index b4236fa4bed2..ff547649d95c 100644
+--- a/drivers/misc/vpumgr/vpu_smm.h
++++ b/drivers/misc/vpumgr/vpu_smm.h
+@@ -20,10 +20,10 @@ int smm_fini(struct vpumgr_device *vdev);
+ int smm_open(struct vpumgr_smm *sess, struct vpumgr_device *vdev);
+ int smm_close(struct vpumgr_smm *sess);
+ 
+-long smm_alloc(struct vpumgr_smm *sess, struct vpumgr_args_alloc *arg);
+-long smm_import(struct vpumgr_smm *sess, struct vpumgr_args_import *arg);
+-long smm_unimport(struct vpumgr_smm *sess, int *p_dmabuf_fd);
+-long smm_ptr2vpu(struct vpumgr_smm *sess, unsigned long *arg);
++int smm_alloc(struct vpumgr_smm *sess, struct vpumgr_args_alloc *arg);
++int smm_import(struct vpumgr_smm *sess, struct vpumgr_args_import *arg);
++int smm_unimport(struct vpumgr_smm *sess, int *p_dmabuf_fd);
++int smm_ptr2vpu(struct vpumgr_smm *sess, unsigned long *arg);
+ 
+ int smm_debugfs_stats_show(struct seq_file *file, struct vpumgr_smm *sess);
+ 
+diff --git a/drivers/misc/vpumgr/vpu_vcm.c b/drivers/misc/vpumgr/vpu_vcm.c
+index 90ee395d3888..db19538fa75e 100644
+--- a/drivers/misc/vpumgr/vpu_vcm.c
++++ b/drivers/misc/vpumgr/vpu_vcm.c
+@@ -21,7 +21,7 @@
+ #define VCM_XLINK_CHANNEL           1
+ #define VCM_XLINK_CHAN_SIZE         128
+ 
+-static const int msg_header_size = (uintptr_t)(&((struct vcm_msg *)(0))->payload.data);
++static const int msg_header_size = offsetof(struct vcm_msg, payload.data);
+ 
+ struct vpu_cmd {
+ 	struct work_struct work;
+@@ -35,6 +35,7 @@ struct vpu_cmd {
+ 
+ static int vcm_vpu_link_init(struct vcm_dev *pvcm)
+ {
++	struct vpumgr_device *vdev = container_of(pvcm, struct vpumgr_device, vcm);
+ 	enum xlink_error rc;
+ 
+ 	pvcm->ipc_xlink_handle.dev_type = VPUIP_DEVICE;
+@@ -57,55 +58,89 @@ static int vcm_vpu_link_init(struct vcm_dev *pvcm)
+ 
+ 	rc = 0;
+ exit:
+-	pr_info("%s: rc = %d\n", __func__, rc);
+-	return rc != X_LINK_SUCCESS;
++	dev_info(vdev->dev, "%s: rc = %d\n", __func__, rc);
++	return -(int)rc;
+ }
+ 
+ static int vcm_vpu_link_fini(struct vcm_dev *pvcm)
+ {
++	xlink_close_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL);
++	xlink_disconnect(&pvcm->ipc_xlink_handle);
++	return 0;
++}
++
++/*
++ * Send a vcm_msg by xlink.
++ * Given limited xlink payload size, packing is also performed.
++ */
++static int vcm_send(struct xlink_handle *xlnk_handle, struct vcm_msg *req)
++{
++	struct vpumgr_device *vdev;
+ 	enum xlink_error rc;
++	u8 *ptr = (u8 *)req;
++	u32 size = 0;
++	u32 len = req->size;
+ 
+-	rc = xlink_close_channel(&pvcm->ipc_xlink_handle, VCM_XLINK_CHANNEL);
+-	if (rc)
+-		goto exit;
++	vdev = container_of(xlnk_handle, struct vpumgr_device, vcm.ipc_xlink_handle);
++	if (len > sizeof(*req))
++		return -EINVAL;
++	do {
++		size = len > VCM_XLINK_CHAN_SIZE ? VCM_XLINK_CHAN_SIZE : len;
++		rc = xlink_write_volatile(xlnk_handle, VCM_XLINK_CHANNEL, ptr, size);
++		if (rc != X_LINK_SUCCESS) {
++			dev_warn(vdev->dev, "%s xlink_write_volatile error %d\n", __func__, rc);
++			return -EINVAL;
++		}
++		ptr += size;
++		len -= size;
++	} while (len > 0);
+ 
+-	rc = xlink_disconnect(&pvcm->ipc_xlink_handle);
+-	if (rc)
+-		goto exit;
+-exit:
+-	pr_info("%s: rc = %d\n", __func__, rc);
+-	return rc != X_LINK_SUCCESS;
++	return 0;
+ }
+ 
++/*
++ * Receives a vcm_msg by xlink.
++ * Given limited xlink payload size, unpacking is also performed.
++ */
+ static int vcm_recv(struct xlink_handle *xlnk_handle, struct vcm_msg *rep)
+ {
++	struct vpumgr_device *vdev;
+ 	enum xlink_error rc;
+-	u64 size; /* xlink_read_data_to_buffer() actually write size_t into size; */
++	u64 size;
+ 	u32 total_size = 0;
+ 	u32 rx_size = 0;
+ 	u8 *ptr = (u8 *)rep;
+ 
++	vdev = container_of(xlnk_handle, struct vpumgr_device, vcm.ipc_xlink_handle);
+ 	do {
++		/* workaround for a bug in xlink_read_data_to_buffer()
++		 * although it's last argument is declared to be of type (u32 *), the
++		 * function actually writes 64-bit value into that address.
++		 */
+ 		rc = xlink_read_data_to_buffer(xlnk_handle, VCM_XLINK_CHANNEL, ptr, (u32 *)&size);
+ 		if (rc != X_LINK_SUCCESS) {
+-			pr_err("%s: xlink_read_data_to_buffer failed, rc:%d\n", __func__, rc);
++			dev_warn(vdev->dev, "%s: xlink_read_data_to_buffer failed, rc:%d\n",
++				 __func__, rc);
+ 			return -EPIPE;
+ 		}
+ 
+ 		if (total_size == 0) {
+ 			if (size < msg_header_size) {
+-				pr_err("%s: first packet is too small (%llu)\n", __func__, size);
++				dev_warn(vdev->dev, "%s: first packet is too small (%llu)\n",
++					 __func__, size);
+ 				return -EINVAL;
+ 			}
+ 
+ 			total_size = rep->size;
+ 			if (total_size > sizeof(*rep)) {
+-				pr_err("%s: packet size (%u) is too big\n", __func__, total_size);
++				dev_warn(vdev->dev, "%s: packet size (%u) is too big\n",
++					 __func__, total_size);
+ 				return -EINVAL;
+ 			}
+ 			if (total_size < size) {
+-				pr_err("%s: first packet is smaller than claimed (%llu)\n",
+-				       __func__, size);
++				dev_warn(vdev->dev,
++					 "%s: first packet is smaller than claimed (%llu)\n",
++					 __func__, size);
+ 				return -EINVAL;
+ 			}
+ 		}
+@@ -114,32 +149,11 @@ static int vcm_recv(struct xlink_handle *xlnk_handle, struct vcm_msg *rep)
+ 		rx_size += size;
+ 	} while (rx_size < total_size);
+ 
+-	if (rx_size != total_size)
+-		pr_warn("%s: actuall size %u exceeds claimed size %ud\n",
+-			__func__, rx_size, total_size);
+-
+-	return 0;
+-}
+-
+-static int vcm_send(struct xlink_handle *xlnk_handle, struct vcm_msg *req)
+-{
+-	enum xlink_error rc;
+-	u8 *ptr = (u8 *)req;
+-	u32 size = 0;
+-	u32 len = req->size;
+-
+-	if (len > sizeof(*req))
++	if (rx_size != total_size) {
++		dev_warn(vdev->dev, "%s: actuall size %u exceeds claimed size %ud\n",
++			 __func__, rx_size, total_size);
+ 		return -EINVAL;
+-	do {
+-		size = len > VCM_XLINK_CHAN_SIZE ? VCM_XLINK_CHAN_SIZE : len;
+-		rc = xlink_write_volatile(xlnk_handle, VCM_XLINK_CHANNEL, ptr, size);
+-		if (rc != X_LINK_SUCCESS) {
+-			pr_err("%s xlink_write_volatile error %d\n", __func__, rc);
+-			return -EINVAL;
+-		}
+-		ptr += size;
+-		len -= size;
+-	} while (len > 0);
++	}
+ 
+ 	return 0;
+ }
+@@ -226,10 +240,19 @@ static void vpu_cmd_submit(struct work_struct *work)
+ 	struct vpu_cmd *p = container_of(work, struct vpu_cmd, work);
+ 
+ 	p->submit_err = vcm_send(p->handle, &p->msg);
+-	if (p->submit_err)
+-		complete(&p->complete);
+ }
+ 
++/*
++ * vcm_submit() - Submit a command to VPU
++ * @v:         Pointer to local vpu context data structure.
++ * @cmd:       Command code
++ * @data_in:   Data arguments
++ * @in_len:    Length of the data arguments
++ * @submit_id: On return, this will containe a newly allocated
++ *             vpu-device-wise unique ID for the submitted command
++ *
++ * Submit a command to corresponding vpu context running on firmware to execute
++ */
+ int vcm_submit(struct vpumgr_ctx *v,
+ 	       u32 cmd, const void *data_in, u32 in_len, s32 *submit_id)
+ {
+@@ -241,6 +264,9 @@ int vcm_submit(struct vpumgr_ctx *v,
+ 	if (!v->vdev->vcm.enabled)
+ 		return -ENOENT;
+ 
++	if (in_len > VCM_PAYLOAD_SIZE)
++		return -EINVAL;
++
+ 	vcmd = kvmalloc(sizeof(*vcmd), GFP_KERNEL);
+ 	if (!vcmd)
+ 		return -ENOMEM;
+@@ -274,6 +300,7 @@ int vcm_submit(struct vpumgr_ctx *v,
+ 	vcmd->msg.size = msg_header_size + in_len;
+ 	vcmd->msg.ctx = ctx;
+ 	vcmd->msg.cmd = cmd;
++	vcmd->msg.rc = 0;
+ 	INIT_WORK(&vcmd->work, vpu_cmd_submit);
+ 
+ 	if (!queue_work(pvcm->wq, &vcmd->work)) {
+@@ -288,6 +315,18 @@ int vcm_submit(struct vpumgr_ctx *v,
+ 	return rc;
+ }
+ 
++/*
++ * vcm_wait() - Wait a submitted command to finish
++ * @v:          Pointer to local vpu context data structure.
++ * @submit_id:  Unique ID of the submitted command to wait for
++ * @vpu_rc:     Return code of the submitted commands
++ * @data_out:   Return data payload of the submitted command
++ * @p_out_len:  Length of the returned paylaod
++ * @timeout_ms: Time in milliseconds before the wait expires
++ *
++ * Wait for a submitted command to finish and retrieves the
++ * return code and outputs on success with timeout.
++ */
+ int vcm_wait(struct vpumgr_ctx *v, s32 submit_id,
+ 	     s32 *vpu_rc, void *data_out, u32 *p_out_len, u32 timeout_ms)
+ {
+@@ -312,18 +351,26 @@ int vcm_wait(struct vpumgr_ctx *v, s32 submit_id,
+ 		return -EINVAL;
+ 	}
+ 
++	/* wait for submission work to be done */
++	flush_work(&vcmd->work);
++	rc = vcmd->submit_err;
++	if (rc)
++		goto exit;
++
++	/* wait for reply */
+ 	rc = wait_for_completion_interruptible_timeout(&vcmd->complete, timeout);
+ 	if (rc < 0)
+ 		goto exit;
+-	if (rc == 0) {
++	else if (rc == 0) {
+ 		rc = -ETIMEDOUT;
+ 		goto exit;
++	} else {
++		/* wait_for_completion_interruptible_timeout return positive
++		 * rc on success, but we return zero as success.
++		 */
++		rc = 0;
+ 	}
+ 
+-	rc = vcmd->submit_err;
+-	if (rc)
+-		goto exit;
+-
+ 	if (vpu_rc)
+ 		*vpu_rc = vcmd->msg.rc;
+ 
+@@ -454,6 +501,8 @@ static int vcm_rxthread(void *param)
+ 				dev_warn(dev, "reply msg #%u's ctx (%u) mismatches vcmd ctx (%u)\n",
+ 					 msg->id, msg->ctx, vcmd->msg.ctx);
+ 
++			vcmd->submit_err = 0;
++
+ 			/* submit corresponding to msg->id is done, do post process */
+ 			memcpy(&vcmd->msg, msg, msg->size);
+ 			complete(&vcmd->complete);
+@@ -498,7 +547,7 @@ int vcm_init(struct vpumgr_device *vdev, u32 sw_dev_id)
+ 			       (void *)vdev, "vcmrx");
+ 	if (IS_ERR(rxthread)) {
+ 		rc = PTR_ERR(rxthread);
+-		goto wq_destroy;
++		goto destroy_idr;
+ 	}
+ 
+ 	pvcm->rxthread = get_task_struct(rxthread);
+@@ -506,7 +555,8 @@ int vcm_init(struct vpumgr_device *vdev, u32 sw_dev_id)
+ 	pvcm->enabled = true;
+ 	return 0;
+ 
+-wq_destroy:
++destroy_idr:
++	idr_destroy(&pvcm->msg_idr);
+ 	destroy_workqueue(pvcm->wq);
+ vpu_link_fini:
+ 	vcm_vpu_link_fini(pvcm);
+diff --git a/drivers/misc/vpumgr/vpu_vcm.h b/drivers/misc/vpumgr/vpu_vcm.h
+index fdf085f2bbad..9e89c281092b 100644
+--- a/drivers/misc/vpumgr/vpu_vcm.h
++++ b/drivers/misc/vpumgr/vpu_vcm.h
+@@ -15,7 +15,7 @@ struct vpumgr_device;
+ #define VCTX_MSG_REPLY              3
+ 
+ /* Maximal payload size supported for request or reply */
+-#define VCM_PAYLOAD_SIZE            8180
++#define VCM_PAYLOAD_SIZE            (8192 - 5 * sizeof(u32))
+ 
+ /**
+  * struct vcm_msg: VPU context manager message
+-- 
+2.27.0
+

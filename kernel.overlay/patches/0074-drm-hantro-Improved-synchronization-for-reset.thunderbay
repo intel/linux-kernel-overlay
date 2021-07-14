@@ -1,0 +1,747 @@
+From 704cafdec57de3eaafc261eb83b07f37529b20f9 Mon Sep 17 00:00:00 2001
+From: Arshad Mehmood <arshad.mehmood@intel.com>
+Date: Mon, 10 May 2021 11:41:24 +0800
+Subject: [PATCH 074/170] drm: hantro: Improved synchronization for reset
+
+Added mutex locks to protect core turning on/off sequence
+
+Signed-off-by: Arshad Mehmood <arshad.mehmood@intel.com>
+---
+ drivers/gpu/drm/hantro_driver/hantro_cache.c  |   2 +
+ drivers/gpu/drm/hantro_driver/hantro_dec.c    |  30 +++--
+ drivers/gpu/drm/hantro_driver/hantro_dec400.c |   1 +
+ drivers/gpu/drm/hantro_driver/hantro_device.h |  38 +++++-
+ drivers/gpu/drm/hantro_driver/hantro_drm.c    |   1 +
+ drivers/gpu/drm/hantro_driver/hantro_drm.h    |  22 ----
+ drivers/gpu/drm/hantro_driver/hantro_drv.c    | 118 +++++++++++++-----
+ drivers/gpu/drm/hantro_driver/hantro_enc.c    |  29 +++--
+ drivers/gpu/drm/hantro_driver/hantro_priv.h   |   4 +-
+ drivers/gpu/drm/hantro_driver/trace.h         |  74 +++++------
+ 10 files changed, 188 insertions(+), 131 deletions(-)
+
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_cache.c b/drivers/gpu/drm/hantro_driver/hantro_cache.c
+index 068b712e1b29..1cd661c004f6 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_cache.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_cache.c
+@@ -317,6 +317,8 @@ int cache_probe(dtbnode *pnode)
+ 		return -ENOMEM;
+ 
+ 	memset(pccore, 0, sizeof(struct cache_dev_t));
++
++	strncpy(pccore->node_name, pnode->node_name, NODE_NAME_SIZE);
+ 	pccore->com_base_addr = pnode->ioaddr;
+ 	pccore->core_cfg.base_addr = pnode->ioaddr;
+ 	pccore->core_cfg.iosize = pnode->iosize;
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_dec.c b/drivers/gpu/drm/hantro_driver/hantro_dec.c
+index 8d85e5b0a640..0c19719e420a 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_dec.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_dec.c
+@@ -460,35 +460,33 @@ static int get_dec_coreid(struct hantrodec_t *dev, struct file *filp,
+ 
+ void hantrodec_core_status_change(struct hantrodec_t *pcore, bool turnon)
+ {
++	START_TIME;
++
+ 	if (!pcore)
+ 		return;
+ 
+-	mutex_lock(&pcore->core_mutex);
+-
+ 	if (turnon && !pcore->enabled) {
+ 		hantro_clock_control(pcore->pdevinfo, pcore->clock_index, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+1, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+2, true);
+-		//hantro_power_domain_1(pcore->pdevinfo, pcore->pd_index, true);
+-
++		hantro_powerdomain_control(pcore->pdevinfo, pcore->pd_index, true);
+ 		pcore->perf_data.last_resv = sched_clock();
+ 		pcore->enabled = 1;
+-
++		trace_core_status_update(pcore->node_name,  "On", (sched_clock() - start) / 1000);
+ 		msleep(1);
+ 	} else
+ 	if(!turnon && pcore->enabled) {
+ 		pcore->enabled = 0;
+-		//hantro_power_domain_1(pcore->pdevinfo, pcore->pd_index, false);
++		hantro_powerdomain_control(pcore->pdevinfo, pcore->pd_index, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+1, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+2, false);
+ 		hantro_clock_control(pcore->pdevinfo, pcore->clock_index, false);
+-
++		trace_core_status_update(pcore->node_name, "Off", (sched_clock() - start) / 1000);
+ 		msleep(1);
+ 	}
+ 
+-	mutex_unlock(&pcore->core_mutex);
+ }
+ 
+ void hantrodec_device_change_status(struct device_info *pdevinfo, bool turnon)
+@@ -496,7 +494,10 @@ void hantrodec_device_change_status(struct device_info *pdevinfo, bool turnon)
+ 	struct hantrodec_t *dec_core = pdevinfo->dechdr;
+ 
+ 	while (dec_core) {
++		mutex_lock(&dec_core->core_mutex);
+ 		hantrodec_core_status_change(dec_core, turnon);
++		mutex_unlock(&dec_core->core_mutex);
++
+ 		dec_core = dec_core->next;
+ 	}
+ }
+@@ -529,9 +530,9 @@ static long reserve_decoder(struct hantrodec_t *dev, struct file *filp,
+ 		goto out;
+ 	}
+ 
+-	if (reserved_core->enabled == 0) {
+-		hantrodec_core_status_change(reserved_core, true);
+-	}
++	mutex_lock(&reserved_core->core_mutex);
++	hantrodec_core_status_change(reserved_core, true);
++	mutex_unlock(&reserved_core->core_mutex);
+ 
+ 	if (pdevinfo->thermal_data.clk_freq != reserved_core->clk_freq) {
+ 		PDEBUG("Reserve decoder:  setting to %ld for device %d, core %ld\n",
+@@ -544,7 +545,7 @@ static long reserve_decoder(struct hantrodec_t *dev, struct file *filp,
+ 
+ 	reserved_core->perf_data.last_resv = sched_clock();
+ out:
+-	trace_dec_reserve(pdevinfo->deviceid, core, (sched_clock() - start) / 1000);
++	trace_core_reserve(reserved_core->node_name,  (sched_clock() - start) / 1000);
+ 	return core;
+ }
+ 
+@@ -586,7 +587,7 @@ static void release_decoder(struct hantrodec_t *dev, long core)
+ 	spin_unlock_irqrestore(&pdevinfo->owner_lock, flags);
+ 	up(&pdevinfo->dec_core_sem);
+ 	wake_up_interruptible_all(&pdevinfo->hw_queue);
+-	trace_dec_release(pdevinfo->deviceid, KCORE(core));
++	trace_core_release(reserved_core->node_name);
+ }
+ 
+ static long reserve_post_processor(struct hantrodec_t *dev, struct file *filp)
+@@ -1417,6 +1418,8 @@ int hantrodec_probe(dtbnode *pnode)
+ 		return -ENOMEM;
+ 
+ 	memset(pcore, 0, sizeof(struct hantrodec_t));
++
++	strncpy(pcore->node_name, pnode->node_name, NODE_NAME_SIZE);
+ 	pcore->multicorebase = pnode->ioaddr;
+ 	pcore->multicorebase_actual = pnode->ioaddr;
+ 	pcore->iosize = pnode->iosize;
+@@ -1432,6 +1435,7 @@ int hantrodec_probe(dtbnode *pnode)
+ 	pcore->dec_owner = NULL;
+ 	pcore->pp_owner = NULL;
+ 	pcore->enabled = 1;
++	pcore->perf_data.last_resv = sched_clock();
+ 
+ 	pcore->reset_index = pnode->reset_index;
+ 	pcore->clock_index = pnode->clock_index;
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_dec400.c b/drivers/gpu/drm/hantro_driver/hantro_dec400.c
+index 3668881b3288..58b980d87683 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_dec400.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_dec400.c
+@@ -220,6 +220,7 @@ int hantro_dec400_probe(dtbnode *pnode)
+ 	if (!pdec400)
+ 		return -EINVAL;
+ 
++	strncpy(pdec400->node_name, pnode->node_name, NODE_NAME_SIZE);
+ 	pdec400->core_cfg.dec400corebase = pnode->ioaddr;
+ 	pdec400->core_cfg.iosize = pnode->iosize;
+ 	pdec400->core_cfg.parentaddr = pnode->parentaddr;
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_device.h b/drivers/gpu/drm/hantro_driver/hantro_device.h
+index 320b7ddd11a6..f4b118c3e63e 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_device.h
++++ b/drivers/gpu/drm/hantro_driver/hantro_device.h
+@@ -9,11 +9,13 @@
+ #ifndef __HANTRO_DEVICE_H__
+ #define __HANTRO_DEVICE_H__
+ 
+-#include "hantro_drm.h"
++#include <linux/ioport.h>
+ 
+ #define MAX(a, b) (((a) > (b)) ? (a) : (b))
+ #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+ 
++#define NODE_NAME_SIZE 128
++
+ typedef enum {
+ 	DEVICE_UNKNOWN = 0,
+ 	DEVICE_KEEMBAY,
+@@ -30,6 +32,29 @@ typedef enum {
+ 	CORE_DEC400,
+ } device_coretype;
+ 
++/*
++ * device index definition is unchanged.
++ * for dec400/cache NODE(id) refers to its parent core number based on NODETYPE
++ * for dec/enc, NODE(id) refers to its core num, and NODETYPE is useless.
++ */
++/* node type for NODETYPE(id), apply to be expanded */
++
++typedef enum {
++	VC8000E,
++	VC8000D_0,
++	VC8000D_1,
++	DECODER_G1_0,
++	DECODER_G1_1,
++	DECODER_G2_0,
++	DECODER_G2_1,
++} cache_client_type;
++
++typedef enum {
++	DIR_RD = 0,
++	DIR_WR,
++	DIR_BI
++} driver_cache_dir;
++
+ // structure to hold data performance data per device
+ typedef struct performance_data {
+ 	int count;
+@@ -51,6 +76,7 @@ struct cache_dev_t {
+ 	struct cache_core_config core_cfg; /* config of each core,such as base addr, irq,etc */
+ 	unsigned long hw_id; /* hw id to indicate project */
+ 	u32 core_id; /* core id for driver and sw internal use */
++	char node_name[NODE_NAME_SIZE];
+ 	u32 is_valid; /* indicate this core is hantro's core or not */
+ 	u32 is_reserved; /* indicate this core is occupied by user or not */
+ 	struct file *cacheowner; /* indicate which process is occupying the core */
+@@ -79,10 +105,9 @@ struct dec400_core_cfg {
+ 
+ struct dec400_t {
+ 	struct dec400_core_cfg core_cfg;
+-
++	char node_name[NODE_NAME_SIZE];
+ 	u32 core_id;
+ 	u8 *hwregs;
+-
+ 	char reg_name[32];
+ 	device_coretype parenttype;
+ 	u32 parentid; /* parent codec core's core_id */
+@@ -106,6 +131,7 @@ struct hantroenc_t {
+ 	CORE_CONFIG core_cfg; /* config of each core,such as base addr, irq,etc */
+ 	u32 hw_id; /* hw id to indicate project */
+ 	u32 core_id; /* core id for driver and sw internal use */
++	char node_name[NODE_NAME_SIZE];
+ 	u32 is_reserved; /* indicate this core is occupied by user or not */
+ 	int pid; /* indicate which process is occupying the core */
+ 	u32 irq_received; /* indicate this core receives irq */
+@@ -138,6 +164,7 @@ struct hantroenc_t {
+ struct hantrodec_t {
+ 	u32 cfg;
+ 	int core_id;
++	char node_name[NODE_NAME_SIZE];
+ 	unsigned int iosize;
+ 	u32 cfg_backup;
+ 	/* indicate if main core exist */
+@@ -266,7 +293,10 @@ struct device_info {
+ 
+ 	const char **clk_names;
+ 	int clk_count;
+-	struct clk  **dev_clk;
++	struct clk **dev_clk;
++
++	int pd_count;
++	struct device **pd_dev;
+ 
+ 	struct device_info *next;
+ };
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_drm.c b/drivers/gpu/drm/hantro_driver/hantro_drm.c
+index b3e2292e83cb..03af28a81a09 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_drm.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_drm.c
+@@ -1402,6 +1402,7 @@ static long hantro_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ static int hantro_device_open(struct inode *inode, struct file *filp)
+ {
+ 	int ret;
++
+ 	ret = drm_open(inode, filp);
+ 	hantrodec_open(inode, filp);
+ 	cache_open(inode, filp);
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_drm.h b/drivers/gpu/drm/hantro_driver/hantro_drm.h
+index 3dc8b2dc9d55..3dd12192553e 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_drm.h
++++ b/drivers/gpu/drm/hantro_driver/hantro_drm.h
+@@ -23,28 +23,6 @@
+ #define NODETYPE(id)	(((u32)(id) >> 8) & 0xff)
+ #define DEVICE_ID(id)	((u32)(id) >> 16)
+ 
+-/*
+- * device index definition is unchanged.
+- * for dec400/cache NODE(id) refers to its parent core number based on NODETYPE
+- * for dec/enc, NODE(id) refers to its core num, and NODETYPE is useless.
+- */
+-/* node type for NODETYPE(id), apply to be expanded */
+-
+-typedef enum {
+-	VC8000E,
+-	VC8000D_0,
+-	VC8000D_1,
+-	DECODER_G1_0,
+-	DECODER_G1_1,
+-	DECODER_G2_0,
+-	DECODER_G2_1,
+-} cache_client_type;
+-
+-typedef enum {
+-	DIR_RD = 0,
+-	DIR_WR,
+-	DIR_BI
+-} driver_cache_dir;
+ 
+ struct hantro_drm_fb {
+ 	struct drm_framebuffer fb;
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_drv.c b/drivers/gpu/drm/hantro_driver/hantro_drv.c
+index 586ab92f6616..c9a3f40ada52 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_drv.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_drv.c
+@@ -52,11 +52,11 @@ bool enable_irqmode = 1;
+ module_param(enable_irqmode, bool, 0);
+ MODULE_PARM_DESC(enable_irqmode, "Enable IRQ Mode(default 1)");
+ 
+-bool power_save_mode;
++bool power_save_mode = 1;
+ module_param(power_save_mode, bool, 0);
+-MODULE_PARM_DESC(power_save_mode, "Power saving mode (default 0 - disabled)");
++MODULE_PARM_DESC(power_save_mode, "Power saving mode (default 1 - enabled)");
+ 
+-uint sleep_duration_ms = 5 * MSEC_PER_SEC;
++uint sleep_duration_ms = 10 * MSEC_PER_SEC;
+ module_param(sleep_duration_ms, uint, 0);
+ MODULE_PARM_DESC(sleep_duration_ms, "Power saving mdoe thread check time in ms (default 5000 ms)");
+ 
+@@ -169,6 +169,7 @@ static dtbnode *trycreatenode(struct platform_device *pdev,
+ 	if (!pnode)
+ 		return NULL;
+ 
++	strncpy(pnode->node_name, ofnode->name, NODE_NAME_SIZE);
+ 	pnode->type = getnodetype(ofnode->name);
+ 	pnode->parentaddr = parentaddr;
+ 	pnode->parenttype = parenttype;
+@@ -525,6 +526,60 @@ static int hantro_reset_init(struct device_info *pdevinfo)
+ 	return 0;
+ }
+ 
++static int hantro_powerdomain_init(struct device_info *pdevinfo)
++{
++	struct device *dev = pdevinfo->dev;
++	struct device **pd_dev = NULL;
++	int i = 0, count = 0;
++
++	count = device_property_read_u32_array(dev, "power-domains", NULL, 0);
++	if (count <= 0)
++	   return -1;
++
++	count = count / 2;  // PD enteris are tuple in DTB.
++	pd_dev = devm_kcalloc(dev, count, sizeof(*pd_dev), GFP_KERNEL);
++	if (!pd_dev)
++		return 0;
++
++	for (i = 0; i < count; i++) {
++		if (verbose)
++			pr_info("Attaching power domain\n");
++
++		pd_dev[i] = dev_pm_domain_attach_by_id(dev, i);
++		if (IS_ERR(pd_dev[i])) {
++			pr_err("Error attaching power domain");
++			return PTR_ERR(pd_dev[i]);
++		}
++	}
++
++	pdevinfo->pd_count = count;
++	pdevinfo->pd_dev = pd_dev;
++	return 0;
++}
++
++int hantro_powerdomain_control(struct device_info *pdevinfo, int index, bool turnon)
++{
++	struct generic_pm_domain *gen_pd;
++
++	if (index < 0 || index > (pdevinfo->pd_count - 1))
++		return 0;
++
++	if (!pdevinfo->pd_dev[index])
++		return 0;
++
++	gen_pd = pd_to_genpd(pdevinfo->pd_dev[index]->pm_domain);
++	if (gen_pd) {
++		if (turnon)
++			gen_pd->power_on(gen_pd);
++		else
++			gen_pd->power_off(gen_pd);
++	}
++
++	msleep(1);
++
++	return 0;
++}
++
+ int hantro_device_clock_control(struct device_info *pdevinfo, bool enable)
+ {
+ 	int i = 0;
+@@ -560,6 +615,10 @@ void hantro_device_change_status_all(struct device_info *pdevinfo, bool turnon)
+ 	for (i = 0; i < pdevinfo->clk_count; i++) {
+ 		hantro_clock_control(pdevinfo, i, turnon);
+ 	}
++
++	for (i = 0; i < pdevinfo->pd_count; i++) {
++		hantro_powerdomain_control(pdevinfo, i, turnon);
++	}
+ }
+ 
+ // Turn on/off all 'cores' on all of devices
+@@ -735,6 +794,7 @@ int init_device_info(struct device *dev, struct device_info *pdevinfo)
+ 
+ 	hantro_clock_init(pdevinfo);
+ 	hantro_reset_init(pdevinfo);
++	hantro_powerdomain_init(pdevinfo);
+ 
+ 	return 0;
+ }
+@@ -778,35 +838,6 @@ int get_reserved_mem_size(struct device_info *pdevice)
+ 	return 0;
+ }
+ 
+-int hantro_power_domain(struct device_info *pdevinfo, int index, bool turnon)
+-{
+-	struct device *virtual_dev = NULL;
+-	struct device *dev = pdevinfo->dev;
+-	struct generic_pm_domain *gen_pd;
+-	int ret;
+-
+-	if (index < 0)
+-		return 0;
+-
+-	virtual_dev = dev_pm_domain_attach_by_id(dev, index);
+-	ret = (int)virtual_dev;
+-	if (IS_ERR(virtual_dev))
+-		return PTR_ERR(virtual_dev);
+-
+-	gen_pd = pd_to_genpd(virtual_dev->pm_domain);
+-	if (gen_pd) {
+-		if (turnon)
+-			gen_pd->power_on(gen_pd);
+-		else
+-			gen_pd->power_off(gen_pd);
+-	}
+-
+-	dev_pm_domain_detach(virtual_dev, true);
+-
+-	msleep(1);
+-	return 0;
+-}
+-
+ int power_monitor_thread(void *arg) {
+ 	struct device_info *pdevinfo;
+ 	struct hantrodec_t *dec_core = NULL;
+@@ -815,39 +846,48 @@ int power_monitor_thread(void *arg) {
+ 
+ 	while (!kthread_should_stop()) {
+ 		msleep(sleep_duration_ms);
++
++		//turnning all cores to on/off could take upto 500ms
+ 		if (hantro_drm.turning_on)
+ 			continue;
+ 
+ 		if (verbose)
+ 			pr_info("Checking for idle cores");
+ 
+-		curr_time = sched_clock();
++		__trace_hantro_msg("%s: Start checking", __func__);
+ 
+ 		pdevinfo = hantro_drm.pdevice_list;
+ 		while (pdevinfo) {
+ 			dec_core = pdevinfo->dechdr;
+ 			while (dec_core) {
++				mutex_lock(&dec_core->core_mutex);
+ 				if (dec_core->enabled && !hantro_drm.turning_on) {
++					curr_time = sched_clock();
+ 					if ((curr_time > dec_core->perf_data.last_resv) && (curr_time - dec_core->perf_data.last_resv) > sleep_diff_ns) {
+ 						hantrodec_core_status_change(dec_core, false);
+ 					}
+ 				}
++				mutex_unlock(&dec_core->core_mutex);
+ 				dec_core = dec_core->next;
+ 			}
+ 
+ 			enc_core = pdevinfo->enchdr;
+ 			while (enc_core) {
++				mutex_lock(&enc_core->core_mutex);
+ 				if (enc_core->enabled && !hantro_drm.turning_on) {
++					curr_time = sched_clock();
+ 					if ((curr_time > enc_core->perf_data.last_resv) && (curr_time - enc_core->perf_data.last_resv) > sleep_diff_ns) {
+ 						hantroenc_core_status_change(enc_core, false);
+ 					}
+ 				}
++				mutex_unlock(&enc_core->core_mutex);
+ 				enc_core = enc_core->next;
+ 			}
+ 
+ 			pdevinfo = pdevinfo->next;
+ 		}
+-		__trace_hantro_msg("end checking");
++
++		__trace_hantro_msg("%s: End checking", __func__);
+ 	}
+ 
+ 	return 0;
+@@ -901,6 +941,7 @@ static int hantro_drm_probe(struct platform_device *pdev)
+ static int hantro_drm_remove(struct platform_device *pdev)
+ {
+ 	struct device_info *pdevinfo;
++	int i;
+ 
+ 	if (!pdev->dev.of_node)
+ 		return 0;
+@@ -927,6 +968,11 @@ static int hantro_drm_remove(struct platform_device *pdev)
+ 
+ 	hantro_device_change_status(pdevinfo, false);
+ 
++	for (i = 0; i < pdevinfo->pd_count; i++) {
++		if (pdevinfo->pd_dev[i])
++			dev_pm_domain_detach(pdevinfo->pd_dev[i], true);
++	}
++
+ 	hantrodec_remove(pdevinfo);
+ 	hantroenc_remove(pdevinfo);
+ 	hantrodec400_remove(pdevinfo);
+@@ -1079,6 +1125,10 @@ int __init hantro_init(void)
+ 	hantrocache_init();
+ 	hantrodec400_init();
+ 
++	// Power domain turn on/off support not available on Keembay
++	if (hantro_drm.device_type == DEVICE_KEEMBAY)
++		power_save_mode = 0;
++
+ 	if (power_save_mode) {
+ 		hantro_drm.monitor_task =  kthread_create(power_monitor_thread,NULL,"power_monitor_thread");
+ 		if (!IS_ERR(hantro_drm.monitor_task)) {
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_enc.c b/drivers/gpu/drm/hantro_driver/hantro_enc.c
+index 64cea520b889..b9ad2d0b6447 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_enc.c
++++ b/drivers/gpu/drm/hantro_driver/hantro_enc.c
+@@ -279,9 +279,9 @@ static long reserve_encoder(struct hantroenc_t *dev, u32 *core_info,
+ 		goto out;
+ 	}
+ 
+-	if (reserved_core->enabled == 0) {
+-		hantroenc_core_status_change(reserved_core, true);
+-	}
++	mutex_lock(&reserved_core->core_mutex);
++	hantroenc_core_status_change(reserved_core, true);
++	mutex_unlock(&reserved_core->core_mutex);
+ 
+ 	if (pdevinfo->thermal_data.clk_freq != reserved_core->clk_freq) {
+ 		clk_set_rate(pdevinfo->dev_clk[reserved_core->clock_index],
+@@ -291,7 +291,7 @@ static long reserve_encoder(struct hantroenc_t *dev, u32 *core_info,
+ 
+ 	reserved_core->perf_data.last_resv = sched_clock();
+ out:
+-	trace_enc_reserve(pdevinfo->deviceid, KCORE((*core_info)),
++	trace_core_reserve(reserved_core->node_name,
+ 			  (sched_clock() - start) / 1000);
+ 	return ret;
+ }
+@@ -350,7 +350,7 @@ static void release_encoder(struct hantroenc_t *dev, u32 *core_info,
+ 	if (resource_shared)
+ 		up(&pdevinfo->enc_core_sem);
+ 
+-	trace_enc_release(pdevinfo->deviceid, KCORE((*core_info)));
++	trace_core_release(reserved_core->node_name);
+ }
+ 
+ long hantroenc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+@@ -566,40 +566,45 @@ int __exit hantroenc_cleanup(void)
+ 
+ void hantroenc_core_status_change(struct hantroenc_t *pcore, bool turnon)
+ {
+-	if (!pcore)
++	START_TIME;
++
++	if (!pcore || pcore->clock_index < 0)
+ 		return;
+ 
+-	mutex_lock(&pcore->core_mutex);
+ 	if (turnon && !pcore->enabled) {
+ 
+ 		hantro_clock_control(pcore->pdevinfo, pcore->clock_index, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+1, true);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+2, true);
+-		//hantro_power_domain_1(pcore->pdevinfo, pcore->pd_index, true);
++		hantro_powerdomain_control(pcore->pdevinfo, pcore->pd_index, true);
+ 		pcore->perf_data.last_resv = sched_clock();
+ 		pcore->enabled = 1;
++		trace_core_status_update(pcore->node_name,  "On", (sched_clock() - start) / 1000);
+ 		msleep(1);
+ 	} else
+ 	if(!turnon && pcore->enabled)
+ 	{
+ 		pcore->enabled = 0;
+-		//hantro_power_domain_1(pcore->pdevinfo, pcore->pd_index, false);
++		hantro_powerdomain_control(pcore->pdevinfo, pcore->pd_index, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+1, false);
+ 		hantro_reset_control(pcore->pdevinfo, pcore->reset_index+2, false);
+ 		hantro_clock_control(pcore->pdevinfo, pcore->clock_index, false);
++		trace_core_status_update(pcore->node_name,  "Off", (sched_clock() - start) / 1000);
+ 		msleep(1);
+ 	}
+ 
+-	mutex_unlock(&pcore->core_mutex);
+ }
+ 
+ void hantroenc_device_change_status(struct device_info *pdevinfo, bool turnon)
+ {
+ 	struct hantroenc_t *enc_core = pdevinfo->enchdr;
+ 	while (enc_core) {
++		mutex_lock(&enc_core->core_mutex);
+ 		hantroenc_core_status_change(enc_core, turnon);
++		mutex_unlock(&enc_core->core_mutex);
++
+ 		enc_core = enc_core->next;
+ 	}
+ }
+@@ -619,13 +624,15 @@ int hantroenc_probe(dtbnode *pnode)
+ 		return -ENOMEM;
+ 
+ 	memset(pcore, 0, sizeof(struct hantroenc_t));
++
++	strncpy(pcore->node_name, pnode->node_name, NODE_NAME_SIZE);
+ 	pcore->core_cfg.base_addr = pnode->ioaddr;
+ 	pcore->core_cfg.iosize = pnode->iosize;
+ 	pcore->reset_index = pnode->reset_index;
+ 	pcore->clock_index = pnode->clock_index;
+ 	pcore->pd_index = pnode->pd_index;
+-
+ 	pcore->enabled = 1;
++	pcore->perf_data.last_resv = sched_clock();
+ 
+ 	result = reserve_io(pcore);
+ 	if (result < 0) {
+diff --git a/drivers/gpu/drm/hantro_driver/hantro_priv.h b/drivers/gpu/drm/hantro_driver/hantro_priv.h
+index 34ad30d32446..4ce8ec1e7db8 100644
+--- a/drivers/gpu/drm/hantro_driver/hantro_priv.h
++++ b/drivers/gpu/drm/hantro_driver/hantro_priv.h
+@@ -78,7 +78,6 @@
+ 
+ #include "hantro_drm.h"
+ #include "hantro_device.h"
+-
+ #include "trace.h"
+ 
+ #define HANTRO_GEM_FLAG_IMPORT		BIT(0)
+@@ -121,6 +120,7 @@ typedef struct dtbnode {
+ 	int type;
+ 	phys_addr_t ioaddr;
+ 	phys_addr_t iosize;
++	char node_name[NODE_NAME_SIZE];
+ 	char reg_name[32];
+ 	int irq[4];
+ 	char irq_name[4][32];
+@@ -259,7 +259,7 @@ void hantrodec_device_change_status(struct device_info *pdevinfo, bool turnon);
+ void hantroenc_core_status_change(struct hantroenc_t *pcore, bool turnon);
+ void hantroenc_device_change_status(struct device_info *pdevinfo, bool turnon);
+ 
+-int hantro_power_domain_1(struct device_info *pdevinfo, int index, bool turnon);
++int hantro_powerdomain_control(struct device_info *pdevinfo, int index, bool turnon);
+ int hantro_clock_control(struct device_info *pdevinfo, int index, bool enable);
+ int hantro_reset_control(struct device_info *pdevinfo, int index, bool deassert);
+ void hantro_all_devices_turnon(void);
+diff --git a/drivers/gpu/drm/hantro_driver/trace.h b/drivers/gpu/drm/hantro_driver/trace.h
+index ed3057d1d036..b10499a00772 100644
+--- a/drivers/gpu/drm/hantro_driver/trace.h
++++ b/drivers/gpu/drm/hantro_driver/trace.h
+@@ -102,49 +102,34 @@ TRACE_EVENT(hantro_cma_free,
+ 		      __entry->paddr,
+ 		      __entry->handle));
+ 
+-TRACE_EVENT(dec_reserve,
+-	    TP_PROTO(int deviceidx, int core, int waittime),
+-	    TP_ARGS(deviceidx, core, waittime),
+-	    TP_STRUCT__entry(__field(int, deviceidx)
+-			     __field(int, core)
+-			     __field(int, waittime)),
+-	    TP_fast_assign(__entry->deviceidx = deviceidx;
+-			   __entry->core = core;
+-			   __entry->waittime = waittime;),
+-	    TP_printk("deviceidx = %d, core = %d, waittime = %d us",
+-		      __entry->deviceidx, __entry->core, __entry->waittime));
++TRACE_EVENT(core_reserve,
++	    TP_PROTO(char *node_name, long waittime),
++	    TP_ARGS(node_name, waittime),
++	    TP_STRUCT__entry(__string(name, node_name)
++				__field(long, waittime)),
++	    TP_fast_assign(__assign_str(name, node_name);
++				__entry->waittime = waittime;),
++	    TP_printk("%s, waittime = %ld us",
++		        __get_str(name), __entry->waittime));
+ 
+-TRACE_EVENT(dec_release,
+-	    TP_PROTO(int deviceidx, int core),
+-	    TP_ARGS(deviceidx, core),
+-	    TP_STRUCT__entry(__field(int, deviceidx)
+-			     __field(int, core)),
+-	    TP_fast_assign(__entry->deviceidx = deviceidx;
+-			   __entry->core = core;),
+-	    TP_printk("deviceidx = %d, core = %d", __entry->deviceidx,
+-		      __entry->core));
++TRACE_EVENT(core_release,
++	    TP_PROTO(char *node_name),
++	    TP_ARGS(node_name),
++	    TP_STRUCT__entry(__string(name, node_name)),
++	    TP_fast_assign(__assign_str(name, node_name);),
++	    TP_printk("%s", __get_str(name)));
+ 
+-TRACE_EVENT(enc_reserve,
+-	    TP_PROTO(int deviceidx, int core, int waittime),
+-	    TP_ARGS(deviceidx, core, waittime),
+-	    TP_STRUCT__entry(__field(int, deviceidx)
+-			     __field(int, core)
+-			     __field(int, waittime)),
+-	    TP_fast_assign(__entry->deviceidx = deviceidx;
+-			   __entry->core = core;
+-			   __entry->waittime = waittime;),
+-	    TP_printk("deviceidx = %d, core = %d, waittime = %d us",
+-		      __entry->deviceidx, __entry->core, __entry->waittime));
+-
+-TRACE_EVENT(enc_release,
+-	    TP_PROTO(int deviceidx, int core),
+-	    TP_ARGS(deviceidx, core),
+-	    TP_STRUCT__entry(__field(int, deviceidx)
+-			     __field(int, core)),
+-	    TP_fast_assign(__entry->deviceidx = deviceidx;
+-			   __entry->core = core;),
+-	    TP_printk("deviceidx = %d, core = %d", __entry->deviceidx,
+-		      __entry->core));
++TRACE_EVENT(core_status_update,
++	    TP_PROTO(char *node_name, char *status, long waittime),
++	    TP_ARGS(node_name, status, waittime),
++	    TP_STRUCT__entry(__string(name, node_name)
++				__string(status, status)
++				__field(long, waittime)),
++	    TP_fast_assign(__assign_str(name, node_name);
++				__assign_str(status, status);
++				__entry->waittime = waittime;),
++	    TP_printk("%s - %3s, waittime = %ld us",
++		        __get_str(name), __get_str(status), __entry->waittime));
+ 
+ TRACE_EVENT(cache_reserve,
+ 	    TP_PROTO(int deviceidx, int waittime),
+@@ -311,10 +296,9 @@ TRACE_EVENT(hantro_err,
+ #define trace_client_remove(file_attr, clientid)
+ #define trace_hantro_cma_alloc(deviceidx, region, paddr, handle, size)
+ #define trace_hantro_cma_free(deviceidx, paddr, handle)
+-#define trace_dec_reserve(deviceidx, core, waittime)
+-#define trace_dec_release(deviceidx, core)
+-#define trace_enc_reserve(deviceidx, core, waittime)
+-#define trace_enc_release(deviceidx, core)
++#define trace_core_reserve(name, waittime)
++#define trace_core_release(name)
++#define trace_core_status_update(name, status, waittime)
+ #define trace_cache_reserve(deviceidx, waittime)
+ #define trace_cache_release(deviceidx)
+ #define trace_fence_acquirebuf(obj, handle, fence_handle, waittime, ret)
+-- 
+2.27.0
+
