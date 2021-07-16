@@ -1,0 +1,145 @@
+From 2f133f4833c1c3a320924a0cc63241ea59f18ded Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 25 Sep 2020 15:42:04 +0200
+Subject: [PATCH 0077/1714] drm/nouveau: stop using TTMs fault callback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We already implemented the fault handler ourself,
+just open code what is necessary here.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/392323/
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c  | 50 ++++++++++++++-------------
+ drivers/gpu/drm/nouveau/nouveau_bo.h  |  1 +
+ drivers/gpu/drm/nouveau/nouveau_ttm.c | 10 +++---
+ 3 files changed, 33 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 83da72937060..823be16154c8 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1225,8 +1225,7 @@ nouveau_ttm_io_mem_free(struct ttm_bo_device *bdev, struct ttm_resource *reg)
+ 	mutex_unlock(&drm->ttm.io_reserve_mutex);
+ }
+ 
+-static int
+-nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
++vm_fault_t nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(bo->bdev);
+ 	struct nouveau_bo *nvbo = nouveau_bo(bo);
+@@ -1242,34 +1241,38 @@ nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 		    !nvbo->kind)
+ 			return 0;
+ 
+-		if (bo->mem.mem_type == TTM_PL_SYSTEM) {
+-			nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_GART,
+-						 0);
++		if (bo->mem.mem_type != TTM_PL_SYSTEM)
++			return 0;
++
++		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_GART, 0);
++
++	} else {
++		/* make sure bo is in mappable vram */
++		if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA ||
++		    bo->mem.start + bo->mem.num_pages < mappable)
++			return 0;
+ 
+-			ret = nouveau_bo_validate(nvbo, false, false);
+-			if (ret)
+-				return ret;
++		for (i = 0; i < nvbo->placement.num_placement; ++i) {
++			nvbo->placements[i].fpfn = 0;
++			nvbo->placements[i].lpfn = mappable;
+ 		}
+-		return 0;
+-	}
+ 
+-	/* make sure bo is in mappable vram */
+-	if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA ||
+-	    bo->mem.start + bo->mem.num_pages < mappable)
+-		return 0;
++		for (i = 0; i < nvbo->placement.num_busy_placement; ++i) {
++			nvbo->busy_placements[i].fpfn = 0;
++			nvbo->busy_placements[i].lpfn = mappable;
++		}
+ 
+-	for (i = 0; i < nvbo->placement.num_placement; ++i) {
+-		nvbo->placements[i].fpfn = 0;
+-		nvbo->placements[i].lpfn = mappable;
++		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_VRAM, 0);
+ 	}
+ 
+-	for (i = 0; i < nvbo->placement.num_busy_placement; ++i) {
+-		nvbo->busy_placements[i].fpfn = 0;
+-		nvbo->busy_placements[i].lpfn = mappable;
+-	}
++	ret = nouveau_bo_validate(nvbo, false, false);
++	if (unlikely(ret == -EBUSY || ret == -ERESTARTSYS))
++		return VM_FAULT_NOPAGE;
++	else if (unlikely(ret))
++		return VM_FAULT_SIGBUS;
+ 
+-	nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_VRAM, 0);
+-	return nouveau_bo_validate(nvbo, false, false);
++	ttm_bo_move_to_lru_tail_unlocked(bo);
++	return 0;
+ }
+ 
+ static int
+@@ -1380,7 +1383,6 @@ struct ttm_bo_driver nouveau_bo_driver = {
+ 	.move_notify = nouveau_bo_move_ntfy,
+ 	.move = nouveau_bo_move,
+ 	.verify_access = nouveau_bo_verify_access,
+-	.fault_reserve_notify = &nouveau_ttm_fault_reserve_notify,
+ 	.io_mem_reserve = &nouveau_ttm_io_mem_reserve,
+ 	.io_mem_free = &nouveau_ttm_io_mem_free,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.h b/drivers/gpu/drm/nouveau/nouveau_bo.h
+index ff68ded8d590..641ef6298a0e 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.h
+@@ -89,6 +89,7 @@ void nouveau_bo_placement_set(struct nouveau_bo *, u32 type, u32 busy);
+ void nouveau_bo_wr16(struct nouveau_bo *, unsigned index, u16 val);
+ u32  nouveau_bo_rd32(struct nouveau_bo *, unsigned index);
+ void nouveau_bo_wr32(struct nouveau_bo *, unsigned index, u32 val);
++vm_fault_t nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo);
+ void nouveau_bo_fence(struct nouveau_bo *, struct nouveau_fence *, bool exclusive);
+ int  nouveau_bo_validate(struct nouveau_bo *, bool interruptible,
+ 			 bool no_wait_gpu);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_ttm.c b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+index 427341753441..edf3bb89a47f 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_ttm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+@@ -134,17 +134,19 @@ static vm_fault_t nouveau_ttm_fault(struct vm_fault *vmf)
+ 	if (ret)
+ 		return ret;
+ 
+-	nouveau_bo_del_io_reserve_lru(bo);
++	ret = nouveau_ttm_fault_reserve_notify(bo);
++	if (ret)
++		goto error_unlock;
+ 
++	nouveau_bo_del_io_reserve_lru(bo);
+ 	prot = vm_get_page_prot(vma->vm_flags);
+ 	ret = ttm_bo_vm_fault_reserved(vmf, prot, TTM_BO_VM_NUM_PREFAULT, 1);
++	nouveau_bo_add_io_reserve_lru(bo);
+ 	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+ 		return ret;
+ 
+-	nouveau_bo_add_io_reserve_lru(bo);
+-
++error_unlock:
+ 	dma_resv_unlock(bo->base.resv);
+-
+ 	return ret;
+ }
+ 
+-- 
+2.25.1
+

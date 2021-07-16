@@ -1,0 +1,664 @@
+From 00caadf00d94ef0ea7d9c3fb56ae9e385cebe529 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 22 Jan 2021 22:56:32 +0200
+Subject: [PATCH 098/128] drm/i915: Encapsulate dbuf state handling harder
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In order to make the dbuf state computation less fragile
+let's make it stand on its own feet by not requiring someone
+to peek into a crystall ball ahead of time to figure out
+which pipes need to be added to the state under which potential
+future conditions. Instead we compute each piece of the state
+as we go along, and if any fallout occurs that affects more than
+the current set of pipes we add the affected pipes to the state
+naturally.
+
+That requires that we track a few extra thigns in the global
+dbuf state: dbuf slices for each pipe, and the weight each
+pipe has when distributing the same set of slice(s) between
+multiple pipes. Easy enough.
+
+We do need to follow a somewhat careful sequence of computations
+though as there are several steps involved in cooking up the dbuf
+state. Thoguh we could avoid some of that by computing more things
+on demand instead of relying on earlier step of the algorithm to
+have filled it out. I think the end result is still reasonable
+as the entire sequence is pretty much consolidated into a single
+function instead of being spread around all over.
+
+The rough sequence is this:
+1. calculate active_pipes
+2. calculate dbuf slices for every pipe
+3. calculate total enabled slices
+4. calculate new dbuf weights for any crtc in the state
+5. calculate new ddb entry for every pipe based on the sets of
+   slices and weights, and add any affected crtc to the state
+6. calculate new plane ddb entries for all crtcs in the state,
+   and add any affected plane to the state so that we'll perform
+   the requisite hw reprogramming
+
+And as a nice bonus we get to throw dev_priv->wm.distrust_bios_wm
+out the window.
+
+v2: Keep crtc_state->wm.skl.ddb
+
+Reviewed-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210122205633.18492-8-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  |  15 -
+ .../drm/i915/display/intel_display_debugfs.c  |   1 -
+ drivers/gpu/drm/i915/i915_drv.h               |   9 -
+ drivers/gpu/drm/i915/intel_pm.c               | 384 +++++++-----------
+ drivers/gpu/drm/i915/intel_pm.h               |   2 +
+ 5 files changed, 140 insertions(+), 271 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 93605ede5e65..6309f2201e33 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -12625,20 +12625,6 @@ static int intel_atomic_check(struct drm_device *dev,
+ 	if (ret)
+ 		goto fail;
+ 
+-	/*
+-	 * distrust_bios_wm will force a full dbuf recomputation
+-	 * but the hardware state will only get updated accordingly
+-	 * if state->modeset==true. Hence distrust_bios_wm==true &&
+-	 * state->modeset==false is an invalid combination which
+-	 * would cause the hardware and software dbuf state to get
+-	 * out of sync. We must prevent that.
+-	 *
+-	 * FIXME clean up this mess and introduce better
+-	 * state tracking for dbuf.
+-	 */
+-	if (dev_priv->wm.distrust_bios_wm)
+-		any_ms = true;
+-
+ 	intel_fbc_choose_crtc(dev_priv, state);
+ 	ret = calc_watermark_data(state);
+ 	if (ret)
+@@ -13523,7 +13509,6 @@ static int intel_atomic_commit(struct drm_device *dev,
+ 		intel_runtime_pm_put(&dev_priv->runtime_pm, state->wakeref);
+ 		return ret;
+ 	}
+-	dev_priv->wm.distrust_bios_wm = false;
+ 	intel_shared_dpll_swap_state(state);
+ 	intel_atomic_track_fbs(state);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display_debugfs.c b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+index 885d2d3c91a3..d62b18d5ecd8 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@ -1139,7 +1139,6 @@ static ssize_t i915_ipc_status_write(struct file *file, const char __user *ubuf,
+ 		if (!dev_priv->ipc_enabled && enable)
+ 			drm_info(&dev_priv->drm,
+ 				 "Enabling IPC: WM will be proper only after next commit\n");
+-		dev_priv->wm.distrust_bios_wm = true;
+ 		dev_priv->ipc_enabled = enable;
+ 		intel_enable_ipc(dev_priv);
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index cfee94e3b9c6..4cbc0bd85510 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1122,15 +1122,6 @@ struct drm_i915_private {
+ 		 * crtc_state->wm.need_postvbl_update.
+ 		 */
+ 		struct mutex wm_mutex;
+-
+-		/*
+-		 * Set during HW readout of watermarks/DDB.  Some platforms
+-		 * need to know when we're still using BIOS-provided values
+-		 * (which we don't fully trust).
+-		 *
+-		 * FIXME get rid of this.
+-		 */
+-		bool distrust_bios_wm;
+ 	} wm;
+ 
+ 	struct dram_info {
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 55fe9a8eff31..86e273b4355d 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4100,56 +4100,22 @@ static unsigned int intel_crtc_ddb_weight(const struct intel_crtc_state *crtc_st
+ 	return hdisplay;
+ }
+ 
+-static u8 skl_compute_dbuf_slices(struct intel_crtc *crtc,
+-				  u8 active_pipes);
+-
+-static int intel_crtc_dbuf_weights(struct intel_atomic_state *state,
+-				   struct intel_crtc *for_crtc,
+-				   unsigned int *weight_start,
+-				   unsigned int *weight_end,
+-				   unsigned int *weight_total)
+-{
+-	const struct intel_dbuf_state *old_dbuf_state =
+-		intel_atomic_get_old_dbuf_state(state);
+-	struct intel_dbuf_state *new_dbuf_state =
+-		intel_atomic_get_new_dbuf_state(state);
+-	u8 active_pipes = new_dbuf_state->active_pipes;
+-	enum pipe for_pipe = for_crtc->pipe;
+-	const struct intel_crtc_state *crtc_state;
+-	struct intel_crtc *crtc;
+-	u8 dbuf_slice_mask;
+-	u8 total_slice_mask;
+-	int i, ret;
+-
+-	/*
+-	 * Get allowed DBuf slices for correspondent pipe and platform.
+-	 */
+-	dbuf_slice_mask = skl_compute_dbuf_slices(for_crtc, active_pipes);
+-	total_slice_mask = dbuf_slice_mask;
++static void intel_crtc_dbuf_weights(const struct intel_dbuf_state *dbuf_state,
++				    enum pipe for_pipe,
++				    unsigned int *weight_start,
++				    unsigned int *weight_end,
++				    unsigned int *weight_total)
++{
++	struct drm_i915_private *dev_priv =
++		to_i915(dbuf_state->base.state->base.dev);
++	enum pipe pipe;
+ 
+ 	*weight_start = 0;
+ 	*weight_end = 0;
+ 	*weight_total = 0;
+ 
+-	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
+-		enum pipe pipe = crtc->pipe;
+-		unsigned int weight;
+-		u8 pipe_dbuf_slice_mask;
+-
+-		if (!crtc_state->hw.active)
+-			continue;
+-
+-		pipe_dbuf_slice_mask =
+-			skl_compute_dbuf_slices(crtc, active_pipes);
+-
+-		/*
+-		 * According to BSpec pipe can share one dbuf slice with another
+-		 * pipes or pipe can use multiple dbufs, in both cases we
+-		 * account for other pipes only if they have exactly same mask.
+-		 * However we need to account how many slices we should enable
+-		 * in total.
+-		 */
+-		total_slice_mask |= pipe_dbuf_slice_mask;
++	for_each_pipe(dev_priv, pipe) {
++		int weight = dbuf_state->weight[pipe];
+ 
+ 		/*
+ 		 * Do not account pipes using other slice sets
+@@ -4158,12 +4124,10 @@ static int intel_crtc_dbuf_weights(struct intel_atomic_state *state,
+ 		 * i.e no partial intersection), so it is enough to check for
+ 		 * equality for now.
+ 		 */
+-		if (dbuf_slice_mask != pipe_dbuf_slice_mask)
++		if (dbuf_state->slices[pipe] != dbuf_state->slices[for_pipe])
+ 			continue;
+ 
+-		weight = intel_crtc_ddb_weight(crtc_state);
+ 		*weight_total += weight;
+-
+ 		if (pipe < for_pipe) {
+ 			*weight_start += weight;
+ 			*weight_end += weight;
+@@ -4171,89 +4135,67 @@ static int intel_crtc_dbuf_weights(struct intel_atomic_state *state,
+ 			*weight_end += weight;
+ 		}
+ 	}
+-
+-	/*
+-	 * FIXME: For now we always enable slice S1 as per
+-	 * the Bspec display initialization sequence.
+-	 */
+-	new_dbuf_state->enabled_slices = total_slice_mask | BIT(DBUF_S1);
+-
+-	if (old_dbuf_state->enabled_slices != new_dbuf_state->enabled_slices) {
+-		ret = intel_atomic_serialize_global_state(&new_dbuf_state->base);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	return 0;
+ }
+ 
+ static int
+-skl_ddb_get_pipe_allocation_limits(struct drm_i915_private *dev_priv,
+-				   struct intel_crtc_state *crtc_state,
+-				   const u64 total_data_rate,
+-				   struct skl_ddb_entry *alloc, /* out */
+-				   int *num_active /* out */)
++skl_crtc_allocate_ddb(struct intel_atomic_state *state, struct intel_crtc *crtc)
+ {
+-	struct intel_atomic_state *state =
+-		to_intel_atomic_state(crtc_state->uapi.state);
+-	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+-	unsigned int weight_start, weight_end, weight_total;
++	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++	unsigned int weight_total, weight_start, weight_end;
+ 	const struct intel_dbuf_state *old_dbuf_state =
+ 		intel_atomic_get_old_dbuf_state(state);
+ 	struct intel_dbuf_state *new_dbuf_state =
+ 		intel_atomic_get_new_dbuf_state(state);
+-	u8 active_pipes = new_dbuf_state->active_pipes;
++	struct intel_crtc_state *crtc_state;
+ 	struct skl_ddb_entry ddb_slices;
++	enum pipe pipe = crtc->pipe;
+ 	u32 ddb_range_size;
+ 	u32 dbuf_slice_mask;
+ 	u32 start, end;
+ 	int ret;
+ 
+-	*num_active = hweight8(active_pipes);
+-
+-	if (!crtc_state->hw.active) {
+-		alloc->start = 0;
+-		alloc->end = 0;
+-		crtc_state->wm.skl.ddb = *alloc;
+-		return 0;
++	if (new_dbuf_state->weight[pipe] == 0) {
++		new_dbuf_state->ddb[pipe].start = 0;
++		new_dbuf_state->ddb[pipe].end = 0;
++		goto out;
+ 	}
+ 
+-	/*
+-	 * If the state doesn't change the active CRTC's or there is no
+-	 * modeset request, then there's no need to recalculate;
+-	 * the existing pipe allocation limits should remain unchanged.
+-	 * Note that we're safe from racing commits since any racing commit
+-	 * that changes the active CRTC list or do modeset would need to
+-	 * grab _all_ crtc locks, including the one we currently hold.
+-	 */
+-	if (old_dbuf_state->active_pipes == new_dbuf_state->active_pipes &&
+-	    !dev_priv->wm.distrust_bios_wm)
+-		return 0;
+-
+-	/*
+-	 * Get allowed DBuf slices for correspondent pipe and platform.
+-	 */
+-	dbuf_slice_mask = skl_compute_dbuf_slices(crtc, active_pipes);
++	dbuf_slice_mask = new_dbuf_state->slices[pipe];
+ 
+ 	skl_ddb_entry_for_slices(dev_priv, dbuf_slice_mask, &ddb_slices);
+ 	ddb_range_size = skl_ddb_entry_size(&ddb_slices);
+ 
+-	ret = intel_crtc_dbuf_weights(state, crtc,
+-				      &weight_start, &weight_end, &weight_total);
+-	if (ret)
+-		return ret;
++	intel_crtc_dbuf_weights(new_dbuf_state, pipe,
++				&weight_start, &weight_end, &weight_total);
+ 
+ 	start = ddb_range_size * weight_start / weight_total;
+ 	end = ddb_range_size * weight_end / weight_total;
+ 
+-	alloc->start = ddb_slices.start + start;
+-	alloc->end = ddb_slices.start + end;
+-	crtc_state->wm.skl.ddb = *alloc;
++	new_dbuf_state->ddb[pipe].start = ddb_slices.start + start;
++	new_dbuf_state->ddb[pipe].end = ddb_slices.start + end;
++
++out:
++	if (skl_ddb_entry_equal(&old_dbuf_state->ddb[pipe],
++				&new_dbuf_state->ddb[pipe]))
++		return 0;
++
++	ret = intel_atomic_lock_global_state(&new_dbuf_state->base);
++	if (ret)
++		return ret;
++
++	crtc_state = intel_atomic_get_crtc_state(&state->base, crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++
++	crtc_state->wm.skl.ddb = new_dbuf_state->ddb[pipe];
+ 
+ 	drm_dbg_kms(&dev_priv->drm,
+-		    "[CRTC:%d:%s] dbuf slices 0x%x, ddb (%d - %d), active pipes 0x%x\n",
++		    "[CRTC:%d:%s] dbuf slices 0x%x -> 0x%x, ddb (%d - %d) -> (%d - %d), active pipes 0x%x -> 0x%x\n",
+ 		    crtc->base.base.id, crtc->base.name,
+-		    dbuf_slice_mask, alloc->start, alloc->end, active_pipes);
++		    old_dbuf_state->slices[pipe], new_dbuf_state->slices[pipe],
++		    old_dbuf_state->ddb[pipe].start, old_dbuf_state->ddb[pipe].end,
++		    new_dbuf_state->ddb[pipe].start, new_dbuf_state->ddb[pipe].end,
++		    old_dbuf_state->active_pipes, new_dbuf_state->active_pipes);
+ 
+ 	return 0;
+ }
+@@ -4819,58 +4761,30 @@ skl_plane_wm_level(const struct intel_crtc_state *crtc_state,
+ }
+ 
+ static int
+-skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+-		      struct intel_crtc *crtc)
++skl_allocate_plane_ddb(struct intel_atomic_state *state,
++		       struct intel_crtc *crtc)
+ {
++	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct intel_crtc_state *crtc_state =
+ 		intel_atomic_get_new_crtc_state(state, crtc);
+-	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	struct intel_dbuf_state *dbuf_state =
++	const struct intel_dbuf_state *dbuf_state =
+ 		intel_atomic_get_new_dbuf_state(state);
+-	struct skl_ddb_entry *alloc = &dbuf_state->ddb[crtc->pipe];
++	const struct skl_ddb_entry *alloc = &dbuf_state->ddb[crtc->pipe];
++	int num_active = hweight8(dbuf_state->active_pipes);
+ 	u16 alloc_size, start = 0;
+ 	u16 total[I915_MAX_PLANES] = {};
+ 	u16 uv_total[I915_MAX_PLANES] = {};
+ 	u64 total_data_rate;
+ 	enum plane_id plane_id;
+-	int num_active;
+ 	u32 blocks;
+ 	int level;
+-	int ret;
+ 
+ 	/* Clear the partitioning for disabled planes. */
+ 	memset(crtc_state->wm.skl.plane_ddb_y, 0, sizeof(crtc_state->wm.skl.plane_ddb_y));
+ 	memset(crtc_state->wm.skl.plane_ddb_uv, 0, sizeof(crtc_state->wm.skl.plane_ddb_uv));
+ 
+-	if (!crtc_state->hw.active) {
+-		struct intel_atomic_state *state =
+-			to_intel_atomic_state(crtc_state->uapi.state);
+-		struct intel_dbuf_state *new_dbuf_state =
+-			intel_atomic_get_new_dbuf_state(state);
+-		const struct intel_dbuf_state *old_dbuf_state =
+-			intel_atomic_get_old_dbuf_state(state);
+-
+-		/*
+-		 * FIXME hack to make sure we compute this sensibly when
+-		 * turning off all the pipes. Otherwise we leave it at
+-		 * whatever we had previously, and then runtime PM will
+-		 * mess it up by turning off all but S1. Remove this
+-		 * once the dbuf state computation flow becomes sane.
+-		 */
+-		if (new_dbuf_state->active_pipes == 0) {
+-			new_dbuf_state->enabled_slices = BIT(DBUF_S1);
+-
+-			if (old_dbuf_state->enabled_slices != new_dbuf_state->enabled_slices) {
+-				ret = intel_atomic_serialize_global_state(&new_dbuf_state->base);
+-				if (ret)
+-					return ret;
+-			}
+-		}
+-
+-		alloc->start = alloc->end = 0;
+-		crtc_state->wm.skl.ddb = *alloc;
++	if (!crtc_state->hw.active)
+ 		return 0;
+-	}
+ 
+ 	if (INTEL_GEN(dev_priv) >= 11)
+ 		total_data_rate =
+@@ -4879,12 +4793,6 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 		total_data_rate =
+ 			skl_get_total_relative_data_rate(state, crtc);
+ 
+-	ret = skl_ddb_get_pipe_allocation_limits(dev_priv, crtc_state,
+-						 total_data_rate,
+-						 alloc, &num_active);
+-	if (ret)
+-		return ret;
+-
+ 	alloc_size = skl_ddb_entry_size(alloc);
+ 	if (alloc_size == 0)
+ 		return 0;
+@@ -5799,39 +5707,114 @@ skl_ddb_add_affected_planes(const struct intel_crtc_state *old_crtc_state,
+ 	return 0;
+ }
+ 
++static u8 intel_dbuf_enabled_slices(const struct intel_dbuf_state *dbuf_state)
++{
++	struct drm_i915_private *dev_priv = to_i915(dbuf_state->base.state->base.dev);
++	u8 enabled_slices;
++	enum pipe pipe;
++
++	/*
++	 * FIXME: For now we always enable slice S1 as per
++	 * the Bspec display initialization sequence.
++	 */
++	enabled_slices = BIT(DBUF_S1);
++
++	for_each_pipe(dev_priv, pipe)
++		enabled_slices |= dbuf_state->slices[pipe];
++
++	return enabled_slices;
++}
++
+ static int
+ skl_compute_ddb(struct intel_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ 	const struct intel_dbuf_state *old_dbuf_state;
+-	const struct intel_dbuf_state *new_dbuf_state;
++	struct intel_dbuf_state *new_dbuf_state = NULL;
+ 	const struct intel_crtc_state *old_crtc_state;
+ 	struct intel_crtc_state *new_crtc_state;
+ 	struct intel_crtc *crtc;
+ 	int ret, i;
+ 
+-	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+-					    new_crtc_state, i) {
+-		ret = skl_allocate_pipe_ddb(state, crtc);
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		new_dbuf_state = intel_atomic_get_dbuf_state(state);
++		if (IS_ERR(new_dbuf_state))
++			return PTR_ERR(new_dbuf_state);
++
++		old_dbuf_state = intel_atomic_get_old_dbuf_state(state);
++		break;
++	}
++
++	if (!new_dbuf_state)
++		return 0;
++
++	new_dbuf_state->active_pipes =
++		intel_calc_active_pipes(state, old_dbuf_state->active_pipes);
++
++	if (old_dbuf_state->active_pipes != new_dbuf_state->active_pipes) {
++		ret = intel_atomic_lock_global_state(&new_dbuf_state->base);
+ 		if (ret)
+ 			return ret;
++	}
+ 
+-		ret = skl_ddb_add_affected_planes(old_crtc_state,
+-						  new_crtc_state);
++	for_each_intel_crtc(&dev_priv->drm, crtc) {
++		enum pipe pipe = crtc->pipe;
++
++		new_dbuf_state->slices[pipe] =
++			skl_compute_dbuf_slices(crtc, new_dbuf_state->active_pipes);
++
++		if (old_dbuf_state->slices[pipe] == new_dbuf_state->slices[pipe])
++			continue;
++
++		ret = intel_atomic_lock_global_state(&new_dbuf_state->base);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	old_dbuf_state = intel_atomic_get_old_dbuf_state(state);
+-	new_dbuf_state = intel_atomic_get_new_dbuf_state(state);
++	new_dbuf_state->enabled_slices = intel_dbuf_enabled_slices(new_dbuf_state);
++
++	if (old_dbuf_state->enabled_slices != new_dbuf_state->enabled_slices) {
++		ret = intel_atomic_serialize_global_state(&new_dbuf_state->base);
++		if (ret)
++			return ret;
+ 
+-	if (new_dbuf_state &&
+-	    new_dbuf_state->enabled_slices != old_dbuf_state->enabled_slices)
+ 		drm_dbg_kms(&dev_priv->drm,
+ 			    "Enabled dbuf slices 0x%x -> 0x%x (out of %d dbuf slices)\n",
+ 			    old_dbuf_state->enabled_slices,
+ 			    new_dbuf_state->enabled_slices,
+ 			    INTEL_INFO(dev_priv)->num_supported_dbuf_slices);
++	}
++
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		enum pipe pipe = crtc->pipe;
++
++		new_dbuf_state->weight[pipe] = intel_crtc_ddb_weight(new_crtc_state);
++
++		if (old_dbuf_state->weight[pipe] == new_dbuf_state->weight[pipe])
++			continue;
++
++		ret = intel_atomic_lock_global_state(&new_dbuf_state->base);
++		if (ret)
++			return ret;
++	}
++
++	for_each_intel_crtc(&dev_priv->drm, crtc) {
++		ret = skl_crtc_allocate_ddb(state, crtc);
++		if (ret)
++			return ret;
++	}
++
++	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
++					    new_crtc_state, i) {
++		ret = skl_allocate_plane_ddb(state, crtc);
++		if (ret)
++			return ret;
++
++		ret = skl_ddb_add_affected_planes(old_crtc_state,
++						  new_crtc_state);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return 0;
+ }
+@@ -5968,83 +5951,6 @@ skl_print_wm_changes(struct intel_atomic_state *state)
+ 	}
+ }
+ 
+-static int intel_add_affected_pipes(struct intel_atomic_state *state,
+-				    u8 pipe_mask)
+-{
+-	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+-	struct intel_crtc *crtc;
+-
+-	for_each_intel_crtc(&dev_priv->drm, crtc) {
+-		struct intel_crtc_state *crtc_state;
+-
+-		if ((pipe_mask & BIT(crtc->pipe)) == 0)
+-			continue;
+-
+-		crtc_state = intel_atomic_get_crtc_state(&state->base, crtc);
+-		if (IS_ERR(crtc_state))
+-			return PTR_ERR(crtc_state);
+-	}
+-
+-	return 0;
+-}
+-
+-static int
+-skl_ddb_add_affected_pipes(struct intel_atomic_state *state)
+-{
+-	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+-	struct intel_crtc_state *crtc_state;
+-	struct intel_crtc *crtc;
+-	int i, ret;
+-
+-	if (dev_priv->wm.distrust_bios_wm) {
+-		/*
+-		 * skl_ddb_get_pipe_allocation_limits() currently requires
+-		 * all active pipes to be included in the state so that
+-		 * it can redistribute the dbuf among them, and it really
+-		 * wants to recompute things when distrust_bios_wm is set
+-		 * so we add all the pipes to the state.
+-		 */
+-		ret = intel_add_affected_pipes(state, ~0);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
+-		struct intel_dbuf_state *new_dbuf_state;
+-		const struct intel_dbuf_state *old_dbuf_state;
+-
+-		new_dbuf_state = intel_atomic_get_dbuf_state(state);
+-		if (IS_ERR(new_dbuf_state))
+-			return PTR_ERR(new_dbuf_state);
+-
+-		old_dbuf_state = intel_atomic_get_old_dbuf_state(state);
+-
+-		new_dbuf_state->active_pipes =
+-			intel_calc_active_pipes(state, old_dbuf_state->active_pipes);
+-
+-		if (old_dbuf_state->active_pipes == new_dbuf_state->active_pipes)
+-			break;
+-
+-		ret = intel_atomic_lock_global_state(&new_dbuf_state->base);
+-		if (ret)
+-			return ret;
+-
+-		/*
+-		 * skl_ddb_get_pipe_allocation_limits() currently requires
+-		 * all active pipes to be included in the state so that
+-		 * it can redistribute the dbuf among them.
+-		 */
+-		ret = intel_add_affected_pipes(state,
+-					       new_dbuf_state->active_pipes);
+-		if (ret)
+-			return ret;
+-
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+ /*
+  * To make sure the cursor watermark registers are always consistent
+  * with our computed state the following scenario needs special
+@@ -6112,15 +6018,6 @@ skl_compute_wm(struct intel_atomic_state *state)
+ 	struct intel_crtc_state *new_crtc_state;
+ 	int ret, i;
+ 
+-	ret = skl_ddb_add_affected_pipes(state);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * Calculate WM's for all pipes that are part of this transaction.
+-	 * Note that skl_ddb_add_affected_pipes may have added more CRTC's that
+-	 * weren't otherwise being modified if pipe allocations had to change.
+-	 */
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		ret = skl_build_pipe_wm(state, crtc);
+ 		if (ret)
+@@ -6288,11 +6185,6 @@ void skl_wm_get_hw_state(struct drm_i915_private *dev_priv)
+ 		skl_pipe_wm_get_hw_state(crtc, &crtc_state->wm.skl.optimal);
+ 		crtc_state->wm.skl.raw = crtc_state->wm.skl.optimal;
+ 	}
+-
+-	if (dev_priv->active_pipes) {
+-		/* Fully recompute DDB on first atomic commit */
+-		dev_priv->wm.distrust_bios_wm = true;
+-	}
+ }
+ 
+ static void ilk_pipe_wm_get_hw_state(struct intel_crtc *crtc)
+diff --git a/drivers/gpu/drm/i915/intel_pm.h b/drivers/gpu/drm/i915/intel_pm.h
+index 724204bb8442..97550cf0b6df 100644
+--- a/drivers/gpu/drm/i915/intel_pm.h
++++ b/drivers/gpu/drm/i915/intel_pm.h
+@@ -71,6 +71,8 @@ struct intel_dbuf_state {
+ 	struct intel_global_state base;
+ 
+ 	struct skl_ddb_entry ddb[I915_MAX_PIPES];
++	unsigned int weight[I915_MAX_PIPES];
++	u8 slices[I915_MAX_PIPES];
+ 
+ 	u8 enabled_slices;
+ 	u8 active_pipes;
+-- 
+2.17.1
+

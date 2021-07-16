@@ -1,0 +1,257 @@
+From 4ef734f4c06e00995c9e041a2cc88788557d5d08 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 2 Feb 2021 12:09:09 -0800
+Subject: [PATCH 30/62] perf tools: Support PERF_SAMPLE_WEIGHT_STRUCT
+
+The new sample type, PERF_SAMPLE_WEIGHT_STRUCT, is an alternative of the
+PERF_SAMPLE_WEIGHT sample type. Users can apply either the
+PERF_SAMPLE_WEIGHT sample type or the PERF_SAMPLE_WEIGHT_STRUCT sample
+type to retrieve the sample weight, but they cannot apply both sample
+types simultaneously.
+
+The new sample type shares the same space as the PERF_SAMPLE_WEIGHT
+sample type. The lower 32 bits are exactly the same for both sample
+type. The higher 32 bits may be different for different architecture.
+
+Add arch specific arch_evsel__set_sample_weight() to set the new sample
+type for X86. Only store the lower 32 bits for the sample->weight if the
+new sample type is applied. In practice, no memory access could last
+than 4G cycles. No data will be lost.
+
+If the kernel doesn't support the new sample type. Fall back to the
+PERF_SAMPLE_WEIGHT sample type.
+
+There is no impact for other architectures.
+
+Committer notes:
+
+Fixup related to PERF_SAMPLE_CODE_PAGE_SIZE, present in acme/perf/core
+but not upstream yet.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lore.kernel.org/lkml/1612296553-21962-6-git-send-email-kan.liang@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/arch/x86/util/Build            |  1 +
+ tools/perf/arch/x86/util/evsel.c          |  8 +++++++
+ tools/perf/util/evsel.c                   | 28 +++++++++++++++++++----
+ tools/perf/util/evsel.h                   |  3 +++
+ tools/perf/util/intel-pt.c                | 22 +++++++++++++++---
+ tools/perf/util/perf_event_attr_fprintf.c |  1 +
+ tools/perf/util/session.c                 |  2 +-
+ tools/perf/util/synthetic-events.c        |  6 +++--
+ 8 files changed, 61 insertions(+), 10 deletions(-)
+ create mode 100644 tools/perf/arch/x86/util/evsel.c
+
+diff --git a/tools/perf/arch/x86/util/Build b/tools/perf/arch/x86/util/Build
+index 98014613b622..0c72d418932e 100644
+--- a/tools/perf/arch/x86/util/Build
++++ b/tools/perf/arch/x86/util/Build
+@@ -8,6 +8,7 @@ perf-y += machine.o
+ perf-y += event.o
+ perf-y += evlist.o
+ perf-y += mem-events.o
++perf-y += evsel.o
+ 
+ perf-$(CONFIG_DWARF) += dwarf-regs.o
+ perf-$(CONFIG_BPF_PROLOGUE) += dwarf-regs.o
+diff --git a/tools/perf/arch/x86/util/evsel.c b/tools/perf/arch/x86/util/evsel.c
+new file mode 100644
+index 000000000000..2f733cdc8dbb
+--- /dev/null
++++ b/tools/perf/arch/x86/util/evsel.c
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include "util/evsel.h"
++
++void arch_evsel__set_sample_weight(struct evsel *evsel)
++{
++	evsel__set_sample_bit(evsel, WEIGHT_STRUCT);
++}
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 9147e8cabf79..07b4418e80d5 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -1012,6 +1012,11 @@ struct evsel_config_term *__evsel__get_config_term(struct evsel *evsel, enum evs
+ 	return found_term;
+ }
+ 
++void __weak arch_evsel__set_sample_weight(struct evsel *evsel)
++{
++	evsel__set_sample_bit(evsel, WEIGHT);
++}
++
+ /*
+  * The enable_on_exec/disabled value strategy:
+  *
+@@ -1166,7 +1171,7 @@ void evsel__config(struct evsel *evsel, struct record_opts *opts,
+ 	}
+ 
+ 	if (opts->sample_weight)
+-		evsel__set_sample_bit(evsel, WEIGHT);
++		arch_evsel__set_sample_weight(evsel);
+ 
+ 	attr->task  = track;
+ 	attr->mmap  = track;
+@@ -1738,6 +1743,10 @@ static int evsel__open_cpu(struct evsel *evsel, struct perf_cpu_map *cpus,
+ 	}
+ 
+ fallback_missing_features:
++	if (perf_missing_features.weight_struct) {
++		evsel__set_sample_bit(evsel, WEIGHT);
++		evsel__reset_sample_bit(evsel, WEIGHT_STRUCT);
++	}
+ 	if (perf_missing_features.clockid_wrong)
+ 		evsel->core.attr.clockid = CLOCK_MONOTONIC; /* should always work */
+ 	if (perf_missing_features.clockid) {
+@@ -1876,7 +1885,12 @@ static int evsel__open_cpu(struct evsel *evsel, struct perf_cpu_map *cpus,
+ 	 * Must probe features in the order they were added to the
+ 	 * perf_event_attr interface.
+ 	 */
+-	if (!perf_missing_features.code_page_size &&
++	if (!perf_missing_features.weight_struct &&
++	    (evsel->core.attr.sample_type & PERF_SAMPLE_WEIGHT_STRUCT)) {
++		perf_missing_features.weight_struct = true;
++		pr_debug2("switching off weight struct support\n");
++		goto fallback_missing_features;
++	} else if (!perf_missing_features.code_page_size &&
+ 	    (evsel->core.attr.sample_type & PERF_SAMPLE_CODE_PAGE_SIZE)) {
+ 		perf_missing_features.code_page_size = true;
+ 		pr_debug2_peo("Kernel has no PERF_SAMPLE_CODE_PAGE_SIZE support, bailing out\n");
+@@ -2324,9 +2338,15 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
+ 		}
+ 	}
+ 
+-	if (type & PERF_SAMPLE_WEIGHT) {
++	if (type & PERF_SAMPLE_WEIGHT_TYPE) {
++		union perf_sample_weight weight;
++
+ 		OVERFLOW_CHECK_u64(array);
+-		data->weight = *array;
++		weight.full = *array;
++		if (type & PERF_SAMPLE_WEIGHT)
++			data->weight = weight.full;
++		else
++			data->weight = weight.var1_dw;
+ 		array++;
+ 	}
+ 
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index 157d7c27d6e3..e262768ce760 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -146,6 +146,7 @@ struct perf_missing_features {
+ 	bool cgroup;
+ 	bool data_page_size;
+ 	bool code_page_size;
++	bool weight_struct;
+ };
+ 
+ extern struct perf_missing_features perf_missing_features;
+@@ -240,6 +241,8 @@ void __evsel__reset_sample_bit(struct evsel *evsel, enum perf_event_sample_forma
+ 
+ void evsel__set_sample_id(struct evsel *evsel, bool use_sample_identifier);
+ 
++void arch_evsel__set_sample_weight(struct evsel *evsel);
++
+ int evsel__set_filter(struct evsel *evsel, const char *filter);
+ int evsel__append_tp_filter(struct evsel *evsel, const char *filter);
+ int evsel__append_addr_filter(struct evsel *evsel, const char *filter);
+diff --git a/tools/perf/util/intel-pt.c b/tools/perf/util/intel-pt.c
+index 2fff6f760457..1239ead42be7 100644
+--- a/tools/perf/util/intel-pt.c
++++ b/tools/perf/util/intel-pt.c
+@@ -1868,13 +1868,29 @@ static int intel_pt_synth_pebs_sample(struct intel_pt_queue *ptq)
+ 	if (sample_type & PERF_SAMPLE_ADDR && items->has_mem_access_address)
+ 		sample.addr = items->mem_access_address;
+ 
+-	if (sample_type & PERF_SAMPLE_WEIGHT) {
++	if (sample_type & PERF_SAMPLE_WEIGHT_TYPE) {
+ 		/*
+ 		 * Refer kernel's setup_pebs_adaptive_sample_data() and
+ 		 * intel_hsw_weight().
+ 		 */
+-		if (items->has_mem_access_latency)
+-			sample.weight = items->mem_access_latency;
++		if (items->has_mem_access_latency) {
++			u64 weight = items->mem_access_latency >> 32;
++
++			/*
++			 * Starts from SPR, the mem access latency field
++			 * contains both cache latency [47:32] and instruction
++			 * latency [15:0]. The cache latency is the same as the
++			 * mem access latency on previous platforms.
++			 *
++			 * In practice, no memory access could last than 4G
++			 * cycles. Use latency >> 32 to distinguish the
++			 * different format of the mem access latency field.
++			 */
++			if (weight > 0)
++				sample.weight = weight & 0xffff;
++			else
++				sample.weight = items->mem_access_latency;
++		}
+ 		if (!sample.weight && items->has_tsx_aux_info) {
+ 			/* Cycles last block */
+ 			sample.weight = (u32)items->tsx_aux_info;
+diff --git a/tools/perf/util/perf_event_attr_fprintf.c b/tools/perf/util/perf_event_attr_fprintf.c
+index 3a2eb25d07a7..08a43881b043 100644
+--- a/tools/perf/util/perf_event_attr_fprintf.c
++++ b/tools/perf/util/perf_event_attr_fprintf.c
+@@ -36,6 +36,7 @@ static void __p_sample_type(char *buf, size_t size, u64 value)
+ 		bit_name(IDENTIFIER), bit_name(REGS_INTR), bit_name(DATA_SRC),
+ 		bit_name(WEIGHT), bit_name(PHYS_ADDR), bit_name(AUX),
+ 		bit_name(CGROUP), bit_name(DATA_PAGE_SIZE), bit_name(CODE_PAGE_SIZE),
++		bit_name(WEIGHT_STRUCT),
+ 		{ .name = NULL, }
+ 	};
+ #undef bit_name
+diff --git a/tools/perf/util/session.c b/tools/perf/util/session.c
+index be0377bc9ba3..e376f8f72e33 100644
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@ -1299,7 +1299,7 @@ static void dump_sample(struct evsel *evsel, union perf_event *event,
+ 	if (sample_type & PERF_SAMPLE_STACK_USER)
+ 		stack_user__printf(&sample->user_stack);
+ 
+-	if (sample_type & PERF_SAMPLE_WEIGHT)
++	if (sample_type & PERF_SAMPLE_WEIGHT_TYPE)
+ 		printf("... weight: %" PRIu64 "\n", sample->weight);
+ 
+ 	if (sample_type & PERF_SAMPLE_DATA_SRC)
+diff --git a/tools/perf/util/synthetic-events.c b/tools/perf/util/synthetic-events.c
+index 590f5e0c88e3..955d8ca8a7ca 100644
+--- a/tools/perf/util/synthetic-events.c
++++ b/tools/perf/util/synthetic-events.c
+@@ -1384,7 +1384,7 @@ size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
+ 		}
+ 	}
+ 
+-	if (type & PERF_SAMPLE_WEIGHT)
++	if (type & PERF_SAMPLE_WEIGHT_TYPE)
+ 		result += sizeof(u64);
+ 
+ 	if (type & PERF_SAMPLE_DATA_SRC)
+@@ -1558,8 +1558,10 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type, u64 read_fo
+ 		}
+ 	}
+ 
+-	if (type & PERF_SAMPLE_WEIGHT) {
++	if (type & PERF_SAMPLE_WEIGHT_TYPE) {
+ 		*array = sample->weight;
++		if (type & PERF_SAMPLE_WEIGHT_STRUCT)
++			*array &= 0xffffffff;
+ 		array++;
+ 	}
+ 
+-- 
+2.25.1
+

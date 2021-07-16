@@ -1,0 +1,118 @@
+From 2748779895f5b17752733f7dd799ede2215b233a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 9 Oct 2020 15:00:28 +0300
+Subject: [PATCH 0407/1714] drm/i915: Skip aux plane stuff when there is no aux
+ plane
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+when the hardware isn't going to use the aux plane there's no
+real point in dealing with the relevant hardware restrictions.
+So let's just skip all that when not necessary.
+
+We can now also remove the offset=~0xfff behaviour for unused
+color planes. Let's just zero out everyting so as to not leave
+stale garbage behind to confuse people debugging the code.
+
+v2: Explicitly set AUX_DIST to zero when there is no aux plane
+
+Reviewed-by: Imre Deak <imre.deak@intel.com> #v1
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201009120028.32422-1-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 14 +++++++++-----
+ drivers/gpu/drm/i915/display/intel_sprite.c  | 13 ++++++++-----
+ 2 files changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index f595b7a2bf76..7292458e5481 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -2001,13 +2001,17 @@ static int ccs_to_main_plane(const struct drm_framebuffer *fb, int ccs_plane)
+ 	return ccs_plane - fb->format->num_planes / 2;
+ }
+ 
+-/* Return either the main plane's CCS or - if not a CCS FB - UV plane */
+ int intel_main_to_aux_plane(const struct drm_framebuffer *fb, int main_plane)
+ {
++	struct drm_i915_private *i915 = to_i915(fb->dev);
++
+ 	if (is_ccs_modifier(fb->modifier))
+ 		return main_to_ccs_plane(fb, main_plane);
+-
+-	return 1;
++	else if (INTEL_GEN(i915) < 11 &&
++		 intel_format_info_is_yuv_semiplanar(fb->format, fb->modifier))
++		return 1;
++	else
++		return 0;
+ }
+ 
+ bool
+@@ -3941,7 +3945,7 @@ static int skl_check_main_surface(struct intel_plane_state *plane_state)
+ 	 * main surface offset, and it must be non-negative. Make
+ 	 * sure that is what we will get.
+ 	 */
+-	if (offset > aux_offset)
++	if (aux_plane && offset > aux_offset)
+ 		offset = intel_plane_adjust_aligned_offset(&x, &y, plane_state, 0,
+ 							   offset, aux_offset & ~(alignment - 1));
+ 
+@@ -4139,7 +4143,7 @@ int skl_check_plane_surface(struct intel_plane_state *plane_state)
+ 	}
+ 
+ 	for (i = fb->format->num_planes; i < ARRAY_SIZE(plane_state->color_plane); i++) {
+-		plane_state->color_plane[i].offset = ~0xfff;
++		plane_state->color_plane[i].offset = 0;
+ 		plane_state->color_plane[i].x = 0;
+ 		plane_state->color_plane[i].y = 0;
+ 	}
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.c b/drivers/gpu/drm/i915/display/intel_sprite.c
+index 2da11ab6343c..af6a0ad9a43d 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.c
++++ b/drivers/gpu/drm/i915/display/intel_sprite.c
+@@ -655,8 +655,6 @@ skl_program_plane(struct intel_plane *plane,
+ 	u32 stride = skl_plane_stride(plane_state, color_plane);
+ 	const struct drm_framebuffer *fb = plane_state->hw.fb;
+ 	int aux_plane = intel_main_to_aux_plane(fb, color_plane);
+-	u32 aux_dist = plane_state->color_plane[aux_plane].offset - surf_addr;
+-	u32 aux_stride = skl_plane_stride(plane_state, aux_plane);
+ 	int crtc_x = plane_state->uapi.dst.x1;
+ 	int crtc_y = plane_state->uapi.dst.y1;
+ 	u32 x = plane_state->color_plane[color_plane].x;
+@@ -664,7 +662,7 @@ skl_program_plane(struct intel_plane *plane,
+ 	u32 src_w = drm_rect_width(&plane_state->uapi.src) >> 16;
+ 	u32 src_h = drm_rect_height(&plane_state->uapi.src) >> 16;
+ 	u8 alpha = plane_state->hw.alpha >> 8;
+-	u32 plane_color_ctl = 0;
++	u32 plane_color_ctl = 0, aux_dist = 0;
+ 	unsigned long irqflags;
+ 	u32 keymsk, keymax;
+ 	u32 plane_ctl = plane_state->ctl;
+@@ -691,6 +689,13 @@ skl_program_plane(struct intel_plane *plane,
+ 		crtc_y = 0;
+ 	}
+ 
++	if (aux_plane) {
++		aux_dist = plane_state->color_plane[aux_plane].offset - surf_addr;
++
++		if (INTEL_GEN(dev_priv) < 12)
++			aux_dist |= skl_plane_stride(plane_state, aux_plane);
++	}
++
+ 	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+ 
+ 	intel_de_write_fw(dev_priv, PLANE_STRIDE(pipe, plane_id), stride);
+@@ -699,8 +704,6 @@ skl_program_plane(struct intel_plane *plane,
+ 	intel_de_write_fw(dev_priv, PLANE_SIZE(pipe, plane_id),
+ 			  (src_h << 16) | src_w);
+ 
+-	if (INTEL_GEN(dev_priv) < 12)
+-		aux_dist |= aux_stride;
+ 	intel_de_write_fw(dev_priv, PLANE_AUX_DIST(pipe, plane_id), aux_dist);
+ 
+ 	if (icl_is_hdr_plane(dev_priv, plane_id))
+-- 
+2.25.1
+

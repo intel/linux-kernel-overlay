@@ -1,0 +1,309 @@
+From 83913f7fad2777b7b80f220879fc8e53cd56687c Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Thu, 29 Oct 2020 13:58:52 +1000
+Subject: [PATCH 0870/1714] drm/ttm: add multihop infrastrucutre (v3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently drivers get called to move a buffer, but if they have to
+move it temporarily through another space (SYSTEM->VRAM via TT)
+then they can end up with a lot of ttm->driver->ttm call stacks,
+if the temprorary space moves requires eviction.
+
+Instead of letting the driver do all the placement/space for the
+temporary, allow it to report back (-EMULTIHOP) and a placement (hop)
+to the move code, which will then do the temporary move, and the
+correct placement move afterwards.
+
+This removes a lot of code from drivers, at the expense of
+adding some midlayering. I've some further ideas on how to turn
+it inside out, but I think this is a good solution to the call
+stack problems.
+
+v2: separate out the driver patches, add WARN for getting
+MULTHOP in paths we shouldn't (Daniel)
+v3: use memset (Christian)
+
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: hristian König <christian.koenig@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201109005432.861936-2-airlied@gmail.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    |  3 +-
+ drivers/gpu/drm/drm_gem_vram_helper.c      |  3 +-
+ drivers/gpu/drm/nouveau/nouveau_bo.c       |  3 +-
+ drivers/gpu/drm/qxl/qxl_ttm.c              |  3 +-
+ drivers/gpu/drm/radeon/radeon_ttm.c        |  3 +-
+ drivers/gpu/drm/ttm/ttm_bo.c               | 74 +++++++++++++++++++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c |  3 +-
+ include/drm/ttm/ttm_bo_driver.h            |  7 +-
+ 8 files changed, 83 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 12aa35ac0eb4..fad7ca959316 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -656,7 +656,8 @@ static bool amdgpu_mem_visible(struct amdgpu_device *adev,
+  */
+ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 			  struct ttm_operation_ctx *ctx,
+-			  struct ttm_resource *new_mem)
++			  struct ttm_resource *new_mem,
++			  struct ttm_place *hop)
+ {
+ 	struct amdgpu_device *adev;
+ 	struct amdgpu_bo *abo;
+diff --git a/drivers/gpu/drm/drm_gem_vram_helper.c b/drivers/gpu/drm/drm_gem_vram_helper.c
+index 5e1b09ba5f2b..889a06696f7e 100644
+--- a/drivers/gpu/drm/drm_gem_vram_helper.c
++++ b/drivers/gpu/drm/drm_gem_vram_helper.c
+@@ -955,7 +955,8 @@ static void bo_driver_delete_mem_notify(struct ttm_buffer_object *bo)
+ static int bo_driver_move(struct ttm_buffer_object *bo,
+ 			  bool evict,
+ 			  struct ttm_operation_ctx *ctx,
+-			  struct ttm_resource *new_mem)
++			  struct ttm_resource *new_mem,
++			  struct ttm_place *hop)
+ {
+ 	struct drm_gem_vram_object *gbo;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index ba5ca2c71300..4553af7caec5 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1023,7 +1023,8 @@ nouveau_bo_vm_cleanup(struct ttm_buffer_object *bo,
+ static int
+ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		struct ttm_operation_ctx *ctx,
+-		struct ttm_resource *new_reg)
++		struct ttm_resource *new_reg,
++		struct ttm_place *hop)
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(bo->bdev);
+ 	struct nouveau_bo *nvbo = nouveau_bo(bo);
+diff --git a/drivers/gpu/drm/qxl/qxl_ttm.c b/drivers/gpu/drm/qxl/qxl_ttm.c
+index a80d59634143..128c38c8a837 100644
+--- a/drivers/gpu/drm/qxl/qxl_ttm.c
++++ b/drivers/gpu/drm/qxl/qxl_ttm.c
+@@ -140,7 +140,8 @@ static void qxl_bo_move_notify(struct ttm_buffer_object *bo,
+ 
+ static int qxl_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		       struct ttm_operation_ctx *ctx,
+-		       struct ttm_resource *new_mem)
++		       struct ttm_resource *new_mem,
++		       struct ttm_place *hop)
+ {
+ 	struct ttm_resource *old_mem = &bo->mem;
+ 	int ret;
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 95038ac3382e..29062dbea299 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -303,7 +303,8 @@ static int radeon_move_ram_vram(struct ttm_buffer_object *bo,
+ 
+ static int radeon_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 			  struct ttm_operation_ctx *ctx,
+-			  struct ttm_resource *new_mem)
++			  struct ttm_resource *new_mem,
++			  struct ttm_place *hop)
+ {
+ 	struct radeon_device *rdev;
+ 	struct radeon_bo *rbo;
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index e2a124b3affb..e6bcbfe530ec 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -231,7 +231,8 @@ EXPORT_SYMBOL(ttm_bo_bulk_move_lru_tail);
+ 
+ static int ttm_bo_handle_move_mem(struct ttm_buffer_object *bo,
+ 				  struct ttm_resource *mem, bool evict,
+-				  struct ttm_operation_ctx *ctx)
++				  struct ttm_operation_ctx *ctx,
++				  struct ttm_place *hop)
+ {
+ 	struct ttm_bo_device *bdev = bo->bdev;
+ 	struct ttm_resource_manager *old_man = ttm_manager_type(bdev, bo->mem.mem_type);
+@@ -259,9 +260,12 @@ static int ttm_bo_handle_move_mem(struct ttm_buffer_object *bo,
+ 		}
+ 	}
+ 
+-	ret = bdev->driver->move(bo, evict, ctx, mem);
+-	if (ret)
++	ret = bdev->driver->move(bo, evict, ctx, mem, hop);
++	if (ret) {
++		if (ret == -EMULTIHOP)
++			return ret;
+ 		goto out_err;
++	}
+ 
+ 	ctx->bytes_moved += bo->num_pages << PAGE_SHIFT;
+ 	return 0;
+@@ -566,8 +570,11 @@ static int ttm_bo_evict(struct ttm_buffer_object *bo,
+ 	struct ttm_bo_device *bdev = bo->bdev;
+ 	struct ttm_resource evict_mem;
+ 	struct ttm_placement placement;
++	struct ttm_place hop;
+ 	int ret = 0;
+ 
++	memset(&hop, 0, sizeof(hop));
++
+ 	dma_resv_assert_held(bo->base.resv);
+ 
+ 	placement.num_placement = 0;
+@@ -596,8 +603,9 @@ static int ttm_bo_evict(struct ttm_buffer_object *bo,
+ 		goto out;
+ 	}
+ 
+-	ret = ttm_bo_handle_move_mem(bo, &evict_mem, true, ctx);
++	ret = ttm_bo_handle_move_mem(bo, &evict_mem, true, ctx, &hop);
+ 	if (unlikely(ret)) {
++		WARN(ret == -EMULTIHOP, "Unexpected multihop in eviction - likely driver bug\n");
+ 		if (ret != -ERESTARTSYS)
+ 			pr_err("Buffer eviction failed\n");
+ 		ttm_resource_free(bo, &evict_mem);
+@@ -936,15 +944,45 @@ int ttm_bo_mem_space(struct ttm_buffer_object *bo,
+ }
+ EXPORT_SYMBOL(ttm_bo_mem_space);
+ 
++static int ttm_bo_bounce_temp_buffer(struct ttm_buffer_object *bo,
++				     struct ttm_resource *mem,
++				     struct ttm_operation_ctx *ctx,
++				     struct ttm_place *hop)
++{
++	struct ttm_placement hop_placement;
++	int ret;
++	struct ttm_resource hop_mem = *mem;
++
++	hop_mem.mm_node = NULL;
++	hop_mem.mem_type = TTM_PL_SYSTEM;
++	hop_mem.placement = 0;
++
++	hop_placement.num_placement = hop_placement.num_busy_placement = 1;
++	hop_placement.placement = hop_placement.busy_placement = hop;
++
++	/* find space in the bounce domain */
++	ret = ttm_bo_mem_space(bo, &hop_placement, &hop_mem, ctx);
++	if (ret)
++		return ret;
++	/* move to the bounce domain */
++	ret = ttm_bo_handle_move_mem(bo, &hop_mem, false, ctx, NULL);
++	if (ret)
++		return ret;
++	return 0;
++}
++
+ static int ttm_bo_move_buffer(struct ttm_buffer_object *bo,
+ 			      struct ttm_placement *placement,
+ 			      struct ttm_operation_ctx *ctx)
+ {
+ 	int ret = 0;
++	struct ttm_place hop;
+ 	struct ttm_resource mem;
+ 
+ 	dma_resv_assert_held(bo->base.resv);
+ 
++	memset(&hop, 0, sizeof(hop));
++
+ 	mem.num_pages = bo->num_pages;
+ 	mem.size = mem.num_pages << PAGE_SHIFT;
+ 	mem.page_alignment = bo->mem.page_alignment;
+@@ -954,12 +992,25 @@ static int ttm_bo_move_buffer(struct ttm_buffer_object *bo,
+ 
+ 	/*
+ 	 * Determine where to move the buffer.
++	 *
++	 * If driver determines move is going to need
++	 * an extra step then it will return -EMULTIHOP
++	 * and the buffer will be moved to the temporary
++	 * stop and the driver will be called to make
++	 * the second hop.
+ 	 */
++bounce:
+ 	ret = ttm_bo_mem_space(bo, placement, &mem, ctx);
+ 	if (ret)
+-		goto out_unlock;
+-	ret = ttm_bo_handle_move_mem(bo, &mem, false, ctx);
+-out_unlock:
++		return ret;
++	ret = ttm_bo_handle_move_mem(bo, &mem, false, ctx, &hop);
++	if (ret == -EMULTIHOP) {
++		ret = ttm_bo_bounce_temp_buffer(bo, &mem, ctx, &hop);
++		if (ret)
++			return ret;
++		/* try and move to final place now. */
++		goto bounce;
++	}
+ 	if (ret)
+ 		ttm_resource_free(bo, &mem);
+ 	return ret;
+@@ -1432,15 +1483,20 @@ int ttm_bo_swapout(struct ttm_operation_ctx *ctx)
+ 	if (bo->mem.mem_type != TTM_PL_SYSTEM) {
+ 		struct ttm_operation_ctx ctx = { false, false };
+ 		struct ttm_resource evict_mem;
++		struct ttm_place hop;
++
++		memset(&hop, 0, sizeof(hop));
+ 
+ 		evict_mem = bo->mem;
+ 		evict_mem.mm_node = NULL;
+ 		evict_mem.placement = 0;
+ 		evict_mem.mem_type = TTM_PL_SYSTEM;
+ 
+-		ret = ttm_bo_handle_move_mem(bo, &evict_mem, true, &ctx);
+-		if (unlikely(ret != 0))
++		ret = ttm_bo_handle_move_mem(bo, &evict_mem, true, &ctx, &hop);
++		if (unlikely(ret != 0)) {
++			WARN(ret == -EMULTIHOP, "Unexpected multihop in swaput - likely driver bug.\n");
+ 			goto out;
++		}
+ 	}
+ 
+ 	/**
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+index 51f70bea41cc..6a04261ce760 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+@@ -695,7 +695,8 @@ static void vmw_swap_notify(struct ttm_buffer_object *bo)
+ static int vmw_move(struct ttm_buffer_object *bo,
+ 		    bool evict,
+ 		    struct ttm_operation_ctx *ctx,
+-		    struct ttm_resource *new_mem)
++		    struct ttm_resource *new_mem,
++		    struct ttm_place *hop)
+ {
+ 	struct ttm_resource_manager *old_man = ttm_manager_type(bo->bdev, bo->mem.mem_type);
+ 	struct ttm_resource_manager *new_man = ttm_manager_type(bo->bdev, new_mem->mem_type);
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index da8208f43378..f02f7cf9ae90 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -121,6 +121,8 @@ struct ttm_bo_driver {
+ 	 * Return the bo flags for a buffer which is not mapped to the hardware.
+ 	 * These will be placed in proposed_flags so that when the move is
+ 	 * finished, they'll end up in bo->mem.flags
++	 * This should not cause multihop evictions, and the core will warn
++	 * if one is proposed.
+ 	 */
+ 
+ 	void (*evict_flags)(struct ttm_buffer_object *bo,
+@@ -134,12 +136,15 @@ struct ttm_bo_driver {
+ 	 * the graphics address space
+ 	 * @ctx: context for this move with parameters
+ 	 * @new_mem: the new memory region receiving the buffer
++	 @ @hop: placement for driver directed intermediate hop
+ 	 *
+ 	 * Move a buffer between two memory regions.
++	 * Returns errno -EMULTIHOP if driver requests a hop
+ 	 */
+ 	int (*move)(struct ttm_buffer_object *bo, bool evict,
+ 		    struct ttm_operation_ctx *ctx,
+-		    struct ttm_resource *new_mem);
++		    struct ttm_resource *new_mem,
++		    struct ttm_place *hop);
+ 
+ 	/**
+ 	 * struct ttm_bo_driver_member verify_access
+-- 
+2.25.1
+

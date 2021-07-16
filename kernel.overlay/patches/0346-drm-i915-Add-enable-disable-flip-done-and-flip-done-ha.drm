@@ -1,0 +1,206 @@
+From 722164e6d035badd42cba857d83a551bd7ed6927 Mon Sep 17 00:00:00 2001
+From: Karthik B S <karthik.b.s@intel.com>
+Date: Mon, 21 Sep 2020 16:32:03 +0530
+Subject: [PATCH 0346/1714] drm/i915: Add enable/disable flip done and flip
+ done handler
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add enable/disable flip done functions and the flip done handler
+function which handles the flip done interrupt.
+
+Enable the flip done interrupt in IER.
+
+Enable flip done function is called before writing the
+surface address register as the write to this register triggers
+the flip done interrupt
+
+Flip done handler is used to send the page flip event as soon as the
+surface address is written as per the requirement of async flips.
+The interrupt is disabled after the event is sent.
+
+v2: -Change function name from icl_* to skl_* (Paulo)
+    -Move flip handler to this patch (Paulo)
+    -Remove vblank_put() (Paulo)
+    -Enable flip done interrupt for gen9+ only (Paulo)
+    -Enable flip done interrupt in power_well_post_enable hook (Paulo)
+    -Removed the event check in flip done handler to handle async
+     flips without pageflip events.
+
+v3: -Move skl_disable_flip_done out of interrupt handler (Paulo)
+    -Make the pending vblank event NULL in the beginning of
+     flip_done_handler to remove sporadic WARN_ON that is seen.
+
+v4: -Calculate timestamps using flip done time stamp and current
+     timestamp for async flips (Ville)
+
+v5: -Fix the sparse warning by making the function 'g4x_get_flip_counter'
+     static.(Reported-by: kernel test robot <lkp@intel.com>)
+    -Fix the typo in commit message.
+
+v6: -Revert back to old time stamping code.
+    -Remove the break while calling skl_enable_flip_done. (Paulo)
+
+v7: -Rebased.
+
+v8: -Rebased.
+
+v9: -Use struct drm_i915_private *i915 in new code. (Ville)
+    -Use intel_crtc instead of drm_crtc. (Ville)
+    -Do not mix the flip done and vblank hooks. (Ville)
+
+v10: -Rebased.
+
+Signed-off-by: Karthik B S <karthik.b.s@intel.com>
+Signed-off-by: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200921110210.21182-2-karthik.b.s@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c |  8 +++
+ drivers/gpu/drm/i915/i915_irq.c              | 52 ++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_irq.h              |  3 ++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index aabf09f89cad..8cb0dc333e4f 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -15616,6 +15616,11 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 
+ 	intel_dbuf_pre_plane_update(state);
+ 
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		if (new_crtc_state->uapi.async_flip)
++			skl_enable_flip_done(crtc);
++	}
++
+ 	/* Now enable the clocks, plane, pipe, and connectors that we set up. */
+ 	dev_priv->display.commit_modeset_enables(state);
+ 
+@@ -15637,6 +15642,9 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 	drm_atomic_helper_wait_for_flip_done(dev, &state->base);
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		if (new_crtc_state->uapi.async_flip)
++			skl_disable_flip_done(crtc);
++
+ 		if (new_crtc_state->hw.active &&
+ 		    !needs_modeset(new_crtc_state) &&
+ 		    !new_crtc_state->preload_luts &&
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 759f523c6a6b..9b8796c1a256 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1245,6 +1245,23 @@ display_pipe_crc_irq_handler(struct drm_i915_private *dev_priv,
+ 			     u32 crc4) {}
+ #endif
+ 
++static void flip_done_handler(struct drm_i915_private *i915,
++			      enum pipe pipe)
++{
++	struct intel_crtc *crtc = intel_get_crtc_for_pipe(i915, pipe);
++	struct drm_crtc_state *crtc_state = crtc->base.state;
++	struct drm_pending_vblank_event *e = crtc_state->event;
++	struct drm_device *dev = &i915->drm;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev->event_lock, irqflags);
++
++	crtc_state->event = NULL;
++
++	drm_crtc_send_vblank_event(&crtc->base, e);
++
++	spin_unlock_irqrestore(&dev->event_lock, irqflags);
++}
+ 
+ static void hsw_pipe_crc_irq_handler(struct drm_i915_private *dev_priv,
+ 				     enum pipe pipe)
+@@ -2329,6 +2346,9 @@ gen8_de_irq_handler(struct drm_i915_private *dev_priv, u32 master_ctl)
+ 		if (iir & GEN8_PIPE_VBLANK)
+ 			intel_handle_vblank(dev_priv, pipe);
+ 
++		if (iir & GEN9_PIPE_PLANE1_FLIP_DONE)
++			flip_done_handler(dev_priv, pipe);
++
+ 		if (iir & GEN8_PIPE_CDCLK_CRC_DONE)
+ 			hsw_pipe_crc_irq_handler(dev_priv, pipe);
+ 
+@@ -2650,6 +2670,19 @@ int bdw_enable_vblank(struct drm_crtc *crtc)
+ 	return 0;
+ }
+ 
++void skl_enable_flip_done(struct intel_crtc *crtc)
++{
++	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
++	enum pipe pipe = crtc->pipe;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&i915->irq_lock, irqflags);
++
++	bdw_enable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE1_FLIP_DONE);
++
++	spin_unlock_irqrestore(&i915->irq_lock, irqflags);
++}
++
+ /* Called from drm generic code, passed 'crtc' which
+  * we use as a pipe index
+  */
+@@ -2710,6 +2743,19 @@ void bdw_disable_vblank(struct drm_crtc *crtc)
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+ }
+ 
++void skl_disable_flip_done(struct intel_crtc *crtc)
++{
++	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
++	enum pipe pipe = crtc->pipe;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&i915->irq_lock, irqflags);
++
++	bdw_disable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE1_FLIP_DONE);
++
++	spin_unlock_irqrestore(&i915->irq_lock, irqflags);
++}
++
+ static void ibx_irq_reset(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_uncore *uncore = &dev_priv->uncore;
+@@ -2920,6 +2966,9 @@ void gen8_irq_power_well_post_enable(struct drm_i915_private *dev_priv,
+ 	u32 extra_ier = GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN;
+ 	enum pipe pipe;
+ 
++	if (INTEL_GEN(dev_priv) >= 9)
++		extra_ier |= GEN9_PIPE_PLANE1_FLIP_DONE;
++
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 
+ 	if (!intel_irqs_enabled(dev_priv)) {
+@@ -3403,6 +3452,9 @@ static void gen8_de_irq_postinstall(struct drm_i915_private *dev_priv)
+ 	de_pipe_enables = de_pipe_masked | GEN8_PIPE_VBLANK |
+ 					   GEN8_PIPE_FIFO_UNDERRUN;
+ 
++	if (INTEL_GEN(dev_priv) >= 9)
++		de_pipe_enables |= GEN9_PIPE_PLANE1_FLIP_DONE;
++
+ 	de_port_enables = de_port_masked;
+ 	if (IS_GEN9_LP(dev_priv))
+ 		de_port_enables |= BXT_DE_PORT_HOTPLUG_MASK;
+diff --git a/drivers/gpu/drm/i915/i915_irq.h b/drivers/gpu/drm/i915/i915_irq.h
+index 25f25cd95818..2efe609519ca 100644
+--- a/drivers/gpu/drm/i915/i915_irq.h
++++ b/drivers/gpu/drm/i915/i915_irq.h
+@@ -118,6 +118,9 @@ void i965_disable_vblank(struct drm_crtc *crtc);
+ void ilk_disable_vblank(struct drm_crtc *crtc);
+ void bdw_disable_vblank(struct drm_crtc *crtc);
+ 
++void skl_enable_flip_done(struct intel_crtc *crtc);
++void skl_disable_flip_done(struct intel_crtc *crtc);
++
+ void gen2_irq_reset(struct intel_uncore *uncore);
+ void gen3_irq_reset(struct intel_uncore *uncore, i915_reg_t imr,
+ 		    i915_reg_t iir, i915_reg_t ier);
+-- 
+2.25.1
+

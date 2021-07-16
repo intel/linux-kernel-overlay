@@ -1,0 +1,166 @@
+From a0b3235b961eb707abe49a7e09f3fd6dbb191fe6 Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Thu, 7 Jan 2021 18:42:34 +0800
+Subject: [PATCH 0830/1087] drm/amd/pm: implement the processor clocks which
+ read by metric
+
+The core processor clocks will be stored in smu metric table, then we
+add this runtime information into amdgpu_pm_info interface.
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Evan Quan <evan.quan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |  1 +
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            | 25 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h       |  2 ++
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 14 +++++++++++
+ .../gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c  | 11 ++++++++
+ 5 files changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 270f8db5115a..57b24c4c205b 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -103,6 +103,7 @@ enum pp_clock_type {
+ 
+ enum amd_pp_sensors {
+ 	AMDGPU_PP_SENSOR_GFX_SCLK = 0,
++	AMDGPU_PP_SENSOR_CPU_CLK,
+ 	AMDGPU_PP_SENSOR_VDDNB,
+ 	AMDGPU_PP_SENSOR_VDDGFX,
+ 	AMDGPU_PP_SENSOR_UVD_VCLK,
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index f5d97b97353a..d319203eddad 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -36,6 +36,7 @@
+ #include <linux/hwmon-sysfs.h>
+ #include <linux/nospec.h>
+ #include <linux/pm_runtime.h>
++#include <asm/processor.h>
+ #include "hwmgr.h"
+ 
+ static const struct cg_flag_name clocks[] = {
+@@ -3622,6 +3623,27 @@ void amdgpu_pm_sysfs_fini(struct amdgpu_device *adev)
+  */
+ #if defined(CONFIG_DEBUG_FS)
+ 
++static void amdgpu_debugfs_prints_cpu_info(struct seq_file *m,
++					   struct amdgpu_device *adev) {
++	uint16_t *p_val;
++	uint32_t size;
++	int i;
++
++	if (is_support_cclk_dpm(adev)) {
++		p_val = kcalloc(boot_cpu_data.x86_max_cores, sizeof(uint16_t),
++				GFP_KERNEL);
++
++		if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_CPU_CLK,
++					    (void *)p_val, &size)) {
++			for (i = 0; i < boot_cpu_data.x86_max_cores; i++)
++				seq_printf(m, "\t%u MHz (CPU%d)\n",
++					   *(p_val + i), i);
++		}
++
++		kfree(p_val);
++	}
++}
++
+ static int amdgpu_debugfs_pm_info_pp(struct seq_file *m, struct amdgpu_device *adev)
+ {
+ 	uint32_t value;
+@@ -3632,6 +3654,9 @@ static int amdgpu_debugfs_pm_info_pp(struct seq_file *m, struct amdgpu_device *a
+ 	/* GPU Clocks */
+ 	size = sizeof(value);
+ 	seq_printf(m, "GFX Clocks and Power:\n");
++
++	amdgpu_debugfs_prints_cpu_info(m, adev);
++
+ 	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GFX_MCLK, (void *)&value, &size))
+ 		seq_printf(m, "\t%u MHz (MCLK)\n", value/100);
+ 	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GFX_SCLK, (void *)&value, &size))
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index e2e59fb0f754..97691e366f07 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -1125,6 +1125,7 @@ typedef enum {
+ 	METRICS_CURR_DCLK1,
+ 	METRICS_CURR_FCLK,
+ 	METRICS_CURR_DCEFCLK,
++	METRICS_AVERAGE_CPUCLK,
+ 	METRICS_AVERAGE_GFXCLK,
+ 	METRICS_AVERAGE_SOCCLK,
+ 	METRICS_AVERAGE_FCLK,
+@@ -1253,6 +1254,7 @@ extern const struct amdgpu_ip_block_version smu_v11_0_ip_block;
+ extern const struct amdgpu_ip_block_version smu_v12_0_ip_block;
+ 
+ bool is_support_sw_smu(struct amdgpu_device *adev);
++bool is_support_cclk_dpm(struct amdgpu_device *adev);
+ int smu_reset(struct smu_context *smu);
+ int smu_sys_get_pp_table(struct smu_context *smu, void **table);
+ int smu_sys_set_pp_table(struct smu_context *smu,  void *buf, size_t size);
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 8e1e97e31411..e94d1b4551b4 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -288,6 +288,20 @@ bool is_support_sw_smu(struct amdgpu_device *adev)
+ 	return false;
+ }
+ 
++bool is_support_cclk_dpm(struct amdgpu_device *adev)
++{
++	struct smu_context *smu = &adev->smu;
++
++	if (!is_support_sw_smu(adev))
++		return false;
++
++	if (!smu_feature_is_enabled(smu, SMU_FEATURE_CCLK_DPM_BIT))
++		return false;
++
++	return true;
++}
++
++
+ int smu_sys_get_pp_table(struct smu_context *smu, void **table)
+ {
+ 	struct smu_table_context *smu_table = &smu->smu_table;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+index 7f78a9378f07..f60932887c27 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+@@ -34,6 +34,7 @@
+ #include "soc15_common.h"
+ #include "asic_reg/gc/gc_10_3_0_offset.h"
+ #include "asic_reg/gc/gc_10_3_0_sh_mask.h"
++#include <asm/processor.h>
+ 
+ /*
+  * DO NOT use these for err/warn/info/debug messages.
+@@ -294,6 +295,10 @@ static int vangogh_get_smu_metrics_data(struct smu_context *smu,
+ 	case METRICS_VOLTAGE_VDDSOC:
+ 		*value = metrics->Voltage[1];
+ 		break;
++	case METRICS_AVERAGE_CPUCLK:
++		memcpy(value, &metrics->CoreFrequency[0],
++		       boot_cpu_data.x86_max_cores * sizeof(uint16_t));
++		break;
+ 	default:
+ 		*value = UINT_MAX;
+ 		break;
+@@ -1254,6 +1259,12 @@ static int vangogh_read_sensor(struct smu_context *smu,
+ 						   (uint32_t *)data);
+ 		*size = 4;
+ 		break;
++	case AMDGPU_PP_SENSOR_CPU_CLK:
++		ret = vangogh_get_smu_metrics_data(smu,
++						   METRICS_AVERAGE_CPUCLK,
++						   (uint32_t *)data);
++		*size = boot_cpu_data.x86_max_cores * sizeof(uint16_t);
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
+-- 
+2.17.1
+

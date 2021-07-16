@@ -1,0 +1,201 @@
+From bf70154f77370b65c26aa7907f4860ca9b1b3e89 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 19 Jan 2021 20:44:54 +0000
+Subject: [PATCH 1020/1087] drm/i915/display: Apply interactive priority to
+ explicit flip fences
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, if a modeset/pageflip needs to wait for render completion to
+an object, we boost the priority of that rendering above all other work.
+We can apply the same interactive priority boosting to explicit fences
+that we can unwrap into a native i915_request (i.e. sync_file).
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210119204454.10343-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 16 +++----
+ drivers/gpu/drm/i915/gem/i915_gem_object.h   |  3 ++
+ drivers/gpu/drm/i915/gem/i915_gem_wait.c     | 46 ++++++++++++++------
+ 3 files changed, 42 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 0189d379a55e..2db59e7a12af 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -15631,15 +15631,6 @@ void intel_plane_unpin_fb(struct intel_plane_state *old_plane_state)
+ 		intel_unpin_fb_vma(vma, old_plane_state->flags);
+ }
+ 
+-static void fb_obj_bump_render_priority(struct drm_i915_gem_object *obj)
+-{
+-	struct i915_sched_attr attr = {
+-		.priority = I915_USER_PRIORITY(I915_PRIORITY_DISPLAY),
+-	};
+-
+-	i915_gem_object_wait_priority(obj, 0, &attr);
+-}
+-
+ /**
+  * intel_prepare_plane_fb - Prepare fb for usage on plane
+  * @_plane: drm plane to prepare for
+@@ -15656,6 +15647,9 @@ int
+ intel_prepare_plane_fb(struct drm_plane *_plane,
+ 		       struct drm_plane_state *_new_plane_state)
+ {
++	struct i915_sched_attr attr = {
++		.priority = I915_USER_PRIORITY(I915_PRIORITY_DISPLAY),
++	};
+ 	struct intel_plane *plane = to_intel_plane(_plane);
+ 	struct intel_plane_state *new_plane_state =
+ 		to_intel_plane_state(_new_plane_state);
+@@ -15695,6 +15689,8 @@ intel_prepare_plane_fb(struct drm_plane *_plane,
+ 	}
+ 
+ 	if (new_plane_state->uapi.fence) { /* explicit fencing */
++		i915_gem_fence_wait_priority(new_plane_state->uapi.fence,
++					     &attr);
+ 		ret = i915_sw_fence_await_dma_fence(&state->commit_ready,
+ 						    new_plane_state->uapi.fence,
+ 						    i915_fence_timeout(dev_priv),
+@@ -15716,7 +15712,7 @@ intel_prepare_plane_fb(struct drm_plane *_plane,
+ 	if (ret)
+ 		return ret;
+ 
+-	fb_obj_bump_render_priority(obj);
++	i915_gem_object_wait_priority(obj, 0, &attr);
+ 	i915_gem_object_flush_frontbuffer(obj, ORIGIN_DIRTYFB);
+ 
+ 	if (!new_plane_state->uapi.fence) { /* implicit fencing */
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index eaa36414d7f2..b6a16ab85956 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -500,6 +500,9 @@ static inline void __start_cpu_write(struct drm_i915_gem_object *obj)
+ 		obj->cache_dirty = true;
+ }
+ 
++void i915_gem_fence_wait_priority(struct dma_fence *fence,
++				  const struct i915_sched_attr *attr);
++
+ int i915_gem_object_wait(struct drm_i915_gem_object *obj,
+ 			 unsigned int flags,
+ 			 long timeout);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_wait.c b/drivers/gpu/drm/i915/gem/i915_gem_wait.c
+index c1b13ac50d0f..4b9856d5ba14 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_wait.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_wait.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/dma-fence-array.h>
++#include <linux/dma-fence-chain.h>
+ #include <linux/jiffies.h>
+ 
+ #include "gt/intel_engine.h"
+@@ -44,8 +45,7 @@ i915_gem_object_wait_reservation(struct dma_resv *resv,
+ 		unsigned int count, i;
+ 		int ret;
+ 
+-		ret = dma_resv_get_fences_rcu(resv,
+-							&excl, &count, &shared);
++		ret = dma_resv_get_fences_rcu(resv, &excl, &count, &shared);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -91,8 +91,8 @@ i915_gem_object_wait_reservation(struct dma_resv *resv,
+ 	return timeout;
+ }
+ 
+-static void __fence_set_priority(struct dma_fence *fence,
+-				 const struct i915_sched_attr *attr)
++static void fence_set_priority(struct dma_fence *fence,
++			       const struct i915_sched_attr *attr)
+ {
+ 	struct i915_request *rq;
+ 	struct intel_engine_cs *engine;
+@@ -103,27 +103,47 @@ static void __fence_set_priority(struct dma_fence *fence,
+ 	rq = to_request(fence);
+ 	engine = rq->engine;
+ 
+-	local_bh_disable();
+ 	rcu_read_lock(); /* RCU serialisation for set-wedged protection */
+ 	if (engine->schedule)
+ 		engine->schedule(rq, attr);
+ 	rcu_read_unlock();
+-	local_bh_enable(); /* kick the tasklets if queues were reprioritised */
+ }
+ 
+-static void fence_set_priority(struct dma_fence *fence,
+-			       const struct i915_sched_attr *attr)
++static inline bool __dma_fence_is_chain(const struct dma_fence *fence)
++{
++	return fence->ops == &dma_fence_chain_ops;
++}
++
++void i915_gem_fence_wait_priority(struct dma_fence *fence,
++				  const struct i915_sched_attr *attr)
+ {
++	if (dma_fence_is_signaled(fence))
++		return;
++
++	local_bh_disable();
++
+ 	/* Recurse once into a fence-array */
+ 	if (dma_fence_is_array(fence)) {
+ 		struct dma_fence_array *array = to_dma_fence_array(fence);
+ 		int i;
+ 
+ 		for (i = 0; i < array->num_fences; i++)
+-			__fence_set_priority(array->fences[i], attr);
++			fence_set_priority(array->fences[i], attr);
++	} else if (__dma_fence_is_chain(fence)) {
++		struct dma_fence *iter;
++
++		/* The chain is ordered; if we boost the last, we boost all */
++		dma_fence_chain_for_each(iter, fence) {
++			fence_set_priority(to_dma_fence_chain(iter)->fence,
++					   attr);
++			break;
++		}
++		dma_fence_put(iter);
+ 	} else {
+-		__fence_set_priority(fence, attr);
++		fence_set_priority(fence, attr);
+ 	}
++
++	local_bh_enable(); /* kick the tasklets if queues were reprioritised */
+ }
+ 
+ int
+@@ -139,12 +159,12 @@ i915_gem_object_wait_priority(struct drm_i915_gem_object *obj,
+ 		int ret;
+ 
+ 		ret = dma_resv_get_fences_rcu(obj->base.resv,
+-							&excl, &count, &shared);
++					      &excl, &count, &shared);
+ 		if (ret)
+ 			return ret;
+ 
+ 		for (i = 0; i < count; i++) {
+-			fence_set_priority(shared[i], attr);
++			i915_gem_fence_wait_priority(shared[i], attr);
+ 			dma_fence_put(shared[i]);
+ 		}
+ 
+@@ -154,7 +174,7 @@ i915_gem_object_wait_priority(struct drm_i915_gem_object *obj,
+ 	}
+ 
+ 	if (excl) {
+-		fence_set_priority(excl, attr);
++		i915_gem_fence_wait_priority(excl, attr);
+ 		dma_fence_put(excl);
+ 	}
+ 	return 0;
+-- 
+2.17.1
+

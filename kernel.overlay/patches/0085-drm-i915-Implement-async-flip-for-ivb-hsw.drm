@@ -1,0 +1,107 @@
+From 81b55403444084b956a4f6a9c13aeef79462a13d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:09 +0200
+Subject: [PATCH 085/330] drm/i915: Implement async flip for ivb/hsw
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add support for async flips on ivb/hsw. Unlike bdw+ we don't need
+any workarounds to disable async flips. Apart from that the only
+real difference from the bdw implementation is the location of the
+flip_done interrupt bits.
+
+Cc: Karthik B S <karthik.b.s@intel.com>
+Cc: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-10-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c    | 24 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_display.c |  3 ++-
+ drivers/gpu/drm/i915/i915_irq.c              |  6 +++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index 44004558ebbd..f75be2292caa 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -539,6 +539,26 @@ bdw_primary_disable_flip_done(struct intel_plane *plane)
+ 	spin_unlock_irq(&i915->irq_lock);
+ }
+ 
++static void
++ivb_primary_enable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++
++	spin_lock_irq(&i915->irq_lock);
++	ilk_enable_display_irq(i915, DE_PLANE_FLIP_DONE_IVB(plane->i9xx_plane));
++	spin_unlock_irq(&i915->irq_lock);
++}
++
++static void
++ivb_primary_disable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++
++	spin_lock_irq(&i915->irq_lock);
++	ilk_disable_display_irq(i915, DE_PLANE_FLIP_DONE_IVB(plane->i9xx_plane));
++	spin_unlock_irq(&i915->irq_lock);
++}
++
+ static bool i9xx_plane_get_hw_state(struct intel_plane *plane,
+ 				    enum pipe *pipe)
+ {
+@@ -757,6 +777,10 @@ intel_primary_plane_create(struct drm_i915_private *dev_priv, enum pipe pipe)
+ 		plane->async_flip = g4x_primary_async_flip;
+ 		plane->enable_flip_done = bdw_primary_enable_flip_done;
+ 		plane->disable_flip_done = bdw_primary_disable_flip_done;
++	} else if (IS_HASWELL(dev_priv) || IS_IVYBRIDGE(dev_priv)) {
++		plane->async_flip = g4x_primary_async_flip;
++		plane->enable_flip_done = ivb_primary_enable_flip_done;
++		plane->disable_flip_done = ivb_primary_disable_flip_done;
+ 	}
+ 
+ 	if (INTEL_GEN(dev_priv) >= 5 || IS_G4X(dev_priv))
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 22162945796a..23b39aa35a58 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1319,7 +1319,8 @@ static unsigned int intel_linear_alignment(const struct drm_i915_private *dev_pr
+ 
+ static bool has_async_flips(struct drm_i915_private *i915)
+ {
+-	return INTEL_GEN(i915) >= 9 || IS_BROADWELL(i915);
++	return INTEL_GEN(i915) >= 9 || IS_BROADWELL(i915) ||
++		IS_HASWELL(i915) || IS_IVYBRIDGE(i915);
+ }
+ 
+ static unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 11f256625f2b..2e836c0cb0e2 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2104,6 +2104,9 @@ static void ivb_display_irq_handler(struct drm_i915_private *dev_priv,
+ 	for_each_pipe(dev_priv, pipe) {
+ 		if (de_iir & DE_PIPE_VBLANK_IVB(pipe))
+ 			intel_handle_vblank(dev_priv, pipe);
++
++		if (de_iir & DE_PLANE_FLIP_DONE_IVB(pipe))
++			flip_done_handler(dev_priv, pipe);
+ 	}
+ 
+ 	/* check event from PCH */
+@@ -3587,6 +3590,9 @@ static void ilk_irq_postinstall(struct drm_i915_private *dev_priv)
+ 				DE_PCH_EVENT_IVB | DE_AUX_CHANNEL_A_IVB);
+ 		extra_mask = (DE_PIPEC_VBLANK_IVB | DE_PIPEB_VBLANK_IVB |
+ 			      DE_PIPEA_VBLANK_IVB | DE_ERR_INT_IVB |
++			      DE_PLANE_FLIP_DONE_IVB(PLANE_C) |
++			      DE_PLANE_FLIP_DONE_IVB(PLANE_B) |
++			      DE_PLANE_FLIP_DONE_IVB(PLANE_A) |
+ 			      DE_DP_A_HOTPLUG_IVB);
+ 	} else {
+ 		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
+-- 
+2.25.1
+

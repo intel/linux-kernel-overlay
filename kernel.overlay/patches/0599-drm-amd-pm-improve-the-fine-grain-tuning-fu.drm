@@ -1,0 +1,239 @@
+From d407e568b89450769cf88a2e2d23acf32736c0d0 Mon Sep 17 00:00:00 2001
+From: Xiaojian Du <Xiaojian.Du@amd.com>
+Date: Fri, 18 Dec 2020 14:32:02 +0800
+Subject: [PATCH 0599/1087] drm/amd/pm: improve the fine grain tuning function
+ for RV/RV2/PCO
+
+This patch is to improve the fine grain tuning function for RV/RV2/PCO.
+This patch adds two new commands: "restore" and "commit".
+This function uses the pp_od_clk_voltage sysfs file to configure the min
+and max value of gfx clock frequency manually or restore the default value.
+
+Command guide:
+echo "s level value" > pp_od_clk_voltage
+        "s" - set the sclk frequency
+        "level" - 0 or 1, "0" represents the min value,  "1" represents
+        the max value
+        "value" - the target value of sclk frequency, it should be limited in the
+        safe range
+echo "r" > pp_od_clk_voltage
+        "r" - reset the sclk frequency, restore the default value instantly
+echo "c" > pp_od_clk_voltage
+        "c" - commit the min and max value of sclk frequency to the system
+        only after the commit command, the target values set by "s" command
+        will take effect.
+Example:
+1)change power profile from "auto" to "manual"
+        $ cat power_dpm_force_performance_level
+        auto
+        $ echo "manual" > power_dpm_force_performance_level
+        $ cat power_dpm_force_performance_level
+        manual
+2)check the default sclk frequency
+        $ cat pp_od_clk_voltage
+        OD_SCLK:
+        0:        200Mhz
+        1:       1400Mhz
+        OD_RANGE:
+        SCLK:     200MHz       1400MHz
+3)use "s" -- set command to configure the min and max sclk frequency
+        $ echo "s 0 600" > pp_od_clk_voltage
+        $ echo "s 1 1000" > pp_od_clk_voltage
+        $ echo "c" > pp_od_clk_voltage
+        $ cat pp_od_clk_voltage
+        OD_SCLK:
+        0:        600Mhz
+        1:       1000Mhz
+        OD_RANGE:
+        SCLK:     200MHz       1400MHz
+4)use "r" -- reset command to restore the min or max sclk frequency
+        $ echo "r" > pp_od_clk_voltage
+        $ cat pp_od_clk_voltage
+        OD_SCLK:
+        0:        200Mhz
+        1:       1400Mhz
+        OD_RANGE:
+        SCLK:     200MHz       1400MHz
+
+Signed-off-by: Xiaojian Du <Xiaojian.Du@amd.com>
+Reviewed-by: Evan Quan <evan.quan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c  | 114 +++++++++++++++---
+ .../drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.h  |   1 +
+ 2 files changed, 98 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c b/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c
+index e57e64bbacdc..0cf899566e31 100644
+--- a/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c
++++ b/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c
+@@ -251,7 +251,7 @@ static int smu10_set_hard_min_gfxclk_by_freq(struct pp_hwmgr *hwmgr, uint32_t cl
+ 		smu10_data->gfx_actual_soft_min_freq = clock;
+ 		smum_send_msg_to_smc_with_parameter(hwmgr,
+ 					PPSMC_MSG_SetHardMinGfxClk,
+-					smu10_data->gfx_actual_soft_min_freq,
++					clock,
+ 					NULL);
+ 	}
+ 	return 0;
+@@ -948,6 +948,8 @@ static int smu10_print_clock_levels(struct pp_hwmgr *hwmgr,
+ 	struct smu10_voltage_dependency_table *mclk_table =
+ 			data->clock_vol_info.vdd_dep_on_fclk;
+ 	uint32_t i, now, size = 0;
++	uint32_t min_freq, max_freq = 0;
++	uint32_t ret = 0;
+ 
+ 	switch (type) {
+ 	case PP_SCLK:
+@@ -983,18 +985,28 @@ static int smu10_print_clock_levels(struct pp_hwmgr *hwmgr,
+ 		break;
+ 	case OD_SCLK:
+ 		if (hwmgr->od_enabled) {
+-			size = sprintf(buf, "%s:\n", "OD_SCLK");
++			ret = smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMinGfxclkFrequency, &min_freq);
++			if (ret)
++				return ret;
++			ret = smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMaxGfxclkFrequency, &max_freq);
++			if (ret)
++				return ret;
+ 
++			size = sprintf(buf, "%s:\n", "OD_SCLK");
+ 			size += sprintf(buf + size, "0: %10uMhz\n",
+-			(data->gfx_actual_soft_min_freq > 0) ? data->gfx_actual_soft_min_freq : data->gfx_min_freq_limit/100);
+-			size += sprintf(buf + size, "1: %10uMhz\n", data->gfx_max_freq_limit/100);
++			(data->gfx_actual_soft_min_freq > 0) ? data->gfx_actual_soft_min_freq : min_freq);
++			size += sprintf(buf + size, "1: %10uMhz\n",
++			(data->gfx_actual_soft_max_freq > 0) ? data->gfx_actual_soft_max_freq : max_freq);
+ 		}
+ 		break;
+ 	case OD_RANGE:
+ 		if (hwmgr->od_enabled) {
+-			uint32_t min_freq, max_freq = 0;
+-			smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMinGfxclkFrequency, &min_freq);
+-			smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMaxGfxclkFrequency, &max_freq);
++			ret = smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMinGfxclkFrequency, &min_freq);
++			if (ret)
++				return ret;
++			ret = smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMaxGfxclkFrequency, &max_freq);
++			if (ret)
++				return ret;
+ 
+ 			size = sprintf(buf, "%s:\n", "OD_RANGE");
+ 			size += sprintf(buf + size, "SCLK: %7uMHz %10uMHz\n",
+@@ -1414,23 +1426,91 @@ static int smu10_set_fine_grain_clk_vol(struct pp_hwmgr *hwmgr,
+ 					enum PP_OD_DPM_TABLE_COMMAND type,
+ 					long *input, uint32_t size)
+ {
++	uint32_t min_freq, max_freq = 0;
++	struct smu10_hwmgr *smu10_data = (struct smu10_hwmgr *)(hwmgr->backend);
++	int ret = 0;
++
+ 	if (!hwmgr->od_enabled) {
+ 		pr_err("Fine grain not support\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (size != 2) {
+-		pr_err("Input parameter number not correct\n");
+-		return -EINVAL;
+-	}
+-
+ 	if (type == PP_OD_EDIT_SCLK_VDDC_TABLE) {
+-		if (input[0] == 0)
+-			smu10_set_hard_min_gfxclk_by_freq(hwmgr, input[1]);
+-		else if (input[0] == 1)
+-			smu10_set_soft_max_gfxclk_by_freq(hwmgr, input[1]);
+-		else
++		if (size != 2) {
++			pr_err("Input parameter number not correct\n");
++			return -EINVAL;
++		}
++
++		if (input[0] == 0) {
++			smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMinGfxclkFrequency, &min_freq);
++			if (input[1] < min_freq) {
++				pr_err("Fine grain setting minimum sclk (%ld) MHz is less than the minimum allowed (%d) MHz\n",
++					input[1], min_freq);
++				return -EINVAL;
++			}
++			smu10_data->gfx_actual_soft_min_freq = input[1];
++		} else if (input[0] == 1) {
++			smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMaxGfxclkFrequency, &max_freq);
++			if (input[1] > max_freq) {
++				pr_err("Fine grain setting maximum sclk (%ld) MHz is greater than the maximum allowed (%d) MHz\n",
++					input[1], max_freq);
++				return -EINVAL;
++			}
++			smu10_data->gfx_actual_soft_max_freq = input[1];
++		} else {
++			return -EINVAL;
++		}
++	} else if (type == PP_OD_RESTORE_DEFAULT_TABLE) {
++		if (size != 0) {
++			pr_err("Input parameter number not correct\n");
++			return -EINVAL;
++		}
++		smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMinGfxclkFrequency, &min_freq);
++		smum_send_msg_to_smc(hwmgr, PPSMC_MSG_GetMaxGfxclkFrequency, &max_freq);
++
++		smu10_data->gfx_actual_soft_min_freq = min_freq;
++		smu10_data->gfx_actual_soft_max_freq = max_freq;
++
++		ret = smum_send_msg_to_smc_with_parameter(hwmgr,
++					PPSMC_MSG_SetHardMinGfxClk,
++					min_freq,
++					NULL);
++		if (ret)
++			return ret;
++
++		ret = smum_send_msg_to_smc_with_parameter(hwmgr,
++					PPSMC_MSG_SetSoftMaxGfxClk,
++					max_freq,
++					NULL);
++		if (ret)
++			return ret;
++	} else if (type == PP_OD_COMMIT_DPM_TABLE) {
++		if (size != 0) {
++			pr_err("Input parameter number not correct\n");
++			return -EINVAL;
++		}
++
++		if (smu10_data->gfx_actual_soft_min_freq > smu10_data->gfx_actual_soft_max_freq) {
++			pr_err("The setting minimun sclk (%d) MHz is greater than the setting maximum sclk (%d) MHz\n",
++					smu10_data->gfx_actual_soft_min_freq, smu10_data->gfx_actual_soft_max_freq);
+ 			return -EINVAL;
++		}
++
++		ret = smum_send_msg_to_smc_with_parameter(hwmgr,
++					PPSMC_MSG_SetHardMinGfxClk,
++					smu10_data->gfx_actual_soft_min_freq,
++					NULL);
++		if (ret)
++			return ret;
++
++		ret = smum_send_msg_to_smc_with_parameter(hwmgr,
++					PPSMC_MSG_SetSoftMaxGfxClk,
++					smu10_data->gfx_actual_soft_max_freq,
++					NULL);
++		if (ret)
++			return ret;
++	} else {
++		return -EINVAL;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.h b/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.h
+index 6c9b5f060902..28d86d354d50 100644
+--- a/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.h
++++ b/drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.h
+@@ -283,6 +283,7 @@ struct smu10_hwmgr {
+ 	uint32_t                        vclk_soft_min;
+ 	uint32_t                        dclk_soft_min;
+ 	uint32_t                        gfx_actual_soft_min_freq;
++	uint32_t                        gfx_actual_soft_max_freq;
+ 	uint32_t                        gfx_min_freq_limit;
+ 	uint32_t                        gfx_max_freq_limit; /* in 10Khz*/
+ 
+-- 
+2.17.1
+

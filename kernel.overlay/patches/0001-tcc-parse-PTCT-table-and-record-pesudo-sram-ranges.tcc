@@ -1,4 +1,4 @@
-From c9afd9f9581b218326c5335b58b56994a795e876 Mon Sep 17 00:00:00 2001
+From 0bba3eeb31c74c35de5c106bf22710cd08ba6cc0 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 14:43:41 +0800
 Subject: [PATCH 1/9] tcc: parse PTCT table and record pesudo sram ranges
@@ -16,7 +16,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index e90310cbe73a..6f7af786d41e 100644
+index 7bdc0239a943..e01f13508171 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1232,6 +1232,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -116,7 +116,7 @@ index e90310cbe73a..6f7af786d41e 100644
  static void __init early_acpi_process_madt(void)
  {
  #ifdef CONFIG_X86_LOCAL_APIC
-@@ -1622,6 +1712,11 @@ int __init acpi_boot_init(void)
+@@ -1623,6 +1713,11 @@ int __init acpi_boot_init(void)
  	if (IS_ENABLED(CONFIG_ACPI_BGRT) && !acpi_nobgrt)
  		acpi_table_parse(ACPI_SIG_BGRT, acpi_parse_bgrt);
  
@@ -129,18 +129,18 @@ index e90310cbe73a..6f7af786d41e 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index 18cafe3ebddc..fbdd8428e487 100644
+index ec66779cb193..f8b20148456d 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
 @@ -39,6 +39,7 @@
- #define ACPI_SIG_PHAT           "PHAT"	/* Platform Health Assessment Table */
+ #define ACPI_SIG_PDTT           "PDTT"	/* Platform Debug Trigger Table */
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
 +#define ACPI_SIG_PTCT           "PTCT"	/* Platform Tuning Configuration Table */
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
  #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
-@@ -1673,6 +1674,59 @@ struct acpi_pptt_id {
+@@ -1552,6 +1553,59 @@ struct acpi_pptt_id {
  	u16 spin_rev;
  };
  
@@ -201,5 +201,5 @@ index 18cafe3ebddc..fbdd8428e487 100644
   *
   * RASF - RAS Feature Table (ACPI 5.0)
 -- 
-2.27.0
+2.25.1
 

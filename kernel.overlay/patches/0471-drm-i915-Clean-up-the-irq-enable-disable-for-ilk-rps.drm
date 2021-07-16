@@ -1,0 +1,123 @@
+From ac0f261abc6b97818c86c49a5ef489167fbf4838 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 21 Oct 2020 16:14:43 +0300
+Subject: [PATCH 0471/1714] drm/i915: Clean up the irq enable/disable for ilk
+ rps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Let's unmask the PCU event irq _after_ we've set up the
+hardware and software to deal with the fallout. We can
+also drop the PCU event bit from DEIER except when we
+need it for rps.
+
+And on the disable side we replace the hand rolled (and
+unlocked) DEIER/IIR/IMR frobbing with ilk_disable_display_irq().
+Ocd does require me to reorder it to be symmetric with
+the enable path however.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201021131443.25616-5-ville.syrjala@linux.intel.com
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+---
+ drivers/gpu/drm/i915/gt/intel_rps.c | 15 ++++++++++-----
+ drivers/gpu/drm/i915/i915_irq.c     | 16 ++++------------
+ 2 files changed, 14 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_rps.c b/drivers/gpu/drm/i915/gt/intel_rps.c
+index de1b22d2dc43..11b9b2f441ec 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rps.c
++++ b/drivers/gpu/drm/i915/gt/intel_rps.c
+@@ -509,6 +509,7 @@ static unsigned int init_emon(struct intel_uncore *uncore)
+ 
+ static bool gen5_rps_enable(struct intel_rps *rps)
+ {
++	struct drm_i915_private *i915 = rps_to_i915(rps);
+ 	struct intel_uncore *uncore = rps_to_uncore(rps);
+ 	u8 fstart, vstart;
+ 	u32 rgvmodectl;
+@@ -566,6 +567,10 @@ static bool gen5_rps_enable(struct intel_rps *rps)
+ 	rps->ips.last_count2 = intel_uncore_read(uncore, GFXEC);
+ 	rps->ips.last_time2 = ktime_get_raw_ns();
+ 
++	spin_lock(&i915->irq_lock);
++	ilk_enable_display_irq(i915, DE_PCU_EVENT);
++	spin_unlock(&i915->irq_lock);
++
+ 	spin_unlock_irq(&mchdev_lock);
+ 
+ 	rps->ips.corr = init_emon(uncore);
+@@ -575,11 +580,16 @@ static bool gen5_rps_enable(struct intel_rps *rps)
+ 
+ static void gen5_rps_disable(struct intel_rps *rps)
+ {
++	struct drm_i915_private *i915 = rps_to_i915(rps);
+ 	struct intel_uncore *uncore = rps_to_uncore(rps);
+ 	u16 rgvswctl;
+ 
+ 	spin_lock_irq(&mchdev_lock);
+ 
++	spin_lock(&i915->irq_lock);
++	ilk_disable_display_irq(i915, DE_PCU_EVENT);
++	spin_unlock(&i915->irq_lock);
++
+ 	rgvswctl = intel_uncore_read16(uncore, MEMSWCTL);
+ 
+ 	/* Ack interrupts, disable EFC interrupt */
+@@ -587,11 +597,6 @@ static void gen5_rps_disable(struct intel_rps *rps)
+ 			   intel_uncore_read(uncore, MEMINTREN) &
+ 			   ~MEMINT_EVAL_CHG_EN);
+ 	intel_uncore_write(uncore, MEMINTRSTS, MEMINT_EVAL_CHG);
+-	intel_uncore_write(uncore, DEIER,
+-			   intel_uncore_read(uncore, DEIER) & ~DE_PCU_EVENT);
+-	intel_uncore_write(uncore, DEIIR, DE_PCU_EVENT);
+-	intel_uncore_write(uncore, DEIMR,
+-			   intel_uncore_read(uncore, DEIMR) | DE_PCU_EVENT);
+ 
+ 	/* Go back to the starting frequency */
+ 	gen5_rps_set(rps, rps->idle_freq);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 82713d4a376e..09221ca1ffb2 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3460,7 +3460,7 @@ static void ilk_irq_postinstall(struct drm_i915_private *dev_priv)
+ 		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
+ 				DE_AUX_CHANNEL_A | DE_PIPEB_CRC_DONE |
+ 				DE_PIPEA_CRC_DONE | DE_POISON);
+-		extra_mask = (DE_PIPEA_VBLANK | DE_PIPEB_VBLANK | DE_PCU_EVENT |
++		extra_mask = (DE_PIPEA_VBLANK | DE_PIPEB_VBLANK |
+ 			      DE_PIPEB_FIFO_UNDERRUN | DE_PIPEA_FIFO_UNDERRUN |
+ 			      DE_DP_A_HOTPLUG);
+ 	}
+@@ -3470,6 +3470,9 @@ static void ilk_irq_postinstall(struct drm_i915_private *dev_priv)
+ 		display_mask |= DE_EDP_PSR_INT_HSW;
+ 	}
+ 
++	if (IS_IRONLAKE_M(dev_priv))
++		extra_mask |= DE_PCU_EVENT;
++
+ 	dev_priv->irq_mask = ~display_mask;
+ 
+ 	ibx_irq_pre_postinstall(dev_priv);
+@@ -3482,17 +3485,6 @@ static void ilk_irq_postinstall(struct drm_i915_private *dev_priv)
+ 	ilk_hpd_detection_setup(dev_priv);
+ 
+ 	ibx_irq_postinstall(dev_priv);
+-
+-	if (IS_IRONLAKE_M(dev_priv)) {
+-		/* Enable PCU event interrupts
+-		 *
+-		 * spinlocking not required here for correctness since interrupt
+-		 * setup is guaranteed to run in single-threaded context. But we
+-		 * need it to make the assert_spin_locked happy. */
+-		spin_lock_irq(&dev_priv->irq_lock);
+-		ilk_enable_display_irq(dev_priv, DE_PCU_EVENT);
+-		spin_unlock_irq(&dev_priv->irq_lock);
+-	}
+ }
+ 
+ void valleyview_enable_display_irqs(struct drm_i915_private *dev_priv)
+-- 
+2.25.1
+

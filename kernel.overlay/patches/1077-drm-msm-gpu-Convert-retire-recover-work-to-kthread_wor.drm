@@ -1,0 +1,240 @@
+From 6319abdc7684cf4b63954ac2b990721a4711b1a6 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 19 Oct 2020 14:10:51 -0700
+Subject: [PATCH 1077/1714] drm/msm/gpu: Convert retire/recover work to
+ kthread_worker
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c     |  3 +--
+ drivers/gpu/drm/msm/adreno/a5xx_preempt.c |  6 ++---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c     |  4 +--
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c     |  4 +--
+ drivers/gpu/drm/msm/msm_gpu.c             | 30 +++++++++++++++--------
+ drivers/gpu/drm/msm/msm_gpu.h             | 13 +++++++---
+ 6 files changed, 34 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+index d6804a802355..a4cc3618abee 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1056,7 +1056,6 @@ static void a5xx_gpmu_err_irq(struct msm_gpu *gpu)
+ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
+ {
+ 	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+ 
+ 	DRM_DEV_ERROR(dev->dev, "gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
+@@ -1072,7 +1071,7 @@ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
+ 	/* Turn off the hangcheck timer to keep it from bothering us */
+ 	del_timer(&gpu->hangcheck_timer);
+ 
+-	queue_work(priv->wq, &gpu->recover_work);
++	kthread_queue_work(gpu->worker, &gpu->recover_work);
+ }
+ 
+ #define RBBM_ERROR_MASK \
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+index 7e04509c4e1f..eaf3f4e197a7 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+@@ -78,13 +78,12 @@ static void a5xx_preempt_timer(struct timer_list *t)
+ 	struct a5xx_gpu *a5xx_gpu = from_timer(a5xx_gpu, t, preempt_timer);
+ 	struct msm_gpu *gpu = &a5xx_gpu->base.base;
+ 	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 
+ 	if (!try_preempt_state(a5xx_gpu, PREEMPT_TRIGGERED, PREEMPT_FAULTED))
+ 		return;
+ 
+ 	DRM_DEV_ERROR(dev->dev, "%s: preemption timed out\n", gpu->name);
+-	queue_work(priv->wq, &gpu->recover_work);
++	kthread_queue_work(gpu->worker, &gpu->recover_work);
+ }
+ 
+ /* Try to trigger a preemption switch */
+@@ -162,7 +161,6 @@ void a5xx_preempt_irq(struct msm_gpu *gpu)
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+ 	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 
+ 	if (!try_preempt_state(a5xx_gpu, PREEMPT_TRIGGERED, PREEMPT_PENDING))
+ 		return;
+@@ -181,7 +179,7 @@ void a5xx_preempt_irq(struct msm_gpu *gpu)
+ 		set_preempt_state(a5xx_gpu, PREEMPT_FAULTED);
+ 		DRM_DEV_ERROR(dev->dev, "%s: Preemption failed to complete\n",
+ 			gpu->name);
+-		queue_work(priv->wq, &gpu->recover_work);
++		kthread_queue_work(gpu->worker, &gpu->recover_work);
+ 		return;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 491fee410daf..e6703ae98760 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -19,8 +19,6 @@ static void a6xx_gmu_fault(struct a6xx_gmu *gmu)
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+ 	struct msm_gpu *gpu = &adreno_gpu->base;
+-	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 
+ 	/* FIXME: add a banner here */
+ 	gmu->hung = true;
+@@ -29,7 +27,7 @@ static void a6xx_gmu_fault(struct a6xx_gmu *gmu)
+ 	del_timer(&gpu->hangcheck_timer);
+ 
+ 	/* Queue the GPU handler because we need to treat this as a recovery */
+-	queue_work(priv->wq, &gpu->recover_work);
++	kthread_queue_work(gpu->worker, &gpu->recover_work);
+ }
+ 
+ static irqreturn_t a6xx_gmu_irq(int irq, void *data)
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 948f3656c20c..09ea147936ad 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -965,8 +965,6 @@ static void a6xx_fault_detect_irq(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+-	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+ 
+ 	/*
+@@ -989,7 +987,7 @@ static void a6xx_fault_detect_irq(struct msm_gpu *gpu)
+ 	/* Turn off the hangcheck timer to keep it from bothering us */
+ 	del_timer(&gpu->hangcheck_timer);
+ 
+-	queue_work(priv->wq, &gpu->recover_work);
++	kthread_queue_work(gpu->worker, &gpu->recover_work);
+ }
+ 
+ static irqreturn_t a6xx_irq(struct msm_gpu *gpu)
+diff --git a/drivers/gpu/drm/msm/msm_gpu.c b/drivers/gpu/drm/msm/msm_gpu.c
+index 55d16489d0f3..3f192a9df0a7 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -441,7 +441,7 @@ find_submit(struct msm_ringbuffer *ring, uint32_t fence)
+ 
+ static void retire_submits(struct msm_gpu *gpu);
+ 
+-static void recover_worker(struct work_struct *work)
++static void recover_worker(struct kthread_work *work)
+ {
+ 	struct msm_gpu *gpu = container_of(work, struct msm_gpu, recover_work);
+ 	struct drm_device *dev = gpu->dev;
+@@ -544,7 +544,6 @@ static void hangcheck_handler(struct timer_list *t)
+ {
+ 	struct msm_gpu *gpu = from_timer(gpu, t, hangcheck_timer);
+ 	struct drm_device *dev = gpu->dev;
+-	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+ 	uint32_t fence = ring->memptrs->fence;
+ 
+@@ -561,7 +560,7 @@ static void hangcheck_handler(struct timer_list *t)
+ 		DRM_DEV_ERROR(dev->dev, "%s:     submitted fence: %u\n",
+ 				gpu->name, ring->seqno);
+ 
+-		queue_work(priv->wq, &gpu->recover_work);
++		kthread_queue_work(gpu->worker, &gpu->recover_work);
+ 	}
+ 
+ 	/* if still more pending work, reset the hangcheck timer: */
+@@ -569,7 +568,7 @@ static void hangcheck_handler(struct timer_list *t)
+ 		hangcheck_timer_reset(gpu);
+ 
+ 	/* workaround for missing irq: */
+-	queue_work(priv->wq, &gpu->retire_work);
++	kthread_queue_work(gpu->worker, &gpu->retire_work);
+ }
+ 
+ /*
+@@ -728,7 +727,7 @@ static void retire_submits(struct msm_gpu *gpu)
+ 	}
+ }
+ 
+-static void retire_worker(struct work_struct *work)
++static void retire_worker(struct kthread_work *work)
+ {
+ 	struct msm_gpu *gpu = container_of(work, struct msm_gpu, retire_work);
+ 	struct drm_device *dev = gpu->dev;
+@@ -745,8 +744,7 @@ static void retire_worker(struct work_struct *work)
+ /* call from irq handler to schedule work to retire bo's */
+ void msm_gpu_retire(struct msm_gpu *gpu)
+ {
+-	struct msm_drm_private *priv = gpu->dev->dev_private;
+-	queue_work(priv->wq, &gpu->retire_work);
++	kthread_queue_work(gpu->worker, &gpu->retire_work);
+ 	update_sw_cntrs(gpu);
+ }
+ 
+@@ -869,10 +867,18 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+ 	gpu->funcs = funcs;
+ 	gpu->name = name;
+ 
+-	INIT_LIST_HEAD(&gpu->active_list);
+-	INIT_WORK(&gpu->retire_work, retire_worker);
+-	INIT_WORK(&gpu->recover_work, recover_worker);
++	gpu->worker = kthread_create_worker(0, "%s-worker", gpu->name);
++	if (IS_ERR(gpu->worker)) {
++		ret = PTR_ERR(gpu->worker);
++		gpu->worker = NULL;
++		goto fail;
++	}
+ 
++	sched_set_fifo_low(gpu->worker->task);
++
++	INIT_LIST_HEAD(&gpu->active_list);
++	kthread_init_work(&gpu->retire_work, retire_worker);
++	kthread_init_work(&gpu->recover_work, recover_worker);
+ 
+ 	timer_setup(&gpu->hangcheck_timer, hangcheck_handler, 0);
+ 
+@@ -1005,4 +1011,8 @@ void msm_gpu_cleanup(struct msm_gpu *gpu)
+ 		gpu->aspace->mmu->funcs->detach(gpu->aspace->mmu);
+ 		msm_gem_address_space_put(gpu->aspace);
+ 	}
++
++	if (gpu->worker) {
++		kthread_destroy_worker(gpu->worker);
++	}
+ }
+diff --git a/drivers/gpu/drm/msm/msm_gpu.h b/drivers/gpu/drm/msm/msm_gpu.h
+index 6c9e1fdc1a76..b937e1d3af01 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -103,9 +103,6 @@ struct msm_gpu {
+ 	/* number of GPU hangs (for all contexts) */
+ 	int global_faults;
+ 
+-	/* worker for handling active-list retiring: */
+-	struct work_struct retire_work;
+-
+ 	void __iomem *mmio;
+ 	int irq;
+ 
+@@ -134,7 +131,15 @@ struct msm_gpu {
+ #define DRM_MSM_HANGCHECK_PERIOD 500 /* in ms */
+ #define DRM_MSM_HANGCHECK_JIFFIES msecs_to_jiffies(DRM_MSM_HANGCHECK_PERIOD)
+ 	struct timer_list hangcheck_timer;
+-	struct work_struct recover_work;
++
++	/* work for handling GPU recovery: */
++	struct kthread_work recover_work;
++
++	/* work for handling active-list retiring: */
++	struct kthread_work retire_work;
++
++	/* worker for retire/recover: */
++	struct kthread_worker *worker;
+ 
+ 	struct drm_gem_object *memptrs_bo;
+ 
+-- 
+2.25.1
+

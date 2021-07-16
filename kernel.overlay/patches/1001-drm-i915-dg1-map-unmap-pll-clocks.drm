@@ -1,0 +1,277 @@
+From c089bed929d663d846c33def836b837001955307 Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Fri, 6 Nov 2020 13:00:06 -0800
+Subject: [PATCH 1001/1714] drm/i915/dg1: map/unmap pll clocks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DG1 uses 2 registers for the ddi clock mapping, with PHY A and B using
+DPCLKA_CFGCR0 and PHY C and D using DPCLKA1_CFGCR0. Hide this behind a
+single macro that chooses the correct register according to the phy
+being accessed, use the correct bitfields for each pll/phy and implement
+separate functions for DG1 since it doesn't share much with ICL/TGL
+anymore.
+
+The previous values were correct for PHY A and B since they were using
+the same register as before and the bitfields were matching.
+
+v2: Add comment and try to simplify DG1_DPCLKA* macros by reusing
+previous ones
+v3:
+  - Fix DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK() after wrong macro reuse
+  - Move phy -> id map to a separate macro (Aditya)
+  - Remove DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK where not required
+    (Aditya)
+  - Use drm_WARN_ON
+
+Cc: José Roberto de Souza <jose.souza@intel.com>
+Cc: Clinton Taylor <Clinton.A.Taylor@intel.com>
+Cc: Matt Roper <matthew.d.roper@intel.com>
+Cc: Aditya Swarup <aditya.swarup@intel.com>
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Reviewed-by: Aditya Swarup <aditya.swarup@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201106210006.837953-1-lucas.demarchi@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c     | 91 +++++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_display.c | 24 +++++-
+ drivers/gpu/drm/i915/i915_reg.h              | 24 ++++++
+ 3 files changed, 135 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 19b16517a502..36a4a1f4d775 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -2970,6 +2970,40 @@ static u32 icl_dpclka_cfgcr0_clk_off(struct drm_i915_private *dev_priv,
+ 	return 0;
+ }
+ 
++static void dg1_map_plls_to_ports(struct intel_encoder *encoder,
++				  const struct intel_crtc_state *crtc_state)
++{
++	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++	struct intel_shared_dpll *pll = crtc_state->shared_dpll;
++	enum phy phy = intel_port_to_phy(dev_priv, encoder->port);
++	u32 val;
++
++	/*
++	 * If we fail this, something went very wrong: first 2 PLLs should be
++	 * used by first 2 phys and last 2 PLLs by last phys
++	 */
++	if (drm_WARN_ON(&dev_priv->drm,
++			(pll->info->id < DPLL_ID_DG1_DPLL2 && phy >= PHY_C) ||
++			(pll->info->id >= DPLL_ID_DG1_DPLL2 && phy < PHY_C)))
++		return;
++
++	mutex_lock(&dev_priv->dpll.lock);
++
++	val = intel_de_read(dev_priv, DG1_DPCLKA_CFGCR0(phy));
++	drm_WARN_ON(&dev_priv->drm,
++		    (val & DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)) == 0);
++
++	val &= ~DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy);
++	val |= DG1_DPCLKA_CFGCR0_DDI_CLK_SEL(pll->info->id, phy);
++	intel_de_write(dev_priv, DG1_DPCLKA_CFGCR0(phy), val);
++	intel_de_posting_read(dev_priv, DG1_DPCLKA_CFGCR0(phy));
++
++	val &= ~DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy);
++	intel_de_write(dev_priv, DG1_DPCLKA_CFGCR0(phy), val);
++
++	mutex_unlock(&dev_priv->dpll.lock);
++}
++
+ static void icl_map_plls_to_ports(struct intel_encoder *encoder,
+ 				  const struct intel_crtc_state *crtc_state)
+ {
+@@ -3017,6 +3051,19 @@ static void icl_map_plls_to_ports(struct intel_encoder *encoder,
+ 	mutex_unlock(&dev_priv->dpll.lock);
+ }
+ 
++static void dg1_unmap_plls_to_ports(struct intel_encoder *encoder)
++{
++	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++	enum phy phy = intel_port_to_phy(dev_priv, encoder->port);
++
++	mutex_lock(&dev_priv->dpll.lock);
++
++	intel_de_rmw(dev_priv, DG1_DPCLKA_CFGCR0(phy), 0,
++		     DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy));
++
++	mutex_unlock(&dev_priv->dpll.lock);
++}
++
+ static void icl_unmap_plls_to_ports(struct intel_encoder *encoder)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+@@ -3032,6 +3079,37 @@ static void icl_unmap_plls_to_ports(struct intel_encoder *encoder)
+ 	mutex_unlock(&dev_priv->dpll.lock);
+ }
+ 
++static void dg1_sanitize_port_clk_off(struct drm_i915_private *dev_priv,
++				      u32 port_mask, bool ddi_clk_needed)
++{
++	enum port port;
++	u32 val;
++
++	for_each_port_masked(port, port_mask) {
++		enum phy phy = intel_port_to_phy(dev_priv, port);
++		bool ddi_clk_off;
++
++		val = intel_de_read(dev_priv, DG1_DPCLKA_CFGCR0(phy));
++		ddi_clk_off = val & DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy);
++
++		if (ddi_clk_needed == !ddi_clk_off)
++			continue;
++
++		/*
++		 * Punt on the case now where clock is gated, but it would
++		 * be needed by the port. Something else is really broken then.
++		 */
++		if (drm_WARN_ON(&dev_priv->drm, ddi_clk_needed))
++			continue;
++
++		drm_notice(&dev_priv->drm,
++			   "PHY %c is disabled with an ungated DDI clock, gate it\n",
++			   phy_name(phy));
++		val |= DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy);
++		intel_de_write(dev_priv, DG1_DPCLKA_CFGCR0(phy), val);
++	}
++}
++
+ static void icl_sanitize_port_clk_off(struct drm_i915_private *dev_priv,
+ 				      u32 port_mask, bool ddi_clk_needed)
+ {
+@@ -3114,7 +3192,10 @@ void icl_sanitize_encoder_pll_mapping(struct intel_encoder *encoder)
+ 		ddi_clk_needed = false;
+ 	}
+ 
+-	icl_sanitize_port_clk_off(dev_priv, port_mask, ddi_clk_needed);
++	if (IS_DG1(dev_priv))
++		dg1_sanitize_port_clk_off(dev_priv, port_mask, ddi_clk_needed);
++	else
++		icl_sanitize_port_clk_off(dev_priv, port_mask, ddi_clk_needed);
+ }
+ 
+ static void intel_ddi_clk_select(struct intel_encoder *encoder,
+@@ -3666,7 +3747,9 @@ static void intel_ddi_pre_enable(struct intel_atomic_state *state,
+ 
+ 	drm_WARN_ON(&dev_priv->drm, crtc_state->has_pch_encoder);
+ 
+-	if (INTEL_GEN(dev_priv) >= 11)
++	if (IS_DG1(dev_priv))
++		dg1_map_plls_to_ports(encoder, crtc_state);
++	else if (INTEL_GEN(dev_priv) >= 11)
+ 		icl_map_plls_to_ports(encoder, crtc_state);
+ 
+ 	intel_set_cpu_fifo_underrun_reporting(dev_priv, pipe, true);
+@@ -3848,7 +3931,9 @@ static void intel_ddi_post_disable(struct intel_atomic_state *state,
+ 		intel_ddi_post_disable_dp(state, encoder, old_crtc_state,
+ 					  old_conn_state);
+ 
+-	if (INTEL_GEN(dev_priv) >= 11)
++	if (IS_DG1(dev_priv))
++		dg1_unmap_plls_to_ports(encoder);
++	else if (INTEL_GEN(dev_priv) >= 11)
+ 		icl_unmap_plls_to_ports(encoder);
+ 
+ 	if (intel_crtc_has_dp_encoder(old_crtc_state) || is_tc_port)
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index d7c14a3acc45..78c3baf3d112 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -11003,6 +11003,26 @@ static int hsw_crtc_compute_clock(struct intel_crtc *crtc,
+ 	return 0;
+ }
+ 
++static void dg1_get_ddi_pll(struct drm_i915_private *dev_priv, enum port port,
++			    struct intel_crtc_state *pipe_config)
++{
++	enum icl_port_dpll_id port_dpll_id = ICL_PORT_DPLL_DEFAULT;
++	enum phy phy = intel_port_to_phy(dev_priv, port);
++	enum intel_dpll_id id;
++	u32 clk_sel;
++
++	clk_sel = intel_de_read(dev_priv, DG1_DPCLKA_CFGCR0(phy)) & DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy);
++	id = DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_DPLL_MAP(clk_sel, phy);
++
++	if (WARN_ON(id > DPLL_ID_DG1_DPLL3))
++		return;
++
++	pipe_config->icl_port_dplls[port_dpll_id].pll =
++		intel_get_shared_dpll_by_id(dev_priv, id);
++
++	icl_set_active_port_dpll(pipe_config, port_dpll_id);
++}
++
+ static void cnl_get_ddi_pll(struct drm_i915_private *dev_priv, enum port port,
+ 			    struct intel_crtc_state *pipe_config)
+ {
+@@ -11311,7 +11331,9 @@ static void hsw_get_ddi_port_state(struct intel_crtc *crtc,
+ 			port = TRANS_DDI_FUNC_CTL_VAL_TO_PORT(tmp);
+ 	}
+ 
+-	if (INTEL_GEN(dev_priv) >= 11)
++	if (IS_DG1(dev_priv))
++		dg1_get_ddi_pll(dev_priv, port, pipe_config);
++	else if (INTEL_GEN(dev_priv) >= 11)
+ 		icl_get_ddi_pll(dev_priv, port, pipe_config);
+ 	else if (IS_CANNONLAKE(dev_priv))
+ 		cnl_get_ddi_pll(dev_priv, port, pipe_config);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 077ede5f8c98..5375b219cc3b 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -230,12 +230,14 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define _TRANS(tran, a, b)		_PICK_EVEN(tran, a, b)
+ #define _PORT(port, a, b)		_PICK_EVEN(port, a, b)
+ #define _PLL(pll, a, b)			_PICK_EVEN(pll, a, b)
++#define _PHY(phy, a, b)			_PICK_EVEN(phy, a, b)
+ 
+ #define _MMIO_PIPE(pipe, a, b)		_MMIO(_PIPE(pipe, a, b))
+ #define _MMIO_PLANE(plane, a, b)	_MMIO(_PLANE(plane, a, b))
+ #define _MMIO_TRANS(tran, a, b)		_MMIO(_TRANS(tran, a, b))
+ #define _MMIO_PORT(port, a, b)		_MMIO(_PORT(port, a, b))
+ #define _MMIO_PLL(pll, a, b)		_MMIO(_PLL(pll, a, b))
++#define _MMIO_PHY(phy, a, b)		_MMIO(_PHY(phy, a, b))
+ 
+ #define _PHY3(phy, ...)			_PICK(phy, __VA_ARGS__)
+ 
+@@ -10300,6 +10302,7 @@ enum skl_power_gate {
+ #define  DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(port)	(3 << DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(port))
+ #define  DPCLKA_CFGCR0_DDI_CLK_SEL(pll, port)	((pll) << DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(port))
+ 
++/* ICL Clocks */
+ #define ICL_DPCLKA_CFGCR0			_MMIO(0x164280)
+ #define  ICL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)	(1 << _PICK(phy, 10, 11, 24))
+ #define  RKL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)	REG_BIT((phy) + 10)
+@@ -10315,6 +10318,27 @@ enum skl_power_gate {
+ #define  RKL_DPCLKA_CFGCR0_DDI_CLK_SEL(pll, phy) \
+ 	((pll) << RKL_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy))
+ 
++/*
++ * DG1 Clocks
++ * First registers controls the first A and B, while the second register
++ * controls the phy C and D. The bits on these registers are the
++ * same, but refer to different phys
++ */
++#define _DG1_DPCLKA_CFGCR0				0x164280
++#define _DG1_DPCLKA1_CFGCR0				0x16C280
++#define _DG1_DPCLKA_PHY_IDX(phy)			((phy) % 2)
++#define _DG1_DPCLKA_PLL_IDX(pll)			((pll) % 2)
++#define _DG1_PHY_DPLL_MAP(phy)				((phy) >= PHY_C ? DPLL_ID_DG1_DPLL2 : DPLL_ID_DG1_DPLL0)
++#define DG1_DPCLKA_CFGCR0(phy)				_MMIO_PHY((phy) / 2, \
++								  _DG1_DPCLKA_CFGCR0, \
++								  _DG1_DPCLKA1_CFGCR0)
++#define   DG1_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)		REG_BIT(_DG1_DPCLKA_PHY_IDX(phy) + 10)
++#define   DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy)	(_DG1_DPCLKA_PHY_IDX(phy) * 2)
++#define   DG1_DPCLKA_CFGCR0_DDI_CLK_SEL(pll, phy)	(_DG1_DPCLKA_PLL_IDX(pll) << DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy))
++#define   DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy)	(0x3 << DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy))
++#define   DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_DPLL_MAP(clk_sel, phy) \
++	(((clk_sel) >> DG1_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy)) + _DG1_PHY_DPLL_MAP(phy))
++
+ /* CNL PLL */
+ #define DPLL0_ENABLE		0x46010
+ #define DPLL1_ENABLE		0x46014
+-- 
+2.25.1
+

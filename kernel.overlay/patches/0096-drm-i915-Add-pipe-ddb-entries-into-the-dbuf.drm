@@ -1,0 +1,126 @@
+From a55bab354a383d0ffb3c5e5372c5cf0ba8e9468e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 22 Jan 2021 22:56:30 +0200
+Subject: [PATCH 096/128] drm/i915: Add pipe ddb entries into the dbuf state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The dbuf state will be where we collect all the inter-pipe dbuf
+allocation stuff. Start by adding the actual per-pipe ddb entries
+there.
+
+Originally the plan was to move them there outright, but that no longer
+works as we're no longer guaranteed to have a dbuf state when it comes
+time to sanity check the ddb overlaps in skl_commit_modeset_enables().
+I think when I wrote this originally we did the watermark/ddb
+calculation last, and so we couldn't have any crtcs in the state w/o
+also having the dbuf state. But that has since changed and we do the
+watermark/ddb calculation much earlier, and thus it is now possible
+to commit crtcs w/o a dbuf state. So we keep another copy of the
+information in the crtc state.
+
+v2: Rebase
+v3: Duplicate the entries instead of moving
+
+Reviewed-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210122205633.18492-6-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/intel_pm.c | 19 ++++++++-----------
+ drivers/gpu/drm/i915/intel_pm.h |  4 ++++
+ 2 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index b88429b9a7af..e69258bcef22 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4105,7 +4105,7 @@ static u8 skl_compute_dbuf_slices(struct intel_crtc *crtc,
+ 
+ static int
+ skl_ddb_get_pipe_allocation_limits(struct drm_i915_private *dev_priv,
+-				   const struct intel_crtc_state *crtc_state,
++				   struct intel_crtc_state *crtc_state,
+ 				   const u64 total_data_rate,
+ 				   struct skl_ddb_entry *alloc, /* out */
+ 				   int *num_active /* out */)
+@@ -4134,6 +4134,7 @@ skl_ddb_get_pipe_allocation_limits(struct drm_i915_private *dev_priv,
+ 	if (!crtc_state->hw.active) {
+ 		alloc->start = 0;
+ 		alloc->end = 0;
++		crtc_state->wm.skl.ddb = *alloc;
+ 		return 0;
+ 	}
+ 
+@@ -4146,16 +4147,8 @@ skl_ddb_get_pipe_allocation_limits(struct drm_i915_private *dev_priv,
+ 	 * grab _all_ crtc locks, including the one we currently hold.
+ 	 */
+ 	if (old_dbuf_state->active_pipes == new_dbuf_state->active_pipes &&
+-	    !dev_priv->wm.distrust_bios_wm) {
+-		/*
+-		 * alloc may be cleared by clear_intel_crtc_state,
+-		 * copy from old state to be sure
+-		 *
+-		 * FIXME get rid of this mess
+-		 */
+-		*alloc = to_intel_crtc_state(for_crtc->base.state)->wm.skl.ddb;
++	    !dev_priv->wm.distrust_bios_wm)
+ 		return 0;
+-	}
+ 
+ 	/*
+ 	 * Get allowed DBuf slices for correspondent pipe and platform.
+@@ -4222,6 +4215,7 @@ skl_ddb_get_pipe_allocation_limits(struct drm_i915_private *dev_priv,
+ 
+ 	alloc->start = ddb_slices.start + start;
+ 	alloc->end = ddb_slices.start + end;
++	crtc_state->wm.skl.ddb = *alloc;
+ 
+ 	drm_dbg_kms(&dev_priv->drm,
+ 		    "[CRTC:%d:%s] dbuf slices 0x%x, ddb (%d - %d), active pipes 0x%x\n",
+@@ -4798,7 +4792,9 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 	struct intel_crtc_state *crtc_state =
+ 		intel_atomic_get_new_crtc_state(state, crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	struct skl_ddb_entry *alloc = &crtc_state->wm.skl.ddb;
++	struct intel_dbuf_state *dbuf_state =
++		intel_atomic_get_new_dbuf_state(state);
++	struct skl_ddb_entry *alloc = &dbuf_state->ddb[crtc->pipe];
+ 	u16 alloc_size, start = 0;
+ 	u16 total[I915_MAX_PLANES] = {};
+ 	u16 uv_total[I915_MAX_PLANES] = {};
+@@ -4839,6 +4835,7 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 		}
+ 
+ 		alloc->start = alloc->end = 0;
++		crtc_state->wm.skl.ddb = *alloc;
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_pm.h b/drivers/gpu/drm/i915/intel_pm.h
+index 00910bc01407..724204bb8442 100644
+--- a/drivers/gpu/drm/i915/intel_pm.h
++++ b/drivers/gpu/drm/i915/intel_pm.h
+@@ -9,8 +9,10 @@
+ #include <linux/types.h>
+ 
+ #include "display/intel_bw.h"
++#include "display/intel_display.h"
+ #include "display/intel_global_state.h"
+ 
++#include "i915_drv.h"
+ #include "i915_reg.h"
+ 
+ struct drm_device;
+@@ -68,6 +70,8 @@ bool intel_set_memory_cxsr(struct drm_i915_private *dev_priv, bool enable);
+ struct intel_dbuf_state {
+ 	struct intel_global_state base;
+ 
++	struct skl_ddb_entry ddb[I915_MAX_PIPES];
++
+ 	u8 enabled_slices;
+ 	u8 active_pipes;
+ };
+-- 
+2.17.1
+

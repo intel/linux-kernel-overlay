@@ -1,0 +1,137 @@
+From 93426fd37783f170ad1f652c91b1e2a8e8089c29 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 30 Sep 2020 15:56:53 +0200
+Subject: [PATCH 0156/1714] drm/ttm: use caching instead of placement for
+ ttm_io_prot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of the placement flags use the caching of the bus
+mapping or tt object for the page protection flags.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Link: https://patchwork.freedesktop.org/patch/394255/
+---
+ drivers/gpu/drm/ttm/ttm_bo_util.c    | 23 ++++++++++++++---------
+ drivers/gpu/drm/ttm/ttm_bo_vm.c      |  2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_blit.c |  4 ++--
+ include/drm/ttm/ttm_bo_driver.h      |  6 ++++--
+ 4 files changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index bdee4df1f3f2..0542097dc419 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -279,13 +279,11 @@ int ttm_bo_move_memcpy(struct ttm_buffer_object *bo,
+ 	for (i = 0; i < new_mem->num_pages; ++i) {
+ 		page = i * dir + add;
+ 		if (old_iomap == NULL) {
+-			pgprot_t prot = ttm_io_prot(old_mem->placement,
+-						    PAGE_KERNEL);
++			pgprot_t prot = ttm_io_prot(bo, old_mem, PAGE_KERNEL);
+ 			ret = ttm_copy_ttm_io_page(ttm, new_iomap, page,
+ 						   prot);
+ 		} else if (new_iomap == NULL) {
+-			pgprot_t prot = ttm_io_prot(new_mem->placement,
+-						    PAGE_KERNEL);
++			pgprot_t prot = ttm_io_prot(bo, new_mem, PAGE_KERNEL);
+ 			ret = ttm_copy_io_ttm_page(ttm, old_iomap, page,
+ 						   prot);
+ 		} else {
+@@ -384,21 +382,28 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 	return 0;
+ }
+ 
+-pgprot_t ttm_io_prot(uint32_t caching_flags, pgprot_t tmp)
++pgprot_t ttm_io_prot(struct ttm_buffer_object *bo, struct ttm_resource *res,
++		     pgprot_t tmp)
+ {
++	struct ttm_resource_manager *man;
++	enum ttm_caching caching;
++
++	man = ttm_manager_type(bo->bdev, res->mem_type);
++	caching = man->use_tt ? bo->ttm->caching : res->bus.caching;
++
+ 	/* Cached mappings need no adjustment */
+-	if (caching_flags & TTM_PL_FLAG_CACHED)
++	if (caching == ttm_cached)
+ 		return tmp;
+ 
+ #if defined(__i386__) || defined(__x86_64__)
+-	if (caching_flags & TTM_PL_FLAG_WC)
++	if (caching == ttm_write_combined)
+ 		tmp = pgprot_writecombine(tmp);
+ 	else if (boot_cpu_data.x86 > 3)
+ 		tmp = pgprot_noncached(tmp);
+ #endif
+ #if defined(__ia64__) || defined(__arm__) || defined(__aarch64__) || \
+     defined(__powerpc__) || defined(__mips__)
+-	if (caching_flags & TTM_PL_FLAG_WC)
++	if (caching == ttm_write_combined)
+ 		tmp = pgprot_writecombine(tmp);
+ 	else
+ 		tmp = pgprot_noncached(tmp);
+@@ -466,7 +471,7 @@ static int ttm_bo_kmap_ttm(struct ttm_buffer_object *bo,
+ 		 * We need to use vmap to get the desired page protection
+ 		 * or to make the buffer object look contiguous.
+ 		 */
+-		prot = ttm_io_prot(mem->placement, PAGE_KERNEL);
++		prot = ttm_io_prot(bo, mem, PAGE_KERNEL);
+ 		map->bo_kmap_type = ttm_bo_map_vmap;
+ 		map->virtual = vmap(ttm->pages + start_page, num_pages,
+ 				    0, prot);
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index 87ee8f0ca08e..eeaca5d1efe3 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -310,7 +310,7 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 	if (unlikely(page_offset >= bo->num_pages))
+ 		return VM_FAULT_SIGBUS;
+ 
+-	prot = ttm_io_prot(bo->mem.placement, prot);
++	prot = ttm_io_prot(bo, &bo->mem, prot);
+ 	if (!bo->mem.bus.is_iomem) {
+ 		struct ttm_operation_ctx ctx = {
+ 			.interruptible = false,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_blit.c b/drivers/gpu/drm/vmwgfx/vmwgfx_blit.c
+index ea2f2f937eb3..f21881e087db 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_blit.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_blit.c
+@@ -484,8 +484,8 @@ int vmw_bo_cpu_blit(struct ttm_buffer_object *dst,
+ 	d.src_pages = src->ttm->pages;
+ 	d.dst_num_pages = dst->num_pages;
+ 	d.src_num_pages = src->num_pages;
+-	d.dst_prot = ttm_io_prot(dst->mem.placement, PAGE_KERNEL);
+-	d.src_prot = ttm_io_prot(src->mem.placement, PAGE_KERNEL);
++	d.dst_prot = ttm_io_prot(dst, &dst->mem, PAGE_KERNEL);
++	d.src_prot = ttm_io_prot(src, &src->mem, PAGE_KERNEL);
+ 	d.diff = diff;
+ 
+ 	for (j = 0; j < h; ++j) {
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index b58dedce7079..f29419cb7980 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -657,13 +657,15 @@ int ttm_bo_pipeline_gutting(struct ttm_buffer_object *bo);
+ /**
+  * ttm_io_prot
+  *
+- * @c_state: Caching state.
++ * bo: ttm buffer object
++ * res: ttm resource object
+  * @tmp: Page protection flag for a normal, cached mapping.
+  *
+  * Utility function that returns the pgprot_t that should be used for
+  * setting up a PTE with the caching model indicated by @c_state.
+  */
+-pgprot_t ttm_io_prot(uint32_t caching_flags, pgprot_t tmp);
++pgprot_t ttm_io_prot(struct ttm_buffer_object *bo, struct ttm_resource *res,
++		     pgprot_t tmp);
+ 
+ /**
+  * ttm_bo_tt_bind
+-- 
+2.25.1
+

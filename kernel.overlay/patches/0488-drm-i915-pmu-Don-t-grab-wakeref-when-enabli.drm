@@ -1,0 +1,129 @@
+From 734ec87797cff4079e0c1922c75afb4cd3f8073d Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Mon, 14 Dec 2020 09:43:47 +0000
+Subject: [PATCH 0488/1087] drm/i915/pmu: Don't grab wakeref when enabling
+ events
+
+Chris found a CI report which points out calling intel_runtime_pm_get from
+inside i915_pmu_enable hook is not allowed since it can be invoked from
+hard irq context. This is something we knew but forgot, so lets fix it
+once again.
+
+We do this by syncing the internal book keeping with hardware rc6 counter
+on driver load.
+
+v2:
+ * Always sync on parking and fully sync on init.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Fixes: f4e9894b6952 ("drm/i915/pmu: Correct the rc6 offset upon enabling")
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201214094349.3563876-1-tvrtko.ursulin@linux.intel.com
+---
+ drivers/gpu/drm/i915/i915_pmu.c | 39 ++++++++++++++-------------------
+ 1 file changed, 16 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_pmu.c b/drivers/gpu/drm/i915/i915_pmu.c
+index cfa5d7c16d44..2766190e4768 100644
+--- a/drivers/gpu/drm/i915/i915_pmu.c
++++ b/drivers/gpu/drm/i915/i915_pmu.c
+@@ -102,11 +102,6 @@ static unsigned int event_bit(struct perf_event *event)
+ 	return config_bit(event->attr.config);
+ }
+ 
+-static bool event_read_needs_wakeref(const struct perf_event *event)
+-{
+-	return event->attr.config == I915_PMU_RC6_RESIDENCY;
+-}
+-
+ static bool pmu_needs_timer(struct i915_pmu *pmu, bool gpu_active)
+ {
+ 	struct drm_i915_private *i915 = container_of(pmu, typeof(*i915), pmu);
+@@ -212,13 +207,24 @@ static u64 get_rc6(struct intel_gt *gt)
+ 	return val;
+ }
+ 
+-static void park_rc6(struct drm_i915_private *i915)
++static void init_rc6(struct i915_pmu *pmu)
+ {
+-	struct i915_pmu *pmu = &i915->pmu;
++	struct drm_i915_private *i915 = container_of(pmu, typeof(*i915), pmu);
++	intel_wakeref_t wakeref;
+ 
+-	if (pmu->enable & config_mask(I915_PMU_RC6_RESIDENCY))
++	with_intel_runtime_pm(i915->gt.uncore->rpm, wakeref) {
+ 		pmu->sample[__I915_SAMPLE_RC6].cur = __get_rc6(&i915->gt);
++		pmu->sample[__I915_SAMPLE_RC6_LAST_REPORTED].cur =
++					pmu->sample[__I915_SAMPLE_RC6].cur;
++		pmu->sleep_last = ktime_get();
++	}
++}
+ 
++static void park_rc6(struct drm_i915_private *i915)
++{
++	struct i915_pmu *pmu = &i915->pmu;
++
++	pmu->sample[__I915_SAMPLE_RC6].cur = __get_rc6(&i915->gt);
+ 	pmu->sleep_last = ktime_get();
+ }
+ 
+@@ -229,6 +235,7 @@ static u64 get_rc6(struct intel_gt *gt)
+ 	return __get_rc6(gt);
+ }
+ 
++static void init_rc6(struct i915_pmu *pmu) { }
+ static void park_rc6(struct drm_i915_private *i915) {}
+ 
+ #endif
+@@ -638,15 +645,10 @@ static void i915_pmu_enable(struct perf_event *event)
+ {
+ 	struct drm_i915_private *i915 =
+ 		container_of(event->pmu, typeof(*i915), pmu.base);
+-	bool need_wakeref = event_read_needs_wakeref(event);
+ 	struct i915_pmu *pmu = &i915->pmu;
+-	intel_wakeref_t wakeref = 0;
+ 	unsigned long flags;
+ 	unsigned int bit;
+ 
+-	if (need_wakeref)
+-		wakeref = intel_runtime_pm_get(&i915->runtime_pm);
+-
+ 	bit = event_bit(event);
+ 	if (bit == -1)
+ 		goto update;
+@@ -661,13 +663,6 @@ static void i915_pmu_enable(struct perf_event *event)
+ 	GEM_BUG_ON(bit >= ARRAY_SIZE(pmu->enable_count));
+ 	GEM_BUG_ON(pmu->enable_count[bit] == ~0);
+ 
+-	if (pmu->enable_count[bit] == 0 &&
+-	    config_mask(I915_PMU_RC6_RESIDENCY) & BIT_ULL(bit)) {
+-		pmu->sample[__I915_SAMPLE_RC6_LAST_REPORTED].cur = 0;
+-		pmu->sample[__I915_SAMPLE_RC6].cur = __get_rc6(&i915->gt);
+-		pmu->sleep_last = ktime_get();
+-	}
+-
+ 	pmu->enable |= BIT_ULL(bit);
+ 	pmu->enable_count[bit]++;
+ 
+@@ -709,9 +704,6 @@ static void i915_pmu_enable(struct perf_event *event)
+ 	 * an existing non-zero value.
+ 	 */
+ 	local64_set(&event->hw.prev_count, __i915_pmu_event_read(event));
+-
+-	if (wakeref)
+-		intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+ }
+ 
+ static void i915_pmu_disable(struct perf_event *event)
+@@ -1170,6 +1162,7 @@ void i915_pmu_register(struct drm_i915_private *i915)
+ 	hrtimer_init(&pmu->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	pmu->timer.function = i915_sample;
+ 	pmu->cpuhp.cpu = -1;
++	init_rc6(pmu);
+ 
+ 	if (!is_igp(i915)) {
+ 		pmu->name = kasprintf(GFP_KERNEL,
+-- 
+2.17.1
+

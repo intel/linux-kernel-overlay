@@ -1,0 +1,121 @@
+From 083e042b4c9d0528c8963bd8aa782cc2c329290c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 9 Oct 2020 11:09:27 +0200
+Subject: [PATCH 05/67] perf,mm: Handle non-page-table-aligned hugetlbfs
+
+A limited nunmber of architectures support hugetlbfs sizes that do not
+align with the page-tables (ARM64, Power, Sparc64). Add support for
+this to the generic perf_get_page_size() implementation, and also
+allow an architecture to override this implementation.
+
+This latter is only needed when it uses non-page-table aligned huge
+pages in its kernel map.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ include/linux/perf_event.h |  4 ++++
+ kernel/events/core.c       | 39 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index f55232965d70..9a38f579bc76 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1587,4 +1587,8 @@ extern void __weak arch_perf_update_userpage(struct perf_event *event,
+ 					     struct perf_event_mmap_page *userpg,
+ 					     u64 now);
+ 
++#ifdef CONFIG_MMU
++extern __weak u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr);
++#endif
++
+ #endif /* _LINUX_PERF_EVENT_H */
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index e4f6976043d4..d2f3ca792936 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7004,10 +7004,18 @@ static u64 perf_virt_to_phys(u64 virt)
+ #ifdef CONFIG_MMU
+ 
+ /*
+- * Return the MMU page size of a given virtual address
++ * Return the MMU page size of a given virtual address.
++ *
++ * This generic implementation handles page-table aligned huge pages, as well
++ * as non-page-table aligned hugetlbfs compound pages.
++ *
++ * If an architecture supports and uses non-page-table aligned pages in their
++ * kernel mapping it will need to provide it's own implementation of this
++ * function.
+  */
+-static u64 __perf_get_page_size(struct mm_struct *mm, unsigned long addr)
++__weak u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr)
+ {
++	struct page *page;
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+@@ -7029,15 +7037,27 @@ static u64 __perf_get_page_size(struct mm_struct *mm, unsigned long addr)
+ 	if (!pud_present(*pud))
+ 		return 0;
+ 
+-	if (pud_leaf(*pud))
++	if (pud_leaf(*pud)) {
++#ifdef pud_page
++		page = pud_page(*pud);
++		if (PageHuge(page))
++			return page_size(compound_head(page));
++#endif
+ 		return 1ULL << PUD_SHIFT;
++	}
+ 
+ 	pmd = pmd_offset(pud, addr);
+ 	if (!pmd_present(*pmd))
+ 		return 0;
+ 
+-	if (pmd_leaf(*pmd))
++	if (pmd_leaf(*pmd)) {
++#ifdef pmd_page
++		page = pmd_page(*pmd);
++		if (PageHuge(page))
++			return page_size(compound_head(page));
++#endif
+ 		return 1ULL << PMD_SHIFT;
++	}
+ 
+ 	pte = pte_offset_map(pmd, addr);
+ 	if (!pte_present(*pte)) {
+@@ -7045,13 +7065,20 @@ static u64 __perf_get_page_size(struct mm_struct *mm, unsigned long addr)
+ 		return 0;
+ 	}
+ 
++	page = pte_page(*pte);
++	if (PageHuge(page)) {
++		u64 size = page_size(compound_head(page));
++		pte_unmap(pte);
++		return size;
++	}
++
+ 	pte_unmap(pte);
+ 	return PAGE_SIZE;
+ }
+ 
+ #else
+ 
+-static u64 __perf_get_page_size(struct mm_struct *mm, unsigned long addr)
++static u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr)
+ {
+ 	return 0;
+ }
+@@ -7082,7 +7109,7 @@ static u64 perf_get_page_size(unsigned long addr)
+ 		mm = &init_mm;
+ 	}
+ 
+-	size = __perf_get_page_size(mm, addr);
++	size = arch_perf_get_page_size(mm, addr);
+ 
+ 	local_irq_restore(flags);
+ 
+-- 
+2.25.1
+

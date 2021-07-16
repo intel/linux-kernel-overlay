@@ -1,0 +1,207 @@
+From c45d49c6091e8ece1279f34782cd9b5b65bf1f7f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:08 +0200
+Subject: [PATCH 084/330] drm/i915: Implement async flips for bdw
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement async flip support for BDW. The implementation is
+similar to the skl+ code. And just like skl/bxt/glk bdw also
+needs the disable w/a, thus we need to plumb the desired state
+of the async flip all the way down to i9xx_plane_ctl_crtc().
+
+According to the spec we do need to bump the surface alignment
+to 256KiB for this. Async flips require an X-tiled buffer so
+we don't have to worry about linear.
+
+Cc: Karthik B S <karthik.b.s@intel.com>
+Cc: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-9-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c    | 51 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_display.c | 10 ++--
+ drivers/gpu/drm/i915/i915_irq.c              | 25 +++++-----
+ drivers/gpu/drm/i915/i915_reg.h              |  1 +
+ 4 files changed, 73 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index 7d968ca890da..44004558ebbd 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -495,6 +495,50 @@ static void i9xx_disable_plane(struct intel_plane *plane,
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ }
+ 
++static void
++g4x_primary_async_flip(struct intel_plane *plane,
++		       const struct intel_crtc_state *crtc_state,
++		       const struct intel_plane_state *plane_state,
++		       bool async_flip)
++{
++	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++	u32 dspcntr = plane_state->ctl | i9xx_plane_ctl_crtc(crtc_state);
++	u32 dspaddr_offset = plane_state->color_plane[0].offset;
++	enum i9xx_plane_id i9xx_plane = plane->i9xx_plane;
++	unsigned long irqflags;
++
++	if (async_flip)
++		dspcntr |= DISPPLANE_ASYNC_FLIP;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	intel_de_write_fw(dev_priv, DSPCNTR(i9xx_plane), dspcntr);
++	intel_de_write_fw(dev_priv, DSPSURF(i9xx_plane),
++			  intel_plane_ggtt_offset(plane_state) + dspaddr_offset);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++}
++
++static void
++bdw_primary_enable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	bdw_enable_pipe_irq(i915, pipe, GEN8_PIPE_PRIMARY_FLIP_DONE);
++	spin_unlock_irq(&i915->irq_lock);
++}
++
++static void
++bdw_primary_disable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	bdw_disable_pipe_irq(i915, pipe, GEN8_PIPE_PRIMARY_FLIP_DONE);
++	spin_unlock_irq(&i915->irq_lock);
++}
++
+ static bool i9xx_plane_get_hw_state(struct intel_plane *plane,
+ 				    enum pipe *pipe)
+ {
+@@ -708,6 +752,13 @@ intel_primary_plane_create(struct drm_i915_private *dev_priv, enum pipe pipe)
+ 	plane->get_hw_state = i9xx_plane_get_hw_state;
+ 	plane->check_plane = i9xx_plane_check;
+ 
++	if (IS_BROADWELL(dev_priv)) {
++		plane->need_async_flip_disable_wa = true;
++		plane->async_flip = g4x_primary_async_flip;
++		plane->enable_flip_done = bdw_primary_enable_flip_done;
++		plane->disable_flip_done = bdw_primary_disable_flip_done;
++	}
++
+ 	if (INTEL_GEN(dev_priv) >= 5 || IS_G4X(dev_priv))
+ 		ret = drm_universal_plane_init(&dev_priv->drm, &plane->base,
+ 					       0, plane_funcs,
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 7ba3404e8f27..22162945796a 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1317,6 +1317,11 @@ static unsigned int intel_linear_alignment(const struct drm_i915_private *dev_pr
+ 		return 0;
+ }
+ 
++static bool has_async_flips(struct drm_i915_private *i915)
++{
++	return INTEL_GEN(i915) >= 9 || IS_BROADWELL(i915);
++}
++
+ static unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+ 					 int color_plane)
+ {
+@@ -1331,7 +1336,7 @@ static unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+ 	case DRM_FORMAT_MOD_LINEAR:
+ 		return intel_linear_alignment(dev_priv);
+ 	case I915_FORMAT_MOD_X_TILED:
+-		if (INTEL_GEN(dev_priv) >= 9)
++		if (has_async_flips(dev_priv))
+ 			return 256 * 1024;
+ 		return 0;
+ 	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+@@ -14775,8 +14780,7 @@ static void intel_mode_config_init(struct drm_i915_private *i915)
+ 
+ 	mode_config->funcs = &intel_mode_funcs;
+ 
+-	if (INTEL_GEN(i915) >= 9)
+-		mode_config->async_page_flip = true;
++	mode_config->async_page_flip = has_async_flips(i915);
+ 
+ 	/*
+ 	 * Maximum framebuffer dimensions, chosen to match
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 5075f4ea2b23..11f256625f2b 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2380,6 +2380,14 @@ static void gen11_dsi_te_interrupt_handler(struct drm_i915_private *dev_priv,
+ 	intel_uncore_write(&dev_priv->uncore, DSI_INTR_IDENT_REG(port), tmp);
+ }
+ 
++static u32 gen8_de_pipe_flip_done_mask(struct drm_i915_private *i915)
++{
++	if (INTEL_GEN(i915) >= 9)
++		return GEN9_PIPE_PLANE1_FLIP_DONE;
++	else
++		return GEN8_PIPE_PRIMARY_FLIP_DONE;
++}
++
+ static irqreturn_t
+ gen8_de_irq_handler(struct drm_i915_private *dev_priv, u32 master_ctl)
+ {
+@@ -2482,7 +2490,7 @@ gen8_de_irq_handler(struct drm_i915_private *dev_priv, u32 master_ctl)
+ 		if (iir & GEN8_PIPE_VBLANK)
+ 			intel_handle_vblank(dev_priv, pipe);
+ 
+-		if (iir & GEN9_PIPE_PLANE1_FLIP_DONE)
++		if (iir & gen8_de_pipe_flip_done_mask(dev_priv))
+ 			flip_done_handler(dev_priv, pipe);
+ 
+ 		if (iir & GEN8_PIPE_CDCLK_CRC_DONE)
+@@ -3101,13 +3109,10 @@ void gen8_irq_power_well_post_enable(struct drm_i915_private *dev_priv,
+ 				     u8 pipe_mask)
+ {
+ 	struct intel_uncore *uncore = &dev_priv->uncore;
+-
+-	u32 extra_ier = GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN;
++	u32 extra_ier = GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN |
++		gen8_de_pipe_flip_done_mask(dev_priv);
+ 	enum pipe pipe;
+ 
+-	if (INTEL_GEN(dev_priv) >= 9)
+-		extra_ier |= GEN9_PIPE_PLANE1_FLIP_DONE;
+-
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 
+ 	if (!intel_irqs_enabled(dev_priv)) {
+@@ -3679,11 +3684,9 @@ static void gen8_de_irq_postinstall(struct drm_i915_private *dev_priv)
+ 			de_port_masked |= DSI0_TE | DSI1_TE;
+ 	}
+ 
+-	de_pipe_enables = de_pipe_masked | GEN8_PIPE_VBLANK |
+-					   GEN8_PIPE_FIFO_UNDERRUN;
+-
+-	if (INTEL_GEN(dev_priv) >= 9)
+-		de_pipe_enables |= GEN9_PIPE_PLANE1_FLIP_DONE;
++	de_pipe_enables = de_pipe_masked |
++		GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN |
++		gen8_de_pipe_flip_done_mask(dev_priv);
+ 
+ 	de_port_enables = de_port_masked;
+ 	if (IS_GEN9_LP(dev_priv))
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index e7e41a3c467e..da7d33b5b677 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6614,6 +6614,7 @@ enum {
+ #define   DISPPLANE_ROTATE_180			(1 << 15)
+ #define   DISPPLANE_TRICKLE_FEED_DISABLE	(1 << 14) /* Ironlake */
+ #define   DISPPLANE_TILED			(1 << 10)
++#define   DISPPLANE_ASYNC_FLIP			(1 << 9) /* g4x+ */
+ #define   DISPPLANE_MIRROR			(1 << 8) /* CHV pipe B */
+ #define _DSPAADDR				0x70184
+ #define _DSPASTRIDE				0x70188
+-- 
+2.25.1
+

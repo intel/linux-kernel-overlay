@@ -1,0 +1,181 @@
+From 0709a486610c17bdcef25113ebb227bdc073ce69 Mon Sep 17 00:00:00 2001
+From: Sebastian Reichel <sebastian.reichel@collabora.com>
+Date: Tue, 15 Dec 2020 12:46:00 +0200
+Subject: [PATCH 0263/1087] drm/omap: dsi: untangle ulps ops from
+ enable/disable
+
+Create a custom function pointer for ULPS and use it instead of
+reusing disable/enable functions for ULPS mode switch. This allows
+us to use the common disable/enable functions pointers for DSI.
+
+Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201215104657.802264-28-tomi.valkeinen@ti.com
+---
+ .../gpu/drm/omapdrm/displays/panel-dsi-cm.c   |  8 +--
+ drivers/gpu/drm/omapdrm/dss/dsi.c             | 53 ++++++++++++++-----
+ drivers/gpu/drm/omapdrm/dss/omapdss.h         |  5 +-
+ 3 files changed, 46 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c b/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
+index efbca64355d6..8253d3048a53 100644
+--- a/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
++++ b/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
+@@ -230,7 +230,7 @@ static int dsicm_enter_ulps(struct panel_drv_data *ddata)
+ 	if (r)
+ 		goto err;
+ 
+-	src->ops->dsi.disable(src, false, true);
++	src->ops->dsi.ulps(src, true);
+ 
+ 	ddata->ulps_enabled = true;
+ 
+@@ -255,7 +255,7 @@ static int dsicm_exit_ulps(struct panel_drv_data *ddata)
+ 	if (!ddata->ulps_enabled)
+ 		return 0;
+ 
+-	src->ops->enable(src);
++	src->ops->dsi.ulps(src, false);
+ 	ddata->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+ 
+ 	r = _dsicm_enable_te(ddata, true);
+@@ -582,7 +582,7 @@ static int dsicm_power_on(struct panel_drv_data *ddata)
+ 
+ 	dsicm_hw_reset(ddata);
+ 
+-	src->ops->dsi.disable(src, true, false);
++	src->ops->disable(src);
+ err_regulators:
+ 	r = regulator_bulk_disable(ARRAY_SIZE(ddata->supplies), ddata->supplies);
+ 	if (r)
+@@ -608,7 +608,7 @@ static void dsicm_power_off(struct panel_drv_data *ddata)
+ 		dsicm_hw_reset(ddata);
+ 	}
+ 
+-	src->ops->dsi.disable(src, true, false);
++	src->ops->disable(src);
+ 
+ 	r = regulator_bulk_disable(ARRAY_SIZE(ddata->supplies), ddata->supplies);
+ 	if (r)
+diff --git a/drivers/gpu/drm/omapdrm/dss/dsi.c b/drivers/gpu/drm/omapdrm/dss/dsi.c
+index 211415135682..5853f89aebbe 100644
+--- a/drivers/gpu/drm/omapdrm/dss/dsi.c
++++ b/drivers/gpu/drm/omapdrm/dss/dsi.c
+@@ -4052,14 +4052,11 @@ static void dsi_display_uninit_dsi(struct dsi_data *dsi, bool disconnect_lanes,
+ 	}
+ }
+ 
+-static void dsi_display_enable(struct omap_dss_device *dssdev)
++static void _dsi_display_enable(struct dsi_data *dsi)
+ {
+-	struct dsi_data *dsi = to_dsi_data(dssdev);
+ 	int r;
+ 
+-	DSSDBG("dsi_display_enable\n");
+-
+-	dsi_bus_lock(dsi);
++	WARN_ON(!dsi_bus_is_locked(dsi));
+ 
+ 	mutex_lock(&dsi->lock);
+ 
+@@ -4075,25 +4072,29 @@ static void dsi_display_enable(struct omap_dss_device *dssdev)
+ 
+ 	mutex_unlock(&dsi->lock);
+ 
+-	dsi_bus_unlock(dsi);
+-
+ 	return;
+ 
+ err_init_dsi:
+ 	dsi_runtime_put(dsi);
+ err_get_dsi:
+ 	mutex_unlock(&dsi->lock);
+-	DSSDBG("dsi_display_enable FAILED\n");
++	DSSDBG("dsi_display_ulps_enable FAILED\n");
+ }
+ 
+-static void dsi_display_disable(struct omap_dss_device *dssdev,
+-		bool disconnect_lanes, bool enter_ulps)
++static void dsi_display_enable(struct omap_dss_device *dssdev)
+ {
+ 	struct dsi_data *dsi = to_dsi_data(dssdev);
+-
+-	DSSDBG("dsi_display_disable\n");
++	DSSDBG("dsi_display_enable\n");
+ 
+ 	dsi_bus_lock(dsi);
++	_dsi_display_enable(dsi);
++	dsi_bus_unlock(dsi);
++}
++
++static void _dsi_display_disable(struct dsi_data *dsi,
++		bool disconnect_lanes, bool enter_ulps)
++{
++	WARN_ON(!dsi_bus_is_locked(dsi));
+ 
+ 	mutex_lock(&dsi->lock);
+ 
+@@ -4107,6 +4108,31 @@ static void dsi_display_disable(struct omap_dss_device *dssdev,
+ 	dsi_runtime_put(dsi);
+ 
+ 	mutex_unlock(&dsi->lock);
++}
++
++static void dsi_display_disable(struct omap_dss_device *dssdev)
++{
++	struct dsi_data *dsi = to_dsi_data(dssdev);
++
++	DSSDBG("dsi_display_disable\n");
++
++	dsi_bus_lock(dsi);
++	_dsi_display_disable(dsi, true, false);
++	dsi_bus_unlock(dsi);
++}
++
++static void dsi_ulps(struct omap_dss_device *dssdev, bool enable)
++{
++	struct dsi_data *dsi = to_dsi_data(dssdev);
++
++	DSSDBG("dsi_ulps %d\n", enable);
++
++	dsi_bus_lock(dsi);
++
++	if (enable)
++		_dsi_display_disable(dsi, false, true);
++	else
++		_dsi_display_enable(dsi);
+ 
+ 	dsi_bus_unlock(dsi);
+ }
+@@ -4812,9 +4838,10 @@ static const struct omap_dss_device_ops dsi_ops = {
+ 	.connect = dsi_connect,
+ 	.disconnect = dsi_disconnect,
+ 	.enable = dsi_display_enable,
++	.disable = dsi_display_disable,
+ 
+ 	.dsi = {
+-		.disable = dsi_display_disable,
++		.ulps = dsi_ulps,
+ 
+ 		.set_config = dsi_set_config,
+ 
+diff --git a/drivers/gpu/drm/omapdrm/dss/omapdss.h b/drivers/gpu/drm/omapdrm/dss/omapdss.h
+index 9bb9a7d62f02..1c5421fe0ee8 100644
+--- a/drivers/gpu/drm/omapdrm/dss/omapdss.h
++++ b/drivers/gpu/drm/omapdrm/dss/omapdss.h
+@@ -284,10 +284,9 @@ struct omap_dss_writeback_info {
+ };
+ 
+ struct omapdss_dsi_ops {
+-	void (*disable)(struct omap_dss_device *dssdev, bool disconnect_lanes,
+-			bool enter_ulps);
+-
+ 	/* bus configuration */
++	void (*ulps)(struct omap_dss_device *dssdev, bool enable);
++
+ 	int (*set_config)(struct omap_dss_device *dssdev,
+ 			const struct omap_dss_dsi_config *cfg);
+ 
+-- 
+2.17.1
+

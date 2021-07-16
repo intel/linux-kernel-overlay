@@ -1,0 +1,270 @@
+From d78edd65a2f372d55c82e301b3156daa15c8d368 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Mon, 18 Jan 2021 14:14:15 +0100
+Subject: [PATCH 0973/1087] drm: Upcast struct drm_device.dev to struct
+ pci_device; replace pdev
+
+We have DRM drivers based on USB, SPI and platform devices. All of them
+are fine with storing their device reference in struct drm_device.dev.
+PCI devices should be no exception. Therefore struct drm_device.pdev is
+deprecated.
+
+Instead upcast from struct drm_device.dev with to_pci_dev(). PCI-specific
+code can use dev_is_pci() to test for a PCI device. This patch changes
+the DRM core code and documentation accordingly.
+
+v4:
+	* split-off pdev deprecation into separate patch
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Sam Ravnborg <sam@ravnborg.org>
+Tested-by: Andy Lavr <andy.lavr@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210118131420.15874-2-tzimmermann@suse.de
+---
+ drivers/gpu/drm/drm_agpsupport.c |  9 ++++++---
+ drivers/gpu/drm/drm_bufs.c       |  4 ++--
+ drivers/gpu/drm/drm_edid.c       |  7 ++++++-
+ drivers/gpu/drm/drm_irq.c        | 12 +++++++-----
+ drivers/gpu/drm/drm_pci.c        | 26 +++++++++++++++-----------
+ drivers/gpu/drm/drm_vm.c         |  2 +-
+ 6 files changed, 37 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_agpsupport.c b/drivers/gpu/drm/drm_agpsupport.c
+index 7ae446fb84ad..5311d03d49cc 100644
+--- a/drivers/gpu/drm/drm_agpsupport.c
++++ b/drivers/gpu/drm/drm_agpsupport.c
+@@ -99,11 +99,13 @@ int drm_agp_info_ioctl(struct drm_device *dev, void *data,
+  */
+ int drm_agp_acquire(struct drm_device *dev)
+ {
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++
+ 	if (!dev->agp)
+ 		return -ENODEV;
+ 	if (dev->agp->acquired)
+ 		return -EBUSY;
+-	dev->agp->bridge = agp_backend_acquire(dev->pdev);
++	dev->agp->bridge = agp_backend_acquire(pdev);
+ 	if (!dev->agp->bridge)
+ 		return -ENODEV;
+ 	dev->agp->acquired = 1;
+@@ -378,14 +380,15 @@ int drm_agp_free_ioctl(struct drm_device *dev, void *data,
+  */
+ struct drm_agp_head *drm_agp_init(struct drm_device *dev)
+ {
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	struct drm_agp_head *head = NULL;
+ 
+ 	head = kzalloc(sizeof(*head), GFP_KERNEL);
+ 	if (!head)
+ 		return NULL;
+-	head->bridge = agp_find_bridge(dev->pdev);
++	head->bridge = agp_find_bridge(pdev);
+ 	if (!head->bridge) {
+-		head->bridge = agp_backend_acquire(dev->pdev);
++		head->bridge = agp_backend_acquire(pdev);
+ 		if (!head->bridge) {
+ 			kfree(head);
+ 			return NULL;
+diff --git a/drivers/gpu/drm/drm_bufs.c b/drivers/gpu/drm/drm_bufs.c
+index aeb1327e3077..e3d77dfefb0a 100644
+--- a/drivers/gpu/drm/drm_bufs.c
++++ b/drivers/gpu/drm/drm_bufs.c
+@@ -326,7 +326,7 @@ static int drm_addmap_core(struct drm_device *dev, resource_size_t offset,
+ 		 * As we're limiting the address to 2^32-1 (or less),
+ 		 * casting it down to 32 bits is no problem, but we
+ 		 * need to point to a 64bit variable first. */
+-		map->handle = dma_alloc_coherent(&dev->pdev->dev,
++		map->handle = dma_alloc_coherent(dev->dev,
+ 						 map->size,
+ 						 &map->offset,
+ 						 GFP_KERNEL);
+@@ -556,7 +556,7 @@ int drm_legacy_rmmap_locked(struct drm_device *dev, struct drm_local_map *map)
+ 	case _DRM_SCATTER_GATHER:
+ 		break;
+ 	case _DRM_CONSISTENT:
+-		dma_free_coherent(&dev->pdev->dev,
++		dma_free_coherent(dev->dev,
+ 				  map->size,
+ 				  map->handle,
+ 				  map->offset);
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index 394cc55b3214..c2bbe7bee7b6 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -32,6 +32,7 @@
+ #include <linux/i2c.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/vga_switcheroo.h>
+ 
+@@ -2075,9 +2076,13 @@ EXPORT_SYMBOL(drm_get_edid);
+ struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
+ 				     struct i2c_adapter *adapter)
+ {
+-	struct pci_dev *pdev = connector->dev->pdev;
++	struct drm_device *dev = connector->dev;
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	struct edid *edid;
+ 
++	if (drm_WARN_ON_ONCE(dev, !dev_is_pci(dev->dev)))
++		return NULL;
++
+ 	vga_switcheroo_lock_ddc(pdev);
+ 	edid = drm_get_edid(connector, adapter);
+ 	vga_switcheroo_unlock_ddc(pdev);
+diff --git a/drivers/gpu/drm/drm_irq.c b/drivers/gpu/drm/drm_irq.c
+index 803af4bbd214..c3bd664ea733 100644
+--- a/drivers/gpu/drm/drm_irq.c
++++ b/drivers/gpu/drm/drm_irq.c
+@@ -122,7 +122,7 @@ int drm_irq_install(struct drm_device *dev, int irq)
+ 		dev->driver->irq_preinstall(dev);
+ 
+ 	/* PCI devices require shared interrupts. */
+-	if (dev->pdev)
++	if (dev_is_pci(dev->dev))
+ 		sh_flags = IRQF_SHARED;
+ 
+ 	ret = request_irq(irq, dev->driver->irq_handler,
+@@ -140,7 +140,7 @@ int drm_irq_install(struct drm_device *dev, int irq)
+ 	if (ret < 0) {
+ 		dev->irq_enabled = false;
+ 		if (drm_core_check_feature(dev, DRIVER_LEGACY))
+-			vga_client_register(dev->pdev, NULL, NULL, NULL);
++			vga_client_register(to_pci_dev(dev->dev), NULL, NULL, NULL);
+ 		free_irq(irq, dev);
+ 	} else {
+ 		dev->irq = irq;
+@@ -203,7 +203,7 @@ int drm_irq_uninstall(struct drm_device *dev)
+ 	DRM_DEBUG("irq=%d\n", dev->irq);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_LEGACY))
+-		vga_client_register(dev->pdev, NULL, NULL, NULL);
++		vga_client_register(to_pci_dev(dev->dev), NULL, NULL, NULL);
+ 
+ 	if (dev->driver->irq_uninstall)
+ 		dev->driver->irq_uninstall(dev);
+@@ -252,6 +252,7 @@ int drm_legacy_irq_control(struct drm_device *dev, void *data,
+ {
+ 	struct drm_control *ctl = data;
+ 	int ret = 0, irq;
++	struct pci_dev *pdev;
+ 
+ 	/* if we haven't irq we fallback for compatibility reasons -
+ 	 * this used to be a separate function in drm_dma.h
+@@ -262,12 +263,13 @@ int drm_legacy_irq_control(struct drm_device *dev, void *data,
+ 	if (!drm_core_check_feature(dev, DRIVER_LEGACY))
+ 		return 0;
+ 	/* UMS was only ever supported on pci devices. */
+-	if (WARN_ON(!dev->pdev))
++	if (WARN_ON(!dev_is_pci(dev->dev)))
+ 		return -EINVAL;
+ 
+ 	switch (ctl->func) {
+ 	case DRM_INST_HANDLER:
+-		irq = dev->pdev->irq;
++		pdev = to_pci_dev(dev->dev);
++		irq = pdev->irq;
+ 
+ 		if (dev->if_version < DRM_IF_VERSION(1, 2) &&
+ 		    ctl->irq != irq)
+diff --git a/drivers/gpu/drm/drm_pci.c b/drivers/gpu/drm/drm_pci.c
+index 5370e6b492fd..2294a1580d35 100644
+--- a/drivers/gpu/drm/drm_pci.c
++++ b/drivers/gpu/drm/drm_pci.c
+@@ -70,7 +70,7 @@ drm_dma_handle_t *drm_pci_alloc(struct drm_device * dev, size_t size, size_t ali
+ 		return NULL;
+ 
+ 	dmah->size = size;
+-	dmah->vaddr = dma_alloc_coherent(&dev->pdev->dev, size,
++	dmah->vaddr = dma_alloc_coherent(dev->dev, size,
+ 					 &dmah->busaddr,
+ 					 GFP_KERNEL);
+ 
+@@ -93,7 +93,7 @@ EXPORT_SYMBOL(drm_pci_alloc);
+  */
+ void drm_pci_free(struct drm_device * dev, drm_dma_handle_t * dmah)
+ {
+-	dma_free_coherent(&dev->pdev->dev, dmah->size, dmah->vaddr,
++	dma_free_coherent(dev->dev, dmah->size, dmah->vaddr,
+ 			  dmah->busaddr);
+ 	kfree(dmah);
+ }
+@@ -112,16 +112,18 @@ static int drm_get_pci_domain(struct drm_device *dev)
+ 		return 0;
+ #endif /* __alpha__ */
+ 
+-	return pci_domain_nr(dev->pdev->bus);
++	return pci_domain_nr(to_pci_dev(dev->dev)->bus);
+ }
+ 
+ int drm_pci_set_busid(struct drm_device *dev, struct drm_master *master)
+ {
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++
+ 	master->unique = kasprintf(GFP_KERNEL, "pci:%04x:%02x:%02x.%d",
+ 					drm_get_pci_domain(dev),
+-					dev->pdev->bus->number,
+-					PCI_SLOT(dev->pdev->devfn),
+-					PCI_FUNC(dev->pdev->devfn));
++					pdev->bus->number,
++					PCI_SLOT(pdev->devfn),
++					PCI_FUNC(pdev->devfn));
+ 	if (!master->unique)
+ 		return -ENOMEM;
+ 
+@@ -131,12 +133,14 @@ int drm_pci_set_busid(struct drm_device *dev, struct drm_master *master)
+ 
+ static int drm_pci_irq_by_busid(struct drm_device *dev, struct drm_irq_busid *p)
+ {
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++
+ 	if ((p->busnum >> 8) != drm_get_pci_domain(dev) ||
+-	    (p->busnum & 0xff) != dev->pdev->bus->number ||
+-	    p->devnum != PCI_SLOT(dev->pdev->devfn) || p->funcnum != PCI_FUNC(dev->pdev->devfn))
++	    (p->busnum & 0xff) != pdev->bus->number ||
++	    p->devnum != PCI_SLOT(pdev->devfn) || p->funcnum != PCI_FUNC(pdev->devfn))
+ 		return -EINVAL;
+ 
+-	p->irq = dev->pdev->irq;
++	p->irq = pdev->irq;
+ 
+ 	DRM_DEBUG("%d:%d:%d => IRQ %d\n", p->busnum, p->devnum, p->funcnum,
+ 		  p->irq);
+@@ -164,7 +168,7 @@ int drm_legacy_irq_by_busid(struct drm_device *dev, void *data,
+ 		return -EOPNOTSUPP;
+ 
+ 	/* UMS was only ever support on PCI devices. */
+-	if (WARN_ON(!dev->pdev))
++	if (WARN_ON(!dev_is_pci(dev->dev)))
+ 		return -EINVAL;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_HAVE_IRQ))
+@@ -188,7 +192,7 @@ void drm_pci_agp_destroy(struct drm_device *dev)
+ static void drm_pci_agp_init(struct drm_device *dev)
+ {
+ 	if (drm_core_check_feature(dev, DRIVER_USE_AGP)) {
+-		if (pci_find_capability(dev->pdev, PCI_CAP_ID_AGP))
++		if (pci_find_capability(to_pci_dev(dev->dev), PCI_CAP_ID_AGP))
+ 			dev->agp = drm_agp_init(dev);
+ 		if (dev->agp) {
+ 			dev->agp->agp_mtrr = arch_phys_wc_add(
+diff --git a/drivers/gpu/drm/drm_vm.c b/drivers/gpu/drm/drm_vm.c
+index 6d5a03b32238..9b3b989d7cad 100644
+--- a/drivers/gpu/drm/drm_vm.c
++++ b/drivers/gpu/drm/drm_vm.c
+@@ -278,7 +278,7 @@ static void drm_vm_shm_close(struct vm_area_struct *vma)
+ 			case _DRM_SCATTER_GATHER:
+ 				break;
+ 			case _DRM_CONSISTENT:
+-				dma_free_coherent(&dev->pdev->dev,
++				dma_free_coherent(dev->dev,
+ 						  map->size,
+ 						  map->handle,
+ 						  map->offset);
+-- 
+2.17.1
+

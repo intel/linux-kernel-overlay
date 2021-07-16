@@ -1,0 +1,133 @@
+From d736e3a2aa87b5946fb5d9b1b76865f0acc63b34 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 31 Dec 2020 09:31:49 +0000
+Subject: [PATCH 0578/1087] drm/i915: Drop i915_request.lock requirement for
+ intel_rps_boost()
+
+Since we use a flag within i915_request.flags to indicate when we have
+boosted the request (so that we only apply the boost) once, this can be
+used as the serialisation with i915_request_retire() to avoid having to
+explicitly take the i915_request.lock which is more heavily contended.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201231093149.19086-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gt/debugfs_gt_pm.c   |  2 +-
+ drivers/gpu/drm/i915/gt/intel_rps.c       | 25 ++++++++++++-----------
+ drivers/gpu/drm/i915/gt/intel_rps_types.h |  2 +-
+ drivers/gpu/drm/i915/i915_debugfs.c       |  2 +-
+ drivers/gpu/drm/i915/i915_request.c       |  4 +---
+ 5 files changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c b/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
+index a0f10e8bbd21..d4f4452ce5ed 100644
+--- a/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
+@@ -578,7 +578,7 @@ static int rps_boost_show(struct seq_file *m, void *data)
+ 		   intel_gpu_freq(rps, rps->efficient_freq),
+ 		   intel_gpu_freq(rps, rps->boost_freq));
+ 
+-	seq_printf(m, "Wait boosts: %d\n", atomic_read(&rps->boosts));
++	seq_printf(m, "Wait boosts: %d\n", READ_ONCE(rps->boosts));
+ 
+ 	if (INTEL_GEN(i915) >= 6 && intel_rps_is_active(rps)) {
+ 		struct intel_uncore *uncore = gt->uncore;
+diff --git a/drivers/gpu/drm/i915/gt/intel_rps.c b/drivers/gpu/drm/i915/gt/intel_rps.c
+index f74d5e09e176..69e1bd46cc46 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rps.c
++++ b/drivers/gpu/drm/i915/gt/intel_rps.c
+@@ -862,6 +862,8 @@ void intel_rps_park(struct intel_rps *rps)
+ {
+ 	int adj;
+ 
++	GEM_BUG_ON(atomic_read(&rps->num_waiters));
++
+ 	if (!intel_rps_clear_active(rps))
+ 		return;
+ 
+@@ -917,28 +919,27 @@ void intel_rps_park(struct intel_rps *rps)
+ 
+ void intel_rps_boost(struct i915_request *rq)
+ {
+-	struct intel_rps *rps = &READ_ONCE(rq->engine)->gt->rps;
+-	unsigned long flags;
+-
+-	if (i915_request_signaled(rq) || !intel_rps_is_active(rps))
++	if (i915_request_signaled(rq) || i915_request_has_waitboost(rq))
+ 		return;
+ 
+ 	/* Serializes with i915_request_retire() */
+-	spin_lock_irqsave(&rq->lock, flags);
+-	if (!i915_request_has_waitboost(rq) &&
+-	    !dma_fence_is_signaled_locked(&rq->fence)) {
+-		set_bit(I915_FENCE_FLAG_BOOST, &rq->fence.flags);
++	if (!test_and_set_bit(I915_FENCE_FLAG_BOOST, &rq->fence.flags)) {
++		struct intel_rps *rps = &READ_ONCE(rq->engine)->gt->rps;
++
++		if (atomic_fetch_inc(&rps->num_waiters))
++			return;
++
++		if (!intel_rps_is_active(rps))
++			return;
+ 
+ 		GT_TRACE(rps_to_gt(rps), "boost fence:%llx:%llx\n",
+ 			 rq->fence.context, rq->fence.seqno);
+ 
+-		if (!atomic_fetch_inc(&rps->num_waiters) &&
+-		    READ_ONCE(rps->cur_freq) < rps->boost_freq)
++		if (READ_ONCE(rps->cur_freq) < rps->boost_freq)
+ 			schedule_work(&rps->work);
+ 
+-		atomic_inc(&rps->boosts);
++		WRITE_ONCE(rps->boosts, rps->boosts + 1); /* debug only */
+ 	}
+-	spin_unlock_irqrestore(&rq->lock, flags);
+ }
+ 
+ int intel_rps_set(struct intel_rps *rps, u8 val)
+diff --git a/drivers/gpu/drm/i915/gt/intel_rps_types.h b/drivers/gpu/drm/i915/gt/intel_rps_types.h
+index 38083f0402d9..029fe13cf303 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rps_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_rps_types.h
+@@ -93,7 +93,7 @@ struct intel_rps {
+ 	} power;
+ 
+ 	atomic_t num_waiters;
+-	atomic_t boosts;
++	unsigned int boosts;
+ 
+ 	/* manual wa residency calculations */
+ 	struct intel_rps_ei ei;
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 7332478a3dd5..de8e0e44cfb6 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -811,7 +811,7 @@ static int i915_rps_boost_info(struct seq_file *m, void *data)
+ 		   intel_gpu_freq(rps, rps->efficient_freq),
+ 		   intel_gpu_freq(rps, rps->boost_freq));
+ 
+-	seq_printf(m, "Wait boosts: %d\n", atomic_read(&rps->boosts));
++	seq_printf(m, "Wait boosts: %d\n", READ_ONCE(rps->boosts));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index 3290e743ba43..bfd82d8259f4 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -307,10 +307,8 @@ bool i915_request_retire(struct i915_request *rq)
+ 		spin_unlock_irq(&rq->lock);
+ 	}
+ 
+-	if (i915_request_has_waitboost(rq)) {
+-		GEM_BUG_ON(!atomic_read(&rq->engine->gt->rps.num_waiters));
++	if (test_and_set_bit(I915_FENCE_FLAG_BOOST, &rq->fence.flags))
+ 		atomic_dec(&rq->engine->gt->rps.num_waiters);
+-	}
+ 
+ 	/*
+ 	 * We only loosely track inflight requests across preemption,
+-- 
+2.17.1
+

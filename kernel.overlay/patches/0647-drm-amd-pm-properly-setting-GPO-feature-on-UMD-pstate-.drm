@@ -1,0 +1,125 @@
+From 4d85fe235ef75e7eac28b78e64529e2153f2240f Mon Sep 17 00:00:00 2001
+From: Evan Quan <evan.quan@amd.com>
+Date: Tue, 13 Oct 2020 14:17:29 +0800
+Subject: [PATCH 0647/1714] drm/amd/pm: properly setting GPO feature on UMD
+ pstate entering/exiting
+
+Disable/enable the GPO feature on UMD pstate entering/exiting.
+
+Signed-off-by: Evan Quan <evan.quan@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h       |  1 +
+ drivers/gpu/drm/amd/pm/inc/smu_types.h        |  1 +
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     |  2 ++
+ .../amd/pm/swsmu/smu11/sienna_cichlid_ppt.c   | 22 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/swsmu/smu_internal.h   |  1 +
+ 5 files changed, 27 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index 5d4e641de440..9724d6fd82f4 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -575,6 +575,7 @@ struct pptable_funcs {
+ 	int (*get_fan_parameters)(struct smu_context *smu);
+ 	int (*post_init)(struct smu_context *smu);
+ 	void (*interrupt_work)(struct smu_context *smu);
++	int (*gpo_control)(struct smu_context *smu, bool enablement);
+ };
+ 
+ typedef enum {
+diff --git a/drivers/gpu/drm/amd/pm/inc/smu_types.h b/drivers/gpu/drm/amd/pm/inc/smu_types.h
+index 85ae724c66d7..c8eee2a427d0 100644
+--- a/drivers/gpu/drm/amd/pm/inc/smu_types.h
++++ b/drivers/gpu/drm/amd/pm/inc/smu_types.h
+@@ -184,6 +184,7 @@
+ 	__SMU_DUMMY_MAP(SetSoftMinSocclkByFreq),         \
+ 	__SMU_DUMMY_MAP(PowerUpCvip),                    \
+ 	__SMU_DUMMY_MAP(PowerDownCvip),                  \
++	__SMU_DUMMY_MAP(SetGpoFeaturePMask),             \
+ 
+ #undef __SMU_DUMMY_MAP
+ #define __SMU_DUMMY_MAP(type)	SMU_MSG_##type
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index b2e5b285cb6e..1a8a9cf993ce 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -1406,6 +1406,7 @@ static int smu_enable_umd_pstate(void *handle,
+ 		if (*level & profile_mode_mask) {
+ 			smu_dpm_ctx->saved_dpm_level = smu_dpm_ctx->dpm_level;
+ 			smu_dpm_ctx->enable_umd_pstate = true;
++			smu_gpo_control(smu, false);
+ 			amdgpu_device_ip_set_powergating_state(smu->adev,
+ 							       AMD_IP_BLOCK_TYPE_GFX,
+ 							       AMD_PG_STATE_UNGATE);
+@@ -1431,6 +1432,7 @@ static int smu_enable_umd_pstate(void *handle,
+ 			amdgpu_device_ip_set_powergating_state(smu->adev,
+ 							       AMD_IP_BLOCK_TYPE_GFX,
+ 							       AMD_PG_STATE_GATE);
++			smu_gpo_control(smu, true);
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+index cf7c4f0e0a0b..5793877a0dd5 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -127,6 +127,7 @@ static struct cmn2asic_msg_mapping sienna_cichlid_message_map[SMU_MSG_MAX_COUNT]
+ 	MSG_MAP(ArmD3,				PPSMC_MSG_ArmD3,                       0),
+ 	MSG_MAP(Mode1Reset,                     PPSMC_MSG_Mode1Reset,		       0),
+ 	MSG_MAP(SetMGpuFanBoostLimitRpm,	PPSMC_MSG_SetMGpuFanBoostLimitRpm,     0),
++	MSG_MAP(SetGpoFeaturePMask,		PPSMC_MSG_SetGpoFeaturePMask,          0),
+ };
+ 
+ static struct cmn2asic_mapping sienna_cichlid_clk_map[SMU_CLK_COUNT] = {
+@@ -2719,6 +2720,26 @@ static int sienna_cichlid_enable_mgpu_fan_boost(struct smu_context *smu)
+ 					       NULL);
+ }
+ 
++static int sienna_cichlid_gpo_control(struct smu_context *smu,
++				      bool enablement)
++{
++	int ret = 0;
++
++	if (smu_cmn_feature_is_supported(smu, SMU_FEATURE_DPM_GFX_GPO_BIT)) {
++		if (enablement)
++			ret = smu_cmn_send_smc_msg_with_param(smu,
++							SMU_MSG_SetGpoFeaturePMask,
++							GFX_GPO_PACE_MASK | GFX_GPO_DEM_MASK,
++							NULL);
++		else
++			ret = smu_cmn_send_smc_msg_with_param(smu,
++							SMU_MSG_SetGpoFeaturePMask,
++							0,
++							NULL);
++	}
++
++	return ret;
++}
+ static const struct pptable_funcs sienna_cichlid_ppt_funcs = {
+ 	.get_allowed_feature_mask = sienna_cichlid_get_allowed_feature_mask,
+ 	.set_default_dpm_table = sienna_cichlid_set_default_dpm_table,
+@@ -2800,6 +2821,7 @@ static const struct pptable_funcs sienna_cichlid_ppt_funcs = {
+ 	.deep_sleep_control = smu_v11_0_deep_sleep_control,
+ 	.get_fan_parameters = sienna_cichlid_get_fan_parameters,
+ 	.interrupt_work = smu_v11_0_interrupt_work,
++	.gpo_control = sienna_cichlid_gpo_control,
+ };
+ 
+ void sienna_cichlid_set_ppt_funcs(struct smu_context *smu)
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu_internal.h b/drivers/gpu/drm/amd/pm/swsmu/smu_internal.h
+index c7e1fe5f442d..f7be2d1a0ff2 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu_internal.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu_internal.h
+@@ -89,6 +89,7 @@
+ #define smu_deep_sleep_control(smu, enablement)				smu_ppt_funcs(deep_sleep_control, 0, smu, enablement)
+ #define smu_get_fan_parameters(smu)					smu_ppt_funcs(get_fan_parameters, 0, smu)
+ #define smu_post_init(smu)						smu_ppt_funcs(post_init, 0, smu)
++#define smu_gpo_control(smu, enablement)				smu_ppt_funcs(gpo_control, 0, smu, enablement)
+ 
+ #endif
+ #endif
+-- 
+2.25.1
+

@@ -1,0 +1,164 @@
+From 7da8ee61e1e79049f9eed8a16e957a5a6dafd238 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 30 Sep 2020 11:17:44 +0200
+Subject: [PATCH 0155/1714] drm/ttm: add caching state to ttm_bus_placement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+And implement setting it up correctly in the drivers.
+
+This allows getting rid of the placement flags for this.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Link: https://patchwork.freedesktop.org/patch/394254/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    |  1 +
+ drivers/gpu/drm/drm_gem_vram_helper.c      |  1 +
+ drivers/gpu/drm/nouveau/nouveau_bo.c       | 11 +++++++++++
+ drivers/gpu/drm/qxl/qxl_ttm.c              |  2 ++
+ drivers/gpu/drm/radeon/radeon_ttm.c        |  2 ++
+ drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c |  1 +
+ include/drm/ttm/ttm_resource.h             |  8 +++++---
+ 7 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index b713aa9abf19..57fd72ca64d2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -769,6 +769,7 @@ static int amdgpu_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_reso
+ 
+ 		mem->bus.offset += adev->gmc.aper_base;
+ 		mem->bus.is_iomem = true;
++		mem->bus.caching = ttm_write_combined;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/drm_gem_vram_helper.c b/drivers/gpu/drm/drm_gem_vram_helper.c
+index ad58d0af5141..b9e7ce1adf25 100644
+--- a/drivers/gpu/drm/drm_gem_vram_helper.c
++++ b/drivers/gpu/drm/drm_gem_vram_helper.c
+@@ -981,6 +981,7 @@ static int bo_driver_io_mem_reserve(struct ttm_bo_device *bdev,
+ 	case TTM_PL_VRAM:
+ 		mem->bus.offset = (mem->start << PAGE_SHIFT) + vmm->vram_base;
+ 		mem->bus.is_iomem = true;
++		mem->bus.caching = ttm_write_combined;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 649b10240149..d2e687c31d70 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1133,6 +1133,8 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_resource *reg)
+ 	struct nouveau_drm *drm = nouveau_bdev(bdev);
+ 	struct nvkm_device *device = nvxx_device(&drm->client.device);
+ 	struct nouveau_mem *mem = nouveau_mem(reg);
++	struct nvif_mmu *mmu = &drm->client.mmu;
++	const u8 type = mmu->type[drm->ttm.type_vram].type;
+ 	int ret;
+ 
+ 	mutex_lock(&drm->ttm.io_reserve_mutex);
+@@ -1148,6 +1150,7 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_resource *reg)
+ 			reg->bus.offset = (reg->start << PAGE_SHIFT) +
+ 				drm->agp.base;
+ 			reg->bus.is_iomem = !drm->agp.cma;
++			reg->bus.caching = ttm_write_combined;
+ 		}
+ #endif
+ 		if (drm->client.mem->oclass < NVIF_CLASS_MEM_NV50 ||
+@@ -1161,6 +1164,14 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_resource *reg)
+ 		reg->bus.offset = (reg->start << PAGE_SHIFT) +
+ 			device->func->resource_addr(device, 1);
+ 		reg->bus.is_iomem = true;
++
++		/* Some BARs do not support being ioremapped WC */
++		if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA &&
++		    type & NVIF_MEM_UNCACHED)
++			reg->bus.caching = ttm_uncached;
++		else
++			reg->bus.caching = ttm_write_combined;
++
+ 		if (drm->client.mem->oclass >= NVIF_CLASS_MEM_NV50) {
+ 			union {
+ 				struct nv50_mem_map_v0 nv50;
+diff --git a/drivers/gpu/drm/qxl/qxl_ttm.c b/drivers/gpu/drm/qxl/qxl_ttm.c
+index f50863493f64..61eb06dbbce8 100644
+--- a/drivers/gpu/drm/qxl/qxl_ttm.c
++++ b/drivers/gpu/drm/qxl/qxl_ttm.c
+@@ -83,11 +83,13 @@ int qxl_ttm_io_mem_reserve(struct ttm_bo_device *bdev,
+ 	case TTM_PL_VRAM:
+ 		mem->bus.is_iomem = true;
+ 		mem->bus.offset = (mem->start << PAGE_SHIFT) + qdev->vram_base;
++		mem->bus.caching = ttm_cached;
+ 		break;
+ 	case TTM_PL_PRIV:
+ 		mem->bus.is_iomem = true;
+ 		mem->bus.offset = (mem->start << PAGE_SHIFT) +
+ 			qdev->surfaceram_base;
++		mem->bus.caching = ttm_cached;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 130a7cea35c3..9b53a1d80632 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -372,6 +372,7 @@ static int radeon_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_reso
+ 			mem->bus.offset = (mem->start << PAGE_SHIFT) +
+ 				rdev->mc.agp_base;
+ 			mem->bus.is_iomem = !rdev->ddev->agp->cant_use_aperture;
++			mem->bus.caching = ttm_write_combined;
+ 		}
+ #endif
+ 		break;
+@@ -382,6 +383,7 @@ static int radeon_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_reso
+ 			return -EINVAL;
+ 		mem->bus.offset += rdev->mc.aper_base;
+ 		mem->bus.is_iomem = true;
++		mem->bus.caching = ttm_write_combined;
+ #ifdef __alpha__
+ 		/*
+ 		 * Alpha: use bus.addr to hold the ioremap() return,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+index 70398e7a0b94..ef2f516f5e0e 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+@@ -682,6 +682,7 @@ static int vmw_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_resourc
+ 		mem->bus.offset = (mem->start << PAGE_SHIFT) +
+ 			dev_priv->vram_start;
+ 		mem->bus.is_iomem = true;
++		mem->bus.caching = ttm_cached;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/include/drm/ttm/ttm_resource.h b/include/drm/ttm/ttm_resource.h
+index 1b2f56163c6c..f48a70d39ac5 100644
+--- a/include/drm/ttm/ttm_resource.h
++++ b/include/drm/ttm/ttm_resource.h
+@@ -29,6 +29,7 @@
+ #include <linux/mutex.h>
+ #include <linux/dma-fence.h>
+ #include <drm/drm_print.h>
++#include <drm/ttm/ttm_caching.h>
+ 
+ #define TTM_MAX_BO_PRIORITY	4U
+ 
+@@ -148,9 +149,10 @@ struct ttm_resource_manager {
+  * Structure indicating the bus placement of an object.
+  */
+ struct ttm_bus_placement {
+-	void		*addr;
+-	phys_addr_t	offset;
+-	bool		is_iomem;
++	void			*addr;
++	phys_addr_t		offset;
++	bool			is_iomem;
++	enum ttm_caching	caching;
+ };
+ 
+ /**
+-- 
+2.25.1
+

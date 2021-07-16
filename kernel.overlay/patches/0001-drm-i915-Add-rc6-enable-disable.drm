@@ -1,0 +1,216 @@
+From 9c4c1ca00e2f15158c9c92b407f8814a2d89429c Mon Sep 17 00:00:00 2001
+From: Don Hiatt <don.hiatt@intel.com>
+Date: Tue, 5 May 2020 15:39:07 -0700
+Subject: [PATCH] drm/i915: Add rc6 enable/disable
+
+Add the ability to enable/disable rc6.
+
+To enable rc6:
+   echo 1 > /sys/class/drm/card0/gt_rc6_enable
+
+To disable rc6:
+   echo 0 > /sys/class/drm/card0/gt_rc6_enable
+
+To display the rc6 state:
+   cat /sys/class/drm/card0/gt_rc6_enable
+
+Signed-off-by: Don Hiatt <don.hiatt@intel.com>
+Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+Signed-off-by: James Xiong <james.xiong@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_rc6.c | 14 +++----
+ drivers/gpu/drm/i915/gt/intel_rc6.h |  3 ++
+ drivers/gpu/drm/i915/i915_sysfs.c   | 60 ++++++++++++++++++++---------
+ 3 files changed, 51 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_rc6.c b/drivers/gpu/drm/i915/gt/intel_rc6.c
+index 35504c97f11d..3758a535a167 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rc6.c
++++ b/drivers/gpu/drm/i915/gt/intel_rc6.c
+@@ -482,14 +482,14 @@ static bool rc6_supported(struct intel_rc6 *rc6)
+ 	return true;
+ }
+ 
+-static void rpm_get(struct intel_rc6 *rc6)
++void intel_rc6_rpm_get(struct intel_rc6 *rc6)
+ {
+ 	GEM_BUG_ON(rc6->wakeref);
+ 	pm_runtime_get_sync(&rc6_to_i915(rc6)->drm.pdev->dev);
+ 	rc6->wakeref = true;
+ }
+ 
+-static void rpm_put(struct intel_rc6 *rc6)
++void intel_rc6_rpm_put(struct intel_rc6 *rc6)
+ {
+ 	GEM_BUG_ON(!rc6->wakeref);
+ 	pm_runtime_put(&rc6_to_i915(rc6)->drm.pdev->dev);
+@@ -530,7 +530,7 @@ void intel_rc6_init(struct intel_rc6 *rc6)
+ 	int err;
+ 
+ 	/* Disable runtime-pm until we can save the GPU state with rc6 pctx */
+-	rpm_get(rc6);
++	intel_rc6_rpm_get(rc6);
+ 
+ 	if (!rc6_supported(rc6))
+ 		return;
+@@ -553,7 +553,7 @@ void intel_rc6_sanitize(struct intel_rc6 *rc6)
+ 	memset(rc6->prev_hw_residency, 0, sizeof(rc6->prev_hw_residency));
+ 
+ 	if (rc6->enabled) { /* unbalanced suspend/resume */
+-		rpm_get(rc6);
++		intel_rc6_rpm_get(rc6);
+ 		rc6->enabled = false;
+ 	}
+ 
+@@ -596,7 +596,7 @@ void intel_rc6_enable(struct intel_rc6 *rc6)
+ 		return;
+ 
+ 	/* rc6 is ready, runtime-pm is go! */
+-	rpm_put(rc6);
++	intel_rc6_rpm_put(rc6);
+ 	rc6->enabled = true;
+ }
+ 
+@@ -644,7 +644,7 @@ void intel_rc6_disable(struct intel_rc6 *rc6)
+ 	if (!rc6->enabled)
+ 		return;
+ 
+-	rpm_get(rc6);
++	intel_rc6_rpm_get(rc6);
+ 	rc6->enabled = false;
+ 
+ 	__intel_rc6_disable(rc6);
+@@ -661,7 +661,7 @@ void intel_rc6_fini(struct intel_rc6 *rc6)
+ 		i915_gem_object_put(pctx);
+ 
+ 	if (rc6->wakeref)
+-		rpm_put(rc6);
++		intel_rc6_rpm_put(rc6);
+ }
+ 
+ static u64 vlv_residency_raw(struct intel_uncore *uncore, const i915_reg_t reg)
+diff --git a/drivers/gpu/drm/i915/gt/intel_rc6.h b/drivers/gpu/drm/i915/gt/intel_rc6.h
+index 9f0f23fca8af..9a9a255f3d07 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rc6.h
++++ b/drivers/gpu/drm/i915/gt/intel_rc6.h
+@@ -22,6 +22,9 @@ void intel_rc6_sanitize(struct intel_rc6 *rc6);
+ void intel_rc6_enable(struct intel_rc6 *rc6);
+ void intel_rc6_disable(struct intel_rc6 *rc6);
+ 
++void intel_rc6_rpm_get(struct intel_rc6 *rc6);
++void intel_rc6_rpm_put(struct intel_rc6 *rc6);
++
+ u64 intel_rc6_residency_ns(struct intel_rc6 *rc6, i915_reg_t reg);
+ u64 intel_rc6_residency_us(struct intel_rc6 *rc6, i915_reg_t reg);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 45d32ef42787..38c138ef756c 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -58,23 +58,6 @@ static u32 calc_residency(struct drm_i915_private *dev_priv,
+ 	return DIV_ROUND_CLOSEST_ULL(res, 1000);
+ }
+ 
+-static ssize_t
+-show_rc6_mask(struct device *kdev, struct device_attribute *attr, char *buf)
+-{
+-	struct drm_i915_private *dev_priv = kdev_minor_to_i915(kdev);
+-	unsigned int mask;
+-
+-	mask = 0;
+-	if (HAS_RC6(dev_priv))
+-		mask |= BIT(0);
+-	if (HAS_RC6p(dev_priv))
+-		mask |= BIT(1);
+-	if (HAS_RC6pp(dev_priv))
+-		mask |= BIT(2);
+-
+-	return snprintf(buf, PAGE_SIZE, "%x\n", mask);
+-}
+-
+ static ssize_t
+ show_rc6_ms(struct device *kdev, struct device_attribute *attr, char *buf)
+ {
+@@ -107,14 +90,12 @@ show_media_rc6_ms(struct device *kdev, struct device_attribute *attr, char *buf)
+ 	return snprintf(buf, PAGE_SIZE, "%u\n", rc6_residency);
+ }
+ 
+-static DEVICE_ATTR(rc6_enable, S_IRUGO, show_rc6_mask, NULL);
+ static DEVICE_ATTR(rc6_residency_ms, S_IRUGO, show_rc6_ms, NULL);
+ static DEVICE_ATTR(rc6p_residency_ms, S_IRUGO, show_rc6p_ms, NULL);
+ static DEVICE_ATTR(rc6pp_residency_ms, S_IRUGO, show_rc6pp_ms, NULL);
+ static DEVICE_ATTR(media_rc6_residency_ms, S_IRUGO, show_media_rc6_ms, NULL);
+ 
+ static struct attribute *rc6_attrs[] = {
+-	&dev_attr_rc6_enable.attr,
+ 	&dev_attr_rc6_residency_ms.attr,
+ 	NULL
+ };
+@@ -433,9 +414,48 @@ static ssize_t gt_min_freq_mhz_store(struct device *kdev,
+ 	return ret ?: count;
+ }
+ 
++static ssize_t gt_rc6_enable_show(struct device *kdev, struct device_attribute *attr, char *buf)
++{
++	struct intel_gt *gt = &kdev_minor_to_i915(kdev)->gt;
++
++	return scnprintf(buf, PAGE_SIZE, "%d\n", gt->rc6.enabled);
++}
++
++static ssize_t gt_rc6_enable_store(struct device *kdev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	struct intel_gt *gt = &kdev_minor_to_i915(kdev)->gt;
++	intel_wakeref_t wakeref;
++	ssize_t ret;
++	u32 val;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++	wakeref = intel_runtime_pm_get(gt->uncore->rpm);
++	if (val) {
++		if (gt->rc6.enabled)
++			goto unlock;
++		if (!gt->rc6.wakeref)
++			intel_rc6_rpm_get(&gt->rc6);
++		intel_rc6_enable(&gt->rc6);
++		intel_rc6_unpark(&gt->rc6);
++	} else {
++		intel_rc6_disable(&gt->rc6);
++
++		if (gt->rc6.wakeref)
++			intel_rc6_rpm_put(&gt->rc6);
++	}
++unlock:
++	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
++	return count;
++}
++
+ static DEVICE_ATTR_RO(gt_act_freq_mhz);
+ static DEVICE_ATTR_RO(gt_cur_freq_mhz);
+ static DEVICE_ATTR_RW(gt_boost_freq_mhz);
++static DEVICE_ATTR_RW(gt_rc6_enable);
+ static DEVICE_ATTR_RW(gt_max_freq_mhz);
+ static DEVICE_ATTR_RW(gt_min_freq_mhz);
+ 
+@@ -469,6 +489,7 @@ static const struct attribute * const gen6_attrs[] = {
+ 	&dev_attr_gt_act_freq_mhz.attr,
+ 	&dev_attr_gt_cur_freq_mhz.attr,
+ 	&dev_attr_gt_boost_freq_mhz.attr,
++	&dev_attr_gt_rc6_enable.attr,
+ 	&dev_attr_gt_max_freq_mhz.attr,
+ 	&dev_attr_gt_min_freq_mhz.attr,
+ 	&dev_attr_gt_RP0_freq_mhz.attr,
+@@ -481,6 +502,7 @@ static const struct attribute * const vlv_attrs[] = {
+ 	&dev_attr_gt_act_freq_mhz.attr,
+ 	&dev_attr_gt_cur_freq_mhz.attr,
+ 	&dev_attr_gt_boost_freq_mhz.attr,
++	&dev_attr_gt_rc6_enable.attr,
+ 	&dev_attr_gt_max_freq_mhz.attr,
+ 	&dev_attr_gt_min_freq_mhz.attr,
+ 	&dev_attr_gt_RP0_freq_mhz.attr,
+-- 
+2.25.1
+

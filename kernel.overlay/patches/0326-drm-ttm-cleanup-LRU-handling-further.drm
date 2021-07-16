@@ -1,0 +1,216 @@
+From 40820fd713683f5b1d777a7ac5d70c37deb4eb57 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 27 Nov 2020 15:14:34 +0100
+Subject: [PATCH 0326/1087] drm/ttm: cleanup LRU handling further
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We only completely delete the BO from the LRU on destruction.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Link: https://patchwork.freedesktop.org/patch/404618/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c |  4 +-
+ drivers/gpu/drm/qxl/qxl_release.c      |  2 +-
+ drivers/gpu/drm/ttm/ttm_bo.c           | 60 +++++++++++---------------
+ drivers/gpu/drm/ttm/ttm_execbuf_util.c |  4 +-
+ include/drm/ttm/ttm_bo_api.h           |  2 +
+ include/drm/ttm/ttm_bo_driver.h        |  5 ++-
+ 6 files changed, 36 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 0768c8686983..ad91c0c3c423 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -653,9 +653,11 @@ void amdgpu_vm_move_to_lru_tail(struct amdgpu_device *adev,
+ 		if (!bo->parent)
+ 			continue;
+ 
+-		ttm_bo_move_to_lru_tail(&bo->tbo, &vm->lru_bulk_move);
++		ttm_bo_move_to_lru_tail(&bo->tbo, &bo->tbo.mem,
++					&vm->lru_bulk_move);
+ 		if (bo->shadow)
+ 			ttm_bo_move_to_lru_tail(&bo->shadow->tbo,
++						&bo->shadow->tbo.mem,
+ 						&vm->lru_bulk_move);
+ 	}
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+diff --git a/drivers/gpu/drm/qxl/qxl_release.c b/drivers/gpu/drm/qxl/qxl_release.c
+index e75e364655b8..0fcfc952d5e9 100644
+--- a/drivers/gpu/drm/qxl/qxl_release.c
++++ b/drivers/gpu/drm/qxl/qxl_release.c
+@@ -456,7 +456,7 @@ void qxl_release_fence_buffer_objects(struct qxl_release *release)
+ 		bo = entry->bo;
+ 
+ 		dma_resv_add_shared_fence(bo->base.resv, &release->base);
+-		ttm_bo_move_to_lru_tail(bo, NULL);
++		ttm_bo_move_to_lru_tail(bo, &bo->mem, NULL);
+ 		dma_resv_unlock(bo->base.resv);
+ 	}
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index c702ec5445f7..31e8b3da5563 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -110,40 +110,14 @@ static struct kobj_type ttm_bo_glob_kobj_type  = {
+ 	.default_attrs = ttm_bo_global_attrs
+ };
+ 
+-static void ttm_bo_add_mem_to_lru(struct ttm_buffer_object *bo,
+-				  struct ttm_resource *mem)
+-{
+-	struct ttm_bo_device *bdev = bo->bdev;
+-	struct ttm_resource_manager *man;
+-
+-	if (!list_empty(&bo->lru) || bo->pin_count)
+-		return;
+-
+-	man = ttm_manager_type(bdev, mem->mem_type);
+-	list_add_tail(&bo->lru, &man->lru[bo->priority]);
+-
+-	if (man->use_tt && bo->ttm &&
+-	    !(bo->ttm->page_flags & (TTM_PAGE_FLAG_SG |
+-				     TTM_PAGE_FLAG_SWAPPED))) {
+-		list_add_tail(&bo->swap, &ttm_bo_glob.swap_lru[bo->priority]);
+-	}
+-}
+-
+ static void ttm_bo_del_from_lru(struct ttm_buffer_object *bo)
+ {
+ 	struct ttm_bo_device *bdev = bo->bdev;
+-	bool notify = false;
+ 
+-	if (!list_empty(&bo->swap)) {
+-		list_del_init(&bo->swap);
+-		notify = true;
+-	}
+-	if (!list_empty(&bo->lru)) {
+-		list_del_init(&bo->lru);
+-		notify = true;
+-	}
++	list_del_init(&bo->swap);
++	list_del_init(&bo->lru);
+ 
+-	if (notify && bdev->driver->del_from_lru_notify)
++	if (bdev->driver->del_from_lru_notify)
+ 		bdev->driver->del_from_lru_notify(bo);
+ }
+ 
+@@ -156,12 +130,30 @@ static void ttm_bo_bulk_move_set_pos(struct ttm_lru_bulk_move_pos *pos,
+ }
+ 
+ void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo,
++			     struct ttm_resource *mem,
+ 			     struct ttm_lru_bulk_move *bulk)
+ {
++	struct ttm_bo_device *bdev = bo->bdev;
++	struct ttm_resource_manager *man;
++
+ 	dma_resv_assert_held(bo->base.resv);
+ 
+-	ttm_bo_del_from_lru(bo);
+-	ttm_bo_add_mem_to_lru(bo, &bo->mem);
++	if (bo->pin_count)
++		return;
++
++	man = ttm_manager_type(bdev, mem->mem_type);
++	list_move_tail(&bo->lru, &man->lru[bo->priority]);
++	if (man->use_tt && bo->ttm &&
++	    !(bo->ttm->page_flags & (TTM_PAGE_FLAG_SG |
++				     TTM_PAGE_FLAG_SWAPPED))) {
++		struct list_head *swap;
++
++		swap = &ttm_bo_glob.swap_lru[bo->priority];
++		list_move_tail(&bo->swap, swap);
++	}
++
++	if (bdev->driver->del_from_lru_notify)
++		bdev->driver->del_from_lru_notify(bo);
+ 
+ 	if (bulk && !bo->pin_count) {
+ 		switch (bo->mem.mem_type) {
+@@ -517,8 +509,7 @@ static void ttm_bo_release(struct kref *kref)
+ 		 */
+ 		if (WARN_ON(bo->pin_count)) {
+ 			bo->pin_count = 0;
+-			ttm_bo_del_from_lru(bo);
+-			ttm_bo_add_mem_to_lru(bo, &bo->mem);
++			ttm_bo_move_to_lru_tail(bo, &bo->mem, NULL);
+ 		}
+ 
+ 		kref_init(&bo->kref);
+@@ -860,8 +851,7 @@ static int ttm_bo_mem_placement(struct ttm_buffer_object *bo,
+ 	mem->placement = place->flags;
+ 
+ 	spin_lock(&ttm_bo_glob.lru_lock);
+-	ttm_bo_del_from_lru(bo);
+-	ttm_bo_add_mem_to_lru(bo, mem);
++	ttm_bo_move_to_lru_tail(bo, mem, NULL);
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/ttm/ttm_execbuf_util.c b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+index 8a8f1a6a83a6..9fa36ed59429 100644
+--- a/drivers/gpu/drm/ttm/ttm_execbuf_util.c
++++ b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+@@ -55,7 +55,7 @@ void ttm_eu_backoff_reservation(struct ww_acquire_ctx *ticket,
+ 	list_for_each_entry(entry, list, head) {
+ 		struct ttm_buffer_object *bo = entry->bo;
+ 
+-		ttm_bo_move_to_lru_tail(bo, NULL);
++		ttm_bo_move_to_lru_tail(bo, &bo->mem, NULL);
+ 		dma_resv_unlock(bo->base.resv);
+ 	}
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+@@ -162,7 +162,7 @@ void ttm_eu_fence_buffer_objects(struct ww_acquire_ctx *ticket,
+ 			dma_resv_add_shared_fence(bo->base.resv, fence);
+ 		else
+ 			dma_resv_add_excl_fence(bo->base.resv, fence);
+-		ttm_bo_move_to_lru_tail(bo, NULL);
++		ttm_bo_move_to_lru_tail(bo, &bo->mem, NULL);
+ 		dma_resv_unlock(bo->base.resv);
+ 	}
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 0d4e3fccaa8a..e17be324d95f 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -309,6 +309,7 @@ void ttm_bo_put(struct ttm_buffer_object *bo);
+  * ttm_bo_move_to_lru_tail
+  *
+  * @bo: The buffer object.
++ * @mem: Resource object.
+  * @bulk: optional bulk move structure to remember BO positions
+  *
+  * Move this BO to the tail of all lru lists used to lookup and reserve an
+@@ -316,6 +317,7 @@ void ttm_bo_put(struct ttm_buffer_object *bo);
+  * held, and is used to make a BO less likely to be considered for eviction.
+  */
+ void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo,
++			     struct ttm_resource *mem,
+ 			     struct ttm_lru_bulk_move *bulk);
+ 
+ /**
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index b1d1ce9740c4..423348414c59 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -491,10 +491,11 @@ static inline int ttm_bo_reserve_slowpath(struct ttm_buffer_object *bo,
+ 	return 0;
+ }
+ 
+-static inline void ttm_bo_move_to_lru_tail_unlocked(struct ttm_buffer_object *bo)
++static inline void
++ttm_bo_move_to_lru_tail_unlocked(struct ttm_buffer_object *bo)
+ {
+ 	spin_lock(&ttm_bo_glob.lru_lock);
+-	ttm_bo_move_to_lru_tail(bo, NULL);
++	ttm_bo_move_to_lru_tail(bo, &bo->mem, NULL);
+ 	spin_unlock(&ttm_bo_glob.lru_lock);
+ }
+ 
+-- 
+2.17.1
+

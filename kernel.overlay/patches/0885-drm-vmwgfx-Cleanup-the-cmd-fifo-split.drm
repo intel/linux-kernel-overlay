@@ -1,0 +1,1796 @@
+From 5feaca7035a52050a867b38734fe5ff1283a0202 Mon Sep 17 00:00:00 2001
+From: Zack Rusin <zackr@vmware.com>
+Date: Wed, 18 Nov 2020 12:54:19 -0500
+Subject: [PATCH 0885/1087] drm/vmwgfx: Cleanup the cmd/fifo split
+
+Lets try to cleanup the usage of the term FIFO which we used for
+both our MMIO based cmd queue processing and for general
+command processing which could have been using command buffers
+interface. We're going to rename the functions which are processing
+commands (and work either via MMIO or command buffers) as _cmd_
+and functions which operate on the MMIO based commands as FIFO
+to match the SVGA device naming.
+
+Signed-off-by: Zack Rusin <zackr@vmware.com>
+Reviewed-by: Martin Krastev <krastevm@vmware.com>
+Link: https://patchwork.freedesktop.org/patch/414044/?series=85516&rev=2
+---
+ drivers/gpu/drm/vmwgfx/Makefile               |  2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_binding.c       | 52 +++++++++----------
+ .../vmwgfx/{vmwgfx_fifo.c => vmwgfx_cmd.c}    | 39 +++++++-------
+ drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c        | 14 ++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_context.c       | 40 +++++++-------
+ drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c       | 12 ++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c           |  3 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h           | 30 +++++------
+ drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c       | 16 +++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c            |  2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_gmr.c           |  8 +--
+ drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c         |  2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c           | 21 ++++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c           |  4 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_mob.c           | 16 +++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c       |  8 +--
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c      |  4 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c          | 24 ++++-----
+ drivers/gpu/drm/vmwgfx/vmwgfx_shader.c        | 24 ++++-----
+ drivers/gpu/drm/vmwgfx/vmwgfx_so.c            |  8 +--
+ drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c          | 28 +++++-----
+ drivers/gpu/drm/vmwgfx/vmwgfx_streamoutput.c  |  8 +--
+ drivers/gpu/drm/vmwgfx/vmwgfx_surface.c       | 40 +++++++-------
+ 23 files changed, 198 insertions(+), 207 deletions(-)
+ rename drivers/gpu/drm/vmwgfx/{vmwgfx_fifo.c => vmwgfx_cmd.c} (94%)
+
+diff --git a/drivers/gpu/drm/vmwgfx/Makefile b/drivers/gpu/drm/vmwgfx/Makefile
+index ef455d6d7c3f..cc4cdca7176e 100644
+--- a/drivers/gpu/drm/vmwgfx/Makefile
++++ b/drivers/gpu/drm/vmwgfx/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ vmwgfx-y := vmwgfx_execbuf.o vmwgfx_gmr.o vmwgfx_kms.o vmwgfx_drv.o \
+ 	    vmwgfx_fb.o vmwgfx_ioctl.o vmwgfx_resource.o vmwgfx_ttm_buffer.o \
+-	    vmwgfx_fifo.o vmwgfx_irq.o vmwgfx_ldu.o vmwgfx_ttm_glue.o \
++	    vmwgfx_cmd.o vmwgfx_irq.o vmwgfx_ldu.o vmwgfx_ttm_glue.o \
+ 	    vmwgfx_overlay.o vmwgfx_gmrid_manager.o vmwgfx_fence.o \
+ 	    vmwgfx_bo.o vmwgfx_scrn.o vmwgfx_context.o \
+ 	    vmwgfx_surface.o vmwgfx_prime.o vmwgfx_mob.o vmwgfx_shader.o \
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_binding.c b/drivers/gpu/drm/vmwgfx/vmwgfx_binding.c
+index f41550797970..180f6dbc9460 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_binding.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_binding.c
+@@ -555,7 +555,7 @@ static int vmw_binding_scrub_shader(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		SVGA3dCmdSetShader body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -564,7 +564,7 @@ static int vmw_binding_scrub_shader(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 	cmd->body.cid = bi->ctx->id;
+ 	cmd->body.type = binding->shader_slot + SVGA3D_SHADERTYPE_MIN;
+ 	cmd->body.shid = ((rebind) ? bi->res->id : SVGA3D_INVALID_ID);
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -587,7 +587,7 @@ static int vmw_binding_scrub_render_target(struct vmw_ctx_bindinfo *bi,
+ 		SVGA3dCmdSetRenderTarget body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -598,7 +598,7 @@ static int vmw_binding_scrub_render_target(struct vmw_ctx_bindinfo *bi,
+ 	cmd->body.target.sid = ((rebind) ? bi->res->id : SVGA3D_INVALID_ID);
+ 	cmd->body.target.face = 0;
+ 	cmd->body.target.mipmap = 0;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -626,7 +626,7 @@ static int vmw_binding_scrub_texture(struct vmw_ctx_bindinfo *bi,
+ 		} body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -636,7 +636,7 @@ static int vmw_binding_scrub_texture(struct vmw_ctx_bindinfo *bi,
+ 	cmd->body.s1.stage = binding->texture_stage;
+ 	cmd->body.s1.name = SVGA3D_TS_BIND_TEXTURE;
+ 	cmd->body.s1.value = ((rebind) ? bi->res->id : SVGA3D_INVALID_ID);
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -657,7 +657,7 @@ static int vmw_binding_scrub_dx_shader(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		SVGA3dCmdDXSetShader body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), bi->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), bi->ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -665,7 +665,7 @@ static int vmw_binding_scrub_dx_shader(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.type = binding->shader_slot + SVGA3D_SHADERTYPE_MIN;
+ 	cmd->body.shaderId = ((rebind) ? bi->res->id : SVGA3D_INVALID_ID);
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -686,7 +686,7 @@ static int vmw_binding_scrub_cb(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		SVGA3dCmdDXSetSingleConstantBuffer body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), bi->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), bi->ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -703,7 +703,7 @@ static int vmw_binding_scrub_cb(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		cmd->body.sizeInBytes = 0;
+ 		cmd->body.sid = SVGA3D_INVALID_ID;
+ 	}
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -810,7 +810,7 @@ static int vmw_emit_set_sr(struct vmw_ctx_binding_state *cbs,
+ 
+ 	view_id_size = cbs->bind_cmd_count*sizeof(uint32);
+ 	cmd_size = sizeof(*cmd) + view_id_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -821,7 +821,7 @@ static int vmw_emit_set_sr(struct vmw_ctx_binding_state *cbs,
+ 
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, view_id_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 	bitmap_clear(cbs->per_shader[shader_slot].dirty_sr,
+ 		     cbs->bind_first_slot, cbs->bind_cmd_count);
+ 
+@@ -846,7 +846,7 @@ static int vmw_emit_set_rt(struct vmw_ctx_binding_state *cbs)
+ 	vmw_collect_view_ids(cbs, loc, SVGA3D_MAX_SIMULTANEOUS_RENDER_TARGETS);
+ 	view_id_size = cbs->bind_cmd_count*sizeof(uint32);
+ 	cmd_size = sizeof(*cmd) + view_id_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -860,7 +860,7 @@ static int vmw_emit_set_rt(struct vmw_ctx_binding_state *cbs)
+ 
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, view_id_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 
+ 	return 0;
+ 
+@@ -930,7 +930,7 @@ static int vmw_emit_set_so_target(struct vmw_ctx_binding_state *cbs)
+ 
+ 	so_target_size = cbs->bind_cmd_count*sizeof(SVGA3dSoTarget);
+ 	cmd_size = sizeof(*cmd) + so_target_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -938,7 +938,7 @@ static int vmw_emit_set_so_target(struct vmw_ctx_binding_state *cbs)
+ 	cmd->header.size = sizeof(cmd->body) + so_target_size;
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, so_target_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 
+ 	return 0;
+ 
+@@ -1044,7 +1044,7 @@ static int vmw_emit_set_vb(struct vmw_ctx_binding_state *cbs)
+ 
+ 	set_vb_size = cbs->bind_cmd_count*sizeof(SVGA3dVertexBuffer);
+ 	cmd_size = sizeof(*cmd) + set_vb_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -1054,7 +1054,7 @@ static int vmw_emit_set_vb(struct vmw_ctx_binding_state *cbs)
+ 
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, set_vb_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 	bitmap_clear(cbs->dirty_vb,
+ 		     cbs->bind_first_slot, cbs->bind_cmd_count);
+ 
+@@ -1074,7 +1074,7 @@ static int vmw_emit_set_uav(struct vmw_ctx_binding_state *cbs)
+ 	vmw_collect_view_ids(cbs, loc, SVGA3D_MAX_UAVIEWS);
+ 	view_id_size = cbs->bind_cmd_count*sizeof(uint32);
+ 	cmd_size = sizeof(*cmd) + view_id_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -1086,7 +1086,7 @@ static int vmw_emit_set_uav(struct vmw_ctx_binding_state *cbs)
+ 
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, view_id_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 
+ 	return 0;
+ }
+@@ -1104,7 +1104,7 @@ static int vmw_emit_set_cs_uav(struct vmw_ctx_binding_state *cbs)
+ 	vmw_collect_view_ids(cbs, loc, SVGA3D_MAX_UAVIEWS);
+ 	view_id_size = cbs->bind_cmd_count*sizeof(uint32);
+ 	cmd_size = sizeof(*cmd) + view_id_size;
+-	cmd = VMW_FIFO_RESERVE_DX(ctx->dev_priv, cmd_size, ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(ctx->dev_priv, cmd_size, ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -1116,7 +1116,7 @@ static int vmw_emit_set_cs_uav(struct vmw_ctx_binding_state *cbs)
+ 
+ 	memcpy(&cmd[1], cbs->bind_cmd_buffer, view_id_size);
+ 
+-	vmw_fifo_commit(ctx->dev_priv, cmd_size);
++	vmw_cmd_commit(ctx->dev_priv, cmd_size);
+ 
+ 	return 0;
+ }
+@@ -1263,7 +1263,7 @@ static int vmw_binding_scrub_ib(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		SVGA3dCmdDXSetIndexBuffer body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), bi->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), bi->ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -1279,7 +1279,7 @@ static int vmw_binding_scrub_ib(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		cmd->body.offset = 0;
+ 	}
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -1315,14 +1315,14 @@ static int vmw_binding_scrub_so(struct vmw_ctx_bindinfo *bi, bool rebind)
+ 		SVGA3dCmdDXSetStreamOutput body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), bi->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), bi->ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+ 	cmd->header.id = SVGA_3D_CMD_DX_SET_STREAMOUTPUT;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.soid = rebind ? bi->res->id : SVGA3D_INVALID_ID;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cmd.c
+similarity index 94%
+rename from drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
+rename to drivers/gpu/drm/vmwgfx/vmwgfx_cmd.c
+index f4b9af67551f..7400d617ae3c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cmd.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0 OR MIT
+ /**************************************************************************
+  *
+- * Copyright 2009-2015 VMware, Inc., Palo Alto, CA., USA
++ * Copyright 2009-2020 VMware, Inc., Palo Alto, CA., USA
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the
+@@ -36,7 +36,7 @@ struct vmw_temp_set_context {
+ 	SVGA3dCmdDXTempSetContext body;
+ };
+ 
+-bool vmw_fifo_have_3d(struct vmw_private *dev_priv)
++bool vmw_supports_3d(struct vmw_private *dev_priv)
+ {
+ 	uint32_t fifo_min, hwversion;
+ 	const struct vmw_fifo_state *fifo = &dev_priv->fifo;
+@@ -66,10 +66,10 @@ bool vmw_fifo_have_3d(struct vmw_private *dev_priv)
+ 		return false;
+ 
+ 	hwversion = vmw_fifo_mem_read(dev_priv,
+-				  ((fifo->capabilities &
+-				    SVGA_FIFO_CAP_3D_HWVERSION_REVISED) ?
+-				   SVGA_FIFO_3D_HWVERSION_REVISED :
+-				   SVGA_FIFO_3D_HWVERSION));
++				      ((fifo->capabilities &
++					SVGA_FIFO_CAP_3D_HWVERSION_REVISED) ?
++					       SVGA_FIFO_3D_HWVERSION_REVISED :
++					       SVGA_FIFO_3D_HWVERSION));
+ 
+ 	if (hwversion == 0)
+ 		return false;
+@@ -126,6 +126,7 @@ int vmw_fifo_init(struct vmw_private *dev_priv, struct vmw_fifo_state *fifo)
+ 
+ 	vmw_write(dev_priv, SVGA_REG_ENABLE, SVGA_REG_ENABLE_ENABLE |
+ 		  SVGA_REG_ENABLE_HIDE);
++
+ 	vmw_write(dev_priv, SVGA_REG_TRACES, 0);
+ 
+ 	min = 4;
+@@ -373,7 +374,7 @@ static void *vmw_local_fifo_reserve(struct vmw_private *dev_priv,
+ 	return NULL;
+ }
+ 
+-void *vmw_fifo_reserve_dx(struct vmw_private *dev_priv, uint32_t bytes,
++void *vmw_cmd_ctx_reserve(struct vmw_private *dev_priv, uint32_t bytes,
+ 			  int ctx_id)
+ {
+ 	void *ret;
+@@ -484,7 +485,7 @@ static void vmw_local_fifo_commit(struct vmw_private *dev_priv, uint32_t bytes)
+ 	mutex_unlock(&fifo_state->fifo_mutex);
+ }
+ 
+-void vmw_fifo_commit(struct vmw_private *dev_priv, uint32_t bytes)
++void vmw_cmd_commit(struct vmw_private *dev_priv, uint32_t bytes)
+ {
+ 	if (dev_priv->cman)
+ 		vmw_cmdbuf_commit(dev_priv->cman, bytes, NULL, false);
+@@ -499,7 +500,7 @@ void vmw_fifo_commit(struct vmw_private *dev_priv, uint32_t bytes)
+  * @dev_priv: Pointer to device private structure.
+  * @bytes: Number of bytes to commit.
+  */
+-void vmw_fifo_commit_flush(struct vmw_private *dev_priv, uint32_t bytes)
++void vmw_cmd_commit_flush(struct vmw_private *dev_priv, uint32_t bytes)
+ {
+ 	if (dev_priv->cman)
+ 		vmw_cmdbuf_commit(dev_priv->cman, bytes, NULL, true);
+@@ -514,7 +515,7 @@ void vmw_fifo_commit_flush(struct vmw_private *dev_priv, uint32_t bytes)
+  * @dev_priv: Pointer to device private structure.
+  * @interruptible: Whether to wait interruptible if function needs to sleep.
+  */
+-int vmw_fifo_flush(struct vmw_private *dev_priv, bool interruptible)
++int vmw_cmd_flush(struct vmw_private *dev_priv, bool interruptible)
+ {
+ 	might_sleep();
+ 
+@@ -524,7 +525,7 @@ int vmw_fifo_flush(struct vmw_private *dev_priv, bool interruptible)
+ 		return 0;
+ }
+ 
+-int vmw_fifo_send_fence(struct vmw_private *dev_priv, uint32_t *seqno)
++int vmw_cmd_send_fence(struct vmw_private *dev_priv, uint32_t *seqno)
+ {
+ 	struct vmw_fifo_state *fifo_state = &dev_priv->fifo;
+ 	struct svga_fifo_cmd_fence *cmd_fence;
+@@ -532,7 +533,7 @@ int vmw_fifo_send_fence(struct vmw_private *dev_priv, uint32_t *seqno)
+ 	int ret = 0;
+ 	uint32_t bytes = sizeof(u32) + sizeof(*cmd_fence);
+ 
+-	fm = VMW_FIFO_RESERVE(dev_priv, bytes);
++	fm = VMW_CMD_RESERVE(dev_priv, bytes);
+ 	if (unlikely(fm == NULL)) {
+ 		*seqno = atomic_read(&dev_priv->marker_seq);
+ 		ret = -ENOMEM;
+@@ -552,14 +553,14 @@ int vmw_fifo_send_fence(struct vmw_private *dev_priv, uint32_t *seqno)
+ 		 * waiting code in vmwgfx_irq.c will emulate this.
+ 		 */
+ 
+-		vmw_fifo_commit(dev_priv, 0);
++		vmw_cmd_commit(dev_priv, 0);
+ 		return 0;
+ 	}
+ 
+ 	*fm++ = SVGA_CMD_FENCE;
+ 	cmd_fence = (struct svga_fifo_cmd_fence *) fm;
+ 	cmd_fence->fence = *seqno;
+-	vmw_fifo_commit_flush(dev_priv, bytes);
++	vmw_cmd_commit_flush(dev_priv, bytes);
+ 	vmw_update_seqno(dev_priv, fifo_state);
+ 
+ out_err:
+@@ -590,7 +591,7 @@ static int vmw_fifo_emit_dummy_legacy_query(struct vmw_private *dev_priv,
+ 		SVGA3dCmdWaitForQuery body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -607,7 +608,7 @@ static int vmw_fifo_emit_dummy_legacy_query(struct vmw_private *dev_priv,
+ 		cmd->body.guestResult.offset = 0;
+ 	}
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -636,7 +637,7 @@ static int vmw_fifo_emit_dummy_gb_query(struct vmw_private *dev_priv,
+ 		SVGA3dCmdWaitForGBQuery body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -648,7 +649,7 @@ static int vmw_fifo_emit_dummy_gb_query(struct vmw_private *dev_priv,
+ 	cmd->body.mobid = bo->mem.start;
+ 	cmd->body.offset = 0;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -672,7 +673,7 @@ static int vmw_fifo_emit_dummy_gb_query(struct vmw_private *dev_priv,
+  *
+  * Returns -ENOMEM on failure to reserve fifo space.
+  */
+-int vmw_fifo_emit_dummy_query(struct vmw_private *dev_priv,
++int vmw_cmd_emit_dummy_query(struct vmw_private *dev_priv,
+ 			      uint32_t cid)
+ {
+ 	if (dev_priv->has_mob)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
+index 546c94e9268a..45fbc41440f1 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
+@@ -610,7 +610,7 @@ static void vmw_cmdbuf_work_func(struct work_struct *work)
+ 
+ 	/* Send a new fence in case one was removed */
+ 	if (send_fence) {
+-		vmw_fifo_send_fence(man->dev_priv, &dummy);
++		vmw_cmd_send_fence(man->dev_priv, &dummy);
+ 		wake_up_all(&man->idle_queue);
+ 	}
+ 
+@@ -1208,18 +1208,14 @@ static int vmw_cmdbuf_startstop(struct vmw_cmdbuf_man *man, u32 context,
+  *
+  * @man: The command buffer manager.
+  * @size: The size of the main space pool.
+- * @default_size: The default size of the command buffer for small kernel
+- * submissions.
+  *
+- * Set the size and allocate the main command buffer space pool,
+- * as well as the default size of the command buffer for
+- * small kernel submissions. If successful, this enables large command
+- * submissions. Note that this function requires that rudimentary command
++ * Set the size and allocate the main command buffer space pool.
++ * If successful, this enables large command submissions.
++ * Note that this function requires that rudimentary command
+  * submission is already available and that the MOB memory manager is alive.
+  * Returns 0 on success. Negative error code on failure.
+  */
+-int vmw_cmdbuf_set_pool_size(struct vmw_cmdbuf_man *man,
+-			     size_t size, size_t default_size)
++int vmw_cmdbuf_set_pool_size(struct vmw_cmdbuf_man *man, size_t size)
+ {
+ 	struct vmw_private *dev_priv = man->dev_priv;
+ 	bool dummy;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_context.c b/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
+index 61c246335e66..6f4d0da11ad8 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
+@@ -163,7 +163,7 @@ static void vmw_hw_context_destroy(struct vmw_resource *res)
+ 	}
+ 
+ 	vmw_execbuf_release_pinned_bo(dev_priv);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return;
+ 
+@@ -171,7 +171,7 @@ static void vmw_hw_context_destroy(struct vmw_resource *res)
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	vmw_fifo_resource_dec(dev_priv);
+ }
+ 
+@@ -265,7 +265,7 @@ static int vmw_context_init(struct vmw_private *dev_priv,
+ 		return -ENOMEM;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		vmw_resource_unreference(&res);
+ 		return -ENOMEM;
+@@ -275,7 +275,7 @@ static int vmw_context_init(struct vmw_private *dev_priv,
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	vmw_fifo_resource_inc(dev_priv);
+ 	res->hw_destroy = vmw_hw_context_destroy;
+ 	return 0;
+@@ -316,7 +316,7 @@ static int vmw_gb_context_create(struct vmw_resource *res)
+ 		goto out_no_fifo;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		ret = -ENOMEM;
+ 		goto out_no_fifo;
+@@ -325,7 +325,7 @@ static int vmw_gb_context_create(struct vmw_resource *res)
+ 	cmd->header.id = SVGA_3D_CMD_DEFINE_GB_CONTEXT;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	vmw_fifo_resource_inc(dev_priv);
+ 
+ 	return 0;
+@@ -348,7 +348,7 @@ static int vmw_gb_context_bind(struct vmw_resource *res,
+ 
+ 	BUG_ON(bo->mem.mem_type != VMW_PL_MOB);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -358,7 +358,7 @@ static int vmw_gb_context_bind(struct vmw_resource *res,
+ 	cmd->body.mobid = bo->mem.start;
+ 	cmd->body.validContents = res->backup_dirty;
+ 	res->backup_dirty = false;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -392,7 +392,7 @@ static int vmw_gb_context_unbind(struct vmw_resource *res,
+ 
+ 	submit_size = sizeof(*cmd2) + (readback ? sizeof(*cmd1) : 0);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(cmd == NULL)) {
+ 		mutex_unlock(&dev_priv->binding_mutex);
+ 		return -ENOMEM;
+@@ -411,7 +411,7 @@ static int vmw_gb_context_unbind(struct vmw_resource *res,
+ 	cmd2->body.cid = res->id;
+ 	cmd2->body.mobid = SVGA3D_INVALID_ID;
+ 
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 	mutex_unlock(&dev_priv->binding_mutex);
+ 
+ 	/*
+@@ -440,14 +440,14 @@ static int vmw_gb_context_destroy(struct vmw_resource *res)
+ 	if (likely(res->id == -1))
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+ 	cmd->header.id = SVGA_3D_CMD_DESTROY_GB_CONTEXT;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	if (dev_priv->query_cid == res->id)
+ 		dev_priv->query_cid_valid = false;
+ 	vmw_resource_release_id(res);
+@@ -483,7 +483,7 @@ static int vmw_dx_context_create(struct vmw_resource *res)
+ 		goto out_no_fifo;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		ret = -ENOMEM;
+ 		goto out_no_fifo;
+@@ -492,7 +492,7 @@ static int vmw_dx_context_create(struct vmw_resource *res)
+ 	cmd->header.id = SVGA_3D_CMD_DX_DEFINE_CONTEXT;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	vmw_fifo_resource_inc(dev_priv);
+ 
+ 	return 0;
+@@ -515,7 +515,7 @@ static int vmw_dx_context_bind(struct vmw_resource *res,
+ 
+ 	BUG_ON(bo->mem.mem_type != VMW_PL_MOB);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -525,7 +525,7 @@ static int vmw_dx_context_bind(struct vmw_resource *res,
+ 	cmd->body.mobid = bo->mem.start;
+ 	cmd->body.validContents = res->backup_dirty;
+ 	res->backup_dirty = false;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 
+ 	return 0;
+@@ -608,7 +608,7 @@ static int vmw_dx_context_unbind(struct vmw_resource *res,
+ 
+ 	submit_size = sizeof(*cmd2) + (readback ? sizeof(*cmd1) : 0);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(cmd == NULL)) {
+ 		mutex_unlock(&dev_priv->binding_mutex);
+ 		return -ENOMEM;
+@@ -627,7 +627,7 @@ static int vmw_dx_context_unbind(struct vmw_resource *res,
+ 	cmd2->body.cid = res->id;
+ 	cmd2->body.mobid = SVGA3D_INVALID_ID;
+ 
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 	mutex_unlock(&dev_priv->binding_mutex);
+ 
+ 	/*
+@@ -656,14 +656,14 @@ static int vmw_dx_context_destroy(struct vmw_resource *res)
+ 	if (likely(res->id == -1))
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+ 	cmd->header.id = SVGA_3D_CMD_DX_DESTROY_CONTEXT;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	if (dev_priv->query_cid == res->id)
+ 		dev_priv->query_cid_valid = false;
+ 	vmw_resource_release_id(res);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
+index a077e420d2ff..ba658fa9cf6c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
+@@ -175,7 +175,7 @@ static int vmw_cotable_unscrub(struct vmw_resource *res)
+ 	WARN_ON_ONCE(bo->mem.mem_type != VMW_PL_MOB);
+ 	dma_resv_assert_held(bo->base.resv);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -188,7 +188,7 @@ static int vmw_cotable_unscrub(struct vmw_resource *res)
+ 	cmd->body.mobid = bo->mem.start;
+ 	cmd->body.validSizeInBytes = vcotbl->size_read_back;
+ 
+-	vmw_fifo_commit_flush(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit_flush(dev_priv, sizeof(*cmd));
+ 	vcotbl->scrubbed = false;
+ 
+ 	return 0;
+@@ -263,7 +263,7 @@ int vmw_cotable_scrub(struct vmw_resource *res, bool readback)
+ 	if (readback)
+ 		submit_size += sizeof(*cmd0);
+ 
+-	cmd1 = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd1 = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (!cmd1)
+ 		return -ENOMEM;
+ 
+@@ -283,7 +283,7 @@ int vmw_cotable_scrub(struct vmw_resource *res, bool readback)
+ 	cmd1->body.type = vcotbl->type;
+ 	cmd1->body.mobid = SVGA3D_INVALID_ID;
+ 	cmd1->body.validSizeInBytes = 0;
+-	vmw_fifo_commit_flush(dev_priv, submit_size);
++	vmw_cmd_commit_flush(dev_priv, submit_size);
+ 	vcotbl->scrubbed = true;
+ 
+ 	/* Trigger a create() on next validate. */
+@@ -349,7 +349,7 @@ static int vmw_cotable_readback(struct vmw_resource *res)
+ 	struct vmw_fence_obj *fence;
+ 
+ 	if (!vcotbl->scrubbed) {
+-		cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++		cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 		if (!cmd)
+ 			return -ENOMEM;
+ 
+@@ -358,7 +358,7 @@ static int vmw_cotable_readback(struct vmw_resource *res)
+ 		cmd->body.cid = vcotbl->ctx->id;
+ 		cmd->body.type = vcotbl->type;
+ 		vcotbl->size_read_back = res->backup_size;
+-		vmw_fifo_commit(dev_priv, sizeof(*cmd));
++		vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	}
+ 
+ 	(void) vmw_execbuf_fence_commands(NULL, dev_priv, &fence, NULL);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 5931e181e289..8c3eb00e8b54 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -423,8 +423,7 @@ static int vmw_request_device_late(struct vmw_private *dev_priv)
+ 	}
+ 
+ 	if (dev_priv->cman) {
+-		ret = vmw_cmdbuf_set_pool_size(dev_priv->cman,
+-					       256*4096, 2*4096);
++		ret = vmw_cmdbuf_set_pool_size(dev_priv->cman, 256*4096);
+ 		if (ret) {
+ 			struct vmw_cmdbuf_man *man = dev_priv->cman;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index f3775617a28c..4d7fece7f75e 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -954,30 +954,29 @@ extern int vmw_fifo_init(struct vmw_private *dev_priv,
+ extern void vmw_fifo_release(struct vmw_private *dev_priv,
+ 			     struct vmw_fifo_state *fifo);
+ extern void *
+-vmw_fifo_reserve_dx(struct vmw_private *dev_priv, uint32_t bytes, int ctx_id);
+-extern void vmw_fifo_commit(struct vmw_private *dev_priv, uint32_t bytes);
+-extern void vmw_fifo_commit_flush(struct vmw_private *dev_priv, uint32_t bytes);
+-extern int vmw_fifo_send_fence(struct vmw_private *dev_priv,
+-			       uint32_t *seqno);
++vmw_cmd_ctx_reserve(struct vmw_private *dev_priv, uint32_t bytes, int ctx_id);
++extern void vmw_cmd_commit(struct vmw_private *dev_priv, uint32_t bytes);
++extern void vmw_cmd_commit_flush(struct vmw_private *dev_priv, uint32_t bytes);
++extern int vmw_cmd_send_fence(struct vmw_private *dev_priv, uint32_t *seqno);
++extern bool vmw_supports_3d(struct vmw_private *dev_priv);
+ extern void vmw_fifo_ping_host(struct vmw_private *dev_priv, uint32_t reason);
+-extern bool vmw_fifo_have_3d(struct vmw_private *dev_priv);
+ extern bool vmw_fifo_have_pitchlock(struct vmw_private *dev_priv);
+-extern int vmw_fifo_emit_dummy_query(struct vmw_private *dev_priv,
+-				     uint32_t cid);
+-extern int vmw_fifo_flush(struct vmw_private *dev_priv,
+-			  bool interruptible);
++extern int vmw_cmd_emit_dummy_query(struct vmw_private *dev_priv,
++				    uint32_t cid);
++extern int vmw_cmd_flush(struct vmw_private *dev_priv,
++			 bool interruptible);
+ 
+-#define VMW_FIFO_RESERVE_DX(__priv, __bytes, __ctx_id)                        \
++#define VMW_CMD_CTX_RESERVE(__priv, __bytes, __ctx_id)                        \
+ ({                                                                            \
+-	vmw_fifo_reserve_dx(__priv, __bytes, __ctx_id) ? : ({                 \
++	vmw_cmd_ctx_reserve(__priv, __bytes, __ctx_id) ? : ({                 \
+ 		DRM_ERROR("FIFO reserve failed at %s for %u bytes\n",         \
+ 			  __func__, (unsigned int) __bytes);                  \
+ 		NULL;                                                         \
+ 	});                                                                   \
+ })
+ 
+-#define VMW_FIFO_RESERVE(__priv, __bytes)                                     \
+-	VMW_FIFO_RESERVE_DX(__priv, __bytes, SVGA3D_INVALID_ID)
++#define VMW_CMD_RESERVE(__priv, __bytes)                                     \
++	VMW_CMD_CTX_RESERVE(__priv, __bytes, SVGA3D_INVALID_ID)
+ 
+ /**
+  * TTM glue - vmwgfx_ttm_glue.c
+@@ -1385,8 +1384,7 @@ struct vmw_cmdbuf_header;
+ 
+ extern struct vmw_cmdbuf_man *
+ vmw_cmdbuf_man_create(struct vmw_private *dev_priv);
+-extern int vmw_cmdbuf_set_pool_size(struct vmw_cmdbuf_man *man,
+-				    size_t size, size_t default_size);
++extern int vmw_cmdbuf_set_pool_size(struct vmw_cmdbuf_man *man, size_t size);
+ extern void vmw_cmdbuf_remove_pool(struct vmw_cmdbuf_man *man);
+ extern void vmw_cmdbuf_man_destroy(struct vmw_cmdbuf_man *man);
+ extern int vmw_cmdbuf_idle(struct vmw_cmdbuf_man *man, bool interruptible,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+index 69cf0973bf28..462f17320708 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -724,7 +724,7 @@ static int vmw_rebind_all_dx_query(struct vmw_resource *ctx_res)
+ 	if (!dx_query_mob || dx_query_mob->dx_query_ctx)
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), ctx_res->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), ctx_res->id);
+ 	if (cmd == NULL)
+ 		return -ENOMEM;
+ 
+@@ -732,7 +732,7 @@ static int vmw_rebind_all_dx_query(struct vmw_resource *ctx_res)
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid = ctx_res->id;
+ 	cmd->body.mobid = dx_query_mob->base.mem.start;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	vmw_context_bind_dx_query(ctx_res, dx_query_mob);
+ 
+@@ -1100,7 +1100,7 @@ static void vmw_query_bo_switch_commit(struct vmw_private *dev_priv,
+ 		BUG_ON(!ctx_entry->valid);
+ 		ctx = ctx_entry->res;
+ 
+-		ret = vmw_fifo_emit_dummy_query(dev_priv, ctx->id);
++		ret = vmw_cmd_emit_dummy_query(dev_priv, ctx->id);
+ 
+ 		if (unlikely(ret != 0))
+ 			VMW_DEBUG_USER("Out of fifo space for dummy query.\n");
+@@ -3762,7 +3762,7 @@ int vmw_execbuf_fence_commands(struct drm_file *file_priv,
+ 	/* p_handle implies file_priv. */
+ 	BUG_ON(p_handle != NULL && file_priv == NULL);
+ 
+-	ret = vmw_fifo_send_fence(dev_priv, &sequence);
++	ret = vmw_cmd_send_fence(dev_priv, &sequence);
+ 	if (unlikely(ret != 0)) {
+ 		VMW_DEBUG_USER("Fence submission error. Syncing.\n");
+ 		synced = true;
+@@ -3876,10 +3876,10 @@ static int vmw_execbuf_submit_fifo(struct vmw_private *dev_priv,
+ 	void *cmd;
+ 
+ 	if (sw_context->dx_ctx_node)
+-		cmd = VMW_FIFO_RESERVE_DX(dev_priv, command_size,
++		cmd = VMW_CMD_CTX_RESERVE(dev_priv, command_size,
+ 					  sw_context->dx_ctx_node->ctx->id);
+ 	else
+-		cmd = VMW_FIFO_RESERVE(dev_priv, command_size);
++		cmd = VMW_CMD_RESERVE(dev_priv, command_size);
+ 
+ 	if (!cmd)
+ 		return -ENOMEM;
+@@ -3888,7 +3888,7 @@ static int vmw_execbuf_submit_fifo(struct vmw_private *dev_priv,
+ 	memcpy(cmd, kernel_commands, command_size);
+ 	vmw_resource_relocations_apply(cmd, &sw_context->res_relocations);
+ 	vmw_resource_relocations_free(&sw_context->res_relocations);
+-	vmw_fifo_commit(dev_priv, command_size);
++	vmw_cmd_commit(dev_priv, command_size);
+ 
+ 	return 0;
+ }
+@@ -4325,7 +4325,7 @@ void __vmw_execbuf_release_pinned_bo(struct vmw_private *dev_priv,
+ 
+ 	if (dev_priv->query_cid_valid) {
+ 		BUG_ON(fence != NULL);
+-		ret = vmw_fifo_emit_dummy_query(dev_priv, dev_priv->query_cid);
++		ret = vmw_cmd_emit_dummy_query(dev_priv, dev_priv->query_cid);
+ 		if (ret)
+ 			goto out_no_emit;
+ 		dev_priv->query_cid_valid = false;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+index f319b8a97f52..33f07abfc3ae 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -258,7 +258,7 @@ static void vmw_fb_dirty_flush(struct work_struct *work)
+ 	if (w && h) {
+ 		WARN_ON_ONCE(par->set_fb->funcs->dirty(cur_fb, NULL, 0, 0,
+ 						       &clip, 1));
+-		vmw_fifo_flush(vmw_priv, false);
++		vmw_cmd_flush(vmw_priv, false);
+ 	}
+ out_unlock:
+ 	mutex_unlock(&par->bo_mutex);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_gmr.c b/drivers/gpu/drm/vmwgfx/vmwgfx_gmr.c
+index 83c0d5a3e4fd..964ddf1ca57a 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_gmr.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_gmr.c
+@@ -51,7 +51,7 @@ static int vmw_gmr2_bind(struct vmw_private *dev_priv,
+ 	uint32_t cmd_size = define_size + remap_size;
+ 	uint32_t i;
+ 
+-	cmd_orig = cmd = VMW_FIFO_RESERVE(dev_priv, cmd_size);
++	cmd_orig = cmd = VMW_CMD_RESERVE(dev_priv, cmd_size);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -98,7 +98,7 @@ static int vmw_gmr2_bind(struct vmw_private *dev_priv,
+ 
+ 	BUG_ON(cmd != cmd_orig + cmd_size / sizeof(*cmd));
+ 
+-	vmw_fifo_commit(dev_priv, cmd_size);
++	vmw_cmd_commit(dev_priv, cmd_size);
+ 
+ 	return 0;
+ }
+@@ -110,7 +110,7 @@ static void vmw_gmr2_unbind(struct vmw_private *dev_priv,
+ 	uint32_t define_size = sizeof(define_cmd) + 4;
+ 	uint32_t *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, define_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, define_size);
+ 	if (unlikely(cmd == NULL))
+ 		return;
+ 
+@@ -120,7 +120,7 @@ static void vmw_gmr2_unbind(struct vmw_private *dev_priv,
+ 	*cmd++ = SVGA_CMD_DEFINE_GMR2;
+ 	memcpy(cmd, &define_cmd, sizeof(define_cmd));
+ 
+-	vmw_fifo_commit(dev_priv, define_size);
++	vmw_cmd_commit(dev_priv, define_size);
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+index c21a841dfc6d..80af8772b8c2 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+@@ -51,7 +51,7 @@ int vmw_getparam_ioctl(struct drm_device *dev, void *data,
+ 		param->value = vmw_overlay_num_free_overlays(dev_priv);
+ 		break;
+ 	case DRM_VMW_PARAM_3D:
+-		param->value = vmw_fifo_have_3d(dev_priv) ? 1 : 0;
++		param->value = vmw_supports_3d(dev_priv) ? 1 : 0;
+ 		break;
+ 	case DRM_VMW_PARAM_HW_CAPS:
+ 		param->value = dev_priv->capabilities;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index bd8f7322f1eb..f2a9188d0b7d 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -36,9 +36,6 @@
+ 
+ #include "vmwgfx_kms.h"
+ 
+-/* Might need a hrtimer here? */
+-#define VMWGFX_PRESENT_RATE ((HZ / 60 > 0) ? HZ / 60 : 1)
+-
+ void vmw_du_cleanup(struct vmw_display_unit *du)
+ {
+ 	drm_plane_cleanup(&du->primary);
+@@ -68,7 +65,7 @@ static int vmw_cursor_update_image(struct vmw_private *dev_priv,
+ 	if (!image)
+ 		return -EINVAL;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, cmd_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, cmd_size);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -83,7 +80,7 @@ static int vmw_cursor_update_image(struct vmw_private *dev_priv,
+ 	cmd->cursor.hotspotX = hotspotX;
+ 	cmd->cursor.hotspotY = hotspotY;
+ 
+-	vmw_fifo_commit_flush(dev_priv, cmd_size);
++	vmw_cmd_commit_flush(dev_priv, cmd_size);
+ 
+ 	return 0;
+ }
+@@ -1032,7 +1029,7 @@ static int vmw_framebuffer_bo_dirty(struct drm_framebuffer *framebuffer,
+ 		break;
+ 	}
+ 
+-	vmw_fifo_flush(dev_priv, false);
++	vmw_cmd_flush(dev_priv, false);
+ 	ttm_read_unlock(&dev_priv->reservation_sem);
+ 
+ 	drm_modeset_unlock_all(&dev_priv->drm);
+@@ -1767,7 +1764,7 @@ int vmw_kms_present(struct vmw_private *dev_priv,
+ 	if (ret)
+ 		return ret;
+ 
+-	vmw_fifo_flush(dev_priv, false);
++	vmw_cmd_flush(dev_priv, false);
+ 
+ 	return 0;
+ }
+@@ -2384,7 +2381,7 @@ int vmw_kms_helper_dirty(struct vmw_private *dev_priv,
+ 
+ 		dirty->unit = unit;
+ 		if (dirty->fifo_reserve_size > 0) {
+-			dirty->cmd = VMW_FIFO_RESERVE(dev_priv,
++			dirty->cmd = VMW_CMD_RESERVE(dev_priv,
+ 						      dirty->fifo_reserve_size);
+ 			if (!dirty->cmd)
+ 				return -ENOMEM;
+@@ -2518,7 +2515,7 @@ int vmw_kms_update_proxy(struct vmw_resource *res,
+ 	if (!clips)
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd) * num_clips);
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd) * num_clips);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -2547,7 +2544,7 @@ int vmw_kms_update_proxy(struct vmw_resource *res,
+ 		copy_size += sizeof(*cmd);
+ 	}
+ 
+-	vmw_fifo_commit(dev_priv, copy_size);
++	vmw_cmd_commit(dev_priv, copy_size);
+ 
+ 	return 0;
+ }
+@@ -2750,7 +2747,7 @@ int vmw_du_helper_plane_update(struct vmw_du_update_plane *update)
+ 		goto out_unref;
+ 
+ 	reserved_size = update->calc_fifo_size(update, num_hits);
+-	cmd_start = VMW_FIFO_RESERVE(update->dev_priv, reserved_size);
++	cmd_start = VMW_CMD_RESERVE(update->dev_priv, reserved_size);
+ 	if (!cmd_start) {
+ 		ret = -ENOMEM;
+ 		goto out_revert;
+@@ -2799,7 +2796,7 @@ int vmw_du_helper_plane_update(struct vmw_du_update_plane *update)
+ 	if (reserved_size < submit_size)
+ 		submit_size = 0;
+ 
+-	vmw_fifo_commit(update->dev_priv, submit_size);
++	vmw_cmd_commit(update->dev_priv, submit_size);
+ 
+ 	vmw_kms_helper_validation_finish(update->dev_priv, NULL, &val_ctx,
+ 					 update->out_fence, NULL);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+index 6586e58240ca..ac806ae78894 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+@@ -554,7 +554,7 @@ int vmw_kms_ldu_do_bo_dirty(struct vmw_private *dev_priv,
+ 	} *cmd;
+ 
+ 	fifo_size = sizeof(*cmd) * num_clips;
+-	cmd = VMW_FIFO_RESERVE(dev_priv, fifo_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, fifo_size);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -567,6 +567,6 @@ int vmw_kms_ldu_do_bo_dirty(struct vmw_private *dev_priv,
+ 		cmd[i].body.height = clips->y2 - clips->y1;
+ 	}
+ 
+-	vmw_fifo_commit(dev_priv, fifo_size);
++	vmw_cmd_commit(dev_priv, fifo_size);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_mob.c b/drivers/gpu/drm/vmwgfx/vmwgfx_mob.c
+index 7f95ed6aa224..a372980fe6a5 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_mob.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_mob.c
+@@ -148,7 +148,7 @@ static int vmw_setup_otable_base(struct vmw_private *dev_priv,
+ 		mob->pt_level += VMW_MOBFMT_PTDEPTH_1 - SVGA3D_MOBFMT_PTDEPTH_1;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		ret = -ENOMEM;
+ 		goto out_no_fifo;
+@@ -170,7 +170,7 @@ static int vmw_setup_otable_base(struct vmw_private *dev_priv,
+ 	 */
+ 	BUG_ON(mob->pt_level == VMW_MOBFMT_PTDEPTH_2);
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	otable->page_table = mob;
+ 
+ 	return 0;
+@@ -203,7 +203,7 @@ static void vmw_takedown_otable_base(struct vmw_private *dev_priv,
+ 		return;
+ 
+ 	bo = otable->page_table->pt_bo;
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return;
+ 
+@@ -215,7 +215,7 @@ static void vmw_takedown_otable_base(struct vmw_private *dev_priv,
+ 	cmd->body.sizeInBytes = 0;
+ 	cmd->body.validSizeInBytes = 0;
+ 	cmd->body.ptDepth = SVGA3D_MOBFMT_INVALID;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	if (bo) {
+ 		int ret;
+@@ -558,12 +558,12 @@ void vmw_mob_unbind(struct vmw_private *dev_priv,
+ 		BUG_ON(ret != 0);
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (cmd) {
+ 		cmd->header.id = SVGA_3D_CMD_DESTROY_GB_MOB;
+ 		cmd->header.size = sizeof(cmd->body);
+ 		cmd->body.mobid = mob->id;
+-		vmw_fifo_commit(dev_priv, sizeof(*cmd));
++		vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	}
+ 
+ 	if (bo) {
+@@ -625,7 +625,7 @@ int vmw_mob_bind(struct vmw_private *dev_priv,
+ 
+ 	vmw_fifo_resource_inc(dev_priv);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		goto out_no_cmd_space;
+ 
+@@ -636,7 +636,7 @@ int vmw_mob_bind(struct vmw_private *dev_priv,
+ 	cmd->body.base = mob->pt_root_page >> PAGE_SHIFT;
+ 	cmd->body.sizeInBytes = num_data_pages * PAGE_SIZE;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+index cd7ed1650d60..d6d282c13b7f 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+@@ -122,7 +122,7 @@ static int vmw_overlay_send_put(struct vmw_private *dev_priv,
+ 
+ 	fifo_size = sizeof(*cmds) + sizeof(*flush) + sizeof(*items) * num_items;
+ 
+-	cmds = VMW_FIFO_RESERVE(dev_priv, fifo_size);
++	cmds = VMW_CMD_RESERVE(dev_priv, fifo_size);
+ 	/* hardware has hung, can't do anything here */
+ 	if (!cmds)
+ 		return -ENOMEM;
+@@ -169,7 +169,7 @@ static int vmw_overlay_send_put(struct vmw_private *dev_priv,
+ 
+ 	fill_flush(flush, arg->stream_id);
+ 
+-	vmw_fifo_commit(dev_priv, fifo_size);
++	vmw_cmd_commit(dev_priv, fifo_size);
+ 
+ 	return 0;
+ }
+@@ -192,7 +192,7 @@ static int vmw_overlay_send_stop(struct vmw_private *dev_priv,
+ 	int ret;
+ 
+ 	for (;;) {
+-		cmds = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmds));
++		cmds = VMW_CMD_RESERVE(dev_priv, sizeof(*cmds));
+ 		if (cmds)
+ 			break;
+ 
+@@ -211,7 +211,7 @@ static int vmw_overlay_send_stop(struct vmw_private *dev_priv,
+ 	cmds->body.items[0].value = false;
+ 	fill_flush(&cmds->flush, stream_id);
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmds));
++	vmw_cmd_commit(dev_priv, sizeof(*cmds));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index f6e8fdfc76e5..d1e7b9608145 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -827,7 +827,7 @@ int vmw_query_readback_all(struct vmw_buffer_object *dx_query_mob)
+ 	dx_query_ctx = dx_query_mob->dx_query_ctx;
+ 	dev_priv     = dx_query_ctx->dev_priv;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), dx_query_ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), dx_query_ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -835,7 +835,7 @@ int vmw_query_readback_all(struct vmw_buffer_object *dx_query_mob)
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.cid    = dx_query_ctx->id;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	/* Triggers a rebind the next time affected context is bound */
+ 	dx_query_mob->dx_query_ctx = NULL;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c b/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+index ff803850ee20..b0db059b8cfb 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+@@ -132,7 +132,7 @@ static int vmw_sou_fifo_create(struct vmw_private *dev_priv,
+ 	BUG_ON(!sou->buffer);
+ 
+ 	fifo_size = sizeof(*cmd);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, fifo_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, fifo_size);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -153,7 +153,7 @@ static int vmw_sou_fifo_create(struct vmw_private *dev_priv,
+ 	vmw_bo_get_guest_ptr(&sou->buffer->base, &cmd->obj.backingStore.ptr);
+ 	cmd->obj.backingStore.pitch = mode->hdisplay * 4;
+ 
+-	vmw_fifo_commit(dev_priv, fifo_size);
++	vmw_cmd_commit(dev_priv, fifo_size);
+ 
+ 	sou->defined = true;
+ 
+@@ -181,7 +181,7 @@ static int vmw_sou_fifo_destroy(struct vmw_private *dev_priv,
+ 		return 0;
+ 
+ 	fifo_size = sizeof(*cmd);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, fifo_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, fifo_size);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -189,7 +189,7 @@ static int vmw_sou_fifo_destroy(struct vmw_private *dev_priv,
+ 	cmd->header.cmdType = SVGA_CMD_DESTROY_SCREEN;
+ 	cmd->body.screenId = sou->base.unit;
+ 
+-	vmw_fifo_commit(dev_priv, fifo_size);
++	vmw_cmd_commit(dev_priv, fifo_size);
+ 
+ 	/* Force sync */
+ 	ret = vmw_fallback_wait(dev_priv, false, true, 0, false, 3*HZ);
+@@ -992,7 +992,7 @@ static int do_bo_define_gmrfb(struct vmw_private *dev_priv,
+ 	if (depth == 32)
+ 		depth = 24;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -1003,7 +1003,7 @@ static int do_bo_define_gmrfb(struct vmw_private *dev_priv,
+ 	cmd->body.bytesPerLine = framebuffer->base.pitches[0];
+ 	/* Buffer is reserved in vram or GMR */
+ 	vmw_bo_get_guest_ptr(&buf->base, &cmd->body.ptr);
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -1029,7 +1029,7 @@ static void vmw_sou_surface_fifo_commit(struct vmw_kms_dirty *dirty)
+ 	int i;
+ 
+ 	if (!dirty->num_hits) {
+-		vmw_fifo_commit(dirty->dev_priv, 0);
++		vmw_cmd_commit(dirty->dev_priv, 0);
+ 		return;
+ 	}
+ 
+@@ -1061,7 +1061,7 @@ static void vmw_sou_surface_fifo_commit(struct vmw_kms_dirty *dirty)
+ 		blit->bottom -= sdirty->top;
+ 	}
+ 
+-	vmw_fifo_commit(dirty->dev_priv, region_size + sizeof(*cmd));
++	vmw_cmd_commit(dirty->dev_priv, region_size + sizeof(*cmd));
+ 
+ 	sdirty->left = sdirty->top = S32_MAX;
+ 	sdirty->right = sdirty->bottom = S32_MIN;
+@@ -1185,11 +1185,11 @@ int vmw_kms_sou_do_surface_dirty(struct vmw_private *dev_priv,
+ static void vmw_sou_bo_fifo_commit(struct vmw_kms_dirty *dirty)
+ {
+ 	if (!dirty->num_hits) {
+-		vmw_fifo_commit(dirty->dev_priv, 0);
++		vmw_cmd_commit(dirty->dev_priv, 0);
+ 		return;
+ 	}
+ 
+-	vmw_fifo_commit(dirty->dev_priv,
++	vmw_cmd_commit(dirty->dev_priv,
+ 			sizeof(struct vmw_kms_sou_bo_blit) *
+ 			dirty->num_hits);
+ }
+@@ -1295,11 +1295,11 @@ int vmw_kms_sou_do_bo_dirty(struct vmw_private *dev_priv,
+ static void vmw_sou_readback_fifo_commit(struct vmw_kms_dirty *dirty)
+ {
+ 	if (!dirty->num_hits) {
+-		vmw_fifo_commit(dirty->dev_priv, 0);
++		vmw_cmd_commit(dirty->dev_priv, 0);
+ 		return;
+ 	}
+ 
+-	vmw_fifo_commit(dirty->dev_priv,
++	vmw_cmd_commit(dirty->dev_priv,
+ 			sizeof(struct vmw_kms_sou_readback_blit) *
+ 			dirty->num_hits);
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+index e76a720f841e..905ae50aaa2a 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+@@ -222,7 +222,7 @@ static int vmw_gb_shader_create(struct vmw_resource *res)
+ 		goto out_no_fifo;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		ret = -ENOMEM;
+ 		goto out_no_fifo;
+@@ -233,7 +233,7 @@ static int vmw_gb_shader_create(struct vmw_resource *res)
+ 	cmd->body.shid = res->id;
+ 	cmd->body.type = shader->type;
+ 	cmd->body.sizeInBytes = shader->size;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	vmw_fifo_resource_inc(dev_priv);
+ 
+ 	return 0;
+@@ -256,7 +256,7 @@ static int vmw_gb_shader_bind(struct vmw_resource *res,
+ 
+ 	BUG_ON(bo->mem.mem_type != VMW_PL_MOB);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -266,7 +266,7 @@ static int vmw_gb_shader_bind(struct vmw_resource *res,
+ 	cmd->body.mobid = bo->mem.start;
+ 	cmd->body.offsetInBytes = res->backup_offset;
+ 	res->backup_dirty = false;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -284,7 +284,7 @@ static int vmw_gb_shader_unbind(struct vmw_resource *res,
+ 
+ 	BUG_ON(res->backup->base.mem.mem_type != VMW_PL_MOB);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -293,7 +293,7 @@ static int vmw_gb_shader_unbind(struct vmw_resource *res,
+ 	cmd->body.shid = res->id;
+ 	cmd->body.mobid = SVGA3D_INVALID_ID;
+ 	cmd->body.offsetInBytes = 0;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	/*
+ 	 * Create a fence object and fence the backup buffer.
+@@ -324,7 +324,7 @@ static int vmw_gb_shader_destroy(struct vmw_resource *res)
+ 	mutex_lock(&dev_priv->binding_mutex);
+ 	vmw_binding_res_list_scrub(&res->binding_head);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		mutex_unlock(&dev_priv->binding_mutex);
+ 		return -ENOMEM;
+@@ -333,7 +333,7 @@ static int vmw_gb_shader_destroy(struct vmw_resource *res)
+ 	cmd->header.id = SVGA_3D_CMD_DESTROY_GB_SHADER;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.shid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	mutex_unlock(&dev_priv->binding_mutex);
+ 	vmw_resource_release_id(res);
+ 	vmw_fifo_resource_dec(dev_priv);
+@@ -394,7 +394,7 @@ static int vmw_dx_shader_unscrub(struct vmw_resource *res)
+ 	if (!list_empty(&shader->cotable_head) || !shader->committed)
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), shader->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), shader->ctx->id);
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -404,7 +404,7 @@ static int vmw_dx_shader_unscrub(struct vmw_resource *res)
+ 	cmd->body.shid = shader->id;
+ 	cmd->body.mobid = res->backup->base.mem.start;
+ 	cmd->body.offsetInBytes = res->backup_offset;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	vmw_cotable_add_resource(shader->cotable, &shader->cotable_head);
+ 
+@@ -481,7 +481,7 @@ static int vmw_dx_shader_scrub(struct vmw_resource *res)
+ 		return 0;
+ 
+ 	WARN_ON_ONCE(!shader->committed);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -491,7 +491,7 @@ static int vmw_dx_shader_scrub(struct vmw_resource *res)
+ 	cmd->body.shid = res->id;
+ 	cmd->body.mobid = SVGA3D_INVALID_ID;
+ 	cmd->body.offsetInBytes = 0;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	res->id = -1;
+ 	list_del_init(&shader->cotable_head);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_so.c b/drivers/gpu/drm/vmwgfx/vmwgfx_so.c
+index 3f97b61dd5d8..7369dd86d3a9 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_so.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_so.c
+@@ -170,7 +170,7 @@ static int vmw_view_create(struct vmw_resource *res)
+ 		return 0;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(res->dev_priv, view->cmd_size, view->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(res->dev_priv, view->cmd_size, view->ctx->id);
+ 	if (!cmd) {
+ 		mutex_unlock(&dev_priv->binding_mutex);
+ 		return -ENOMEM;
+@@ -181,7 +181,7 @@ static int vmw_view_create(struct vmw_resource *res)
+ 	/* Sid may have changed due to surface eviction. */
+ 	WARN_ON(view->srf->id == SVGA3D_INVALID_ID);
+ 	cmd->body.sid = view->srf->id;
+-	vmw_fifo_commit(res->dev_priv, view->cmd_size);
++	vmw_cmd_commit(res->dev_priv, view->cmd_size);
+ 	res->id = view->view_id;
+ 	list_add_tail(&view->srf_head, &srf->view_list);
+ 	vmw_cotable_add_resource(view->cotable, &view->cotable_head);
+@@ -213,14 +213,14 @@ static int vmw_view_destroy(struct vmw_resource *res)
+ 	if (!view->committed || res->id == -1)
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), view->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), view->ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+ 	cmd->header.id = vmw_view_destroy_cmds[view->view_type];
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.view_id = view->view_id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	res->id = -1;
+ 	list_del_init(&view->cotable_head);
+ 	list_del_init(&view->srf_head);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c b/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
+index d0d40da3e4e4..fbe977881364 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
+@@ -170,7 +170,7 @@ static int vmw_stdu_define_st(struct vmw_private *dev_priv,
+ 		SVGA3dCmdDefineGBScreenTarget body;
+ 	} *cmd;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -188,7 +188,7 @@ static int vmw_stdu_define_st(struct vmw_private *dev_priv,
+ 	stdu->base.set_gui_x = cmd->body.xRoot;
+ 	stdu->base.set_gui_y = cmd->body.yRoot;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	stdu->defined = true;
+ 	stdu->display_width  = mode->hdisplay;
+@@ -229,7 +229,7 @@ static int vmw_stdu_bind_st(struct vmw_private *dev_priv,
+ 	memset(&image, 0, sizeof(image));
+ 	image.sid = res ? res->id : SVGA3D_INVALID_ID;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -239,7 +239,7 @@ static int vmw_stdu_bind_st(struct vmw_private *dev_priv,
+ 	cmd->body.stid   = stdu->base.unit;
+ 	cmd->body.image  = image;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -293,7 +293,7 @@ static int vmw_stdu_update_st(struct vmw_private *dev_priv,
+ 		return -EINVAL;
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -301,7 +301,7 @@ static int vmw_stdu_update_st(struct vmw_private *dev_priv,
+ 				 0, stdu->display_width,
+ 				 0, stdu->display_height);
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	return 0;
+ }
+@@ -329,7 +329,7 @@ static int vmw_stdu_destroy_st(struct vmw_private *dev_priv,
+ 	if (unlikely(!stdu->defined))
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL))
+ 		return -ENOMEM;
+ 
+@@ -338,7 +338,7 @@ static int vmw_stdu_destroy_st(struct vmw_private *dev_priv,
+ 
+ 	cmd->body.stid   = stdu->base.unit;
+ 
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	/* Force sync */
+ 	ret = vmw_fallback_wait(dev_priv, false, true, 0, false, 3*HZ);
+@@ -499,7 +499,7 @@ static void vmw_stdu_bo_fifo_commit(struct vmw_kms_dirty *dirty)
+ 	size_t blit_size = sizeof(*blit) * dirty->num_hits + sizeof(*suffix);
+ 
+ 	if (!dirty->num_hits) {
+-		vmw_fifo_commit(dirty->dev_priv, 0);
++		vmw_cmd_commit(dirty->dev_priv, 0);
+ 		return;
+ 	}
+ 
+@@ -522,7 +522,7 @@ static void vmw_stdu_bo_fifo_commit(struct vmw_kms_dirty *dirty)
+ 					 ddirty->top, ddirty->bottom);
+ 	}
+ 
+-	vmw_fifo_commit(dirty->dev_priv, sizeof(*cmd) + blit_size);
++	vmw_cmd_commit(dirty->dev_priv, sizeof(*cmd) + blit_size);
+ 
+ 	stdu->display_srf->res.res_dirty = true;
+ 	ddirty->left = ddirty->top = S32_MAX;
+@@ -628,7 +628,7 @@ static void vmw_stdu_bo_cpu_commit(struct vmw_kms_dirty *dirty)
+ 
+ 
+ 		dev_priv = vmw_priv(stdu->base.crtc.dev);
+-		cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++		cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 		if (!cmd)
+ 			goto out_cleanup;
+ 
+@@ -636,7 +636,7 @@ static void vmw_stdu_bo_cpu_commit(struct vmw_kms_dirty *dirty)
+ 					 region.x1, region.x2,
+ 					 region.y1, region.y2);
+ 
+-		vmw_fifo_commit(dev_priv, sizeof(*cmd));
++		vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	}
+ 
+ out_cleanup:
+@@ -795,7 +795,7 @@ static void vmw_kms_stdu_surface_fifo_commit(struct vmw_kms_dirty *dirty)
+ 	size_t commit_size;
+ 
+ 	if (!dirty->num_hits) {
+-		vmw_fifo_commit(dirty->dev_priv, 0);
++		vmw_cmd_commit(dirty->dev_priv, 0);
+ 		return;
+ 	}
+ 
+@@ -817,7 +817,7 @@ static void vmw_kms_stdu_surface_fifo_commit(struct vmw_kms_dirty *dirty)
+ 	vmw_stdu_populate_update(update, stdu->base.unit, sdirty->left,
+ 				 sdirty->right, sdirty->top, sdirty->bottom);
+ 
+-	vmw_fifo_commit(dirty->dev_priv, commit_size);
++	vmw_cmd_commit(dirty->dev_priv, commit_size);
+ 
+ 	sdirty->left = sdirty->top = S32_MAX;
+ 	sdirty->right = sdirty->bottom = S32_MIN;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_streamoutput.c b/drivers/gpu/drm/vmwgfx/vmwgfx_streamoutput.c
+index 193192456663..1dd042a20a66 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_streamoutput.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_streamoutput.c
+@@ -99,7 +99,7 @@ static int vmw_dx_streamoutput_unscrub(struct vmw_resource *res)
+ 	if (!list_empty(&so->cotable_head) || !so->committed )
+ 		return 0;
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), so->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), so->ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -109,7 +109,7 @@ static int vmw_dx_streamoutput_unscrub(struct vmw_resource *res)
+ 	cmd->body.mobid = res->backup->base.mem.start;
+ 	cmd->body.offsetInBytes = res->backup_offset;
+ 	cmd->body.sizeInBytes = so->size;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	vmw_cotable_add_resource(so->cotable, &so->cotable_head);
+ 
+@@ -172,7 +172,7 @@ static int vmw_dx_streamoutput_scrub(struct vmw_resource *res)
+ 
+ 	WARN_ON_ONCE(!so->committed);
+ 
+-	cmd = VMW_FIFO_RESERVE_DX(dev_priv, sizeof(*cmd), so->ctx->id);
++	cmd = VMW_CMD_CTX_RESERVE(dev_priv, sizeof(*cmd), so->ctx->id);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -182,7 +182,7 @@ static int vmw_dx_streamoutput_scrub(struct vmw_resource *res)
+ 	cmd->body.mobid = SVGA3D_INVALID_ID;
+ 	cmd->body.offsetInBytes = 0;
+ 	cmd->body.sizeInBytes = so->size;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 
+ 	res->id = -1;
+ 	list_del_init(&so->cotable_head);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index fa9be30bec6c..f6cab77075a0 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -372,12 +372,12 @@ static void vmw_hw_surface_destroy(struct vmw_resource *res)
+ 
+ 	if (res->id != -1) {
+ 
+-		cmd = VMW_FIFO_RESERVE(dev_priv, vmw_surface_destroy_size());
++		cmd = VMW_CMD_RESERVE(dev_priv, vmw_surface_destroy_size());
+ 		if (unlikely(!cmd))
+ 			return;
+ 
+ 		vmw_surface_destroy_encode(res->id, cmd);
+-		vmw_fifo_commit(dev_priv, vmw_surface_destroy_size());
++		vmw_cmd_commit(dev_priv, vmw_surface_destroy_size());
+ 
+ 		/*
+ 		 * used_memory_size_atomic, or separate lock
+@@ -440,14 +440,14 @@ static int vmw_legacy_srf_create(struct vmw_resource *res)
+ 	 */
+ 
+ 	submit_size = vmw_surface_define_size(srf);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(!cmd)) {
+ 		ret = -ENOMEM;
+ 		goto out_no_fifo;
+ 	}
+ 
+ 	vmw_surface_define_encode(srf, cmd);
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 	vmw_fifo_resource_inc(dev_priv);
+ 
+ 	/*
+@@ -492,14 +492,14 @@ static int vmw_legacy_srf_dma(struct vmw_resource *res,
+ 
+ 	BUG_ON(!val_buf->bo);
+ 	submit_size = vmw_surface_dma_size(srf);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(!cmd))
+ 		return -ENOMEM;
+ 
+ 	vmw_bo_get_guest_ptr(val_buf->bo, &ptr);
+ 	vmw_surface_dma_encode(srf, cmd, &ptr, bind);
+ 
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 
+ 	/*
+ 	 * Create a fence object and fence the backup buffer.
+@@ -578,12 +578,12 @@ static int vmw_legacy_srf_destroy(struct vmw_resource *res)
+ 	 */
+ 
+ 	submit_size = vmw_surface_destroy_size();
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(!cmd))
+ 		return -ENOMEM;
+ 
+ 	vmw_surface_destroy_encode(res->id, cmd);
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 
+ 	/*
+ 	 * Surface memory usage accounting.
+@@ -1121,7 +1121,7 @@ static int vmw_gb_surface_create(struct vmw_resource *res)
+ 		submit_len = sizeof(*cmd);
+ 	}
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_len);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_len);
+ 	cmd2 = (typeof(cmd2))cmd;
+ 	cmd3 = (typeof(cmd3))cmd;
+ 	cmd4 = (typeof(cmd4))cmd;
+@@ -1188,7 +1188,7 @@ static int vmw_gb_surface_create(struct vmw_resource *res)
+ 		cmd->body.size.depth = metadata->base_size.depth;
+ 	}
+ 
+-	vmw_fifo_commit(dev_priv, submit_len);
++	vmw_cmd_commit(dev_priv, submit_len);
+ 
+ 	return 0;
+ 
+@@ -1219,7 +1219,7 @@ static int vmw_gb_surface_bind(struct vmw_resource *res,
+ 
+ 	submit_size = sizeof(*cmd1) + (res->backup_dirty ? sizeof(*cmd2) : 0);
+ 
+-	cmd1 = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd1 = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(!cmd1))
+ 		return -ENOMEM;
+ 
+@@ -1233,7 +1233,7 @@ static int vmw_gb_surface_bind(struct vmw_resource *res,
+ 		cmd2->header.size = sizeof(cmd2->body);
+ 		cmd2->body.sid = res->id;
+ 	}
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 
+ 	if (res->backup->dirty && res->backup_dirty) {
+ 		/* We've just made a full upload. Cear dirty regions. */
+@@ -1272,7 +1272,7 @@ static int vmw_gb_surface_unbind(struct vmw_resource *res,
+ 	BUG_ON(bo->mem.mem_type != VMW_PL_MOB);
+ 
+ 	submit_size = sizeof(*cmd3) + (readback ? sizeof(*cmd1) : sizeof(*cmd2));
+-	cmd = VMW_FIFO_RESERVE(dev_priv, submit_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, submit_size);
+ 	if (unlikely(!cmd))
+ 		return -ENOMEM;
+ 
+@@ -1295,7 +1295,7 @@ static int vmw_gb_surface_unbind(struct vmw_resource *res,
+ 	cmd3->body.sid = res->id;
+ 	cmd3->body.mobid = SVGA3D_INVALID_ID;
+ 
+-	vmw_fifo_commit(dev_priv, submit_size);
++	vmw_cmd_commit(dev_priv, submit_size);
+ 
+ 	/*
+ 	 * Create a fence object and fence the backup buffer.
+@@ -1328,7 +1328,7 @@ static int vmw_gb_surface_destroy(struct vmw_resource *res)
+ 	vmw_view_surface_list_destroy(dev_priv, &srf->view_list);
+ 	vmw_binding_res_list_scrub(&res->binding_head);
+ 
+-	cmd = VMW_FIFO_RESERVE(dev_priv, sizeof(*cmd));
++	cmd = VMW_CMD_RESERVE(dev_priv, sizeof(*cmd));
+ 	if (unlikely(!cmd)) {
+ 		mutex_unlock(&dev_priv->binding_mutex);
+ 		return -ENOMEM;
+@@ -1337,7 +1337,7 @@ static int vmw_gb_surface_destroy(struct vmw_resource *res)
+ 	cmd->header.id = SVGA_3D_CMD_DESTROY_GB_SURFACE;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.sid = res->id;
+-	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++	vmw_cmd_commit(dev_priv, sizeof(*cmd));
+ 	mutex_unlock(&dev_priv->binding_mutex);
+ 	vmw_resource_release_id(res);
+ 	vmw_fifo_resource_dec(dev_priv);
+@@ -1895,7 +1895,7 @@ static int vmw_surface_dirty_sync(struct vmw_resource *res)
+ 		goto out;
+ 
+ 	alloc_size = num_dirty * ((has_dx) ? sizeof(*cmd1) : sizeof(*cmd2));
+-	cmd = VMW_FIFO_RESERVE(dev_priv, alloc_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, alloc_size);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -1931,7 +1931,7 @@ static int vmw_surface_dirty_sync(struct vmw_resource *res)
+ 		}
+ 
+ 	}
+-	vmw_fifo_commit(dev_priv, alloc_size);
++	vmw_cmd_commit(dev_priv, alloc_size);
+  out:
+ 	memset(&dirty->boxes[0], 0, sizeof(dirty->boxes[0]) *
+ 	       dirty->num_subres);
+@@ -2031,14 +2031,14 @@ static int vmw_surface_clean(struct vmw_resource *res)
+ 	} *cmd;
+ 
+ 	alloc_size = sizeof(*cmd);
+-	cmd = VMW_FIFO_RESERVE(dev_priv, alloc_size);
++	cmd = VMW_CMD_RESERVE(dev_priv, alloc_size);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+ 	cmd->header.id = SVGA_3D_CMD_READBACK_GB_SURFACE;
+ 	cmd->header.size = sizeof(cmd->body);
+ 	cmd->body.sid = res->id;
+-	vmw_fifo_commit(dev_priv, alloc_size);
++	vmw_cmd_commit(dev_priv, alloc_size);
+ 
+ 	return 0;
+ }
+-- 
+2.17.1
+

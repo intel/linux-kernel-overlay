@@ -1,0 +1,228 @@
+From 7f6654f91a710e1f9a87e78fdd283f7afa888f54 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 23 Oct 2020 09:51:06 -0700
+Subject: [PATCH 1104/1714] drm/msm/gem: Add some _locked() helpers
+
+When we cut-over to using dma_resv_lock/etc instead of msm_obj->lock,
+we'll need these for the submit path (where resv->lock is already held).
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Reviewed-by: Kristian H. Kristensen <hoegsberg@google.com>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_gem.c | 89 +++++++++++++++++++++++++++--------
+ drivers/gpu/drm/msm/msm_gem.h |  6 +++
+ 2 files changed, 75 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index 49b38d1c6fbb..673c71dc4686 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -434,18 +434,14 @@ static int msm_gem_pin_iova(struct drm_gem_object *obj,
+ 			msm_obj->sgt, obj->size >> PAGE_SHIFT);
+ }
+ 
+-/*
+- * get iova and pin it. Should have a matching put
+- * limits iova to specified range (in pages)
+- */
+-int msm_gem_get_and_pin_iova_range(struct drm_gem_object *obj,
++static int get_and_pin_iova_range_locked(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace, uint64_t *iova,
+ 		u64 range_start, u64 range_end)
+ {
+ 	u64 local;
+ 	int ret;
+ 
+-	msm_gem_lock(obj);
++	WARN_ON(!msm_gem_is_locked(obj));
+ 
+ 	ret = get_iova_locked(obj, aspace, &local,
+ 		range_start, range_end);
+@@ -456,10 +452,32 @@ int msm_gem_get_and_pin_iova_range(struct drm_gem_object *obj,
+ 	if (!ret)
+ 		*iova = local;
+ 
++	return ret;
++}
++
++/*
++ * get iova and pin it. Should have a matching put
++ * limits iova to specified range (in pages)
++ */
++int msm_gem_get_and_pin_iova_range(struct drm_gem_object *obj,
++		struct msm_gem_address_space *aspace, uint64_t *iova,
++		u64 range_start, u64 range_end)
++{
++	int ret;
++
++	msm_gem_lock(obj);
++	ret = get_and_pin_iova_range_locked(obj, aspace, iova, range_start, range_end);
+ 	msm_gem_unlock(obj);
++
+ 	return ret;
+ }
+ 
++int msm_gem_get_and_pin_iova_locked(struct drm_gem_object *obj,
++		struct msm_gem_address_space *aspace, uint64_t *iova)
++{
++	return get_and_pin_iova_range_locked(obj, aspace, iova, 0, U64_MAX);
++}
++
+ /* get iova and pin it. Should have a matching put */
+ int msm_gem_get_and_pin_iova(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace, uint64_t *iova)
+@@ -500,21 +518,31 @@ uint64_t msm_gem_iova(struct drm_gem_object *obj,
+ }
+ 
+ /*
+- * Unpin a iova by updating the reference counts. The memory isn't actually
+- * purged until something else (shrinker, mm_notifier, destroy, etc) decides
+- * to get rid of it
++ * Locked variant of msm_gem_unpin_iova()
+  */
+-void msm_gem_unpin_iova(struct drm_gem_object *obj,
++void msm_gem_unpin_iova_locked(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace)
+ {
+ 	struct msm_gem_vma *vma;
+ 
+-	msm_gem_lock(obj);
++	WARN_ON(!msm_gem_is_locked(obj));
++
+ 	vma = lookup_vma(obj, aspace);
+ 
+ 	if (!WARN_ON(!vma))
+ 		msm_gem_unmap_vma(aspace, vma);
++}
+ 
++/*
++ * Unpin a iova by updating the reference counts. The memory isn't actually
++ * purged until something else (shrinker, mm_notifier, destroy, etc) decides
++ * to get rid of it
++ */
++void msm_gem_unpin_iova(struct drm_gem_object *obj,
++		struct msm_gem_address_space *aspace)
++{
++	msm_gem_lock(obj);
++	msm_gem_unpin_iova_locked(obj, aspace);
+ 	msm_gem_unlock(obj);
+ }
+ 
+@@ -553,15 +581,14 @@ static void *get_vaddr(struct drm_gem_object *obj, unsigned madv)
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+ 	int ret = 0;
+ 
++	WARN_ON(!msm_gem_is_locked(obj));
++
+ 	if (obj->import_attach)
+ 		return ERR_PTR(-ENODEV);
+ 
+-	msm_gem_lock(obj);
+-
+ 	if (WARN_ON(msm_obj->madv > madv)) {
+ 		DRM_DEV_ERROR(obj->dev->dev, "Invalid madv state: %u vs %u\n",
+ 			msm_obj->madv, madv);
+-		msm_gem_unlock(obj);
+ 		return ERR_PTR(-EBUSY);
+ 	}
+ 
+@@ -587,20 +614,29 @@ static void *get_vaddr(struct drm_gem_object *obj, unsigned madv)
+ 		}
+ 	}
+ 
+-	msm_gem_unlock(obj);
+ 	return msm_obj->vaddr;
+ 
+ fail:
+ 	msm_obj->vmap_count--;
+-	msm_gem_unlock(obj);
+ 	return ERR_PTR(ret);
+ }
+ 
+-void *msm_gem_get_vaddr(struct drm_gem_object *obj)
++void *msm_gem_get_vaddr_locked(struct drm_gem_object *obj)
+ {
+ 	return get_vaddr(obj, MSM_MADV_WILLNEED);
+ }
+ 
++void *msm_gem_get_vaddr(struct drm_gem_object *obj)
++{
++	void *ret;
++
++	msm_gem_lock(obj);
++	ret = msm_gem_get_vaddr_locked(obj);
++	msm_gem_unlock(obj);
++
++	return ret;
++}
++
+ /*
+  * Don't use this!  It is for the very special case of dumping
+  * submits from GPU hangs or faults, were the bo may already
+@@ -609,16 +645,29 @@ void *msm_gem_get_vaddr(struct drm_gem_object *obj)
+  */
+ void *msm_gem_get_vaddr_active(struct drm_gem_object *obj)
+ {
+-	return get_vaddr(obj, __MSM_MADV_PURGED);
++	void *ret;
++
++	msm_gem_lock(obj);
++	ret = get_vaddr(obj, __MSM_MADV_PURGED);
++	msm_gem_unlock(obj);
++
++	return ret;
+ }
+ 
+-void msm_gem_put_vaddr(struct drm_gem_object *obj)
++void msm_gem_put_vaddr_locked(struct drm_gem_object *obj)
+ {
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+ 
+-	msm_gem_lock(obj);
++	WARN_ON(!msm_gem_is_locked(obj));
+ 	WARN_ON(msm_obj->vmap_count < 1);
++
+ 	msm_obj->vmap_count--;
++}
++
++void msm_gem_put_vaddr(struct drm_gem_object *obj)
++{
++	msm_gem_lock(obj);
++	msm_gem_put_vaddr_locked(obj);
+ 	msm_gem_unlock(obj);
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index 93125deaa4e0..dacbcff978b4 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -102,10 +102,14 @@ int msm_gem_get_iova(struct drm_gem_object *obj,
+ int msm_gem_get_and_pin_iova_range(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace, uint64_t *iova,
+ 		u64 range_start, u64 range_end);
++int msm_gem_get_and_pin_iova_locked(struct drm_gem_object *obj,
++		struct msm_gem_address_space *aspace, uint64_t *iova);
+ int msm_gem_get_and_pin_iova(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace, uint64_t *iova);
+ uint64_t msm_gem_iova(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace);
++void msm_gem_unpin_iova_locked(struct drm_gem_object *obj,
++		struct msm_gem_address_space *aspace);
+ void msm_gem_unpin_iova(struct drm_gem_object *obj,
+ 		struct msm_gem_address_space *aspace);
+ struct page **msm_gem_get_pages(struct drm_gem_object *obj);
+@@ -114,8 +118,10 @@ int msm_gem_dumb_create(struct drm_file *file, struct drm_device *dev,
+ 		struct drm_mode_create_dumb *args);
+ int msm_gem_dumb_map_offset(struct drm_file *file, struct drm_device *dev,
+ 		uint32_t handle, uint64_t *offset);
++void *msm_gem_get_vaddr_locked(struct drm_gem_object *obj);
+ void *msm_gem_get_vaddr(struct drm_gem_object *obj);
+ void *msm_gem_get_vaddr_active(struct drm_gem_object *obj);
++void msm_gem_put_vaddr_locked(struct drm_gem_object *obj);
+ void msm_gem_put_vaddr(struct drm_gem_object *obj);
+ int msm_gem_madvise(struct drm_gem_object *obj, unsigned madv);
+ int msm_gem_sync_object(struct drm_gem_object *obj,
+-- 
+2.25.1
+

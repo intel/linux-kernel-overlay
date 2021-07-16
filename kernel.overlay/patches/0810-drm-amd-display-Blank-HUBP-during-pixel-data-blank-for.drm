@@ -1,0 +1,167 @@
+From 4c3f48bb8e5d0050351eab05bea6d25d08e6b5f9 Mon Sep 17 00:00:00 2001
+From: Joshua Aberback <joshua.aberback@amd.com>
+Date: Sun, 18 Oct 2020 17:36:00 -0400
+Subject: [PATCH 0810/1714] drm/amd/display: Blank HUBP during pixel data blank
+ for DCN30
+
+[Why]
+There are some timings for which we support p-state
+switching in active, but not in blank. There was a
+previous issue where a timing that had active-only
+support would hang a p-state request when we were in
+an extended blanking period. The workaround for that
+issue was to block active-only p-state switching,
+but that resulted in a lack of p-state support for
+some common timings such as 1440p60. We want to fix
+that issue properly by un-blocking p-state requests
+while the display is blanked, so that we can re-enable
+active-only p-state switching.
+
+[How]
+ - new version of blank_pixel_data for DCN30
+ - call hubp->set_blank from dcn30_blank_pixel_data
+ - blank every hubp in the mpcc tree, and odm tree
+ - on blank enable, wait until the next frame before blanking HUBP
+
+Signed-off-by: Joshua Aberback <joshua.aberback@amd.com>
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/display/dc/dcn30/dcn30_hwseq.c    | 83 +++++++++++++++++++
+ .../drm/amd/display/dc/dcn30/dcn30_hwseq.h    |  2 +
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_init.c |  2 +-
+ .../dc/dml/dcn30/display_mode_vba_30.c        |  2 +-
+ 4 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+index cc2eca8c9a62..7195257f8922 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+@@ -809,3 +809,86 @@ void dcn30_hardware_release(struct dc *dc)
+ 		dc->res_pool->hubbub->funcs->force_pstate_change_control(
+ 				dc->res_pool->hubbub, true, true);
+ }
++
++void dcn30_blank_pixel_data(struct dc *dc, struct pipe_ctx *pipe_ctx, bool blank)
++{
++	struct tg_color black_color = {0};
++	struct stream_resource *stream_res = &pipe_ctx->stream_res;
++	struct dc_stream_state *stream = pipe_ctx->stream;
++	enum dc_color_space color_space = stream->output_color_space;
++	enum controller_dp_test_pattern test_pattern = CONTROLLER_DP_TEST_PATTERN_SOLID_COLOR;
++	enum controller_dp_color_space test_pattern_color_space = CONTROLLER_DP_COLOR_SPACE_UDEFINED;
++	struct pipe_ctx *odm_pipe;
++	struct pipe_ctx *mpcc_pipe;
++	int odm_cnt = 1;
++
++	int width = stream->timing.h_addressable + stream->timing.h_border_left + stream->timing.h_border_right;
++	int height = stream->timing.v_addressable + stream->timing.v_border_bottom + stream->timing.v_border_top;
++
++	if (stream->link->test_pattern_enabled)
++		return;
++
++	/* get opp dpg blank color */
++	color_space_to_black_color(dc, color_space, &black_color);
++
++	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe)
++		odm_cnt++;
++
++	width = width / odm_cnt;
++
++	if (blank) {
++		dc->hwss.set_abm_immediate_disable(pipe_ctx);
++
++		if (dc->debug.visual_confirm != VISUAL_CONFIRM_DISABLE) {
++			test_pattern = CONTROLLER_DP_TEST_PATTERN_COLORSQUARES;
++			test_pattern_color_space = CONTROLLER_DP_COLOR_SPACE_RGB;
++		}
++	} else {
++		test_pattern = CONTROLLER_DP_TEST_PATTERN_VIDEOMODE;
++	}
++
++	stream_res->opp->funcs->opp_set_disp_pattern_generator(
++			stream_res->opp,
++			test_pattern,
++			test_pattern_color_space,
++			stream->timing.display_color_depth,
++			&black_color,
++			width,
++			height,
++			0);
++
++	/* wait for the next frame when enabling DPG */
++	if (blank && stream_res->tg->funcs->is_tg_enabled(stream_res->tg))
++		dc->hwseq->funcs.wait_for_blank_complete(pipe_ctx->stream_res.opp);
++
++	/* Blank HUBP to allow p-state during blank on all timings */
++	pipe_ctx->plane_res.hubp->funcs->set_blank(pipe_ctx->plane_res.hubp, blank);
++	for (mpcc_pipe = pipe_ctx->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
++		mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, blank);
++
++	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
++		odm_pipe->stream_res.opp->funcs->opp_set_disp_pattern_generator(
++				odm_pipe->stream_res.opp,
++				dc->debug.visual_confirm != VISUAL_CONFIRM_DISABLE && blank ?
++						CONTROLLER_DP_TEST_PATTERN_COLORRAMP : test_pattern,
++				test_pattern_color_space,
++				stream->timing.display_color_depth,
++				&black_color,
++				width,
++				height,
++				0);
++
++		if (blank && stream_res->tg->funcs->is_tg_enabled(stream_res->tg))
++			dc->hwseq->funcs.wait_for_blank_complete(pipe_ctx->stream_res.opp);
++
++		odm_pipe->plane_res.hubp->funcs->set_blank(odm_pipe->plane_res.hubp, blank);
++		for (mpcc_pipe = odm_pipe->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
++			mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, blank);
++	}
++
++	if (!blank)
++		if (stream_res->abm) {
++			dc->hwss.set_pipe(pipe_ctx);
++			stream_res->abm->funcs->set_abm_level(stream_res->abm, stream->abm_level);
++		}
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+index 0ae047221afe..7d9db7cdd2f7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+@@ -69,4 +69,6 @@ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable);
+ 
+ void dcn30_hardware_release(struct dc *dc);
+ 
++void dcn30_blank_pixel_data(struct dc *dc, struct pipe_ctx *pipe_ctx, bool blank);
++
+ #endif /* __DC_HWSS_DCN30_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+index b829cb116916..4d1b756f5cbf 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+@@ -106,7 +106,7 @@ static const struct hwseq_private_funcs dcn30_private_funcs = {
+ 	.set_output_transfer_func = dcn30_set_output_transfer_func,
+ 	.power_down = dce110_power_down,
+ 	.enable_display_power_gating = dcn10_dummy_display_power_gating,
+-	.blank_pixel_data = dcn20_blank_pixel_data,
++	.blank_pixel_data = dcn30_blank_pixel_data,
+ 	.reset_hw_ctx_wrap = dcn20_reset_hw_ctx_wrap,
+ 	.enable_stream_timing = dcn20_enable_stream_timing,
+ 	.edp_backlight_control = dce110_edp_backlight_control,
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c b/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
+index 0f668699809d..3f83bcb18655 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
+@@ -5558,7 +5558,7 @@ static void CalculateWatermarksAndDRAMSpeedChangeSupport(
+ 		}
+ 	}
+ 
+-	if (mode_lib->vba.MinActiveDRAMClockChangeMargin > 0 && PrefetchMode == 0) {
++	if (mode_lib->vba.MinActiveDRAMClockChangeMargin > 0) {
+ 		*DRAMClockChangeSupport = dm_dram_clock_change_vactive;
+ 	} else if (((mode_lib->vba.SynchronizedVBlank == true || mode_lib->vba.TotalNumberOfActiveOTG == 1 || SecondMinActiveDRAMClockChangeMarginOneDisplayInVBLank > 0) && PrefetchMode == 0)) {
+ 		*DRAMClockChangeSupport = dm_dram_clock_change_vblank;
+-- 
+2.25.1
+

@@ -1,0 +1,61 @@
+From aaa78d591bd17f4190613abfb24fb237efb62c27 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 23 Oct 2020 09:51:09 -0700
+Subject: [PATCH 1107/1714] drm/msm: Do rpm get sooner in the submit path
+
+Unfortunately, due to an dev_pm_opp locking interaction with
+mm->mmap_sem, we need to do pm get before aquiring obj locks,
+otherwise we can have anger lockdep with the chain:
+
+  opp_table_lock --> &mm->mmap_sem --> reservation_ww_class_mutex
+
+For an explicit fencing userspace, the impact should be minimal
+as we do all the fence waits before this point.  It could result
+in some needless resumes in error cases, etc.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Reviewed-by: Kristian H. Kristensen <hoegsberg@google.com>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_gem_submit.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b6c258c89290..aa3c7af54079 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -750,11 +750,20 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ 	ret = submit_lookup_objects(submit, args, file);
+ 	if (ret)
+-		goto out;
++		goto out_pre_pm;
+ 
+ 	ret = submit_lookup_cmds(submit, args, file);
+ 	if (ret)
+-		goto out;
++		goto out_pre_pm;
++
++	/*
++	 * Thanks to dev_pm_opp opp_table_lock interactions with mm->mmap_sem
++	 * in the resume path, we need to to rpm get before we lock objs.
++	 * Which unfortunately might involve powering up the GPU sooner than
++	 * is necessary.  But at least in the explicit fencing case, we will
++	 * have already done all the fence waiting.
++	 */
++	pm_runtime_get_sync(&gpu->pdev->dev);
+ 
+ 	/* copy_*_user while holding a ww ticket upsets lockdep */
+ 	ww_acquire_init(&submit->ticket, &reservation_ww_class);
+@@ -831,6 +840,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ 
+ out:
++	pm_runtime_put(&gpu->pdev->dev);
++out_pre_pm:
+ 	submit_cleanup(submit);
+ 	if (has_ww_ticket)
+ 		ww_acquire_fini(&submit->ticket);
+-- 
+2.25.1
+

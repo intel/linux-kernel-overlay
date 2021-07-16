@@ -1,0 +1,150 @@
+From bc4e007f781da4b310ee49e5b15abcffe0a0e673 Mon Sep 17 00:00:00 2001
+From: Voon Weifeng <weifeng.voon@intel.com>
+Date: Tue, 8 Jun 2021 11:51:56 +0800
+Subject: [PATCH 10/30] net: stmmac: split xPCS setup from mdio register
+
+This patch is a preparation patch for the enabling of Intel mGbE 2.5Gbps
+link speed. The Intel mGbR link speed configuration (1G/2.5G) is depends on
+a mdio ADHOC register which can be configured in the bios menu.
+As PHY interface might be different for 1G and 2.5G, the mdio bus need be
+ready to check the link speed and select the PHY interface before probing
+the xPCS.
+
+Signed-off-by: Voon Weifeng <weifeng.voon@intel.com>
+Signed-off-by: Michael Sit Wei Hong <michael.wei.hong.sit@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  1 +
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c |  9 +++
+ .../net/ethernet/stmicro/stmmac/stmmac_mdio.c | 64 ++++++++++---------
+ 3 files changed, 45 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index 1eda88408c7f1..30cbf31e5c102 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -311,6 +311,7 @@ enum stmmac_state {
+ int stmmac_mdio_unregister(struct net_device *ndev);
+ int stmmac_mdio_register(struct net_device *ndev);
+ int stmmac_mdio_reset(struct mii_bus *mii);
++int stmmac_xpcs_setup(struct mii_bus *mii);
+ void stmmac_set_ethtool_ops(struct net_device *netdev);
+ 
+ void stmmac_ptp_register(struct stmmac_priv *priv);
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 1c6abfb22c49d..ce51f94ac7ec2 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -7062,6 +7062,14 @@ int stmmac_dvr_probe(struct device *device,
+ 		}
+ 	}
+ 
++	if (priv->plat->mdio_bus_data) {
++		if (priv->plat->mdio_bus_data->has_xpcs) {
++			ret = stmmac_xpcs_setup(priv->mii);
++			if (ret)
++				goto error_xpcs_setup;
++		}
++	}
++
+ 	ret = stmmac_phy_setup(priv);
+ 	if (ret) {
+ 		netdev_err(ndev, "failed to setup phy (%d)\n", ret);
+@@ -7098,6 +7106,7 @@ int stmmac_dvr_probe(struct device *device,
+ 	unregister_netdev(ndev);
+ error_netdev_register:
+ 	phylink_destroy(priv->phylink);
++error_xpcs_setup:
+ error_phy_setup:
+ 	if (priv->hw->pcs != STMMAC_PCS_TBI &&
+ 	    priv->hw->pcs != STMMAC_PCS_RTBI)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+index 6312a152c8ad9..bc900e240da26 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+@@ -397,6 +397,41 @@ int stmmac_mdio_reset(struct mii_bus *bus)
+ 	return 0;
+ }
+ 
++int stmmac_xpcs_setup(struct mii_bus *bus)
++{
++	int mode, addr;
++	struct net_device *ndev = bus->priv;
++	struct mdio_xpcs_args *xpcs;
++	struct stmmac_priv *priv;
++	struct mdio_device *mdiodev;
++
++	priv = netdev_priv(ndev);
++	mode = priv->plat->phy_interface;
++
++	/* Try to probe the XPCS by scanning all addresses. */
++	for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
++		mdiodev = mdio_device_create(bus, addr);
++		if (IS_ERR(mdiodev))
++			continue;
++
++		xpcs = xpcs_create(mdiodev, mode);
++		if (IS_ERR_OR_NULL(xpcs)) {
++			mdio_device_free(mdiodev);
++			continue;
++		}
++
++		priv->hw->xpcs = xpcs;
++		break;
++	}
++
++	if (!priv->hw->xpcs) {
++		dev_warn(priv->device, "No xPCS found\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
+ /**
+  * stmmac_mdio_register
+  * @ndev: net device structure
+@@ -501,40 +536,11 @@ int stmmac_mdio_register(struct net_device *ndev)
+ 		goto no_phy_found;
+ 	}
+ 
+-	/* Try to probe the XPCS by scanning all addresses. */
+-	if (mdio_bus_data->has_xpcs) {
+-		int mode = priv->plat->phy_interface;
+-		struct mdio_device *mdiodev;
+-		struct mdio_xpcs_args *xpcs;
+-
+-		for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
+-			mdiodev = mdio_device_create(new_bus, addr);
+-			if (IS_ERR(mdiodev))
+-				continue;
+-
+-			xpcs = xpcs_create(mdiodev, mode);
+-			if (IS_ERR_OR_NULL(xpcs)) {
+-				mdio_device_free(mdiodev);
+-				continue;
+-			}
+-
+-			priv->hw->xpcs = xpcs;
+-			break;
+-		}
+-
+-		if (!priv->hw->xpcs) {
+-			dev_warn(dev, "No XPCS found\n");
+-			err = -ENODEV;
+-			goto no_xpcs_found;
+-		}
+-	}
+-
+ bus_register_done:
+ 	priv->mii = new_bus;
+ 
+ 	return 0;
+ 
+-no_xpcs_found:
+ no_phy_found:
+ 	mdiobus_unregister(new_bus);
+ bus_register_fail:
+-- 
+2.25.1
+

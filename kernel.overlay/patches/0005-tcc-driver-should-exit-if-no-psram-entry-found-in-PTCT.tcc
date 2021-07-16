@@ -1,4 +1,4 @@
-From ec324516795f629750921ac3fc8b5366dedd9a5a Mon Sep 17 00:00:00 2001
+From c647633d9cc1ac716bddba38005f77f86e7e92f9 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 15 Jun 2020 09:55:13 +0800
 Subject: [PATCH 5/9] tcc: driver should exit if no psram entry found in PTCT.
@@ -14,7 +14,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 7fdcdaebe781..b2a2fc7d80b0 100644
+index c9c3605a167a..5712d304b019 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1285,7 +1285,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
@@ -57,5 +57,5 @@ index ee631d3e1a8e..544ab59b3a94 100644
 -MODULE_LICENSE("GPL v2");
 +MODULE_LICENSE("Dual BSD/GPL");
 -- 
-2.27.0
+2.25.1
 

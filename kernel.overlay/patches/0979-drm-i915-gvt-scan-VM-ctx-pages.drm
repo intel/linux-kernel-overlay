@@ -1,0 +1,168 @@
+From 730914baad2c226e0fd3abe8ce35eb838716f029 Mon Sep 17 00:00:00 2001
+From: Yan Zhao <yan.y.zhao@intel.com>
+Date: Wed, 23 Dec 2020 11:45:00 +0800
+Subject: [PATCH 0979/1087] drm/i915/gvt: scan VM ctx pages
+
+Logical Context is actually a big batch buffer consisting of multiple
+LRI commands + saved registers. It comprises Ring Context (the first
+0x50 dwords) and Engine Context. The registers defined in Engine Context
+are command accessible, and safe to execute in VM Context.
+This patch
+1. stops copy Ring Context and only copys Engine Context from VM Context
+2. audits VM Engine Contexts to disallow undesired LRIs
+(if accessing registers out of Engine Context that hardware generates).
+
+Cc: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Wang Zhi <zhi.a.wang@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20201223034500.16983-1-yan.y.zhao@intel.com
+Reviewed-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gvt/cmd_parser.c | 52 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gvt/cmd_parser.h |  2 ++
+ drivers/gpu/drm/i915/gvt/reg.h        |  2 ++
+ drivers/gpu/drm/i915/gvt/scheduler.c  | 22 +++++++++---
+ 4 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/cmd_parser.c b/drivers/gpu/drm/i915/gvt/cmd_parser.c
+index 2e6d46246f76..a598329a3354 100644
+--- a/drivers/gpu/drm/i915/gvt/cmd_parser.c
++++ b/drivers/gpu/drm/i915/gvt/cmd_parser.c
+@@ -3193,6 +3193,58 @@ void intel_gvt_update_reg_whitelist(struct intel_vgpu *vgpu)
+ 	}
+ }
+ 
++int intel_gvt_scan_engine_context(struct intel_vgpu_workload *workload)
++{
++	struct intel_vgpu *vgpu = workload->vgpu;
++	unsigned long gma_head, gma_tail, gma_start, ctx_size;
++	struct parser_exec_state s;
++	int ring_id = workload->engine->id;
++	struct intel_context *ce = vgpu->submission.shadow[ring_id];
++	int ret;
++
++	GEM_BUG_ON(atomic_read(&ce->pin_count) < 0);
++
++	ctx_size = workload->engine->context_size - PAGE_SIZE;
++
++	/* Only ring contxt is loaded to HW for inhibit context, no need to
++	 * scan engine context
++	 */
++	if (is_inhibit_context(ce))
++		return 0;
++
++	gma_start = i915_ggtt_offset(ce->state) + LRC_STATE_PN*PAGE_SIZE;
++	gma_head = 0;
++	gma_tail = ctx_size;
++
++	s.buf_type = RING_BUFFER_CTX;
++	s.buf_addr_type = GTT_BUFFER;
++	s.vgpu = workload->vgpu;
++	s.engine = workload->engine;
++	s.ring_start = gma_start;
++	s.ring_size = ctx_size;
++	s.ring_head = gma_start + gma_head;
++	s.ring_tail = gma_start + gma_tail;
++	s.rb_va = ce->lrc_reg_state;
++	s.workload = workload;
++	s.is_ctx_wa = false;
++	s.is_init_ctx = false;
++
++	/* don't scan the first RING_CTX_SIZE(0x50) dwords, as it's ring
++	 * context
++	 */
++	ret = ip_gma_set(&s, gma_start + gma_head + RING_CTX_SIZE);
++	if (ret)
++		goto out;
++
++	ret = command_scan(&s, gma_head, gma_tail,
++		gma_start, ctx_size);
++out:
++	if (ret)
++		gvt_vgpu_err("scan shadow ctx error\n");
++
++	return ret;
++}
++
+ static int init_cmd_table(struct intel_gvt *gvt)
+ {
+ 	unsigned int gen_type = intel_gvt_get_device_type(gvt);
+diff --git a/drivers/gpu/drm/i915/gvt/cmd_parser.h b/drivers/gpu/drm/i915/gvt/cmd_parser.h
+index 09ca2b8a63c8..d5e95b7026a1 100644
+--- a/drivers/gpu/drm/i915/gvt/cmd_parser.h
++++ b/drivers/gpu/drm/i915/gvt/cmd_parser.h
+@@ -52,4 +52,6 @@ int intel_gvt_scan_and_shadow_wa_ctx(struct intel_shadow_wa_ctx *wa_ctx);
+ 
+ void intel_gvt_update_reg_whitelist(struct intel_vgpu *vgpu);
+ 
++int intel_gvt_scan_engine_context(struct intel_vgpu_workload *workload);
++
+ #endif
+diff --git a/drivers/gpu/drm/i915/gvt/reg.h b/drivers/gpu/drm/i915/gvt/reg.h
+index b58860dee970..244cc7320b54 100644
+--- a/drivers/gpu/drm/i915/gvt/reg.h
++++ b/drivers/gpu/drm/i915/gvt/reg.h
+@@ -133,4 +133,6 @@
+ #define RING_GFX_MODE(base)	_MMIO((base) + 0x29c)
+ #define VF_GUARDBAND		_MMIO(0x83a4)
+ 
++
++#define BCS_TILE_REGISTER_VAL_OFFSET (0x43*4)
+ #endif
+diff --git a/drivers/gpu/drm/i915/gvt/scheduler.c b/drivers/gpu/drm/i915/gvt/scheduler.c
+index 6af5c06caee0..43f31c2eab14 100644
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -137,6 +137,7 @@ static int populate_shadow_context(struct intel_vgpu_workload *workload)
+ 	int i;
+ 	bool skip = false;
+ 	int ring_id = workload->engine->id;
++	int ret;
+ 
+ 	GEM_BUG_ON(!intel_context_is_pinned(ctx));
+ 
+@@ -163,16 +164,24 @@ static int populate_shadow_context(struct intel_vgpu_workload *workload)
+ 		COPY_REG(bb_per_ctx_ptr);
+ 		COPY_REG(rcs_indirect_ctx);
+ 		COPY_REG(rcs_indirect_ctx_offset);
+-	}
++	} else if (workload->engine->id == BCS0)
++		intel_gvt_hypervisor_read_gpa(vgpu,
++				workload->ring_context_gpa +
++				BCS_TILE_REGISTER_VAL_OFFSET,
++				(void *)shadow_ring_context +
++				BCS_TILE_REGISTER_VAL_OFFSET, 4);
+ #undef COPY_REG
+ #undef COPY_REG_MASKED
+ 
++	/* don't copy Ring Context (the first 0x50 dwords),
++	 * only copy the Engine Context part from guest
++	 */
+ 	intel_gvt_hypervisor_read_gpa(vgpu,
+ 			workload->ring_context_gpa +
+-			sizeof(*shadow_ring_context),
++			RING_CTX_SIZE,
+ 			(void *)shadow_ring_context +
+-			sizeof(*shadow_ring_context),
+-			I915_GTT_PAGE_SIZE - sizeof(*shadow_ring_context));
++			RING_CTX_SIZE,
++			I915_GTT_PAGE_SIZE - RING_CTX_SIZE);
+ 
+ 	sr_oa_regs(workload, (u32 *)shadow_ring_context, false);
+ 
+@@ -239,6 +248,11 @@ static int populate_shadow_context(struct intel_vgpu_workload *workload)
+ 		gpa_size = I915_GTT_PAGE_SIZE;
+ 		dst = context_base + (i << I915_GTT_PAGE_SHIFT);
+ 	}
++	ret = intel_gvt_scan_engine_context(workload);
++	if (ret) {
++		gvt_vgpu_err("invalid cmd found in guest context pages\n");
++		return ret;
++	}
+ 	s->last_ctx[ring_id].valid = true;
+ 	return 0;
+ }
+-- 
+2.17.1
+

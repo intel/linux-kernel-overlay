@@ -1,0 +1,302 @@
+From d2c15258007b43156daf3e7dc8218d7b535e72af Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 20 Oct 2020 11:03:18 +1000
+Subject: [PATCH 0213/1714] drm/ttm: drop move notify around move.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The drivers now do this in the move callback.
+
+move_notify is still needed in the destroy path.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201020010319.1692445-7-airlied@gmail.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 13 +++++--
+ drivers/gpu/drm/drm_gem_vram_helper.c      | 11 +++++-
+ drivers/gpu/drm/nouveau/nouveau_bo.c       | 12 ++++--
+ drivers/gpu/drm/qxl/qxl_ttm.c              | 45 +++++++++++++---------
+ drivers/gpu/drm/radeon/radeon_ttm.c        | 11 +++++-
+ drivers/gpu/drm/ttm/ttm_bo.c               | 12 +-----
+ drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c | 14 ++++++-
+ 7 files changed, 78 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 2ea1989c3a86..b62abac37789 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -666,6 +666,8 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	struct ttm_resource *old_mem = &bo->mem;
+ 	int r;
+ 
++	amdgpu_bo_move_notify(bo, evict, new_mem);
++
+ 	/* Can't move a pinned BO */
+ 	abo = ttm_to_amdgpu_bo(bo);
+ 	if (WARN_ON_ONCE(abo->tbo.pin_count > 0))
+@@ -687,7 +689,7 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	    new_mem->mem_type == TTM_PL_SYSTEM) {
+ 		r = ttm_bo_wait_ctx(bo, ctx);
+ 		if (r)
+-			return r;
++			goto fail;
+ 
+ 		amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+ 		ttm_resource_free(bo, &bo->mem);
+@@ -728,12 +730,12 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		if (!amdgpu_mem_visible(adev, old_mem) ||
+ 		    !amdgpu_mem_visible(adev, new_mem)) {
+ 			pr_err("Move buffer fallback to memcpy unavailable\n");
+-			return r;
++			goto fail;
+ 		}
+ 
+ 		r = ttm_bo_move_memcpy(bo, ctx, new_mem);
+ 		if (r)
+-			return r;
++			goto fail;
+ 	}
+ 
+ 	if (bo->type == ttm_bo_type_device &&
+@@ -748,6 +750,11 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	/* update statistics */
+ 	atomic64_add((u64)bo->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
+ 	return 0;
++fail:
++	swap(*new_mem, bo->mem);
++	amdgpu_bo_move_notify(bo, false, new_mem);
++	swap(*new_mem, bo->mem);
++	return r;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/drm_gem_vram_helper.c b/drivers/gpu/drm/drm_gem_vram_helper.c
+index 7aeb5daf2805..19087b22bdbb 100644
+--- a/drivers/gpu/drm/drm_gem_vram_helper.c
++++ b/drivers/gpu/drm/drm_gem_vram_helper.c
+@@ -590,7 +590,16 @@ static int drm_gem_vram_bo_driver_move(struct drm_gem_vram_object *gbo,
+ 				       struct ttm_operation_ctx *ctx,
+ 				       struct ttm_resource *new_mem)
+ {
+-	return ttm_bo_move_memcpy(&gbo->bo, ctx, new_mem);
++	int ret;
++
++	drm_gem_vram_bo_driver_move_notify(gbo, evict, new_mem);
++	ret = ttm_bo_move_memcpy(&gbo->bo, ctx, new_mem);
++	if (ret) {
++		swap(*new_mem, gbo->bo.mem);
++		drm_gem_vram_bo_driver_move_notify(gbo, false, new_mem);
++		swap(*new_mem, gbo->bo.mem);
++	}
++	return ret;
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 6e9f7093bc88..97f68a560276 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1032,9 +1032,10 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	struct nouveau_drm_tile *new_tile = NULL;
+ 	int ret = 0;
+ 
++	nouveau_bo_move_ntfy(bo, evict, new_reg);
+ 	ret = ttm_bo_wait_ctx(bo, ctx);
+ 	if (ret)
+-		return ret;
++		goto out_ntfy;
+ 
+ 	if (nvbo->bo.pin_count)
+ 		NV_WARN(drm, "Moving pinned object %p!\n", nvbo);
+@@ -1042,7 +1043,7 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	if (drm->client.device.info.family < NV_DEVICE_INFO_V0_TESLA) {
+ 		ret = nouveau_bo_vm_bind(bo, new_reg, &new_tile);
+ 		if (ret)
+-			return ret;
++			goto out_ntfy;
+ 	}
+ 
+ 	/* Fake bo copy. */
+@@ -1090,7 +1091,12 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		else
+ 			nouveau_bo_vm_cleanup(bo, new_tile, &nvbo->tile);
+ 	}
+-
++out_ntfy:
++	if (ret) {
++		swap(*new_reg, bo->mem);
++		nouveau_bo_move_ntfy(bo, false, new_reg);
++		swap(*new_reg, bo->mem);
++	}
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/qxl/qxl_ttm.c b/drivers/gpu/drm/qxl/qxl_ttm.c
+index 95c4f2c7ab79..a6149e3cc3d2 100644
+--- a/drivers/gpu/drm/qxl/qxl_ttm.c
++++ b/drivers/gpu/drm/qxl/qxl_ttm.c
+@@ -136,24 +136,6 @@ static struct ttm_tt *qxl_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	return ttm;
+ }
+ 
+-static int qxl_bo_move(struct ttm_buffer_object *bo, bool evict,
+-		       struct ttm_operation_ctx *ctx,
+-		       struct ttm_resource *new_mem)
+-{
+-	struct ttm_resource *old_mem = &bo->mem;
+-	int ret;
+-
+-	ret = ttm_bo_wait_ctx(bo, ctx);
+-	if (ret)
+-		return ret;
+-
+-	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
+-		ttm_bo_move_null(bo, new_mem);
+-		return 0;
+-	}
+-	return ttm_bo_move_memcpy(bo, ctx, new_mem);
+-}
+-
+ static void qxl_bo_move_notify(struct ttm_buffer_object *bo,
+ 			       bool evict,
+ 			       struct ttm_resource *new_mem)
+@@ -170,6 +152,33 @@ static void qxl_bo_move_notify(struct ttm_buffer_object *bo,
+ 		qxl_surface_evict(qdev, qbo, new_mem ? true : false);
+ }
+ 
++static int qxl_bo_move(struct ttm_buffer_object *bo, bool evict,
++		       struct ttm_operation_ctx *ctx,
++		       struct ttm_resource *new_mem)
++{
++	struct ttm_resource *old_mem = &bo->mem;
++	int ret;
++
++	qxl_bo_move_notify(bo, evict, new_mem);
++
++	ret = ttm_bo_wait_ctx(bo, ctx);
++	if (ret)
++		goto out;
++
++	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
++		ttm_bo_move_null(bo, new_mem);
++		return 0;
++	}
++	ret = ttm_bo_move_memcpy(bo, ctx, new_mem);
++out:
++	if (ret) {
++		swap(*new_mem, bo->mem);
++		qxl_bo_move_notify(bo, false, new_mem);
++		swap(*new_mem, bo->mem);
++	}
++	return ret;
++}
++
+ static struct ttm_bo_driver qxl_bo_driver = {
+ 	.ttm_tt_create = &qxl_ttm_tt_create,
+ 	.ttm_tt_bind = &qxl_ttm_backend_bind,
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 914b2ca86936..e9c95ef0859b 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -311,9 +311,11 @@ static int radeon_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	struct ttm_resource *old_mem = &bo->mem;
+ 	int r;
+ 
++	radeon_bo_move_notify(bo, evict, new_mem);
++
+ 	r = ttm_bo_wait_ctx(bo, ctx);
+ 	if (r)
+-		return r;
++		goto fail;
+ 
+ 	/* Can't move a pinned BO */
+ 	rbo = container_of(bo, struct radeon_bo, tbo);
+@@ -359,13 +361,18 @@ static int radeon_bo_move(struct ttm_buffer_object *bo, bool evict,
+ memcpy:
+ 		r = ttm_bo_move_memcpy(bo, ctx, new_mem);
+ 		if (r) {
+-			return r;
++			goto fail;
+ 		}
+ 	}
+ 
+ 	/* update statistics */
+ 	atomic64_add((u64)bo->num_pages << PAGE_SHIFT, &rdev->num_bytes_moved);
+ 	return 0;
++fail:
++	swap(*new_mem, bo->mem);
++	radeon_bo_move_notify(bo, false, new_mem);
++	swap(*new_mem, bo->mem);
++	return r;
+ }
+ 
+ static int radeon_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_resource *mem)
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 24a578e3a201..f1b4431964f0 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -263,19 +263,9 @@ static int ttm_bo_handle_move_mem(struct ttm_buffer_object *bo,
+ 		}
+ 	}
+ 
+-	if (bdev->driver->move_notify)
+-		bdev->driver->move_notify(bo, evict, mem);
+-
+ 	ret = bdev->driver->move(bo, evict, ctx, mem);
+-	if (ret) {
+-		if (bdev->driver->move_notify) {
+-			swap(*mem, bo->mem);
+-			bdev->driver->move_notify(bo, false, mem);
+-			swap(*mem, bo->mem);
+-		}
+-
++	if (ret)
+ 		goto out_err;
+-	}
+ 
+ 	ctx->bytes_moved += bo->num_pages << PAGE_SHIFT;
+ 	return 0;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+index 7fda8a6dc4d8..fcb2dbe78d57 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+@@ -731,6 +731,8 @@ static int vmw_move(struct ttm_buffer_object *bo,
+ 	struct ttm_resource_manager *new_man = ttm_manager_type(bo->bdev, new_mem->mem_type);
+ 	int ret;
+ 
++	vmw_move_notify(bo, evict, new_mem);
++
+ 	if (old_man->use_tt && new_man->use_tt) {
+ 		if (bo->mem.mem_type == TTM_PL_SYSTEM) {
+ 			ttm_bo_assign_mem(bo, new_mem);
+@@ -738,15 +740,23 @@ static int vmw_move(struct ttm_buffer_object *bo,
+ 		}
+ 		ret = ttm_bo_wait_ctx(bo, ctx);
+ 		if (ret)
+-			return ret;
++			goto fail;
+ 
+ 		vmw_ttm_unbind(bo->bdev, bo->ttm);
+ 		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_mem);
+ 		return 0;
+ 	} else {
+-		return ttm_bo_move_memcpy(bo, ctx, new_mem);
++		ret = ttm_bo_move_memcpy(bo, ctx, new_mem);
++		if (ret)
++			goto fail;
+ 	}
++	return 0;
++fail:
++	swap(*new_mem, bo->mem);
++	vmw_move_notify(bo, false, new_mem);
++	swap(*new_mem, bo->mem);
++	return ret;
+ }
+ 
+ struct ttm_bo_driver vmw_bo_driver = {
+-- 
+2.25.1
+

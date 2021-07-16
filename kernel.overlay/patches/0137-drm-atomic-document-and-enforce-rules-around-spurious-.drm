@@ -1,0 +1,123 @@
+From 4e5c4164134f6530a0c0fdca0fe05e5c61b30eab Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 25 Sep 2020 10:46:50 +0200
+Subject: [PATCH 0137/1714] drm/atomic: document and enforce rules around
+ "spurious" EBUSY
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When doing an atomic modeset with ALLOW_MODESET drivers are allowed to
+pull in arbitrary other resources, including CRTCs (e.g. when
+reconfiguring global resources).
+
+But in nonblocking mode userspace has then no idea this happened,
+which can lead to spurious EBUSY calls, both:
+- when that other CRTC is currently busy doing a page_flip the
+  ALLOW_MODESET commit can fail with an EBUSY
+- on the other CRTC a normal atomic flip can fail with EBUSY because
+  of the additional commit inserted by the kernel without userspace's
+  knowledge
+
+For blocking commits this isn't a problem, because everyone else will
+just block until all the CRTC are reconfigured. Only thing userspace
+can notice is the dropped frames without any reason for why frames got
+dropped.
+
+Consensus is that we need new uapi to handle this properly, but no one
+has any idea what exactly the new uapi should look like. Since this
+has been shipping for years already compositors need to deal no matter
+what, so as a first step just try to enforce this across drivers
+better with some checks.
+
+v2: Add comments and a WARN_ON to enforce this only when allowed - we
+don't want to silently convert page flips into blocking plane updates
+just because the driver is buggy.
+
+v3: Fix inverted WARN_ON (Pekka).
+
+v4: Drop the uapi changes, only add a WARN_ON for now to enforce some
+rules for drivers.
+
+v5: Make the WARNING more informative (Daniel)
+
+v6: Add unconditional debug output for compositor hackers to figure
+out what's going on when they get an EBUSY (Daniel)
+
+v7: Fix up old/new_crtc_state confusion for real (Pekka/Ville)
+
+Acked-by: Pekka Paalanen <pekka.paalanen@collabora.com>
+Reviewed-by: Daniel Stone <daniels@collabora.com>
+References: https://lists.freedesktop.org/archives/dri-devel/2018-July/182281.html
+Bugzilla: https://gitlab.freedesktop.org/wayland/weston/issues/24#note_9568
+Cc: Daniel Stone <daniel@fooishbar.org>
+Cc: Pekka Paalanen <pekka.paalanen@collabora.co.uk>
+Cc: Simon Ser <contact@emersion.fr>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200925084651.3250104-1-daniel.vetter@ffwll.ch
+---
+ drivers/gpu/drm/drm_atomic.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+index 2ba729eec451..b2d20eb6c807 100644
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -281,6 +281,10 @@ EXPORT_SYMBOL(__drm_atomic_state_free);
+  * needed. It will also grab the relevant CRTC lock to make sure that the state
+  * is consistent.
+  *
++ * WARNING: Drivers may only add new CRTC states to a @state if
++ * drm_atomic_state.allow_modeset is set, or if it's a driver-internal commit
++ * not created by userspace through an IOCTL call.
++ *
+  * Returns:
+  *
+  * Either the allocated state or the error code encoded into the pointer. When
+@@ -1262,10 +1266,15 @@ int drm_atomic_check_only(struct drm_atomic_state *state)
+ 	struct drm_crtc_state *new_crtc_state;
+ 	struct drm_connector *conn;
+ 	struct drm_connector_state *conn_state;
++	unsigned requested_crtc = 0;
++	unsigned affected_crtc = 0;
+ 	int i, ret = 0;
+ 
+ 	DRM_DEBUG_ATOMIC("checking %p\n", state);
+ 
++	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i)
++		requested_crtc |= drm_crtc_mask(crtc);
++
+ 	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+ 		ret = drm_atomic_plane_check(old_plane_state, new_plane_state);
+ 		if (ret) {
+@@ -1313,6 +1322,26 @@ int drm_atomic_check_only(struct drm_atomic_state *state)
+ 		}
+ 	}
+ 
++	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i)
++		affected_crtc |= drm_crtc_mask(crtc);
++
++	/*
++	 * For commits that allow modesets drivers can add other CRTCs to the
++	 * atomic commit, e.g. when they need to reallocate global resources.
++	 * This can cause spurious EBUSY, which robs compositors of a very
++	 * effective sanity check for their drawing loop. Therefor only allow
++	 * drivers to add unrelated CRTC states for modeset commits.
++	 *
++	 * FIXME: Should add affected_crtc mask to the ATOMIC IOCTL as an output
++	 * so compositors know what's going on.
++	 */
++	if (affected_crtc != requested_crtc) {
++		DRM_DEBUG_ATOMIC("driver added CRTC to commit: requested 0x%x, affected 0x%0x\n",
++				 requested_crtc, affected_crtc);
++		WARN(!state->allow_modeset, "adding CRTC not allowed without modesets: requested 0x%x, affected 0x%0x\n",
++		     requested_crtc, affected_crtc);
++	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(drm_atomic_check_only);
+-- 
+2.25.1
+

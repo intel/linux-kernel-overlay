@@ -1,4 +1,4 @@
-From 986bc95c3ed8125026c1d130915ea586d41ff9af Mon Sep 17 00:00:00 2001
+From 90a0d3945c908de348541dc668296a88dd6efbc2 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 8 Jun 2020 00:40:45 +0800
 Subject: [PATCH 3/9] tcc: update license header
@@ -14,7 +14,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 62 insertions(+), 17 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 6f7af786d41e..7fdcdaebe781 100644
+index e01f13508171..c9c3605a167a 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1243,9 +1243,6 @@ static inline bool is_TCC_range(u64 start, u64 end)
@@ -150,5 +150,5 @@ index 4d4e0557dddc..cd4a83f6e7e0 100644
  	p_memslot->minor = UNDEFINED_DEVNODE;
  	vaddr = memremap(p_memslot->paddr, p_memslot->size, MEMREMAP_WB);
 -- 
-2.27.0
+2.25.1
 

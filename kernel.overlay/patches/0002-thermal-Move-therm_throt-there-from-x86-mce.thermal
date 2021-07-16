@@ -1,0 +1,316 @@
+From 879feb1506f8d3dfcaa92e2bd3fc2aa89a7b99a7 Mon Sep 17 00:00:00 2001
+From: Borislav Petkov <bp@suse.de>
+Date: Thu, 7 Jan 2021 13:29:05 +0100
+Subject: [PATCH 2/5] thermal: Move therm_throt there from x86/mce
+
+This functionality has nothing to do with MCE, move it to the thermal
+framework and untangle it from MCE.
+
+Requested-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Tested-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Link: https://lkml.kernel.org/r/20210202121003.GD18075@zn.tnic
+---
+ arch/x86/Kconfig                              |  4 ---
+ arch/x86/include/asm/mce.h                    | 16 ----------
+ arch/x86/include/asm/thermal.h                | 13 ++++++++
+ arch/x86/kernel/cpu/intel.c                   |  3 ++
+ arch/x86/kernel/cpu/mce/Makefile              |  2 --
+ arch/x86/kernel/cpu/mce/intel.c               |  1 -
+ arch/x86/kernel/irq.c                         | 21 ++++++++++++
+ drivers/thermal/intel/Kconfig                 |  4 +++
+ drivers/thermal/intel/Makefile                |  1 +
+ .../thermal/intel}/therm_throt.c              | 32 ++++++-------------
+ drivers/thermal/intel/thermal_interrupt.h     | 15 +++++++++
+ drivers/thermal/intel/x86_pkg_temp_thermal.c  |  4 ++-
+ 12 files changed, 69 insertions(+), 47 deletions(-)
+ create mode 100644 arch/x86/include/asm/thermal.h
+ rename {arch/x86/kernel/cpu/mce => drivers/thermal/intel}/therm_throt.c (97%)
+ create mode 100644 drivers/thermal/intel/thermal_interrupt.h
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 3a5ecb1039bf..13f017c6f54d 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1156,10 +1156,6 @@ config X86_MCE_INJECT
+ 	  If you don't know what a machine check is and you don't do kernel
+ 	  QA it is safe to say n.
+ 
+-config X86_THERMAL_VECTOR
+-	def_bool y
+-	depends on X86_MCE_INTEL
+-
+ source "arch/x86/events/Kconfig"
+ 
+ config X86_LEGACY_VM86
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index cc1064ddbaef..134e21bed484 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -288,22 +288,6 @@ extern void (*mce_threshold_vector)(void);
+ /* Deferred error interrupt handler */
+ extern void (*deferred_error_int_vector)(void);
+ 
+-/*
+- * Thermal handler
+- */
+-
+-void intel_init_thermal(struct cpuinfo_x86 *c);
+-
+-/* Interrupt Handler for core thermal thresholds */
+-extern int (*platform_thermal_notify)(__u64 msr_val);
+-
+-/* Interrupt Handler for package thermal thresholds */
+-extern int (*platform_thermal_package_notify)(__u64 msr_val);
+-
+-/* Callback support of rate control, return true, if
+- * callback has rate control */
+-extern bool (*platform_thermal_package_rate_control)(void);
+-
+ /*
+  * Used by APEI to report memory error via /dev/mcelog
+  */
+diff --git a/arch/x86/include/asm/thermal.h b/arch/x86/include/asm/thermal.h
+new file mode 100644
+index 000000000000..ddbdefd5b94f
+--- /dev/null
++++ b/arch/x86/include/asm/thermal.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_THERMAL_H
++#define _ASM_X86_THERMAL_H
++
++#ifdef CONFIG_X86_THERMAL_VECTOR
++void intel_init_thermal(struct cpuinfo_x86 *c);
++bool x86_thermal_enabled(void);
++void intel_thermal_interrupt(void);
++#else
++static inline void intel_init_thermal(struct cpuinfo_x86 *c) { }
++#endif
++
++#endif /* _ASM_X86_THERMAL_H */
+diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+index 816fdbec795a..0e422a544835 100644
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -24,6 +24,7 @@
+ #include <asm/traps.h>
+ #include <asm/resctrl.h>
+ #include <asm/numa.h>
++#include <asm/thermal.h>
+ 
+ #ifdef CONFIG_X86_64
+ #include <linux/topology.h>
+@@ -719,6 +720,8 @@ static void init_intel(struct cpuinfo_x86 *c)
+ 		tsx_disable();
+ 
+ 	split_lock_init();
++
++	intel_init_thermal(c);
+ }
+ 
+ #ifdef CONFIG_X86_32
+diff --git a/arch/x86/kernel/cpu/mce/Makefile b/arch/x86/kernel/cpu/mce/Makefile
+index 9f020c994154..015856abdbb1 100644
+--- a/arch/x86/kernel/cpu/mce/Makefile
++++ b/arch/x86/kernel/cpu/mce/Makefile
+@@ -9,8 +9,6 @@ obj-$(CONFIG_X86_MCE_THRESHOLD) += threshold.o
+ mce-inject-y			:= inject.o
+ obj-$(CONFIG_X86_MCE_INJECT)	+= mce-inject.o
+ 
+-obj-$(CONFIG_X86_THERMAL_VECTOR) += therm_throt.o
+-
+ obj-$(CONFIG_ACPI_APEI)		+= apei.o
+ 
+ obj-$(CONFIG_X86_MCELOG_LEGACY)	+= dev-mcelog.o
+diff --git a/arch/x86/kernel/cpu/mce/intel.c b/arch/x86/kernel/cpu/mce/intel.c
+index abe9fe0fb851..c845888e004a 100644
+--- a/arch/x86/kernel/cpu/mce/intel.c
++++ b/arch/x86/kernel/cpu/mce/intel.c
+@@ -511,7 +511,6 @@ static void intel_ppin_init(struct cpuinfo_x86 *c)
+ 
+ void mce_intel_feature_init(struct cpuinfo_x86 *c)
+ {
+-	intel_init_thermal(c);
+ 	intel_init_cmci();
+ 	intel_init_lmce();
+ 	intel_ppin_init(c);
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index c5dd50369e2f..d4ad344e80bf 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -21,6 +21,7 @@
+ #include <asm/hw_irq.h>
+ #include <asm/desc.h>
+ #include <asm/traps.h>
++#include <asm/thermal.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/irq_vectors.h>
+@@ -374,3 +375,23 @@ void fixup_irqs(void)
+ 	}
+ }
+ #endif
++
++#ifdef CONFIG_X86_THERMAL_VECTOR
++static void smp_thermal_vector(void)
++{
++	if (x86_thermal_enabled())
++		intel_thermal_interrupt();
++	else
++		pr_err("CPU%d: Unexpected LVT thermal interrupt!\n",
++		       smp_processor_id());
++}
++
++DEFINE_IDTENTRY_SYSVEC(sysvec_thermal)
++{
++	trace_thermal_apic_entry(THERMAL_APIC_VECTOR);
++	inc_irq_stat(irq_thermal_count);
++	smp_thermal_vector();
++	trace_thermal_apic_exit(THERMAL_APIC_VECTOR);
++	ack_APIC_irq();
++}
++#endif
+diff --git a/drivers/thermal/intel/Kconfig b/drivers/thermal/intel/Kconfig
+index 8025b21f43fa..ce4f59213c7a 100644
+--- a/drivers/thermal/intel/Kconfig
++++ b/drivers/thermal/intel/Kconfig
+@@ -8,6 +8,10 @@ config INTEL_POWERCLAMP
+ 	  enforce idle time which results in more package C-state residency. The
+ 	  user interface is exposed via generic thermal framework.
+ 
++config X86_THERMAL_VECTOR
++	def_bool y
++	depends on X86 && CPU_SUP_INTEL && X86_LOCAL_APIC
++
+ config X86_PKG_TEMP_THERMAL
+ 	tristate "X86 package temperature thermal driver"
+ 	depends on X86_THERMAL_VECTOR
+diff --git a/drivers/thermal/intel/Makefile b/drivers/thermal/intel/Makefile
+index 0d9736ced5d4..ff2ad30ef397 100644
+--- a/drivers/thermal/intel/Makefile
++++ b/drivers/thermal/intel/Makefile
+@@ -10,3 +10,4 @@ obj-$(CONFIG_INTEL_QUARK_DTS_THERMAL)	+= intel_quark_dts_thermal.o
+ obj-$(CONFIG_INT340X_THERMAL)  += int340x_thermal/
+ obj-$(CONFIG_INTEL_BXT_PMIC_THERMAL) += intel_bxt_pmic_thermal.o
+ obj-$(CONFIG_INTEL_PCH_THERMAL)	+= intel_pch_thermal.o
++obj-$(CONFIG_X86_THERMAL_VECTOR) += therm_throt.o
+diff --git a/arch/x86/kernel/cpu/mce/therm_throt.c b/drivers/thermal/intel/therm_throt.c
+similarity index 97%
+rename from arch/x86/kernel/cpu/mce/therm_throt.c
+rename to drivers/thermal/intel/therm_throt.c
+index 5b15d7cef1d1..f8e882592ba5 100644
+--- a/arch/x86/kernel/cpu/mce/therm_throt.c
++++ b/drivers/thermal/intel/therm_throt.c
+@@ -26,13 +26,13 @@
+ #include <linux/cpu.h>
+ 
+ #include <asm/processor.h>
++#include <asm/thermal.h>
+ #include <asm/traps.h>
+ #include <asm/apic.h>
+-#include <asm/mce.h>
++#include <asm/irq.h>
+ #include <asm/msr.h>
+-#include <asm/trace/irq_vectors.h>
+ 
+-#include "internal.h"
++#include "thermal_interrupt.h"
+ 
+ /* How long to wait between reporting thermal events */
+ #define CHECK_INTERVAL		(300 * HZ)
+@@ -570,7 +570,7 @@ static void notify_thresholds(__u64 msr_val)
+ }
+ 
+ /* Thermal transition interrupt handler */
+-static void intel_thermal_interrupt(void)
++void intel_thermal_interrupt(void)
+ {
+ 	__u64 msr_val;
+ 
+@@ -606,23 +606,6 @@ static void intel_thermal_interrupt(void)
+ 	}
+ }
+ 
+-static void unexpected_thermal_interrupt(void)
+-{
+-	pr_err("CPU%d: Unexpected LVT thermal interrupt!\n",
+-		smp_processor_id());
+-}
+-
+-static void (*smp_thermal_vector)(void) = unexpected_thermal_interrupt;
+-
+-DEFINE_IDTENTRY_SYSVEC(sysvec_thermal)
+-{
+-	trace_thermal_apic_entry(THERMAL_APIC_VECTOR);
+-	inc_irq_stat(irq_thermal_count);
+-	smp_thermal_vector();
+-	trace_thermal_apic_exit(THERMAL_APIC_VECTOR);
+-	ack_APIC_irq();
+-}
+-
+ /* Thermal monitoring depends on APIC, ACPI and clock modulation */
+ static int intel_thermal_supported(struct cpuinfo_x86 *c)
+ {
+@@ -633,6 +616,11 @@ static int intel_thermal_supported(struct cpuinfo_x86 *c)
+ 	return 1;
+ }
+ 
++bool x86_thermal_enabled(void)
++{
++	return atomic_read(&therm_throt_en);
++}
++
+ void intel_init_thermal(struct cpuinfo_x86 *c)
+ {
+ 	unsigned int cpu = smp_processor_id();
+@@ -719,8 +707,6 @@ void intel_init_thermal(struct cpuinfo_x86 *c)
+ 				| PACKAGE_THERM_INT_HIGH_ENABLE), h);
+ 	}
+ 
+-	smp_thermal_vector = intel_thermal_interrupt;
+-
+ 	rdmsr(MSR_IA32_MISC_ENABLE, l, h);
+ 	wrmsr(MSR_IA32_MISC_ENABLE, l | MSR_IA32_MISC_ENABLE_TM1, h);
+ 
+diff --git a/drivers/thermal/intel/thermal_interrupt.h b/drivers/thermal/intel/thermal_interrupt.h
+new file mode 100644
+index 000000000000..53f427bb58dc
+--- /dev/null
++++ b/drivers/thermal/intel/thermal_interrupt.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _INTEL_THERMAL_INTERRUPT_H
++#define _INTEL_THERMAL_INTERRUPT_H
++
++/* Interrupt Handler for package thermal thresholds */
++extern int (*platform_thermal_package_notify)(__u64 msr_val);
++
++/* Interrupt Handler for core thermal thresholds */
++extern int (*platform_thermal_notify)(__u64 msr_val);
++
++/* Callback support of rate control, return true, if
++ * callback has rate control */
++extern bool (*platform_thermal_package_rate_control)(void);
++
++#endif /* _INTEL_THERMAL_INTERRUPT_H */
+diff --git a/drivers/thermal/intel/x86_pkg_temp_thermal.c b/drivers/thermal/intel/x86_pkg_temp_thermal.c
+index b81c33202f41..295742e83960 100644
+--- a/drivers/thermal/intel/x86_pkg_temp_thermal.c
++++ b/drivers/thermal/intel/x86_pkg_temp_thermal.c
+@@ -17,8 +17,10 @@
+ #include <linux/pm.h>
+ #include <linux/thermal.h>
+ #include <linux/debugfs.h>
++
+ #include <asm/cpu_device_id.h>
+-#include <asm/mce.h>
++
++#include "thermal_interrupt.h"
+ 
+ /*
+ * Rate control delay: Idea is to introduce denounce effect
+-- 
+2.25.1
+

@@ -1,0 +1,136 @@
+From ea3e858e2d73d1938aa3bc942dfcc21033658cec Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 8 Jan 2021 19:44:14 +0200
+Subject: [PATCH 032/128] drm/i915/pps: abstract intel_pps_vdd_off_sync
+
+Add a locked version of intel_pps_vdd_off_sync_unlocked() that does
+everything the callers expect it to. No functional changes.
+
+v2: Fix typo (Anshuman)
+
+Reviewed-by: Anshuman Gupta <anshuman.gupta@intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/1e722290208d827c5cae107fe41dbfe41a494793.1610127741.git.jani.nikula@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_dp.c  | 31 +++---------------------
+ drivers/gpu/drm/i915/display/intel_pps.c | 18 +++++++++++++-
+ drivers/gpu/drm/i915/display/intel_pps.h |  2 +-
+ 3 files changed, 21 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index de54f39e961b..5fcff4c389d6 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -6300,17 +6300,8 @@ void intel_dp_encoder_flush_work(struct drm_encoder *encoder)
+ 	struct intel_dp *intel_dp = &dig_port->dp;
+ 
+ 	intel_dp_mst_encoder_cleanup(dig_port);
+-	if (intel_dp_is_edp(intel_dp)) {
+-		intel_wakeref_t wakeref;
+ 
+-		cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
+-		/*
+-		 * vdd might still be enabled do to the delayed vdd off.
+-		 * Make sure vdd is actually turned off here.
+-		 */
+-		with_intel_pps_lock(intel_dp, wakeref)
+-			intel_pps_vdd_off_sync_unlocked(intel_dp);
+-	}
++	intel_pps_vdd_off_sync(intel_dp);
+ 
+ 	intel_dp_aux_fini(intel_dp);
+ }
+@@ -6326,18 +6317,8 @@ static void intel_dp_encoder_destroy(struct drm_encoder *encoder)
+ void intel_dp_encoder_suspend(struct intel_encoder *intel_encoder)
+ {
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(intel_encoder);
+-	intel_wakeref_t wakeref;
+-
+-	if (!intel_dp_is_edp(intel_dp))
+-		return;
+ 
+-	/*
+-	 * vdd might still be enabled do to the delayed vdd off.
+-	 * Make sure vdd is actually turned off here.
+-	 */
+-	cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
+-	with_intel_pps_lock(intel_dp, wakeref)
+-		intel_pps_vdd_off_sync_unlocked(intel_dp);
++	intel_pps_vdd_off_sync(intel_dp);
+ }
+ 
+ void intel_dp_encoder_shutdown(struct intel_encoder *intel_encoder)
+@@ -7191,13 +7172,7 @@ static bool intel_edp_init_connector(struct intel_dp *intel_dp,
+ 	return true;
+ 
+ out_vdd_off:
+-	cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
+-	/*
+-	 * vdd might still be enabled do to the delayed vdd off.
+-	 * Make sure vdd is actually turned off here.
+-	 */
+-	with_intel_pps_lock(intel_dp, wakeref)
+-		intel_pps_vdd_off_sync_unlocked(intel_dp);
++	intel_pps_vdd_off_sync(intel_dp);
+ 
+ 	return false;
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.c b/drivers/gpu/drm/i915/display/intel_pps.c
+index fd3677948800..b6c07694ae9d 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.c
++++ b/drivers/gpu/drm/i915/display/intel_pps.c
+@@ -637,7 +637,7 @@ void intel_pps_vdd_on(struct intel_dp *intel_dp)
+ 			dp_to_dig_port(intel_dp)->base.base.name);
+ }
+ 
+-void intel_pps_vdd_off_sync_unlocked(struct intel_dp *intel_dp)
++static void intel_pps_vdd_off_sync_unlocked(struct intel_dp *intel_dp)
+ {
+ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ 	struct intel_digital_port *dig_port =
+@@ -678,6 +678,22 @@ void intel_pps_vdd_off_sync_unlocked(struct intel_dp *intel_dp)
+ 				fetch_and_zero(&intel_dp->vdd_wakeref));
+ }
+ 
++void intel_pps_vdd_off_sync(struct intel_dp *intel_dp)
++{
++	intel_wakeref_t wakeref;
++
++	if (!intel_dp_is_edp(intel_dp))
++		return;
++
++	cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
++	/*
++	 * vdd might still be enabled due to the delayed vdd off.
++	 * Make sure vdd is actually turned off here.
++	 */
++	with_intel_pps_lock(intel_dp, wakeref)
++		intel_pps_vdd_off_sync_unlocked(intel_dp);
++}
++
+ void edp_panel_vdd_work(struct work_struct *__work)
+ {
+ 	struct intel_dp *intel_dp =
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.h b/drivers/gpu/drm/i915/display/intel_pps.h
+index e7f0473be9a7..3cab183658c6 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.h
++++ b/drivers/gpu/drm/i915/display/intel_pps.h
+@@ -29,7 +29,6 @@ void intel_pps_backlight_power(struct intel_connector *connector, bool enable);
+ 
+ bool intel_pps_vdd_on_unlocked(struct intel_dp *intel_dp);
+ void intel_pps_vdd_off_unlocked(struct intel_dp *intel_dp, bool sync);
+-void intel_pps_vdd_off_sync_unlocked(struct intel_dp *intel_dp);
+ void intel_pps_on_unlocked(struct intel_dp *intel_dp);
+ void intel_pps_off_unlocked(struct intel_dp *intel_dp);
+ void edp_panel_vdd_work(struct work_struct *__work);
+@@ -38,6 +37,7 @@ void intel_pps_vdd_sanitize(struct intel_dp *intel_dp);
+ void intel_pps_vdd_on(struct intel_dp *intel_dp);
+ void intel_pps_on(struct intel_dp *intel_dp);
+ void intel_pps_off(struct intel_dp *intel_dp);
++void intel_pps_vdd_off_sync(struct intel_dp *intel_dp);
+ bool intel_pps_have_power(struct intel_dp *intel_dp);
+ 
+ void wait_panel_power_cycle(struct intel_dp *intel_dp);
+-- 
+2.17.1
+

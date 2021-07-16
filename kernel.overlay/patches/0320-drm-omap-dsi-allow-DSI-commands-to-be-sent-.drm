@@ -1,0 +1,190 @@
+From 137e20b63a0ee03747580e7cce698c9e4cbfaf63 Mon Sep 17 00:00:00 2001
+From: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Date: Tue, 15 Dec 2020 12:46:57 +0200
+Subject: [PATCH 0320/1087] drm/omap: dsi: allow DSI commands to be sent early
+
+Panel drivers can send DSI commands in panel's prepare(), which happens
+before the bridge's enable() is called. The OMAP DSI driver currently
+only sets up the DSI interface at bridge's enable(), so prepare() cannot
+be used to send DSI commands.
+
+This patch fixes the issue by making it possible to enable the DSI
+interface any time a command is about to be sent. Disabling the
+interface is be done via delayed work.
+
+Clarifications for the delayed disable work and the panel doing DSI
+transactions:
+
+bridge_enable: If the disable callback is called just before
+bridge_enable takes the dsi_bus_lock, no problem, bridge_enable just
+enables the interface again. If the callback is ran just after
+bridge_enable's dsi_bus_unlock, no problem, dsi->video_enabled == true
+so the callback does nothing.
+
+bridge_disable: similar to bridge-enable, the callback won't do anything
+if video_enabled == true, and after bridge-disable has turned the video
+and the interface off, there's nothing to do for the callback.
+
+omap_dsi_host_detach: this is called when the panel does
+mipi_dsi_detach(), and we expect the panel to _not_ do any DSI
+transactions after (or during) mipi_dsi_detatch(), so there are no
+race conditions.
+
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Reviewed-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201215104657.802264-85-tomi.valkeinen@ti.com
+---
+ drivers/gpu/drm/omapdrm/dss/dsi.c | 50 +++++++++++++++++++++++++++----
+ drivers/gpu/drm/omapdrm/dss/dsi.h |  3 ++
+ 2 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/omapdrm/dss/dsi.c b/drivers/gpu/drm/omapdrm/dss/dsi.c
+index 0dd5c0381080..8e11612f5fe1 100644
+--- a/drivers/gpu/drm/omapdrm/dss/dsi.c
++++ b/drivers/gpu/drm/omapdrm/dss/dsi.c
+@@ -3500,6 +3500,9 @@ static void dsi_enable(struct dsi_data *dsi)
+ 
+ 	WARN_ON(!dsi_bus_is_locked(dsi));
+ 
++	if (WARN_ON(dsi->iface_enabled))
++		return;
++
+ 	mutex_lock(&dsi->lock);
+ 
+ 	r = dsi_runtime_get(dsi);
+@@ -3512,6 +3515,8 @@ static void dsi_enable(struct dsi_data *dsi)
+ 	if (r)
+ 		goto err_init_dsi;
+ 
++	dsi->iface_enabled = true;
++
+ 	mutex_unlock(&dsi->lock);
+ 
+ 	return;
+@@ -3527,6 +3532,9 @@ static void dsi_disable(struct dsi_data *dsi)
+ {
+ 	WARN_ON(!dsi_bus_is_locked(dsi));
+ 
++	if (WARN_ON(!dsi->iface_enabled))
++		return;
++
+ 	mutex_lock(&dsi->lock);
+ 
+ 	dsi_sync_vc(dsi, 0);
+@@ -3538,6 +3546,8 @@ static void dsi_disable(struct dsi_data *dsi)
+ 
+ 	dsi_runtime_put(dsi);
+ 
++	dsi->iface_enabled = false;
++
+ 	mutex_unlock(&dsi->lock);
+ }
+ 
+@@ -4226,10 +4236,12 @@ static ssize_t omap_dsi_host_transfer(struct mipi_dsi_host *host,
+ 
+ 	dsi_bus_lock(dsi);
+ 
+-	if (dsi->video_enabled)
+-		r = _omap_dsi_host_transfer(dsi, vc, msg);
+-	else
+-		r = -EIO;
++	if (!dsi->iface_enabled) {
++		dsi_enable(dsi);
++		schedule_delayed_work(&dsi->dsi_disable_work, msecs_to_jiffies(2000));
++	}
++
++	r = _omap_dsi_host_transfer(dsi, vc, msg);
+ 
+ 	dsi_bus_unlock(dsi);
+ 
+@@ -4394,6 +4406,15 @@ static int omap_dsi_host_detach(struct mipi_dsi_host *host,
+ 	if (WARN_ON(dsi->dsidev != client))
+ 		return -EINVAL;
+ 
++	cancel_delayed_work_sync(&dsi->dsi_disable_work);
++
++	dsi_bus_lock(dsi);
++
++	if (dsi->iface_enabled)
++		dsi_disable(dsi);
++
++	dsi_bus_unlock(dsi);
++
+ 	omap_dsi_unregister_te_irq(dsi);
+ 	dsi->dsidev = NULL;
+ 	return 0;
+@@ -4629,9 +4650,12 @@ static void dsi_bridge_enable(struct drm_bridge *bridge)
+ 	struct dsi_data *dsi = drm_bridge_to_dsi(bridge);
+ 	struct omap_dss_device *dssdev = &dsi->output;
+ 
++	cancel_delayed_work_sync(&dsi->dsi_disable_work);
++
+ 	dsi_bus_lock(dsi);
+ 
+-	dsi_enable(dsi);
++	if (!dsi->iface_enabled)
++		dsi_enable(dsi);
+ 
+ 	dsi_enable_video_output(dssdev, VC_VIDEO);
+ 
+@@ -4645,6 +4669,8 @@ static void dsi_bridge_disable(struct drm_bridge *bridge)
+ 	struct dsi_data *dsi = drm_bridge_to_dsi(bridge);
+ 	struct omap_dss_device *dssdev = &dsi->output;
+ 
++	cancel_delayed_work_sync(&dsi->dsi_disable_work);
++
+ 	dsi_bus_lock(dsi);
+ 
+ 	dsi->video_enabled = false;
+@@ -4837,6 +4863,18 @@ static const struct soc_device_attribute dsi_soc_devices[] = {
+ 	{ /* sentinel */ }
+ };
+ 
++static void omap_dsi_disable_work_callback(struct work_struct *work)
++{
++	struct dsi_data *dsi = container_of(work, struct dsi_data, dsi_disable_work.work);
++
++	dsi_bus_lock(dsi);
++
++	if (dsi->iface_enabled && !dsi->video_enabled)
++		dsi_disable(dsi);
++
++	dsi_bus_unlock(dsi);
++}
++
+ static int dsi_probe(struct platform_device *pdev)
+ {
+ 	const struct soc_device_attribute *soc;
+@@ -4870,6 +4908,8 @@ static int dsi_probe(struct platform_device *pdev)
+ 	INIT_DEFERRABLE_WORK(&dsi->framedone_timeout_work,
+ 			     dsi_framedone_timeout_work_callback);
+ 
++	INIT_DEFERRABLE_WORK(&dsi->dsi_disable_work, omap_dsi_disable_work_callback);
++
+ #ifdef DSI_CATCH_MISSING_TE
+ 	timer_setup(&dsi->te_timer, dsi_te_timeout, 0);
+ #endif
+diff --git a/drivers/gpu/drm/omapdrm/dss/dsi.h b/drivers/gpu/drm/omapdrm/dss/dsi.h
+index de9411067ba2..601707c0ecc4 100644
+--- a/drivers/gpu/drm/omapdrm/dss/dsi.h
++++ b/drivers/gpu/drm/omapdrm/dss/dsi.h
+@@ -394,6 +394,7 @@ struct dsi_data {
+ 	atomic_t do_ext_te_update;
+ 
+ 	bool te_enabled;
++	bool iface_enabled;
+ 	bool video_enabled;
+ 
+ 	struct delayed_work framedone_timeout_work;
+@@ -443,6 +444,8 @@ struct dsi_data {
+ 
+ 	struct omap_dss_device output;
+ 	struct drm_bridge bridge;
++
++	struct delayed_work dsi_disable_work;
+ };
+ 
+ struct dsi_packet_sent_handler_data {
+-- 
+2.17.1
+

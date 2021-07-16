@@ -1,0 +1,440 @@
+From 41ccf92e4e74152b4535827f99c296874dacbded Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Thu, 4 Feb 2021 14:28:06 +1000
+Subject: [PATCH 249/330] drm/nouveau/device: pass instance id when looking up
+ a subdev/engine
+
+This switches to using the subdev list for lookup, and otherwise should
+be a no-op aside from switching the function signatures.
+
+Callers will be transitioned to split type+inst individually.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/core/device.h    |  4 +-
+ .../drm/nouveau/include/nvkm/core/engine.h    |  2 +
+ drivers/gpu/drm/nouveau/nvkm/core/engine.c    |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/device/base.c | 94 +++----------------
+ .../gpu/drm/nouveau/nvkm/engine/device/user.c |  6 +-
+ .../drm/nouveau/nvkm/engine/disp/channv50.c   |  2 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   |  2 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.c  |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.c  |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/tu102.c  |  4 +-
+ .../gpu/drm/nouveau/nvkm/subdev/fb/ramgk104.c |  8 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c |  4 +-
+ .../gpu/drm/nouveau/nvkm/subdev/therm/gk104.c |  6 +-
+ 13 files changed, 41 insertions(+), 109 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+index a1c7219b04b3..b4c373bc3ca8 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -111,8 +111,8 @@ struct nvkm_device {
+ 	struct list_head subdev;
+ };
+ 
+-struct nvkm_subdev *nvkm_device_subdev(struct nvkm_device *, int index);
+-struct nvkm_engine *nvkm_device_engine(struct nvkm_device *, int index);
++struct nvkm_subdev *nvkm_device_subdev(struct nvkm_device *, int type, int inst);
++struct nvkm_engine *nvkm_device_engine(struct nvkm_device *, int type, int inst);
+ 
+ struct nvkm_device_func {
+ 	struct nvkm_device_pci *(*pci)(struct nvkm_device *);
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h b/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
+index c9d84bd17364..580d3d72fc13 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
+@@ -6,6 +6,8 @@
+ struct nvkm_fifo_chan;
+ struct nvkm_fb_tile;
+ 
++extern const struct nvkm_subdev_func nvkm_engine;
++
+ struct nvkm_engine {
+ 	const struct nvkm_engine_func *func;
+ 	struct nvkm_subdev subdev;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/engine.c b/drivers/gpu/drm/nouveau/nvkm/core/engine.c
+index 6016af82b0cc..774270ae9e24 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/engine.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/engine.c
+@@ -165,8 +165,8 @@ nvkm_engine_dtor(struct nvkm_subdev *subdev)
+ 	return engine;
+ }
+ 
+-static const struct nvkm_subdev_func
+-nvkm_engine_func = {
++const struct nvkm_subdev_func
++nvkm_engine = {
+ 	.dtor = nvkm_engine_dtor,
+ 	.preinit = nvkm_engine_preinit,
+ 	.init = nvkm_engine_init,
+@@ -180,7 +180,7 @@ nvkm_engine_ctor(const struct nvkm_engine_func *func,
+ 		 struct nvkm_device *device, int index, bool enable,
+ 		 struct nvkm_engine *engine)
+ {
+-	nvkm_subdev_ctor(&nvkm_engine_func, device, index, &engine->subdev);
++	nvkm_subdev_ctor(&nvkm_engine, device, index, &engine->subdev);
+ 	engine->func = func;
+ 	refcount_set(&engine->use.refcount, 0);
+ 	mutex_init(&engine->use.mutex);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index fa1b6fa6bc74..a4d7d6cffaee 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -2726,97 +2726,27 @@ nvkm_device_event_func = {
+ };
+ 
+ struct nvkm_subdev *
+-nvkm_device_subdev(struct nvkm_device *device, int index)
++nvkm_device_subdev(struct nvkm_device *device, int type, int inst)
+ {
+-	struct nvkm_engine *engine;
++	struct nvkm_subdev *subdev;
+ 
+-	if (device->disable_mask & (1ULL << index))
++	if (device->disable_mask & (1ULL << (type + inst)))
+ 		return NULL;
+ 
+-	switch (index) {
+-#define _(n,p,m) case NVKM_SUBDEV_##n: if (p) return (m); break
+-	_(ACR     , device->acr     , &device->acr->subdev);
+-	_(BAR     , device->bar     , &device->bar->subdev);
+-	_(VBIOS   , device->bios    , &device->bios->subdev);
+-	_(BUS     , device->bus     , &device->bus->subdev);
+-	_(CLK     , device->clk     , &device->clk->subdev);
+-	_(DEVINIT , device->devinit , &device->devinit->subdev);
+-	_(FAULT   , device->fault   , &device->fault->subdev);
+-	_(FB      , device->fb      , &device->fb->subdev);
+-	_(FUSE    , device->fuse    , &device->fuse->subdev);
+-	_(GPIO    , device->gpio    , &device->gpio->subdev);
+-	_(GSP     , device->gsp     , &device->gsp->subdev);
+-	_(I2C     , device->i2c     , &device->i2c->subdev);
+-	_(IBUS    , device->ibus    ,  device->ibus);
+-	_(ICCSENSE, device->iccsense, &device->iccsense->subdev);
+-	_(INSTMEM , device->imem    , &device->imem->subdev);
+-	_(LTC     , device->ltc     , &device->ltc->subdev);
+-	_(MC      , device->mc      , &device->mc->subdev);
+-	_(MMU     , device->mmu     , &device->mmu->subdev);
+-	_(MXM     , device->mxm     ,  device->mxm);
+-	_(PCI     , device->pci     , &device->pci->subdev);
+-	_(PMU     , device->pmu     , &device->pmu->subdev);
+-	_(THERM   , device->therm   , &device->therm->subdev);
+-	_(TIMER   , device->timer   , &device->timer->subdev);
+-	_(TOP     , device->top     , &device->top->subdev);
+-	_(VOLT    , device->volt    , &device->volt->subdev);
+-#undef _
+-	default:
+-		engine = nvkm_device_engine(device, index);
+-		if (engine)
+-			return &engine->subdev;
+-		break;
++	list_for_each_entry(subdev, &device->subdev, head) {
++		if (subdev->index == type + inst)
++			return subdev;
+ 	}
++
+ 	return NULL;
+ }
+ 
+ struct nvkm_engine *
+-nvkm_device_engine(struct nvkm_device *device, int index)
++nvkm_device_engine(struct nvkm_device *device, int type, int inst)
+ {
+-	if (device->disable_mask & (1ULL << index))
+-		return NULL;
+-
+-	switch (index) {
+-#define _(n,p,m) case NVKM_ENGINE_##n: if (p) return (m); break
+-	_(BSP    , device->bsp     ,  device->bsp);
+-	_(CE0    , device->ce[0]   ,  device->ce[0]);
+-	_(CE1    , device->ce[1]   ,  device->ce[1]);
+-	_(CE2    , device->ce[2]   ,  device->ce[2]);
+-	_(CE3    , device->ce[3]   ,  device->ce[3]);
+-	_(CE4    , device->ce[4]   ,  device->ce[4]);
+-	_(CE5    , device->ce[5]   ,  device->ce[5]);
+-	_(CE6    , device->ce[6]   ,  device->ce[6]);
+-	_(CE7    , device->ce[7]   ,  device->ce[7]);
+-	_(CE8    , device->ce[8]   ,  device->ce[8]);
+-	_(CIPHER , device->cipher  ,  device->cipher);
+-	_(DISP   , device->disp    , &device->disp->engine);
+-	_(DMAOBJ , device->dma     , &device->dma->engine);
+-	_(FIFO   , device->fifo    , &device->fifo->engine);
+-	_(GR     , device->gr      , &device->gr->engine);
+-	_(IFB    , device->ifb     ,  device->ifb);
+-	_(ME     , device->me      ,  device->me);
+-	_(MPEG   , device->mpeg    ,  device->mpeg);
+-	_(MSENC  , device->msenc   ,  device->msenc);
+-	_(MSPDEC , device->mspdec  ,  device->mspdec);
+-	_(MSPPP  , device->msppp   ,  device->msppp);
+-	_(MSVLD  , device->msvld   ,  device->msvld);
+-	_(NVENC0 , device->nvenc[0], &device->nvenc[0]->engine);
+-	_(NVENC1 , device->nvenc[1], &device->nvenc[1]->engine);
+-	_(NVENC2 , device->nvenc[2], &device->nvenc[2]->engine);
+-	_(NVDEC0 , device->nvdec[0], &device->nvdec[0]->engine);
+-	_(NVDEC1 , device->nvdec[1], &device->nvdec[1]->engine);
+-	_(NVDEC2 , device->nvdec[2], &device->nvdec[2]->engine);
+-	_(PM     , device->pm      , &device->pm->engine);
+-	_(SEC    , device->sec     ,  device->sec);
+-	_(SEC2   , device->sec2    , &device->sec2->engine);
+-	_(SW     , device->sw      , &device->sw->engine);
+-	_(VIC    , device->vic     ,  device->vic);
+-	_(VP     , device->vp      ,  device->vp);
+-#undef _
+-	default:
+-		WARN_ON(1);
+-		break;
+-	}
++	struct nvkm_subdev *subdev = nvkm_device_subdev(device, type, inst);
++	if (subdev && subdev->func == &nvkm_engine)
++		return container_of(subdev, struct nvkm_engine, subdev);
+ 	return NULL;
+ }
+ 
+@@ -3264,7 +3194,7 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
+ 	if (device->chip->m && (subdev_mask & (1ULL << (s)))) {                \
+ 		ret = device->chip->m(device, (s), &device->m);                \
+ 		if (ret) {                                                     \
+-			subdev = nvkm_device_subdev(device, (s));              \
++			subdev = nvkm_device_subdev(device, (s), 0);           \
+ 			nvkm_subdev_del(&subdev);                              \
+ 			device->m = NULL;                                      \
+ 			if (ret != -ENODEV) {                                  \
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
+index 147894798786..e1958070b895 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
+@@ -51,7 +51,7 @@ nvkm_udevice_info_subdev(struct nvkm_device *device, u64 mthd, u64 *data)
+ 		return -EINVAL;
+ 	}
+ 
+-	subdev = nvkm_device_subdev(device, subidx);
++	subdev = nvkm_device_subdev(device, subidx, 0);
+ 	if (subdev)
+ 		return nvkm_subdev_info(subdev, mthd, data);
+ 	return -ENODEV;
+@@ -70,7 +70,7 @@ nvkm_udevice_info_v1(struct nvkm_device *device,
+ 	switch (args->mthd) {
+ #define ENGINE__(A,B,C) NV_DEVICE_INFO_ENGINE_##A: { int _i;                   \
+ 	for (_i = (B), args->data = 0ULL; _i <= (C); _i++) {                   \
+-		if (nvkm_device_engine(device, _i))                            \
++		if (nvkm_device_engine(device, _i, 0))                         \
+ 			args->data |= BIT_ULL(_i);                             \
+ 	}                                                                      \
+ }
+@@ -357,7 +357,7 @@ nvkm_udevice_child_get(struct nvkm_object *object, int index,
+ 	int i;
+ 
+ 	for (; i = __ffs64(mask), mask && !sclass; mask &= ~(1ULL << i)) {
+-		if (!(engine = nvkm_device_engine(device, i)) ||
++		if (!(engine = nvkm_device_engine(device, i, 0)) ||
+ 		    !(engine->func->base.sclass))
+ 			continue;
+ 		oclass->engine = engine;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
+index 50e3539f33d2..a7a7eb041515 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
+@@ -278,7 +278,7 @@ nv50_disp_chan_child_get(struct nvkm_object *object, int index,
+ 	const struct nvkm_device_oclass *oclass = NULL;
+ 
+ 	if (chan->func->bind)
+-		sclass->engine = nvkm_device_engine(device, NVKM_ENGINE_DMAOBJ);
++		sclass->engine = nvkm_device_engine(device, NVKM_ENGINE_DMAOBJ, 0);
+ 	else
+ 		sclass->engine = NULL;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index 407c45e6e305..0409c69daacb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -209,7 +209,7 @@ nvkm_fifo_chan_child_get(struct nvkm_object *object, int index,
+ 	int ret, i, c;
+ 
+ 	for (; c = 0, i = __ffs64(mask), mask; mask &= ~(1ULL << i)) {
+-		if (!(engine = nvkm_device_engine(device, i)))
++		if (!(engine = nvkm_device_engine(device, i, 0)))
+ 			continue;
+ 		oclass->engine = engine;
+ 		oclass->base.oclass = 0;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+index 6e9001a25f7d..4811cd30f0a3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -138,7 +138,7 @@ gf100_fifo_engine(struct gf100_fifo *fifo, u32 engn)
+ 		return NULL;
+ 	}
+ 
+-	return nvkm_device_engine(device, engn);
++	return nvkm_device_engine(device, engn, 0);
+ }
+ 
+ static void
+@@ -161,7 +161,7 @@ gf100_fifo_recover_work(struct work_struct *w)
+ 	nvkm_mask(device, 0x002630, engm, engm);
+ 
+ 	for (todo = mask; engn = __ffs64(todo), todo; todo &= ~BIT_ULL(engn)) {
+-		if ((engine = nvkm_device_engine(device, engn))) {
++		if ((engine = nvkm_device_engine(device, engn, 0))) {
+ 			nvkm_subdev_fini(&engine->subdev, false);
+ 			WARN_ON(nvkm_subdev_init(&engine->subdev));
+ 		}
+@@ -286,7 +286,7 @@ gf100_fifo_fault(struct nvkm_fifo *base, struct nvkm_fault_data *info)
+ 			nvkm_mask(device, 0x001718, 0x00000000, 0x00000000);
+ 			break;
+ 		default:
+-			engine = nvkm_device_engine(device, eu->data2);
++			engine = nvkm_device_engine(device, eu->data2, 0);
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+index 566361c669c4..25425f731103 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -483,7 +483,7 @@ gk104_fifo_fault(struct nvkm_fifo *base, struct nvkm_fault_data *info)
+ 			nvkm_mask(device, 0x001718, 0x00000000, 0x00000000);
+ 			break;
+ 		default:
+-			engine = nvkm_device_engine(device, ee->data2);
++			engine = nvkm_device_engine(device, ee->data2, 0);
+ 			break;
+ 		}
+ 	}
+@@ -496,7 +496,7 @@ gk104_fifo_fault(struct nvkm_fifo *base, struct nvkm_fault_data *info)
+ 			do {
+ 				*dst++ = toupper(*src++);
+ 			} while(*src);
+-			engine = nvkm_device_engine(device, engidx);
++			engine = nvkm_device_engine(device, engidx, 0);
+ 		}
+ 	} else {
+ 		snprintf(en, sizeof(en), "%s", ee->name);
+@@ -921,7 +921,7 @@ gk104_fifo_oneinit(struct nvkm_fifo *base)
+ 		nvkm_debug(subdev, "engine %2d: runlist %2d pbdma %2d (%s)\n",
+ 			   engn, runl, pbid, nvkm_subdev_type[engidx]);
+ 
+-		fifo->engine[engn].engine = nvkm_device_engine(device, engidx);
++		fifo->engine[engn].engine = nvkm_device_engine(device, engidx, 0);
+ 		fifo->engine[engn].runl = runl;
+ 		fifo->engine[engn].pbid = pbid;
+ 		fifo->engine_nr = max(fifo->engine_nr, engn + 1);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+index 6fd16790514c..f2e91f9c06e1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+@@ -303,7 +303,7 @@ tu102_fifo_fault(struct nvkm_fifo *base, struct nvkm_fault_data *info)
+ 			nvkm_mask(device, 0x001718, 0x00000000, 0x00000000);
+ 			break;
+ 		default:
+-			engine = nvkm_device_engine(device, ee->data2);
++			engine = nvkm_device_engine(device, ee->data2, 0);
+ 			break;
+ 		}
+ 	}
+@@ -318,7 +318,7 @@ tu102_fifo_fault(struct nvkm_fifo *base, struct nvkm_fault_data *info)
+ 			do {
+ 				*dst++ = toupper(*src++);
+ 			} while (*src);
+-			engine = nvkm_device_engine(device, engidx);
++			engine = nvkm_device_engine(device, engidx, 0);
+ 		}
+ 	} else {
+ 		snprintf(en, sizeof(en), "%s", ee->name);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgk104.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgk104.c
+index d350d92852d2..34a354599ee2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgk104.c
+@@ -260,7 +260,7 @@ gk104_ram_calc_gddr5(struct gk104_ram *ram, u32 freq)
+ 	ram_mask(fuc, 0x10f808, 0x40000000, 0x40000000);
+ 	ram_block(fuc);
+ 
+-	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP))
++	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP, 0))
+ 		ram_wr32(fuc, 0x62c000, 0x0f0f0000);
+ 
+ 	/* MR1: turn termination on early, for some reason.. */
+@@ -661,7 +661,7 @@ gk104_ram_calc_gddr5(struct gk104_ram *ram, u32 freq)
+ 
+ 	ram_unblock(fuc);
+ 
+-	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP))
++	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP, 0))
+ 		ram_wr32(fuc, 0x62c000, 0x0f0f0f00);
+ 
+ 	if (next->bios.rammap_11_08_01)
+@@ -711,7 +711,7 @@ gk104_ram_calc_sddr3(struct gk104_ram *ram, u32 freq)
+ 	ram_mask(fuc, 0x10f808, 0x40000000, 0x40000000);
+ 	ram_block(fuc);
+ 
+-	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP))
++	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP, 0))
+ 		ram_wr32(fuc, 0x62c000, 0x0f0f0000);
+ 
+ 	if (vc == 1 && ram_have(fuc, gpio2E)) {
+@@ -943,7 +943,7 @@ gk104_ram_calc_sddr3(struct gk104_ram *ram, u32 freq)
+ 
+ 	ram_unblock(fuc);
+ 
+-	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP))
++	if (nvkm_device_engine(ram->base.fb->subdev.device, NVKM_ENGINE_DISP, 0))
+ 		ram_wr32(fuc, 0x62c000, 0x0f0f0f00);
+ 
+ 	if (next->bios.rammap_11_08_01)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
+index 09f669ac6630..43bf0324a82e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
+@@ -90,7 +90,7 @@ nvkm_mc_intr(struct nvkm_device *device, bool *handled)
+ 	stat = nvkm_top_intr(device, intr, &subdevs);
+ 	while (subdevs) {
+ 		enum nvkm_devidx subidx = __ffs64(subdevs);
+-		subdev = nvkm_device_subdev(device, subidx);
++		subdev = nvkm_device_subdev(device, subidx, 0);
+ 		if (subdev)
+ 			nvkm_subdev_intr(subdev);
+ 		subdevs &= ~BIT_ULL(subidx);
+@@ -98,7 +98,7 @@ nvkm_mc_intr(struct nvkm_device *device, bool *handled)
+ 
+ 	for (map = mc->func->intr; map->stat; map++) {
+ 		if (intr & map->stat) {
+-			subdev = nvkm_device_subdev(device, map->unit);
++			subdev = nvkm_device_subdev(device, map->unit, 0);
+ 			if (subdev)
+ 				nvkm_subdev_intr(subdev);
+ 			stat &= ~map->stat;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/therm/gk104.c b/drivers/gpu/drm/nouveau/nvkm/subdev/therm/gk104.c
+index 4e03971d2e3d..f6f7db2a3db7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/therm/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/therm/gk104.c
+@@ -36,7 +36,7 @@ gk104_clkgate_enable(struct nvkm_therm *base)
+ 
+ 	/* Program ENG_MANT, ENG_FILTER */
+ 	for (i = 0; order[i].engine != NVKM_SUBDEV_NR; i++) {
+-		if (!nvkm_device_subdev(dev, order[i].engine))
++		if (!nvkm_device_subdev(dev, order[i].engine, 0))
+ 			continue;
+ 
+ 		nvkm_mask(dev, 0x20200 + order[i].offset, 0xff00, 0x4500);
+@@ -48,7 +48,7 @@ gk104_clkgate_enable(struct nvkm_therm *base)
+ 
+ 	/* Enable clockgating (ENG_CLK = RUN->AUTO) */
+ 	for (i = 0; order[i].engine != NVKM_SUBDEV_NR; i++) {
+-		if (!nvkm_device_subdev(dev, order[i].engine))
++		if (!nvkm_device_subdev(dev, order[i].engine, 0))
+ 			continue;
+ 
+ 		nvkm_mask(dev, 0x20200 + order[i].offset, 0x00ff, 0x0045);
+@@ -65,7 +65,7 @@ gk104_clkgate_fini(struct nvkm_therm *base, bool suspend)
+ 
+ 	/* ENG_CLK = AUTO->RUN, ENG_PWR = RUN->AUTO */
+ 	for (i = 0; order[i].engine != NVKM_SUBDEV_NR; i++) {
+-		if (!nvkm_device_subdev(dev, order[i].engine))
++		if (!nvkm_device_subdev(dev, order[i].engine, 0))
+ 			continue;
+ 
+ 		nvkm_mask(dev, 0x20200 + order[i].offset, 0xff, 0x54);
+-- 
+2.25.1
+

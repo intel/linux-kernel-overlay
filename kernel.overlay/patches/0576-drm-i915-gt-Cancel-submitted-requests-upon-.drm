@@ -1,0 +1,92 @@
+From 65db0001d8a20ad48370405e2c7c65d521d9b8ba Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 30 Dec 2020 22:00:28 +0000
+Subject: [PATCH 0576/1087] drm/i915/gt: Cancel submitted requests upon context
+ reset
+
+Since we process schedule-in of a context after submitting the request,
+if we decide to reset the context at that time, we also have to cancel
+the requets we have marked for submission.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201230220028.17089-1-chris@chris-wilson.co.uk
+---
+ .../drm/i915/gt/intel_execlists_submission.c  | 22 ++++++++++++++-----
+ drivers/gpu/drm/i915/i915_request.c           |  2 ++
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index f08ba2d1f6d6..33c5bbaad9fe 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -215,22 +215,32 @@ static void mark_eio(struct i915_request *rq)
+ }
+ 
+ static struct i915_request *
+-active_request(const struct intel_timeline * const tl, struct i915_request *rq)
++__active_request(const struct intel_timeline * const tl,
++		 struct i915_request *rq,
++		 int error)
+ {
+ 	struct i915_request *active = rq;
+ 
+-	rcu_read_lock();
+-	list_for_each_entry_continue_reverse(rq, &tl->requests, link) {
++	list_for_each_entry_from_reverse(rq, &tl->requests, link) {
+ 		if (__i915_request_is_complete(rq))
+ 			break;
+ 
++		if (error) {
++			i915_request_set_error_once(rq, error);
++			__i915_request_skip(rq);
++		}
+ 		active = rq;
+ 	}
+-	rcu_read_unlock();
+ 
+ 	return active;
+ }
+ 
++static struct i915_request *
++active_request(const struct intel_timeline * const tl, struct i915_request *rq)
++{
++	return __active_request(tl, rq, 0);
++}
++
+ static inline void
+ ring_set_paused(const struct intel_engine_cs *engine, int state)
+ {
+@@ -487,14 +497,14 @@ static void reset_active(struct i915_request *rq,
+ 	 * remain correctly ordered. And we defer to __i915_request_submit()
+ 	 * so that all asynchronous waits are correctly handled.
+ 	 */
+-	ENGINE_TRACE(engine, "{ rq=%llx:%lld }\n",
++	ENGINE_TRACE(engine, "{ reset rq=%llx:%lld }\n",
+ 		     rq->fence.context, rq->fence.seqno);
+ 
+ 	/* On resubmission of the active request, payload will be scrubbed */
+ 	if (__i915_request_is_complete(rq))
+ 		head = rq->tail;
+ 	else
+-		head = active_request(ce->timeline, rq)->head;
++		head = __active_request(ce->timeline, rq, -EIO)->head;
+ 	head = intel_ring_wrap(ce->ring, head);
+ 
+ 	/* Scrub the context image to prevent replaying the previous batch */
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index de434697dccd..03ac6eead4db 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -490,6 +490,8 @@ void __i915_request_skip(struct i915_request *rq)
+ 	if (rq->infix == rq->postfix)
+ 		return;
+ 
++	RQ_TRACE(rq, "error: %d\n", rq->fence.error);
++
+ 	/*
+ 	 * As this request likely depends on state from the lost
+ 	 * context, clear out all the user operations leaving the
+-- 
+2.17.1
+

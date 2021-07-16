@@ -1,0 +1,190 @@
+From fe629c2664a08158de8fa7f0260845c263ab6626 Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Thu, 27 Aug 2020 17:33:32 -0400
+Subject: [PATCH 0537/1714] drm/amdgpu: add TOC firmware support for apu (v3)
+
+APU needs load toc firmware for gfx10 series on psp front door loading.
+
+v2: rebase against latest code
+v3: clarify error message
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 11 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c | 36 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |  7 +++++
+ drivers/gpu/drm/amd/amdgpu/psp_v11_0.c  | 33 ++++++++++++++++-------
+ 4 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index ab6d9f1186c2..4ad6d801bc25 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -324,6 +324,10 @@ static int amdgpu_firmware_info(struct drm_amdgpu_info_firmware *fw_info,
+ 		fw_info->ver = adev->dm.dmcub_fw_version;
+ 		fw_info->feature = 0;
+ 		break;
++	case AMDGPU_INFO_FW_TOC:
++		fw_info->ver = adev->psp.toc_fw_version;
++		fw_info->feature = adev->psp.toc_feature_version;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1444,6 +1448,13 @@ static int amdgpu_debugfs_firmware_info(struct seq_file *m, void *data)
+ 	seq_printf(m, "DMCUB feature version: %u, firmware version: 0x%08x\n",
+ 		   fw_info.feature, fw_info.ver);
+ 
++	/* TOC */
++	query_fw.fw_type = AMDGPU_INFO_FW_TOC;
++	ret = amdgpu_firmware_info(&fw_info, &query_fw, adev);
++	if (ret)
++		return ret;
++	seq_printf(m, "TOC feature version: %u, firmware version: 0x%08x\n",
++		   fw_info.feature, fw_info.ver);
+ 
+ 	seq_printf(m, "VBIOS version: %s\n", ctx->vbios_version);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index a6dbe4b83533..cf337f2e9b0f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -2422,6 +2422,42 @@ int psp_init_asd_microcode(struct psp_context *psp,
+ 	return err;
+ }
+ 
++int psp_init_toc_microcode(struct psp_context *psp,
++			   const char *chip_name)
++{
++	struct amdgpu_device *adev = psp->adev;
++	char fw_name[30];
++	const struct psp_firmware_header_v1_0 *toc_hdr;
++	int err = 0;
++
++	if (!chip_name) {
++		dev_err(adev->dev, "invalid chip name for toc microcode\n");
++		return -EINVAL;
++	}
++
++	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_toc.bin", chip_name);
++	err = request_firmware(&adev->psp.toc_fw, fw_name, adev->dev);
++	if (err)
++		goto out;
++
++	err = amdgpu_ucode_validate(adev->psp.toc_fw);
++	if (err)
++		goto out;
++
++	toc_hdr = (const struct psp_firmware_header_v1_0 *)adev->psp.toc_fw->data;
++	adev->psp.toc_fw_version = le32_to_cpu(toc_hdr->header.ucode_version);
++	adev->psp.toc_feature_version = le32_to_cpu(toc_hdr->ucode_feature_version);
++	adev->psp.toc_bin_size = le32_to_cpu(toc_hdr->header.ucode_size_bytes);
++	adev->psp.toc_start_addr = (uint8_t *)toc_hdr +
++				le32_to_cpu(toc_hdr->header.ucode_array_offset_bytes);
++	return 0;
++out:
++	dev_err(adev->dev, "fail to request/validate toc microcode\n");
++	release_firmware(adev->psp.toc_fw);
++	adev->psp.toc_fw = NULL;
++	return err;
++}
++
+ int psp_init_sos_microcode(struct psp_context *psp,
+ 			   const char *chip_name)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 919d2fb7427b..13f56618660a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -253,6 +253,11 @@ struct psp_context
+ 	uint32_t			asd_ucode_size;
+ 	uint8_t				*asd_start_addr;
+ 
++	/* toc firmware */
++	const struct firmware		*toc_fw;
++	uint32_t			toc_fw_version;
++	uint32_t			toc_feature_version;
++
+ 	/* fence buffer */
+ 	struct amdgpu_bo		*fence_buf_bo;
+ 	uint64_t			fence_buf_mc_addr;
+@@ -386,6 +391,8 @@ int psp_ring_cmd_submit(struct psp_context *psp,
+ 			int index);
+ int psp_init_asd_microcode(struct psp_context *psp,
+ 			   const char *chip_name);
++int psp_init_toc_microcode(struct psp_context *psp,
++			   const char *chip_name);
+ int psp_init_sos_microcode(struct psp_context *psp,
+ 			   const char *chip_name);
+ int psp_init_ta_microcode(struct psp_context *psp,
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+index 6c5d9612abcb..f2d6b2518eee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+@@ -109,20 +109,16 @@ static int psp_v11_0_init_microcode(struct psp_context *psp)
+ 		BUG();
+ 	}
+ 
+-	err = psp_init_sos_microcode(psp, chip_name);
+-	if (err)
+-		return err;
+-
+-	if (adev->asic_type != CHIP_SIENNA_CICHLID &&
+-	    adev->asic_type != CHIP_NAVY_FLOUNDER) {
+-		err = psp_init_asd_microcode(psp, chip_name);
+-		if (err)
+-			return err;
+-	}
+ 
+ 	switch (adev->asic_type) {
+ 	case CHIP_VEGA20:
+ 	case CHIP_ARCTURUS:
++		err = psp_init_sos_microcode(psp, chip_name);
++		if (err)
++			return err;
++		err = psp_init_asd_microcode(psp, chip_name);
++		if (err)
++			return err;
+ 		snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_ta.bin", chip_name);
+ 		err = request_firmware(&adev->psp.ta_fw, fw_name, adev->dev);
+ 		if (err) {
+@@ -150,6 +146,12 @@ static int psp_v11_0_init_microcode(struct psp_context *psp)
+ 	case CHIP_NAVI10:
+ 	case CHIP_NAVI14:
+ 	case CHIP_NAVI12:
++		err = psp_init_sos_microcode(psp, chip_name);
++		if (err)
++			return err;
++		err = psp_init_asd_microcode(psp, chip_name);
++		if (err)
++			return err;
+ 		if (amdgpu_sriov_vf(adev))
+ 			break;
+ 		snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_ta.bin", chip_name);
+@@ -180,10 +182,21 @@ static int psp_v11_0_init_microcode(struct psp_context *psp)
+ 		break;
+ 	case CHIP_SIENNA_CICHLID:
+ 	case CHIP_NAVY_FLOUNDER:
++		err = psp_init_sos_microcode(psp, chip_name);
++		if (err)
++			return err;
+ 		err = psp_init_ta_microcode(&adev->psp, chip_name);
+ 		if (err)
+ 			return err;
+ 		break;
++	case CHIP_VANGOGH:
++		err = psp_init_asd_microcode(psp, chip_name);
++		if (err)
++			return err;
++		err = psp_init_toc_microcode(psp, chip_name);
++		if (err)
++			return err;
++		break;
+ 	default:
+ 		BUG();
+ 	}
+-- 
+2.25.1
+

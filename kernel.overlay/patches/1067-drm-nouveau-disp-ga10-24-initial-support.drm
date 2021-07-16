@@ -1,0 +1,788 @@
+From 2f1bec9eafa4426c5501d5026e51663bdeed497a Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 13 Jan 2021 17:12:52 +1000
+Subject: [PATCH 1067/1087] drm/nouveau/disp/ga10[24]: initial support
+
+UEFI/RM no longer use IED scripts from the VBIOS, though they appear to
+have been updated for use by the x86 VBIOS code, so we should be able to
+continue using them for the moment.
+
+Unfortunately, we require some hacks to do so, as the BeforeLinkTraining
+IED script became a pointer to an array of scripts instead, without a
+revbump of the relevant tables.
+
+There's also some changes to SOR clock divider fiddling, which are
+hopefully correct enough that things work as they should.
+
+AFAIK, GA100 shouldn't have display, so it hasn't been added.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+---
+ drivers/gpu/drm/nouveau/dispnv50/Kbuild       |   1 +
+ drivers/gpu/drm/nouveau/dispnv50/core.c       |   1 +
+ drivers/gpu/drm/nouveau/dispnv50/curs.c       |   1 +
+ drivers/gpu/drm/nouveau/dispnv50/wimm.c       |   1 +
+ drivers/gpu/drm/nouveau/dispnv50/wndw.c       |   1 +
+ drivers/gpu/drm/nouveau/dispnv50/wndw.h       |   8 +
+ drivers/gpu/drm/nouveau/dispnv50/wndwc57e.c   |  10 +-
+ drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c   | 106 +++++++++++++
+ drivers/gpu/drm/nouveau/include/nvif/class.h  |   5 +
+ .../drm/nouveau/include/nvkm/engine/disp.h    |   1 +
+ drivers/gpu/drm/nouveau/nvif/disp.c           |   1 +
+ .../gpu/drm/nouveau/nvkm/engine/device/base.c |   2 +
+ .../gpu/drm/nouveau/nvkm/engine/disp/Kbuild   |   3 +
+ drivers/gpu/drm/nouveau/nvkm/engine/disp/dp.c |  33 ++++-
+ .../gpu/drm/nouveau/nvkm/engine/disp/ga102.c  |  46 ++++++
+ .../gpu/drm/nouveau/nvkm/engine/disp/ior.h    |   4 +
+ .../gpu/drm/nouveau/nvkm/engine/disp/nv50.h   |   2 +
+ .../drm/nouveau/nvkm/engine/disp/rootga102.c  |  52 +++++++
+ .../drm/nouveau/nvkm/engine/disp/rootnv50.h   |   1 +
+ .../drm/nouveau/nvkm/engine/disp/sorga102.c   | 140 ++++++++++++++++++
+ .../drm/nouveau/nvkm/engine/disp/sortu102.c   |   2 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/tu102.c  |   2 +-
+ 22 files changed, 410 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/disp/rootga102.c
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/disp/sorga102.c
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/Kbuild b/drivers/gpu/drm/nouveau/dispnv50/Kbuild
+index 6fdddb266fb1..4488e1c061b3 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/Kbuild
++++ b/drivers/gpu/drm/nouveau/dispnv50/Kbuild
+@@ -37,6 +37,7 @@ nouveau-y += dispnv50/wimmc37b.o
+ nouveau-y += dispnv50/wndw.o
+ nouveau-y += dispnv50/wndwc37e.o
+ nouveau-y += dispnv50/wndwc57e.o
++nouveau-y += dispnv50/wndwc67e.o
+ 
+ nouveau-y += dispnv50/base.o
+ nouveau-y += dispnv50/base507c.o
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/core.c b/drivers/gpu/drm/nouveau/dispnv50/core.c
+index 27ea3f34706d..abefc2343443 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/core.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/core.c
+@@ -42,6 +42,7 @@ nv50_core_new(struct nouveau_drm *drm, struct nv50_core **pcore)
+ 		int version;
+ 		int (*new)(struct nouveau_drm *, s32, struct nv50_core **);
+ 	} cores[] = {
++		{ GA102_DISP_CORE_CHANNEL_DMA, 0, corec57d_new },
+ 		{ TU102_DISP_CORE_CHANNEL_DMA, 0, corec57d_new },
+ 		{ GV100_DISP_CORE_CHANNEL_DMA, 0, corec37d_new },
+ 		{ GP102_DISP_CORE_CHANNEL_DMA, 0, core917d_new },
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/curs.c b/drivers/gpu/drm/nouveau/dispnv50/curs.c
+index 121c24a18f11..31d8b2e4791d 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/curs.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/curs.c
+@@ -31,6 +31,7 @@ nv50_curs_new(struct nouveau_drm *drm, int head, struct nv50_wndw **pwndw)
+ 		int version;
+ 		int (*new)(struct nouveau_drm *, int, s32, struct nv50_wndw **);
+ 	} curses[] = {
++		{ GA102_DISP_CURSOR, 0, cursc37a_new },
+ 		{ TU102_DISP_CURSOR, 0, cursc37a_new },
+ 		{ GV100_DISP_CURSOR, 0, cursc37a_new },
+ 		{ GK104_DISP_CURSOR, 0, curs907a_new },
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/wimm.c b/drivers/gpu/drm/nouveau/dispnv50/wimm.c
+index a1ac153d5e98..566fbddfc8d7 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/wimm.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/wimm.c
+@@ -31,6 +31,7 @@ nv50_wimm_init(struct nouveau_drm *drm, struct nv50_wndw *wndw)
+ 		int version;
+ 		int (*init)(struct nouveau_drm *, s32, struct nv50_wndw *);
+ 	} wimms[] = {
++		{ GA102_DISP_WINDOW_IMM_CHANNEL_DMA, 0, wimmc37b_init },
+ 		{ TU102_DISP_WINDOW_IMM_CHANNEL_DMA, 0, wimmc37b_init },
+ 		{ GV100_DISP_WINDOW_IMM_CHANNEL_DMA, 0, wimmc37b_init },
+ 		{}
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/wndw.c b/drivers/gpu/drm/nouveau/dispnv50/wndw.c
+index 0356474ad6f6..ce451242f79e 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/wndw.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/wndw.c
+@@ -784,6 +784,7 @@ nv50_wndw_new(struct nouveau_drm *drm, enum drm_plane_type type, int index,
+ 		int (*new)(struct nouveau_drm *, enum drm_plane_type,
+ 			   int, s32, struct nv50_wndw **);
+ 	} wndws[] = {
++		{ GA102_DISP_WINDOW_CHANNEL_DMA, 0, wndwc67e_new },
+ 		{ TU102_DISP_WINDOW_CHANNEL_DMA, 0, wndwc57e_new },
+ 		{ GV100_DISP_WINDOW_CHANNEL_DMA, 0, wndwc37e_new },
+ 		{}
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/wndw.h b/drivers/gpu/drm/nouveau/dispnv50/wndw.h
+index 3278e2880034..f4e0c5080034 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/wndw.h
++++ b/drivers/gpu/drm/nouveau/dispnv50/wndw.h
+@@ -129,6 +129,14 @@ int wndwc37e_update(struct nv50_wndw *, u32 *);
+ 
+ int wndwc57e_new(struct nouveau_drm *, enum drm_plane_type, int, s32,
+ 		 struct nv50_wndw **);
++bool wndwc57e_ilut(struct nv50_wndw *, struct nv50_wndw_atom *, int);
++int wndwc57e_ilut_set(struct nv50_wndw *, struct nv50_wndw_atom *);
++int wndwc57e_ilut_clr(struct nv50_wndw *);
++int wndwc57e_csc_set(struct nv50_wndw *, struct nv50_wndw_atom *);
++int wndwc57e_csc_clr(struct nv50_wndw *);
++
++int wndwc67e_new(struct nouveau_drm *, enum drm_plane_type, int, s32,
++		 struct nv50_wndw **);
+ 
+ int nv50_wndw_new(struct nouveau_drm *, enum drm_plane_type, int index,
+ 		  struct nv50_wndw **);
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/wndwc57e.c b/drivers/gpu/drm/nouveau/dispnv50/wndwc57e.c
+index 429be0bb0222..abdd3bb658b3 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/wndwc57e.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/wndwc57e.c
+@@ -80,7 +80,7 @@ wndwc57e_image_set(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+ 	return 0;
+ }
+ 
+-static int
++int
+ wndwc57e_csc_clr(struct nv50_wndw *wndw)
+ {
+ 	struct nvif_push *push = wndw->wndw.push;
+@@ -98,7 +98,7 @@ wndwc57e_csc_clr(struct nv50_wndw *wndw)
+ 	return 0;
+ }
+ 
+-static int
++int
+ wndwc57e_csc_set(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+ {
+ 	struct nvif_push *push = wndw->wndw.push;
+@@ -111,7 +111,7 @@ wndwc57e_csc_set(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+ 	return 0;
+ }
+ 
+-static int
++int
+ wndwc57e_ilut_clr(struct nv50_wndw *wndw)
+ {
+ 	struct nvif_push *push = wndw->wndw.push;
+@@ -124,7 +124,7 @@ wndwc57e_ilut_clr(struct nv50_wndw *wndw)
+ 	return 0;
+ }
+ 
+-static int
++int
+ wndwc57e_ilut_set(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+ {
+ 	struct nvif_push *push = wndw->wndw.push;
+@@ -179,7 +179,7 @@ wndwc57e_ilut_load(struct drm_color_lut *in, int size, void __iomem *mem)
+ 	writew(readw(mem - 4), mem + 4);
+ }
+ 
+-static bool
++bool
+ wndwc57e_ilut(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw, int size)
+ {
+ 	if (size = size ? size : 1024, size != 256 && size != 1024)
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c b/drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c
+new file mode 100644
+index 000000000000..7a370fa1df20
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "wndw.h"
++#include "atom.h"
++
++#include <nvif/pushc37b.h>
++
++#include <nvhw/class/clc57e.h>
++
++static int
++wndwc67e_image_set(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
++{
++	struct nvif_push *push = wndw->wndw.push;
++	int ret;
++
++	if ((ret = PUSH_WAIT(push, 17)))
++		return ret;
++
++	PUSH_MTHD(push, NVC57E, SET_PRESENT_CONTROL,
++		  NVVAL(NVC57E, SET_PRESENT_CONTROL, MIN_PRESENT_INTERVAL, asyw->image.interval) |
++		  NVVAL(NVC57E, SET_PRESENT_CONTROL, BEGIN_MODE, asyw->image.mode) |
++		  NVDEF(NVC57E, SET_PRESENT_CONTROL, TIMESTAMP_MODE, DISABLE));
++
++	PUSH_MTHD(push, NVC57E, SET_SIZE,
++		  NVVAL(NVC57E, SET_SIZE, WIDTH, asyw->image.w) |
++		  NVVAL(NVC57E, SET_SIZE, HEIGHT, asyw->image.h),
++
++				SET_STORAGE,
++		  NVVAL(NVC57E, SET_STORAGE, BLOCK_HEIGHT, asyw->image.blockh),
++
++				SET_PARAMS,
++		  NVVAL(NVC57E, SET_PARAMS, FORMAT, asyw->image.format) |
++		  NVDEF(NVC57E, SET_PARAMS, CLAMP_BEFORE_BLEND, DISABLE) |
++		  NVDEF(NVC57E, SET_PARAMS, SWAP_UV, DISABLE) |
++		  NVDEF(NVC57E, SET_PARAMS, FMT_ROUNDING_MODE, ROUND_TO_NEAREST),
++
++				SET_PLANAR_STORAGE(0),
++		  NVVAL(NVC57E, SET_PLANAR_STORAGE, PITCH, asyw->image.blocks[0]) |
++		  NVVAL(NVC57E, SET_PLANAR_STORAGE, PITCH, asyw->image.pitch[0] >> 6));
++
++	PUSH_MTHD(push, NVC57E, SET_CONTEXT_DMA_ISO(0), asyw->image.handle, 1);
++	PUSH_MTHD(push, NVC57E, SET_OFFSET(0), asyw->image.offset[0] >> 8);
++
++	PUSH_MTHD(push, NVC57E, SET_POINT_IN(0),
++		  NVVAL(NVC57E, SET_POINT_IN, X, asyw->state.src_x >> 16) |
++		  NVVAL(NVC57E, SET_POINT_IN, Y, asyw->state.src_y >> 16));
++
++	PUSH_MTHD(push, NVC57E, SET_SIZE_IN,
++		  NVVAL(NVC57E, SET_SIZE_IN, WIDTH, asyw->state.src_w >> 16) |
++		  NVVAL(NVC57E, SET_SIZE_IN, HEIGHT, asyw->state.src_h >> 16));
++
++	PUSH_MTHD(push, NVC57E, SET_SIZE_OUT,
++		  NVVAL(NVC57E, SET_SIZE_OUT, WIDTH, asyw->state.crtc_w) |
++		  NVVAL(NVC57E, SET_SIZE_OUT, HEIGHT, asyw->state.crtc_h));
++	return 0;
++}
++
++static const struct nv50_wndw_func
++wndwc67e = {
++	.acquire = wndwc37e_acquire,
++	.release = wndwc37e_release,
++	.sema_set = wndwc37e_sema_set,
++	.sema_clr = wndwc37e_sema_clr,
++	.ntfy_set = wndwc37e_ntfy_set,
++	.ntfy_clr = wndwc37e_ntfy_clr,
++	.ntfy_reset = corec37d_ntfy_init,
++	.ntfy_wait_begun = base507c_ntfy_wait_begun,
++	.ilut = wndwc57e_ilut,
++	.ilut_identity = true,
++	.ilut_size = 1024,
++	.xlut_set = wndwc57e_ilut_set,
++	.xlut_clr = wndwc57e_ilut_clr,
++	.csc = base907c_csc,
++	.csc_set = wndwc57e_csc_set,
++	.csc_clr = wndwc57e_csc_clr,
++	.image_set = wndwc67e_image_set,
++	.image_clr = wndwc37e_image_clr,
++	.blend_set = wndwc37e_blend_set,
++	.update = wndwc37e_update,
++};
++
++int
++wndwc67e_new(struct nouveau_drm *drm, enum drm_plane_type type, int index,
++	     s32 oclass, struct nv50_wndw **pwndw)
++{
++	return wndwc37e_new_(&wndwc67e, drm, type, index, oclass, BIT(index >> 1), pwndw);
++}
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/class.h b/drivers/gpu/drm/nouveau/include/nvif/class.h
+index 2c79beb41126..ba2c28ea43d2 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/class.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/class.h
+@@ -88,6 +88,7 @@
+ #define GP102_DISP                                    /* cl5070.h */ 0x00009870
+ #define GV100_DISP                                    /* cl5070.h */ 0x0000c370
+ #define TU102_DISP                                    /* cl5070.h */ 0x0000c570
++#define GA102_DISP                                    /* cl5070.h */ 0x0000c670
+ 
+ #define GV100_DISP_CAPS                                              0x0000c373
+ 
+@@ -103,6 +104,7 @@
+ #define GK104_DISP_CURSOR                             /* cl507a.h */ 0x0000917a
+ #define GV100_DISP_CURSOR                             /* cl507a.h */ 0x0000c37a
+ #define TU102_DISP_CURSOR                             /* cl507a.h */ 0x0000c57a
++#define GA102_DISP_CURSOR                             /* cl507a.h */ 0x0000c67a
+ 
+ #define NV50_DISP_OVERLAY                             /* cl507b.h */ 0x0000507b
+ #define G82_DISP_OVERLAY                              /* cl507b.h */ 0x0000827b
+@@ -112,6 +114,7 @@
+ 
+ #define GV100_DISP_WINDOW_IMM_CHANNEL_DMA             /* clc37b.h */ 0x0000c37b
+ #define TU102_DISP_WINDOW_IMM_CHANNEL_DMA             /* clc37b.h */ 0x0000c57b
++#define GA102_DISP_WINDOW_IMM_CHANNEL_DMA             /* clc37b.h */ 0x0000c67b
+ 
+ #define NV50_DISP_BASE_CHANNEL_DMA                    /* cl507c.h */ 0x0000507c
+ #define G82_DISP_BASE_CHANNEL_DMA                     /* cl507c.h */ 0x0000827c
+@@ -135,6 +138,7 @@
+ #define GP102_DISP_CORE_CHANNEL_DMA                   /* cl507d.h */ 0x0000987d
+ #define GV100_DISP_CORE_CHANNEL_DMA                   /* cl507d.h */ 0x0000c37d
+ #define TU102_DISP_CORE_CHANNEL_DMA                   /* cl507d.h */ 0x0000c57d
++#define GA102_DISP_CORE_CHANNEL_DMA                   /* cl507d.h */ 0x0000c67d
+ 
+ #define NV50_DISP_OVERLAY_CHANNEL_DMA                 /* cl507e.h */ 0x0000507e
+ #define G82_DISP_OVERLAY_CHANNEL_DMA                  /* cl507e.h */ 0x0000827e
+@@ -145,6 +149,7 @@
+ 
+ #define GV100_DISP_WINDOW_CHANNEL_DMA                 /* clc37e.h */ 0x0000c37e
+ #define TU102_DISP_WINDOW_CHANNEL_DMA                 /* clc37e.h */ 0x0000c57e
++#define GA102_DISP_WINDOW_CHANNEL_DMA                 /* clc37e.h */ 0x0000c67e
+ 
+ #define NV50_TESLA                                                   0x00005097
+ #define G82_TESLA                                                    0x00008297
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/disp.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/disp.h
+index 5a96c942d912..0f6fa6631a19 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/disp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/disp.h
+@@ -37,4 +37,5 @@ int gp100_disp_new(struct nvkm_device *, int, struct nvkm_disp **);
+ int gp102_disp_new(struct nvkm_device *, int, struct nvkm_disp **);
+ int gv100_disp_new(struct nvkm_device *, int, struct nvkm_disp **);
+ int tu102_disp_new(struct nvkm_device *, int, struct nvkm_disp **);
++int ga102_disp_new(struct nvkm_device *, int, struct nvkm_disp **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvif/disp.c b/drivers/gpu/drm/nouveau/nvif/disp.c
+index 8d0d30e08f57..529cb60d5efb 100644
+--- a/drivers/gpu/drm/nouveau/nvif/disp.c
++++ b/drivers/gpu/drm/nouveau/nvif/disp.c
+@@ -35,6 +35,7 @@ nvif_disp_ctor(struct nvif_device *device, const char *name, s32 oclass,
+ 	       struct nvif_disp *disp)
+ {
+ 	static const struct nvif_mclass disps[] = {
++		{ GA102_DISP, -1 },
+ 		{ TU102_DISP, -1 },
+ 		{ GV100_DISP, -1 },
+ 		{ GP102_DISP, -1 },
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index bea3daf08570..cdcc851e06f9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -2684,6 +2684,7 @@ nv172_chipset = {
+ 	.mmu = tu102_mmu_new,
+ 	.pci = gp100_pci_new,
+ 	.timer = gk20a_timer_new,
++	.disp = ga102_disp_new,
+ 	.dma = gv100_dma_new,
+ };
+ 
+@@ -2702,6 +2703,7 @@ nv174_chipset = {
+ 	.mmu = tu102_mmu_new,
+ 	.pci = gp100_pci_new,
+ 	.timer = gk20a_timer_new,
++	.disp = ga102_disp_new,
+ 	.dma = gv100_dma_new,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/Kbuild b/drivers/gpu/drm/nouveau/nvkm/engine/disp/Kbuild
+index cf075311cdd2..b03f043efe26 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/Kbuild
+@@ -17,6 +17,7 @@ nvkm-y += nvkm/engine/disp/gp100.o
+ nvkm-y += nvkm/engine/disp/gp102.o
+ nvkm-y += nvkm/engine/disp/gv100.o
+ nvkm-y += nvkm/engine/disp/tu102.o
++nvkm-y += nvkm/engine/disp/ga102.o
+ nvkm-y += nvkm/engine/disp/vga.o
+ 
+ nvkm-y += nvkm/engine/disp/head.o
+@@ -42,6 +43,7 @@ nvkm-y += nvkm/engine/disp/sorgm200.o
+ nvkm-y += nvkm/engine/disp/sorgp100.o
+ nvkm-y += nvkm/engine/disp/sorgv100.o
+ nvkm-y += nvkm/engine/disp/sortu102.o
++nvkm-y += nvkm/engine/disp/sorga102.o
+ 
+ nvkm-y += nvkm/engine/disp/outp.o
+ nvkm-y += nvkm/engine/disp/dp.o
+@@ -75,6 +77,7 @@ nvkm-y += nvkm/engine/disp/rootgp100.o
+ nvkm-y += nvkm/engine/disp/rootgp102.o
+ nvkm-y += nvkm/engine/disp/rootgv100.o
+ nvkm-y += nvkm/engine/disp/roottu102.o
++nvkm-y += nvkm/engine/disp/rootga102.o
+ 
+ nvkm-y += nvkm/engine/disp/capsgv100.o
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dp.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dp.c
+index 3800aeb507d0..55fbfe28c6dc 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dp.c
+@@ -33,6 +33,12 @@
+ 
+ #include <nvif/event.h>
+ 
++/* IED scripts are no longer used by UEFI/RM from Ampere, but have been updated for
++ * the x86 option ROM.  However, the relevant VBIOS table versions weren't modified,
++ * so we're unable to detect this in a nice way.
++ */
++#define AMPERE_IED_HACK(disp) ((disp)->engine.subdev.device->card_type >= GA100)
++
+ struct lt_state {
+ 	struct nvkm_dp *dp;
+ 	u8  stat[6];
+@@ -238,6 +244,19 @@ nvkm_dp_train_links(struct nvkm_dp *dp)
+ 		dp->dpcd[DPCD_RC02] &= ~DPCD_RC02_TPS3_SUPPORTED;
+ 	lt.pc2 = dp->dpcd[DPCD_RC02] & DPCD_RC02_TPS3_SUPPORTED;
+ 
++	if (AMPERE_IED_HACK(disp) && (lnkcmp = lt.dp->info.script[0])) {
++		/* Execute BeforeLinkTraining script from DP Info table. */
++		while (ior->dp.bw < nvbios_rd08(bios, lnkcmp))
++			lnkcmp += 3;
++		lnkcmp = nvbios_rd16(bios, lnkcmp + 1);
++
++		nvbios_init(&dp->outp.disp->engine.subdev, lnkcmp,
++			init.outp = &dp->outp.info;
++			init.or   = ior->id;
++			init.link = ior->asy.link;
++		);
++	}
++
+ 	/* Set desired link configuration on the source. */
+ 	if ((lnkcmp = lt.dp->info.lnkcmp)) {
+ 		if (dp->version < 0x30) {
+@@ -316,12 +335,14 @@ nvkm_dp_train_init(struct nvkm_dp *dp)
+ 		);
+ 	}
+ 
+-	/* Execute BeforeLinkTraining script from DP Info table. */
+-	nvbios_init(&dp->outp.disp->engine.subdev, dp->info.script[0],
+-		init.outp = &dp->outp.info;
+-		init.or   = dp->outp.ior->id;
+-		init.link = dp->outp.ior->asy.link;
+-	);
++	if (!AMPERE_IED_HACK(dp->outp.disp)) {
++		/* Execute BeforeLinkTraining script from DP Info table. */
++		nvbios_init(&dp->outp.disp->engine.subdev, dp->info.script[0],
++			init.outp = &dp->outp.info;
++			init.or   = dp->outp.ior->id;
++			init.link = dp->outp.ior->asy.link;
++		);
++	}
+ }
+ 
+ static const struct dp_rates {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
+new file mode 100644
+index 000000000000..aa2e5645fe36
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
+@@ -0,0 +1,46 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "nv50.h"
++#include "head.h"
++#include "ior.h"
++#include "channv50.h"
++#include "rootnv50.h"
++
++static const struct nv50_disp_func
++ga102_disp = {
++	.init = tu102_disp_init,
++	.fini = gv100_disp_fini,
++	.intr = gv100_disp_intr,
++	.uevent = &gv100_disp_chan_uevent,
++	.super = gv100_disp_super,
++	.root = &ga102_disp_root_oclass,
++	.wndw = { .cnt = gv100_disp_wndw_cnt },
++	.head = { .cnt = gv100_head_cnt, .new = gv100_head_new },
++	.sor = { .cnt = gv100_sor_cnt, .new = ga102_sor_new },
++	.ramht_size = 0x2000,
++};
++
++int
++ga102_disp_new(struct nvkm_device *device, int index, struct nvkm_disp **pdisp)
++{
++	return nv50_disp_new_(&ga102_disp, device, index, pdisp);
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
+index 09f3038eff26..9f0bb7c6b010 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
+@@ -150,6 +150,8 @@ void gv100_sor_dp_audio(struct nvkm_ior *, int, bool);
+ void gv100_sor_dp_audio_sym(struct nvkm_ior *, int, u16, u32);
+ void gv100_sor_dp_watermark(struct nvkm_ior *, int, u8);
+ 
++void tu102_sor_dp_vcpi(struct nvkm_ior *, int, u8, u8, u16, u16);
++
+ void g84_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
+ void gt215_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
+ void gf119_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
+@@ -207,4 +209,6 @@ int gv100_sor_cnt(struct nvkm_disp *, unsigned long *);
+ int gv100_sor_new(struct nvkm_disp *, int);
+ 
+ int tu102_sor_new(struct nvkm_disp *, int);
++
++int ga102_sor_new(struct nvkm_disp *, int);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
+index a677161c7f3a..db31b37752a2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
+@@ -86,6 +86,8 @@ void gv100_disp_intr(struct nv50_disp *);
+ void gv100_disp_super(struct work_struct *);
+ int gv100_disp_wndw_cnt(struct nvkm_disp *, unsigned long *);
+ 
++int tu102_disp_init(struct nv50_disp *);
++
+ void nv50_disp_dptmds_war_2(struct nv50_disp *, struct dcb_output *);
+ void nv50_disp_dptmds_war_3(struct nv50_disp *, struct dcb_output *);
+ void nv50_disp_update_sppll1(struct nv50_disp *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootga102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootga102.c
+new file mode 100644
+index 000000000000..9af07c3cf9fc
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootga102.c
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "rootnv50.h"
++#include "channv50.h"
++
++#include <nvif/class.h>
++
++static const struct nv50_disp_root_func
++ga102_disp_root = {
++	.user = {
++		{{-1,-1,GV100_DISP_CAPS                }, gv100_disp_caps_new },
++		{{0,0,GA102_DISP_CURSOR                }, gv100_disp_curs_new },
++		{{0,0,GA102_DISP_WINDOW_IMM_CHANNEL_DMA}, gv100_disp_wimm_new },
++		{{0,0,GA102_DISP_CORE_CHANNEL_DMA      }, gv100_disp_core_new },
++		{{0,0,GA102_DISP_WINDOW_CHANNEL_DMA    }, gv100_disp_wndw_new },
++		{}
++	},
++};
++
++static int
++ga102_disp_root_new(struct nvkm_disp *disp, const struct nvkm_oclass *oclass,
++		    void *data, u32 size, struct nvkm_object **pobject)
++{
++	return nv50_disp_root_new_(&ga102_disp_root, disp, oclass, data, size, pobject);
++}
++
++const struct nvkm_disp_oclass
++ga102_disp_root_oclass = {
++	.base.oclass = GA102_DISP,
++	.base.minver = -1,
++	.base.maxver = -1,
++	.ctor = ga102_disp_root_new,
++};
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
+index 7070f5408d92..27bb170d0293 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
+@@ -41,4 +41,5 @@ extern const struct nvkm_disp_oclass gp100_disp_root_oclass;
+ extern const struct nvkm_disp_oclass gp102_disp_root_oclass;
+ extern const struct nvkm_disp_oclass gv100_disp_root_oclass;
+ extern const struct nvkm_disp_oclass tu102_disp_root_oclass;
++extern const struct nvkm_disp_oclass ga102_disp_root_oclass;
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/sorga102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/sorga102.c
+new file mode 100644
+index 000000000000..033827de9116
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/sorga102.c
+@@ -0,0 +1,140 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "ior.h"
++
++#include <subdev/timer.h>
++
++static int
++ga102_sor_dp_links(struct nvkm_ior *sor, struct nvkm_i2c_aux *aux)
++{
++	struct nvkm_device *device = sor->disp->engine.subdev.device;
++	const u32 soff = nv50_ior_base(sor);
++	const u32 loff = nv50_sor_link(sor);
++	u32 dpctrl = 0x00000000;
++	u32 clksor = 0x00000000;
++
++	switch (sor->dp.bw) {
++	case 0x06: clksor |= 0x00000000; break;
++	case 0x0a: clksor |= 0x00040000; break;
++	case 0x14: clksor |= 0x00080000; break;
++	case 0x1e: clksor |= 0x000c0000; break;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++
++	dpctrl |= ((1 << sor->dp.nr) - 1) << 16;
++	if (sor->dp.mst)
++		dpctrl |= 0x40000000;
++	if (sor->dp.ef)
++		dpctrl |= 0x00004000;
++
++	nvkm_mask(device, 0x612300 + soff, 0x007c0000, clksor);
++
++	/*XXX*/
++	nvkm_msec(device, 40, NVKM_DELAY);
++	nvkm_mask(device, 0x612300 + soff, 0x00030000, 0x00010000);
++	nvkm_mask(device, 0x61c10c + loff, 0x00000003, 0x00000001);
++
++	nvkm_mask(device, 0x61c10c + loff, 0x401f4000, dpctrl);
++	return 0;
++}
++
++static void
++ga102_sor_clock(struct nvkm_ior *sor)
++{
++	struct nvkm_device *device = sor->disp->engine.subdev.device;
++	u32 div2 = 0;
++	if (sor->asy.proto == TMDS) {
++		if (sor->tmds.high_speed)
++			div2 = 1;
++	}
++	nvkm_wr32(device, 0x00ec08 + (sor->id * 0x10), 0x00000000);
++	nvkm_wr32(device, 0x00ec04 + (sor->id * 0x10), div2);
++}
++
++static const struct nvkm_ior_func
++ga102_sor_hda = {
++	.route = {
++		.get = gm200_sor_route_get,
++		.set = gm200_sor_route_set,
++	},
++	.state = gv100_sor_state,
++	.power = nv50_sor_power,
++	.clock = ga102_sor_clock,
++	.hdmi = {
++		.ctrl = gv100_hdmi_ctrl,
++		.scdc = gm200_hdmi_scdc,
++	},
++	.dp = {
++		.lanes = { 0, 1, 2, 3 },
++		.links = ga102_sor_dp_links,
++		.power = g94_sor_dp_power,
++		.pattern = gm107_sor_dp_pattern,
++		.drive = gm200_sor_dp_drive,
++		.vcpi = tu102_sor_dp_vcpi,
++		.audio = gv100_sor_dp_audio,
++		.audio_sym = gv100_sor_dp_audio_sym,
++		.watermark = gv100_sor_dp_watermark,
++	},
++	.hda = {
++		.hpd = gf119_hda_hpd,
++		.eld = gf119_hda_eld,
++		.device_entry = gv100_hda_device_entry,
++	},
++};
++
++static const struct nvkm_ior_func
++ga102_sor = {
++	.route = {
++		.get = gm200_sor_route_get,
++		.set = gm200_sor_route_set,
++	},
++	.state = gv100_sor_state,
++	.power = nv50_sor_power,
++	.clock = ga102_sor_clock,
++	.hdmi = {
++		.ctrl = gv100_hdmi_ctrl,
++		.scdc = gm200_hdmi_scdc,
++	},
++	.dp = {
++		.lanes = { 0, 1, 2, 3 },
++		.links = ga102_sor_dp_links,
++		.power = g94_sor_dp_power,
++		.pattern = gm107_sor_dp_pattern,
++		.drive = gm200_sor_dp_drive,
++		.vcpi = tu102_sor_dp_vcpi,
++		.audio = gv100_sor_dp_audio,
++		.audio_sym = gv100_sor_dp_audio_sym,
++		.watermark = gv100_sor_dp_watermark,
++	},
++};
++
++int
++ga102_sor_new(struct nvkm_disp *disp, int id)
++{
++	struct nvkm_device *device = disp->engine.subdev.device;
++	u32 hda = nvkm_rd32(device, 0x08a15c);
++	if (hda & BIT(id))
++		return nvkm_ior_new_(&ga102_sor_hda, disp, SOR, id);
++	return nvkm_ior_new_(&ga102_sor, disp, SOR, id);
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/sortu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/sortu102.c
+index 59865a934c4b..0cf9e8752d25 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/sortu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/sortu102.c
+@@ -23,7 +23,7 @@
+ 
+ #include <subdev/timer.h>
+ 
+-static void
++void
+ tu102_sor_dp_vcpi(struct nvkm_ior *sor, int head,
+ 		  u8 slot, u8 slot_nr, u16 pbn, u16 aligned)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
+index 883ae4151ff8..4c85d1d4fbd4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
+@@ -28,7 +28,7 @@
+ #include <core/gpuobj.h>
+ #include <subdev/timer.h>
+ 
+-static int
++int
+ tu102_disp_init(struct nv50_disp *disp)
+ {
+ 	struct nvkm_device *device = disp->base.engine.subdev.device;
+-- 
+2.17.1
+

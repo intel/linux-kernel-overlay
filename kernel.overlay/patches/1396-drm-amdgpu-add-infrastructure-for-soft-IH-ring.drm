@@ -1,0 +1,180 @@
+From 60d5bffa24724340ba37a717d64b6a3ac03a59e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Sat, 31 Oct 2020 18:38:15 +0100
+Subject: [PATCH 1396/1714] drm/amdgpu: add infrastructure for soft IH ring
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a soft IH ring implementation similar to the hardware IH1/2.
+
+This can be used if the hardware delegation of interrupts to IH1/2
+doesn't work for some reason.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c  | 29 ++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h  |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c | 35 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h |  8 ++++--
+ 4 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+index 111a301ce878..dcd9b4a8e20b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -131,6 +131,35 @@ void amdgpu_ih_ring_fini(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
+ 	}
+ }
+ 
++/**
++ * amdgpu_ih_ring_write - write IV to the ring buffer
++ *
++ * @ih: ih ring to write to
++ * @iv: the iv to write
++ * @num_dw: size of the iv in dw
++ *
++ * Writes an IV to the ring buffer using the CPU and increment the wptr.
++ * Used for testing and delegating IVs to a software ring.
++ */
++void amdgpu_ih_ring_write(struct amdgpu_ih_ring *ih, const uint32_t *iv,
++			  unsigned int num_dw)
++{
++	uint32_t wptr = le32_to_cpu(*ih->wptr_cpu) >> 2;
++	unsigned int i;
++
++	for (i = 0; i < num_dw; ++i)
++	        ih->ring[wptr++] = cpu_to_le32(iv[i]);
++
++	wptr <<= 2;
++	wptr &= ih->ptr_mask;
++
++	/* Only commit the new wptr if we don't overflow */
++	if (wptr != READ_ONCE(ih->rptr)) {
++		wmb();
++		WRITE_ONCE(*ih->wptr_cpu, cpu_to_le32(wptr));
++	}
++}
++
+ /**
+  * amdgpu_ih_process - interrupt handler
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+index 4e0bb645176d..3c9cfe7eecff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -72,6 +72,8 @@ struct amdgpu_ih_funcs {
+ int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
+ 			unsigned ring_size, bool use_bus_addr);
+ void amdgpu_ih_ring_fini(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih);
++void amdgpu_ih_ring_write(struct amdgpu_ih_ring *ih, const uint32_t *iv,
++			  unsigned int num_dw);
+ int amdgpu_ih_process(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index 300ac73b4738..bea57e8e793f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -206,6 +206,21 @@ static void amdgpu_irq_handle_ih2(struct work_struct *work)
+ 	amdgpu_ih_process(adev, &adev->irq.ih2);
+ }
+ 
++/**
++ * amdgpu_irq_handle_ih_soft - kick of processing for ih_soft
++ *
++ * @work: work structure in struct amdgpu_irq
++ *
++ * Kick of processing IH soft ring.
++ */
++static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
++{
++	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
++						  irq.ih_soft_work);
++
++	amdgpu_ih_process(adev, &adev->irq.ih_soft);
++}
++
+ /**
+  * amdgpu_msi_ok - check whether MSI functionality is enabled
+  *
+@@ -281,6 +296,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+ 
+ 	INIT_WORK(&adev->irq.ih1_work, amdgpu_irq_handle_ih1);
+ 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
++	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
+ 
+ 	adev->irq.installed = true;
+ 	/* Use vector 0 for MSI-X */
+@@ -413,6 +429,7 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 	bool handled = false;
+ 	int r;
+ 
++	entry.ih = ih;
+ 	entry.iv_entry = (const uint32_t *)&ih->ring[ring_index];
+ 	amdgpu_ih_decode_iv(adev, &entry);
+ 
+@@ -450,6 +467,24 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
+ }
+ 
++/**
++ * amdgpu_irq_delegate - delegate IV to soft IH ring
++ *
++ * @adev: amdgpu device pointer
++ * @entry: IV entry
++ * @num_dw: size of IV
++ *
++ * Delegate the IV to the soft IH ring and schedule processing of it. Used
++ * if the hardware delegation to IH1 or IH2 doesn't work for some reason.
++ */
++void amdgpu_irq_delegate(struct amdgpu_device *adev,
++			 struct amdgpu_iv_entry *entry,
++			 unsigned int num_dw)
++{
++	amdgpu_ih_ring_write(&adev->irq.ih_soft, entry->iv_entry, num_dw);
++	schedule_work(&adev->irq.ih_soft_work);
++}
++
+ /**
+  * amdgpu_irq_update - update hardware interrupt state
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+index c718e94a55c9..ac527e5deae6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+@@ -44,6 +44,7 @@ enum amdgpu_interrupt_state {
+ };
+ 
+ struct amdgpu_iv_entry {
++	struct amdgpu_ih_ring *ih;
+ 	unsigned client_id;
+ 	unsigned src_id;
+ 	unsigned ring_id;
+@@ -88,9 +89,9 @@ struct amdgpu_irq {
+ 	bool				msi_enabled; /* msi enabled */
+ 
+ 	/* interrupt rings */
+-	struct amdgpu_ih_ring		ih, ih1, ih2;
++	struct amdgpu_ih_ring		ih, ih1, ih2, ih_soft;
+ 	const struct amdgpu_ih_funcs    *ih_funcs;
+-	struct work_struct		ih1_work, ih2_work;
++	struct work_struct		ih1_work, ih2_work, ih_soft_work;
+ 	struct amdgpu_irq_src		self_irq;
+ 
+ 	/* gen irq stuff */
+@@ -109,6 +110,9 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
+ 		      struct amdgpu_irq_src *source);
+ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 			 struct amdgpu_ih_ring *ih);
++void amdgpu_irq_delegate(struct amdgpu_device *adev,
++			 struct amdgpu_iv_entry *entry,
++			 unsigned int num_dw);
+ int amdgpu_irq_update(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+ 		      unsigned type);
+ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+-- 
+2.25.1
+

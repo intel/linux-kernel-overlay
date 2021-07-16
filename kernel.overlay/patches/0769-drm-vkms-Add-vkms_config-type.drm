@@ -1,0 +1,175 @@
+From 9555898369e751355e9790cfc5207b0a0294ca26 Mon Sep 17 00:00:00 2001
+From: Sumera Priyadarsini <sylphrenadin@gmail.com>
+Date: Tue, 12 Jan 2021 00:36:34 +0530
+Subject: [PATCH 0769/1087] drm/vkms: Add vkms_config type
+
+Currently, data for the device instance is held by vkms_device.
+Add a separate type, vkms_config to contain configuration details
+for the device and various modes to be later used by configfs.
+This config data stays constant once the device is created.
+
+Accordingly, add vkms_create and vkms_destroy to initialize/destroy
+device through configfs. Currently, they are being called from vkms_init
+and vkms_exit, but will be evoked from configfs later on. When configfs
+is added, device configuration will be tracked by configfs and only vkms
+device lifetime will be handled by vkms_init and vkms_exit functions.
+
+Modify usage of enable_cursor feature to reflect the changes in
+relevant files.
+
+Co-developed-by: Daniel Vetter <danvet.vetter@ffwl.ch>
+Signed-off-by: Daniel Vetter <danvet.vetter@ffwl.ch>
+Signed-off-by: Sumera Priyadarsini <sylphrenadin@gmail.com>
+Reviewed-by: Melissa Wen <melissa.srw@gmail.com>
+Signed-off-by: Melissa Wen <melissa.srw@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/a090ad29b826185df30f80c66932dd2173d7b060.1610391685.git.sylphrenadin@gmail.com
+---
+ drivers/gpu/drm/vkms/vkms_drv.c    | 40 ++++++++++++++++++++++++------
+ drivers/gpu/drm/vkms/vkms_drv.h    | 11 ++++++--
+ drivers/gpu/drm/vkms/vkms_output.c |  4 +--
+ 3 files changed, 43 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.c b/drivers/gpu/drm/vkms/vkms_drv.c
+index aef29393b811..6b33975a5cb2 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -34,9 +34,9 @@
+ #define DRIVER_MAJOR	1
+ #define DRIVER_MINOR	0
+ 
+-static struct vkms_device *vkms_device;
++static struct vkms_config *default_config;
+ 
+-bool enable_cursor = true;
++static bool enable_cursor = true;
+ module_param_named(enable_cursor, enable_cursor, bool, 0444);
+ MODULE_PARM_DESC(enable_cursor, "Enable/Disable cursor support");
+ 
+@@ -122,10 +122,11 @@ static int vkms_modeset_init(struct vkms_device *vkmsdev)
+ 	return vkms_output_init(vkmsdev, 0);
+ }
+ 
+-static int __init vkms_init(void)
++static int vkms_create(struct vkms_config *config)
+ {
+ 	int ret;
+ 	struct platform_device *pdev;
++	struct vkms_device *vkms_device;
+ 
+ 	pdev = platform_device_register_simple(DRIVER_NAME, -1, NULL, 0);
+ 	if (IS_ERR(pdev))
+@@ -143,6 +144,8 @@ static int __init vkms_init(void)
+ 		goto out_devres;
+ 	}
+ 	vkms_device->platform = pdev;
++	vkms_device->config = config;
++	config->dev = vkms_device;
+ 
+ 	ret = dma_coerce_mask_and_coherent(vkms_device->drm.dev,
+ 					   DMA_BIT_MASK(64));
+@@ -179,21 +182,42 @@ static int __init vkms_init(void)
+ 	return ret;
+ }
+ 
+-static void __exit vkms_exit(void)
++static int __init vkms_init(void)
++{
++	struct vkms_config *config = kmalloc(sizeof(*config), GFP_KERNEL);
++
++	default_config = config;
++
++	config->cursor = enable_cursor;
++
++	return vkms_create(config);
++}
++
++static void vkms_destroy(struct vkms_config *config)
+ {
+ 	struct platform_device *pdev;
+ 
+-	if (!vkms_device) {
++	if (!config->dev) {
+ 		DRM_INFO("vkms_device is NULL.\n");
+ 		return;
+ 	}
+ 
+-	pdev = vkms_device->platform;
++	pdev = config->dev->platform;
+ 
+-	drm_dev_unregister(&vkms_device->drm);
+-	drm_atomic_helper_shutdown(&vkms_device->drm);
++	drm_dev_unregister(&config->dev->drm);
++	drm_atomic_helper_shutdown(&config->dev->drm);
+ 	devres_release_group(&pdev->dev, NULL);
+ 	platform_device_unregister(pdev);
++
++	config->dev = NULL;
++}
++
++static void __exit vkms_exit(void)
++{
++	if (default_config->dev)
++		vkms_destroy(default_config);
++
++	kfree(default_config);
+ }
+ 
+ module_init(vkms_init);
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 5ed91ff08cb3..2981367636c4 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -19,8 +19,6 @@
+ #define XRES_MAX  8192
+ #define YRES_MAX  8192
+ 
+-extern bool enable_cursor;
+-
+ struct vkms_composer {
+ 	struct drm_framebuffer fb;
+ 	struct drm_rect src, dst;
+@@ -82,10 +80,19 @@ struct vkms_output {
+ 	spinlock_t composer_lock;
+ };
+ 
++struct vkms_device;
++
++struct vkms_config {
++	bool cursor;
++	/* only set when instantiated */
++	struct vkms_device *dev;
++};
++
+ struct vkms_device {
+ 	struct drm_device drm;
+ 	struct platform_device *platform;
+ 	struct vkms_output output;
++	const struct vkms_config *config;
+ };
+ 
+ #define drm_crtc_to_vkms_output(target) \
+diff --git a/drivers/gpu/drm/vkms/vkms_output.c b/drivers/gpu/drm/vkms/vkms_output.c
+index 4a1848b0318f..8f3ffb28b9d1 100644
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -46,7 +46,7 @@ int vkms_output_init(struct vkms_device *vkmsdev, int index)
+ 	if (IS_ERR(primary))
+ 		return PTR_ERR(primary);
+ 
+-	if (enable_cursor) {
++	if (vkmsdev->config->cursor) {
+ 		cursor = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_CURSOR, index);
+ 		if (IS_ERR(cursor)) {
+ 			ret = PTR_ERR(cursor);
+@@ -98,7 +98,7 @@ int vkms_output_init(struct vkms_device *vkmsdev, int index)
+ 	drm_crtc_cleanup(crtc);
+ 
+ err_crtc:
+-	if (enable_cursor)
++	if (vkmsdev->config->cursor)
+ 		drm_plane_cleanup(cursor);
+ 
+ err_cursor:
+-- 
+2.17.1
+

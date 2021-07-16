@@ -1,0 +1,148 @@
+From c30977ad1cd1fc6e5e9c3cdcf8b9f5b6628c8258 Mon Sep 17 00:00:00 2001
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Date: Wed, 16 Sep 2020 09:20:23 -0400
+Subject: [PATCH 0681/1714] drm/amd/display: enable odm + full screen mpo on
+ dcn21
+
+[WHY & HOW]
+Enable ODM Combine + Fullscreen MPO on DCN2.1
+For lower power consumption in video use cases.
+
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+Signed-off-by: Sung Lee <sung.lee@amd.com>
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/dc/core/dc_resource.c |  8 ++++++
+ .../drm/amd/display/dc/dcn20/dcn20_resource.c | 14 +++++++++--
+ .../drm/amd/display/dc/dcn21/dcn21_resource.c | 25 +++++++++++++++----
+ .../drm/amd/display/dc/dcn30/dcn30_resource.c | 13 +++++++++-
+ 4 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 419c0df08602..2932116b7ac0 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1508,6 +1508,14 @@ bool dc_add_plane_to_context(
+ 			free_pipe->clock_source = tail_pipe->clock_source;
+ 			free_pipe->top_pipe = tail_pipe;
+ 			tail_pipe->bottom_pipe = free_pipe;
++			if (!free_pipe->next_odm_pipe && tail_pipe->next_odm_pipe && tail_pipe->next_odm_pipe->bottom_pipe) {
++				free_pipe->next_odm_pipe = tail_pipe->next_odm_pipe->bottom_pipe;
++				tail_pipe->next_odm_pipe->bottom_pipe->prev_odm_pipe = free_pipe;
++			}
++			if (!free_pipe->prev_odm_pipe && tail_pipe->prev_odm_pipe && tail_pipe->prev_odm_pipe->bottom_pipe) {
++				free_pipe->prev_odm_pipe = tail_pipe->prev_odm_pipe->bottom_pipe;
++				tail_pipe->prev_odm_pipe->bottom_pipe->next_odm_pipe = free_pipe;
++			}
+ 		}
+ 		head_pipe = head_pipe->next_odm_pipe;
+ 	}
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
+index 01fa8de8ff86..2e613960516a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
+@@ -1882,9 +1882,16 @@ bool dcn20_split_stream_for_odm(
+ 		next_odm_pipe->next_odm_pipe = prev_odm_pipe->next_odm_pipe;
+ 		next_odm_pipe->next_odm_pipe->prev_odm_pipe = next_odm_pipe;
+ 	}
++	if (prev_odm_pipe->top_pipe && prev_odm_pipe->top_pipe->next_odm_pipe) {
++		prev_odm_pipe->top_pipe->next_odm_pipe->bottom_pipe = next_odm_pipe;
++		next_odm_pipe->top_pipe = prev_odm_pipe->top_pipe->next_odm_pipe;
++	}
++	if (prev_odm_pipe->bottom_pipe && prev_odm_pipe->bottom_pipe->next_odm_pipe) {
++		prev_odm_pipe->bottom_pipe->next_odm_pipe->top_pipe = next_odm_pipe;
++		next_odm_pipe->bottom_pipe = prev_odm_pipe->bottom_pipe->next_odm_pipe;
++	}
+ 	prev_odm_pipe->next_odm_pipe = next_odm_pipe;
+ 	next_odm_pipe->prev_odm_pipe = prev_odm_pipe;
+-	ASSERT(next_odm_pipe->top_pipe == NULL);
+ 
+ 	if (prev_odm_pipe->plane_state) {
+ 		struct scaler_data *sd = &prev_odm_pipe->plane_res.scl_data;
+@@ -1922,7 +1929,10 @@ bool dcn20_split_stream_for_odm(
+ 				sd->ratios.horz_c, sd->h_active - sd->recout.x));
+ 		sd->recout.x = 0;
+ 	}
+-	next_odm_pipe->stream_res.opp = pool->opps[next_odm_pipe->pipe_idx];
++	if (!next_odm_pipe->top_pipe)
++		next_odm_pipe->stream_res.opp = pool->opps[next_odm_pipe->pipe_idx];
++	else
++		next_odm_pipe->stream_res.opp = next_odm_pipe->top_pipe->stream_res.opp;
+ 	if (next_odm_pipe->stream->timing.flags.DSC == 1) {
+ 		dcn20_acquire_dsc(dc, res_ctx, &next_odm_pipe->stream_res.dsc, next_odm_pipe->pipe_idx);
+ 		ASSERT(next_odm_pipe->stream_res.dsc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
+index c5108029f75e..8a85e07935b2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
+@@ -1205,6 +1205,26 @@ static bool dcn21_fast_validate_bw(
+ 
+ 	vlevel = dcn20_validate_apply_pipe_split_flags(dc, context, vlevel, split, NULL);
+ 
++	for (i = 0, pipe_idx = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++		struct pipe_ctx *mpo_pipe = pipe->bottom_pipe;
++		struct vba_vars_st *vba = &context->bw_ctx.dml.vba;
++
++		if (!pipe->stream)
++			continue;
++
++		/* We only support full screen mpo with ODM */
++		if (vba->ODMCombineEnabled[vba->pipe_plane[pipe_idx]] != dm_odm_combine_mode_disabled
++				&& pipe->plane_state && mpo_pipe
++				&& memcmp(&mpo_pipe->plane_res.scl_data.recout,
++						&pipe->plane_res.scl_data.recout,
++						sizeof(struct rect)) != 0) {
++			ASSERT(mpo_pipe->plane_state != pipe->plane_state);
++			goto validate_fail;
++		}
++		pipe_idx++;
++	}
++
+ 	/*initialize pipe_just_split_from to invalid idx*/
+ 	for (i = 0; i < MAX_PIPES; i++)
+ 		pipe_split_from[i] = -1;
+@@ -1235,11 +1255,6 @@ static bool dcn21_fast_validate_bw(
+ 		if (pipe->top_pipe && pipe->plane_state == pipe->top_pipe->plane_state)
+ 			continue;
+ 
+-		/* We do not support mpo + odm at the moment */
+-		if (hsplit_pipe && hsplit_pipe->plane_state != pipe->plane_state
+-				&& context->bw_ctx.dml.vba.ODMCombineEnabled[pipe_idx])
+-			goto validate_fail;
+-
+ 		if (split[i] == 2) {
+ 			if (!hsplit_pipe || hsplit_pipe->plane_state != pipe->plane_state) {
+ 				/* pipe not split previously needs split */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
+index cc7da68d04a8..8c554b3c9aca 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
+@@ -1873,11 +1873,22 @@ static bool dcn30_split_stream_for_mpc_or_odm(
+ 			sec_pipe->next_odm_pipe = pri_pipe->next_odm_pipe;
+ 			sec_pipe->next_odm_pipe->prev_odm_pipe = sec_pipe;
+ 		}
++		if (pri_pipe->top_pipe && pri_pipe->top_pipe->next_odm_pipe) {
++			pri_pipe->top_pipe->next_odm_pipe->bottom_pipe = sec_pipe;
++			sec_pipe->top_pipe = pri_pipe->top_pipe->next_odm_pipe;
++		}
++		if (pri_pipe->bottom_pipe && pri_pipe->bottom_pipe->next_odm_pipe) {
++			pri_pipe->bottom_pipe->next_odm_pipe->top_pipe = sec_pipe;
++			sec_pipe->bottom_pipe = pri_pipe->bottom_pipe->next_odm_pipe;
++		}
+ 		pri_pipe->next_odm_pipe = sec_pipe;
+ 		sec_pipe->prev_odm_pipe = pri_pipe;
+ 		ASSERT(sec_pipe->top_pipe == NULL);
+ 
+-		sec_pipe->stream_res.opp = pool->opps[pipe_idx];
++		if (!sec_pipe->top_pipe)
++			sec_pipe->stream_res.opp = pool->opps[pipe_idx];
++		else
++			sec_pipe->stream_res.opp = sec_pipe->top_pipe->stream_res.opp;
+ 		if (sec_pipe->stream->timing.flags.DSC == 1) {
+ 			dcn20_acquire_dsc(dc, res_ctx, &sec_pipe->stream_res.dsc, pipe_idx);
+ 			ASSERT(sec_pipe->stream_res.dsc);
+-- 
+2.25.1
+

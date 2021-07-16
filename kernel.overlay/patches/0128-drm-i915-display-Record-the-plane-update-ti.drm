@@ -1,0 +1,392 @@
+From 3a8d0d6674197776d1c6c7e799382f374ff876e4 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 2 Dec 2020 21:28:14 +0000
+Subject: [PATCH 0128/1087] drm/i915/display: Record the plane update times for
+ debugging
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since we try and estimate how long we require to update the registers to
+perform a plane update, it is of vital importance that we measure the
+distribution of plane updates to better guide our estimate. If we
+underestimate how long it takes to perform the plane update, we may
+slip into the next scanout frame causing a tear. If we overestimate, we
+may unnecessarily delay the update to the next frame, causing visible
+jitter.
+
+Replace the warning that we exceed some arbitrary threshold for the
+vblank update with a histogram for debugfs.
+
+v2: Add a per-crtc debugfs entry so that the information is easier to
+extract when testing individual CRTC, and so that it can be reset before
+a test.
+
+v3: Flip the graph on its side; creates space to label the time axis.
+
+Updates: 4684
+       |
+   1us |
+       |
+   4us |********
+       |**********
+  16us |***********
+       |*****
+  66us |
+       |
+ 262us |
+       |
+   1ms |
+       |
+   4ms |
+       |
+  17ms |
+       |
+Min update: 5918ns
+Max update: 54781ns
+Average update: 16628ns
+Overruns > 250us: 0
+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/1982
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com> #v2
+Link: https://patchwork.freedesktop.org/patch/msgid/20201202212814.26320-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/display/intel_display.c  |  10 +-
+ .../drm/i915/display/intel_display_debugfs.c  | 124 ++++++++++++++++++
+ .../drm/i915/display/intel_display_debugfs.h  |   3 +
+ .../drm/i915/display/intel_display_types.h    |   9 ++
+ drivers/gpu/drm/i915/display/intel_sprite.c   |  49 ++++---
+ drivers/gpu/drm/i915/display/intel_sprite.h   |  10 ++
+ 6 files changed, 187 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 53a00cf3fa32..28d1495deaa1 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -45,6 +45,7 @@
+ 
+ #include "display/intel_crt.h"
+ #include "display/intel_ddi.h"
++#include "display/intel_display_debugfs.h"
+ #include "display/intel_dp.h"
+ #include "display/intel_dp_mst.h"
+ #include "display/intel_dpll_mgr.h"
+@@ -17266,6 +17267,12 @@ intel_cursor_plane_create(struct drm_i915_private *dev_priv,
+ 	return ERR_PTR(ret);
+ }
+ 
++static int intel_crtc_late_register(struct drm_crtc *crtc)
++{
++	intel_crtc_debugfs_add(crtc);
++	return 0;
++}
++
+ #define INTEL_CRTC_FUNCS \
+ 	.gamma_set = drm_atomic_helper_legacy_gamma_set, \
+ 	.set_config = drm_atomic_helper_set_config, \
+@@ -17275,7 +17282,8 @@ intel_cursor_plane_create(struct drm_i915_private *dev_priv,
+ 	.atomic_destroy_state = intel_crtc_destroy_state, \
+ 	.set_crc_source = intel_crtc_set_crc_source, \
+ 	.verify_crc_source = intel_crtc_verify_crc_source, \
+-	.get_crc_sources = intel_crtc_get_crc_sources
++	.get_crc_sources = intel_crtc_get_crc_sources, \
++	.late_register = intel_crtc_late_register
+ 
+ static const struct drm_crtc_funcs bdw_crtc_funcs = {
+ 	INTEL_CRTC_FUNCS,
+diff --git a/drivers/gpu/drm/i915/display/intel_display_debugfs.c b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+index ca41e8c00ad7..cd7e5519ee7d 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@ -18,6 +18,7 @@
+ #include "intel_pm.h"
+ #include "intel_psr.h"
+ #include "intel_sideband.h"
++#include "intel_sprite.h"
+ 
+ static inline struct drm_i915_private *node_to_i915(struct drm_info_node *node)
+ {
+@@ -865,6 +866,110 @@ static void intel_scaler_info(struct seq_file *m, struct intel_crtc *crtc)
+ 	}
+ }
+ 
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_VBLANK_EVADE)
++static void crtc_updates_info(struct seq_file *m,
++			      struct intel_crtc *crtc,
++			      const char *hdr)
++{
++	u64 count;
++	int row;
++
++	count = 0;
++	for (row = 0; row < ARRAY_SIZE(crtc->debug.vbl.times); row++)
++		count += crtc->debug.vbl.times[row];
++	seq_printf(m, "%sUpdates: %llu\n", hdr, count);
++	if (!count)
++		return;
++
++	for (row = 0; row < ARRAY_SIZE(crtc->debug.vbl.times); row++) {
++		char columns[80] = "       |";
++		unsigned int x;
++
++		if (row & 1) {
++			const char *units;
++
++			if (row > 10) {
++				x = 1000000;
++				units = "ms";
++			} else {
++				x = 1000;
++				units = "us";
++			}
++
++			snprintf(columns, sizeof(columns), "%4ld%s |",
++				 DIV_ROUND_CLOSEST(BIT(row + 9), x), units);
++		}
++
++		if (crtc->debug.vbl.times[row]) {
++			x = ilog2(crtc->debug.vbl.times[row]);
++			memset(columns + 8, '*', x);
++			columns[8 + x] = '\0';
++		}
++
++		seq_printf(m, "%s%s\n", hdr, columns);
++	}
++
++	seq_printf(m, "%sMin update: %lluns\n",
++		   hdr, crtc->debug.vbl.min);
++	seq_printf(m, "%sMax update: %lluns\n",
++		   hdr, crtc->debug.vbl.max);
++	seq_printf(m, "%sAverage update: %lluns\n",
++		   hdr, div64_u64(crtc->debug.vbl.sum,  count));
++	seq_printf(m, "%sOverruns > %uus: %u\n",
++		   hdr, VBLANK_EVASION_TIME_US, crtc->debug.vbl.over);
++}
++
++static int crtc_updates_show(struct seq_file *m, void *data)
++{
++	crtc_updates_info(m, m->private, "");
++	return 0;
++}
++
++static int crtc_updates_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, crtc_updates_show, inode->i_private);
++}
++
++static ssize_t crtc_updates_write(struct file *file,
++				  const char __user *ubuf,
++				  size_t len, loff_t *offp)
++{
++	struct seq_file *m = file->private_data;
++	struct intel_crtc *crtc = m->private;
++
++	/* May race with an update. Meh. */
++	memset(&crtc->debug.vbl, 0, sizeof(crtc->debug.vbl));
++
++	return len;
++}
++
++static const struct file_operations crtc_updates_fops = {
++	.owner = THIS_MODULE,
++	.open = crtc_updates_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++	.write = crtc_updates_write
++};
++
++static void crtc_updates_add(struct drm_crtc *crtc)
++{
++	debugfs_create_file("i915_update_info", 0644, crtc->debugfs_entry,
++			    to_intel_crtc(crtc), &crtc_updates_fops);
++}
++
++#else
++static void crtc_updates_info(struct seq_file *m,
++			      struct intel_crtc *crtc,
++			      const char *hdr)
++{
++}
++
++static void crtc_updates_add(struct drm_crtc *crtc)
++{
++}
++#endif
++
+ static void intel_crtc_info(struct seq_file *m, struct intel_crtc *crtc)
+ {
+ 	struct drm_i915_private *dev_priv = node_to_i915(m->private);
+@@ -907,6 +1012,8 @@ static void intel_crtc_info(struct seq_file *m, struct intel_crtc *crtc)
+ 	seq_printf(m, "\tunderrun reporting: cpu=%s pch=%s\n",
+ 		   yesno(!crtc->cpu_fifo_underrun_disabled),
+ 		   yesno(!crtc->pch_fifo_underrun_disabled));
++
++	crtc_updates_info(m, crtc, "\t");
+ }
+ 
+ static int i915_display_info(struct seq_file *m, void *unused)
+@@ -2278,3 +2385,20 @@ int intel_connector_debugfs_add(struct drm_connector *connector)
+ 
+ 	return 0;
+ }
++
++/**
++ * intel_crtc_debugfs_add - add i915 specific crtc debugfs files
++ * @crtc: pointer to a drm_crtc
++ *
++ * Returns 0 on success, negative error codes on error.
++ *
++ * Failure to add debugfs entries should generally be ignored.
++ */
++int intel_crtc_debugfs_add(struct drm_crtc *crtc)
++{
++	if (!crtc->debugfs_entry)
++		return -ENODEV;
++
++	crtc_updates_add(crtc);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_display_debugfs.h b/drivers/gpu/drm/i915/display/intel_display_debugfs.h
+index c922c1745bfe..557901f3eb90 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.h
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.h
+@@ -7,14 +7,17 @@
+ #define __INTEL_DISPLAY_DEBUGFS_H__
+ 
+ struct drm_connector;
++struct drm_crtc;
+ struct drm_i915_private;
+ 
+ #ifdef CONFIG_DEBUG_FS
+ void intel_display_debugfs_register(struct drm_i915_private *i915);
+ int intel_connector_debugfs_add(struct drm_connector *connector);
++int intel_crtc_debugfs_add(struct drm_crtc *crtc);
+ #else
+ static inline void intel_display_debugfs_register(struct drm_i915_private *i915) {}
+ static inline int intel_connector_debugfs_add(struct drm_connector *connector) { return 0; }
++static inline int intel_crtc_debugfs_add(struct drm_crtc *crtc) { return 0; }
+ #endif
+ 
+ #endif /* __INTEL_DISPLAY_DEBUGFS_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 491e3550174f..d426dd31479e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1188,6 +1188,15 @@ struct intel_crtc {
+ 		ktime_t start_vbl_time;
+ 		int min_vbl, max_vbl;
+ 		int scanline_start;
++#ifdef CONFIG_DRM_I915_DEBUG_VBLANK_EVADE
++		struct {
++			u64 min;
++			u64 max;
++			u64 sum;
++			unsigned int over;
++			unsigned int times[17]; /* [1us, 16ms] */
++		} vbl;
++#endif
+ 	} debug;
+ 
+ 	/* scalers available on this crtc */
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.c b/drivers/gpu/drm/i915/display/intel_sprite.c
+index 019a2d6d807a..b7e208816074 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.c
++++ b/drivers/gpu/drm/i915/display/intel_sprite.c
+@@ -61,14 +61,6 @@ int intel_usecs_to_scanlines(const struct drm_display_mode *adjusted_mode,
+ 			    1000 * adjusted_mode->crtc_htotal);
+ }
+ 
+-/* FIXME: We should instead only take spinlocks once for the entire update
+- * instead of once per mmio. */
+-#if IS_ENABLED(CONFIG_PROVE_LOCKING)
+-#define VBLANK_EVASION_TIME_US 250
+-#else
+-#define VBLANK_EVASION_TIME_US 100
+-#endif
+-
+ /**
+  * intel_pipe_update_start() - start update of a set of display registers
+  * @new_crtc_state: the new crtc state
+@@ -187,6 +179,36 @@ void intel_pipe_update_start(const struct intel_crtc_state *new_crtc_state)
+ 	local_irq_disable();
+ }
+ 
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_VBLANK_EVADE)
++static void dbg_vblank_evade(struct intel_crtc *crtc, ktime_t end)
++{
++	u64 delta = ktime_to_ns(ktime_sub(end, crtc->debug.start_vbl_time));
++	unsigned int h;
++
++	h = ilog2(delta >> 9);
++	if (h >= ARRAY_SIZE(crtc->debug.vbl.times))
++		h = ARRAY_SIZE(crtc->debug.vbl.times) - 1;
++	crtc->debug.vbl.times[h]++;
++
++	crtc->debug.vbl.sum += delta;
++	if (!crtc->debug.vbl.min || delta < crtc->debug.vbl.min)
++		crtc->debug.vbl.min = delta;
++	if (delta > crtc->debug.vbl.max)
++		crtc->debug.vbl.max = delta;
++
++	if (delta > 1000 * VBLANK_EVASION_TIME_US) {
++		drm_dbg_kms(crtc->base.dev,
++			    "Atomic update on pipe (%c) took %lld us, max time under evasion is %u us\n",
++			    pipe_name(crtc->pipe),
++			    div_u64(delta, 1000),
++			    VBLANK_EVASION_TIME_US);
++		crtc->debug.vbl.over++;
++	}
++}
++#else
++static void dbg_vblank_evade(struct intel_crtc *crtc, ktime_t end) {}
++#endif
++
+ /**
+  * intel_pipe_update_end() - end update of a set of display registers
+  * @new_crtc_state: the new crtc state
+@@ -249,15 +271,8 @@ void intel_pipe_update_end(struct intel_crtc_state *new_crtc_state)
+ 			crtc->debug.min_vbl, crtc->debug.max_vbl,
+ 			crtc->debug.scanline_start, scanline_end);
+ 	}
+-#ifdef CONFIG_DRM_I915_DEBUG_VBLANK_EVADE
+-	else if (ktime_us_delta(end_vbl_time, crtc->debug.start_vbl_time) >
+-		 VBLANK_EVASION_TIME_US)
+-		drm_warn(&dev_priv->drm,
+-			 "Atomic update on pipe (%c) took %lld us, max time under evasion is %u us\n",
+-			 pipe_name(pipe),
+-			 ktime_us_delta(end_vbl_time, crtc->debug.start_vbl_time),
+-			 VBLANK_EVASION_TIME_US);
+-#endif
++
++	dbg_vblank_evade(crtc, end_vbl_time);
+ }
+ 
+ int intel_plane_check_stride(const struct intel_plane_state *plane_state)
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.h b/drivers/gpu/drm/i915/display/intel_sprite.h
+index cd2104ba1ca1..76126dd8d584 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.h
++++ b/drivers/gpu/drm/i915/display/intel_sprite.h
+@@ -17,6 +17,16 @@ struct drm_i915_private;
+ struct intel_crtc_state;
+ struct intel_plane_state;
+ 
++/*
++ * FIXME: We should instead only take spinlocks once for the entire update
++ * instead of once per mmio.
++ */
++#if IS_ENABLED(CONFIG_PROVE_LOCKING)
++#define VBLANK_EVASION_TIME_US 250
++#else
++#define VBLANK_EVASION_TIME_US 100
++#endif
++
+ int intel_usecs_to_scanlines(const struct drm_display_mode *adjusted_mode,
+ 			     int usecs);
+ struct intel_plane *intel_sprite_plane_create(struct drm_i915_private *dev_priv,
+-- 
+2.17.1
+

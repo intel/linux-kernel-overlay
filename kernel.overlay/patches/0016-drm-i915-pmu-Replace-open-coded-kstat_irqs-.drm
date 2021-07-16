@@ -1,0 +1,195 @@
+From d199f6575628c849d9466395bd6fdefde8bf77d9 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 10 Dec 2020 20:25:50 +0100
+Subject: [PATCH 0016/1087] drm/i915/pmu: Replace open coded kstat_irqs() copy
+
+Driver code has no business with the internals of the irq descriptor.
+
+Aside of that the count is per interrupt line and therefore takes
+interrupts from other devices into account which share the interrupt line
+and are not handled by the graphics driver.
+
+Replace it with a pmu private count which only counts interrupts which
+originate from the graphics card.
+
+To avoid atomics or heuristics of some sort make the counter field
+'unsigned long'. That limits the count to 4e9 on 32bit which is a lot and
+postprocessing can easily deal with the occasional wraparound.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Link: https://lore.kernel.org/r/20201210194043.957046529@linutronix.de
+---
+ drivers/gpu/drm/i915/i915_irq.c | 34 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_pmu.c | 19 +-----------------
+ drivers/gpu/drm/i915/i915_pmu.h |  8 ++++++++
+ 3 files changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index c80eeac53952..6cdb052e3850 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -60,6 +60,24 @@
+  * and related files, but that will be described in separate chapters.
+  */
+ 
++/*
++ * Interrupt statistic for PMU. Increments the counter only if the
++ * interrupt originated from the the GPU so interrupts from a device which
++ * shares the interrupt line are not accounted.
++ */
++static inline void pmu_irq_stats(struct drm_i915_private *i915,
++				 irqreturn_t res)
++{
++	if (unlikely(res != IRQ_HANDLED))
++		return;
++
++	/*
++	 * A clever compiler translates that into INC. A not so clever one
++	 * should at least prevent store tearing.
++	 */
++	WRITE_ONCE(i915->pmu.irq_count, i915->pmu.irq_count + 1);
++}
++
+ typedef bool (*long_pulse_detect_func)(enum hpd_pin pin, u32 val);
+ typedef u32 (*hotplug_enables_func)(struct drm_i915_private *i915,
+ 				    enum hpd_pin pin);
+@@ -1668,6 +1686,8 @@ static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+ 		valleyview_pipestat_irq_handler(dev_priv, pipe_stats);
+ 	} while (0);
+ 
++	pmu_irq_stats(dev_priv, ret);
++
+ 	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ 
+ 	return ret;
+@@ -1745,6 +1765,8 @@ static irqreturn_t cherryview_irq_handler(int irq, void *arg)
+ 		valleyview_pipestat_irq_handler(dev_priv, pipe_stats);
+ 	} while (0);
+ 
++	pmu_irq_stats(dev_priv, ret);
++
+ 	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ 
+ 	return ret;
+@@ -2155,6 +2177,8 @@ static irqreturn_t ilk_irq_handler(int irq, void *arg)
+ 	if (sde_ier)
+ 		raw_reg_write(regs, SDEIER, sde_ier);
+ 
++	pmu_irq_stats(i915, ret);
++
+ 	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
+ 	enable_rpm_wakeref_asserts(&i915->runtime_pm);
+ 
+@@ -2541,6 +2565,8 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
+ 
+ 	gen8_master_intr_enable(regs);
+ 
++	pmu_irq_stats(dev_priv, IRQ_HANDLED);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -2636,6 +2662,8 @@ __gen11_irq_handler(struct drm_i915_private * const i915,
+ 
+ 	gen11_gu_misc_irq_handler(gt, gu_misc_iir);
+ 
++	pmu_irq_stats(i915, IRQ_HANDLED);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -3934,6 +3962,8 @@ static irqreturn_t i8xx_irq_handler(int irq, void *arg)
+ 		i8xx_pipestat_irq_handler(dev_priv, iir, pipe_stats);
+ 	} while (0);
+ 
++	pmu_irq_stats(dev_priv, ret);
++
+ 	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ 
+ 	return ret;
+@@ -4043,6 +4073,8 @@ static irqreturn_t i915_irq_handler(int irq, void *arg)
+ 		i915_pipestat_irq_handler(dev_priv, iir, pipe_stats);
+ 	} while (0);
+ 
++	pmu_irq_stats(dev_priv, ret);
++
+ 	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ 
+ 	return ret;
+@@ -4189,6 +4221,8 @@ static irqreturn_t i965_irq_handler(int irq, void *arg)
+ 		i965_pipestat_irq_handler(dev_priv, iir, pipe_stats);
+ 	} while (0);
+ 
++	pmu_irq_stats(dev_priv, IRQ_HANDLED);
++
+ 	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/i915_pmu.c b/drivers/gpu/drm/i915/i915_pmu.c
+index cd786ad12be7..d76685ce0399 100644
+--- a/drivers/gpu/drm/i915/i915_pmu.c
++++ b/drivers/gpu/drm/i915/i915_pmu.c
+@@ -4,7 +4,6 @@
+  * Copyright © 2017-2018 Intel Corporation
+  */
+ 
+-#include <linux/irq.h>
+ #include <linux/pm_runtime.h>
+ 
+ #include "gt/intel_engine.h"
+@@ -424,22 +423,6 @@ static enum hrtimer_restart i915_sample(struct hrtimer *hrtimer)
+ 	return HRTIMER_RESTART;
+ }
+ 
+-static u64 count_interrupts(struct drm_i915_private *i915)
+-{
+-	/* open-coded kstat_irqs() */
+-	struct irq_desc *desc = irq_to_desc(i915->drm.pdev->irq);
+-	u64 sum = 0;
+-	int cpu;
+-
+-	if (!desc || !desc->kstat_irqs)
+-		return 0;
+-
+-	for_each_possible_cpu(cpu)
+-		sum += *per_cpu_ptr(desc->kstat_irqs, cpu);
+-
+-	return sum;
+-}
+-
+ static void i915_pmu_event_destroy(struct perf_event *event)
+ {
+ 	struct drm_i915_private *i915 =
+@@ -590,7 +573,7 @@ static u64 __i915_pmu_event_read(struct perf_event *event)
+ 				   USEC_PER_SEC /* to MHz */);
+ 			break;
+ 		case I915_PMU_INTERRUPTS:
+-			val = count_interrupts(i915);
++			val = READ_ONCE(pmu->irq_count);
+ 			break;
+ 		case I915_PMU_RC6_RESIDENCY:
+ 			val = get_rc6(&i915->gt);
+diff --git a/drivers/gpu/drm/i915/i915_pmu.h b/drivers/gpu/drm/i915/i915_pmu.h
+index a24885ab415c..8405d6da5b9a 100644
+--- a/drivers/gpu/drm/i915/i915_pmu.h
++++ b/drivers/gpu/drm/i915/i915_pmu.h
+@@ -111,6 +111,14 @@ struct i915_pmu {
+ 	 * @sleep_last: Last time GT parked for RC6 estimation.
+ 	 */
+ 	ktime_t sleep_last;
++	/**
++	 * @irq_count: Number of interrupts
++	 *
++	 * Intentionally unsigned long to avoid atomics or heuristics on 32bit.
++	 * 4e9 interrupts are a lot and postprocessing can really deal with an
++	 * occasional wraparound easily. It's 32bit after all.
++	 */
++	unsigned long irq_count;
+ 	/**
+ 	 * @events_attr_group: Device events attribute group.
+ 	 */
+-- 
+2.17.1
+

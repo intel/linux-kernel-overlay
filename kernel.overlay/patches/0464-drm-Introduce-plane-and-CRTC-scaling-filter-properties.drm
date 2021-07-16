@@ -1,0 +1,363 @@
+From be6f3467d17825a2e8d6b599ca3480c054efb766 Mon Sep 17 00:00:00 2001
+From: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+Date: Tue, 20 Oct 2020 21:44:23 +0530
+Subject: [PATCH 0464/1714] drm: Introduce plane and CRTC scaling filter
+ properties
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce per-plane and per-CRTC scaling filter properties to allow
+userspace to select the driver's default scaling filter or
+Nearest-neighbor(NN) filter for upscaling operations on CRTC and
+plane.
+
+Drivers can set up this property for a plane by calling
+drm_plane_create_scaling_filter() and for a CRTC by calling
+drm_crtc_create_scaling_filter().
+
+NN filter works by filling in the missing color values in the upscaled
+image with that of the coordinate-mapped nearest source pixel value.
+
+NN filter for integer multiple scaling can be particularly useful for
+for pixel art games that rely on sharp, blocky images to deliver their
+distinctive look.
+
+changes since: v6:
+* Move property doc to existing "Standard CRTC Properties" and
+  "Plane Composition Properties" doc comments (Simon)
+changes since v3:
+* Refactor code, add new function for common code (Ville)
+changes since v2:
+* Create per-plane and per-CRTC scaling filter property (Ville)
+changes since v1:
+* None
+changes since RFC:
+* Add separate properties for plane and CRTC (Ville)
+
+Link: https://github.com/xbmc/xbmc/pull/18194
+Link: https://github.com/xbmc/xbmc/pull/18567
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Acked-by: Simon Ser <contact@emersion.fr>
+Acked-by: Daniel Vetter <daniel@ffwll.ch>
+Signed-off-by: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201020161427.6941-2-pankaj.laxminarayan.bharadiya@intel.com
+---
+ drivers/gpu/drm/drm_atomic_uapi.c   |  8 ++++
+ drivers/gpu/drm/drm_blend.c         | 13 +++++
+ drivers/gpu/drm/drm_crtc.c          | 40 ++++++++++++++++
+ drivers/gpu/drm/drm_crtc_internal.h |  3 ++
+ drivers/gpu/drm/drm_plane.c         | 73 +++++++++++++++++++++++++++++
+ include/drm/drm_crtc.h              | 16 +++++++
+ include/drm/drm_plane.h             | 21 +++++++++
+ 7 files changed, 174 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index 25c269bc4681..ef82009035e6 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -469,6 +469,8 @@ static int drm_atomic_crtc_set_property(struct drm_crtc *crtc,
+ 			return -EFAULT;
+ 
+ 		set_out_fence_for_crtc(state->state, crtc, fence_ptr);
++	} else if (property == crtc->scaling_filter_property) {
++		state->scaling_filter = val;
+ 	} else if (crtc->funcs->atomic_set_property) {
+ 		return crtc->funcs->atomic_set_property(crtc, state, property, val);
+ 	} else {
+@@ -503,6 +505,8 @@ drm_atomic_crtc_get_property(struct drm_crtc *crtc,
+ 		*val = (state->gamma_lut) ? state->gamma_lut->base.id : 0;
+ 	else if (property == config->prop_out_fence_ptr)
+ 		*val = 0;
++	else if (property == crtc->scaling_filter_property)
++		*val = state->scaling_filter;
+ 	else if (crtc->funcs->atomic_get_property)
+ 		return crtc->funcs->atomic_get_property(crtc, state, property, val);
+ 	else
+@@ -585,6 +589,8 @@ static int drm_atomic_plane_set_property(struct drm_plane *plane,
+ 					sizeof(struct drm_rect),
+ 					&replaced);
+ 		return ret;
++	} else if (property == plane->scaling_filter_property) {
++		state->scaling_filter = val;
+ 	} else if (plane->funcs->atomic_set_property) {
+ 		return plane->funcs->atomic_set_property(plane, state,
+ 				property, val);
+@@ -643,6 +649,8 @@ drm_atomic_plane_get_property(struct drm_plane *plane,
+ 	} else if (property == config->prop_fb_damage_clips) {
+ 		*val = (state->fb_damage_clips) ?
+ 			state->fb_damage_clips->base.id : 0;
++	} else if (property == plane->scaling_filter_property) {
++		*val = state->scaling_filter;
+ 	} else if (plane->funcs->atomic_get_property) {
+ 		return plane->funcs->atomic_get_property(plane, state, property, val);
+ 	} else {
+diff --git a/drivers/gpu/drm/drm_blend.c b/drivers/gpu/drm/drm_blend.c
+index f1dcad96f341..ae2234aae93d 100644
+--- a/drivers/gpu/drm/drm_blend.c
++++ b/drivers/gpu/drm/drm_blend.c
+@@ -194,6 +194,19 @@
+  * Note that all the property extensions described here apply either to the
+  * plane or the CRTC (e.g. for the background color, which currently is not
+  * exposed and assumed to be black).
++ *
++ * SCALING_FILTER:
++ *
++ *     Indicates scaling filter to be used for plane scaler
++ *
++ *     The value of this property can be one of the following:
++ *     Default:
++ *             Driver's default scaling filter
++ *     Nearest Neighbor:
++ *             Nearest Neighbor scaling filter
++ *
++ * Drivers can set up this property for a plane by calling
++ * drm_plane_create_scaling_filter_property
+  */
+ 
+ /**
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index aecdd7ea26dc..f927976eca50 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -229,6 +229,15 @@ struct dma_fence *drm_crtc_create_fence(struct drm_crtc *crtc)
+  * 	user-space must set this property to 0.
+  *
+  * 	Setting MODE_ID to 0 will release reserved resources for the CRTC.
++ * SCALING_FILTER:
++ *	Atomic property for setting the scaling filter for CRTC scaler
++ *
++ *	The value of this property can be one of the following:
++ *	Default:
++ *		Driver's default scaling filter
++ *	Nearest Neighbor:
++ *		Nearest Neighbor scaling filter
++ *
+  */
+ 
+ /**
+@@ -774,3 +783,34 @@ int drm_mode_crtc_set_obj_prop(struct drm_mode_object *obj,
+ 
+ 	return ret;
+ }
++
++/**
++ * drm_crtc_create_scaling_filter_property - create a new scaling filter
++ * property
++ *
++ * @crtc: drm CRTC
++ * @supported_filters: bitmask of supported scaling filters, must include
++ *		       BIT(DRM_SCALING_FILTER_DEFAULT).
++ *
++ * This function lets driver to enable the scaling filter property on a given
++ * CRTC.
++ *
++ * RETURNS:
++ * Zero for success or -errno
++ */
++int drm_crtc_create_scaling_filter_property(struct drm_crtc *crtc,
++					    unsigned int supported_filters)
++{
++	struct drm_property *prop =
++		drm_create_scaling_filter_prop(crtc->dev, supported_filters);
++
++	if (IS_ERR(prop))
++		return PTR_ERR(prop);
++
++	drm_object_attach_property(&crtc->base, prop,
++				   DRM_SCALING_FILTER_DEFAULT);
++	crtc->scaling_filter_property = prop;
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_crtc_create_scaling_filter_property);
+diff --git a/drivers/gpu/drm/drm_crtc_internal.h b/drivers/gpu/drm/drm_crtc_internal.h
+index da96b2f64d7e..54d4cf1233e9 100644
+--- a/drivers/gpu/drm/drm_crtc_internal.h
++++ b/drivers/gpu/drm/drm_crtc_internal.h
+@@ -72,6 +72,9 @@ int drm_crtc_force_disable(struct drm_crtc *crtc);
+ 
+ struct dma_fence *drm_crtc_create_fence(struct drm_crtc *crtc);
+ 
++struct drm_property *
++drm_create_scaling_filter_prop(struct drm_device *dev,
++			       unsigned int supported_filters);
+ /* IOCTLs */
+ int drm_mode_getcrtc(struct drm_device *dev,
+ 		     void *data, struct drm_file *file_priv);
+diff --git a/drivers/gpu/drm/drm_plane.c b/drivers/gpu/drm/drm_plane.c
+index affe1cfed009..e6231947f987 100644
+--- a/drivers/gpu/drm/drm_plane.c
++++ b/drivers/gpu/drm/drm_plane.c
+@@ -1231,3 +1231,76 @@ int drm_mode_page_flip_ioctl(struct drm_device *dev,
+ 
+ 	return ret;
+ }
++
++struct drm_property *
++drm_create_scaling_filter_prop(struct drm_device *dev,
++			       unsigned int supported_filters)
++{
++	struct drm_property *prop;
++	static const struct drm_prop_enum_list props[] = {
++		{ DRM_SCALING_FILTER_DEFAULT, "Default" },
++		{ DRM_SCALING_FILTER_NEAREST_NEIGHBOR, "Nearest Neighbor" },
++	};
++	unsigned int valid_mode_mask = BIT(DRM_SCALING_FILTER_DEFAULT) |
++				       BIT(DRM_SCALING_FILTER_NEAREST_NEIGHBOR);
++	int i;
++
++	if (WARN_ON((supported_filters & ~valid_mode_mask) ||
++		    ((supported_filters & BIT(DRM_SCALING_FILTER_DEFAULT)) == 0)))
++		return ERR_PTR(-EINVAL);
++
++	prop = drm_property_create(dev, DRM_MODE_PROP_ENUM,
++				   "SCALING_FILTER",
++				   hweight32(supported_filters));
++	if (!prop)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < ARRAY_SIZE(props); i++) {
++		int ret;
++
++		if (!(BIT(props[i].type) & supported_filters))
++			continue;
++
++		ret = drm_property_add_enum(prop, props[i].type,
++					    props[i].name);
++
++		if (ret) {
++			drm_property_destroy(dev, prop);
++
++			return ERR_PTR(ret);
++		}
++	}
++
++	return prop;
++}
++
++/**
++ * drm_plane_create_scaling_filter_property - create a new scaling filter
++ * property
++ *
++ * @plane: drm plane
++ * @supported_filters: bitmask of supported scaling filters, must include
++ *		       BIT(DRM_SCALING_FILTER_DEFAULT).
++ *
++ * This function lets driver to enable the scaling filter property on a given
++ * plane.
++ *
++ * RETURNS:
++ * Zero for success or -errno
++ */
++int drm_plane_create_scaling_filter_property(struct drm_plane *plane,
++					     unsigned int supported_filters)
++{
++	struct drm_property *prop =
++		drm_create_scaling_filter_prop(plane->dev, supported_filters);
++
++	if (IS_ERR(prop))
++		return PTR_ERR(prop);
++
++	drm_object_attach_property(&plane->base, prop,
++				   DRM_SCALING_FILTER_DEFAULT);
++	plane->scaling_filter_property = prop;
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_plane_create_scaling_filter_property);
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 59b51a09cae6..ba839e5e357d 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -324,6 +324,13 @@ struct drm_crtc_state {
+ 	 */
+ 	bool self_refresh_active;
+ 
++	/**
++	 * @scaling_filter:
++	 *
++	 * Scaling filter to be applied
++	 */
++	enum drm_scaling_filter scaling_filter;
++
+ 	/**
+ 	 * @event:
+ 	 *
+@@ -1083,6 +1090,12 @@ struct drm_crtc {
+ 	/** @properties: property tracking for this CRTC */
+ 	struct drm_object_properties properties;
+ 
++	/**
++	 * @scaling_filter_property: property to apply a particular filter while
++	 * scaling.
++	 */
++	struct drm_property *scaling_filter_property;
++
+ 	/**
+ 	 * @state:
+ 	 *
+@@ -1266,4 +1279,7 @@ static inline struct drm_crtc *drm_crtc_find(struct drm_device *dev,
+ #define drm_for_each_crtc(crtc, dev) \
+ 	list_for_each_entry(crtc, &(dev)->mode_config.crtc_list, head)
+ 
++int drm_crtc_create_scaling_filter_property(struct drm_crtc *crtc,
++					    unsigned int supported_filters);
++
+ #endif /* __DRM_CRTC_H__ */
+diff --git a/include/drm/drm_plane.h b/include/drm/drm_plane.h
+index 3f396d94afe4..1d82b264e5e4 100644
+--- a/include/drm/drm_plane.h
++++ b/include/drm/drm_plane.h
+@@ -35,6 +35,11 @@ struct drm_crtc;
+ struct drm_printer;
+ struct drm_modeset_acquire_ctx;
+ 
++enum drm_scaling_filter {
++	DRM_SCALING_FILTER_DEFAULT,
++	DRM_SCALING_FILTER_NEAREST_NEIGHBOR,
++};
++
+ /**
+  * struct drm_plane_state - mutable plane state
+  *
+@@ -214,6 +219,13 @@ struct drm_plane_state {
+ 	 */
+ 	bool visible;
+ 
++	/**
++	 * @scaling_filter:
++	 *
++	 * Scaling filter to be applied
++	 */
++	enum drm_scaling_filter scaling_filter;
++
+ 	/**
+ 	 * @commit: Tracks the pending commit to prevent use-after-free conditions,
+ 	 * and for async plane updates.
+@@ -724,6 +736,12 @@ struct drm_plane {
+ 	 * See drm_plane_create_color_properties().
+ 	 */
+ 	struct drm_property *color_range_property;
++
++	/**
++	 * @scaling_filter_property: property to apply a particular filter while
++	 * scaling.
++	 */
++	struct drm_property *scaling_filter_property;
+ };
+ 
+ #define obj_to_plane(x) container_of(x, struct drm_plane, base)
+@@ -862,4 +880,7 @@ drm_plane_get_damage_clips(const struct drm_plane_state *state)
+ 					state->fb_damage_clips->data : NULL);
+ }
+ 
++int drm_plane_create_scaling_filter_property(struct drm_plane *plane,
++					     unsigned int supported_filters);
++
+ #endif
+-- 
+2.25.1
+

@@ -1,0 +1,183 @@
+From 3f405906955978d5afeeae28b5c8d76ef1584a30 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Thu, 29 Oct 2020 13:59:08 +1000
+Subject: [PATCH 0871/1714] drm/amdgpu/ttm: use multihop
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This removes the code to move resources directly between
+SYSTEM and VRAM in favour of using the core ttm mulithop code.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201109005432.861936-3-airlied@gmail.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 136 +++---------------------
+ 1 file changed, 12 insertions(+), 124 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index fad7ca959316..676fb520e044 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -512,119 +512,6 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 	return r;
+ }
+ 
+-/**
+- * amdgpu_move_vram_ram - Copy VRAM buffer to RAM buffer
+- *
+- * Called by amdgpu_bo_move().
+- */
+-static int amdgpu_move_vram_ram(struct ttm_buffer_object *bo, bool evict,
+-				struct ttm_operation_ctx *ctx,
+-				struct ttm_resource *new_mem)
+-{
+-	struct ttm_resource *old_mem = &bo->mem;
+-	struct ttm_resource tmp_mem;
+-	struct ttm_place placements;
+-	struct ttm_placement placement;
+-	int r;
+-
+-	/* create space/pages for new_mem in GTT space */
+-	tmp_mem = *new_mem;
+-	tmp_mem.mm_node = NULL;
+-	placement.num_placement = 1;
+-	placement.placement = &placements;
+-	placement.num_busy_placement = 1;
+-	placement.busy_placement = &placements;
+-	placements.fpfn = 0;
+-	placements.lpfn = 0;
+-	placements.mem_type = TTM_PL_TT;
+-	placements.flags = 0;
+-	r = ttm_bo_mem_space(bo, &placement, &tmp_mem, ctx);
+-	if (unlikely(r)) {
+-		pr_err("Failed to find GTT space for blit from VRAM\n");
+-		return r;
+-	}
+-
+-	r = ttm_tt_populate(bo->bdev, bo->ttm, ctx);
+-	if (unlikely(r))
+-		goto out_cleanup;
+-
+-	/* Bind the memory to the GTT space */
+-	r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, &tmp_mem);
+-	if (unlikely(r)) {
+-		goto out_cleanup;
+-	}
+-
+-	/* blit VRAM to GTT */
+-	r = amdgpu_move_blit(bo, evict, &tmp_mem, old_mem);
+-	if (unlikely(r)) {
+-		goto out_cleanup;
+-	}
+-
+-	r = ttm_bo_wait_ctx(bo, ctx);
+-	if (unlikely(r))
+-		goto out_cleanup;
+-
+-	amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+-	ttm_resource_free(bo, &bo->mem);
+-	ttm_bo_assign_mem(bo, new_mem);
+-out_cleanup:
+-	ttm_resource_free(bo, &tmp_mem);
+-	return r;
+-}
+-
+-/**
+- * amdgpu_move_ram_vram - Copy buffer from RAM to VRAM
+- *
+- * Called by amdgpu_bo_move().
+- */
+-static int amdgpu_move_ram_vram(struct ttm_buffer_object *bo, bool evict,
+-				struct ttm_operation_ctx *ctx,
+-				struct ttm_resource *new_mem)
+-{
+-	struct ttm_resource *old_mem = &bo->mem;
+-	struct ttm_resource tmp_mem;
+-	struct ttm_placement placement;
+-	struct ttm_place placements;
+-	int r;
+-
+-	/* make space in GTT for old_mem buffer */
+-	tmp_mem = *new_mem;
+-	tmp_mem.mm_node = NULL;
+-	placement.num_placement = 1;
+-	placement.placement = &placements;
+-	placement.num_busy_placement = 1;
+-	placement.busy_placement = &placements;
+-	placements.fpfn = 0;
+-	placements.lpfn = 0;
+-	placements.mem_type = TTM_PL_TT;
+-	placements.flags = 0;
+-	r = ttm_bo_mem_space(bo, &placement, &tmp_mem, ctx);
+-	if (unlikely(r)) {
+-		pr_err("Failed to find GTT space for blit to VRAM\n");
+-		return r;
+-	}
+-
+-	/* move/bind old memory to GTT space */
+-	r = ttm_tt_populate(bo->bdev, bo->ttm, ctx);
+-	if (unlikely(r))
+-		return r;
+-
+-	r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, &tmp_mem);
+-	if (unlikely(r)) {
+-		goto out_cleanup;
+-	}
+-
+-	ttm_bo_assign_mem(bo, &tmp_mem);
+-	/* copy to VRAM */
+-	r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
+-	if (unlikely(r)) {
+-		goto out_cleanup;
+-	}
+-out_cleanup:
+-	ttm_resource_free(bo, &tmp_mem);
+-	return r;
+-}
+-
+ /**
+  * amdgpu_mem_visible - Check that memory can be accessed by ttm_bo_move_memcpy
+  *
+@@ -664,6 +551,17 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	struct ttm_resource *old_mem = &bo->mem;
+ 	int r;
+ 
++	if ((old_mem->mem_type == TTM_PL_SYSTEM &&
++	     new_mem->mem_type == TTM_PL_VRAM) ||
++	    (old_mem->mem_type == TTM_PL_VRAM &&
++	     new_mem->mem_type == TTM_PL_SYSTEM)) {
++		hop->fpfn = 0;
++		hop->lpfn = 0;
++		hop->mem_type = TTM_PL_TT;
++		hop->flags = 0;
++		return -EMULTIHOP;
++	}
++
+ 	if (new_mem->mem_type == TTM_PL_TT) {
+ 		r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, new_mem);
+ 		if (r)
+@@ -717,17 +615,7 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		goto memcpy;
+ 	}
+ 
+-	if (old_mem->mem_type == TTM_PL_VRAM &&
+-	    new_mem->mem_type == TTM_PL_SYSTEM) {
+-		r = amdgpu_move_vram_ram(bo, evict, ctx, new_mem);
+-	} else if (old_mem->mem_type == TTM_PL_SYSTEM &&
+-		   new_mem->mem_type == TTM_PL_VRAM) {
+-		r = amdgpu_move_ram_vram(bo, evict, ctx, new_mem);
+-	} else {
+-		r = amdgpu_move_blit(bo, evict,
+-				     new_mem, old_mem);
+-	}
+-
++	r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
+ 	if (r) {
+ memcpy:
+ 		/* Check that all memory is CPU accessible */
+-- 
+2.25.1
+

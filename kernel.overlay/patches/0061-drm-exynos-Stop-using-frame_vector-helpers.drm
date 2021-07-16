@@ -1,0 +1,162 @@
+From 9fcfcee38b393446d624d1cc292c8e86d7b11da7 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 27 Nov 2020 17:41:15 +0100
+Subject: [PATCH 061/105] drm/exynos: Stop using frame_vector helpers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+All we need are a pages array, pin_user_pages_fast can give us that
+directly. Plus this avoids the entire raw pfn side of get_vaddr_frames.
+
+Note that pin_user_pages_fast is a safe replacement despite the
+seeming lack of checking for vma->vm_flasg & (VM_IO | VM_PFNMAP). Such
+ptes are marked with pte_mkspecial (which pup_fast rejects in the
+fastpath), and only architectures supporting that support the
+pin_user_pages_fast fastpath.
+
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Inki Dae <inki.dae@samsung.com>
+Cc: Joonyoung Shim <jy0922.shim@samsung.com>
+Cc: Seung-Woo Kim <sw0312.kim@samsung.com>
+Cc: Kyungmin Park <kyungmin.park@samsung.com>
+Cc: Kukjin Kim <kgene@kernel.org>
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Jérôme Glisse <jglisse@redhat.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: linux-mm@kvack.org
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linux-samsung-soc@vger.kernel.org
+Cc: linux-media@vger.kernel.org
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201127164131.2244124-2-daniel.vetter@ffwll.ch
+---
+ drivers/gpu/drm/exynos/Kconfig          |  1 -
+ drivers/gpu/drm/exynos/exynos_drm_g2d.c | 47 +++++++++++--------------
+ 2 files changed, 20 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/exynos/Kconfig b/drivers/gpu/drm/exynos/Kconfig
+index 951d5f708e92..6a251e3aa779 100644
+--- a/drivers/gpu/drm/exynos/Kconfig
++++ b/drivers/gpu/drm/exynos/Kconfig
+@@ -89,7 +89,6 @@ comment "Sub-drivers"
+ config DRM_EXYNOS_G2D
+ 	bool "G2D"
+ 	depends on VIDEO_SAMSUNG_S5P_G2D=n || COMPILE_TEST
+-	select FRAME_VECTOR
+ 	help
+ 	  Choose this option if you want to use Exynos G2D for DRM.
+ 
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_g2d.c b/drivers/gpu/drm/exynos/exynos_drm_g2d.c
+index 967a5cdc120e..ecede41af9b9 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_g2d.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_g2d.c
+@@ -205,7 +205,8 @@ struct g2d_cmdlist_userptr {
+ 	dma_addr_t		dma_addr;
+ 	unsigned long		userptr;
+ 	unsigned long		size;
+-	struct frame_vector	*vec;
++	struct page		**pages;
++	unsigned int		npages;
+ 	struct sg_table		*sgt;
+ 	atomic_t		refcount;
+ 	bool			in_pool;
+@@ -378,7 +379,6 @@ static void g2d_userptr_put_dma_addr(struct g2d_data *g2d,
+ 					bool force)
+ {
+ 	struct g2d_cmdlist_userptr *g2d_userptr = obj;
+-	struct page **pages;
+ 
+ 	if (!obj)
+ 		return;
+@@ -398,15 +398,9 @@ static void g2d_userptr_put_dma_addr(struct g2d_data *g2d,
+ 	dma_unmap_sgtable(to_dma_dev(g2d->drm_dev), g2d_userptr->sgt,
+ 			  DMA_BIDIRECTIONAL, 0);
+ 
+-	pages = frame_vector_pages(g2d_userptr->vec);
+-	if (!IS_ERR(pages)) {
+-		int i;
+-
+-		for (i = 0; i < frame_vector_count(g2d_userptr->vec); i++)
+-			set_page_dirty_lock(pages[i]);
+-	}
+-	put_vaddr_frames(g2d_userptr->vec);
+-	frame_vector_destroy(g2d_userptr->vec);
++	unpin_user_pages_dirty_lock(g2d_userptr->pages, g2d_userptr->npages,
++				    true);
++	kvfree(g2d_userptr->pages);
+ 
+ 	if (!g2d_userptr->out_of_list)
+ 		list_del_init(&g2d_userptr->list);
+@@ -474,35 +468,34 @@ static dma_addr_t *g2d_userptr_get_dma_addr(struct g2d_data *g2d,
+ 	offset = userptr & ~PAGE_MASK;
+ 	end = PAGE_ALIGN(userptr + size);
+ 	npages = (end - start) >> PAGE_SHIFT;
+-	g2d_userptr->vec = frame_vector_create(npages);
+-	if (!g2d_userptr->vec) {
++	g2d_userptr->pages = kvmalloc_array(npages, sizeof(*g2d_userptr->pages),
++					    GFP_KERNEL);
++	if (!g2d_userptr->pages) {
+ 		ret = -ENOMEM;
+ 		goto err_free;
+ 	}
+ 
+-	ret = get_vaddr_frames(start, npages, FOLL_FORCE | FOLL_WRITE,
+-		g2d_userptr->vec);
++	ret = pin_user_pages_fast(start, npages, FOLL_FORCE | FOLL_WRITE,
++				  g2d_userptr->pages);
+ 	if (ret != npages) {
+ 		DRM_DEV_ERROR(g2d->dev,
+ 			      "failed to get user pages from userptr.\n");
+ 		if (ret < 0)
+-			goto err_destroy_framevec;
+-		ret = -EFAULT;
+-		goto err_put_framevec;
+-	}
+-	if (frame_vector_to_pages(g2d_userptr->vec) < 0) {
++			goto err_destroy_pages;
++		npages = ret;
+ 		ret = -EFAULT;
+-		goto err_put_framevec;
++		goto err_unpin_pages;
+ 	}
++	g2d_userptr->npages = npages;
+ 
+ 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+ 	if (!sgt) {
+ 		ret = -ENOMEM;
+-		goto err_put_framevec;
++		goto err_unpin_pages;
+ 	}
+ 
+ 	ret = sg_alloc_table_from_pages(sgt,
+-					frame_vector_pages(g2d_userptr->vec),
++					g2d_userptr->pages,
+ 					npages, offset, size, GFP_KERNEL);
+ 	if (ret < 0) {
+ 		DRM_DEV_ERROR(g2d->dev, "failed to get sgt from pages.\n");
+@@ -538,11 +531,11 @@ static dma_addr_t *g2d_userptr_get_dma_addr(struct g2d_data *g2d,
+ err_free_sgt:
+ 	kfree(sgt);
+ 
+-err_put_framevec:
+-	put_vaddr_frames(g2d_userptr->vec);
++err_unpin_pages:
++	unpin_user_pages(g2d_userptr->pages, npages);
+ 
+-err_destroy_framevec:
+-	frame_vector_destroy(g2d_userptr->vec);
++err_destroy_pages:
++	kvfree(g2d_userptr->pages);
+ 
+ err_free:
+ 	kfree(g2d_userptr);
+-- 
+2.25.1
+

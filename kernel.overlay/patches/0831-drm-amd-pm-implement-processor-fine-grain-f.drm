@@ -1,0 +1,252 @@
+From ec247c6109b3517442dd80ff875599e4f98fb840 Mon Sep 17 00:00:00 2001
+From: Huang Rui <ray.huang@amd.com>
+Date: Fri, 8 Jan 2021 15:31:38 +0800
+Subject: [PATCH 0831/1087] drm/amd/pm: implement processor fine grain feature
+ for vangogh (v3)
+
+This patch is to implement the processor fine grain feature for vangogh.
+It's similar with gfx clock, the only difference is below:
+
+echo "p core_id level value" > pp_od_clk_voltage
+
+1. "p" - set the cclk (processor) frequency
+2. "core_id" - 0/1/2/3, represents which cpu core you want to select
+2. "level" - 0 or 1, "0" represents the min value,  "1" represents the
+   max value
+3. "value" - the target value of cclk frequency, it should be limited in
+   the safe range
+
+v2: fix some missing changes as Evan's suggestion.
+v3: add version check and fix the restore.
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Evan Quan <evan.quan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |  1 +
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            |  3 +
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h       |  6 ++
+ drivers/gpu/drm/amd/pm/inc/smu_types.h        |  1 +
+ .../gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c  | 95 ++++++++++++++++++-
+ 5 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 57b24c4c205b..a41875ac5dfb 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -156,6 +156,7 @@ enum {
+ enum PP_OD_DPM_TABLE_COMMAND {
+ 	PP_OD_EDIT_SCLK_VDDC_TABLE,
+ 	PP_OD_EDIT_MCLK_VDDC_TABLE,
++	PP_OD_EDIT_CCLK_VDDC_TABLE,
+ 	PP_OD_EDIT_VDDC_CURVE,
+ 	PP_OD_RESTORE_DEFAULT_TABLE,
+ 	PP_OD_COMMIT_DPM_TABLE,
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index d319203eddad..ecd72d896b49 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -800,6 +800,8 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
+ 
+ 	if (*buf == 's')
+ 		type = PP_OD_EDIT_SCLK_VDDC_TABLE;
++	else if (*buf == 'p')
++		type = PP_OD_EDIT_CCLK_VDDC_TABLE;
+ 	else if (*buf == 'm')
+ 		type = PP_OD_EDIT_MCLK_VDDC_TABLE;
+ 	else if(*buf == 'r')
+@@ -916,6 +918,7 @@ static ssize_t amdgpu_get_pp_od_clk_voltage(struct device *dev,
+ 		size += smu_print_clk_levels(&adev->smu, SMU_OD_VDDC_CURVE, buf+size);
+ 		size += smu_print_clk_levels(&adev->smu, SMU_OD_VDDGFX_OFFSET, buf+size);
+ 		size += smu_print_clk_levels(&adev->smu, SMU_OD_RANGE, buf+size);
++		size += smu_print_clk_levels(&adev->smu, SMU_OD_CCLK, buf+size);
+ 	} else if (adev->powerplay.pp_funcs->print_clock_levels) {
+ 		size = amdgpu_dpm_print_clock_levels(adev, OD_SCLK, buf);
+ 		size += amdgpu_dpm_print_clock_levels(adev, OD_MCLK, buf+size);
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index 97691e366f07..277559e80961 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -468,6 +468,12 @@ struct smu_context
+ 
+ 	bool fine_grain_enabled;
+ 	bool fine_grain_started;
++
++	uint32_t cpu_default_soft_min_freq;
++	uint32_t cpu_default_soft_max_freq;
++	uint32_t cpu_actual_soft_min_freq;
++	uint32_t cpu_actual_soft_max_freq;
++	uint32_t cpu_core_id_select;
+ };
+ 
+ struct i2c_adapter;
+diff --git a/drivers/gpu/drm/amd/pm/inc/smu_types.h b/drivers/gpu/drm/amd/pm/inc/smu_types.h
+index 8e428c728e0e..b76270e8767c 100644
+--- a/drivers/gpu/drm/amd/pm/inc/smu_types.h
++++ b/drivers/gpu/drm/amd/pm/inc/smu_types.h
+@@ -237,6 +237,7 @@ enum smu_clk_type {
+ 	SMU_SCLK,
+ 	SMU_MCLK,
+ 	SMU_PCIE,
++	SMU_OD_CCLK,
+ 	SMU_OD_SCLK,
+ 	SMU_OD_MCLK,
+ 	SMU_OD_VDDC_CURVE,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+index f60932887c27..b49044825680 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+@@ -458,11 +458,22 @@ static int vangogh_print_fine_grain_clk(struct smu_context *smu,
+ 			(smu->gfx_actual_soft_max_freq > 0) ? smu->gfx_actual_soft_max_freq : smu->gfx_default_soft_max_freq);
+ 		}
+ 		break;
++	case SMU_OD_CCLK:
++		if (smu->od_enabled) {
++			size = sprintf(buf, "CCLK_RANGE in Core%d:\n",  smu->cpu_core_id_select);
++			size += sprintf(buf + size, "0: %10uMhz\n",
++			(smu->cpu_actual_soft_min_freq > 0) ? smu->cpu_actual_soft_min_freq : smu->cpu_default_soft_min_freq);
++			size += sprintf(buf + size, "1: %10uMhz\n",
++			(smu->cpu_actual_soft_max_freq > 0) ? smu->cpu_actual_soft_max_freq : smu->cpu_default_soft_max_freq);
++		}
++		break;
+ 	case SMU_OD_RANGE:
+ 		if (smu->od_enabled) {
+ 			size = sprintf(buf, "%s:\n", "OD_RANGE");
+ 			size += sprintf(buf + size, "SCLK: %7uMhz %10uMhz\n",
+ 				smu->gfx_default_hard_min_freq, smu->gfx_default_soft_max_freq);
++			size += sprintf(buf + size, "CCLK: %7uMhz %10uMhz\n",
++				smu->cpu_default_soft_min_freq, smu->cpu_default_soft_max_freq);
+ 		}
+ 		break;
+ 	case SMU_SOCCLK:
+@@ -1386,9 +1397,10 @@ static ssize_t vangogh_get_gpu_metrics(struct smu_context *smu,
+ }
+ 
+ static int vangogh_od_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_TABLE_COMMAND type,
+-							long input[], uint32_t size)
++					long input[], uint32_t size)
+ {
+ 	int ret = 0;
++	int i;
+ 
+ 	if (!smu->od_enabled) {
+ 		dev_warn(smu->adev->dev, "Fine grain is not enabled!\n");
+@@ -1396,6 +1408,34 @@ static int vangogh_od_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_TAB
+ 	}
+ 
+ 	switch (type) {
++	case PP_OD_EDIT_CCLK_VDDC_TABLE:
++		if (size != 3) {
++			dev_err(smu->adev->dev, "Input parameter number not correct (should be 4 for processor)\n");
++			return -EINVAL;
++		}
++		if (input[0] >= boot_cpu_data.x86_max_cores) {
++			dev_err(smu->adev->dev, "core index is overflow, should be less than %d\n",
++				boot_cpu_data.x86_max_cores);
++		}
++		smu->cpu_core_id_select = input[0];
++		if (input[1] == 0) {
++			if (input[2] < smu->cpu_default_soft_min_freq) {
++				dev_warn(smu->adev->dev, "Fine grain setting minimum cclk (%ld) MHz is less than the minimum allowed (%d) MHz\n",
++					input[2], smu->cpu_default_soft_min_freq);
++				return -EINVAL;
++			}
++			smu->cpu_actual_soft_min_freq = input[2];
++		} else if (input[1] == 1) {
++			if (input[2] > smu->cpu_default_soft_max_freq) {
++				dev_warn(smu->adev->dev, "Fine grain setting maximum cclk (%ld) MHz is greater than the maximum allowed (%d) MHz\n",
++					input[2], smu->cpu_default_soft_max_freq);
++				return -EINVAL;
++			}
++			smu->cpu_actual_soft_max_freq = input[2];
++		} else {
++			return -EINVAL;
++		}
++		break;
+ 	case PP_OD_EDIT_SCLK_VDDC_TABLE:
+ 		if (size != 2) {
+ 			dev_err(smu->adev->dev, "Input parameter number not correct\n");
+@@ -1429,6 +1469,8 @@ static int vangogh_od_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_TAB
+ 		} else {
+ 			smu->gfx_actual_hard_min_freq = smu->gfx_default_hard_min_freq;
+ 			smu->gfx_actual_soft_max_freq = smu->gfx_default_soft_max_freq;
++			smu->cpu_actual_soft_min_freq = smu->cpu_default_soft_min_freq;
++			smu->cpu_actual_soft_max_freq = smu->cpu_default_soft_max_freq;
+ 
+ 			ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetHardMinGfxClk,
+ 									smu->gfx_actual_hard_min_freq, NULL);
+@@ -1443,6 +1485,29 @@ static int vangogh_od_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_TAB
+ 				dev_err(smu->adev->dev, "Restore the default soft max sclk failed!");
+ 				return ret;
+ 			}
++
++			if (smu->adev->pm.fw_version < 0x43f1b00) {
++				dev_warn(smu->adev->dev, "CPUSoftMax/CPUSoftMin are not supported, please update SBIOS!\n");
++				break;
++			}
++
++			for (i = 0; i < boot_cpu_data.x86_max_cores; i++) {
++				ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetSoftMinCclk,
++								      (i << 20) | smu->cpu_actual_soft_min_freq,
++								      NULL);
++				if (ret) {
++					dev_err(smu->adev->dev, "Set hard min cclk failed!");
++					return ret;
++				}
++
++				ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetSoftMaxCclk,
++								      (i << 20) | smu->cpu_actual_soft_max_freq,
++								      NULL);
++				if (ret) {
++					dev_err(smu->adev->dev, "Set soft max cclk failed!");
++					return ret;
++				}
++			}
+ 		}
+ 		break;
+ 	case PP_OD_COMMIT_DPM_TABLE:
+@@ -1471,6 +1536,29 @@ static int vangogh_od_edit_dpm_table(struct smu_context *smu, enum PP_OD_DPM_TAB
+ 				dev_err(smu->adev->dev, "Set soft max sclk failed!");
+ 				return ret;
+ 			}
++
++			if (smu->adev->pm.fw_version < 0x43f1b00) {
++				dev_warn(smu->adev->dev, "CPUSoftMax/CPUSoftMin are not supported, please update SBIOS!\n");
++				break;
++			}
++
++			ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetSoftMinCclk,
++							      ((smu->cpu_core_id_select << 20)
++							       | smu->cpu_actual_soft_min_freq),
++							      NULL);
++			if (ret) {
++				dev_err(smu->adev->dev, "Set hard min cclk failed!");
++				return ret;
++			}
++
++			ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetSoftMaxCclk,
++							      ((smu->cpu_core_id_select << 20)
++							       | smu->cpu_actual_soft_max_freq),
++							      NULL);
++			if (ret) {
++				dev_err(smu->adev->dev, "Set soft max cclk failed!");
++				return ret;
++			}
+ 		}
+ 		break;
+ 	default:
+@@ -1496,6 +1584,11 @@ static int vangogh_set_fine_grain_gfx_freq_parameters(struct smu_context *smu)
+ 	smu->gfx_actual_hard_min_freq = 0;
+ 	smu->gfx_actual_soft_max_freq = 0;
+ 
++	smu->cpu_default_soft_min_freq = 1400;
++	smu->cpu_default_soft_max_freq = 3500;
++	smu->cpu_actual_soft_min_freq = 0;
++	smu->cpu_actual_soft_max_freq = 0;
++
+ 	return 0;
+ }
+ 
+-- 
+2.17.1
+

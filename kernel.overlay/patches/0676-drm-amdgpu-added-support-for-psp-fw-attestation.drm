@@ -1,0 +1,398 @@
+From aee9a8afc3b0a42b7ab1c742c903658304aad901 Mon Sep 17 00:00:00 2001
+From: John Clements <john.clements@amd.com>
+Date: Mon, 26 Oct 2020 14:57:13 +0800
+Subject: [PATCH 0676/1714] drm/amdgpu: added support for psp fw attestation
+
+loaded fw can be queried from sys fs interface
+
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: John Clements <john.clements@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile           |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c   |   3 +
+ .../drm/amd/amdgpu/amdgpu_fw_attestation.c    | 142 ++++++++++++++++++
+ .../drm/amd/amdgpu/amdgpu_fw_attestation.h    |  30 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c       |  36 ++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h       |   2 +
+ drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h       |  54 +++++--
+ 7 files changed, 250 insertions(+), 20 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 247dd46e1681..6fde9a9d5e2b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -55,7 +55,8 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+ 	amdgpu_vf_error.o amdgpu_sched.o amdgpu_debugfs.o amdgpu_ids.o \
+ 	amdgpu_gmc.o amdgpu_mmhub.o amdgpu_xgmi.o amdgpu_csa.o amdgpu_ras.o amdgpu_vm_cpu.o \
+ 	amdgpu_vm_sdma.o amdgpu_discovery.o amdgpu_ras_eeprom.o amdgpu_nbio.o \
+-	amdgpu_umc.o smu_v11_0_i2c.o amdgpu_fru_eeprom.o amdgpu_rap.o
++	amdgpu_umc.o smu_v11_0_i2c.o amdgpu_fru_eeprom.o amdgpu_rap.o \
++	amdgpu_fw_attestation.o
+ 
+ amdgpu-$(CONFIG_PERF_EVENTS) += amdgpu_pmu.o
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index 484d5abc3a90..f0342d459a7e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -35,6 +35,7 @@
+ #include "amdgpu_dm_debugfs.h"
+ #include "amdgpu_ras.h"
+ #include "amdgpu_rap.h"
++#include "amdgpu_fw_attestation.h"
+ 
+ /**
+  * amdgpu_debugfs_add_files - Add simple debugfs entries
+@@ -1668,6 +1669,8 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
+ 
+ 	amdgpu_rap_debugfs_init(adev);
+ 
++	amdgpu_fw_attestation_debugfs_init(adev);
++
+ 	return amdgpu_debugfs_add_files(adev, amdgpu_debugfs_list,
+ 					ARRAY_SIZE(amdgpu_debugfs_list));
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.c
+new file mode 100644
+index 000000000000..c6947d6c7ff5
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.c
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2020 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include <linux/debugfs.h>
++#include <linux/firmware.h>
++#include <linux/dma-mapping.h>
++
++#include "amdgpu.h"
++#include "amdgpu_psp.h"
++#include "amdgpu_ucode.h"
++#include "soc15_common.h"
++
++#define FW_ATTESTATION_DB_COOKIE        0x143b6a37
++#define FW_ATTESTATION_RECORD_VALID  	1
++#define FW_ATTESTATION_MAX_SIZE		4096
++
++typedef struct FW_ATT_DB_HEADER
++{
++	uint32_t AttDbVersion;           /* version of the fwar feature */
++	uint32_t AttDbCookie;            /* cookie as an extra check for corrupt data */
++} FW_ATT_DB_HEADER;
++
++typedef struct FW_ATT_RECORD
++{
++	uint16_t AttFwIdV1;              /* Legacy FW Type field */
++	uint16_t AttFwIdV2;              /* V2 FW ID field */
++	uint32_t AttFWVersion;           /* FW Version */
++	uint16_t AttFWActiveFunctionID;  /* The VF ID (only in VF Attestation Table) */
++	uint16_t AttSource;              /* FW source indicator */
++	uint16_t RecordValid;            /* Indicates whether the record is a valid entry */
++	uint8_t  AttFwTaId;              /* Ta ID (only in TA Attestation Table) */
++	uint8_t  Reserved;
++} FW_ATT_RECORD;
++
++static ssize_t amdgpu_fw_attestation_debugfs_read(struct file *f,
++						  char __user *buf,
++						  size_t size,
++						  loff_t *pos)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *)file_inode(f)->i_private;
++	uint64_t records_addr = 0;
++	uint64_t vram_pos = 0;
++	FW_ATT_DB_HEADER fw_att_hdr = {0};
++	FW_ATT_RECORD fw_att_record = {0};
++
++	if (size < sizeof(FW_ATT_RECORD)) {
++		DRM_WARN("FW attestation input buffer not enough memory");
++		return -EINVAL;
++	}
++
++	if ((*pos + sizeof(FW_ATT_DB_HEADER)) >= FW_ATTESTATION_MAX_SIZE) {
++		DRM_WARN("FW attestation out of bounds");
++		return 0;
++	}
++
++	if (psp_get_fw_attestation_records_addr(&adev->psp, &records_addr)) {
++		DRM_WARN("Failed to get FW attestation record address");
++		return -EINVAL;
++	}
++
++	vram_pos =  records_addr - adev->gmc.vram_start;
++
++	if (*pos == 0) {
++		amdgpu_device_vram_access(adev,
++					  vram_pos,
++					  (uint32_t*)&fw_att_hdr,
++					  sizeof(FW_ATT_DB_HEADER),
++					  false);
++
++		if (fw_att_hdr.AttDbCookie != FW_ATTESTATION_DB_COOKIE) {
++			DRM_WARN("Invalid FW attestation cookie");
++			return -EINVAL;
++		}
++
++		DRM_INFO("FW attestation version = 0x%X", fw_att_hdr.AttDbVersion);
++	}
++
++	amdgpu_device_vram_access(adev,
++				  vram_pos + sizeof(FW_ATT_DB_HEADER) + *pos,
++				  (uint32_t*)&fw_att_record,
++				  sizeof(FW_ATT_RECORD),
++				  false);
++
++	if (fw_att_record.RecordValid != FW_ATTESTATION_RECORD_VALID)
++		return 0;
++
++	if (copy_to_user(buf, (void*)&fw_att_record, sizeof(FW_ATT_RECORD)))
++		return -EINVAL;
++
++	*pos += sizeof(FW_ATT_RECORD);
++
++	return sizeof(FW_ATT_RECORD);
++}
++
++static const struct file_operations amdgpu_fw_attestation_debugfs_ops = {
++	.owner = THIS_MODULE,
++	.read = amdgpu_fw_attestation_debugfs_read,
++	.write = NULL,
++	.llseek = default_llseek
++};
++
++static int amdgpu_is_fw_attestation_supported(struct amdgpu_device *adev)
++{
++	if (adev->asic_type >= CHIP_SIENNA_CICHLID)
++		return 1;
++
++	return 0;
++}
++
++void amdgpu_fw_attestation_debugfs_init(struct amdgpu_device *adev)
++{
++#if defined(CONFIG_DEBUG_FS)
++	if (!amdgpu_is_fw_attestation_supported(adev))
++		return;
++
++	debugfs_create_file("amdgpu_fw_attestation",
++			    S_IRUSR,
++			    adev_to_drm(adev)->primary->debugfs_root,
++			    adev,
++			    &amdgpu_fw_attestation_debugfs_ops);
++#endif
++}
+\ No newline at end of file
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.h
+new file mode 100644
+index 000000000000..90af4fe58c99
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2020 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ *
++ */
++#ifndef _AMDGPU_FW_ATTESTATION_H
++#define _AMDGPU_FW_ATTESTATION_H
++
++#include "amdgpu.h"
++
++void amdgpu_fw_attestation_debugfs_init(struct amdgpu_device *adev);
++#endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 0e512d0c048c..407579fc7b00 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -290,6 +290,8 @@ psp_cmd_submit_buf(struct psp_context *psp,
+ 	skip_unsupport = (psp->cmd_buf_mem->resp.status == TEE_ERROR_NOT_SUPPORTED ||
+ 		psp->cmd_buf_mem->resp.status == PSP_ERR_UNKNOWN_COMMAND) && amdgpu_sriov_vf(psp->adev);
+ 
++	memcpy((void*)&cmd->resp, (void*)&psp->cmd_buf_mem->resp, sizeof(struct psp_gfx_resp));
++
+ 	/* In some cases, psp response status is not 0 even there is no
+ 	 * problem while the command is submitted. Some version of PSP FW
+ 	 * doesn't write 0 to that field.
+@@ -310,9 +312,6 @@ psp_cmd_submit_buf(struct psp_context *psp,
+ 		}
+ 	}
+ 
+-	/* get xGMI session id from response buffer */
+-	cmd->resp.session_id = psp->cmd_buf_mem->resp.session_id;
+-
+ 	if (ucode) {
+ 		ucode->tmr_mc_addr_lo = psp->cmd_buf_mem->resp.fw_addr_lo;
+ 		ucode->tmr_mc_addr_hi = psp->cmd_buf_mem->resp.fw_addr_hi;
+@@ -511,6 +510,37 @@ static int psp_tmr_terminate(struct psp_context *psp)
+ 	return 0;
+ }
+ 
++int psp_get_fw_attestation_records_addr(struct psp_context *psp,
++					uint64_t *output_ptr)
++{
++	int ret;
++	struct psp_gfx_cmd_resp *cmd;
++
++	if (!output_ptr)
++		return -EINVAL;
++
++	if (amdgpu_sriov_vf(psp->adev))
++		return 0;
++
++	cmd = kzalloc(sizeof(struct psp_gfx_cmd_resp), GFP_KERNEL);
++	if (!cmd)
++		return -ENOMEM;
++
++	cmd->cmd_id = GFX_CMD_ID_GET_FW_ATTESTATION;
++
++	ret = psp_cmd_submit_buf(psp, NULL, cmd,
++				 psp->fence_buf_mc_addr);
++
++	if (!ret) {
++		*output_ptr = ((uint64_t)cmd->resp.uresp.fwar_db_info.fwar_db_addr_lo) +
++			      ((uint64_t)cmd->resp.uresp.fwar_db_info.fwar_db_addr_hi << 32);
++	}
++
++	kfree(cmd);
++
++	return ret;
++}
++
+ static void psp_prep_asd_load_cmd_buf(struct psp_gfx_cmd_resp *cmd,
+ 				uint64_t asd_mc, uint32_t size)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 06e03851d9c5..da250bc1ac57 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -398,4 +398,6 @@ int psp_init_sos_microcode(struct psp_context *psp,
+ 			   const char *chip_name);
+ int psp_init_ta_microcode(struct psp_context *psp,
+ 			  const char *chip_name);
++int psp_get_fw_attestation_records_addr(struct psp_context *psp,
++					uint64_t *output_ptr);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h b/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
+index 4137dc710aaf..d65a5339d354 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
+@@ -86,21 +86,22 @@ struct psp_gfx_ctrl
+ /* TEE Gfx Command IDs for the ring buffer interface. */
+ enum psp_gfx_cmd_id
+ {
+-    GFX_CMD_ID_LOAD_TA      = 0x00000001,   /* load TA */
+-    GFX_CMD_ID_UNLOAD_TA    = 0x00000002,   /* unload TA */
+-    GFX_CMD_ID_INVOKE_CMD   = 0x00000003,   /* send command to TA */
+-    GFX_CMD_ID_LOAD_ASD     = 0x00000004,   /* load ASD Driver */
+-    GFX_CMD_ID_SETUP_TMR    = 0x00000005,   /* setup TMR region */
+-    GFX_CMD_ID_LOAD_IP_FW   = 0x00000006,   /* load HW IP FW */
+-    GFX_CMD_ID_DESTROY_TMR  = 0x00000007,   /* destroy TMR region */
+-    GFX_CMD_ID_SAVE_RESTORE = 0x00000008,   /* save/restore HW IP FW */
+-    GFX_CMD_ID_SETUP_VMR    = 0x00000009,   /* setup VMR region */
+-    GFX_CMD_ID_DESTROY_VMR  = 0x0000000A,   /* destroy VMR region */
+-    GFX_CMD_ID_PROG_REG     = 0x0000000B,   /* program regs */
+-    GFX_CMD_ID_CLEAR_VF_FW  = 0x0000000D,   /* Clear VF FW, to be used on VF shutdown. */
++    GFX_CMD_ID_LOAD_TA            = 0x00000001,   /* load TA */
++    GFX_CMD_ID_UNLOAD_TA          = 0x00000002,   /* unload TA */
++    GFX_CMD_ID_INVOKE_CMD         = 0x00000003,   /* send command to TA */
++    GFX_CMD_ID_LOAD_ASD           = 0x00000004,   /* load ASD Driver */
++    GFX_CMD_ID_SETUP_TMR          = 0x00000005,   /* setup TMR region */
++    GFX_CMD_ID_LOAD_IP_FW         = 0x00000006,   /* load HW IP FW */
++    GFX_CMD_ID_DESTROY_TMR        = 0x00000007,   /* destroy TMR region */
++    GFX_CMD_ID_SAVE_RESTORE       = 0x00000008,   /* save/restore HW IP FW */
++    GFX_CMD_ID_SETUP_VMR          = 0x00000009,   /* setup VMR region */
++    GFX_CMD_ID_DESTROY_VMR        = 0x0000000A,   /* destroy VMR region */
++    GFX_CMD_ID_PROG_REG           = 0x0000000B,   /* program regs */
++    GFX_CMD_ID_CLEAR_VF_FW        = 0x0000000D,   /* Clear VF FW, to be used on VF shutdown. */
++    GFX_CMD_ID_GET_FW_ATTESTATION = 0x0000000F,   /* Query GPUVA of the Fw Attestation DB */
+     /* IDs upto 0x1F are reserved for older programs (Raven, Vega 10/12/20) */
+-    GFX_CMD_ID_LOAD_TOC     = 0x00000020,   /* Load TOC and obtain TMR size */
+-    GFX_CMD_ID_AUTOLOAD_RLC = 0x00000021,   /* Indicates all graphics fw loaded, start RLC autoload */
++    GFX_CMD_ID_LOAD_TOC           = 0x00000020,   /* Load TOC and obtain TMR size */
++    GFX_CMD_ID_AUTOLOAD_RLC       = 0x00000021,   /* Indicates all graphics fw loaded, start RLC autoload */
+ };
+ 
+ /* Command to load Trusted Application binary into PSP OS. */
+@@ -285,6 +286,25 @@ union psp_gfx_commands
+     struct psp_gfx_cmd_load_toc         cmd_load_toc;
+ };
+ 
++struct psp_gfx_uresp_reserved
++{
++    uint32_t reserved[8];
++};
++
++/* Command-specific response for Fw Attestation Db */
++struct psp_gfx_uresp_fwar_db_info
++{
++    uint32_t fwar_db_addr_lo;
++    uint32_t fwar_db_addr_hi;
++};
++
++/* Union of command-specific responses for GPCOM ring. */
++union psp_gfx_uresp
++{
++    struct psp_gfx_uresp_reserved reserved;
++    struct psp_gfx_uresp_fwar_db_info fwar_db_info;
++};
++
+ /* Structure of GFX Response buffer.
+ * For GPCOM I/F it is part of GFX_CMD_RESP buffer, for RBI
+ * it is separate buffer.
+@@ -297,9 +317,11 @@ struct psp_gfx_resp
+     uint32_t	fw_addr_hi;	/* +12 bits [63:32] of FW address within TMR (in response to cmd_load_ip_fw command) */
+     uint32_t	tmr_size;	/* +16 size of the TMR to be reserved including MM fw and Gfx fw in response to cmd_load_toc command */
+ 
+-    uint32_t	reserved[3];
++    uint32_t	reserved[11];
++
++    union psp_gfx_uresp uresp;      /* +64 response union containing command-specific responses */
+ 
+-    /* total 32 bytes */
++    /* total 96 bytes */
+ };
+ 
+ /* Structure of Command buffer pointed by psp_gfx_rb_frame.cmd_buf_addr_hi
+-- 
+2.25.1
+

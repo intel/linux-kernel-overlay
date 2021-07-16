@@ -1,0 +1,136 @@
+From 790ba55b787564e4773407823ba9ca34961e4099 Mon Sep 17 00:00:00 2001
+From: Leo Yan <leo.yan@linaro.org>
+Date: Fri, 6 Nov 2020 17:48:47 +0800
+Subject: [PATCH 56/62] perf mem: Support new memory event
+ PERF_MEM_EVENTS__LOAD_STORE
+
+On the architectures with perf memory profiling, two types of hardware
+events have been supported: load and store; if want to profile memory
+for both load and store operations, the tool will use these two events
+at the same time, the usage is:
+
+  # perf mem record -t load,store -- uname
+
+But this cannot be applied for AUX tracing event, the same PMU event can
+be used to only trace memory load, or only memory store, or trace for
+both memory load and store.
+
+This patch introduces a new event PERF_MEM_EVENTS__LOAD_STORE, which is
+used to support the event which can record both memory load and store
+operations.
+
+When user specifies memory operation type as 'load,store', or doesn't
+set type so use 'load,store' as default, if the arch supports the event
+PERF_MEM_EVENTS__LOAD_STORE, the tool will convert the required
+operations to this single event; otherwise, if the arch doesn't support
+PERF_MEM_EVENTS__LOAD_STORE, the tool rolls back to enable both events
+PERF_MEM_EVENTS__LOAD and PERF_MEM_EVENTS__STORE, which keeps the same
+behaviour with before.
+
+Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Link: https://lore.kernel.org/r/20201106094853.21082-4-leo.yan@linaro.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/builtin-mem.c     | 24 ++++++++++++++++++------
+ tools/perf/util/mem-events.c | 13 ++++++++++++-
+ tools/perf/util/mem-events.h |  1 +
+ 3 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/tools/perf/builtin-mem.c b/tools/perf/builtin-mem.c
+index bdf7323130fc..4ab52d489a7a 100644
+--- a/tools/perf/builtin-mem.c
++++ b/tools/perf/builtin-mem.c
+@@ -93,14 +93,26 @@ static int __cmd_record(int argc, const char **argv, struct perf_mem *mem)
+ 
+ 	rec_argv[i++] = "record";
+ 
+-	if (mem->operation & MEM_OPERATION_LOAD) {
+-		e = perf_mem_events__ptr(PERF_MEM_EVENTS__LOAD);
+-		e->record = true;
+-	}
++	e = perf_mem_events__ptr(PERF_MEM_EVENTS__LOAD_STORE);
+ 
+-	if (mem->operation & MEM_OPERATION_STORE) {
+-		e = perf_mem_events__ptr(PERF_MEM_EVENTS__STORE);
++	/*
++	 * The load and store operations are required, use the event
++	 * PERF_MEM_EVENTS__LOAD_STORE if it is supported.
++	 */
++	if (e->tag &&
++	    (mem->operation & MEM_OPERATION_LOAD) &&
++	    (mem->operation & MEM_OPERATION_STORE)) {
+ 		e->record = true;
++	} else {
++		if (mem->operation & MEM_OPERATION_LOAD) {
++			e = perf_mem_events__ptr(PERF_MEM_EVENTS__LOAD);
++			e->record = true;
++		}
++
++		if (mem->operation & MEM_OPERATION_STORE) {
++			e = perf_mem_events__ptr(PERF_MEM_EVENTS__STORE);
++			e->record = true;
++		}
+ 	}
+ 
+ 	e = perf_mem_events__ptr(PERF_MEM_EVENTS__LOAD);
+diff --git a/tools/perf/util/mem-events.c b/tools/perf/util/mem-events.c
+index 90a158b2982c..f93a852ad838 100644
+--- a/tools/perf/util/mem-events.c
++++ b/tools/perf/util/mem-events.c
+@@ -20,6 +20,7 @@ unsigned int perf_mem_events__loads_ldlat = 30;
+ static struct perf_mem_event perf_mem_events[PERF_MEM_EVENTS__MAX] = {
+ 	E("ldlat-loads",	"cpu/mem-loads,ldlat=%u/P",	"cpu/events/mem-loads"),
+ 	E("ldlat-stores",	"cpu/mem-stores/P",		"cpu/events/mem-stores"),
++	E(NULL,			NULL,				NULL),
+ };
+ #undef E
+ 
+@@ -80,6 +81,9 @@ int perf_mem_events__parse(const char *str)
+ 		for (j = 0; j < PERF_MEM_EVENTS__MAX; j++) {
+ 			struct perf_mem_event *e = perf_mem_events__ptr(j);
+ 
++			if (!e->tag)
++				continue;
++
+ 			if (strstr(e->tag, tok))
+ 				e->record = found = true;
+ 		}
+@@ -110,6 +114,13 @@ int perf_mem_events__init(void)
+ 		struct perf_mem_event *e = perf_mem_events__ptr(j);
+ 		struct stat st;
+ 
++		/*
++		 * If the event entry isn't valid, skip initialization
++		 * and "e->supported" will keep false.
++		 */
++		if (!e->tag)
++			continue;
++
+ 		scnprintf(path, PATH_MAX, "%s/devices/%s",
+ 			  mnt, e->sysfs_name);
+ 
+@@ -128,7 +139,7 @@ void perf_mem_events__list(void)
+ 		struct perf_mem_event *e = perf_mem_events__ptr(j);
+ 
+ 		fprintf(stderr, "%-13s%-*s%s\n",
+-			e->tag,
++			e->tag ?: "",
+ 			verbose > 0 ? 25 : 0,
+ 			verbose > 0 ? perf_mem_events__name(j) : "",
+ 			e->supported ? ": available" : "");
+diff --git a/tools/perf/util/mem-events.h b/tools/perf/util/mem-events.h
+index e66ac161b469..755cef7e0625 100644
+--- a/tools/perf/util/mem-events.h
++++ b/tools/perf/util/mem-events.h
+@@ -29,6 +29,7 @@ struct mem_info {
+ enum {
+ 	PERF_MEM_EVENTS__LOAD,
+ 	PERF_MEM_EVENTS__STORE,
++	PERF_MEM_EVENTS__LOAD_STORE,
+ 	PERF_MEM_EVENTS__MAX,
+ };
+ 
+-- 
+2.25.1
+

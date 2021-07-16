@@ -1,0 +1,157 @@
+From be191575b500600781f12f8b09901a38f917e372 Mon Sep 17 00:00:00 2001
+From: Joshua Aberback <joshua.aberback@amd.com>
+Date: Mon, 31 Aug 2020 01:58:03 -0400
+Subject: [PATCH 0631/1087] drm/amd/display: Update idle optimization handling
+
+[How]
+ - use dc interface instead of hwss interface in cursor functions, to keep
+dc->idle_optimizations_allowed updated
+ - add dc interface to check if idle optimizations might apply to a plane
+
+Signed-off-by: Joshua Aberback <joshua.aberback@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c            |  6 ++++--
+ drivers/gpu/drm/amd/display/dc/dc.h                 |  4 ++++
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h        |  1 +
+ drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c  | 13 +++++++++++++
+ drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h  |  2 ++
+ drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c   |  1 +
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_resource.c   |  4 ++++
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h   |  2 ++
+ 8 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index cf0bcf674a91..8f1cadb823c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -3138,9 +3138,11 @@ void dc_lock_memory_clock_frequency(struct dc *dc)
+ 			core_link_enable_stream(dc->current_state, &dc->current_state->res_ctx.pipe_ctx[i]);
+ }
+ 
+-bool dc_is_plane_eligible_for_idle_optimizaitons(struct dc *dc,
+-						 struct dc_plane_state *plane)
++bool dc_is_plane_eligible_for_idle_optimizaitons(struct dc *dc, struct dc_plane_state *plane)
+ {
++	if (dc->hwss.does_plane_fit_in_mall && dc->hwss.does_plane_fit_in_mall(dc, plane))
++		return true;
++
+ 	return false;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 3aedadb34548..90fdddb72e3b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -171,6 +171,9 @@ struct dc_caps {
+ 	bool dmcub_support;
+ 	uint32_t num_of_internal_disp;
+ 	enum dp_protocol_version max_dp_protocol_version;
++	unsigned int mall_size_per_mem_channel;
++	unsigned int mall_size_total;
++	unsigned int cursor_cache_size;
+ 	struct dc_plane_cap planes[MAX_PLANES];
+ 	struct dc_color_caps color;
+ };
+@@ -499,6 +502,7 @@ struct dc_debug_options {
+ 	bool dmcub_emulation;
+ #if defined(CONFIG_DRM_AMD_DC_DCN)
+ 	bool disable_idle_power_optimizations;
++	unsigned int mall_size_override;
+ #endif
+ 	bool dmub_command_table; /* for testing only */
+ 	struct dc_bw_validation_profile bw_val_profile;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index 701aa7178a89..b41e6367b15e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -71,6 +71,7 @@ struct dc_plane_address {
+ 	union {
+ 		struct{
+ 			PHYSICAL_ADDRESS_LOC addr;
++			PHYSICAL_ADDRESS_LOC cursor_cache_addr;
+ 			PHYSICAL_ADDRESS_LOC meta_addr;
+ 			union large_integer dcc_const_color;
+ 		} grph;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+index 3deb3fb1724d..b83c13d3d8b7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+@@ -814,6 +814,19 @@ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable)
+ 	return true;
+ }
+ 
++bool dcn30_does_plane_fit_in_mall(struct dc *dc, struct dc_plane_state *plane)
++{
++	// add meta size?
++	unsigned int surface_size = plane->plane_size.surface_pitch * plane->plane_size.surface_size.height *
++			(plane->format >= SURFACE_PIXEL_FORMAT_GRPH_ARGB16161616 ? 8 : 4);
++	unsigned int mall_size = dc->caps.mall_size_total;
++
++	if (dc->debug.mall_size_override)
++		mall_size = 1024 * 1024 * dc->debug.mall_size_override;
++
++	return (surface_size + dc->caps.cursor_cache_size) < mall_size;
++}
++
+ void dcn30_hardware_release(struct dc *dc)
+ {
+ 	/* if pstate unsupported, force it supported */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+index 7d32c43aafe0..bfc97e2ece61 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+@@ -65,6 +65,8 @@ void dcn30_set_avmute(struct pipe_ctx *pipe_ctx, bool enable);
+ void dcn30_update_info_frame(struct pipe_ctx *pipe_ctx);
+ void dcn30_program_dmdata_engine(struct pipe_ctx *pipe_ctx);
+ 
++bool dcn30_does_plane_fit_in_mall(struct dc *dc, struct dc_plane_state *plane);
++
+ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable);
+ 
+ void dcn30_hardware_release(struct dc *dc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+index 6125fe440ad0..87c74aa84406 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+@@ -91,6 +91,7 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
+ 	.get_vupdate_offset_from_vsync = dcn10_get_vupdate_offset_from_vsync,
+ 	.calc_vupdate_position = dcn10_calc_vupdate_position,
+ 	.apply_idle_power_optimizations = dcn30_apply_idle_power_optimizations,
++	.does_plane_fit_in_mall = dcn30_does_plane_fit_in_mall,
+ 	.set_backlight_level = dcn21_set_backlight_level,
+ 	.set_abm_immediate_disable = dcn21_set_abm_immediate_disable,
+ 	.hardware_release = dcn30_hardware_release,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
+index 5e126fdf6ec1..e5bb15d8487b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_resource.c
+@@ -2631,6 +2631,10 @@ static bool dcn30_resource_construct(
+ 	dc->caps.max_cursor_size = 256;
+ 	dc->caps.min_horizontal_blanking_period = 80;
+ 	dc->caps.dmdata_alloc_size = 2048;
++	dc->caps.mall_size_per_mem_channel = 8;
++	/* total size = mall per channel * num channels * 1024 * 1024 */
++	dc->caps.mall_size_total = dc->caps.mall_size_per_mem_channel * dc->ctx->dc_bios->vram_info.num_chans * 1048576;
++	dc->caps.cursor_cache_size = dc->caps.max_cursor_size * dc->caps.max_cursor_size * 8;
+ 
+ 	dc->caps.max_slave_planes = 1;
+ 	dc->caps.post_blend_color_processing = true;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 62804dc7b698..7b12ffcdd4ec 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -217,6 +217,8 @@ struct hw_sequencer_funcs {
+ 	/* Idle Optimization Related */
+ 	bool (*apply_idle_power_optimizations)(struct dc *dc, bool enable);
+ 
++	bool (*does_plane_fit_in_mall)(struct dc *dc, struct dc_plane_state *plane);
++
+ 	bool (*is_abm_supported)(struct dc *dc,
+ 			struct dc_state *context, struct dc_stream_state *stream);
+ 
+-- 
+2.17.1
+

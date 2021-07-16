@@ -1,0 +1,123 @@
+From 2d7604d273c880f3602bcea6cb099a1f0d80a5fc Mon Sep 17 00:00:00 2001
+From: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Date: Fri, 11 Dec 2020 13:42:37 +0200
+Subject: [PATCH 0232/1087] drm: add legacy support for using degamma for gamma
+
+The DRM core handles legacy gamma-set ioctl by setting GAMMA_LUT and
+clearing CTM and DEGAMMA_LUT.
+
+This works fine on HW where we have either:
+
+degamma -> ctm -> gamma -> out
+
+or
+
+ctm -> gamma -> out
+
+However, if the HW has gamma table before ctm, the atomic property
+should be DEGAMMA_LUT, and thus we have:
+
+degamma -> ctm -> out
+
+This is fine for userspace which sets gamma table using the properties,
+as the userspace can check for the existence of gamma & degamma, but the
+legacy gamma-set ioctl does not work.
+
+Change the DRM core to use DEGAMMA_LUT instead of GAMMA_LUT when the
+latter is unavailable.
+
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201211114237.213288-3-tomi.valkeinen@ti.com
+---
+ drivers/gpu/drm/drm_color_mgmt.c | 22 ++++++++++++++++++----
+ drivers/gpu/drm/drm_fb_helper.c  |  5 +++++
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_color_mgmt.c b/drivers/gpu/drm/drm_color_mgmt.c
+index 553f423a8498..bb14f488c8f6 100644
+--- a/drivers/gpu/drm/drm_color_mgmt.c
++++ b/drivers/gpu/drm/drm_color_mgmt.c
+@@ -91,7 +91,7 @@
+  *
+  * There is also support for a legacy gamma table, which is set up by calling
+  * drm_mode_crtc_set_gamma_size(). The DRM core will then alias the legacy gamma
+- * ramp with "GAMMA_LUT".
++ * ramp with "GAMMA_LUT" or, if that is unavailable, "DEGAMMA_LUT".
+  *
+  * Support for different non RGB color encodings is controlled through
+  * &drm_plane specific COLOR_ENCODING and COLOR_RANGE properties. They
+@@ -238,6 +238,7 @@ EXPORT_SYMBOL(drm_mode_crtc_set_gamma_size);
+ static bool drm_crtc_supports_legacy_gamma(struct drm_crtc *crtc)
+ {
+ 	u32 gamma_id = crtc->dev->mode_config.gamma_lut_property->base.id;
++	u32 degamma_id = crtc->dev->mode_config.degamma_lut_property->base.id;
+ 
+ 	if (!crtc->gamma_size)
+ 		return false;
+@@ -245,7 +246,8 @@ static bool drm_crtc_supports_legacy_gamma(struct drm_crtc *crtc)
+ 	if (crtc->funcs->gamma_set)
+ 		return true;
+ 
+-	return !!drm_mode_obj_find_prop_id(&crtc->base, gamma_id);
++	return !!(drm_mode_obj_find_prop_id(&crtc->base, gamma_id) ||
++		  drm_mode_obj_find_prop_id(&crtc->base, degamma_id));
+ }
+ 
+ /**
+@@ -276,12 +278,22 @@ static int drm_crtc_legacy_gamma_set(struct drm_crtc *crtc,
+ 	struct drm_crtc_state *crtc_state;
+ 	struct drm_property_blob *blob;
+ 	struct drm_color_lut *blob_data;
++	u32 gamma_id = dev->mode_config.gamma_lut_property->base.id;
++	u32 degamma_id = dev->mode_config.degamma_lut_property->base.id;
++	bool use_gamma_lut;
+ 	int i, ret = 0;
+ 	bool replaced;
+ 
+ 	if (crtc->funcs->gamma_set)
+ 		return crtc->funcs->gamma_set(crtc, red, green, blue, size, ctx);
+ 
++	if (drm_mode_obj_find_prop_id(&crtc->base, gamma_id))
++		use_gamma_lut = true;
++	else if (drm_mode_obj_find_prop_id(&crtc->base, degamma_id))
++		use_gamma_lut = false;
++	else
++		return -ENODEV;
++
+ 	state = drm_atomic_state_alloc(crtc->dev);
+ 	if (!state)
+ 		return -ENOMEM;
+@@ -311,9 +323,11 @@ static int drm_crtc_legacy_gamma_set(struct drm_crtc *crtc,
+ 	}
+ 
+ 	/* Set GAMMA_LUT and reset DEGAMMA_LUT and CTM */
+-	replaced = drm_property_replace_blob(&crtc_state->degamma_lut, NULL);
++	replaced = drm_property_replace_blob(&crtc_state->degamma_lut,
++					     use_gamma_lut ? NULL : blob);
+ 	replaced |= drm_property_replace_blob(&crtc_state->ctm, NULL);
+-	replaced |= drm_property_replace_blob(&crtc_state->gamma_lut, blob);
++	replaced |= drm_property_replace_blob(&crtc_state->gamma_lut,
++					      use_gamma_lut ? blob : NULL);
+ 	crtc_state->color_mgmt_changed |= replaced;
+ 
+ 	ret = drm_atomic_commit(state);
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index e82db0f4e771..5ad19785daee 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -1059,6 +1059,11 @@ static int setcmap_atomic(struct fb_cmap *cmap, struct fb_info *info)
+ 			goto out_state;
+ 		}
+ 
++		/*
++		 * FIXME: This always uses gamma_lut. Some HW have only
++		 * degamma_lut, in which case we should reset gamma_lut and set
++		 * degamma_lut. See drm_crtc_legacy_gamma_set().
++		 */
+ 		replaced  = drm_property_replace_blob(&crtc_state->degamma_lut,
+ 						      NULL);
+ 		replaced |= drm_property_replace_blob(&crtc_state->ctm, NULL);
+-- 
+2.17.1
+

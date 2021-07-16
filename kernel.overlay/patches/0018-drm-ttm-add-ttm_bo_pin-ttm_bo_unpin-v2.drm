@@ -1,0 +1,132 @@
+From d37bfb49e4877713b0f145d479c09b8d54243671 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 21 Sep 2020 13:05:54 +0200
+Subject: [PATCH 0018/1714] drm/ttm: add ttm_bo_pin()/ttm_bo_unpin() v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As an alternative to the placement flag add a
+pin count to the ttm buffer object.
+
+v2: add dma_resv_assert_help() calls
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Huang Rui <ray.huang@amd.com>
+Link: https://patchwork.freedesktop.org/patch/391596/?series=81973&rev=1
+---
+ drivers/gpu/drm/ttm/ttm_bo.c      |  9 ++++++---
+ drivers/gpu/drm/ttm/ttm_bo_util.c |  2 +-
+ include/drm/ttm/ttm_bo_api.h      | 26 ++++++++++++++++++++++++++
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 8b4eb2aea8b0..974f3931e8e4 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -115,7 +115,7 @@ static void ttm_bo_add_mem_to_lru(struct ttm_buffer_object *bo,
+ 	struct ttm_bo_device *bdev = bo->bdev;
+ 	struct ttm_resource_manager *man;
+ 
+-	if (!list_empty(&bo->lru))
++	if (!list_empty(&bo->lru) || bo->pin_count)
+ 		return;
+ 
+ 	if (mem->placement & TTM_PL_FLAG_NO_EVICT)
+@@ -165,7 +165,8 @@ void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo,
+ 	ttm_bo_del_from_lru(bo);
+ 	ttm_bo_add_mem_to_lru(bo, &bo->mem);
+ 
+-	if (bulk && !(bo->mem.placement & TTM_PL_FLAG_NO_EVICT)) {
++	if (bulk && !(bo->mem.placement & TTM_PL_FLAG_NO_EVICT) &&
++	    !bo->pin_count) {
+ 		switch (bo->mem.mem_type) {
+ 		case TTM_PL_TT:
+ 			ttm_bo_bulk_move_set_pos(&bulk->tt[bo->priority], bo);
+@@ -544,8 +545,9 @@ static void ttm_bo_release(struct kref *kref)
+ 		 * shrinkers, now that they are queued for
+ 		 * destruction.
+ 		 */
+-		if (bo->mem.placement & TTM_PL_FLAG_NO_EVICT) {
++		if (bo->mem.placement & TTM_PL_FLAG_NO_EVICT || bo->pin_count) {
+ 			bo->mem.placement &= ~TTM_PL_FLAG_NO_EVICT;
++			bo->pin_count = 0;
+ 			ttm_bo_del_from_lru(bo);
+ 			ttm_bo_add_mem_to_lru(bo, &bo->mem);
+ 		}
+@@ -1172,6 +1174,7 @@ int ttm_bo_init_reserved(struct ttm_bo_device *bdev,
+ 	bo->moving = NULL;
+ 	bo->mem.placement = TTM_PL_FLAG_CACHED;
+ 	bo->acc_size = acc_size;
++	bo->pin_count = 0;
+ 	bo->sg = sg;
+ 	if (resv) {
+ 		bo->base.resv = resv;
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index c90133d8a612..bdee4df1f3f2 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -352,7 +352,6 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 		return -ENOMEM;
+ 
+ 	fbo->base = *bo;
+-	fbo->base.mem.placement |= TTM_PL_FLAG_NO_EVICT;
+ 
+ 	ttm_bo_get(bo);
+ 	fbo->bo = bo;
+@@ -372,6 +371,7 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 	kref_init(&fbo->base.kref);
+ 	fbo->base.destroy = &ttm_transfered_destroy;
+ 	fbo->base.acc_size = 0;
++	fbo->base.pin_count = 1;
+ 	if (bo->type != ttm_bo_type_sg)
+ 		fbo->base.base.resv = &fbo->base.base._resv;
+ 
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index da837d22f78e..2ff4fdada333 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -153,6 +153,7 @@ struct ttm_buffer_object {
+ 
+ 	struct dma_fence *moving;
+ 	unsigned priority;
++	unsigned pin_count;
+ 
+ 	/**
+ 	 * Special members that are protected by the reserve lock
+@@ -607,6 +608,31 @@ static inline bool ttm_bo_uses_embedded_gem_object(struct ttm_buffer_object *bo)
+ 	return bo->base.dev != NULL;
+ }
+ 
++/**
++ * ttm_bo_pin - Pin the buffer object.
++ * @bo: The buffer object to pin
++ *
++ * Make sure the buffer is not evicted any more during memory pressure.
++ */
++static inline void ttm_bo_pin(struct ttm_buffer_object *bo)
++{
++	dma_resv_assert_held(bo->base.resv);
++	++bo->pin_count;
++}
++
++/**
++ * ttm_bo_unpin - Unpin the buffer object.
++ * @bo: The buffer object to unpin
++ *
++ * Allows the buffer object to be evicted again during memory pressure.
++ */
++static inline void ttm_bo_unpin(struct ttm_buffer_object *bo)
++{
++	dma_resv_assert_held(bo->base.resv);
++	WARN_ON_ONCE(!bo->pin_count);
++	--bo->pin_count;
++}
++
+ int ttm_mem_evict_first(struct ttm_bo_device *bdev,
+ 			struct ttm_resource_manager *man,
+ 			const struct ttm_place *place,
+-- 
+2.25.1
+

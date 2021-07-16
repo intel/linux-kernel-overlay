@@ -1,0 +1,134 @@
+From eb44106488e73325d8cd33371fe90f477cd36921 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 19 Oct 2020 14:10:53 -0700
+Subject: [PATCH 1079/1714] drm/msm/atomic: Convert to per-CRTC kthread_work
+
+Use a SCHED_FIFO kthread_worker for async atomic commits.  We have a
+hard deadline if we don't want to miss a frame.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_atomic.c | 25 ++++++++++++++++++++-----
+ drivers/gpu/drm/msm/msm_drv.h    |  3 ++-
+ drivers/gpu/drm/msm/msm_kms.h    | 17 +++++++++++++----
+ 3 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index 93d39608a073..6a326761dc4a 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -117,14 +117,13 @@ static enum hrtimer_restart msm_atomic_pending_timer(struct hrtimer *t)
+ {
+ 	struct msm_pending_timer *timer = container_of(t,
+ 			struct msm_pending_timer, timer);
+-	struct msm_drm_private *priv = timer->kms->dev->dev_private;
+ 
+-	queue_work(priv->wq, &timer->work);
++	kthread_queue_work(timer->worker, &timer->work);
+ 
+ 	return HRTIMER_NORESTART;
+ }
+ 
+-static void msm_atomic_pending_work(struct work_struct *work)
++static void msm_atomic_pending_work(struct kthread_work *work)
+ {
+ 	struct msm_pending_timer *timer = container_of(work,
+ 			struct msm_pending_timer, work);
+@@ -132,14 +131,30 @@ static void msm_atomic_pending_work(struct work_struct *work)
+ 	msm_atomic_async_commit(timer->kms, timer->crtc_idx);
+ }
+ 
+-void msm_atomic_init_pending_timer(struct msm_pending_timer *timer,
++int msm_atomic_init_pending_timer(struct msm_pending_timer *timer,
+ 		struct msm_kms *kms, int crtc_idx)
+ {
+ 	timer->kms = kms;
+ 	timer->crtc_idx = crtc_idx;
+ 	hrtimer_init(&timer->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+ 	timer->timer.function = msm_atomic_pending_timer;
+-	INIT_WORK(&timer->work, msm_atomic_pending_work);
++
++	timer->worker = kthread_create_worker(0, "atomic-worker-%d", crtc_idx);
++	if (IS_ERR(timer->worker)) {
++		int ret = PTR_ERR(timer->worker);
++		timer->worker = NULL;
++		return ret;
++	}
++	sched_set_fifo(timer->worker->task);
++	kthread_init_work(&timer->work, msm_atomic_pending_work);
++
++	return 0;
++}
++
++void msm_atomic_destroy_pending_timer(struct msm_pending_timer *timer)
++{
++	if (timer->worker)
++		kthread_destroy_worker(timer->worker);
+ }
+ 
+ static bool can_do_async(struct drm_atomic_state *state,
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index a6aef687bc6e..784d54f004b8 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -228,8 +228,9 @@ struct msm_pending_timer;
+ 
+ int msm_atomic_prepare_fb(struct drm_plane *plane,
+ 			  struct drm_plane_state *new_state);
+-void msm_atomic_init_pending_timer(struct msm_pending_timer *timer,
++int msm_atomic_init_pending_timer(struct msm_pending_timer *timer,
+ 		struct msm_kms *kms, int crtc_idx);
++void msm_atomic_destroy_pending_timer(struct msm_pending_timer *timer);
+ void msm_atomic_commit_tail(struct drm_atomic_state *state);
+ struct drm_atomic_state *msm_atomic_state_alloc(struct drm_device *dev);
+ void msm_atomic_state_clear(struct drm_atomic_state *state);
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index 602c0c7f300a..d8151a89e163 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -136,7 +136,8 @@ struct msm_kms;
+  */
+ struct msm_pending_timer {
+ 	struct hrtimer timer;
+-	struct work_struct work;
++	struct kthread_work work;
++	struct kthread_worker *worker;
+ 	struct msm_kms *kms;
+ 	unsigned crtc_idx;
+ };
+@@ -163,21 +164,29 @@ struct msm_kms {
+ static inline int msm_kms_init(struct msm_kms *kms,
+ 		const struct msm_kms_funcs *funcs)
+ {
+-	unsigned i;
++	unsigned i, ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(kms->commit_lock); i++)
+ 		mutex_init(&kms->commit_lock[i]);
+ 
+ 	kms->funcs = funcs;
+ 
+-	for (i = 0; i < ARRAY_SIZE(kms->pending_timers); i++)
+-		msm_atomic_init_pending_timer(&kms->pending_timers[i], kms, i);
++	for (i = 0; i < ARRAY_SIZE(kms->pending_timers); i++) {
++		ret = msm_atomic_init_pending_timer(&kms->pending_timers[i], kms, i);
++		if (ret) {
++			return ret;
++		}
++	}
+ 
+ 	return 0;
+ }
+ 
+ static inline void msm_kms_destroy(struct msm_kms *kms)
+ {
++	unsigned i;
++
++	for (i = 0; i < ARRAY_SIZE(kms->pending_timers); i++)
++		msm_atomic_destroy_pending_timer(&kms->pending_timers[i]);
+ }
+ 
+ struct msm_kms *mdp4_kms_init(struct drm_device *dev);
+-- 
+2.25.1
+

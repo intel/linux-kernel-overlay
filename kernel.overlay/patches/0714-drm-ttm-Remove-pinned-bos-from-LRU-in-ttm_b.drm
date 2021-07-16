@@ -1,0 +1,77 @@
+From 5a275fd2db4e0af2ff56a8d59af20e8db8d2815a Mon Sep 17 00:00:00 2001
+From: Lyude Paul <lyude@redhat.com>
+Date: Tue, 5 Jan 2021 12:45:05 +0100
+Subject: [PATCH 0714/1087] drm/ttm: Remove pinned bos from LRU in
+ ttm_bo_move_to_lru_tail() v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Recently a regression was introduced which caused TTM's buffer eviction to
+attempt to evict already-pinned BOs, causing issues with buffer eviction
+under memory pressure along with suspend/resume:
+
+  nouveau 0000:1f:00.0: DRM: evicting buffers...
+  nouveau 0000:1f:00.0: DRM: Moving pinned object 00000000c428c3ff!
+  nouveau 0000:1f:00.0: fifo: fault 00 [READ] at 0000000000200000 engine 04
+  [BAR1] client 07 [HUB/HOST_CPU] reason 02 [PTE] on channel -1 [00ffeaa000
+  unknown]
+  nouveau 0000:1f:00.0: fifo: DROPPED_MMU_FAULT 00001000
+  nouveau 0000:1f:00.0: fifo: fault 01 [WRITE] at 0000000000020000 engine
+  0c [HOST6] client 07 [HUB/HOST_CPU] reason 02 [PTE] on channel 1
+  [00ffb28000 DRM]
+  nouveau 0000:1f:00.0: fifo: channel 1: killed
+  nouveau 0000:1f:00.0: fifo: runlist 0: scheduled for recovery
+  [TTM] Buffer eviction failed
+  nouveau 0000:1f:00.0: DRM: waiting for kernel channels to go idle...
+  nouveau 0000:1f:00.0: DRM: failed to idle channel 1 [DRM]
+  nouveau 0000:1f:00.0: DRM: resuming display...
+
+After some bisection and investigation, it appears this resulted from the
+recent changes to ttm_bo_move_to_lru_tail(). Previously when a buffer was
+pinned, the buffer would be removed from the LRU once ttm_bo_unreserve
+to maintain the LRU list when pinning or unpinning BOs. However, since:
+
+commit 3d1a88e1051f ("drm/ttm: cleanup LRU handling further")
+
+We've been exiting from ttm_bo_move_to_lru_tail() at the very beginning of
+the function if the bo we're looking at is pinned, resulting in the pinned
+BO never getting removed from the lru and as a result - causing issues when
+it eventually becomes time for eviction.
+
+So, let's fix this by calling ttm_bo_del_from_lru() from
+ttm_bo_move_to_lru_tail() in the event that we're dealing with a pinned
+buffer.
+
+v2 (chk): reduce to only the fixing one liner since we always want to
+call the callback whenever we would move on the LRU.
+
+Fixes: 3d1a88e1051f ("drm/ttm: cleanup LRU handling further")
+Cc: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Lyude Paul <lyude@redhat.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210105114505.38210-1-christian.koenig@amd.com
+---
+ drivers/gpu/drm/ttm/ttm_bo.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 31e8b3da5563..b65f4b12f986 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -138,8 +138,10 @@ void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo,
+ 
+ 	dma_resv_assert_held(bo->base.resv);
+ 
+-	if (bo->pin_count)
++	if (bo->pin_count) {
++		ttm_bo_del_from_lru(bo);
+ 		return;
++	}
+ 
+ 	man = ttm_manager_type(bdev, mem->mem_type);
+ 	list_move_tail(&bo->lru, &man->lru[bo->priority]);
+-- 
+2.17.1
+

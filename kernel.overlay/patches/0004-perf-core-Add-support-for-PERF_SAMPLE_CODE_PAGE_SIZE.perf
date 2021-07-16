@@ -1,0 +1,121 @@
+From 9e7abf179f5956785d1fa0667ff0001da695e0ac Mon Sep 17 00:00:00 2001
+From: Stephane Eranian <eranian@google.com>
+Date: Thu, 1 Oct 2020 06:57:49 -0700
+Subject: [PATCH 04/67] perf/core: Add support for PERF_SAMPLE_CODE_PAGE_SIZE
+
+When studying code layout, it is useful to capture the page size of the
+sampled code address.
+
+Add a new sample type for code page size.
+The new sample type requires collecting the ip. The code page size can
+be calculated from the NMI-safe perf_get_page_size().
+
+For large PEBS, it's very unlikely that the mapping is gone for the
+earlier PEBS records. Enable the feature for the large PEBS. The worst
+case is that page-size '0' is returned.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Stephane Eranian <eranian@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20201001135749.2804-5-kan.liang@linux.intel.com
+---
+ arch/x86/events/perf_event.h    |  2 +-
+ include/linux/perf_event.h      |  1 +
+ include/uapi/linux/perf_event.h |  4 +++-
+ kernel/events/core.c            | 11 ++++++++++-
+ 4 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 6a8edfe59b09..7895cf4c59a7 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -132,7 +132,7 @@ struct amd_nb {
+ 	PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_IDENTIFIER | \
+ 	PERF_SAMPLE_TRANSACTION | PERF_SAMPLE_PHYS_ADDR | \
+ 	PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER | \
+-	PERF_SAMPLE_PERIOD)
++	PERF_SAMPLE_PERIOD | PERF_SAMPLE_CODE_PAGE_SIZE)
+ 
+ #define PEBS_GP_REGS			\
+ 	((1ULL << PERF_REG_X86_AX)    | \
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index dc56f3fae51b..f55232965d70 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1029,6 +1029,7 @@ struct perf_sample_data {
+ 	u64				phys_addr;
+ 	u64				cgroup;
+ 	u64				data_page_size;
++	u64				code_page_size;
+ } ____cacheline_aligned;
+ 
+ /* default value for data source */
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 54695b2b20a3..b15e3447cd9f 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -144,8 +144,9 @@ enum perf_event_sample_format {
+ 	PERF_SAMPLE_AUX				= 1U << 20,
+ 	PERF_SAMPLE_CGROUP			= 1U << 21,
+ 	PERF_SAMPLE_DATA_PAGE_SIZE		= 1U << 22,
++	PERF_SAMPLE_CODE_PAGE_SIZE		= 1U << 23,
+ 
+-	PERF_SAMPLE_MAX = 1U << 23,		/* non-ABI */
++	PERF_SAMPLE_MAX = 1U << 24,		/* non-ABI */
+ 
+ 	__PERF_SAMPLE_CALLCHAIN_EARLY		= 1ULL << 63, /* non-ABI; internal use */
+ };
+@@ -898,6 +899,7 @@ enum perf_event_type {
+ 	 *	{ u64			size;
+ 	 *	  char			data[size]; } && PERF_SAMPLE_AUX
+ 	 *	{ u64			data_page_size;} && PERF_SAMPLE_DATA_PAGE_SIZE
++	 *	{ u64			code_page_size;} && PERF_SAMPLE_CODE_PAGE_SIZE
+ 	 * };
+ 	 */
+ 	PERF_RECORD_SAMPLE			= 9,
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 041313cabe98..e4f6976043d4 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1899,6 +1899,9 @@ static void __perf_event_header_size(struct perf_event *event, u64 sample_type)
+ 	if (sample_type & PERF_SAMPLE_DATA_PAGE_SIZE)
+ 		size += sizeof(data->data_page_size);
+ 
++	if (sample_type & PERF_SAMPLE_CODE_PAGE_SIZE)
++		size += sizeof(data->code_page_size);
++
+ 	event->header_size = size;
+ }
+ 
+@@ -6938,6 +6941,9 @@ void perf_output_sample(struct perf_output_handle *handle,
+ 	if (sample_type & PERF_SAMPLE_DATA_PAGE_SIZE)
+ 		perf_output_put(handle, data->data_page_size);
+ 
++	if (sample_type & PERF_SAMPLE_CODE_PAGE_SIZE)
++		perf_output_put(handle, data->code_page_size);
++
+ 	if (sample_type & PERF_SAMPLE_AUX) {
+ 		perf_output_put(handle, data->aux_size);
+ 
+@@ -7118,7 +7124,7 @@ void perf_prepare_sample(struct perf_event_header *header,
+ 
+ 	__perf_event_header__init_id(header, data, event);
+ 
+-	if (sample_type & PERF_SAMPLE_IP)
++	if (sample_type & (PERF_SAMPLE_IP | PERF_SAMPLE_CODE_PAGE_SIZE))
+ 		data->ip = perf_instruction_pointer(regs);
+ 
+ 	if (sample_type & PERF_SAMPLE_CALLCHAIN) {
+@@ -7245,6 +7251,9 @@ void perf_prepare_sample(struct perf_event_header *header,
+ 	if (sample_type & PERF_SAMPLE_DATA_PAGE_SIZE)
+ 		data->data_page_size = perf_get_page_size(data->addr);
+ 
++	if (sample_type & PERF_SAMPLE_CODE_PAGE_SIZE)
++		data->code_page_size = perf_get_page_size(data->ip);
++
+ 	if (sample_type & PERF_SAMPLE_AUX) {
+ 		u64 size;
+ 
+-- 
+2.25.1
+

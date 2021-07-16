@@ -1,0 +1,770 @@
+From 8c21ed5e4f756cfcffff460759e1f0abcbe2fe75 Mon Sep 17 00:00:00 2001
+From: Jonathan Kim <jonathan.kim@amd.com>
+Date: Tue, 1 Sep 2020 20:21:00 -0400
+Subject: [PATCH 0561/1714] drm/amdgpu: add per device user friendly xgmi
+ events for vega20
+
+Non-outbound data metrics are non useful so mark them as legacy.
+Bucket new perf counters into device and not device ip.
+Bind events to chip instead of IP.
+Report available event counters and not number of hw counter banks.
+Move DF public macros to private since not needed outside of IP version.
+
+v5: cleanup by moving per chip configs into structs
+
+v4: After more discussion, replace *_LEGACY references with IP references
+to indicate concept of pmu-typed versus event-config-typed event
+registration.
+
+v3: attr groups const array is global but attr groups are allocated per
+device which doesn't work and causes problems on memory allocation and
+de-allocation for pmu unregister. Switch to building const attr groups
+per pmu instead to simplify solution.
+
+v2: add comments on sysfs structure and formatting.
+
+Signed-off-by: Jonathan Kim <jonathan.kim@amd.com>
+Reviewed-by: Harish Kasiviswanathan <harish.kasiviswanathan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h     |  13 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.c | 434 ++++++++++++++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.h |  28 +-
+ drivers/gpu/drm/amd/amdgpu/df_v3_6.c    |  72 +---
+ drivers/gpu/drm/amd/amdgpu/df_v3_6.h    |   9 -
+ 5 files changed, 408 insertions(+), 148 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 87f095dc385c..bfecee8093d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1294,19 +1294,6 @@ bool amdgpu_device_load_pci_state(struct pci_dev *pdev);
+ 
+ #include "amdgpu_object.h"
+ 
+-/* used by df_v3_6.c and amdgpu_pmu.c */
+-#define AMDGPU_PMU_ATTR(_name, _object)					\
+-static ssize_t								\
+-_name##_show(struct device *dev,					\
+-			       struct device_attribute *attr,		\
+-			       char *page)				\
+-{									\
+-	BUILD_BUG_ON(sizeof(_object) >= PAGE_SIZE - 1);			\
+-	return sprintf(page, _object "\n");				\
+-}									\
+-									\
+-static struct device_attribute pmu_attr_##_name = __ATTR_RO(_name)
+-
+ static inline bool amdgpu_is_tmz(struct amdgpu_device *adev)
+ {
+        return adev->gmc.tmz_enabled;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.c
+index 1b0ec715c8ba..6624e80d2b9a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.c
+@@ -19,17 +19,26 @@
+  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+  * OTHER DEALINGS IN THE SOFTWARE.
+  *
+- * Author: Jonathan Kim <jonathan.kim@amd.com>
+- *
+  */
+ 
+ #include <linux/perf_event.h>
+ #include <linux/init.h>
+ #include "amdgpu.h"
+ #include "amdgpu_pmu.h"
+-#include "df_v3_6.h"
+ 
+ #define PMU_NAME_SIZE 32
++#define NUM_FORMATS_AMDGPU_PMU		4
++#define NUM_FORMATS_DF_VEGA20		3
++#define NUM_EVENTS_DF_VEGA20		8
++#define NUM_EVENT_TYPES_VEGA20		1
++#define NUM_EVENTS_VEGA20_XGMI		2
++#define NUM_EVENTS_VEGA20_MAX		NUM_EVENTS_VEGA20_XGMI
++
++struct amdgpu_pmu_event_attribute {
++	struct device_attribute attr;
++	const char *event_str;
++	unsigned int type;
++};
+ 
+ /* record to keep track of pmu entry per pmu type per device */
+ struct amdgpu_pmu_entry {
+@@ -37,11 +46,132 @@ struct amdgpu_pmu_entry {
+ 	struct amdgpu_device *adev;
+ 	struct pmu pmu;
+ 	unsigned int pmu_perf_type;
++	char *pmu_type_name;
++	char *pmu_file_prefix;
++	struct attribute_group fmt_attr_group;
++	struct amdgpu_pmu_event_attribute *fmt_attr;
++	struct attribute_group evt_attr_group;
++	struct amdgpu_pmu_event_attribute *evt_attr;
+ };
+ 
++static ssize_t amdgpu_pmu_event_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct amdgpu_pmu_event_attribute *amdgpu_pmu_attr;
++
++	amdgpu_pmu_attr = container_of(attr, struct amdgpu_pmu_event_attribute,
++									attr);
++
++	if (!amdgpu_pmu_attr->type)
++		return sprintf(buf, "%s\n", amdgpu_pmu_attr->event_str);
++
++	return sprintf(buf, "%s,type=0x%x\n",
++			amdgpu_pmu_attr->event_str, amdgpu_pmu_attr->type);
++}
++
+ static LIST_HEAD(amdgpu_pmu_list);
+ 
+ 
++struct amdgpu_pmu_attr {
++	const char *name;
++	const char *config;
++};
++
++struct amdgpu_pmu_type {
++	const unsigned int type;
++	const unsigned int num_of_type;
++};
++
++struct amdgpu_pmu_config {
++	struct amdgpu_pmu_attr *formats;
++	unsigned int num_formats;
++	struct amdgpu_pmu_attr *events;
++	unsigned int num_events;
++	struct amdgpu_pmu_type *types;
++	unsigned int num_types;
++};
++
++/*
++ * Events fall under two categories:
++ *  - PMU typed
++ *    Events in /sys/bus/event_source/devices/amdgpu_<pmu_type>_<dev_num> have
++ *    performance counter operations handled by one IP <pmu_type>.  Formats and
++ *    events should be defined by <pmu_type>_<asic_type>_formats and
++ *    <pmu_type>_<asic_type>_events respectively.
++ *
++ *  - Event config typed
++ *    Events in /sys/bus/event_source/devices/amdgpu_<dev_num> have performance
++ *    counter operations that can be handled by multiple IPs dictated by their
++ *    "type" format field.  Formats and events should be defined by
++ *    amdgpu_pmu_formats and <asic_type>_events respectively.  Format field
++ *    "type" is generated in amdgpu_pmu_event_show and defined in
++ *    <asic_type>_event_config_types.
++ */
++
++static struct amdgpu_pmu_attr amdgpu_pmu_formats[NUM_FORMATS_AMDGPU_PMU] = {
++	{ .name = "event", .config = "config:0-7" },
++	{ .name = "instance", .config = "config:8-15" },
++	{ .name = "umask", .config = "config:16-23"},
++	{ .name = "type", .config = "config:56-63"}
++};
++
++/* Vega20 events */
++static struct amdgpu_pmu_attr vega20_events[NUM_EVENTS_VEGA20_MAX] = {
++	{ .name = "xgmi_link0_data_outbound",
++			.config = "event=0x7,instance=0x46,umask=0x2" },
++	{ .name = "xgmi_link1_data_outbound",
++			.config = "event=0x7,instance=0x47,umask=0x2" }
++};
++
++static struct amdgpu_pmu_type vega20_types[NUM_EVENT_TYPES_VEGA20] = {
++	{ .type = AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI,
++					.num_of_type = NUM_EVENTS_VEGA20_XGMI }
++};
++
++static struct amdgpu_pmu_config vega20_config = {
++	.formats = amdgpu_pmu_formats,
++	.num_formats = ARRAY_SIZE(amdgpu_pmu_formats),
++	.events = vega20_events,
++	.num_events = ARRAY_SIZE(vega20_events),
++	.types = vega20_types,
++	.num_types = ARRAY_SIZE(vega20_types)
++};
++
++/* Vega20 data fabric (DF) events */
++static struct amdgpu_pmu_attr df_vega20_formats[NUM_FORMATS_DF_VEGA20] = {
++	{ .name = "event", .config = "config:0-7" },
++	{ .name = "instance", .config = "config:8-15" },
++	{ .name = "umask", .config = "config:16-23"}
++};
++
++static struct amdgpu_pmu_attr df_vega20_events[NUM_EVENTS_DF_VEGA20] = {
++	{ .name = "cake0_pcsout_txdata",
++			.config = "event=0x7,instance=0x46,umask=0x2" },
++	{ .name = "cake1_pcsout_txdata",
++			.config = "event=0x7,instance=0x47,umask=0x2" },
++	{ .name = "cake0_pcsout_txmeta",
++			.config = "event=0x7,instance=0x46,umask=0x4" },
++	{ .name = "cake1_pcsout_txmeta",
++			.config = "event=0x7,instance=0x47,umask=0x4" },
++	{ .name = "cake0_ftiinstat_reqalloc",
++			.config = "event=0xb,instance=0x46,umask=0x4" },
++	{ .name = "cake1_ftiinstat_reqalloc",
++			.config = "event=0xb,instance=0x47,umask=0x4" },
++	{ .name = "cake0_ftiinstat_rspalloc",
++			.config = "event=0xb,instance=0x46,umask=0x8" },
++	{ .name = "cake1_ftiinstat_rspalloc",
++			.config = "event=0xb,instance=0x47,umask=0x8" }
++};
++
++static struct amdgpu_pmu_config df_vega20_config = {
++	.formats = df_vega20_formats,
++	.num_formats = ARRAY_SIZE(df_vega20_formats),
++	.events = df_vega20_events,
++	.num_events = ARRAY_SIZE(df_vega20_events),
++	.types = NULL,
++	.num_types = 0
++};
++
+ /* initialize perf counter */
+ static int amdgpu_perf_event_init(struct perf_event *event)
+ {
+@@ -53,6 +183,7 @@ static int amdgpu_perf_event_init(struct perf_event *event)
+ 
+ 	/* update the hw_perf_event struct with config data */
+ 	hwc->config = event->attr.config;
++	hwc->config_base = AMDGPU_PMU_PERF_TYPE_NONE;
+ 
+ 	return 0;
+ }
+@@ -72,8 +203,9 @@ static void amdgpu_perf_start(struct perf_event *event, int flags)
+ 	WARN_ON_ONCE(!(hwc->state & PERF_HES_UPTODATE));
+ 	hwc->state = 0;
+ 
+-	switch (pe->pmu_perf_type) {
+-	case PERF_TYPE_AMDGPU_DF:
++	switch (hwc->config_base) {
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_DF:
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI:
+ 		if (!(flags & PERF_EF_RELOAD)) {
+ 			target_cntr = pe->adev->df.funcs->pmc_start(pe->adev,
+ 						hwc->config, 0 /* unused */,
+@@ -101,14 +233,14 @@ static void amdgpu_perf_read(struct perf_event *event)
+ 	struct amdgpu_pmu_entry *pe = container_of(event->pmu,
+ 						  struct amdgpu_pmu_entry,
+ 						  pmu);
+-
+ 	u64 count, prev;
+ 
+ 	do {
+ 		prev = local64_read(&hwc->prev_count);
+ 
+-		switch (pe->pmu_perf_type) {
+-		case PERF_TYPE_AMDGPU_DF:
++		switch (hwc->config_base) {
++		case AMDGPU_PMU_EVENT_CONFIG_TYPE_DF:
++		case AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI:
+ 			pe->adev->df.funcs->pmc_get_count(pe->adev,
+ 						hwc->config, hwc->idx, &count);
+ 			break;
+@@ -132,8 +264,9 @@ static void amdgpu_perf_stop(struct perf_event *event, int flags)
+ 	if (hwc->state & PERF_HES_UPTODATE)
+ 		return;
+ 
+-	switch (pe->pmu_perf_type) {
+-	case PERF_TYPE_AMDGPU_DF:
++	switch (hwc->config_base) {
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_DF:
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI:
+ 		pe->adev->df.funcs->pmc_stop(pe->adev, hwc->config, hwc->idx,
+ 									0);
+ 		break;
+@@ -160,10 +293,22 @@ static int amdgpu_perf_add(struct perf_event *event, int flags)
+ 						  struct amdgpu_pmu_entry,
+ 						  pmu);
+ 
++	switch (pe->pmu_perf_type) {
++	case AMDGPU_PMU_PERF_TYPE_DF:
++		hwc->config_base = AMDGPU_PMU_EVENT_CONFIG_TYPE_DF;
++		break;
++	case AMDGPU_PMU_PERF_TYPE_ALL:
++		hwc->config_base = (hwc->config >>
++					AMDGPU_PMU_EVENT_CONFIG_TYPE_SHIFT) &
++					AMDGPU_PMU_EVENT_CONFIG_TYPE_MASK;
++		break;
++	}
++
+ 	event->hw.state = PERF_HES_UPTODATE | PERF_HES_STOPPED;
+ 
+-	switch (pe->pmu_perf_type) {
+-	case PERF_TYPE_AMDGPU_DF:
++	switch (hwc->config_base) {
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_DF:
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI:
+ 		target_cntr = pe->adev->df.funcs->pmc_start(pe->adev,
+ 						hwc->config, 0 /* unused */,
+ 						1 /* add counter */);
+@@ -196,8 +341,9 @@ static void amdgpu_perf_del(struct perf_event *event, int flags)
+ 
+ 	amdgpu_perf_stop(event, PERF_EF_UPDATE);
+ 
+-	switch (pe->pmu_perf_type) {
+-	case PERF_TYPE_AMDGPU_DF:
++	switch (hwc->config_base) {
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_DF:
++	case AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI:
+ 		pe->adev->df.funcs->pmc_stop(pe->adev, hwc->config, hwc->idx,
+ 									1);
+ 		break;
+@@ -208,25 +354,92 @@ static void amdgpu_perf_del(struct perf_event *event, int flags)
+ 	perf_event_update_userpage(event);
+ }
+ 
+-/* vega20 pmus */
++static void amdgpu_pmu_create_event_attrs_by_type(
++				struct attribute_group *attr_group,
++				struct amdgpu_pmu_event_attribute *pmu_attr,
++				struct amdgpu_pmu_attr events[],
++				int s_offset,
++				int e_offset,
++				unsigned int type)
++{
++	int i;
++
++	pmu_attr += s_offset;
++
++	for (i = s_offset; i < e_offset; i++) {
++		attr_group->attrs[i] = &pmu_attr->attr.attr;
++		sysfs_attr_init(&pmu_attr->attr.attr);
++		pmu_attr->attr.attr.name = events[i].name;
++		pmu_attr->attr.attr.mode = 0444;
++		pmu_attr->attr.show = amdgpu_pmu_event_show;
++		pmu_attr->event_str = events[i].config;
++		pmu_attr->type = type;
++		pmu_attr++;
++	}
++}
+ 
+-/* init pmu tracking per pmu type */
+-static int init_pmu_by_type(struct amdgpu_device *adev,
+-		  const struct attribute_group *attr_groups[],
+-		  char *pmu_type_name, char *pmu_file_prefix,
+-		  unsigned int pmu_perf_type,
+-		  unsigned int num_counters)
++static void amdgpu_pmu_create_attrs(struct attribute_group *attr_group,
++				struct amdgpu_pmu_event_attribute *pmu_attr,
++				struct amdgpu_pmu_attr events[],
++				int num_events)
+ {
+-	char pmu_name[PMU_NAME_SIZE];
+-	struct amdgpu_pmu_entry *pmu_entry;
+-	int ret = 0;
++	amdgpu_pmu_create_event_attrs_by_type(attr_group, pmu_attr, events, 0,
++				num_events, AMDGPU_PMU_EVENT_CONFIG_TYPE_NONE);
++}
+ 
+-	pmu_entry = kzalloc(sizeof(struct amdgpu_pmu_entry), GFP_KERNEL);
+ 
+-	if (!pmu_entry)
++static int amdgpu_pmu_alloc_pmu_attrs(
++				struct attribute_group *fmt_attr_group,
++				struct amdgpu_pmu_event_attribute **fmt_attr,
++				struct attribute_group *evt_attr_group,
++				struct amdgpu_pmu_event_attribute **evt_attr,
++				struct amdgpu_pmu_config *config)
++{
++	*fmt_attr = kcalloc(config->num_formats, sizeof(**fmt_attr),
++								GFP_KERNEL);
++
++	if (!(*fmt_attr))
+ 		return -ENOMEM;
+ 
+-	pmu_entry->adev = adev;
++	fmt_attr_group->attrs = kcalloc(config->num_formats + 1,
++				sizeof(*fmt_attr_group->attrs), GFP_KERNEL);
++
++	if (!fmt_attr_group->attrs)
++		goto err_fmt_attr_grp;
++
++	*evt_attr = kcalloc(config->num_events, sizeof(**evt_attr), GFP_KERNEL);
++
++	if (!(*evt_attr))
++		goto err_evt_attr;
++
++	evt_attr_group->attrs = kcalloc(config->num_events + 1,
++				sizeof(*evt_attr_group->attrs), GFP_KERNEL);
++
++	if (!evt_attr_group->attrs)
++		goto err_evt_attr_grp;
++
++	return 0;
++err_evt_attr_grp:
++	kfree(*evt_attr);
++err_evt_attr:
++	kfree(fmt_attr_group->attrs);
++err_fmt_attr_grp:
++	kfree(*fmt_attr);
++	return -ENOMEM;
++}
++
++/* init pmu tracking per pmu type */
++static int init_pmu_entry_by_type_and_add(struct amdgpu_pmu_entry *pmu_entry,
++			struct amdgpu_pmu_config *config)
++{
++	const struct attribute_group *attr_groups[] = {
++		&pmu_entry->fmt_attr_group,
++		&pmu_entry->evt_attr_group,
++		NULL
++	};
++	char pmu_name[PMU_NAME_SIZE];
++	int ret = 0, total_num_events = 0;
++
+ 	pmu_entry->pmu = (struct pmu){
+ 		.event_init = amdgpu_perf_event_init,
+ 		.add = amdgpu_perf_add,
+@@ -237,59 +450,162 @@ static int init_pmu_by_type(struct amdgpu_device *adev,
+ 		.task_ctx_nr = perf_invalid_context,
+ 	};
+ 
+-	pmu_entry->pmu.attr_groups = attr_groups;
+-	pmu_entry->pmu_perf_type = pmu_perf_type;
+-	snprintf(pmu_name, PMU_NAME_SIZE, "%s_%d",
+-				pmu_file_prefix, adev_to_drm(adev)->primary->index);
++	ret = amdgpu_pmu_alloc_pmu_attrs(&pmu_entry->fmt_attr_group,
++					&pmu_entry->fmt_attr,
++					&pmu_entry->evt_attr_group,
++					&pmu_entry->evt_attr,
++					config);
++
++	if (ret)
++		goto err_out;
++
++	amdgpu_pmu_create_attrs(&pmu_entry->fmt_attr_group, pmu_entry->fmt_attr,
++					config->formats, config->num_formats);
++
++	if (pmu_entry->pmu_perf_type == AMDGPU_PMU_PERF_TYPE_ALL) {
++		int i;
++
++		for (i = 0; i < config->num_types; i++) {
++			amdgpu_pmu_create_event_attrs_by_type(
++					&pmu_entry->evt_attr_group,
++					pmu_entry->evt_attr,
++					config->events,
++					total_num_events,
++					total_num_events +
++						config->types[i].num_of_type,
++					config->types[i].type);
++			total_num_events += config->types[i].num_of_type;
++		}
++	} else {
++		amdgpu_pmu_create_attrs(&pmu_entry->evt_attr_group,
++					pmu_entry->evt_attr,
++					config->events, config->num_events);
++		total_num_events = config->num_events;
++	}
++
++	pmu_entry->pmu.attr_groups = kmemdup(attr_groups, sizeof(attr_groups),
++								GFP_KERNEL);
++
++	if (!pmu_entry->pmu.attr_groups)
++		goto err_attr_group;
++
++	snprintf(pmu_name, PMU_NAME_SIZE, "%s_%d", pmu_entry->pmu_file_prefix,
++				adev_to_drm(pmu_entry->adev)->primary->index);
+ 
+ 	ret = perf_pmu_register(&pmu_entry->pmu, pmu_name, -1);
+ 
+-	if (ret) {
+-		kfree(pmu_entry);
+-		pr_warn("Error initializing AMDGPU %s PMUs.\n", pmu_type_name);
+-		return ret;
+-	}
++	if (ret)
++		goto err_register;
++
++	if (pmu_entry->pmu_perf_type != AMDGPU_PMU_PERF_TYPE_ALL)
++		pr_info("Detected AMDGPU %s Counters. # of Counters = %d.\n",
++				pmu_entry->pmu_type_name, total_num_events);
++	else
++		pr_info("Detected AMDGPU %d Perf Events.\n", total_num_events);
+ 
+-	pr_info("Detected AMDGPU %s Counters. # of Counters = %d.\n",
+-			pmu_type_name, num_counters);
+ 
+ 	list_add_tail(&pmu_entry->entry, &amdgpu_pmu_list);
+ 
+ 	return 0;
++err_register:
++	kfree(pmu_entry->pmu.attr_groups);
++err_attr_group:
++	kfree(pmu_entry->fmt_attr_group.attrs);
++	kfree(pmu_entry->fmt_attr);
++	kfree(pmu_entry->evt_attr_group.attrs);
++	kfree(pmu_entry->evt_attr);
++err_out:
++	pr_warn("Error initializing AMDGPU %s PMUs.\n",
++						pmu_entry->pmu_type_name);
++	return ret;
++}
++
++/* destroy all pmu data associated with target device */
++void amdgpu_pmu_fini(struct amdgpu_device *adev)
++{
++	struct amdgpu_pmu_entry *pe, *temp;
++
++	list_for_each_entry_safe(pe, temp, &amdgpu_pmu_list, entry) {
++		if (pe->adev != adev)
++			continue;
++		list_del(&pe->entry);
++		perf_pmu_unregister(&pe->pmu);
++		kfree(pe->pmu.attr_groups);
++		kfree(pe->fmt_attr_group.attrs);
++		kfree(pe->fmt_attr);
++		kfree(pe->evt_attr_group.attrs);
++		kfree(pe->evt_attr);
++		kfree(pe);
++	}
++}
++
++static struct amdgpu_pmu_entry *create_pmu_entry(struct amdgpu_device *adev,
++						unsigned int pmu_type,
++						char *pmu_type_name,
++						char *pmu_file_prefix)
++{
++	struct amdgpu_pmu_entry *pmu_entry;
++
++	pmu_entry = kzalloc(sizeof(struct amdgpu_pmu_entry), GFP_KERNEL);
++
++	if (!pmu_entry)
++		return pmu_entry;
++
++	pmu_entry->adev = adev;
++	pmu_entry->fmt_attr_group.name = "format";
++	pmu_entry->fmt_attr_group.attrs = NULL;
++	pmu_entry->evt_attr_group.name = "events";
++	pmu_entry->evt_attr_group.attrs = NULL;
++	pmu_entry->pmu_perf_type = pmu_type;
++	pmu_entry->pmu_type_name = pmu_type_name;
++	pmu_entry->pmu_file_prefix = pmu_file_prefix;
++
++	return pmu_entry;
+ }
+ 
+ /* init amdgpu_pmu */
+ int amdgpu_pmu_init(struct amdgpu_device *adev)
+ {
+ 	int ret = 0;
++	struct amdgpu_pmu_entry *pmu_entry, *pmu_entry_df;
+ 
+ 	switch (adev->asic_type) {
+ 	case CHIP_VEGA20:
+-		/* init df */
+-		ret = init_pmu_by_type(adev, df_v3_6_attr_groups,
+-				       "DF", "amdgpu_df", PERF_TYPE_AMDGPU_DF,
+-				       DF_V3_6_MAX_COUNTERS);
++		pmu_entry_df = create_pmu_entry(adev, AMDGPU_PMU_PERF_TYPE_DF,
++						"DF", "amdgpu_df");
+ 
+-		/* other pmu types go here*/
+-		break;
+-	default:
+-		return 0;
+-	}
++		if (!pmu_entry_df)
++			return -ENOMEM;
+ 
+-	return 0;
+-}
++		ret = init_pmu_entry_by_type_and_add(pmu_entry_df,
++							&df_vega20_config);
+ 
++		if (ret) {
++			kfree(pmu_entry_df);
++			return ret;
++		}
+ 
+-/* destroy all pmu data associated with target device */
+-void amdgpu_pmu_fini(struct amdgpu_device *adev)
+-{
+-	struct amdgpu_pmu_entry *pe, *temp;
++		pmu_entry = create_pmu_entry(adev, AMDGPU_PMU_PERF_TYPE_ALL,
++						"", "amdgpu");
+ 
+-	list_for_each_entry_safe(pe, temp, &amdgpu_pmu_list, entry) {
+-		if (pe->adev == adev) {
+-			list_del(&pe->entry);
+-			perf_pmu_unregister(&pe->pmu);
+-			kfree(pe);
++		if (!pmu_entry) {
++			amdgpu_pmu_fini(adev);
++			return -ENOMEM;
+ 		}
+-	}
++
++		ret = init_pmu_entry_by_type_and_add(pmu_entry,
++							&vega20_config);
++
++		if (ret) {
++			kfree(pmu_entry);
++			amdgpu_pmu_fini(adev);
++			return ret;
++		}
++
++		break;
++	default:
++		return 0;
++	};
++
++	return ret;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.h
+index 7dddb7160a11..6882dc48c5d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_pmu.h
+@@ -19,18 +19,38 @@
+  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+  * OTHER DEALINGS IN THE SOFTWARE.
+  *
+- * Author: Jonathan Kim <jonathan.kim@amd.com>
+- *
+  */
+ 
+ #ifndef _AMDGPU_PMU_H_
+ #define _AMDGPU_PMU_H_
+ 
++/* PMU types. */
+ enum amdgpu_pmu_perf_type {
+-	PERF_TYPE_AMDGPU_DF = 0,
+-	PERF_TYPE_AMDGPU_MAX
++	AMDGPU_PMU_PERF_TYPE_NONE = 0,
++	AMDGPU_PMU_PERF_TYPE_DF,
++	AMDGPU_PMU_PERF_TYPE_ALL
+ };
+ 
++/*
++ * PMU type AMDGPU_PMU_PERF_TYPE_ALL can hold events of different "type"
++ * configurations.  Event config types are parsed from the 64-bit raw
++ * config (See EVENT_CONFIG_TYPE_SHIFT and EVENT_CONFIG_TYPE_MASK) and
++ * are registered into the HW perf events config_base.
++ *
++ * PMU types with only a single event configuration type
++ * (non-AMDGPU_PMU_PERF_TYPE_ALL) have their event config type auto generated
++ * when the performance counter is added.
++ */
++enum amdgpu_pmu_event_config_type {
++	AMDGPU_PMU_EVENT_CONFIG_TYPE_NONE = 0,
++	AMDGPU_PMU_EVENT_CONFIG_TYPE_DF,
++	AMDGPU_PMU_EVENT_CONFIG_TYPE_XGMI,
++	AMDGPU_PMU_EVENT_CONFIG_TYPE_MAX
++};
++
++#define AMDGPU_PMU_EVENT_CONFIG_TYPE_SHIFT	56
++#define AMDGPU_PMU_EVENT_CONFIG_TYPE_MASK	0xff
++
+ int amdgpu_pmu_init(struct amdgpu_device *adev);
+ void amdgpu_pmu_fini(struct amdgpu_device *adev);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/df_v3_6.c b/drivers/gpu/drm/amd/amdgpu/df_v3_6.c
+index 0ca6e176acb0..6e57ae95f997 100644
+--- a/drivers/gpu/drm/amd/amdgpu/df_v3_6.c
++++ b/drivers/gpu/drm/amd/amdgpu/df_v3_6.c
+@@ -30,71 +30,17 @@
+ #define DF_3_6_SMN_REG_INST_DIST        0x8
+ #define DF_3_6_INST_CNT                 8
+ 
+-static u32 df_v3_6_channel_number[] = {1, 2, 0, 4, 0, 8, 0,
+-				       16, 32, 0, 0, 0, 2, 4, 8};
+-
+-/* init df format attrs */
+-AMDGPU_PMU_ATTR(event,		"config:0-7");
+-AMDGPU_PMU_ATTR(instance,	"config:8-15");
+-AMDGPU_PMU_ATTR(umask,		"config:16-23");
+-
+-/* df format attributes  */
+-static struct attribute *df_v3_6_format_attrs[] = {
+-	&pmu_attr_event.attr,
+-	&pmu_attr_instance.attr,
+-	&pmu_attr_umask.attr,
+-	NULL
+-};
+-
+-/* df format attribute group */
+-static struct attribute_group df_v3_6_format_attr_group = {
+-	.name = "format",
+-	.attrs = df_v3_6_format_attrs,
+-};
++/* Defined in global_features.h as FTI_PERFMON_VISIBLE */
++#define DF_V3_6_MAX_COUNTERS		4
+ 
+-/* df event attrs */
+-AMDGPU_PMU_ATTR(cake0_pcsout_txdata,
+-		      "event=0x7,instance=0x46,umask=0x2");
+-AMDGPU_PMU_ATTR(cake1_pcsout_txdata,
+-		      "event=0x7,instance=0x47,umask=0x2");
+-AMDGPU_PMU_ATTR(cake0_pcsout_txmeta,
+-		      "event=0x7,instance=0x46,umask=0x4");
+-AMDGPU_PMU_ATTR(cake1_pcsout_txmeta,
+-		      "event=0x7,instance=0x47,umask=0x4");
+-AMDGPU_PMU_ATTR(cake0_ftiinstat_reqalloc,
+-		      "event=0xb,instance=0x46,umask=0x4");
+-AMDGPU_PMU_ATTR(cake1_ftiinstat_reqalloc,
+-		      "event=0xb,instance=0x47,umask=0x4");
+-AMDGPU_PMU_ATTR(cake0_ftiinstat_rspalloc,
+-		      "event=0xb,instance=0x46,umask=0x8");
+-AMDGPU_PMU_ATTR(cake1_ftiinstat_rspalloc,
+-		      "event=0xb,instance=0x47,umask=0x8");
+-
+-/* df event attributes  */
+-static struct attribute *df_v3_6_event_attrs[] = {
+-	&pmu_attr_cake0_pcsout_txdata.attr,
+-	&pmu_attr_cake1_pcsout_txdata.attr,
+-	&pmu_attr_cake0_pcsout_txmeta.attr,
+-	&pmu_attr_cake1_pcsout_txmeta.attr,
+-	&pmu_attr_cake0_ftiinstat_reqalloc.attr,
+-	&pmu_attr_cake1_ftiinstat_reqalloc.attr,
+-	&pmu_attr_cake0_ftiinstat_rspalloc.attr,
+-	&pmu_attr_cake1_ftiinstat_rspalloc.attr,
+-	NULL
+-};
+-
+-/* df event attribute group */
+-static struct attribute_group df_v3_6_event_attr_group = {
+-	.name = "events",
+-	.attrs = df_v3_6_event_attrs
+-};
++/* get flags from df perfmon config */
++#define DF_V3_6_GET_EVENT(x)		(x & 0xFFUL)
++#define DF_V3_6_GET_INSTANCE(x)		((x >> 8) & 0xFFUL)
++#define DF_V3_6_GET_UNITMASK(x)		((x >> 16) & 0xFFUL)
++#define DF_V3_6_PERFMON_OVERFLOW	0xFFFFFFFFFFFFULL
+ 
+-/* df event attr groups  */
+-const struct attribute_group *df_v3_6_attr_groups[] = {
+-		&df_v3_6_format_attr_group,
+-		&df_v3_6_event_attr_group,
+-		NULL
+-};
++static u32 df_v3_6_channel_number[] = {1, 2, 0, 4, 0, 8, 0,
++				       16, 32, 0, 0, 0, 2, 4, 8};
+ 
+ static uint64_t df_v3_6_get_fica(struct amdgpu_device *adev,
+ 				 uint32_t ficaa_val)
+diff --git a/drivers/gpu/drm/amd/amdgpu/df_v3_6.h b/drivers/gpu/drm/amd/amdgpu/df_v3_6.h
+index 76998541bc30..2505c7ef258a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/df_v3_6.h
++++ b/drivers/gpu/drm/amd/amdgpu/df_v3_6.h
+@@ -35,15 +35,6 @@ enum DF_V3_6_MGCG {
+ 	DF_V3_6_MGCG_ENABLE_63_CYCLE_DELAY = 15
+ };
+ 
+-/* Defined in global_features.h as FTI_PERFMON_VISIBLE */
+-#define DF_V3_6_MAX_COUNTERS		4
+-
+-/* get flags from df perfmon config */
+-#define DF_V3_6_GET_EVENT(x)		(x & 0xFFUL)
+-#define DF_V3_6_GET_INSTANCE(x)		((x >> 8) & 0xFFUL)
+-#define DF_V3_6_GET_UNITMASK(x)		((x >> 16) & 0xFFUL)
+-#define DF_V3_6_PERFMON_OVERFLOW	0xFFFFFFFFFFFFULL
+-
+ extern const struct attribute_group *df_v3_6_attr_groups[];
+ extern const struct amdgpu_df_funcs df_v3_6_funcs;
+ 
+-- 
+2.25.1
+

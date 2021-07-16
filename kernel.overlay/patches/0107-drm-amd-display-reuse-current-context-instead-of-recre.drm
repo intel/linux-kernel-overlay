@@ -1,0 +1,193 @@
+From 40a411132223b942fd8daa06b28aa91f272dcb5c Mon Sep 17 00:00:00 2001
+From: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Date: Wed, 6 Jan 2021 11:23:05 -0500
+Subject: [PATCH 107/330] drm/amd/display: reuse current context instead of
+ recreating one
+
+[Why]
+Currently we discard the current context and recreate it. The current
+context is what is applied to the HW so we should be re-using this
+rather than creating a new context.
+
+Recreating the context can lead to mismatch between new context and the
+current context
+
+For example: gsl groups get changed when we create a new context this
+can cause issues in a multi display config (with flip immediate) because
+we don't align the existing gsl groups in the new and current context.
+If we reuse the current context the gsl group assignment stays the same.
+
+[How]
+Instead of discarding the current context, we instead just copy the
+current state and add/remove planes and streams.
+
+Signed-off-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+Acked-by: Anson Jacob <Anson.Jacob@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 23 +++++++---------
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 27 +++++++++++++------
+ drivers/gpu/drm/amd/display/dc/dc_stream.h    |  3 +--
+ 3 files changed, 30 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 2d6260644925..96ba8252249e 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1936,7 +1936,7 @@ static void dm_gpureset_commit_state(struct dc_state *dc_state,
+ 		dc_commit_updates_for_stream(
+ 			dm->dc, bundle->surface_updates,
+ 			dc_state->stream_status->plane_count,
+-			dc_state->streams[k], &bundle->stream_update, dc_state);
++			dc_state->streams[k], &bundle->stream_update);
+ 	}
+ 
+ cleanup:
+@@ -1967,8 +1967,7 @@ static void dm_set_dpms_off(struct dc_link *link)
+ 
+ 	stream_update.stream = stream_state;
+ 	dc_commit_updates_for_stream(stream_state->ctx->dc, NULL, 0,
+-				     stream_state, &stream_update,
+-				     stream_state->ctx->dc->current_state);
++				     stream_state, &stream_update);
+ 	mutex_unlock(&adev->dm.dc_lock);
+ }
+ 
+@@ -7641,7 +7640,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 				    struct drm_crtc *pcrtc,
+ 				    bool wait_for_vblank)
+ {
+-	uint32_t i;
++	int i;
+ 	uint64_t timestamp_ns;
+ 	struct drm_plane *plane;
+ 	struct drm_plane_state *old_plane_state, *new_plane_state;
+@@ -7682,7 +7681,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 		amdgpu_dm_commit_cursors(state);
+ 
+ 	/* update planes when needed */
+-	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
++	for_each_oldnew_plane_in_state_reverse(state, plane, old_plane_state, new_plane_state, i) {
+ 		struct drm_crtc *crtc = new_plane_state->crtc;
+ 		struct drm_crtc_state *new_crtc_state;
+ 		struct drm_framebuffer *fb = new_plane_state->fb;
+@@ -7905,8 +7904,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 						     bundle->surface_updates,
+ 						     planes_count,
+ 						     acrtc_state->stream,
+-						     &bundle->stream_update,
+-						     dc_state);
++						     &bundle->stream_update);
+ 
+ 		/**
+ 		 * Enable or disable the interrupts on the backend.
+@@ -8242,13 +8240,13 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 		struct dm_connector_state *dm_new_con_state = to_dm_connector_state(new_con_state);
+ 		struct dm_connector_state *dm_old_con_state = to_dm_connector_state(old_con_state);
+ 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(dm_new_con_state->base.crtc);
+-		struct dc_surface_update dummy_updates[MAX_SURFACES];
++		struct dc_surface_update surface_updates[MAX_SURFACES];
+ 		struct dc_stream_update stream_update;
+ 		struct dc_info_packet hdr_packet;
+ 		struct dc_stream_status *status = NULL;
+ 		bool abm_changed, hdr_changed, scaling_changed;
+ 
+-		memset(&dummy_updates, 0, sizeof(dummy_updates));
++		memset(&surface_updates, 0, sizeof(surface_updates));
+ 		memset(&stream_update, 0, sizeof(stream_update));
+ 
+ 		if (acrtc) {
+@@ -8305,16 +8303,15 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 		 * To fix this, DC should permit updating only stream properties.
+ 		 */
+ 		for (j = 0; j < status->plane_count; j++)
+-			dummy_updates[j].surface = status->plane_states[0];
++			surface_updates[j].surface = status->plane_states[j];
+ 
+ 
+ 		mutex_lock(&dm->dc_lock);
+ 		dc_commit_updates_for_stream(dm->dc,
+-						     dummy_updates,
++						surface_updates,
+ 						     status->plane_count,
+ 						     dm_new_crtc_state->stream,
+-						     &stream_update,
+-						     dc_state);
++						     &stream_update);
+ 		mutex_unlock(&dm->dc_lock);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 8fa179cbed32..e3a65d1714ca 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -2695,8 +2695,7 @@ void dc_commit_updates_for_stream(struct dc *dc,
+ 		struct dc_surface_update *srf_updates,
+ 		int surface_count,
+ 		struct dc_stream_state *stream,
+-		struct dc_stream_update *stream_update,
+-		struct dc_state *state)
++		struct dc_stream_update *stream_update)
+ {
+ 	const struct dc_stream_status *stream_status;
+ 	enum surface_update_type update_type;
+@@ -2715,6 +2714,12 @@ void dc_commit_updates_for_stream(struct dc *dc,
+ 
+ 
+ 	if (update_type >= UPDATE_TYPE_FULL) {
++		struct dc_plane_state *new_planes[MAX_SURFACES];
++
++		memset(new_planes, 0, sizeof(new_planes));
++
++		for (i = 0; i < surface_count; i++)
++			new_planes[i] = srf_updates[i].surface;
+ 
+ 		/* initialize scratch memory for building context */
+ 		context = dc_create_state(dc);
+@@ -2723,15 +2728,21 @@ void dc_commit_updates_for_stream(struct dc *dc,
+ 			return;
+ 		}
+ 
+-		dc_resource_state_copy_construct(state, context);
++		dc_resource_state_copy_construct(
++				dc->current_state, context);
+ 
+-		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			struct pipe_ctx *new_pipe = &context->res_ctx.pipe_ctx[i];
+-			struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++		/*remove old surfaces from context */
++		if (!dc_rem_all_planes_for_stream(dc, stream, context)) {
++			DC_ERROR("Failed to remove streams for new validate context!\n");
++			return;
++		}
+ 
+-			if (new_pipe->plane_state && new_pipe->plane_state != old_pipe->plane_state)
+-				new_pipe->plane_state->force_full_update = true;
++		/* add surface to context */
++		if (!dc_add_all_planes_for_stream(dc, stream, new_planes, surface_count, context)) {
++			DC_ERROR("Failed to add streams for new validate context!\n");
++			return;
+ 		}
++
+ 	}
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 80b67b860091..a4f7ec888c67 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -294,8 +294,7 @@ void dc_commit_updates_for_stream(struct dc *dc,
+ 		struct dc_surface_update *srf_updates,
+ 		int surface_count,
+ 		struct dc_stream_state *stream,
+-		struct dc_stream_update *stream_update,
+-		struct dc_state *state);
++		struct dc_stream_update *stream_update);
+ /*
+  * Log the current stream state.
+  */
+-- 
+2.25.1
+

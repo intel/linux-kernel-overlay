@@ -1,0 +1,75 @@
+From ad81b3894309a37c2b5b35acece295c8324eaf6c Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 24 Dec 2020 13:55:40 +0000
+Subject: [PATCH 0565/1087] drm/i915/gt: Remove virtual breadcrumb before
+ transfer
+
+The issue with stale virtual breadcrumbs remain. Now we have the problem
+that if the irq-signaler is still referencing the stale breadcrumb as we
+transfer it to a new sibling, the list becomes spaghetti. This is a very
+small window, but that doesn't stop it being hit infrequently. To
+prevent the lists being tangled (the iterator starting on one engine's
+b->signalers but walking onto another list), always decouple the virtual
+breadcrumb on schedule-out and make sure that the walker has stepped out
+of the lists.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201224135544.1713-5-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gt/intel_breadcrumbs.c       |  5 +++--
+ .../gpu/drm/i915/gt/intel_execlists_submission.c  | 15 +++++++++++++++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+index f96cd7d9b419..8f7c8595ba08 100644
+--- a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+@@ -451,15 +451,16 @@ void i915_request_cancel_breadcrumb(struct i915_request *rq)
+ {
+ 	struct intel_breadcrumbs *b = READ_ONCE(rq->engine)->breadcrumbs;
+ 	struct intel_context *ce = rq->context;
++	unsigned long flags;
+ 	bool release;
+ 
+ 	if (!test_and_clear_bit(I915_FENCE_FLAG_SIGNAL, &rq->fence.flags))
+ 		return;
+ 
+-	spin_lock(&ce->signal_lock);
++	spin_lock_irqsave(&ce->signal_lock, flags);
+ 	list_del_rcu(&rq->signal_link);
+ 	release = remove_signaling_context(b, ce);
+-	spin_unlock(&ce->signal_lock);
++	spin_unlock_irqrestore(&ce->signal_lock, flags);
+ 	if (release)
+ 		intel_context_put(ce);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index b5f256be73dd..1f6e9fe5bcc0 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -581,6 +581,21 @@ static inline void execlists_schedule_in(struct i915_request *rq, int idx)
+ static void kick_siblings(struct i915_request *rq, struct intel_context *ce)
+ {
+ 	struct virtual_engine *ve = container_of(ce, typeof(*ve), context);
++	struct intel_engine_cs *engine = rq->engine;
++
++	/* Flush concurrent rcu iterators in signal_irq_work */
++	if (test_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &rq->fence.flags)) {
++		/*
++		 * After this point, the rq may be transferred to a new
++		 * sibling, so before we clear ce->inflight make sure that
++		 * the context has been removed from the b->signalers and
++		 * furthermore we need to make sure that the concurrent
++		 * iterator in signal_irq_work is no longer following
++		 * ce->signal_link.
++		 */
++		i915_request_cancel_breadcrumb(rq);
++		irq_work_sync(&engine->breadcrumbs->irq_work);
++	}
+ 
+ 	if (READ_ONCE(ve->request))
+ 		tasklet_hi_schedule(&ve->base.execlists.tasklet);
+-- 
+2.17.1
+

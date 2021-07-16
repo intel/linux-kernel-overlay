@@ -1,0 +1,168 @@
+From fe94ba627a28f41613f18814736784204abc808a Mon Sep 17 00:00:00 2001
+From: Kuogee Hsieh <khsieh@codeaurora.org>
+Date: Wed, 13 Jan 2021 11:00:00 -0800
+Subject: [PATCH 020/105] drm/msm/dp: unplug interrupt missed after irq_hpd
+ handler
+
+There is HPD unplug interrupts missed at scenario of an irq_hpd
+followed by unplug interrupts with around 10 ms in between.
+Since both AUX_SW_RESET and DP_SW_RESET clear pending HPD interrupts,
+irq_hpd handler should not issues either aux or sw reset to avoid
+following unplug interrupt be cleared accidentally. This patch
+also postpone handling of irq_hpd until connected state if it
+happened at connection pending state.
+
+Changes in V2:
+-- add postpone handling of irq_hpd until connected state
+-- check DP_TRAINING_1 instead of DP_TRAINING_NONE
+
+Signed-off-by: Kuogee Hsieh <khsieh@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/dp/dp_aux.c     |  7 -------
+ drivers/gpu/drm/msm/dp/dp_catalog.c | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 15 ++++++++++-----
+ drivers/gpu/drm/msm/dp/dp_display.c |  7 +++++++
+ 4 files changed, 41 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.c b/drivers/gpu/drm/msm/dp/dp_aux.c
+index 19b35ae3e927..1c6e1d2b947c 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.c
++++ b/drivers/gpu/drm/msm/dp/dp_aux.c
+@@ -336,7 +336,6 @@ static ssize_t dp_aux_transfer(struct drm_dp_aux *dp_aux,
+ 	ssize_t ret;
+ 	int const aux_cmd_native_max = 16;
+ 	int const aux_cmd_i2c_max = 128;
+-	int const retry_count = 5;
+ 	struct dp_aux_private *aux = container_of(dp_aux,
+ 		struct dp_aux_private, dp_aux);
+ 
+@@ -378,12 +377,6 @@ static ssize_t dp_aux_transfer(struct drm_dp_aux *dp_aux,
+ 	ret = dp_aux_cmd_fifo_tx(aux, msg);
+ 
+ 	if (ret < 0) {
+-		if (aux->native) {
+-			aux->retry_cnt++;
+-			if (!(aux->retry_cnt % retry_count))
+-				dp_catalog_aux_update_cfg(aux->catalog);
+-			dp_catalog_aux_reset(aux->catalog);
+-		}
+ 		usleep_range(400, 500); /* at least 400us to next try */
+ 		goto unlock_exit;
+ 	}
+diff --git a/drivers/gpu/drm/msm/dp/dp_catalog.c b/drivers/gpu/drm/msm/dp/dp_catalog.c
+index 44f0c57798d0..b1a9b1b98f5f 100644
+--- a/drivers/gpu/drm/msm/dp/dp_catalog.c
++++ b/drivers/gpu/drm/msm/dp/dp_catalog.c
+@@ -190,6 +190,18 @@ int dp_catalog_aux_clear_hw_interrupts(struct dp_catalog *dp_catalog)
+ 	return 0;
+ }
+ 
++/**
++ * dp_catalog_aux_reset() - reset AUX controller
++ *
++ * @aux: DP catalog structure
++ *
++ * return: void
++ *
++ * This function reset AUX controller
++ *
++ * NOTE: reset AUX controller will also clear any pending HPD related interrupts
++ * 
++ */
+ void dp_catalog_aux_reset(struct dp_catalog *dp_catalog)
+ {
+ 	u32 aux_ctrl;
+@@ -483,6 +495,18 @@ int dp_catalog_ctrl_set_pattern(struct dp_catalog *dp_catalog,
+ 	return 0;
+ }
+ 
++/**
++ * dp_catalog_ctrl_reset() - reset DP controller
++ *
++ * @dp_catalog: DP catalog structure
++ *
++ * return: void
++ *
++ * This function reset the DP controller
++ *
++ * NOTE: reset DP controller will also clear any pending HPD related interrupts
++ * 
++ */
+ void dp_catalog_ctrl_reset(struct dp_catalog *dp_catalog)
+ {
+ 	u32 sw_reset;
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 36b39c381b3f..4d14691d3611 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1296,7 +1296,8 @@ static int dp_ctrl_setup_main_link(struct dp_ctrl_private *ctrl,
+ 	 * transitioned to PUSH_IDLE. In order to start transmitting
+ 	 * a link training pattern, we have to first do soft reset.
+ 	 */
+-	dp_catalog_ctrl_reset(ctrl->catalog);
++	if (*training_step == DP_TRAINING_1)
++		dp_catalog_ctrl_reset(ctrl->catalog);
+ 
+ 	ret = dp_ctrl_link_train(ctrl, cr, training_step);
+ 
+@@ -1489,15 +1490,18 @@ static int dp_ctrl_deinitialize_mainlink(struct dp_ctrl_private *ctrl)
+ 	return 0;
+ }
+ 
++static void dp_ctrl_link_idle_reset(struct dp_ctrl_private *ctrl)
++{
++	dp_ctrl_push_idle(&ctrl->dp_ctrl);
++	dp_catalog_ctrl_reset(ctrl->catalog);
++}
++
+ static int dp_ctrl_link_maintenance(struct dp_ctrl_private *ctrl)
+ {
+ 	int ret = 0;
+ 	struct dp_cr_status cr;
+ 	int training_step = DP_TRAINING_NONE;
+ 
+-	dp_ctrl_push_idle(&ctrl->dp_ctrl);
+-	dp_catalog_ctrl_reset(ctrl->catalog);
+-
+ 	ctrl->dp_ctrl.pixel_rate = ctrl->panel->dp_mode.drm_mode.clock;
+ 
+ 	ret = dp_ctrl_setup_main_link(ctrl, &cr, &training_step);
+@@ -1624,6 +1628,7 @@ void dp_ctrl_handle_sink_request(struct dp_ctrl *dp_ctrl)
+ 
+ 	if (sink_request & DP_TEST_LINK_TRAINING) {
+ 		dp_link_send_test_response(ctrl->link);
++		dp_ctrl_link_idle_reset(ctrl);
+ 		if (dp_ctrl_link_maintenance(ctrl)) {
+ 			DRM_ERROR("LM failed: TEST_LINK_TRAINING\n");
+ 			return;
+@@ -1677,7 +1682,7 @@ int dp_ctrl_on_link(struct dp_ctrl *dp_ctrl)
+ 			break;
+ 		}
+ 
+-		training_step = DP_TRAINING_NONE;
++		training_step = DP_TRAINING_1;
+ 		rc = dp_ctrl_setup_main_link(ctrl, &cr, &training_step);
+ 		if (rc == 0) {
+ 			/* training completed successfully */
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 3bc7ed21de28..3a7e6c5adbf5 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -700,6 +700,13 @@ static int dp_irq_hpd_handle(struct dp_display_private *dp, u32 data)
+ 		return 0;
+ 	}
+ 
++	if (state == ST_CONNECT_PENDING) {
++		/* wait until ST_CONNECTED */
++		dp_add_event(dp, EV_IRQ_HPD_INT, 0, 1); /* delay = 1 */
++		mutex_unlock(&dp->event_mutex);
++		return 0;
++	}
++
+ 	ret = dp_display_usbpd_attention_cb(&dp->pdev->dev);
+ 	if (ret == -ECONNRESET) { /* cable unplugged */
+ 		dp->core_initialized = false;
+-- 
+2.25.1
+

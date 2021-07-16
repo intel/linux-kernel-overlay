@@ -1,0 +1,844 @@
+From 4ea5d5450876193a1a3b0c5c3297d5272fe00305 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 23 Dec 2020 12:23:59 +0000
+Subject: [PATCH 0558/1087] drm/i915/gt: Consolidate the CS timestamp clocks
+
+Pull the GT clock information [used to derive CS timestamps and PM
+interval] under the GT so that is it local to the users. In doing so, we
+consolidate the two references for the same information, of which the
+runtime-info took note of a potential clock source override and scaling
+factors.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201223122359.22562-2-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gt/debugfs_gt_pm.c       |  20 +-
+ drivers/gpu/drm/i915/gt/intel_context.h       |   6 +-
+ drivers/gpu/drm/i915/gt/intel_gt.c            |   4 +-
+ .../gpu/drm/i915/gt/intel_gt_clock_utils.c    | 197 ++++++++++++++----
+ .../gpu/drm/i915/gt/intel_gt_clock_utils.h    |   8 +-
+ drivers/gpu/drm/i915/gt/intel_gt_types.h      |   1 +
+ drivers/gpu/drm/i915/gt/selftest_engine_pm.c  |   6 +-
+ drivers/gpu/drm/i915/gt/selftest_gt_pm.c      |   8 +-
+ drivers/gpu/drm/i915/i915_debugfs.c           |  19 +-
+ drivers/gpu/drm/i915/i915_drv.h               |  12 --
+ drivers/gpu/drm/i915/i915_getparam.c          |   2 +-
+ drivers/gpu/drm/i915/i915_gpu_error.c         |   2 +-
+ drivers/gpu/drm/i915/i915_perf.c              |  11 +-
+ drivers/gpu/drm/i915/intel_device_info.c      | 157 --------------
+ drivers/gpu/drm/i915/intel_device_info.h      |   3 -
+ drivers/gpu/drm/i915/selftests/i915_perf.c    |   2 +-
+ drivers/gpu/drm/i915/selftests/i915_request.c |   3 +-
+ 17 files changed, 205 insertions(+), 256 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c b/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
+index 8975717ace06..a0f10e8bbd21 100644
+--- a/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/debugfs_gt_pm.c
+@@ -404,34 +404,34 @@ static int frequency_show(struct seq_file *m, void *unused)
+ 		seq_printf(m, "RPDECLIMIT: 0x%08x\n", rpdeclimit);
+ 		seq_printf(m, "RPNSWREQ: %dMHz\n", reqf);
+ 		seq_printf(m, "CAGF: %dMHz\n", cagf);
+-		seq_printf(m, "RP CUR UP EI: %d (%dns)\n",
++		seq_printf(m, "RP CUR UP EI: %d (%lldns)\n",
+ 			   rpcurupei,
+ 			   intel_gt_pm_interval_to_ns(gt, rpcurupei));
+-		seq_printf(m, "RP CUR UP: %d (%dns)\n",
++		seq_printf(m, "RP CUR UP: %d (%lldns)\n",
+ 			   rpcurup, intel_gt_pm_interval_to_ns(gt, rpcurup));
+-		seq_printf(m, "RP PREV UP: %d (%dns)\n",
++		seq_printf(m, "RP PREV UP: %d (%lldns)\n",
+ 			   rpprevup, intel_gt_pm_interval_to_ns(gt, rpprevup));
+ 		seq_printf(m, "Up threshold: %d%%\n",
+ 			   rps->power.up_threshold);
+-		seq_printf(m, "RP UP EI: %d (%dns)\n",
++		seq_printf(m, "RP UP EI: %d (%lldns)\n",
+ 			   rpupei, intel_gt_pm_interval_to_ns(gt, rpupei));
+-		seq_printf(m, "RP UP THRESHOLD: %d (%dns)\n",
++		seq_printf(m, "RP UP THRESHOLD: %d (%lldns)\n",
+ 			   rpupt, intel_gt_pm_interval_to_ns(gt, rpupt));
+ 
+-		seq_printf(m, "RP CUR DOWN EI: %d (%dns)\n",
++		seq_printf(m, "RP CUR DOWN EI: %d (%lldns)\n",
+ 			   rpcurdownei,
+ 			   intel_gt_pm_interval_to_ns(gt, rpcurdownei));
+-		seq_printf(m, "RP CUR DOWN: %d (%dns)\n",
++		seq_printf(m, "RP CUR DOWN: %d (%lldns)\n",
+ 			   rpcurdown,
+ 			   intel_gt_pm_interval_to_ns(gt, rpcurdown));
+-		seq_printf(m, "RP PREV DOWN: %d (%dns)\n",
++		seq_printf(m, "RP PREV DOWN: %d (%lldns)\n",
+ 			   rpprevdown,
+ 			   intel_gt_pm_interval_to_ns(gt, rpprevdown));
+ 		seq_printf(m, "Down threshold: %d%%\n",
+ 			   rps->power.down_threshold);
+-		seq_printf(m, "RP DOWN EI: %d (%dns)\n",
++		seq_printf(m, "RP DOWN EI: %d (%lldns)\n",
+ 			   rpdownei, intel_gt_pm_interval_to_ns(gt, rpdownei));
+-		seq_printf(m, "RP DOWN THRESHOLD: %d (%dns)\n",
++		seq_printf(m, "RP DOWN THRESHOLD: %d (%lldns)\n",
+ 			   rpdownt, intel_gt_pm_interval_to_ns(gt, rpdownt));
+ 
+ 		max_freq = (IS_GEN9_LP(i915) ? rp_state_cap >> 0 :
+diff --git a/drivers/gpu/drm/i915/gt/intel_context.h b/drivers/gpu/drm/i915/gt/intel_context.h
+index fda2eba81e22..2ce2ec639ba2 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context.h
++++ b/drivers/gpu/drm/i915/gt/intel_context.h
+@@ -248,16 +248,14 @@ intel_context_clear_nopreempt(struct intel_context *ce)
+ 
+ static inline u64 intel_context_get_total_runtime_ns(struct intel_context *ce)
+ {
+-	const u32 period =
+-		RUNTIME_INFO(ce->engine->i915)->cs_timestamp_period_ns;
++	const u32 period = ce->engine->gt->clock_period_ns;
+ 
+ 	return READ_ONCE(ce->runtime.total) * period;
+ }
+ 
+ static inline u64 intel_context_get_avg_runtime_ns(struct intel_context *ce)
+ {
+-	const u32 period =
+-		RUNTIME_INFO(ce->engine->i915)->cs_timestamp_period_ns;
++	const u32 period = ce->engine->gt->clock_period_ns;
+ 
+ 	return mul_u32_u32(ewma_runtime_read(&ce->runtime.avg), period);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 44f1d51e5ae5..d8e1ab412634 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -46,6 +46,8 @@ void intel_gt_init_hw_early(struct intel_gt *gt, struct i915_ggtt *ggtt)
+ 
+ int intel_gt_init_mmio(struct intel_gt *gt)
+ {
++	intel_gt_init_clock_frequency(gt);
++
+ 	intel_uc_init_mmio(&gt->uc);
+ 	intel_sseu_info_init(gt);
+ 
+@@ -546,8 +548,6 @@ int intel_gt_init(struct intel_gt *gt)
+ 	 */
+ 	intel_uncore_forcewake_get(gt->uncore, FORCEWAKE_ALL);
+ 
+-	intel_gt_init_clock_frequency(gt);
+-
+ 	err = intel_gt_init_scratch(gt, IS_GEN(gt->i915, 2) ? SZ_256K : SZ_4K);
+ 	if (err)
+ 		goto out_fw;
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.c b/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.c
+index 999079686846..a4242ca8dcd7 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.c
+@@ -7,34 +7,146 @@
+ #include "intel_gt.h"
+ #include "intel_gt_clock_utils.h"
+ 
+-#define MHZ_12   12000000 /* 12MHz (24MHz/2), 83.333ns */
+-#define MHZ_12_5 12500000 /* 12.5MHz (25MHz/2), 80ns */
+-#define MHZ_19_2 19200000 /* 19.2MHz, 52.083ns */
++static u32 read_reference_ts_freq(struct intel_uncore *uncore)
++{
++	u32 ts_override = intel_uncore_read(uncore, GEN9_TIMESTAMP_OVERRIDE);
++	u32 base_freq, frac_freq;
++
++	base_freq = ((ts_override & GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DIVIDER_MASK) >>
++		     GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DIVIDER_SHIFT) + 1;
++	base_freq *= 1000000;
++
++	frac_freq = ((ts_override &
++		      GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DENOMINATOR_MASK) >>
++		     GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DENOMINATOR_SHIFT);
++	frac_freq = 1000000 / (frac_freq + 1);
++
++	return base_freq + frac_freq;
++}
++
++static u32 gen10_get_crystal_clock_freq(struct intel_uncore *uncore,
++					u32 rpm_config_reg)
++{
++	u32 f19_2_mhz = 19200000;
++	u32 f24_mhz = 24000000;
++	u32 crystal_clock =
++		(rpm_config_reg & GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK) >>
++		GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_SHIFT;
+ 
+-static u32 read_clock_frequency(const struct intel_gt *gt)
++	switch (crystal_clock) {
++	case GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_19_2_MHZ:
++		return f19_2_mhz;
++	case GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_24_MHZ:
++		return f24_mhz;
++	default:
++		MISSING_CASE(crystal_clock);
++		return 0;
++	}
++}
++
++static u32 gen11_get_crystal_clock_freq(struct intel_uncore *uncore,
++					u32 rpm_config_reg)
+ {
+-	if (INTEL_GEN(gt->i915) >= 11) {
+-		u32 config;
+-
+-		config = intel_uncore_read(gt->uncore, RPM_CONFIG0);
+-		config &= GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK;
+-		config >>= GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_SHIFT;
+-
+-		switch (config) {
+-		case 0: return MHZ_12;
+-		case 1:
+-		case 2: return MHZ_19_2;
+-		default:
+-		case 3: return MHZ_12_5;
++	u32 f19_2_mhz = 19200000;
++	u32 f24_mhz = 24000000;
++	u32 f25_mhz = 25000000;
++	u32 f38_4_mhz = 38400000;
++	u32 crystal_clock =
++		(rpm_config_reg & GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK) >>
++		GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_SHIFT;
++
++	switch (crystal_clock) {
++	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_24_MHZ:
++		return f24_mhz;
++	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_19_2_MHZ:
++		return f19_2_mhz;
++	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_38_4_MHZ:
++		return f38_4_mhz;
++	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_25_MHZ:
++		return f25_mhz;
++	default:
++		MISSING_CASE(crystal_clock);
++		return 0;
++	}
++}
++
++static u32 read_clock_frequency(struct intel_uncore *uncore)
++{
++	u32 f12_5_mhz = 12500000;
++	u32 f19_2_mhz = 19200000;
++	u32 f24_mhz = 24000000;
++
++	if (INTEL_GEN(uncore->i915) <= 4) {
++		/*
++		 * PRMs say:
++		 *
++		 *     "The value in this register increments once every 16
++		 *      hclks." (through the “Clocking Configuration”
++		 *      (“CLKCFG”) MCHBAR register)
++		 */
++		return RUNTIME_INFO(uncore->i915)->rawclk_freq * 1000 / 16;
++	} else if (INTEL_GEN(uncore->i915) <= 8) {
++		/*
++		 * PRMs say:
++		 *
++		 *     "The PCU TSC counts 10ns increments; this timestamp
++		 *      reflects bits 38:3 of the TSC (i.e. 80ns granularity,
++		 *      rolling over every 1.5 hours).
++		 */
++		return f12_5_mhz;
++	} else if (INTEL_GEN(uncore->i915) <= 9) {
++		u32 ctc_reg = intel_uncore_read(uncore, CTC_MODE);
++		u32 freq = 0;
++
++		if ((ctc_reg & CTC_SOURCE_PARAMETER_MASK) == CTC_SOURCE_DIVIDE_LOGIC) {
++			freq = read_reference_ts_freq(uncore);
++		} else {
++			freq = IS_GEN9_LP(uncore->i915) ? f19_2_mhz : f24_mhz;
++
++			/*
++			 * Now figure out how the command stream's timestamp
++			 * register increments from this frequency (it might
++			 * increment only every few clock cycle).
++			 */
++			freq >>= 3 - ((ctc_reg & CTC_SHIFT_PARAMETER_MASK) >>
++				      CTC_SHIFT_PARAMETER_SHIFT);
+ 		}
+-	} else if (INTEL_GEN(gt->i915) >= 9) {
+-		if (IS_GEN9_LP(gt->i915))
+-			return MHZ_19_2;
+-		else
+-			return MHZ_12;
+-	} else {
+-		return MHZ_12_5;
++
++		return freq;
++	} else if (INTEL_GEN(uncore->i915) <= 12) {
++		u32 ctc_reg = intel_uncore_read(uncore, CTC_MODE);
++		u32 freq = 0;
++
++		/*
++		 * First figure out the reference frequency. There are 2 ways
++		 * we can compute the frequency, either through the
++		 * TIMESTAMP_OVERRIDE register or through RPM_CONFIG. CTC_MODE
++		 * tells us which one we should use.
++		 */
++		if ((ctc_reg & CTC_SOURCE_PARAMETER_MASK) == CTC_SOURCE_DIVIDE_LOGIC) {
++			freq = read_reference_ts_freq(uncore);
++		} else {
++			u32 c0 = intel_uncore_read(uncore, RPM_CONFIG0);
++
++			if (INTEL_GEN(uncore->i915) <= 10)
++				freq = gen10_get_crystal_clock_freq(uncore, c0);
++			else
++				freq = gen11_get_crystal_clock_freq(uncore, c0);
++
++			/*
++			 * Now figure out how the command stream's timestamp
++			 * register increments from this frequency (it might
++			 * increment only every few clock cycle).
++			 */
++			freq >>= 3 - ((c0 & GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_MASK) >>
++				      GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_SHIFT);
++		}
++
++		return freq;
+ 	}
++
++	MISSING_CASE("Unknown gen, unable to read command streamer timestamp frequency\n");
++	return 0;
+ }
+ 
+ void intel_gt_init_clock_frequency(struct intel_gt *gt)
+@@ -43,20 +155,27 @@ void intel_gt_init_clock_frequency(struct intel_gt *gt)
+ 	 * Note that on gen11+, the clock frequency may be reconfigured.
+ 	 * We do not, and we assume nobody else does.
+ 	 */
+-	gt->clock_frequency = read_clock_frequency(gt);
++	gt->clock_frequency = read_clock_frequency(gt->uncore);
++	if (gt->clock_frequency)
++		gt->clock_period_ns = intel_gt_clock_interval_to_ns(gt, 1);
++
+ 	GT_TRACE(gt,
+-		 "Using clock frequency: %dkHz\n",
+-		 gt->clock_frequency / 1000);
++		 "Using clock frequency: %dkHz, period: %dns, wrap: %lldms\n",
++		 gt->clock_frequency / 1000,
++		 gt->clock_period_ns,
++		 div_u64(mul_u32_u32(gt->clock_period_ns, S32_MAX),
++			 USEC_PER_SEC));
++
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
+ void intel_gt_check_clock_frequency(const struct intel_gt *gt)
+ {
+-	if (gt->clock_frequency != read_clock_frequency(gt)) {
++	if (gt->clock_frequency != read_clock_frequency(gt->uncore)) {
+ 		dev_err(gt->i915->drm.dev,
+ 			"GT clock frequency changed, was %uHz, now %uHz!\n",
+ 			gt->clock_frequency,
+-			read_clock_frequency(gt));
++			read_clock_frequency(gt->uncore));
+ 	}
+ }
+ #endif
+@@ -66,26 +185,24 @@ static u64 div_u64_roundup(u64 nom, u32 den)
+ 	return div_u64(nom + den - 1, den);
+ }
+ 
+-u32 intel_gt_clock_interval_to_ns(const struct intel_gt *gt, u32 count)
++u64 intel_gt_clock_interval_to_ns(const struct intel_gt *gt, u64 count)
+ {
+-	return div_u64_roundup(mul_u32_u32(count, 1000 * 1000 * 1000),
+-			       gt->clock_frequency);
++	return div_u64_roundup(count * NSEC_PER_SEC, gt->clock_frequency);
+ }
+ 
+-u32 intel_gt_pm_interval_to_ns(const struct intel_gt *gt, u32 count)
++u64 intel_gt_pm_interval_to_ns(const struct intel_gt *gt, u64 count)
+ {
+ 	return intel_gt_clock_interval_to_ns(gt, 16 * count);
+ }
+ 
+-u32 intel_gt_ns_to_clock_interval(const struct intel_gt *gt, u32 ns)
++u64 intel_gt_ns_to_clock_interval(const struct intel_gt *gt, u64 ns)
+ {
+-	return div_u64_roundup(mul_u32_u32(gt->clock_frequency, ns),
+-			       1000 * 1000 * 1000);
++	return div_u64_roundup(gt->clock_frequency * ns, NSEC_PER_SEC);
+ }
+ 
+-u32 intel_gt_ns_to_pm_interval(const struct intel_gt *gt, u32 ns)
++u64 intel_gt_ns_to_pm_interval(const struct intel_gt *gt, u64 ns)
+ {
+-	u32 val;
++	u64 val;
+ 
+ 	/*
+ 	 * Make these a multiple of magic 25 to avoid SNB (eg. Dell XPS
+@@ -94,9 +211,9 @@ u32 intel_gt_ns_to_pm_interval(const struct intel_gt *gt, u32 ns)
+ 	 * EI/thresholds are "bad", leading to a very sluggish or even
+ 	 * frozen machine.
+ 	 */
+-	val = DIV_ROUND_UP(intel_gt_ns_to_clock_interval(gt, ns), 16);
++	val = div_u64_roundup(intel_gt_ns_to_clock_interval(gt, ns), 16);
+ 	if (IS_GEN(gt->i915, 6))
+-		val = roundup(val, 25);
++		val = div_u64_roundup(val, 25) * 25;
+ 
+ 	return val;
+ }
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.h b/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.h
+index f793c89f2cbd..8b03e97a85df 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_clock_utils.h
+@@ -18,10 +18,10 @@ void intel_gt_check_clock_frequency(const struct intel_gt *gt);
+ static inline void intel_gt_check_clock_frequency(const struct intel_gt *gt) {}
+ #endif
+ 
+-u32 intel_gt_clock_interval_to_ns(const struct intel_gt *gt, u32 count);
+-u32 intel_gt_pm_interval_to_ns(const struct intel_gt *gt, u32 count);
++u64 intel_gt_clock_interval_to_ns(const struct intel_gt *gt, u64 count);
++u64 intel_gt_pm_interval_to_ns(const struct intel_gt *gt, u64 count);
+ 
+-u32 intel_gt_ns_to_clock_interval(const struct intel_gt *gt, u32 ns);
+-u32 intel_gt_ns_to_pm_interval(const struct intel_gt *gt, u32 ns);
++u64 intel_gt_ns_to_clock_interval(const struct intel_gt *gt, u64 ns);
++u64 intel_gt_ns_to_pm_interval(const struct intel_gt *gt, u64 ns);
+ 
+ #endif /* __INTEL_GT_CLOCK_UTILS_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_types.h b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+index c7bde529feab..a83d3e18254d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@ -75,6 +75,7 @@ struct intel_gt {
+ 	intel_wakeref_t awake;
+ 
+ 	u32 clock_frequency;
++	u32 clock_period_ns;
+ 
+ 	struct intel_llc llc;
+ 	struct intel_rc6 rc6;
+diff --git a/drivers/gpu/drm/i915/gt/selftest_engine_pm.c b/drivers/gpu/drm/i915/gt/selftest_engine_pm.c
+index d88504a5d69c..ca080445695e 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_engine_pm.c
++++ b/drivers/gpu/drm/i915/gt/selftest_engine_pm.c
+@@ -156,7 +156,7 @@ static int __live_engine_timestamps(struct intel_engine_cs *engine)
+ 	d_ring = trifilter(s_ring);
+ 	d_ctx = trifilter(s_ctx);
+ 
+-	pr_info("%s elapsed:%lldns, CTX_TIMESTAMP:%dns, RING_TIMESTAMP:%dns\n",
++	pr_info("%s elapsed:%lldns, CTX_TIMESTAMP:%lldns, RING_TIMESTAMP:%lldns\n",
+ 		engine->name, dt,
+ 		intel_gt_clock_interval_to_ns(engine->gt, d_ctx),
+ 		intel_gt_clock_interval_to_ns(engine->gt, d_ring));
+@@ -171,11 +171,11 @@ static int __live_engine_timestamps(struct intel_engine_cs *engine)
+ 	d_ring = trifilter(s_ring);
+ 	d_ctx = trifilter(s_ctx);
+ 
+-	d_ctx *= RUNTIME_INFO(engine->i915)->cs_timestamp_frequency_hz;
++	d_ctx *= engine->gt->clock_frequency;
+ 	if (IS_ICELAKE(engine->i915))
+ 		d_ring *= 12500000; /* Fixed 80ns for icl ctx timestamp? */
+ 	else
+-		d_ring *= RUNTIME_INFO(engine->i915)->cs_timestamp_frequency_hz;
++		d_ring *= engine->gt->clock_frequency;
+ 
+ 	if (3 * d_ctx > 4 * d_ring || 4 * d_ctx < 3 * d_ring) {
+ 		pr_err("%s Mismatch between ring and context timestamps!\n",
+diff --git a/drivers/gpu/drm/i915/gt/selftest_gt_pm.c b/drivers/gpu/drm/i915/gt/selftest_gt_pm.c
+index 6180a47c1b51..5d911f724ebe 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/selftest_gt_pm.c
+@@ -71,7 +71,7 @@ static int live_gt_clocks(void *arg)
+ 	enum intel_engine_id id;
+ 	int err = 0;
+ 
+-	if (!RUNTIME_INFO(gt->i915)->cs_timestamp_frequency_hz) { /* unknown */
++	if (!gt->clock_frequency) { /* unknown */
+ 		pr_info("CS_TIMESTAMP frequency unknown\n");
+ 		return 0;
+ 	}
+@@ -112,12 +112,12 @@ static int live_gt_clocks(void *arg)
+ 
+ 		measure_clocks(engine, &cycles, &dt);
+ 
+-		time = i915_cs_timestamp_ticks_to_ns(engine->i915, cycles);
+-		expected = i915_cs_timestamp_ns_to_ticks(engine->i915, dt);
++		time = intel_gt_clock_interval_to_ns(engine->gt, cycles);
++		expected = intel_gt_ns_to_clock_interval(engine->gt, dt);
+ 
+ 		pr_info("%s: TIMESTAMP %d cycles [%lldns] in %lldns [%d cycles], using CS clock frequency of %uKHz\n",
+ 			engine->name, cycles, time, dt, expected,
+-			RUNTIME_INFO(engine->i915)->cs_timestamp_frequency_hz / 1000);
++			engine->gt->clock_frequency / 1000);
+ 
+ 		if (9 * time < 8 * dt || 8 * time > 9 * dt) {
+ 			pr_err("%s: CS ticks did not match walltime!\n",
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index c72160e3702f..7332478a3dd5 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -635,27 +635,27 @@ static int i915_frequency_info(struct seq_file *m, void *unused)
+ 		seq_printf(m, "RPDECLIMIT: 0x%08x\n", rpdeclimit);
+ 		seq_printf(m, "RPNSWREQ: %dMHz\n", reqf);
+ 		seq_printf(m, "CAGF: %dMHz\n", cagf);
+-		seq_printf(m, "RP CUR UP EI: %d (%dns)\n",
++		seq_printf(m, "RP CUR UP EI: %d (%lldns)\n",
+ 			   rpupei,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt, rpupei));
+-		seq_printf(m, "RP CUR UP: %d (%dun)\n",
++		seq_printf(m, "RP CUR UP: %d (%lldun)\n",
+ 			   rpcurup,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt, rpcurup));
+-		seq_printf(m, "RP PREV UP: %d (%dns)\n",
++		seq_printf(m, "RP PREV UP: %d (%lldns)\n",
+ 			   rpprevup,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt, rpprevup));
+ 		seq_printf(m, "Up threshold: %d%%\n",
+ 			   rps->power.up_threshold);
+ 
+-		seq_printf(m, "RP CUR DOWN EI: %d (%dns)\n",
++		seq_printf(m, "RP CUR DOWN EI: %d (%lldns)\n",
+ 			   rpdownei,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt,
+ 						      rpdownei));
+-		seq_printf(m, "RP CUR DOWN: %d (%dns)\n",
++		seq_printf(m, "RP CUR DOWN: %d (%lldns)\n",
+ 			   rpcurdown,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt,
+ 						      rpcurdown));
+-		seq_printf(m, "RP PREV DOWN: %d (%dns)\n",
++		seq_printf(m, "RP PREV DOWN: %d (%lldns)\n",
+ 			   rpprevdown,
+ 			   intel_gt_pm_interval_to_ns(&dev_priv->gt,
+ 						      rpprevdown));
+@@ -862,8 +862,9 @@ static int i915_engine_info(struct seq_file *m, void *unused)
+ 		   yesno(i915->gt.awake),
+ 		   atomic_read(&i915->gt.wakeref.count),
+ 		   ktime_to_ms(intel_gt_get_awake_time(&i915->gt)));
+-	seq_printf(m, "CS timestamp frequency: %u Hz\n",
+-		   RUNTIME_INFO(i915)->cs_timestamp_frequency_hz);
++	seq_printf(m, "CS timestamp frequency: %u Hz, %d ns\n",
++		   i915->gt.clock_frequency,
++		   i915->gt.clock_period_ns);
+ 
+ 	p = drm_seq_file_printer(m);
+ 	for_each_uabi_engine(engine, i915)
+@@ -949,7 +950,7 @@ i915_perf_noa_delay_set(void *data, u64 val)
+ 	 * This would lead to infinite waits as we're doing timestamp
+ 	 * difference on the CS with only 32bits.
+ 	 */
+-	if (i915_cs_timestamp_ns_to_ticks(i915, val) > U32_MAX)
++	if (intel_gt_ns_to_clock_interval(&i915->gt, val) > U32_MAX)
+ 		return -EINVAL;
+ 
+ 	atomic64_set(&i915->perf.noa_programming_delay, val);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6cdefb92f913..5e5bcef20e33 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2000,16 +2000,4 @@ i915_coherent_map_type(struct drm_i915_private *i915)
+ 	return HAS_LLC(i915) ? I915_MAP_WB : I915_MAP_WC;
+ }
+ 
+-static inline u64 i915_cs_timestamp_ns_to_ticks(struct drm_i915_private *i915, u64 val)
+-{
+-	return DIV_ROUND_UP_ULL(val * RUNTIME_INFO(i915)->cs_timestamp_frequency_hz,
+-				1000000000);
+-}
+-
+-static inline u64 i915_cs_timestamp_ticks_to_ns(struct drm_i915_private *i915, u64 val)
+-{
+-	return div_u64(val * 1000000000,
+-		       RUNTIME_INFO(i915)->cs_timestamp_frequency_hz);
+-}
+-
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_getparam.c b/drivers/gpu/drm/i915/i915_getparam.c
+index f96032c60a12..75c3bfc2486e 100644
+--- a/drivers/gpu/drm/i915/i915_getparam.c
++++ b/drivers/gpu/drm/i915/i915_getparam.c
+@@ -154,7 +154,7 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
+ 			return -ENODEV;
+ 		break;
+ 	case I915_PARAM_CS_TIMESTAMP_FREQUENCY:
+-		value = RUNTIME_INFO(i915)->cs_timestamp_frequency_hz;
++		value = i915->gt.clock_frequency;
+ 		break;
+ 	case I915_PARAM_MMAP_GTT_COHERENT:
+ 		value = INTEL_INFO(i915)->has_coherent_ggtt;
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index d8cac4c5881f..8b163ee1b86d 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -485,7 +485,7 @@ static void error_print_context(struct drm_i915_error_state_buf *m,
+ 				const char *header,
+ 				const struct i915_gem_context_coredump *ctx)
+ {
+-	const u32 period = RUNTIME_INFO(m->i915)->cs_timestamp_period_ns;
++	const u32 period = m->i915->gt.clock_period_ns;
+ 
+ 	err_printf(m, "%s%s[%d] prio %d, guilty %d active %d, runtime total %lluns, avg %lluns\n",
+ 		   header, ctx->comm, ctx->pid, ctx->sched_attr.priority,
+diff --git a/drivers/gpu/drm/i915/i915_perf.c b/drivers/gpu/drm/i915/i915_perf.c
+index f65c32bd970e..112ba5f2ce90 100644
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -201,6 +201,7 @@
+ #include "gt/intel_execlists_submission.h"
+ #include "gt/intel_gpu_commands.h"
+ #include "gt/intel_gt.h"
++#include "gt/intel_gt_clock_utils.h"
+ #include "gt/intel_lrc.h"
+ #include "gt/intel_ring.h"
+ 
+@@ -1637,7 +1638,8 @@ static int alloc_noa_wait(struct i915_perf_stream *stream)
+ 	struct drm_i915_gem_object *bo;
+ 	struct i915_vma *vma;
+ 	const u64 delay_ticks = 0xffffffffffffffff -
+-		i915_cs_timestamp_ns_to_ticks(i915, atomic64_read(&stream->perf->noa_programming_delay));
++		intel_gt_ns_to_clock_interval(stream->perf->i915->ggtt.vm.gt,
++					      atomic64_read(&stream->perf->noa_programming_delay));
+ 	const u32 base = stream->engine->mmio_base;
+ #define CS_GPR(x) GEN8_RING_CS_GPR(base, x)
+ 	u32 *batch, *ts0, *cs, *jump;
+@@ -3518,7 +3520,8 @@ i915_perf_open_ioctl_locked(struct i915_perf *perf,
+ 
+ static u64 oa_exponent_to_ns(struct i915_perf *perf, int exponent)
+ {
+-	return i915_cs_timestamp_ticks_to_ns(perf->i915, 2ULL << exponent);
++	return intel_gt_clock_interval_to_ns(perf->i915->ggtt.vm.gt,
++					     2ULL << exponent);
+ }
+ 
+ /**
+@@ -4372,8 +4375,8 @@ void i915_perf_init(struct drm_i915_private *i915)
+ 	if (perf->ops.enable_metric_set) {
+ 		mutex_init(&perf->lock);
+ 
+-		oa_sample_rate_hard_limit =
+-			RUNTIME_INFO(i915)->cs_timestamp_frequency_hz / 2;
++		/* Choose a representative limit */
++		oa_sample_rate_hard_limit = i915->gt.clock_frequency / 2;
+ 
+ 		mutex_init(&perf->metrics_lock);
+ 		idr_init_base(&perf->metrics_idr, 1);
+diff --git a/drivers/gpu/drm/i915/intel_device_info.c b/drivers/gpu/drm/i915/intel_device_info.c
+index ef767f04c37c..f2d5ae59081e 100644
+--- a/drivers/gpu/drm/i915/intel_device_info.c
++++ b/drivers/gpu/drm/i915/intel_device_info.c
+@@ -117,150 +117,6 @@ void intel_device_info_print_runtime(const struct intel_runtime_info *info,
+ 				     struct drm_printer *p)
+ {
+ 	drm_printf(p, "rawclk rate: %u kHz\n", info->rawclk_freq);
+-	drm_printf(p, "CS timestamp frequency: %u Hz\n",
+-		   info->cs_timestamp_frequency_hz);
+-}
+-
+-static u32 read_reference_ts_freq(struct drm_i915_private *dev_priv)
+-{
+-	u32 ts_override = intel_uncore_read(&dev_priv->uncore,
+-					    GEN9_TIMESTAMP_OVERRIDE);
+-	u32 base_freq, frac_freq;
+-
+-	base_freq = ((ts_override & GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DIVIDER_MASK) >>
+-		     GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DIVIDER_SHIFT) + 1;
+-	base_freq *= 1000000;
+-
+-	frac_freq = ((ts_override &
+-		      GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DENOMINATOR_MASK) >>
+-		     GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DENOMINATOR_SHIFT);
+-	frac_freq = 1000000 / (frac_freq + 1);
+-
+-	return base_freq + frac_freq;
+-}
+-
+-static u32 gen10_get_crystal_clock_freq(struct drm_i915_private *dev_priv,
+-					u32 rpm_config_reg)
+-{
+-	u32 f19_2_mhz = 19200000;
+-	u32 f24_mhz = 24000000;
+-	u32 crystal_clock = (rpm_config_reg &
+-			     GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK) >>
+-			    GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_SHIFT;
+-
+-	switch (crystal_clock) {
+-	case GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_19_2_MHZ:
+-		return f19_2_mhz;
+-	case GEN9_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_24_MHZ:
+-		return f24_mhz;
+-	default:
+-		MISSING_CASE(crystal_clock);
+-		return 0;
+-	}
+-}
+-
+-static u32 gen11_get_crystal_clock_freq(struct drm_i915_private *dev_priv,
+-					u32 rpm_config_reg)
+-{
+-	u32 f19_2_mhz = 19200000;
+-	u32 f24_mhz = 24000000;
+-	u32 f25_mhz = 25000000;
+-	u32 f38_4_mhz = 38400000;
+-	u32 crystal_clock = (rpm_config_reg &
+-			     GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK) >>
+-			    GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_SHIFT;
+-
+-	switch (crystal_clock) {
+-	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_24_MHZ:
+-		return f24_mhz;
+-	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_19_2_MHZ:
+-		return f19_2_mhz;
+-	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_38_4_MHZ:
+-		return f38_4_mhz;
+-	case GEN11_RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_25_MHZ:
+-		return f25_mhz;
+-	default:
+-		MISSING_CASE(crystal_clock);
+-		return 0;
+-	}
+-}
+-
+-static u32 read_timestamp_frequency(struct drm_i915_private *dev_priv)
+-{
+-	struct intel_uncore *uncore = &dev_priv->uncore;
+-	u32 f12_5_mhz = 12500000;
+-	u32 f19_2_mhz = 19200000;
+-	u32 f24_mhz = 24000000;
+-
+-	if (INTEL_GEN(dev_priv) <= 4) {
+-		/* PRMs say:
+-		 *
+-		 *     "The value in this register increments once every 16
+-		 *      hclks." (through the “Clocking Configuration”
+-		 *      (“CLKCFG”) MCHBAR register)
+-		 */
+-		return RUNTIME_INFO(dev_priv)->rawclk_freq * 1000 / 16;
+-	} else if (INTEL_GEN(dev_priv) <= 8) {
+-		/* PRMs say:
+-		 *
+-		 *     "The PCU TSC counts 10ns increments; this timestamp
+-		 *      reflects bits 38:3 of the TSC (i.e. 80ns granularity,
+-		 *      rolling over every 1.5 hours).
+-		 */
+-		return f12_5_mhz;
+-	} else if (INTEL_GEN(dev_priv) <= 9) {
+-		u32 ctc_reg = intel_uncore_read(uncore, CTC_MODE);
+-		u32 freq = 0;
+-
+-		if ((ctc_reg & CTC_SOURCE_PARAMETER_MASK) == CTC_SOURCE_DIVIDE_LOGIC) {
+-			freq = read_reference_ts_freq(dev_priv);
+-		} else {
+-			freq = IS_GEN9_LP(dev_priv) ? f19_2_mhz : f24_mhz;
+-
+-			/* Now figure out how the command stream's timestamp
+-			 * register increments from this frequency (it might
+-			 * increment only every few clock cycle).
+-			 */
+-			freq >>= 3 - ((ctc_reg & CTC_SHIFT_PARAMETER_MASK) >>
+-				      CTC_SHIFT_PARAMETER_SHIFT);
+-		}
+-
+-		return freq;
+-	} else if (INTEL_GEN(dev_priv) <= 12) {
+-		u32 ctc_reg = intel_uncore_read(uncore, CTC_MODE);
+-		u32 freq = 0;
+-
+-		/* First figure out the reference frequency. There are 2 ways
+-		 * we can compute the frequency, either through the
+-		 * TIMESTAMP_OVERRIDE register or through RPM_CONFIG. CTC_MODE
+-		 * tells us which one we should use.
+-		 */
+-		if ((ctc_reg & CTC_SOURCE_PARAMETER_MASK) == CTC_SOURCE_DIVIDE_LOGIC) {
+-			freq = read_reference_ts_freq(dev_priv);
+-		} else {
+-			u32 rpm_config_reg = intel_uncore_read(uncore, RPM_CONFIG0);
+-
+-			if (INTEL_GEN(dev_priv) <= 10)
+-				freq = gen10_get_crystal_clock_freq(dev_priv,
+-								rpm_config_reg);
+-			else
+-				freq = gen11_get_crystal_clock_freq(dev_priv,
+-								rpm_config_reg);
+-
+-			/* Now figure out how the command stream's timestamp
+-			 * register increments from this frequency (it might
+-			 * increment only every few clock cycle).
+-			 */
+-			freq >>= 3 - ((rpm_config_reg &
+-				       GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_MASK) >>
+-				      GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_SHIFT);
+-		}
+-
+-		return freq;
+-	}
+-
+-	MISSING_CASE("Unknown gen, unable to read command streamer timestamp frequency\n");
+-	return 0;
+ }
+ 
+ #undef INTEL_VGA_DEVICE
+@@ -505,19 +361,6 @@ void intel_device_info_runtime_init(struct drm_i915_private *dev_priv)
+ 	runtime->rawclk_freq = intel_read_rawclk(dev_priv);
+ 	drm_dbg(&dev_priv->drm, "rawclk rate: %d kHz\n", runtime->rawclk_freq);
+ 
+-	/* Initialize command stream timestamp frequency */
+-	runtime->cs_timestamp_frequency_hz =
+-		read_timestamp_frequency(dev_priv);
+-	if (runtime->cs_timestamp_frequency_hz) {
+-		runtime->cs_timestamp_period_ns =
+-			i915_cs_timestamp_ticks_to_ns(dev_priv, 1);
+-		drm_dbg(&dev_priv->drm,
+-			"CS timestamp wraparound in %lldms\n",
+-			div_u64(mul_u32_u32(runtime->cs_timestamp_period_ns,
+-					    S32_MAX),
+-				USEC_PER_SEC));
+-	}
+-
+ 	if (!HAS_DISPLAY(dev_priv)) {
+ 		dev_priv->drm.driver_features &= ~(DRIVER_MODESET |
+ 						   DRIVER_ATOMIC);
+diff --git a/drivers/gpu/drm/i915/intel_device_info.h b/drivers/gpu/drm/i915/intel_device_info.h
+index d92fa041c700..17d0fdb94d2d 100644
+--- a/drivers/gpu/drm/i915/intel_device_info.h
++++ b/drivers/gpu/drm/i915/intel_device_info.h
+@@ -224,9 +224,6 @@ struct intel_runtime_info {
+ 	u8 num_scalers[I915_MAX_PIPES];
+ 
+ 	u32 rawclk_freq;
+-
+-	u32 cs_timestamp_frequency_hz;
+-	u32 cs_timestamp_period_ns;
+ };
+ 
+ struct intel_driver_caps {
+diff --git a/drivers/gpu/drm/i915/selftests/i915_perf.c b/drivers/gpu/drm/i915/selftests/i915_perf.c
+index debbac660519..e9d86dab8677 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_perf.c
++++ b/drivers/gpu/drm/i915/selftests/i915_perf.c
+@@ -262,7 +262,7 @@ static int live_noa_delay(void *arg)
+ 
+ 	delay = intel_read_status_page(stream->engine, 0x102);
+ 	delay -= intel_read_status_page(stream->engine, 0x100);
+-	delay = i915_cs_timestamp_ticks_to_ns(i915, delay);
++	delay = intel_gt_clock_interval_to_ns(stream->engine->gt, delay);
+ 	pr_info("GPU delay: %uns, expected %lluns\n",
+ 		delay, expected);
+ 
+diff --git a/drivers/gpu/drm/i915/selftests/i915_request.c b/drivers/gpu/drm/i915/selftests/i915_request.c
+index e424a6d1a68c..ddf76069066e 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_request.c
+@@ -33,6 +33,7 @@
+ #include "gt/intel_engine_pm.h"
+ #include "gt/intel_engine_user.h"
+ #include "gt/intel_gt.h"
++#include "gt/intel_gt_clock_utils.h"
+ #include "gt/intel_gt_requests.h"
+ #include "gt/selftest_engine_heartbeat.h"
+ 
+@@ -1560,7 +1561,7 @@ static u32 trifilter(u32 *a)
+ 
+ static u64 cycles_to_ns(struct intel_engine_cs *engine, u32 cycles)
+ {
+-	u64 ns = i915_cs_timestamp_ticks_to_ns(engine->i915, cycles);
++	u64 ns = intel_gt_clock_interval_to_ns(engine->gt, cycles);
+ 
+ 	return DIV_ROUND_CLOSEST(ns, 1 << TF_BIAS);
+ }
+-- 
+2.17.1
+

@@ -1,0 +1,143 @@
+From de865b852854e6579cd303d5f6f2d12a1160b5ab Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 2 Nov 2020 13:01:53 +0100
+Subject: [PATCH 0261/1714] drm/ttm: rework no_retry handling v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+During eviction we do want to trigger the OOM killer.
+
+Only while doing new allocations we should try to avoid that and
+return -ENOMEM to the application.
+
+v2: rename the flag to gfp_retry_mayfail.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/398685/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 3 ---
+ drivers/gpu/drm/ttm/ttm_pool.c             | 2 +-
+ drivers/gpu/drm/ttm/ttm_tt.c               | 7 -------
+ include/drm/ttm/ttm_bo_api.h               | 2 ++
+ include/drm/ttm/ttm_bo_driver.h            | 3 ---
+ 6 files changed, 5 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 1aa516429c80..4e9dfbea31c6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -516,6 +516,8 @@ static int amdgpu_bo_do_create(struct amdgpu_device *adev,
+ 	struct ttm_operation_ctx ctx = {
+ 		.interruptible = (bp->type != ttm_bo_type_kernel),
+ 		.no_wait_gpu = bp->no_wait_gpu,
++		/* We opt to avoid OOM on system pages allocations */
++		.gfp_retry_mayfail = true,
+ 		.resv = bp->resv,
+ 		.flags = bp->type != ttm_bo_type_kernel ?
+ 			TTM_OPT_FLAG_ALLOW_RES_EVICT : 0
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 9c00c5e5ebd8..3d65f2009b01 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1914,9 +1914,6 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 	}
+ 	adev->mman.initialized = true;
+ 
+-	/* We opt to avoid OOM on system pages allocations */
+-	adev->mman.bdev.no_retry = true;
+-
+ 	/* Initialize VRAM pool with all of VRAM divided into pages */
+ 	r = amdgpu_vram_mgr_init(adev);
+ 	if (r) {
+diff --git a/drivers/gpu/drm/ttm/ttm_pool.c b/drivers/gpu/drm/ttm/ttm_pool.c
+index 1e50deefb5d5..44ec41aa78d6 100644
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -367,7 +367,7 @@ int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
+ 	if (tt->page_flags & TTM_PAGE_FLAG_ZERO_ALLOC)
+ 		gfp_flags |= __GFP_ZERO;
+ 
+-	if (tt->page_flags & TTM_PAGE_FLAG_NO_RETRY)
++	if (ctx->gfp_retry_mayfail)
+ 		gfp_flags |= __GFP_RETRY_MAYFAIL;
+ 
+ 	if (pool->use_dma32)
+diff --git a/drivers/gpu/drm/ttm/ttm_tt.c b/drivers/gpu/drm/ttm/ttm_tt.c
+index 8861a74ac335..cfd633c7e764 100644
+--- a/drivers/gpu/drm/ttm/ttm_tt.c
++++ b/drivers/gpu/drm/ttm/ttm_tt.c
+@@ -51,9 +51,6 @@ int ttm_tt_create(struct ttm_buffer_object *bo, bool zero_alloc)
+ 	if (bo->ttm)
+ 		return 0;
+ 
+-	if (bdev->no_retry)
+-		page_flags |= TTM_PAGE_FLAG_NO_RETRY;
+-
+ 	switch (bo->type) {
+ 	case ttm_bo_type_device:
+ 		if (zero_alloc)
+@@ -211,8 +208,6 @@ int ttm_tt_swapin(struct ttm_tt *ttm)
+ 
+ 	swap_space = swap_storage->f_mapping;
+ 	gfp_mask = mapping_gfp_mask(swap_space);
+-	if (ttm->page_flags & TTM_PAGE_FLAG_NO_RETRY)
+-		gfp_mask |= __GFP_RETRY_MAYFAIL;
+ 
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		from_page = shmem_read_mapping_page_gfp(swap_space, i,
+@@ -260,8 +255,6 @@ int ttm_tt_swapout(struct ttm_bo_device *bdev, struct ttm_tt *ttm)
+ 
+ 	swap_space = swap_storage->f_mapping;
+ 	gfp_mask = mapping_gfp_mask(swap_space);
+-	if (ttm->page_flags & TTM_PAGE_FLAG_NO_RETRY)
+-		gfp_mask |= __GFP_RETRY_MAYFAIL;
+ 
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		from_page = ttm->pages[i];
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 37102e45e496..4637357ba856 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -195,6 +195,7 @@ struct ttm_bo_kmap_obj {
+  *
+  * @interruptible: Sleep interruptible if sleeping.
+  * @no_wait_gpu: Return immediately if the GPU is busy.
++ * @gfp_retry_mayfail: Set the __GFP_RETRY_MAYFAIL when allocation pages.
+  * @resv: Reservation object to allow reserved evictions with.
+  * @flags: Including the following flags
+  *
+@@ -204,6 +205,7 @@ struct ttm_bo_kmap_obj {
+ struct ttm_operation_ctx {
+ 	bool interruptible;
+ 	bool no_wait_gpu;
++	bool gfp_retry_mayfail;
+ 	struct dma_resv *resv;
+ 	uint64_t bytes_moved;
+ 	uint32_t flags;
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index e9f683fa72dc..da8208f43378 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -276,7 +276,6 @@ extern struct ttm_bo_global {
+  * @dev_mapping: A pointer to the struct address_space representing the
+  * device address space.
+  * @wq: Work queue structure for the delayed delete workqueue.
+- * @no_retry: Don't retry allocation if it fails
+  *
+  */
+ 
+@@ -314,8 +313,6 @@ struct ttm_bo_device {
+ 	 */
+ 
+ 	struct delayed_work wq;
+-
+-	bool no_retry;
+ };
+ 
+ static inline struct ttm_resource_manager *ttm_manager_type(struct ttm_bo_device *bdev,
+-- 
+2.25.1
+

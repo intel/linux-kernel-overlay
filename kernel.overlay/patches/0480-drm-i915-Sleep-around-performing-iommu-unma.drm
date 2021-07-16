@@ -1,0 +1,74 @@
+From 1aaf412391093175800130678b642ca472863a37 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 9 Dec 2020 16:40:07 +0000
+Subject: [PATCH 0480/1087] drm/i915: Sleep around performing iommu unmaps on
+ Tigerlake
+
+Tigerlake is plagued by spontaneous DMAR faults [reason 7, next page
+table ptr is invalid] which lead to GPU hangs. These faults occur when
+an iommu map is immediately reused. Adding further clflushes and
+barriers around either the GTT PTE or iommu PTE updates do not prevent
+the faults. So far the only effect has been from inducing a delay
+between reuse of the iommu on the GPU, and applying the delay at the
+iommu map allows for the smallest stable delay.
+
+Note that such a delay is hideous and clearly does not fix the root cause,
+and so should only be a bandaid until a complete solution is found. The
+delay was determined by running igt/gem_exec_fence/parallel in a loop for
+a few hours (unpatched MTBF is about 10s).
+
+We have also seen such DMAR fault [reason 7] errors on other platforms,
+notably gen9-gen11, but so far it has only been trivially and
+consistently reproduced on Tigerlake.
+
+v2: Leave a tell-tale to know when we apply the vt'd quirk, and as a
+reminder to remove it again. Hopefully.
+
+Testcase: igt/gem_exec_fence/parallel
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Acked-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201209164008.5487-2-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gt/intel_ggtt.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index cf94525be2c1..eece0844fbe9 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -101,7 +101,16 @@ static bool needs_idle_maps(struct drm_i915_private *i915)
+ 	 * Query intel_iommu to see if we need the workaround. Presumably that
+ 	 * was loaded first.
+ 	 */
+-	return IS_GEN(i915, 5) && IS_MOBILE(i915) && intel_vtd_active();
++	if (!intel_vtd_active())
++		return false;
++
++	if (IS_GEN(i915, 5) && IS_MOBILE(i915))
++		return true;
++
++	if (IS_GEN(i915, 12))
++		return true; /* XXX DMAR fault reason 7 */
++
++	return false;
+ }
+ 
+ void i915_ggtt_suspend(struct i915_ggtt *ggtt)
+@@ -1050,7 +1059,12 @@ static int i915_gmch_probe(struct i915_ggtt *ggtt)
+ 
+ 	ggtt->vm.alloc_pt_dma = alloc_pt_dma;
+ 
+-	ggtt->do_idle_maps = needs_idle_maps(i915);
++	if (needs_idle_maps(i915)) {
++		drm_notice(&i915->drm,
++			   "Flushing DMA requests before IOMMU unmaps; performance may be degraded\n");
++		ggtt->do_idle_maps = true;
++	}
++
+ 	ggtt->vm.insert_page = i915_ggtt_insert_page;
+ 	ggtt->vm.insert_entries = i915_ggtt_insert_entries;
+ 	ggtt->vm.clear_range = i915_ggtt_clear_range;
+-- 
+2.17.1
+

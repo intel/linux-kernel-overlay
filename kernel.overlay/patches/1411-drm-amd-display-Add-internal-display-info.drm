@@ -1,0 +1,206 @@
+From 3a4b4c2eec89b9012956237ca515a72a925d7a2e Mon Sep 17 00:00:00 2001
+From: Yongqiang Sun <yongqiang.sun@amd.com>
+Date: Wed, 11 Nov 2020 15:12:04 -0500
+Subject: [PATCH 1411/1714] drm/amd/display: Add internal display info
+
+[Why & How]
+Get internal display info from vbios and pass it to dmub fw to determine
+if multiple display optmization is needed.
+
+Signed-off-by: Yongqiang Sun <yongqiang.sun@amd.com>
+Reviewed-by: Tony Cheng <Tony.Cheng@amd.com>
+Acked-by: Anthony Koo <Anthony.Koo@amd.com>
+Acked-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/display/dc/bios/bios_parser2.c    | 73 +++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c |  7 ++
+ .../gpu/drm/amd/display/dc/dc_bios_types.h    |  5 ++
+ drivers/gpu/drm/amd/display/dc/dc_link.h      |  1 +
+ .../amd/display/include/bios_parser_types.h   |  5 ++
+ drivers/gpu/drm/amd/include/atomfirmware.h    |  1 +
+ 6 files changed, 92 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+index 1782ff5542e9..90d5b320f1ac 100644
+--- a/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
++++ b/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c
+@@ -65,6 +65,11 @@
+ 	GENERIC_OBJECT_ID_BRACKET_LAYOUT << OBJECT_ID_SHIFT)
+ #endif /* GENERICOBJECT_BRACKET_LAYOUT_ENUM_ID2 */
+ 
++
++//TODO: Remove this temp define after atomfirmware.h is updated.
++#define  ATOM_DISP_CONNECTOR_CAPS_RECORD_TYPE 23
++
++
+ #define DC_LOGGER \
+ 	bp->base.ctx->logger
+ 
+@@ -1455,6 +1460,72 @@ static struct atom_encoder_caps_record *get_encoder_cap_record(
+ 	return NULL;
+ }
+ 
++static struct atom_disp_connector_caps_record *get_disp_connector_caps_record(
++	struct bios_parser *bp,
++	struct atom_display_object_path_v2 *object)
++{
++	struct atom_common_record_header *header;
++	uint32_t offset;
++
++	if (!object) {
++		BREAK_TO_DEBUGGER(); /* Invalid object */
++		return NULL;
++	}
++
++	offset = object->disp_recordoffset + bp->object_info_tbl_offset;
++
++	for (;;) {
++		header = GET_IMAGE(struct atom_common_record_header, offset);
++
++		if (!header)
++			return NULL;
++
++		offset += header->record_size;
++
++		if (header->record_type == LAST_RECORD_TYPE ||
++				!header->record_size)
++			break;
++
++		if (header->record_type != ATOM_DISP_CONNECTOR_CAPS_RECORD_TYPE)
++			continue;
++
++		if (sizeof(struct atom_disp_connector_caps_record) <=
++							header->record_size)
++			return (struct atom_disp_connector_caps_record *)header;
++	}
++
++	return NULL;
++}
++
++static enum bp_result bios_parser_get_disp_connector_caps_info(
++	struct dc_bios *dcb,
++	struct graphics_object_id object_id,
++	struct bp_disp_connector_caps_info *info)
++{
++	struct bios_parser *bp = BP_FROM_DCB(dcb);
++	struct atom_display_object_path_v2 *object;
++	struct atom_disp_connector_caps_record *record = NULL;
++
++	if (!info)
++		return BP_RESULT_BADINPUT;
++
++	object = get_bios_object(bp, object_id);
++
++	if (!object)
++		return BP_RESULT_BADINPUT;
++
++	record = get_disp_connector_caps_record(bp, object);
++	if (!record)
++		return BP_RESULT_NORECORD;
++
++	info->INTERNAL_DISPLAY = (record->connectcaps & ATOM_CONNECTOR_CAP_INTERNAL_DISPLAY)
++									? 1 : 0;
++	info->INTERNAL_DISPLAY_BL = (record->connectcaps & ATOM_CONNECTOR_CAP_INTERNAL_DISPLAY_BL)
++											? 1 : 0;
++
++	return BP_RESULT_OK;
++}
++
+ static enum bp_result get_vram_info_v23(
+ 	struct bios_parser *bp,
+ 	struct dc_vram_info *info)
+@@ -2463,6 +2534,8 @@ static const struct dc_vbios_funcs vbios_funcs = {
+ 	.enable_lvtma_control = bios_parser_enable_lvtma_control,
+ 
+ 	.get_soc_bb_info = bios_parser_get_soc_bb_info,
++
++	.get_disp_connector_caps_info = bios_parser_get_disp_connector_caps_info,
+ };
+ 
+ static bool bios_parser2_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index e67242e535f8..50553f210a41 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -1369,6 +1369,7 @@ static bool dc_link_construct(struct dc_link *link,
+ 	struct integrated_info info = {{{ 0 }}};
+ 	struct dc_bios *bios = init_params->dc->ctx->dc_bios;
+ 	const struct dc_vbios_funcs *bp_funcs = bios->funcs;
++	struct bp_disp_connector_caps_info disp_connect_caps_info = { 0 };
+ 
+ 	DC_LOGGER_INIT(dc_ctx->logger);
+ 
+@@ -1389,6 +1390,12 @@ static bool dc_link_construct(struct dc_link *link,
+ 	link->link_id =
+ 		bios->funcs->get_connector_id(bios, init_params->connector_index);
+ 
++
++	if (bios->funcs->get_disp_connector_caps_info) {
++		bios->funcs->get_disp_connector_caps_info(bios, link->link_id, &disp_connect_caps_info);
++		link->is_internal_display = disp_connect_caps_info.INTERNAL_DISPLAY;
++	}
++
+ 	if (link->link_id.type != OBJECT_TYPE_CONNECTOR) {
+ 		dm_output_to_console("%s: Invalid Connector ObjectID from Adapter Service for connector index:%d! type %d expected %d\n",
+ 				     __func__, init_params->connector_index,
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_bios_types.h b/drivers/gpu/drm/amd/display/dc/dc_bios_types.h
+index e146e3cba8eb..509d23fdd3c9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_bios_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_bios_types.h
+@@ -144,6 +144,11 @@ struct dc_vbios_funcs {
+ 	enum bp_result (*get_soc_bb_info)(
+ 		struct dc_bios *dcb,
+ 		struct bp_soc_bb_info *soc_bb_info);
++
++	enum bp_result (*get_disp_connector_caps_info)(
++			struct dc_bios *dcb,
++			struct graphics_object_id object_id,
++			struct bp_disp_connector_caps_info *info);
+ };
+ 
+ struct bios_registers {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_link.h b/drivers/gpu/drm/amd/display/dc/dc_link.h
+index 65b083e64131..66445e34fd37 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_link.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_link.h
+@@ -101,6 +101,7 @@ struct dc_link {
+ 	bool aux_access_disabled;
+ 	bool sync_lt_in_progress;
+ 	bool lttpr_non_transparent_mode;
++	bool is_internal_display;
+ 
+ 	/* caps is the same as reported_link_cap. link_traing use
+ 	 * reported_link_cap. Will clean up.  TODO
+diff --git a/drivers/gpu/drm/amd/display/include/bios_parser_types.h b/drivers/gpu/drm/amd/display/include/bios_parser_types.h
+index 7c782924c941..76a87b682883 100644
+--- a/drivers/gpu/drm/amd/display/include/bios_parser_types.h
++++ b/drivers/gpu/drm/amd/display/include/bios_parser_types.h
+@@ -309,6 +309,11 @@ struct bp_spread_spectrum_parameters {
+ 	struct spread_spectrum_flags flags;
+ };
+ 
++struct bp_disp_connector_caps_info {
++	uint32_t INTERNAL_DISPLAY    : 1;
++	uint32_t INTERNAL_DISPLAY_BL : 1;
++};
++
+ struct bp_encoder_cap_info {
+ 	uint32_t DP_HBR2_CAP:1;
+ 	uint32_t DP_HBR2_EN:1;
+diff --git a/drivers/gpu/drm/amd/include/atomfirmware.h b/drivers/gpu/drm/amd/include/atomfirmware.h
+index 6139d10f4289..c38635992101 100644
+--- a/drivers/gpu/drm/amd/include/atomfirmware.h
++++ b/drivers/gpu/drm/amd/include/atomfirmware.h
+@@ -725,6 +725,7 @@ enum atom_object_record_type_id
+   ATOM_ENCODER_CAP_RECORD_TYPE=20,
+   ATOM_BRACKET_LAYOUT_RECORD_TYPE=21,
+   ATOM_CONNECTOR_FORCED_TMDS_CAP_RECORD_TYPE=22,
++  ATOM_DISP_CONNECTOR_CAPS_RECORD_TYPE=23,
+   ATOM_RECORD_END_TYPE  =0xFF,
+ };
+ 
+-- 
+2.25.1
+

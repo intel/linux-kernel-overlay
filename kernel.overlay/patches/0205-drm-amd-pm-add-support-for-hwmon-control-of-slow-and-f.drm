@@ -1,0 +1,438 @@
+From 94494ceb8fff13e42496088d1c2372dbd6df370e Mon Sep 17 00:00:00 2001
+From: Xiaomeng Hou <Xiaomeng.Hou@amd.com>
+Date: Mon, 25 Jan 2021 15:59:14 +0800
+Subject: [PATCH 205/330] drm/amd/pm: add support for hwmon control of slow and
+ fast PPT limit on vangogh
+
+Implement hwmon API for reading/setting slow and fast PPT limit.
+
+APU power is managed to system-level requirements through the PPT
+(package power tracking) feature. PPT is intended to limit power to the
+requirements of the power source and could be dynamically updated to
+maximize APU performance within the system power budget.
+
+Here FAST_PPT_LIMIT manages the ~10 ms moving average of APU power,
+while SLOW_PPT_LIMIT manages the configurable, thermally significant
+moving average of APU power (default ~5000 ms).
+
+User could read slow/fast ppt limit using command "cat power*_cap" or
+"sensors" in the hwmon device directory. User could adjust values of
+slow/fast ppt limit as needed depending on workloads through command
+"echo ## > power*_cap".
+
+Example:
+$ echo 15000000 > power1_cap
+$ echo 18000000 > power2_cap
+$ sensors
+amdgpu-pci-0300
+Adapter: PCI adapter
+slowPPT:     9.04W (cap = 15.00 W)
+fastPPT:     9.04W (cap = 18.00 W)
+
+v2: align with existing interfaces for the getting/setting of PPT
+    limits. Encode the upper 8 bits of limit value to distinguish
+    slow and fast power limit type.
+
+Signed-off-by: Xiaomeng Hou <Xiaomeng.Hou@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            |  45 ++++++-
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h       |  12 ++
+ drivers/gpu/drm/amd/pm/inc/smu_v11_0.h        |   9 ++
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     |  35 ++++--
+ .../gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c    |   8 +-
+ .../gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c  | 113 ++++++++++++++++++
+ 6 files changed, 204 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index 39899e7989a2..5fa65f191a37 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -3059,7 +3059,8 @@ static ssize_t amdgpu_hwmon_show_power_cap_max(struct device *dev,
+ 					 char *buf)
+ {
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
+-	uint32_t limit = 0;
++	int limit_type = to_sensor_dev_attr(attr)->index;
++	uint32_t limit = limit_type << 24;
+ 	ssize_t size;
+ 	int r;
+ 
+@@ -3093,7 +3094,8 @@ static ssize_t amdgpu_hwmon_show_power_cap(struct device *dev,
+ 					 char *buf)
+ {
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
+-	uint32_t limit = 0;
++	int limit_type = to_sensor_dev_attr(attr)->index;
++	uint32_t limit = limit_type << 24;
+ 	ssize_t size;
+ 	int r;
+ 
+@@ -3122,6 +3124,15 @@ static ssize_t amdgpu_hwmon_show_power_cap(struct device *dev,
+ 	return size;
+ }
+ 
++static ssize_t amdgpu_hwmon_show_power_label(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	int limit_type = to_sensor_dev_attr(attr)->index;
++
++	return snprintf(buf, PAGE_SIZE, "%s\n",
++		limit_type == SMU_FAST_PPT_LIMIT ? "fastPPT" : "slowPPT");
++}
+ 
+ static ssize_t amdgpu_hwmon_set_power_cap(struct device *dev,
+ 		struct device_attribute *attr,
+@@ -3129,6 +3140,7 @@ static ssize_t amdgpu_hwmon_set_power_cap(struct device *dev,
+ 		size_t count)
+ {
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
++	int limit_type = to_sensor_dev_attr(attr)->index;
+ 	int err;
+ 	u32 value;
+ 
+@@ -3143,7 +3155,7 @@ static ssize_t amdgpu_hwmon_set_power_cap(struct device *dev,
+ 		return err;
+ 
+ 	value = value / 1000000; /* convert to Watt */
+-
++	value |= limit_type << 24;
+ 
+ 	err = pm_runtime_get_sync(adev_to_drm(adev)->dev);
+ 	if (err < 0) {
+@@ -3355,6 +3367,12 @@ static SENSOR_DEVICE_ATTR(power1_average, S_IRUGO, amdgpu_hwmon_show_power_avg,
+ static SENSOR_DEVICE_ATTR(power1_cap_max, S_IRUGO, amdgpu_hwmon_show_power_cap_max, NULL, 0);
+ static SENSOR_DEVICE_ATTR(power1_cap_min, S_IRUGO, amdgpu_hwmon_show_power_cap_min, NULL, 0);
+ static SENSOR_DEVICE_ATTR(power1_cap, S_IRUGO | S_IWUSR, amdgpu_hwmon_show_power_cap, amdgpu_hwmon_set_power_cap, 0);
++static SENSOR_DEVICE_ATTR(power1_label, S_IRUGO, amdgpu_hwmon_show_power_label, NULL, 0);
++static SENSOR_DEVICE_ATTR(power2_average, S_IRUGO, amdgpu_hwmon_show_power_avg, NULL, 1);
++static SENSOR_DEVICE_ATTR(power2_cap_max, S_IRUGO, amdgpu_hwmon_show_power_cap_max, NULL, 1);
++static SENSOR_DEVICE_ATTR(power2_cap_min, S_IRUGO, amdgpu_hwmon_show_power_cap_min, NULL, 1);
++static SENSOR_DEVICE_ATTR(power2_cap, S_IRUGO | S_IWUSR, amdgpu_hwmon_show_power_cap, amdgpu_hwmon_set_power_cap, 1);
++static SENSOR_DEVICE_ATTR(power2_label, S_IRUGO, amdgpu_hwmon_show_power_label, NULL, 1);
+ static SENSOR_DEVICE_ATTR(freq1_input, S_IRUGO, amdgpu_hwmon_show_sclk, NULL, 0);
+ static SENSOR_DEVICE_ATTR(freq1_label, S_IRUGO, amdgpu_hwmon_show_sclk_label, NULL, 0);
+ static SENSOR_DEVICE_ATTR(freq2_input, S_IRUGO, amdgpu_hwmon_show_mclk, NULL, 0);
+@@ -3393,6 +3411,12 @@ static struct attribute *hwmon_attributes[] = {
+ 	&sensor_dev_attr_power1_cap_max.dev_attr.attr,
+ 	&sensor_dev_attr_power1_cap_min.dev_attr.attr,
+ 	&sensor_dev_attr_power1_cap.dev_attr.attr,
++	&sensor_dev_attr_power1_label.dev_attr.attr,
++	&sensor_dev_attr_power2_average.dev_attr.attr,
++	&sensor_dev_attr_power2_cap_max.dev_attr.attr,
++	&sensor_dev_attr_power2_cap_min.dev_attr.attr,
++	&sensor_dev_attr_power2_cap.dev_attr.attr,
++	&sensor_dev_attr_power2_label.dev_attr.attr,
+ 	&sensor_dev_attr_freq1_input.dev_attr.attr,
+ 	&sensor_dev_attr_freq1_label.dev_attr.attr,
+ 	&sensor_dev_attr_freq2_input.dev_attr.attr,
+@@ -3485,8 +3509,9 @@ static umode_t hwmon_attributes_visible(struct kobject *kobj,
+ 			effective_mode &= ~S_IWUSR;
+ 	}
+ 
+-	if (((adev->flags & AMD_IS_APU) ||
+-	     adev->family == AMDGPU_FAMILY_SI) &&	/* not implemented yet */
++	if (((adev->family == AMDGPU_FAMILY_SI) ||
++		 ((adev->flags & AMD_IS_APU) &&
++	      (adev->asic_type != CHIP_VANGOGH))) &&	/* not implemented yet */
+ 	    (attr == &sensor_dev_attr_power1_cap_max.dev_attr.attr ||
+ 	     attr == &sensor_dev_attr_power1_cap_min.dev_attr.attr||
+ 	     attr == &sensor_dev_attr_power1_cap.dev_attr.attr))
+@@ -3549,6 +3574,16 @@ static umode_t hwmon_attributes_visible(struct kobject *kobj,
+ 	     attr == &sensor_dev_attr_temp3_label.dev_attr.attr))
+ 		return 0;
+ 
++	/* only Vangogh has fast PPT limit and power labels */
++	if (!(adev->asic_type == CHIP_VANGOGH) &&
++	    (attr == &sensor_dev_attr_power2_average.dev_attr.attr ||
++		 attr == &sensor_dev_attr_power2_cap_max.dev_attr.attr ||
++	     attr == &sensor_dev_attr_power2_cap_min.dev_attr.attr ||
++		 attr == &sensor_dev_attr_power2_cap.dev_attr.attr ||
++		 attr == &sensor_dev_attr_power2_label.dev_attr.attr ||
++		 attr == &sensor_dev_attr_power1_label.dev_attr.attr))
++		return 0;
++
+ 	return effective_mode;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index 82a5f4a4faf5..10b0624ade65 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -161,6 +161,12 @@ enum smu_power_src_type
+ 	SMU_POWER_SOURCE_COUNT,
+ };
+ 
++enum smu_ppt_limit_type
++{
++	SMU_DEFAULT_PPT_LIMIT = 0,
++	SMU_FAST_PPT_LIMIT,
++};
++
+ enum smu_ppt_limit_level
+ {
+ 	SMU_PPT_LIMIT_MIN = -1,
+@@ -708,6 +714,12 @@ struct pptable_funcs {
+ 	 */
+ 	int (*get_power_limit)(struct smu_context *smu);
+ 
++	/**
++	 * @get_ppt_limit: Get the device's ppt limits.
++	 */
++	int (*get_ppt_limit)(struct smu_context *smu, uint32_t *ppt_limit,
++			enum smu_ppt_limit_type limit_type, enum smu_ppt_limit_level limit_level);
++
+ 	/**
+ 	 * @set_df_cstate: Set data fabric cstate.
+ 	 */
+diff --git a/drivers/gpu/drm/amd/pm/inc/smu_v11_0.h b/drivers/gpu/drm/amd/pm/inc/smu_v11_0.h
+index e49c2d08a983..d4cddd2390a2 100644
+--- a/drivers/gpu/drm/amd/pm/inc/smu_v11_0.h
++++ b/drivers/gpu/drm/amd/pm/inc/smu_v11_0.h
+@@ -129,6 +129,15 @@ struct smu_11_0_power_context {
+ 	enum smu_11_0_power_state power_state;
+ };
+ 
++struct smu_11_5_power_context {
++	uint32_t	power_source;
++	uint8_t		in_power_limit_boost_mode;
++	enum smu_11_0_power_state power_state;
++
++	uint32_t	current_fast_ppt_limit;
++	uint32_t	max_fast_ppt_limit;
++};
++
+ enum smu_v11_0_baco_seq {
+ 	BACO_SEQ_BACO = 0,
+ 	BACO_SEQ_MSR,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 9017024642bb..d143ef1b460b 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -2046,29 +2046,38 @@ int smu_get_power_limit(struct smu_context *smu,
+ 			uint32_t *limit,
+ 			enum smu_ppt_limit_level limit_level)
+ {
++	uint32_t limit_type = *limit >> 24;
++	int ret = 0;
++
+ 	if (!smu->pm_enabled || !smu->adev->pm.dpm_enabled)
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&smu->mutex);
+ 
+-	switch (limit_level) {
+-	case SMU_PPT_LIMIT_CURRENT:
+-		*limit = smu->current_power_limit;
+-		break;
+-	case SMU_PPT_LIMIT_MAX:
+-		*limit = smu->max_power_limit;
+-		break;
+-	default:
+-		break;
++	if (limit_type != SMU_DEFAULT_PPT_LIMIT) {
++		if (smu->ppt_funcs->get_ppt_limit)
++			ret = smu->ppt_funcs->get_ppt_limit(smu, limit, limit_type, limit_level);
++	} else {
++		switch (limit_level) {
++		case SMU_PPT_LIMIT_CURRENT:
++			*limit = smu->current_power_limit;
++			break;
++		case SMU_PPT_LIMIT_MAX:
++			*limit = smu->max_power_limit;
++			break;
++		default:
++			break;
++		}
+ 	}
+ 
+ 	mutex_unlock(&smu->mutex);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ int smu_set_power_limit(struct smu_context *smu, uint32_t limit)
+ {
++	uint32_t limit_type = limit >> 24;
+ 	int ret = 0;
+ 
+ 	if (!smu->pm_enabled || !smu->adev->pm.dpm_enabled)
+@@ -2076,6 +2085,12 @@ int smu_set_power_limit(struct smu_context *smu, uint32_t limit)
+ 
+ 	mutex_lock(&smu->mutex);
+ 
++	if (limit_type != SMU_DEFAULT_PPT_LIMIT)
++		if (smu->ppt_funcs->set_power_limit) {
++			ret = smu->ppt_funcs->set_power_limit(smu, limit);
++			goto out;
++		}
++
+ 	if (limit > smu->max_power_limit) {
+ 		dev_err(smu->adev->dev,
+ 			"New power limit (%d) is over the max allowed %d\n",
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
+index 36d651342a76..90585461a56e 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
+@@ -474,12 +474,14 @@ int smu_v11_0_fini_smc_tables(struct smu_context *smu)
+ int smu_v11_0_init_power(struct smu_context *smu)
+ {
+ 	struct smu_power_context *smu_power = &smu->smu_power;
++	size_t size = smu->adev->asic_type == CHIP_VANGOGH ?
++			sizeof(struct smu_11_5_power_context) :
++			sizeof(struct smu_11_0_power_context);
+ 
+-	smu_power->power_context = kzalloc(sizeof(struct smu_11_0_power_context),
+-					   GFP_KERNEL);
++	smu_power->power_context = kzalloc(size, GFP_KERNEL);
+ 	if (!smu_power->power_context)
+ 		return -ENOMEM;
+-	smu_power->power_context_size = sizeof(struct smu_11_0_power_context);
++	smu_power->power_context_size = size;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+index 42271e80c0b4..3277014b5881 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c
+@@ -122,6 +122,10 @@ static struct cmn2asic_msg_mapping vangogh_message_map[SMU_MSG_MAX_COUNT] = {
+ 	MSG_MAP(SetSoftMinCclk,                     PPSMC_MSG_SetSoftMinCclk,						0),
+ 	MSG_MAP(SetSoftMaxCclk,                     PPSMC_MSG_SetSoftMaxCclk,						0),
+ 	MSG_MAP(RequestActiveWgp,                   PPSMC_MSG_RequestActiveWgp,                     0),
++	MSG_MAP(SetFastPPTLimit,                    PPSMC_MSG_SetFastPPTLimit,						0),
++	MSG_MAP(SetSlowPPTLimit,                    PPSMC_MSG_SetSlowPPTLimit,						0),
++	MSG_MAP(GetFastPPTLimit,                    PPSMC_MSG_GetFastPPTLimit,						0),
++	MSG_MAP(GetSlowPPTLimit,                    PPSMC_MSG_GetSlowPPTLimit,						0),
+ };
+ 
+ static struct cmn2asic_mapping vangogh_feature_mask_map[SMU_FEATURE_COUNT] = {
+@@ -1773,6 +1777,112 @@ static int vangogh_mode2_reset(struct smu_context *smu)
+ 	return vangogh_mode_reset(smu, SMU_RESET_MODE_2);
+ }
+ 
++static int vangogh_get_power_limit(struct smu_context *smu)
++{
++	struct smu_11_5_power_context *power_context =
++								smu->smu_power.power_context;
++	uint32_t ppt_limit;
++	int ret = 0;
++
++	if (smu->adev->pm.fw_version < 0x43f1e00)
++		return ret;
++
++	ret = smu_cmn_send_smc_msg(smu, SMU_MSG_GetSlowPPTLimit, &ppt_limit);
++	if (ret) {
++		dev_err(smu->adev->dev, "Get slow PPT limit failed!\n");
++		return ret;
++	}
++	/* convert from milliwatt to watt */
++	smu->current_power_limit = ppt_limit / 1000;
++	smu->max_power_limit = 29;
++
++	ret = smu_cmn_send_smc_msg(smu, SMU_MSG_GetFastPPTLimit, &ppt_limit);
++	if (ret) {
++		dev_err(smu->adev->dev, "Get fast PPT limit failed!\n");
++		return ret;
++	}
++	/* convert from milliwatt to watt */
++	power_context->current_fast_ppt_limit = ppt_limit / 1000;
++	power_context->max_fast_ppt_limit = 30;
++
++	return ret;
++}
++
++static int vangogh_get_ppt_limit(struct smu_context *smu,
++								uint32_t *ppt_limit,
++								enum smu_ppt_limit_type type,
++								enum smu_ppt_limit_level level)
++{
++	struct smu_11_5_power_context *power_context =
++							smu->smu_power.power_context;
++
++	if (!power_context)
++		return -EOPNOTSUPP;
++
++	if (type == SMU_FAST_PPT_LIMIT) {
++		switch (level) {
++		case SMU_PPT_LIMIT_MAX:
++			*ppt_limit = power_context->max_fast_ppt_limit;
++			break;
++		case SMU_PPT_LIMIT_CURRENT:
++			*ppt_limit = power_context->current_fast_ppt_limit;
++			break;
++		default:
++			break;
++		}
++	}
++
++	return 0;
++}
++
++static int vangogh_set_power_limit(struct smu_context *smu, uint32_t ppt_limit)
++{
++	struct smu_11_5_power_context *power_context =
++							smu->smu_power.power_context;
++	uint32_t limit_type = ppt_limit >> 24;
++	int ret = 0;
++
++	if (!smu_cmn_feature_is_enabled(smu, SMU_FEATURE_PPT_BIT)) {
++		dev_err(smu->adev->dev, "Setting new power limit is not supported!\n");
++		return -EOPNOTSUPP;
++	}
++
++	switch (limit_type) {
++	case SMU_DEFAULT_PPT_LIMIT:
++		ret = smu_cmn_send_smc_msg_with_param(smu,
++				SMU_MSG_SetSlowPPTLimit,
++				ppt_limit * 1000, /* convert from watt to milliwatt */
++				NULL);
++		if (ret)
++			return ret;
++
++		smu->current_power_limit = ppt_limit;
++		break;
++	case SMU_FAST_PPT_LIMIT:
++		ppt_limit &= ~(SMU_FAST_PPT_LIMIT << 24);
++		if (ppt_limit > power_context->max_fast_ppt_limit) {
++			dev_err(smu->adev->dev,
++				"New power limit (%d) is over the max allowed %d\n",
++				ppt_limit, power_context->max_fast_ppt_limit);
++			return ret;
++		}
++
++		ret = smu_cmn_send_smc_msg_with_param(smu,
++				SMU_MSG_SetFastPPTLimit,
++				ppt_limit * 1000, /* convert from watt to milliwatt */
++				NULL);
++		if (ret)
++			return ret;
++
++		power_context->current_fast_ppt_limit = ppt_limit;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
+ static const struct pptable_funcs vangogh_ppt_funcs = {
+ 
+ 	.check_fw_status = smu_v11_0_check_fw_status,
+@@ -1809,6 +1919,9 @@ static const struct pptable_funcs vangogh_ppt_funcs = {
+ 	.post_init = vangogh_post_smu_init,
+ 	.mode2_reset = vangogh_mode2_reset,
+ 	.gfx_off_control = smu_v11_0_gfx_off_control,
++	.get_ppt_limit = vangogh_get_ppt_limit,
++	.get_power_limit = vangogh_get_power_limit,
++	.set_power_limit = vangogh_set_power_limit,
+ };
+ 
+ void vangogh_set_ppt_funcs(struct smu_context *smu)
+-- 
+2.25.1
+

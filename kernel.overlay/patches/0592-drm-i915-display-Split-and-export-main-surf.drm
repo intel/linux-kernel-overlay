@@ -1,0 +1,158 @@
+From 2ac5834cbdd0c3e5980ea4778926191c33efc8f7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jos=C3=A9=20Roberto=20de=20Souza?= <jose.souza@intel.com>
+Date: Mon, 4 Jan 2021 12:56:53 -0800
+Subject: [PATCH 0592/1087] drm/i915/display: Split and export main surface
+ calculation from skl_check_main_surface()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The calculation the offsets of the main surface will be needed by PSR2
+selective fetch code so here splitting and exporting it.
+No functional changes were done here.
+
+v3: Rebased
+
+Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Tested-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210104205654.238928-3-jose.souza@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 78 ++++++++++++--------
+ drivers/gpu/drm/i915/display/intel_display.h |  2 +
+ 2 files changed, 51 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index f2c48e5cdb43..0189d379a55e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -3752,33 +3752,19 @@ static int intel_plane_max_height(struct intel_plane *plane,
+ 		return INT_MAX;
+ }
+ 
+-static int skl_check_main_surface(struct intel_plane_state *plane_state)
++int skl_calc_main_surface_offset(const struct intel_plane_state *plane_state,
++				 int *x, int *y, u32 *offset)
+ {
+ 	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 	const struct drm_framebuffer *fb = plane_state->hw.fb;
+-	unsigned int rotation = plane_state->hw.rotation;
+-	int x = plane_state->uapi.src.x1 >> 16;
+-	int y = plane_state->uapi.src.y1 >> 16;
+-	int w = drm_rect_width(&plane_state->uapi.src) >> 16;
+-	int h = drm_rect_height(&plane_state->uapi.src) >> 16;
+-	int min_width = intel_plane_min_width(plane, fb, 0, rotation);
+-	int max_width = intel_plane_max_width(plane, fb, 0, rotation);
+-	int max_height = intel_plane_max_height(plane, fb, 0, rotation);
+-	int aux_plane = intel_main_to_aux_plane(fb, 0);
+-	u32 aux_offset = plane_state->color_plane[aux_plane].offset;
+-	u32 alignment, offset;
++	const int aux_plane = intel_main_to_aux_plane(fb, 0);
++	const u32 aux_offset = plane_state->color_plane[aux_plane].offset;
++	const u32 alignment = intel_surf_alignment(fb, 0);
++	const int w = drm_rect_width(&plane_state->uapi.src) >> 16;
+ 
+-	if (w > max_width || w < min_width || h > max_height) {
+-		drm_dbg_kms(&dev_priv->drm,
+-			    "requested Y/RGB source size %dx%d outside limits (min: %dx1 max: %dx%d)\n",
+-			    w, h, min_width, max_width, max_height);
+-		return -EINVAL;
+-	}
+-
+-	intel_add_fb_offsets(&x, &y, plane_state, 0);
+-	offset = intel_plane_compute_aligned_offset(&x, &y, plane_state, 0);
+-	alignment = intel_surf_alignment(fb, 0);
++	intel_add_fb_offsets(x, y, plane_state, 0);
++	*offset = intel_plane_compute_aligned_offset(x, y, plane_state, 0);
+ 	if (drm_WARN_ON(&dev_priv->drm, alignment && !is_power_of_2(alignment)))
+ 		return -EINVAL;
+ 
+@@ -3787,9 +3773,10 @@ static int skl_check_main_surface(struct intel_plane_state *plane_state)
+ 	 * main surface offset, and it must be non-negative. Make
+ 	 * sure that is what we will get.
+ 	 */
+-	if (aux_plane && offset > aux_offset)
+-		offset = intel_plane_adjust_aligned_offset(&x, &y, plane_state, 0,
+-							   offset, aux_offset & ~(alignment - 1));
++	if (aux_plane && *offset > aux_offset)
++		*offset = intel_plane_adjust_aligned_offset(x, y, plane_state, 0,
++							    *offset,
++							    aux_offset & ~(alignment - 1));
+ 
+ 	/*
+ 	 * When using an X-tiled surface, the plane blows up
+@@ -3800,18 +3787,51 @@ static int skl_check_main_surface(struct intel_plane_state *plane_state)
+ 	if (fb->modifier == I915_FORMAT_MOD_X_TILED) {
+ 		int cpp = fb->format->cpp[0];
+ 
+-		while ((x + w) * cpp > plane_state->color_plane[0].stride) {
+-			if (offset == 0) {
++		while ((*x + w) * cpp > plane_state->color_plane[0].stride) {
++			if (*offset == 0) {
+ 				drm_dbg_kms(&dev_priv->drm,
+ 					    "Unable to find suitable display surface offset due to X-tiling\n");
+ 				return -EINVAL;
+ 			}
+ 
+-			offset = intel_plane_adjust_aligned_offset(&x, &y, plane_state, 0,
+-								   offset, offset - alignment);
++			*offset = intel_plane_adjust_aligned_offset(x, y, plane_state, 0,
++								    *offset,
++								    *offset - alignment);
+ 		}
+ 	}
+ 
++	return 0;
++}
++
++static int skl_check_main_surface(struct intel_plane_state *plane_state)
++{
++	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
++	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++	const struct drm_framebuffer *fb = plane_state->hw.fb;
++	const unsigned int rotation = plane_state->hw.rotation;
++	int x = plane_state->uapi.src.x1 >> 16;
++	int y = plane_state->uapi.src.y1 >> 16;
++	const int w = drm_rect_width(&plane_state->uapi.src) >> 16;
++	const int h = drm_rect_height(&plane_state->uapi.src) >> 16;
++	const int min_width = intel_plane_min_width(plane, fb, 0, rotation);
++	const int max_width = intel_plane_max_width(plane, fb, 0, rotation);
++	const int max_height = intel_plane_max_height(plane, fb, 0, rotation);
++	const int aux_plane = intel_main_to_aux_plane(fb, 0);
++	const u32 alignment = intel_surf_alignment(fb, 0);
++	u32 offset;
++	int ret;
++
++	if (w > max_width || w < min_width || h > max_height) {
++		drm_dbg_kms(&dev_priv->drm,
++			    "requested Y/RGB source size %dx%d outside limits (min: %dx1 max: %dx%d)\n",
++			    w, h, min_width, max_width, max_height);
++		return -EINVAL;
++	}
++
++	ret = skl_calc_main_surface_offset(plane_state, &x, &y, &offset);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * CCS AUX surface doesn't have its own x/y offsets, we must make sure
+ 	 * they match with the main surface x/y offsets.
+diff --git a/drivers/gpu/drm/i915/display/intel_display.h b/drivers/gpu/drm/i915/display/intel_display.h
+index f7e49a39bd92..7ddbc00a0f41 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -630,6 +630,8 @@ u32 skl_plane_ctl_crtc(const struct intel_crtc_state *crtc_state);
+ u32 skl_plane_stride(const struct intel_plane_state *plane_state,
+ 		     int plane);
+ int skl_check_plane_surface(struct intel_plane_state *plane_state);
++int skl_calc_main_surface_offset(const struct intel_plane_state *plane_state,
++				 int *x, int *y, u32 *offset);
+ int skl_format_to_fourcc(int format, bool rgb_order, bool alpha);
+ int bdw_get_pipemisc_bpp(struct intel_crtc *crtc);
+ unsigned int intel_plane_fence_y_offset(const struct intel_plane_state *plane_state);
+-- 
+2.17.1
+

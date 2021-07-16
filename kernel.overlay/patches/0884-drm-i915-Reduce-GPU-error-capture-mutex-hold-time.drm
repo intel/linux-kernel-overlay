@@ -1,0 +1,94 @@
+From 60fd312bdc054ef9cdfa85156c54a63c9cedd722 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 16 Sep 2020 10:00:59 +0100
+Subject: [PATCH 0884/1714] drm/i915: Reduce GPU error capture mutex hold time
+
+Shrink the hold time for the error capture mutex to just around the
+acquire/release of the PTE used for reading back the object via the
+Global GTT. For platforms that do not need the GGTT read back, we can
+skip the mutex entirely and allow concurrent error capture. Where we do
+use the GGTT, by restricting the hold time around the slow readback and
+compression, we are more resilient against softlockups (khungtaskd) as
+the heartbeat may well also trigger an error while the first is on
+going, and this allows the heartbeat reset to skip past the capture and
+not be stalled.
+
+Testcase: igt/gem_exec_capture/many-*
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200916090059.3189-3-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gpu_error.c | 28 +++++----------------------
+ 1 file changed, 5 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index cf6e47adfde6..b3f3a2e07408 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -1026,6 +1026,7 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 		dma_addr_t dma;
+ 
+ 		for_each_sgt_daddr(dma, iter, vma->pages) {
++			mutex_lock(&ggtt->error_mutex);
+ 			ggtt->vm.insert_page(&ggtt->vm, dma, slot,
+ 					     I915_CACHE_NONE, 0);
+ 			mb();
+@@ -1035,6 +1036,10 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 					    (void  __force *)s, dst,
+ 					    true);
+ 			io_mapping_unmap(s);
++
++			mb();
++			ggtt->vm.clear_range(&ggtt->vm, slot, PAGE_SIZE);
++			mutex_unlock(&ggtt->error_mutex);
+ 			if (ret)
+ 				break;
+ 		}
+@@ -1505,25 +1510,6 @@ gt_record_uc(struct intel_gt_coredump *gt,
+ 	return error_uc;
+ }
+ 
+-static void gt_capture_prepare(struct intel_gt_coredump *gt)
+-{
+-	struct i915_ggtt *ggtt = gt->_gt->ggtt;
+-
+-	mutex_lock(&ggtt->error_mutex);
+-}
+-
+-static void gt_capture_finish(struct intel_gt_coredump *gt)
+-{
+-	struct i915_ggtt *ggtt = gt->_gt->ggtt;
+-
+-	if (drm_mm_node_allocated(&ggtt->error_capture))
+-		ggtt->vm.clear_range(&ggtt->vm,
+-				     ggtt->error_capture.start,
+-				     PAGE_SIZE);
+-
+-	mutex_unlock(&ggtt->error_mutex);
+-}
+-
+ /* Capture all registers which don't fit into another category. */
+ static void gt_record_regs(struct intel_gt_coredump *gt)
+ {
+@@ -1782,8 +1768,6 @@ i915_vma_capture_prepare(struct intel_gt_coredump *gt)
+ 		return NULL;
+ 	}
+ 
+-	gt_capture_prepare(gt);
+-
+ 	return compress;
+ }
+ 
+@@ -1793,8 +1777,6 @@ void i915_vma_capture_finish(struct intel_gt_coredump *gt,
+ 	if (!compress)
+ 		return;
+ 
+-	gt_capture_finish(gt);
+-
+ 	compress_fini(compress);
+ 	kfree(compress);
+ }
+-- 
+2.25.1
+

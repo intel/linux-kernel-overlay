@@ -1,0 +1,159 @@
+From 155abfd3bb3dda0427e6597c9b3c0873db30ef3f Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 23 Oct 2020 09:51:17 -0700
+Subject: [PATCH 1115/1714] drm/msm: Refcount submits
+
+Before we remove dev->struct_mutex from the retire path, we have to deal
+with the situation of a submit retiring before the submit ioctl returns.
+
+To deal with this, ring->submits will hold a reference to the submit,
+which is dropped when the submit is retired.  And the submit ioctl path
+holds it's own ref, which it drops when it is done with the submit.
+
+Also, add to submit list *after* getting/pinning bo's, to prevent badness
+in case the completed fence is corrupted, and retire_worker mistakenly
+believes the submit is done too early.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Reviewed-by: Jordan Crouse <jcrouse@codeaurora.org>
+Reviewed-by: Kristian H. Kristensen <hoegsberg@google.com>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_drv.h        |  1 -
+ drivers/gpu/drm/msm/msm_gem.h        | 13 +++++++++++++
+ drivers/gpu/drm/msm/msm_gem_submit.c | 11 +++++------
+ drivers/gpu/drm/msm/msm_gpu.c        | 21 ++++++++++++++++-----
+ 4 files changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 35c2e8697e67..156c35c94ff9 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -278,7 +278,6 @@ void msm_unregister_mmu(struct drm_device *dev, struct msm_mmu *mmu);
+ 
+ bool msm_use_mmu(struct drm_device *dev);
+ 
+-void msm_gem_submit_free(struct msm_gem_submit *submit);
+ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index 8fd7080372f4..a685bb6c0753 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -212,6 +212,7 @@ void msm_gem_free_work(struct work_struct *work);
+  * lasts for the duration of the submit-ioctl.
+  */
+ struct msm_gem_submit {
++	struct kref ref;
+ 	struct drm_device *dev;
+ 	struct msm_gpu *gpu;
+ 	struct msm_gem_address_space *aspace;
+@@ -248,6 +249,18 @@ struct msm_gem_submit {
+ 	} bos[];
+ };
+ 
++void __msm_gem_submit_destroy(struct kref *kref);
++
++static inline void msm_gem_submit_get(struct msm_gem_submit *submit)
++{
++	kref_get(&submit->ref);
++}
++
++static inline void msm_gem_submit_put(struct msm_gem_submit *submit)
++{
++	kref_put(&submit->ref, __msm_gem_submit_destroy);
++}
++
+ /* helper to determine of a buffer in submit should be dumped, used for both
+  * devcoredump and debugfs cmdstream dumping:
+  */
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 24ce4c65429d..d04c349d8112 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -42,6 +42,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	if (!submit)
+ 		return NULL;
+ 
++	kref_init(&submit->ref);
+ 	submit->dev = dev;
+ 	submit->aspace = queue->ctx->aspace;
+ 	submit->gpu = gpu;
+@@ -60,14 +61,13 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	return submit;
+ }
+ 
+-void msm_gem_submit_free(struct msm_gem_submit *submit)
++void __msm_gem_submit_destroy(struct kref *kref)
+ {
++	struct msm_gem_submit *submit =
++			container_of(kref, struct msm_gem_submit, ref);
+ 	unsigned i;
+ 
+ 	dma_fence_put(submit->fence);
+-	spin_lock(&submit->ring->submit_lock);
+-	list_del(&submit->node);
+-	spin_unlock(&submit->ring->submit_lock);
+ 	put_pid(submit->pid);
+ 	msm_submitqueue_put(submit->queue);
+ 
+@@ -847,8 +847,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	submit_cleanup(submit);
+ 	if (has_ww_ticket)
+ 		ww_acquire_fini(&submit->ticket);
+-	if (ret)
+-		msm_gem_submit_free(submit);
++	msm_gem_submit_put(submit);
+ out_unlock:
+ 	if (ret && (out_fence_fd >= 0))
+ 		put_unused_fd(out_fence_fd);
+diff --git a/drivers/gpu/drm/msm/msm_gpu.c b/drivers/gpu/drm/msm/msm_gpu.c
+index 6e6b170b9e5d..a69f6cb38838 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -718,7 +718,12 @@ static void retire_submit(struct msm_gpu *gpu, struct msm_ringbuffer *ring,
+ 
+ 	pm_runtime_mark_last_busy(&gpu->pdev->dev);
+ 	pm_runtime_put_autosuspend(&gpu->pdev->dev);
+-	msm_gem_submit_free(submit);
++
++	spin_lock(&ring->submit_lock);
++	list_del(&submit->node);
++	spin_unlock(&ring->submit_lock);
++
++	msm_gem_submit_put(submit);
+ }
+ 
+ static void retire_submits(struct msm_gpu *gpu)
+@@ -791,10 +796,6 @@ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+ 
+ 	submit->seqno = ++ring->seqno;
+ 
+-	spin_lock(&ring->submit_lock);
+-	list_add_tail(&submit->node, &ring->submits);
+-	spin_unlock(&ring->submit_lock);
+-
+ 	msm_rd_dump_submit(priv->rd, submit, NULL);
+ 
+ 	update_sw_cntrs(gpu);
+@@ -821,6 +822,16 @@ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+ 		msm_gem_active_get(drm_obj, gpu);
+ 	}
+ 
++	/*
++	 * ring->submits holds a ref to the submit, to deal with the case
++	 * that a submit completes before msm_ioctl_gem_submit() returns.
++	 */
++	msm_gem_submit_get(submit);
++
++	spin_lock(&ring->submit_lock);
++	list_add_tail(&submit->node, &ring->submits);
++	spin_unlock(&ring->submit_lock);
++
+ 	gpu->funcs->submit(gpu, submit);
+ 	priv->lastctx = submit->queue->ctx;
+ 
+-- 
+2.25.1
+

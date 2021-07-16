@@ -1,0 +1,195 @@
+From c5d2e275e52a9ad3559368b66da626833034ac48 Mon Sep 17 00:00:00 2001
+From: Isaac Hazan <isaac.hazan@intel.com>
+Date: Thu, 24 Sep 2020 11:44:01 +0300
+Subject: [PATCH 05/38] thunderbolt: Add functions for enabling and disabling
+ lane bonding on XDomain
+
+These can be used by service drivers to enable and disable lane bonding
+as needed.
+
+Signed-off-by: Isaac Hazan <isaac.hazan@intel.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Acked-by: Yehezkel Bernat <YehezkelShB@gmail.com>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/thunderbolt/switch.c  | 24 +++++++++++--
+ drivers/thunderbolt/tb.h      |  3 ++
+ drivers/thunderbolt/xdomain.c | 66 +++++++++++++++++++++++++++++++++++
+ include/linux/thunderbolt.h   |  2 ++
+ 4 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/thunderbolt/switch.c b/drivers/thunderbolt/switch.c
+index 05a360901790..cdfd8cccfe19 100644
+--- a/drivers/thunderbolt/switch.c
++++ b/drivers/thunderbolt/switch.c
+@@ -503,12 +503,13 @@ static void tb_dump_port(struct tb *tb, struct tb_regs_port_header *port)
+ 
+ /**
+  * tb_port_state() - get connectedness state of a port
++ * @port: the port to check
+  *
+  * The port must have a TB_CAP_PHY (i.e. it should be a real port).
+  *
+  * Return: Returns an enum tb_port_state on success or an error code on failure.
+  */
+-static int tb_port_state(struct tb_port *port)
++int tb_port_state(struct tb_port *port)
+ {
+ 	struct tb_cap_phy phy;
+ 	int res;
+@@ -1008,7 +1009,16 @@ static int tb_port_set_link_width(struct tb_port *port, unsigned int width)
+ 			     port->cap_phy + LANE_ADP_CS_1, 1);
+ }
+ 
+-static int tb_port_lane_bonding_enable(struct tb_port *port)
++/**
++ * tb_port_lane_bonding_enable() - Enable bonding on port
++ * @port: port to enable
++ *
++ * Enable bonding by setting the link width of the port and the
++ * other port in case of dual link port.
++ *
++ * Return: %0 in case of success and negative errno in case of error
++ */
++int tb_port_lane_bonding_enable(struct tb_port *port)
+ {
+ 	int ret;
+ 
+@@ -1038,7 +1048,15 @@ static int tb_port_lane_bonding_enable(struct tb_port *port)
+ 	return 0;
+ }
+ 
+-static void tb_port_lane_bonding_disable(struct tb_port *port)
++/**
++ * tb_port_lane_bonding_disable() - Disable bonding on port
++ * @port: port to disable
++ *
++ * Disable bonding by setting the link width of the port and the
++ * other port in case of dual link port.
++ *
++ */
++void tb_port_lane_bonding_disable(struct tb_port *port)
+ {
+ 	port->dual_link_port->bonded = false;
+ 	port->bonded = false;
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 09658d07460e..aa7e2dc66059 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -865,6 +865,9 @@ struct tb_port *tb_next_port_on_path(struct tb_port *start, struct tb_port *end,
+ 
+ int tb_port_get_link_speed(struct tb_port *port);
+ int tb_port_get_link_width(struct tb_port *port);
++int tb_port_state(struct tb_port *port);
++int tb_port_lane_bonding_enable(struct tb_port *port);
++void tb_port_lane_bonding_disable(struct tb_port *port);
+ 
+ int tb_switch_find_vse_cap(struct tb_switch *sw, enum tb_switch_vse_cap vsec);
+ int tb_switch_find_cap(struct tb_switch *sw, enum tb_switch_cap cap);
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 50e3d0fedeaa..af0d7810b62e 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/device.h>
++#include <linux/delay.h>
+ #include <linux/kmod.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+@@ -21,6 +22,7 @@
+ #define XDOMAIN_UUID_RETRIES			10
+ #define XDOMAIN_PROPERTIES_RETRIES		60
+ #define XDOMAIN_PROPERTIES_CHANGED_RETRIES	10
++#define XDOMAIN_BONDING_WAIT			100  /* ms */
+ 
+ struct xdomain_request_work {
+ 	struct work_struct work;
+@@ -1444,6 +1446,70 @@ void tb_xdomain_remove(struct tb_xdomain *xd)
+ 		device_unregister(&xd->dev);
+ }
+ 
++/**
++ * tb_xdomain_lane_bonding_enable() - Enable lane bonding on XDomain
++ * @xd: XDomain connection
++ *
++ * Lane bonding is disabled by default for XDomains. This function tries
++ * to enable bonding by first enabling the port and waiting for the CL0
++ * state.
++ *
++ * Return: %0 in case of success and negative errno in case of error.
++ */
++int tb_xdomain_lane_bonding_enable(struct tb_xdomain *xd)
++{
++	struct tb_port *port;
++	int ret;
++
++	port = tb_port_at(xd->route, tb_xdomain_parent(xd));
++	if (!port->dual_link_port)
++		return -ENODEV;
++
++	ret = tb_port_enable(port->dual_link_port);
++	if (ret)
++		return ret;
++
++	ret = tb_wait_for_port(port->dual_link_port, true);
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		return -ENOTCONN;
++
++	ret = tb_port_lane_bonding_enable(port);
++	if (ret) {
++		tb_port_warn(port, "failed to enable lane bonding\n");
++		return ret;
++	}
++
++	tb_xdomain_update_link_attributes(xd);
++
++	dev_dbg(&xd->dev, "lane bonding enabled\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(tb_xdomain_lane_bonding_enable);
++
++/**
++ * tb_xdomain_lane_bonding_disable() - Disable lane bonding
++ * @xd: XDomain connection
++ *
++ * Lane bonding is disabled by default for XDomains. If bonding has been
++ * enabled, this function can be used to disable it.
++ */
++void tb_xdomain_lane_bonding_disable(struct tb_xdomain *xd)
++{
++	struct tb_port *port;
++
++	port = tb_port_at(xd->route, tb_xdomain_parent(xd));
++	if (port->dual_link_port) {
++		tb_port_lane_bonding_disable(port);
++		tb_port_disable(port->dual_link_port);
++		tb_xdomain_update_link_attributes(xd);
++
++		dev_dbg(&xd->dev, "lane bonding disabled\n");
++	}
++}
++EXPORT_SYMBOL_GPL(tb_xdomain_lane_bonding_disable);
++
+ /**
+  * tb_xdomain_enable_paths() - Enable DMA paths for XDomain connection
+  * @xd: XDomain connection
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index e441af88ed77..0a747f92847e 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -247,6 +247,8 @@ struct tb_xdomain {
+ 	u8 depth;
+ };
+ 
++int tb_xdomain_lane_bonding_enable(struct tb_xdomain *xd);
++void tb_xdomain_lane_bonding_disable(struct tb_xdomain *xd);
+ int tb_xdomain_enable_paths(struct tb_xdomain *xd, u16 transmit_path,
+ 			    u16 transmit_ring, u16 receive_path,
+ 			    u16 receive_ring);
+-- 
+2.25.1
+

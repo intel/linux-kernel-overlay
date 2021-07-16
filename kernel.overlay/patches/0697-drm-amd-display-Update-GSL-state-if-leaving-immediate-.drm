@@ -1,0 +1,284 @@
+From 48ea9033f5168cb389a043a4700cfbefdb31699f Mon Sep 17 00:00:00 2001
+From: Alvin Lee <alvin.lee2@amd.com>
+Date: Thu, 8 Oct 2020 13:32:35 -0400
+Subject: [PATCH 0697/1714] drm/amd/display: Update GSL state if leaving
+ immediate flip
+
+[Why]
+We should leave GSL if we're not doing immediate flip no matter if
+we're doing pipe split or not
+
+[How]
+Check for updating GSL state whenever we're not doing
+immediate flip
+
+v2: Squash in build fix (Alex)
+
+Signed-off-by: Aric Cyr <aric.cyr@amd.com>
+Signed-off-by: Alvin Lee <alvin.lee2@amd.com>
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      |  11 --
+ .../amd/display/dc/dcn10/dcn10_hw_sequencer.c | 116 ------------------
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_init.c |   1 -
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    |   2 +-
+ .../gpu/drm/amd/display/dc/dcn20/dcn20_init.c |   1 -
+ .../gpu/drm/amd/display/dc/dcn21/dcn21_init.c |   1 -
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_init.c |   1 -
+ .../drm/amd/display/dc/dcn301/dcn301_init.c   |   1 -
+ .../gpu/drm/amd/display/dc/inc/hw_sequencer.h |   2 -
+ 9 files changed, 1 insertion(+), 135 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 39f77a732067..3cc6c22c9ec8 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -2380,7 +2380,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		enum surface_update_type update_type,
+ 		struct dc_state *context)
+ {
+-	bool mpcc_disconnected = false;
+ 	int i, j;
+ 	struct pipe_ctx *top_pipe_to_program = NULL;
+ 
+@@ -2411,15 +2410,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		context_clock_trace(dc, context);
+ 	}
+ 
+-	if (update_type != UPDATE_TYPE_FAST && dc->hwss.interdependent_update_lock &&
+-		dc->hwss.disconnect_pipes && dc->hwss.wait_for_pending_cleared){
+-		dc->hwss.interdependent_update_lock(dc, context, true);
+-		mpcc_disconnected = dc->hwss.disconnect_pipes(dc, context);
+-		dc->hwss.interdependent_update_lock(dc, context, false);
+-		if (mpcc_disconnected)
+-			dc->hwss.wait_for_pending_cleared(dc, context);
+-	}
+-
+ 	for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+@@ -2458,7 +2448,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		 */
+ 		dc->hwss.pipe_control_lock(dc, top_pipe_to_program, true);
+ 
+-
+ 	// Stream updates
+ 	if (stream_update)
+ 		commit_planes_do_stream_update(dc, stream, stream_update, update_type, context);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index b7046d8eb114..08227f0d13f2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -2775,122 +2775,6 @@ static struct pipe_ctx *dcn10_find_top_pipe_for_stream(
+ 	return NULL;
+ }
+ 
+-bool dcn10_disconnect_pipes(
+-		struct dc *dc,
+-		struct dc_state *context)
+-{
+-		bool found_pipe = false;
+-		int i, j;
+-		struct dce_hwseq *hws = dc->hwseq;
+-		struct dc_state *old_ctx = dc->current_state;
+-		bool mpcc_disconnected = false;
+-		struct pipe_ctx *old_pipe;
+-		struct pipe_ctx *new_pipe;
+-		DC_LOGGER_INIT(dc->ctx->logger);
+-
+-		/* Set pipe update flags and lock pipes */
+-		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+-			new_pipe = &context->res_ctx.pipe_ctx[i];
+-			new_pipe->update_flags.raw = 0;
+-
+-			if (!old_pipe->plane_state && !new_pipe->plane_state)
+-				continue;
+-
+-			if (old_pipe->plane_state && !new_pipe->plane_state)
+-				new_pipe->update_flags.bits.disable = 1;
+-
+-			/* Check for scl update */
+-			if (memcmp(&old_pipe->plane_res.scl_data, &new_pipe->plane_res.scl_data, sizeof(struct scaler_data)))
+-					new_pipe->update_flags.bits.scaler = 1;
+-
+-			/* Check for vp update */
+-			if (memcmp(&old_pipe->plane_res.scl_data.viewport, &new_pipe->plane_res.scl_data.viewport, sizeof(struct rect))
+-					|| memcmp(&old_pipe->plane_res.scl_data.viewport_c,
+-						&new_pipe->plane_res.scl_data.viewport_c, sizeof(struct rect)))
+-				new_pipe->update_flags.bits.viewport = 1;
+-
+-		}
+-
+-		if (!IS_DIAG_DC(dc->ctx->dce_environment)) {
+-			/* Disconnect mpcc here only if losing pipe split*/
+-			for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-				if (context->res_ctx.pipe_ctx[i].update_flags.bits.disable &&
+-					old_ctx->res_ctx.pipe_ctx[i].top_pipe) {
+-
+-					/* Find the top pipe in the new ctx for the bottom pipe that we
+-					 * want to remove by comparing the streams and planes. If both
+-					 * pipes are being disabled then do it in the regular pipe
+-					 * programming sequence
+-					 */
+-					for (j = 0; j < dc->res_pool->pipe_count; j++) {
+-						if (old_ctx->res_ctx.pipe_ctx[i].top_pipe->stream == context->res_ctx.pipe_ctx[j].stream &&
+-							old_ctx->res_ctx.pipe_ctx[i].top_pipe->plane_state == context->res_ctx.pipe_ctx[j].plane_state &&
+-							!context->res_ctx.pipe_ctx[j].top_pipe &&
+-							!context->res_ctx.pipe_ctx[j].update_flags.bits.disable) {
+-							found_pipe = true;
+-							break;
+-						}
+-					}
+-
+-					// Disconnect if the top pipe lost it's pipe split
+-					if (found_pipe && !context->res_ctx.pipe_ctx[j].bottom_pipe) {
+-						hws->funcs.plane_atomic_disconnect(dc, &dc->current_state->res_ctx.pipe_ctx[i]);
+-						DC_LOG_DC("Reset mpcc for pipe %d\n", dc->current_state->res_ctx.pipe_ctx[i].pipe_idx);
+-						mpcc_disconnected = true;
+-					}
+-				}
+-				found_pipe = false;
+-			}
+-		}
+-
+-		if (mpcc_disconnected) {
+-			for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-				struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+-				struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+-				struct dc_plane_state *plane_state = pipe_ctx->plane_state;
+-				struct hubp *hubp = pipe_ctx->plane_res.hubp;
+-
+-				if (!pipe_ctx || !plane_state || !pipe_ctx->stream)
+-					continue;
+-
+-				// Only update scaler and viewport here if we lose a pipe split.
+-				// This is to prevent half the screen from being black when we
+-				// unlock after disconnecting MPCC.
+-				if (!(old_pipe && !pipe_ctx->top_pipe &&
+-					!pipe_ctx->bottom_pipe && old_pipe->bottom_pipe))
+-					continue;
+-
+-				if (pipe_ctx->update_flags.raw || pipe_ctx->plane_state->update_flags.raw || pipe_ctx->stream->update_flags.raw) {
+-					if (pipe_ctx->update_flags.bits.scaler ||
+-						plane_state->update_flags.bits.scaling_change ||
+-						plane_state->update_flags.bits.position_change ||
+-						plane_state->update_flags.bits.per_pixel_alpha_change ||
+-						pipe_ctx->stream->update_flags.bits.scaling) {
+-
+-						pipe_ctx->plane_res.scl_data.lb_params.alpha_en = pipe_ctx->plane_state->per_pixel_alpha;
+-						ASSERT(pipe_ctx->plane_res.scl_data.lb_params.depth == LB_PIXEL_DEPTH_30BPP);
+-						/* scaler configuration */
+-						pipe_ctx->plane_res.dpp->funcs->dpp_set_scaler(
+-						pipe_ctx->plane_res.dpp, &pipe_ctx->plane_res.scl_data);
+-					}
+-
+-					if (pipe_ctx->update_flags.bits.viewport ||
+-						(context == dc->current_state && plane_state->update_flags.bits.position_change) ||
+-						(context == dc->current_state && plane_state->update_flags.bits.scaling_change) ||
+-						(context == dc->current_state && pipe_ctx->stream->update_flags.bits.scaling)) {
+-
+-						hubp->funcs->mem_program_viewport(
+-							hubp,
+-							&pipe_ctx->plane_res.scl_data.viewport,
+-							&pipe_ctx->plane_res.scl_data.viewport_c);
+-					}
+-				}
+-			}
+-		}
+-	return mpcc_disconnected;
+-}
+-
+ void dcn10_wait_for_pending_cleared(struct dc *dc,
+ 		struct dc_state *context)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
+index b24c8ae8b1ec..254300b06b43 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
+@@ -34,7 +34,6 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
+ 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
+ 	.apply_ctx_for_surface = dcn10_apply_ctx_for_surface,
+ 	.post_unlock_program_front_end = dcn10_post_unlock_program_front_end,
+-	.disconnect_pipes = dcn10_disconnect_pipes,
+ 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
+ 	.update_plane_addr = dcn10_update_plane_addr,
+ 	.update_dchub = dcn10_update_dchub,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index 04b939f3cdcc..71499c131947 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -1191,7 +1191,7 @@ void dcn20_pipe_control_lock(
+ 	/* In flip immediate and pipe splitting case, we need to use GSL
+ 	 * for synchronization. Only do setup on locking and on flip type change.
+ 	 */
+-	if (lock && pipe->bottom_pipe != NULL)
++	if (lock && (pipe->bottom_pipe != NULL || !flip_immediate))
+ 		if ((flip_immediate && pipe->stream_res.gsl_group == 0) ||
+ 		    (!flip_immediate && pipe->stream_res.gsl_group > 0))
+ 			dcn20_setup_gsl_group_as_lock(dc, pipe, flip_immediate);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+index 072193c5ffe6..f4bc2a44f806 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+@@ -34,7 +34,6 @@ static const struct hw_sequencer_funcs dcn20_funcs = {
+ 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
+ 	.apply_ctx_for_surface = NULL,
+ 	.program_front_end_for_ctx = dcn20_program_front_end_for_ctx,
+-	.disconnect_pipes = dcn10_disconnect_pipes,
+ 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
+ 	.post_unlock_program_front_end = dcn20_post_unlock_program_front_end,
+ 	.update_plane_addr = dcn20_update_plane_addr,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+index 4ab29911508d..3e3eca1778cb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+@@ -35,7 +35,6 @@ static const struct hw_sequencer_funcs dcn21_funcs = {
+ 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
+ 	.apply_ctx_for_surface = NULL,
+ 	.program_front_end_for_ctx = dcn20_program_front_end_for_ctx,
+-	.disconnect_pipes = dcn10_disconnect_pipes,
+ 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
+ 	.post_unlock_program_front_end = dcn20_post_unlock_program_front_end,
+ 	.update_plane_addr = dcn20_update_plane_addr,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+index ba247571fed1..b829cb116916 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+@@ -35,7 +35,6 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
+ 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
+ 	.apply_ctx_for_surface = NULL,
+ 	.program_front_end_for_ctx = dcn20_program_front_end_for_ctx,
+-	.disconnect_pipes = dcn10_disconnect_pipes,
+ 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
+ 	.post_unlock_program_front_end = dcn20_post_unlock_program_front_end,
+ 	.update_plane_addr = dcn20_update_plane_addr,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c b/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
+index d4bebb3a52e4..6d9587c39efd 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
+@@ -37,7 +37,6 @@ static const struct hw_sequencer_funcs dcn301_funcs = {
+ 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
+ 	.apply_ctx_for_surface = NULL,
+ 	.program_front_end_for_ctx = dcn20_program_front_end_for_ctx,
+-	.disconnect_pipes = dcn10_disconnect_pipes,
+ 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
+ 	.post_unlock_program_front_end = dcn20_post_unlock_program_front_end,
+ 	.update_plane_addr = dcn20_update_plane_addr,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index fa3005c2e37e..f728928cda5a 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -70,8 +70,6 @@ struct hw_sequencer_funcs {
+ 			int num_planes, struct dc_state *context);
+ 	void (*program_front_end_for_ctx)(struct dc *dc,
+ 			struct dc_state *context);
+-	bool (*disconnect_pipes)(struct dc *dc,
+-			struct dc_state *context);
+ 	void (*wait_for_pending_cleared)(struct dc *dc,
+ 			struct dc_state *context);
+ 	void (*post_unlock_program_front_end)(struct dc *dc,
+-- 
+2.25.1
+

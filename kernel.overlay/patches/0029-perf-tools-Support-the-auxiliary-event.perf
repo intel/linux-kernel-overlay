@@ -1,0 +1,212 @@
+From 60c5c44ddac21fed827c0754a84376096d867fe3 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 2 Feb 2021 12:09:06 -0800
+Subject: [PATCH 29/62] perf tools: Support the auxiliary event
+
+On the Intel Sapphire Rapids server, an auxiliary event has to be
+enabled simultaneously with the load latency event to retrieve complete
+Memory Info.
+
+Add X86 specific perf_mem_events__name() to handle the auxiliary event.
+
+- Users are only interested in the samples of the mem-loads event.
+  Sample read the auxiliary event.
+
+- The auxiliary event must be in front of the load latency event in a
+  group. Assume the second event to sample if the auxiliary event is the
+  leader.
+
+- Add a weak is_mem_loads_aux_event() to check the auxiliary event for
+  X86. For other ARCHs, it always return false.
+
+Parse the unique event name, mem-loads-aux, for the auxiliary event.
+
+Committer notes:
+
+According to 61b985e3e775a3a7 ("perf/x86/intel: Add perf core PMU
+support for Sapphire Rapids"), ENODATA is only returned by
+sys_perf_event_open() when used with these auxiliary events, with this
+in evsel__open_strerror():
+
+       case ENODATA:
+               return scnprintf(msg, size, "Cannot collect data source with the load latency event alone. "
+                                "Please add an auxiliary event in front of the load latency event.");
+
+This is Ok at this point in time, but fragile long term, I pointed this
+out in the e-mail thread, requesting a follow up patch to check if
+ENODATA is really for this specific case.
+
+Fixed up sizeof(MEM_LOADS_AUX_NAME) bug pointed out by Namhyung.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lore.kernel.org/lkml/20210205152648.GC920417@kernel.org
+Link: http://lore.kernel.org/lkml/1612296553-21962-3-git-send-email-kan.liang@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/arch/x86/util/Build        |  1 +
+ tools/perf/arch/x86/util/mem-events.c | 44 +++++++++++++++++++++++++++
+ tools/perf/util/evsel.c               |  3 ++
+ tools/perf/util/mem-events.c          |  5 +++
+ tools/perf/util/mem-events.h          |  2 ++
+ tools/perf/util/parse-events.l        |  1 +
+ tools/perf/util/record.c              |  5 ++-
+ 7 files changed, 60 insertions(+), 1 deletion(-)
+ create mode 100644 tools/perf/arch/x86/util/mem-events.c
+
+diff --git a/tools/perf/arch/x86/util/Build b/tools/perf/arch/x86/util/Build
+index ce1ec92fecdc..98014613b622 100644
+--- a/tools/perf/arch/x86/util/Build
++++ b/tools/perf/arch/x86/util/Build
+@@ -7,6 +7,7 @@ perf-y += topdown.o
+ perf-y += machine.o
+ perf-y += event.o
+ perf-y += evlist.o
++perf-y += mem-events.o
+ 
+ perf-$(CONFIG_DWARF) += dwarf-regs.o
+ perf-$(CONFIG_BPF_PROLOGUE) += dwarf-regs.o
+diff --git a/tools/perf/arch/x86/util/mem-events.c b/tools/perf/arch/x86/util/mem-events.c
+new file mode 100644
+index 000000000000..588110fd8904
+--- /dev/null
++++ b/tools/perf/arch/x86/util/mem-events.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "util/pmu.h"
++#include "map_symbol.h"
++#include "mem-events.h"
++
++static char mem_loads_name[100];
++static bool mem_loads_name__init;
++
++#define MEM_LOADS_AUX		0x8203
++#define MEM_LOADS_AUX_NAME	"{cpu/mem-loads-aux/,cpu/mem-loads,ldlat=%u/pp}:S"
++
++bool is_mem_loads_aux_event(struct evsel *leader)
++{
++	if (!pmu_have_event("cpu", "mem-loads-aux"))
++		return false;
++
++	return leader->core.attr.config == MEM_LOADS_AUX;
++}
++
++char *perf_mem_events__name(int i)
++{
++	struct perf_mem_event *e = perf_mem_events__ptr(i);
++
++	if (!e)
++		return NULL;
++
++	if (i == PERF_MEM_EVENTS__LOAD) {
++		if (mem_loads_name__init)
++			return mem_loads_name;
++
++		mem_loads_name__init = true;
++
++		if (pmu_have_event("cpu", "mem-loads-aux")) {
++			scnprintf(mem_loads_name, sizeof(mem_loads_name),
++				  MEM_LOADS_AUX_NAME, perf_mem_events__loads_ldlat);
++		} else {
++			scnprintf(mem_loads_name, sizeof(mem_loads_name),
++				  e->name, perf_mem_events__loads_ldlat);
++		}
++		return mem_loads_name;
++	}
++
++	return (char *)e->name;
++}
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 992b9723e0ae..9147e8cabf79 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -2705,6 +2705,9 @@ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 		if (perf_missing_features.aux_output)
+ 			return scnprintf(msg, size, "The 'aux_output' feature is not supported, update the kernel.");
+ 		break;
++	case ENODATA:
++		return scnprintf(msg, size, "Cannot collect data source with the load latency event alone. "
++				 "Please add an auxiliary event in front of the load latency event.");
+ 	default:
+ 		break;
+ 	}
+diff --git a/tools/perf/util/mem-events.c b/tools/perf/util/mem-events.c
+index c805bbea6a80..90a158b2982c 100644
+--- a/tools/perf/util/mem-events.c
++++ b/tools/perf/util/mem-events.c
+@@ -55,6 +55,11 @@ char * __weak perf_mem_events__name(int i)
+ 	return (char *)e->name;
+ }
+ 
++__weak bool is_mem_loads_aux_event(struct evsel *leader __maybe_unused)
++{
++	return false;
++}
++
+ int perf_mem_events__parse(const char *str)
+ {
+ 	char *tok, *saveptr = NULL;
+diff --git a/tools/perf/util/mem-events.h b/tools/perf/util/mem-events.h
+index 59f60ca4d3d4..e66ac161b469 100644
+--- a/tools/perf/util/mem-events.h
++++ b/tools/perf/util/mem-events.h
+@@ -9,6 +9,7 @@
+ #include <linux/refcount.h>
+ #include <linux/perf_event.h>
+ #include "stat.h"
++#include "evsel.h"
+ 
+ struct perf_mem_event {
+ 	bool		record;
+@@ -38,6 +39,7 @@ int perf_mem_events__init(void);
+ 
+ char *perf_mem_events__name(int i);
+ struct perf_mem_event *perf_mem_events__ptr(int i);
++bool is_mem_loads_aux_event(struct evsel *leader);
+ 
+ void perf_mem_events__list(void);
+ 
+diff --git a/tools/perf/util/parse-events.l b/tools/perf/util/parse-events.l
+index 9db5097317f4..0b36285a9435 100644
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@ -356,6 +356,7 @@ bpf-output					{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_BPF_OUT
+ cycles-ct				|
+ cycles-t				|
+ mem-loads				|
++mem-loads-aux				|
+ mem-stores				|
+ topdown-[a-z-]+				|
+ tx-capacity-[a-z-]+			|
+diff --git a/tools/perf/util/record.c b/tools/perf/util/record.c
+index e70c9dd04567..d0735fbf7939 100644
+--- a/tools/perf/util/record.c
++++ b/tools/perf/util/record.c
+@@ -15,6 +15,8 @@
+ #include "record.h"
+ #include "../perf-sys.h"
+ #include "topdown.h"
++#include "map_symbol.h"
++#include "mem-events.h"
+ 
+ /*
+  * evsel__config_leader_sampling() uses special rules for leader sampling.
+@@ -25,7 +27,8 @@ static struct evsel *evsel__read_sampler(struct evsel *evsel, struct evlist *evl
+ {
+ 	struct evsel *leader = evsel->leader;
+ 
+-	if (evsel__is_aux_event(leader) || arch_topdown_sample_read(leader)) {
++	if (evsel__is_aux_event(leader) || arch_topdown_sample_read(leader) ||
++	    is_mem_loads_aux_event(leader)) {
+ 		evlist__for_each_entry(evlist, evsel) {
+ 			if (evsel->leader == leader && evsel != evsel->leader)
+ 				return evsel;
+-- 
+2.25.1
+

@@ -1,4 +1,4 @@
-From 6af4b6f15186e8af63c657a6157c1cf614c3ca6f Mon Sep 17 00:00:00 2001
+From baa41ccc44c926cc0fb9182a46073e14db315711 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 11 Jun 2020 02:09:09 +0800
 Subject: [PATCH 4/9] tcc: L3 psram region should not overlay L2 psram region.
@@ -527,5 +527,5 @@ index 000000000000..90ae36c62fe2
 +#define TCC_REQ_BUFFER _IOWR(IOCTL_TCC_MAGIC, IOCTL_TCC_REQ_BUFFER, struct tcc_buf_mem_req_s *)
 +
 -- 
-2.27.0
+2.25.1
 

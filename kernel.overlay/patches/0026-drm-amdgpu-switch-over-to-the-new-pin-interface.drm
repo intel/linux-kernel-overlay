@@ -1,0 +1,287 @@
+From 5faf1765c725ce76750167013491c7489f9aefec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 21 Sep 2020 15:55:39 +0200
+Subject: [PATCH 0026/1714] drm/amdgpu: switch over to the new pin interface
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stop using TTM_PL_FLAG_NO_EVICT.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Tested-by: Nirmoy Das <nirmoy.das@amd.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Huang Rui <ray.huang@amd.com>
+Link: https://patchwork.freedesktop.org/patch/391617/?series=81973&rev=1
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  |  5 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c   |  8 +---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c   |  5 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c       |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c    | 41 +++++--------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h    |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c        |  2 +-
+ 9 files changed, 24 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 5da487b64a66..054a1c2d5054 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1479,7 +1479,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 		}
+ 	}
+ 
+-	if (!amdgpu_ttm_tt_get_usermm(bo->tbo.ttm) && !bo->pin_count)
++	if (!amdgpu_ttm_tt_get_usermm(bo->tbo.ttm) && !bo->tbo.pin_count)
+ 		amdgpu_bo_fence(bo,
+ 				&avm->process_info->eviction_fence->base,
+ 				true);
+@@ -1558,7 +1558,8 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
+ 	 * required.
+ 	 */
+ 	if (mem->mapped_to_gpu_memory == 0 &&
+-	    !amdgpu_ttm_tt_get_usermm(mem->bo->tbo.ttm) && !mem->bo->pin_count)
++	    !amdgpu_ttm_tt_get_usermm(mem->bo->tbo.ttm) &&
++	    !mem->bo->tbo.pin_count)
+ 		amdgpu_amdkfd_remove_eviction_fence(mem->bo,
+ 						process_info->eviction_fence);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 12598a4b5c78..d50b63a93d37 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -410,7 +410,7 @@ static int amdgpu_cs_bo_validate(struct amdgpu_cs_parser *p,
+ 	uint32_t domain;
+ 	int r;
+ 
+-	if (bo->pin_count)
++	if (bo->tbo.pin_count)
+ 		return 0;
+ 
+ 	/* Don't move this buffer if we have depleted our allowance
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index 7cc7af2a6822..b25faaee6f0e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -132,10 +132,7 @@ static void amdgpu_display_unpin_work_func(struct work_struct *__work)
+ 	/* unpin of the old buffer */
+ 	r = amdgpu_bo_reserve(work->old_abo, true);
+ 	if (likely(r == 0)) {
+-		r = amdgpu_bo_unpin(work->old_abo);
+-		if (unlikely(r != 0)) {
+-			DRM_ERROR("failed to unpin buffer after flip\n");
+-		}
++		amdgpu_bo_unpin(work->old_abo);
+ 		amdgpu_bo_unreserve(work->old_abo);
+ 	} else
+ 		DRM_ERROR("failed to reserve buffer after flip\n");
+@@ -249,8 +246,7 @@ int amdgpu_display_crtc_page_flip_target(struct drm_crtc *crtc,
+ 	}
+ unpin:
+ 	if (!adev->enable_virtual_display)
+-		if (unlikely(amdgpu_bo_unpin(new_abo) != 0))
+-			DRM_ERROR("failed to unpin new abo in error path\n");
++		amdgpu_bo_unpin(new_abo);
+ 
+ unreserve:
+ 	amdgpu_bo_unreserve(new_abo);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index 1b56dbc1f304..cdef422de29c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -281,7 +281,7 @@ static struct sg_table *amdgpu_dma_buf_map(struct dma_buf_attachment *attach,
+ 	struct sg_table *sgt;
+ 	long r;
+ 
+-	if (!bo->pin_count) {
++	if (!bo->tbo.pin_count) {
+ 		/* move buffer into GTT or VRAM */
+ 		struct ttm_operation_ctx ctx = { false, false };
+ 		unsigned domains = AMDGPU_GEM_DOMAIN_GTT;
+@@ -390,7 +390,8 @@ static int amdgpu_dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+-	if (!bo->pin_count && (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT)) {
++	if (!bo->tbo.pin_count &&
++	    (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT)) {
+ 		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
+ 		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index e8c76bd8c501..3fcfc4372672 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -875,7 +875,7 @@ static int amdgpu_debugfs_gem_bo_info(int id, void *ptr, void *data)
+ 	seq_printf(m, "\t0x%08x: %12ld byte %s",
+ 		   id, amdgpu_bo_size(bo), placement);
+ 
+-	pin_count = READ_ONCE(bo->pin_count);
++	pin_count = READ_ONCE(bo->tbo.pin_count);
+ 	if (pin_count)
+ 		seq_printf(m, " pin count %d", pin_count);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index ac043baac05d..63e9c5793c30 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -78,7 +78,7 @@ static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
+ 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
+ 
+-	if (bo->pin_count > 0)
++	if (bo->tbo.pin_count > 0)
+ 		amdgpu_bo_subtract_pin_size(bo);
+ 
+ 	amdgpu_bo_kunmap(bo);
+@@ -721,7 +721,7 @@ int amdgpu_bo_validate(struct amdgpu_bo *bo)
+ 	uint32_t domain;
+ 	int r;
+ 
+-	if (bo->pin_count)
++	if (bo->tbo.pin_count)
+ 		return 0;
+ 
+ 	domain = bo->preferred_domains;
+@@ -918,13 +918,13 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 	 */
+ 	domain = amdgpu_bo_get_preferred_pin_domain(adev, domain);
+ 
+-	if (bo->pin_count) {
++	if (bo->tbo.pin_count) {
+ 		uint32_t mem_type = bo->tbo.mem.mem_type;
+ 
+ 		if (!(domain & amdgpu_mem_type_to_domain(mem_type)))
+ 			return -EINVAL;
+ 
+-		bo->pin_count++;
++		ttm_bo_pin(&bo->tbo);
+ 
+ 		if (max_offset != 0) {
+ 			u64 domain_start = amdgpu_ttm_domain_start(adev,
+@@ -955,7 +955,6 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 		if (!bo->placements[i].lpfn ||
+ 		    (lpfn && lpfn < bo->placements[i].lpfn))
+ 			bo->placements[i].lpfn = lpfn;
+-		bo->placements[i].flags |= TTM_PL_FLAG_NO_EVICT;
+ 	}
+ 
+ 	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+@@ -964,7 +963,7 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 		goto error;
+ 	}
+ 
+-	bo->pin_count = 1;
++	ttm_bo_pin(&bo->tbo);
+ 
+ 	domain = amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
+ 	if (domain == AMDGPU_GEM_DOMAIN_VRAM) {
+@@ -1006,34 +1005,16 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
+  * Returns:
+  * 0 for success or a negative error code on failure.
+  */
+-int amdgpu_bo_unpin(struct amdgpu_bo *bo)
++void amdgpu_bo_unpin(struct amdgpu_bo *bo)
+ {
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	struct ttm_operation_ctx ctx = { false, false };
+-	int r, i;
+-
+-	if (WARN_ON_ONCE(!bo->pin_count)) {
+-		dev_warn(adev->dev, "%p unpin not necessary\n", bo);
+-		return 0;
+-	}
+-	bo->pin_count--;
+-	if (bo->pin_count)
+-		return 0;
++	ttm_bo_unpin(&bo->tbo);
++	if (bo->tbo.pin_count)
++		return;
+ 
+ 	amdgpu_bo_subtract_pin_size(bo);
+ 
+ 	if (bo->tbo.base.import_attach)
+ 		dma_buf_unpin(bo->tbo.base.import_attach);
+-
+-	for (i = 0; i < bo->placement.num_placement; i++) {
+-		bo->placements[i].lpfn = 0;
+-		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+-	}
+-	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+-	if (unlikely(r))
+-		dev_err(adev->dev, "%p validate failed for unpin\n", bo);
+-
+-	return r;
+ }
+ 
+ /**
+@@ -1385,7 +1366,7 @@ int amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 		return 0;
+ 
+ 	/* Can't move a pinned BO to visible VRAM */
+-	if (abo->pin_count > 0)
++	if (abo->tbo.pin_count > 0)
+ 		return -EINVAL;
+ 
+ 	/* hurrah the memory is not visible ! */
+@@ -1489,7 +1470,7 @@ u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo)
+ {
+ 	WARN_ON_ONCE(bo->tbo.mem.mem_type == TTM_PL_SYSTEM);
+ 	WARN_ON_ONCE(!dma_resv_is_locked(bo->tbo.base.resv) &&
+-		     !bo->pin_count && bo->tbo.type != ttm_bo_type_kernel);
++		     !bo->tbo.pin_count && bo->tbo.type != ttm_bo_type_kernel);
+ 	WARN_ON_ONCE(bo->tbo.mem.start == AMDGPU_BO_INVALID_OFFSET);
+ 	WARN_ON_ONCE(bo->tbo.mem.mem_type == TTM_PL_VRAM &&
+ 		     !(bo->flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS));
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 5ddb6cf96030..e91750e43448 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -89,7 +89,6 @@ struct amdgpu_bo {
+ 	struct ttm_buffer_object	tbo;
+ 	struct ttm_bo_kmap_obj		kmap;
+ 	u64				flags;
+-	unsigned			pin_count;
+ 	u64				tiling_flags;
+ 	u64				metadata_flags;
+ 	void				*metadata;
+@@ -267,7 +266,7 @@ void amdgpu_bo_unref(struct amdgpu_bo **bo);
+ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain);
+ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 			     u64 min_offset, u64 max_offset);
+-int amdgpu_bo_unpin(struct amdgpu_bo *bo);
++void amdgpu_bo_unpin(struct amdgpu_bo *bo);
+ int amdgpu_bo_evict_vram(struct amdgpu_device *adev);
+ int amdgpu_bo_init(struct amdgpu_device *adev);
+ int amdgpu_bo_late_init(struct amdgpu_device *adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index a0248d78190f..d4962ad2651a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -662,7 +662,7 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	/* Can't move a pinned BO */
+ 	abo = ttm_to_amdgpu_bo(bo);
+-	if (WARN_ON_ONCE(abo->pin_count > 0))
++	if (WARN_ON_ONCE(abo->tbo.pin_count > 0))
+ 		return -EINVAL;
+ 
+ 	adev = amdgpu_ttm_adev(bo->bdev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index df110afa97bf..875c84e97bab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -609,7 +609,7 @@ void amdgpu_vm_del_from_lru_notify(struct ttm_buffer_object *bo)
+ 	if (!amdgpu_bo_is_amdgpu_bo(bo))
+ 		return;
+ 
+-	if (bo->mem.placement & TTM_PL_FLAG_NO_EVICT)
++	if (bo->pin_count)
+ 		return;
+ 
+ 	abo = ttm_to_amdgpu_bo(bo);
+-- 
+2.25.1
+

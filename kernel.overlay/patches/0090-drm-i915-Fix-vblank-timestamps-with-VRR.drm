@@ -1,0 +1,156 @@
+From 0122dc622cae1a3224124060503384b666ea0261 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 22 Jan 2021 15:26:46 -0800
+Subject: [PATCH 090/128] drm/i915: Fix vblank timestamps with VRR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To get sensible vblank timestamping behaviour we need to feed
+the vmax based timings to the vblank code, otherwise it'll chop
+off the scanline counter when it exceeds the minumum vtotal.
+
+Additionally with VRR we have three cases to consider when we
+generate the vblank timestamp:
+1) we are in vertical active
+  -> nothing special needs to be done, just return the current
+     scanout position and the core will calculate the timestamp
+     corresponding to the past time when the current vertical
+     active started
+2) we are in vertical blank and no push has been sent
+  -> the hardware will keep extending the vblank presumably
+     to its maximum length, so we make the timestmap match the
+     expected time when the max length vblank will end. Since
+     the timings used for this are now based on vmax nothing
+     special actually needs to be done
+3) we are in vblank and a push has been sent so the vblank is
+   about to terminate
+  -> presumably we want the timestmap to accurately reflect
+     when the vblank will terminate, so we use the sampled
+     frame timestamp vs. current timestamp to guesstimate
+     how far along the vblank exit we are, and then we
+     adjust the reported scanout position accordingly so
+     that the core will see that the vblank is close to
+     ending.
+
+v2:
+* Fix the else if (use_scanline_Counter) (Manasi)
+
+Signed-off-by: Manasi Navare <manasi.d.navare@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210122232647.22688-17-manasi.d.navare@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c    | 17 ++++++++++++-----
+ .../gpu/drm/i915/display/intel_display_types.h  |  4 ++++
+ drivers/gpu/drm/i915/display/intel_vrr.c        |  4 ++++
+ drivers/gpu/drm/i915/i915_irq.c                 | 15 ++++++++++++++-
+ 4 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index ab1016df3f0a..93605ede5e65 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -11791,10 +11791,17 @@ intel_crtc_update_active_timings(const struct intel_crtc_state *crtc_state)
+ {
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	const struct drm_display_mode *adjusted_mode =
+-		&crtc_state->hw.adjusted_mode;
++	struct drm_display_mode adjusted_mode =
++		crtc_state->hw.adjusted_mode;
++
++	if (crtc_state->vrr.enable) {
++		adjusted_mode.crtc_vtotal = crtc_state->vrr.vmax;
++		adjusted_mode.crtc_vblank_end = crtc_state->vrr.vmax;
++		adjusted_mode.crtc_vblank_start = intel_vrr_vmin_vblank_start(crtc_state);
++		crtc->vmax_vblank_start = intel_vrr_vmax_vblank_start(crtc_state);
++	}
+ 
+-	drm_calc_timestamping_constants(&crtc->base, adjusted_mode);
++	drm_calc_timestamping_constants(&crtc->base, &adjusted_mode);
+ 
+ 	crtc->mode_flags = crtc_state->mode_flags;
+ 
+@@ -11828,8 +11835,8 @@ intel_crtc_update_active_timings(const struct intel_crtc_state *crtc_state)
+ 	if (IS_GEN(dev_priv, 2)) {
+ 		int vtotal;
+ 
+-		vtotal = adjusted_mode->crtc_vtotal;
+-		if (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)
++		vtotal = adjusted_mode.crtc_vtotal;
++		if (adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
+ 			vtotal /= 2;
+ 
+ 		crtc->scanline_offset = vtotal - 1;
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index b5bac4c81de1..39397748b4b0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -693,6 +693,8 @@ struct intel_crtc_scaler_state {
+ #define I915_MODE_FLAG_DSI_USE_TE1 (1<<4)
+ /* Flag to indicate mipi dsi periodic command mode where we do not get TE */
+ #define I915_MODE_FLAG_DSI_PERIODIC_CMD_MODE (1<<5)
++/* Do tricks to make vblank timestamps sane with VRR? */
++#define I915_MODE_FLAG_VRR (1<<6)
+ 
+ struct intel_wm_level {
+ 	bool enable;
+@@ -1200,6 +1202,8 @@ struct intel_crtc {
+ 	/* I915_MODE_FLAG_* */
+ 	u8 mode_flags;
+ 
++	u16 vmax_vblank_start;
++
+ 	struct intel_display_power_domain_set enabled_power_domains;
+ 	struct intel_overlay *overlay;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.c b/drivers/gpu/drm/i915/display/intel_vrr.c
+index 49ff5add90e0..a9c2b2fd9252 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.c
++++ b/drivers/gpu/drm/i915/display/intel_vrr.c
+@@ -134,6 +134,8 @@ intel_vrr_compute_config(struct intel_crtc_state *crtc_state,
+ 	 */
+ 	crtc_state->vrr.pipeline_full =
+ 		min(255, crtc_state->vrr.vmin - adjusted_mode->crtc_vdisplay - 4 - 1);
++
++	crtc_state->mode_flags |= I915_MODE_FLAG_VRR;
+ }
+ 
+ void intel_vrr_enable(struct intel_encoder *encoder,
+@@ -202,4 +204,6 @@ void intel_vrr_get_config(struct intel_crtc *crtc,
+ 		crtc_state->vrr.flipline = intel_de_read(dev_priv, TRANS_VRR_FLIPLINE(cpu_transcoder)) + 1;
+ 	crtc_state->vrr.vmax = intel_de_read(dev_priv, TRANS_VRR_VMAX(cpu_transcoder)) + 1;
+ 	crtc_state->vrr.vmin = intel_de_read(dev_priv, TRANS_VRR_VMIN(cpu_transcoder)) + 1;
++
++	crtc_state->mode_flags |= I915_MODE_FLAG_VRR;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index b1998b272fd1..5075f4ea2b23 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -893,7 +893,20 @@ static bool i915_get_crtc_scanoutpos(struct drm_crtc *_crtc,
+ 	if (stime)
+ 		*stime = ktime_get();
+ 
+-	if (use_scanline_counter) {
++	if (crtc->mode_flags & I915_MODE_FLAG_VRR) {
++		int scanlines = intel_crtc_scanlines_since_frame_timestamp(crtc);
++
++		position = __intel_get_crtc_scanline(crtc);
++
++		/*
++		 * Already exiting vblank? If so, shift our position
++		 * so it looks like we're already apporaching the full
++		 * vblank end. This should make the generated timestamp
++		 * more or less match when the active portion will start.
++		 */
++		if (position >= vbl_start && scanlines < position)
++			position = min(crtc->vmax_vblank_start + scanlines, vtotal - 1);
++	} else if (use_scanline_counter) {
+ 		/* No obvious pixelcount register. Only query vertical
+ 		 * scanout position from Display scan line register.
+ 		 */
+-- 
+2.17.1
+

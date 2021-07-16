@@ -1,0 +1,123 @@
+From 01a1634e6f75aee5a2ea7d9399b445c9e960e82e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 24 Nov 2020 22:11:53 +0200
+Subject: [PATCH 0149/1087] drm/i915: Track logically enabled planes for hw
+ state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently crtc_state->uapi.plane_mask only tracks logically
+enabled planes on the uapi level. For bigjoiner purposes
+we want to do the same for the hw state. Let's follow the
+pattern established by active_planes & co. here.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201124201156.17095-1-ville.syrjala@linux.intel.com
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_atomic_plane.c  |  3 +++
+ drivers/gpu/drm/i915/display/intel_display.c       | 13 +++++++++----
+ drivers/gpu/drm/i915/display/intel_display_types.h |  5 ++++-
+ 3 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.c b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+index 7e9f84b00859..b5e1ee99535c 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+@@ -312,10 +312,13 @@ int intel_plane_atomic_check_with_state(const struct intel_crtc_state *old_crtc_
+ 	int ret;
+ 
+ 	intel_plane_set_invisible(new_crtc_state, new_plane_state);
++	new_crtc_state->enabled_planes &= ~BIT(plane->id);
+ 
+ 	if (!new_plane_state->hw.crtc && !old_plane_state->hw.crtc)
+ 		return 0;
+ 
++	new_crtc_state->enabled_planes |= BIT(plane->id);
++
+ 	ret = plane->check_plane(new_crtc_state, new_plane_state);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index fda9095d6811..cfb7857de75d 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -3552,7 +3552,7 @@ intel_set_plane_visible(struct intel_crtc_state *crtc_state,
+ 		crtc_state->uapi.plane_mask &= ~drm_plane_mask(&plane->base);
+ }
+ 
+-static void fixup_active_planes(struct intel_crtc_state *crtc_state)
++static void fixup_plane_bitmasks(struct intel_crtc_state *crtc_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
+ 	struct drm_plane *plane;
+@@ -3562,11 +3562,14 @@ static void fixup_active_planes(struct intel_crtc_state *crtc_state)
+ 	 * have been used on the same (or wrong) pipe. plane_mask uses
+ 	 * unique ids, hence we can use that to reconstruct active_planes.
+ 	 */
++	crtc_state->enabled_planes = 0;
+ 	crtc_state->active_planes = 0;
+ 
+ 	drm_for_each_plane_mask(plane, &dev_priv->drm,
+-				crtc_state->uapi.plane_mask)
++				crtc_state->uapi.plane_mask) {
++		crtc_state->enabled_planes |= BIT(to_intel_plane(plane)->id);
+ 		crtc_state->active_planes |= BIT(to_intel_plane(plane)->id);
++	}
+ }
+ 
+ static void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+@@ -3584,7 +3587,7 @@ static void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+ 		    crtc->base.base.id, crtc->base.name);
+ 
+ 	intel_set_plane_visible(crtc_state, plane_state, false);
+-	fixup_active_planes(crtc_state);
++	fixup_plane_bitmasks(crtc_state);
+ 	crtc_state->data_rate[plane->id] = 0;
+ 	crtc_state->min_cdclk[plane->id] = 0;
+ 
+@@ -12804,6 +12807,7 @@ static int icl_check_nv12_planes(struct intel_crtc_state *crtc_state)
+ 
+ 		plane_state->planar_linked_plane = NULL;
+ 		if (plane_state->planar_slave && !plane_state->uapi.visible) {
++			crtc_state->enabled_planes &= ~BIT(plane->id);
+ 			crtc_state->active_planes &= ~BIT(plane->id);
+ 			crtc_state->update_planes |= BIT(plane->id);
+ 		}
+@@ -12847,6 +12851,7 @@ static int icl_check_nv12_planes(struct intel_crtc_state *crtc_state)
+ 
+ 		linked_state->planar_slave = true;
+ 		linked_state->planar_linked_plane = plane;
++		crtc_state->enabled_planes |= BIT(linked->id);
+ 		crtc_state->active_planes |= BIT(linked->id);
+ 		crtc_state->update_planes |= BIT(linked->id);
+ 		drm_dbg_kms(&dev_priv->drm, "Using %s as Y plane for %s\n",
+@@ -19133,7 +19138,7 @@ static void readout_plane_state(struct drm_i915_private *dev_priv)
+ 		struct intel_crtc_state *crtc_state =
+ 			to_intel_crtc_state(crtc->base.state);
+ 
+-		fixup_active_planes(crtc_state);
++		fixup_plane_bitmasks(crtc_state);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 1fa0246b3a82..5bc5bfbc4551 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1053,7 +1053,10 @@ struct intel_crtc_state {
+ 		u32 cgm_mode;
+ 	};
+ 
+-	/* bitmask of visible planes (enum plane_id) */
++	/* bitmask of logically enabled planes (enum plane_id) */
++	u8 enabled_planes;
++
++	/* bitmask of actually visible planes (enum plane_id) */
+ 	u8 active_planes;
+ 	u8 nv12_planes;
+ 	u8 c8_planes;
+-- 
+2.17.1
+

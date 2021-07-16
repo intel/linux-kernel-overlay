@@ -1,4 +1,4 @@
-From c22ae15d78c4738c4b4479d2cf3bff63cfa69dc3 Mon Sep 17 00:00:00 2001
+From 35ac81a7b54aae6a469bcc8705e24c783ca8bc4c Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Sat, 8 Aug 2020 18:02:04 +0800
 Subject: [PATCH 7/9] tcc: return error code to better match varies error
@@ -149,5 +149,5 @@ index ce5d565b68ee..c83e71948579 100644
  		ret = copy_to_user((struct tcc_buf_mem_req_s *)arg, &req_mem, sizeof(req_mem));
  		if (ret != 0)
 -- 
-2.27.0
+2.25.1
 

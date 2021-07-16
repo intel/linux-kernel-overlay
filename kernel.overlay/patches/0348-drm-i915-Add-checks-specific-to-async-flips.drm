@@ -1,0 +1,209 @@
+From 8d1c41dee56d46bacc38339daa99bfd7520dd860 Mon Sep 17 00:00:00 2001
+From: Karthik B S <karthik.b.s@intel.com>
+Date: Mon, 21 Sep 2020 16:32:05 +0530
+Subject: [PATCH 0348/1714] drm/i915: Add checks specific to async flips
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If flip is requested on any other plane, reject it.
+
+Make sure there is no change in fbc, offset and framebuffer modifiers
+when async flip is requested.
+
+If any of these are modified, reject async flip.
+
+v2: -Replace DRM_ERROR (Paulo)
+    -Add check for changes in OFFSET, FBC, RC(Paulo)
+
+v3: -Removed TODO as benchmarking tests have been run now.
+
+v4: -Added more state checks for async flip (Ville)
+    -Moved intel_atomic_check_async to the end of intel_atomic_check
+     as the plane checks needs to pass before this. (Ville)
+    -Removed crtc_state->enable_fbc check. (Ville)
+    -Set the I915_MODE_FLAG_GET_SCANLINE_FROM_TIMESTAMP flag for async
+     flip case as scanline counter is not reliable here.
+
+v5: -Fix typo and other check patch errors seen in CI
+     in 'intel_atomic_check_async' function.
+
+v6: -Don't call intel_atomic_check_async multiple times. (Ville)
+    -Remove the check for n_planes in intel_atomic_check_async
+    -Added documentation for async flips. (Paulo)
+
+v7: -Replace 'intel_plane' with 'plane'. (Ville)
+    -Replace all uapi.foo as hw.foo. (Ville)
+    -Do not use intel_wm_need_update function. (Ville)
+    -Add destination coordinate check. (Ville)
+    -Do not allow async flip with linear buffer
+     on older hw as it has issues with this. (Ville)
+    -Remove break after intel_atomic_check_async. (Ville)
+
+v8: -Rebased.
+
+v9: -Replace DRM_DEBUG_KMS with drm_dbg_kms(). (Ville)
+    -Fix comment formatting. (Ville)
+    -Remove gen specific checks. (Ville)
+    -Remove irrelevant FB size check. (Ville)
+    -Add missing stride check. (Ville)
+    -Use drm_rect_equals() instead of individual checks. (Ville)
+    -Call intel_atomic_check_async before state dump. (Ville)
+
+v10: -Fix the checkpatch errors seen on CI.
+
+v11: -Use const for all plane/crtc states. (Ville)
+     -Use 'switch' instead of 'if' for modifier check. (Ville)
+     -Move documentation changes to a single patch. (Ville)
+
+Signed-off-by: Karthik B S <karthik.b.s@intel.com>
+Signed-off-by: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200921110210.21182-4-karthik.b.s@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 121 +++++++++++++++++++
+ 1 file changed, 121 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index b9046afef167..3263fc62dc30 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -14886,6 +14886,121 @@ static bool intel_cpu_transcoders_need_modeset(struct intel_atomic_state *state,
+ 	return false;
+ }
+ 
++static int intel_atomic_check_async(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *i915 = to_i915(state->base.dev);
++	const struct intel_crtc_state *old_crtc_state, *new_crtc_state;
++	const struct intel_plane_state *new_plane_state, *old_plane_state;
++	struct intel_crtc *crtc;
++	struct intel_plane *plane;
++	int i;
++
++	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
++					    new_crtc_state, i) {
++		if (needs_modeset(new_crtc_state)) {
++			drm_dbg_kms(&i915->drm, "Modeset Required. Async flip not supported\n");
++			return -EINVAL;
++		}
++
++		if (!new_crtc_state->hw.active) {
++			drm_dbg_kms(&i915->drm, "CRTC inactive\n");
++			return -EINVAL;
++		}
++		if (old_crtc_state->active_planes != new_crtc_state->active_planes) {
++			drm_dbg_kms(&i915->drm,
++				    "Active planes cannot be changed during async flip\n");
++			return -EINVAL;
++		}
++	}
++
++	for_each_oldnew_intel_plane_in_state(state, plane, old_plane_state,
++					     new_plane_state, i) {
++		/*
++		 * TODO: Async flip is only supported through the page flip IOCTL
++		 * as of now. So support currently added for primary plane only.
++		 * Support for other planes on platforms on which supports
++		 * this(vlv/chv and icl+) should be added when async flip is
++		 * enabled in the atomic IOCTL path.
++		 */
++		if (plane->id != PLANE_PRIMARY)
++			return -EINVAL;
++
++		/*
++		 * FIXME: This check is kept generic for all platforms.
++		 * Need to verify this for all gen9 and gen10 platforms to enable
++		 * this selectively if required.
++		 */
++		switch (new_plane_state->hw.fb->modifier) {
++		case I915_FORMAT_MOD_X_TILED:
++		case I915_FORMAT_MOD_Y_TILED:
++		case I915_FORMAT_MOD_Yf_TILED:
++			break;
++		default:
++			drm_dbg_kms(&i915->drm,
++				    "Linear memory/CCS does not support async flips\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->color_plane[0].stride !=
++		    new_plane_state->color_plane[0].stride) {
++			drm_dbg_kms(&i915->drm, "Stride cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.fb->modifier !=
++		    new_plane_state->hw.fb->modifier) {
++			drm_dbg_kms(&i915->drm,
++				    "Framebuffer modifiers cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.fb->format !=
++		    new_plane_state->hw.fb->format) {
++			drm_dbg_kms(&i915->drm,
++				    "Framebuffer format cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.rotation !=
++		    new_plane_state->hw.rotation) {
++			drm_dbg_kms(&i915->drm, "Rotation cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (!drm_rect_equals(&old_plane_state->uapi.src, &new_plane_state->uapi.src) ||
++		    !drm_rect_equals(&old_plane_state->uapi.dst, &new_plane_state->uapi.dst)) {
++			drm_dbg_kms(&i915->drm,
++				    "Plane size/co-ordinates cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.alpha != new_plane_state->hw.alpha) {
++			drm_dbg_kms(&i915->drm, "Alpha value cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.pixel_blend_mode !=
++		    new_plane_state->hw.pixel_blend_mode) {
++			drm_dbg_kms(&i915->drm,
++				    "Pixel blend mode cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.color_encoding != new_plane_state->hw.color_encoding) {
++			drm_dbg_kms(&i915->drm,
++				    "Color encoding cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++
++		if (old_plane_state->hw.color_range != new_plane_state->hw.color_range) {
++			drm_dbg_kms(&i915->drm, "Color range cannot be changed in async flip\n");
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
+ /**
+  * intel_atomic_check - validate state object
+  * @dev: drm device
+@@ -15054,6 +15169,12 @@ static int intel_atomic_check(struct drm_device *dev,
+ 
+ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+ 					    new_crtc_state, i) {
++		if (new_crtc_state->uapi.async_flip) {
++			ret = intel_atomic_check_async(state);
++			if (ret)
++				goto fail;
++		}
++
+ 		if (!needs_modeset(new_crtc_state) &&
+ 		    !new_crtc_state->update_pipe)
+ 			continue;
+-- 
+2.25.1
+

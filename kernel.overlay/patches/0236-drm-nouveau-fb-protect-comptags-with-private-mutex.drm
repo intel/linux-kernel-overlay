@@ -1,0 +1,244 @@
+From f2ca5be1f00caf2af322e9caa11a13b00be7a215 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 2 Dec 2020 16:24:20 +1000
+Subject: [PATCH 236/330] drm/nouveau/fb: protect comptags with private mutex
+
+nvkm_subdev.mutex is going away.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/fb.h   |  6 +++++-
+ drivers/gpu/drm/nouveau/nvkm/core/memory.c     | 18 +++++++++---------
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c  | 10 ++++++----
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv20.c  |  4 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv25.c  |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv30.c  |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv35.c  |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv36.c  |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv40.c  |  2 +-
+ .../gpu/drm/nouveau/nvkm/subdev/ltc/gf100.c    |  4 ++--
+ 10 files changed, 29 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h
+index 2ecd52aec1d1..38c2a5fb418a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h
+@@ -36,7 +36,11 @@ struct nvkm_fb {
+ 	struct nvkm_blob vpr_scrubber;
+ 
+ 	struct nvkm_ram *ram;
+-	struct nvkm_mm tags;
++
++	struct {
++		struct mutex mutex; /* protects mm and nvkm_memory::tags */
++		struct nvkm_mm mm;
++	} tags;
+ 
+ 	struct {
+ 		struct nvkm_fb_tile region[16];
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/memory.c b/drivers/gpu/drm/nouveau/nvkm/core/memory.c
+index 38130ef272d6..c69daac9bac7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/memory.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/memory.c
+@@ -33,13 +33,13 @@ nvkm_memory_tags_put(struct nvkm_memory *memory, struct nvkm_device *device,
+ 	struct nvkm_fb *fb = device->fb;
+ 	struct nvkm_tags *tags = *ptags;
+ 	if (tags) {
+-		mutex_lock(&fb->subdev.mutex);
++		mutex_lock(&fb->tags.mutex);
+ 		if (refcount_dec_and_test(&tags->refcount)) {
+-			nvkm_mm_free(&fb->tags, &tags->mn);
++			nvkm_mm_free(&fb->tags.mm, &tags->mn);
+ 			kfree(memory->tags);
+ 			memory->tags = NULL;
+ 		}
+-		mutex_unlock(&fb->subdev.mutex);
++		mutex_unlock(&fb->tags.mutex);
+ 		*ptags = NULL;
+ 	}
+ }
+@@ -52,29 +52,29 @@ nvkm_memory_tags_get(struct nvkm_memory *memory, struct nvkm_device *device,
+ 	struct nvkm_fb *fb = device->fb;
+ 	struct nvkm_tags *tags;
+ 
+-	mutex_lock(&fb->subdev.mutex);
++	mutex_lock(&fb->tags.mutex);
+ 	if ((tags = memory->tags)) {
+ 		/* If comptags exist for the memory, but a different amount
+ 		 * than requested, the buffer is being mapped with settings
+ 		 * that are incompatible with existing mappings.
+ 		 */
+ 		if (tags->mn && tags->mn->length != nr) {
+-			mutex_unlock(&fb->subdev.mutex);
++			mutex_unlock(&fb->tags.mutex);
+ 			return -EINVAL;
+ 		}
+ 
+ 		refcount_inc(&tags->refcount);
+-		mutex_unlock(&fb->subdev.mutex);
++		mutex_unlock(&fb->tags.mutex);
+ 		*ptags = tags;
+ 		return 0;
+ 	}
+ 
+ 	if (!(tags = kmalloc(sizeof(*tags), GFP_KERNEL))) {
+-		mutex_unlock(&fb->subdev.mutex);
++		mutex_unlock(&fb->tags.mutex);
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, nr, nr, 1, &tags->mn)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, nr, nr, 1, &tags->mn)) {
+ 		if (clr)
+ 			clr(device, tags->mn->offset, tags->mn->length);
+ 	} else {
+@@ -92,7 +92,7 @@ nvkm_memory_tags_get(struct nvkm_memory *memory, struct nvkm_device *device,
+ 
+ 	refcount_set(&tags->refcount, 1);
+ 	*ptags = memory->tags = tags;
+-	mutex_unlock(&fb->subdev.mutex);
++	mutex_unlock(&fb->tags.mutex);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c
+index 5940e0dea2f8..7a13165915c9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c
+@@ -122,7 +122,7 @@ nvkm_fb_oneinit(struct nvkm_subdev *subdev)
+ 		nvkm_debug(subdev, "%d comptags\n", tags);
+ 	}
+ 
+-	return nvkm_mm_init(&fb->tags, 0, 0, tags, 1);
++	return nvkm_mm_init(&fb->tags.mm, 0, 0, tags, 1);
+ }
+ 
+ static int
+@@ -205,7 +205,9 @@ nvkm_fb_dtor(struct nvkm_subdev *subdev)
+ 	for (i = 0; i < fb->tile.regions; i++)
+ 		fb->func->tile.fini(fb, i, &fb->tile.region[i]);
+ 
+-	nvkm_mm_fini(&fb->tags);
++	nvkm_mm_fini(&fb->tags.mm);
++	mutex_destroy(&fb->tags.mutex);
++
+ 	nvkm_ram_del(&fb->ram);
+ 
+ 	nvkm_blob_dtor(&fb->vpr_scrubber);
+@@ -230,8 +232,8 @@ nvkm_fb_ctor(const struct nvkm_fb_func *func, struct nvkm_device *device,
+ 	nvkm_subdev_ctor(&nvkm_fb, device, index, &fb->subdev);
+ 	fb->func = func;
+ 	fb->tile.regions = fb->func->tile.regions;
+-	fb->page = nvkm_longopt(device->cfgopt, "NvFbBigPage",
+-				fb->func->default_bigpage);
++	fb->page = nvkm_longopt(device->cfgopt, "NvFbBigPage", fb->func->default_bigpage);
++	mutex_init(&fb->tags.mutex);
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv20.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv20.c
+index a021d21ff153..e5ddbe6b698e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv20.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv20.c
+@@ -45,7 +45,7 @@ nv20_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ {
+ 	u32 tiles = DIV_ROUND_UP(size, 0x40);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x40);
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		if (!(flags & 2)) tile->zcomp = 0x00000000; /* Z16 */
+ 		else              tile->zcomp = 0x04000000; /* Z24S8 */
+ 		tile->zcomp |= tile->tag->offset;
+@@ -63,7 +63,7 @@ nv20_fb_tile_fini(struct nvkm_fb *fb, int i, struct nvkm_fb_tile *tile)
+ 	tile->limit = 0;
+ 	tile->pitch = 0;
+ 	tile->zcomp = 0;
+-	nvkm_mm_free(&fb->tags, &tile->tag);
++	nvkm_mm_free(&fb->tags.mm, &tile->tag);
+ }
+ 
+ void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv25.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv25.c
+index 7709f5fe9a45..fb87e699ff54 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv25.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv25.c
+@@ -32,7 +32,7 @@ nv25_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ {
+ 	u32 tiles = DIV_ROUND_UP(size, 0x40);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x40);
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		if (!(flags & 2)) tile->zcomp = 0x00100000; /* Z16 */
+ 		else              tile->zcomp = 0x00200000; /* Z24S8 */
+ 		tile->zcomp |= tile->tag->offset;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv30.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv30.c
+index 8aa782666507..6e033495fc1a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv30.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv30.c
+@@ -51,7 +51,7 @@ nv30_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ {
+ 	u32 tiles = DIV_ROUND_UP(size, 0x40);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x40);
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		if (flags & 2) tile->zcomp |= 0x01000000; /* Z16 */
+ 		else           tile->zcomp |= 0x02000000; /* Z24S8 */
+ 		tile->zcomp |= ((tile->tag->offset           ) >> 6);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv35.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv35.c
+index 6e83dcff72e0..02a38d83c812 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv35.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv35.c
+@@ -32,7 +32,7 @@ nv35_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ {
+ 	u32 tiles = DIV_ROUND_UP(size, 0x40);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x40);
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		if (flags & 2) tile->zcomp |= 0x04000000; /* Z16 */
+ 		else           tile->zcomp |= 0x08000000; /* Z24S8 */
+ 		tile->zcomp |= ((tile->tag->offset           ) >> 6);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv36.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv36.c
+index 2a07617bb44c..f45143ebded3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv36.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv36.c
+@@ -32,7 +32,7 @@ nv36_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ {
+ 	u32 tiles = DIV_ROUND_UP(size, 0x40);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x40);
+-	if (!nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	if (!nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		if (flags & 2) tile->zcomp |= 0x10000000; /* Z16 */
+ 		else           tile->zcomp |= 0x20000000; /* Z24S8 */
+ 		tile->zcomp |= ((tile->tag->offset           ) >> 6);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv40.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv40.c
+index 955160778b5b..f51ba70c673a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv40.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv40.c
+@@ -33,7 +33,7 @@ nv40_fb_tile_comp(struct nvkm_fb *fb, int i, u32 size, u32 flags,
+ 	u32 tiles = DIV_ROUND_UP(size, 0x80);
+ 	u32 tags  = round_up(tiles / fb->ram->parts, 0x100);
+ 	if ( (flags & 2) &&
+-	    !nvkm_mm_head(&fb->tags, 0, 1, tags, tags, 1, &tile->tag)) {
++	    !nvkm_mm_head(&fb->tags.mm, 0, 1, tags, tags, 1, &tile->tag)) {
+ 		tile->zcomp  = 0x28000000; /* Z24S8_SPLIT_GRAD */
+ 		tile->zcomp |= ((tile->tag->offset           ) >> 8);
+ 		tile->zcomp |= ((tile->tag->offset + tags - 1) >> 8) << 13;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/ltc/gf100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/ltc/gf100.c
+index a21ef45b8572..1d453566fa3d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/ltc/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/ltc/gf100.c
+@@ -200,8 +200,8 @@ gf100_ltc_oneinit_tag_ram(struct nvkm_ltc *ltc)
+ 	}
+ 
+ mm_init:
+-	nvkm_mm_fini(&fb->tags);
+-	return nvkm_mm_init(&fb->tags, 0, 0, ltc->num_tags, 1);
++	nvkm_mm_fini(&fb->tags.mm);
++	return nvkm_mm_init(&fb->tags.mm, 0, 0, ltc->num_tags, 1);
+ }
+ 
+ int
+-- 
+2.25.1
+

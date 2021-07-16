@@ -1,0 +1,219 @@
+From 905923cc39b54f23a4c37c3cc110625af0aa23d4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:05 +0200
+Subject: [PATCH 054/128] drm/i915: Add plane vfuncs to enable/disable
+ flip_done interrupt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Prepare for more platforms with async flip support by turning
+the flip_done interrupt enable/disable into plane vfuncs.
+
+Cc: Karthik B S <karthik.b.s@intel.com>
+Cc: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-6-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_display.c  | 42 +++++++++++++++++--
+ .../drm/i915/display/intel_display_types.h    |  2 +
+ drivers/gpu/drm/i915/display/intel_sprite.c   | 27 +++++++++++-
+ drivers/gpu/drm/i915/i915_irq.c               | 26 ------------
+ drivers/gpu/drm/i915/i915_irq.h               |  3 --
+ 5 files changed, 67 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index b8344e0c4e49..d9e0f1ecf776 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -4783,6 +4783,42 @@ static void intel_post_plane_update(struct intel_atomic_state *state,
+ 		icl_wa_scalerclkgating(dev_priv, pipe, false);
+ }
+ 
++static void intel_crtc_enable_flip_done(struct intel_atomic_state *state,
++					struct intel_crtc *crtc)
++{
++	const struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
++	u8 update_planes = crtc_state->update_planes;
++	const struct intel_plane_state *plane_state;
++	struct intel_plane *plane;
++	int i;
++
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		if (plane->enable_flip_done &&
++		    plane->pipe == crtc->pipe &&
++		    update_planes & BIT(plane->id))
++			plane->enable_flip_done(plane);
++	}
++}
++
++static void intel_crtc_disable_flip_done(struct intel_atomic_state *state,
++					 struct intel_crtc *crtc)
++{
++	const struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
++	u8 update_planes = crtc_state->update_planes;
++	const struct intel_plane_state *plane_state;
++	struct intel_plane *plane;
++	int i;
++
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		if (plane->disable_flip_done &&
++		    plane->pipe == crtc->pipe &&
++		    update_planes & BIT(plane->id))
++			plane->disable_flip_done(plane);
++	}
++}
++
+ static void skl_disable_async_flip_wa(struct intel_atomic_state *state,
+ 				      struct intel_crtc *crtc,
+ 				      const struct intel_crtc_state *new_crtc_state)
+@@ -12207,7 +12243,7 @@ static void kill_bigjoiner_slave(struct intel_atomic_state *state,
+  * Async flip can only change the plane surface address, so anything else
+  * changing is rejected from the intel_atomic_check_async() function.
+  * Once this check is cleared, flip done interrupt is enabled using
+- * the skl_enable_flip_done() function.
++ * the intel_crtc_enable_flip_done() function.
+  *
+  * As soon as the surface address register is written, flip done interrupt is
+  * generated and the requested events are sent to the usersapce in the interrupt
+@@ -13152,7 +13188,7 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		if (new_crtc_state->uapi.async_flip)
+-			skl_enable_flip_done(crtc);
++			intel_crtc_enable_flip_done(state, crtc);
+ 	}
+ 
+ 	/* Now enable the clocks, plane, pipe, and connectors that we set up. */
+@@ -13177,7 +13213,7 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		if (new_crtc_state->uapi.async_flip)
+-			skl_disable_flip_done(crtc);
++			intel_crtc_disable_flip_done(state, crtc);
+ 
+ 		if (new_crtc_state->hw.active &&
+ 		    !intel_crtc_needs_modeset(new_crtc_state) &&
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 3c7be009a444..ac04ee2a6403 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1268,6 +1268,8 @@ struct intel_plane {
+ 	void (*async_flip)(struct intel_plane *plane,
+ 			   const struct intel_crtc_state *crtc_state,
+ 			   const struct intel_plane_state *plane_state);
++	void (*enable_flip_done)(struct intel_plane *plane);
++	void (*disable_flip_done)(struct intel_plane *plane);
+ };
+ 
+ struct intel_watermark_params {
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.c b/drivers/gpu/drm/i915/display/intel_sprite.c
+index e839a7748068..affd8cffa306 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.c
++++ b/drivers/gpu/drm/i915/display/intel_sprite.c
+@@ -958,6 +958,28 @@ skl_plane_get_hw_state(struct intel_plane *plane,
+ 	return ret;
+ }
+ 
++static void
++skl_plane_enable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	bdw_enable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE_FLIP_DONE(plane->id));
++	spin_unlock_irq(&i915->irq_lock);
++}
++
++static void
++skl_plane_disable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	bdw_disable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE_FLIP_DONE(plane->id));
++	spin_unlock_irq(&i915->irq_lock);
++}
++
+ static void i9xx_plane_linear_gamma(u16 gamma[8])
+ {
+ 	/* The points are not evenly spaced. */
+@@ -3291,8 +3313,11 @@ skl_universal_plane_create(struct drm_i915_private *dev_priv,
+ 	plane->check_plane = skl_plane_check;
+ 	plane->min_cdclk = skl_plane_min_cdclk;
+ 
+-	if (plane_id == PLANE_PRIMARY)
++	if (plane_id == PLANE_PRIMARY) {
+ 		plane->async_flip = skl_plane_async_flip;
++		plane->enable_flip_done = skl_plane_enable_flip_done;
++		plane->disable_flip_done = skl_plane_disable_flip_done;
++	}
+ 
+ 	if (INTEL_GEN(dev_priv) >= 11)
+ 		formats = icl_get_plane_formats(dev_priv, pipe,
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 4484609d870d..33019cf0e630 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2822,19 +2822,6 @@ int bdw_enable_vblank(struct drm_crtc *crtc)
+ 	return 0;
+ }
+ 
+-void skl_enable_flip_done(struct intel_crtc *crtc)
+-{
+-	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+-	enum pipe pipe = crtc->pipe;
+-	unsigned long irqflags;
+-
+-	spin_lock_irqsave(&i915->irq_lock, irqflags);
+-
+-	bdw_enable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE1_FLIP_DONE);
+-
+-	spin_unlock_irqrestore(&i915->irq_lock, irqflags);
+-}
+-
+ /* Called from drm generic code, passed 'crtc' which
+  * we use as a pipe index
+  */
+@@ -2899,19 +2886,6 @@ void bdw_disable_vblank(struct drm_crtc *crtc)
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+ }
+ 
+-void skl_disable_flip_done(struct intel_crtc *crtc)
+-{
+-	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+-	enum pipe pipe = crtc->pipe;
+-	unsigned long irqflags;
+-
+-	spin_lock_irqsave(&i915->irq_lock, irqflags);
+-
+-	bdw_disable_pipe_irq(i915, pipe, GEN9_PIPE_PLANE1_FLIP_DONE);
+-
+-	spin_unlock_irqrestore(&i915->irq_lock, irqflags);
+-}
+-
+ static void ibx_irq_reset(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_uncore *uncore = &dev_priv->uncore;
+diff --git a/drivers/gpu/drm/i915/i915_irq.h b/drivers/gpu/drm/i915/i915_irq.h
+index 2efe609519ca..25f25cd95818 100644
+--- a/drivers/gpu/drm/i915/i915_irq.h
++++ b/drivers/gpu/drm/i915/i915_irq.h
+@@ -118,9 +118,6 @@ void i965_disable_vblank(struct drm_crtc *crtc);
+ void ilk_disable_vblank(struct drm_crtc *crtc);
+ void bdw_disable_vblank(struct drm_crtc *crtc);
+ 
+-void skl_enable_flip_done(struct intel_crtc *crtc);
+-void skl_disable_flip_done(struct intel_crtc *crtc);
+-
+ void gen2_irq_reset(struct intel_uncore *uncore);
+ void gen3_irq_reset(struct intel_uncore *uncore, i915_reg_t imr,
+ 		    i915_reg_t iir, i915_reg_t ier);
+-- 
+2.17.1
+

@@ -1,4 +1,4 @@
-From 40a623ab9ecaeb8c401d7271c26f2a55347c1d68 Mon Sep 17 00:00:00 2001
+From dde63313c21b2f4603f959ceb59f9b19aefcddfa Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 16:56:12 +0800
 Subject: [PATCH 8/9] tcc: update tcc range end_address.
@@ -11,7 +11,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 7fdcdaebe781..9ff5e0d411b9 100644
+index c9c3605a167a..00010b4cb947 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1300,7 +1300,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
@@ -24,5 +24,5 @@ index 7fdcdaebe781..9ff5e0d411b9 100644
  		}
  		ptr += entry->size;
 -- 
-2.27.0
+2.25.1
 

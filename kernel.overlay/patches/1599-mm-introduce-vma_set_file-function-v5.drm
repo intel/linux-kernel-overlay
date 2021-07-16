@@ -1,0 +1,196 @@
+From c72b3ff00e02b3626dd237b98e942f7bd16bc724 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 14 Sep 2020 15:09:33 +0200
+Subject: [PATCH 1599/1714] mm: introduce vma_set_file function v5
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the new vma_set_file() function to allow changing
+vma->vm_file with the necessary refcount dance.
+
+v2: add more users of this.
+v3: add missing EXPORT_SYMBOL, rebase on mmap cleanup,
+    add comments why we drop the reference on two occasions.
+v4: make it clear that changing an anonymous vma is illegal.
+v5: move vma_set_file to mm/util.c
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch> (v2)
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Andrew Morton <akpm@linux-foundation.org>
+Link: https://patchwork.freedesktop.org/patch/399360/
+---
+ drivers/dma-buf/dma-buf.c                  |  3 +--
+ drivers/gpu/drm/etnaviv/etnaviv_gem.c      |  4 +---
+ drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c |  3 +--
+ drivers/gpu/drm/i915/gem/i915_gem_mman.c   |  5 +++--
+ drivers/gpu/drm/msm/msm_gem.c              |  4 +---
+ drivers/gpu/drm/omapdrm/omap_gem.c         |  3 +--
+ drivers/gpu/drm/vgem/vgem_drv.c            |  3 +--
+ drivers/staging/android/ashmem.c           |  6 +++---
+ include/linux/mm.h                         |  2 ++
+ mm/util.c                                  | 12 ++++++++++++
+ 10 files changed, 26 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf.c b/drivers/dma-buf/dma-buf.c
+index 282bd8b84170..e63684d4cd90 100644
+--- a/drivers/dma-buf/dma-buf.c
++++ b/drivers/dma-buf/dma-buf.c
+@@ -1183,8 +1183,7 @@ int dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma,
+ 		return -EINVAL;
+ 
+ 	/* readjust the vma */
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(dmabuf->file);
++	vma_set_file(vma, dmabuf->file);
+ 	vma->vm_pgoff = pgoff;
+ 
+ 	return dmabuf->ops->mmap(dmabuf, vma);
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem.c b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+index bbd235473645..6d38c5c17f23 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+@@ -145,10 +145,8 @@ static int etnaviv_gem_mmap_obj(struct etnaviv_gem_object *etnaviv_obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+-		get_file(etnaviv_obj->base.filp);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = etnaviv_obj->base.filp;
++		vma_set_file(vma, etnaviv_obj->base.filp);
+ 
+ 		vma->vm_page_prot = vm_page_prot;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
+index 0dd477e56573..04e9c04545ad 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
+@@ -114,8 +114,7 @@ static int i915_gem_dmabuf_mmap(struct dma_buf *dma_buf, struct vm_area_struct *
+ 	if (ret)
+ 		return ret;
+ 
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(obj->base.filp);
++	vma_set_file(vma, obj->base.filp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index 3d69e51f3e4d..ec28a6cde49b 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -893,8 +893,9 @@ int i915_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	 * requires avoiding extraneous references to their filp, hence why
+ 	 * we prefer to use an anonymous file for their mmaps.
+ 	 */
+-	fput(vma->vm_file);
+-	vma->vm_file = anon;
++	vma_set_file(vma, anon);
++	/* Drop the initial creation reference, the vma is now holding one. */
++	fput(anon);
+ 
+ 	switch (mmo->mmap_type) {
+ 	case I915_MMAP_TYPE_WC:
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index 82cbaf337b50..9a7c49bc394f 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -211,10 +211,8 @@ int msm_gem_mmap_obj(struct drm_gem_object *obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+-		get_file(obj->filp);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = obj->filp;
++		vma_set_file(vma, obj->filp);
+ 
+ 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	}
+diff --git a/drivers/gpu/drm/omapdrm/omap_gem.c b/drivers/gpu/drm/omapdrm/omap_gem.c
+index 68c271f4250b..30d299ca8795 100644
+--- a/drivers/gpu/drm/omapdrm/omap_gem.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem.c
+@@ -564,9 +564,8 @@ int omap_gem_mmap_obj(struct drm_gem_object *obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = get_file(obj->filp);
++		vma_set_file(vma, obj->filp);
+ 
+ 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	}
+diff --git a/drivers/gpu/drm/vgem/vgem_drv.c b/drivers/gpu/drm/vgem/vgem_drv.c
+index 9a413091abb6..f8635ccaf9a1 100644
+--- a/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -403,8 +403,7 @@ static int vgem_prime_mmap(struct drm_gem_object *obj,
+ 	if (ret)
+ 		return ret;
+ 
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(obj->filp);
++	vma_set_file(vma, obj->filp);
+ 	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+ 	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 
+diff --git a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
+index 10b4be1f3e78..4789d36ddfd3 100644
+--- a/drivers/staging/android/ashmem.c
++++ b/drivers/staging/android/ashmem.c
+@@ -450,9 +450,9 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
+ 		vma_set_anonymous(vma);
+ 	}
+ 
+-	if (vma->vm_file)
+-		fput(vma->vm_file);
+-	vma->vm_file = asma->file;
++	vma_set_file(vma, asma->file);
++	/* XXX: merge this with the get_file() above if possible */
++	fput(asma->file);
+ 
+ out:
+ 	mutex_unlock(&ashmem_mutex);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index db6ae4d3fb4e..47bff16c182d 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2719,6 +2719,8 @@ static inline void vma_set_page_prot(struct vm_area_struct *vma)
+ }
+ #endif
+ 
++void vma_set_file(struct vm_area_struct *vma, struct file *file);
++
+ #ifdef CONFIG_NUMA_BALANCING
+ unsigned long change_prot_numa(struct vm_area_struct *vma,
+ 			unsigned long start, unsigned long end);
+diff --git a/mm/util.c b/mm/util.c
+index 4ddb6e186dd5..8c9b7d1e7c49 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -311,6 +311,18 @@ int vma_is_stack_for_current(struct vm_area_struct *vma)
+ 	return (vma->vm_start <= KSTK_ESP(t) && vma->vm_end >= KSTK_ESP(t));
+ }
+ 
++/*
++ * Change backing file, only valid to use during initial VMA setup.
++ */
++void vma_set_file(struct vm_area_struct *vma, struct file *file)
++{
++	/* Changing an anonymous vma with this is illegal */
++	get_file(file);
++	swap(vma->vm_file, file);
++	fput(file);
++}
++EXPORT_SYMBOL(vma_set_file);
++
+ #ifndef STACK_RND_MASK
+ #define STACK_RND_MASK (0x7ff >> (PAGE_SHIFT - 12))     /* 8MB of VA */
+ #endif
+-- 
+2.25.1
+

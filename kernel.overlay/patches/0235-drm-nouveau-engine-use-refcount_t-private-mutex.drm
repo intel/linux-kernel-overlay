@@ -1,0 +1,109 @@
+From 965859a3ee4a043dc37f915b2dc95a0db09891cf Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 2 Dec 2020 16:09:25 +1000
+Subject: [PATCH 235/330] drm/nouveau/engine: use refcount_t + private mutex
+
+nvkm_subdev.mutex is going away.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/core/engine.h    |  6 +++-
+ drivers/gpu/drm/nouveau/nvkm/core/engine.c    | 32 ++++++++++++-------
+ 2 files changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h b/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
+index c6b401a6ea23..c9d84bd17364 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/engine.h
+@@ -11,7 +11,11 @@ struct nvkm_engine {
+ 	struct nvkm_subdev subdev;
+ 	spinlock_t lock;
+ 
+-	int usecount;
++	struct {
++		refcount_t refcount;
++		struct mutex mutex;
++		bool enabled;
++	} use;
+ };
+ 
+ struct nvkm_engine_func {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/engine.c b/drivers/gpu/drm/nouveau/nvkm/core/engine.c
+index 1a47c40e171b..8220a0d21628 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/engine.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/engine.c
+@@ -40,10 +40,11 @@ nvkm_engine_unref(struct nvkm_engine **pengine)
+ {
+ 	struct nvkm_engine *engine = *pengine;
+ 	if (engine) {
+-		mutex_lock(&engine->subdev.mutex);
+-		if (--engine->usecount == 0)
++		if (refcount_dec_and_mutex_lock(&engine->use.refcount, &engine->use.mutex)) {
+ 			nvkm_subdev_fini(&engine->subdev, false);
+-		mutex_unlock(&engine->subdev.mutex);
++			engine->use.enabled = false;
++			mutex_unlock(&engine->use.mutex);
++		}
+ 		*pengine = NULL;
+ 	}
+ }
+@@ -51,17 +52,21 @@ nvkm_engine_unref(struct nvkm_engine **pengine)
+ struct nvkm_engine *
+ nvkm_engine_ref(struct nvkm_engine *engine)
+ {
++	int ret;
+ 	if (engine) {
+-		mutex_lock(&engine->subdev.mutex);
+-		if (++engine->usecount == 1) {
+-			int ret = nvkm_subdev_init(&engine->subdev);
+-			if (ret) {
+-				engine->usecount--;
+-				mutex_unlock(&engine->subdev.mutex);
+-				return ERR_PTR(ret);
++		if (!refcount_inc_not_zero(&engine->use.refcount)) {
++			mutex_lock(&engine->use.mutex);
++			if (!refcount_inc_not_zero(&engine->use.refcount)) {
++				engine->use.enabled = true;
++				if ((ret = nvkm_subdev_init(&engine->subdev))) {
++					engine->use.enabled = false;
++					mutex_unlock(&engine->use.mutex);
++					return ERR_PTR(ret);
++				}
++				refcount_set(&engine->use.refcount, 1);
+ 			}
++			mutex_unlock(&engine->use.mutex);
+ 		}
+-		mutex_unlock(&engine->subdev.mutex);
+ 	}
+ 	return engine;
+ }
+@@ -114,7 +119,7 @@ nvkm_engine_init(struct nvkm_subdev *subdev)
+ 	int ret = 0, i;
+ 	s64 time;
+ 
+-	if (!engine->usecount) {
++	if (!engine->use.enabled) {
+ 		nvkm_trace(subdev, "init skipped, engine has no users\n");
+ 		return ret;
+ 	}
+@@ -156,6 +161,7 @@ nvkm_engine_dtor(struct nvkm_subdev *subdev)
+ 	struct nvkm_engine *engine = nvkm_engine(subdev);
+ 	if (engine->func->dtor)
+ 		return engine->func->dtor(engine);
++	mutex_destroy(&engine->use.mutex);
+ 	return engine;
+ }
+ 
+@@ -176,6 +182,8 @@ nvkm_engine_ctor(const struct nvkm_engine_func *func,
+ {
+ 	nvkm_subdev_ctor(&nvkm_engine_func, device, index, &engine->subdev);
+ 	engine->func = func;
++	refcount_set(&engine->use.refcount, 0);
++	mutex_init(&engine->use.mutex);
+ 
+ 	if (!nvkm_boolopt(device->cfgopt, nvkm_subdev_name[index], enable)) {
+ 		nvkm_debug(&engine->subdev, "disabled\n");
+-- 
+2.25.1
+

@@ -1,0 +1,243 @@
+From 1f949e8ee50d819862a172dcf835526cbc18db5d Mon Sep 17 00:00:00 2001
+From: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Date: Wed, 10 Jun 2020 15:55:10 +0800
+Subject: [PATCH 0382/1714] drm/i915: Init lspcon after HPD in
+ intel_dp_detect()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On HP 800 G4 DM, if HDMI cable isn't plugged before boot, the HDMI port
+becomes useless and never responds to cable hotplugging:
+[    3.031904] [drm:lspcon_init [i915]] *ERROR* Failed to probe lspcon
+[    3.031945] [drm:intel_ddi_init [i915]] *ERROR* LSPCON init failed on port D
+
+Seems like the lspcon chip on the system only gets powered after the
+cable is plugged.
+
+Consilidate lspcon_init() into lspcon_resume() to dynamically init
+lspcon chip, and make HDMI port work.
+
+v6:
+ - Rebase on latest for-linux-next.
+v5:
+ - Consolidate lspcon_resume() with lspcon_init().
+ - Move more logic into lspcon code.
+v4:
+ - Trust VBT in intel_infoframe_init().
+ - Init lspcon in intel_dp_detect().
+v3:
+ - Make sure it's handled under long HPD case.
+v2:
+ - Move lspcon_init() inside of intel_dp_hpd_pulse().
+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/203
+Signed-off-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200610075542.12882-1-kai.heng.feng@canonical.com
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c    | 19 +------
+ drivers/gpu/drm/i915/display/intel_dp.c     | 10 ++--
+ drivers/gpu/drm/i915/display/intel_hdmi.c   |  2 +-
+ drivers/gpu/drm/i915/display/intel_lspcon.c | 61 ++++++++++++---------
+ drivers/gpu/drm/i915/display/intel_lspcon.h |  3 +-
+ 5 files changed, 41 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 5742394c8292..b4c520348b3b 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -5111,7 +5111,7 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ {
+ 	struct intel_digital_port *dig_port;
+ 	struct intel_encoder *encoder;
+-	bool init_hdmi, init_dp, init_lspcon = false;
++	bool init_hdmi, init_dp;
+ 	enum phy phy = intel_port_to_phy(dev_priv, port);
+ 
+ 	/*
+@@ -5137,7 +5137,6 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ 		 * is initialized before lspcon.
+ 		 */
+ 		init_dp = true;
+-		init_lspcon = true;
+ 		init_hdmi = false;
+ 		drm_dbg_kms(&dev_priv->drm, "VBT says port %c has lspcon\n",
+ 			    port_name(port));
+@@ -5238,22 +5237,6 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ 			goto err;
+ 	}
+ 
+-	if (init_lspcon) {
+-		if (lspcon_init(dig_port))
+-			/* TODO: handle hdmi info frame part */
+-			drm_dbg_kms(&dev_priv->drm,
+-				    "LSPCON init success on port %c\n",
+-				    port_name(port));
+-		else
+-			/*
+-			 * LSPCON init faied, but DP init was success, so
+-			 * lets try to drive as DP++ port.
+-			 */
+-			drm_err(&dev_priv->drm,
+-				"LSPCON init failed on port %c\n",
+-				port_name(port));
+-	}
+-
+ 	if (INTEL_GEN(dev_priv) >= 11) {
+ 		if (intel_phy_is_tc(dev_priv, phy))
+ 			dig_port->connected = intel_tc_port_connected;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 7bcd9d2c5d72..d1bf950ffe59 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -6173,15 +6173,14 @@ static enum drm_connector_status
+ intel_dp_detect_dpcd(struct intel_dp *intel_dp)
+ {
+ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
+-	struct intel_lspcon *lspcon = dp_to_lspcon(intel_dp);
++	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
+ 	u8 *dpcd = intel_dp->dpcd;
+ 	u8 type;
+ 
+ 	if (drm_WARN_ON(&i915->drm, intel_dp_is_edp(intel_dp)))
+ 		return connector_status_connected;
+ 
+-	if (lspcon->active)
+-		lspcon_resume(lspcon);
++	lspcon_resume(dig_port);
+ 
+ 	if (!intel_dp_get_dpcd(intel_dp))
+ 		return connector_status_disconnected;
+@@ -6765,14 +6764,13 @@ void intel_dp_encoder_reset(struct drm_encoder *encoder)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->dev);
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(to_intel_encoder(encoder));
+-	struct intel_lspcon *lspcon = dp_to_lspcon(intel_dp);
++	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
+ 	intel_wakeref_t wakeref;
+ 
+ 	if (!HAS_DDI(dev_priv))
+ 		intel_dp->DP = intel_de_read(dev_priv, intel_dp->output_reg);
+ 
+-	if (lspcon->active)
+-		lspcon_resume(lspcon);
++	lspcon_resume(dig_port);
+ 
+ 	intel_dp->reset_link_params = true;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index 414a46a6b5f3..8051df3d54a8 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -3215,7 +3215,7 @@ void intel_infoframe_init(struct intel_digital_port *dig_port)
+ 		dig_port->set_infoframes = g4x_set_infoframes;
+ 		dig_port->infoframes_enabled = g4x_infoframes_enabled;
+ 	} else if (HAS_DDI(dev_priv)) {
+-		if (dig_port->lspcon.active) {
++		if (intel_bios_is_lspcon_present(dev_priv, dig_port->base.port)) {
+ 			dig_port->write_infoframe = lspcon_write_infoframe;
+ 			dig_port->read_infoframe = lspcon_read_infoframe;
+ 			dig_port->set_infoframes = lspcon_set_infoframes;
+diff --git a/drivers/gpu/drm/i915/display/intel_lspcon.c b/drivers/gpu/drm/i915/display/intel_lspcon.c
+index dc1b35559afd..db2e1e938572 100644
+--- a/drivers/gpu/drm/i915/display/intel_lspcon.c
++++ b/drivers/gpu/drm/i915/display/intel_lspcon.c
+@@ -525,26 +525,6 @@ u32 lspcon_infoframes_enabled(struct intel_encoder *encoder,
+ 	return 0;
+ }
+ 
+-void lspcon_resume(struct intel_lspcon *lspcon)
+-{
+-	enum drm_lspcon_mode expected_mode;
+-
+-	if (lspcon_wake_native_aux_ch(lspcon)) {
+-		expected_mode = DRM_LSPCON_MODE_PCON;
+-		lspcon_resume_in_pcon_wa(lspcon);
+-	} else {
+-		expected_mode = DRM_LSPCON_MODE_LS;
+-	}
+-
+-	if (lspcon_wait_mode(lspcon, expected_mode) == DRM_LSPCON_MODE_PCON)
+-		return;
+-
+-	if (lspcon_change_mode(lspcon, DRM_LSPCON_MODE_PCON))
+-		DRM_ERROR("LSPCON resume failed\n");
+-	else
+-		DRM_DEBUG_KMS("LSPCON resume success\n");
+-}
+-
+ void lspcon_wait_pcon_mode(struct intel_lspcon *lspcon)
+ {
+ 	lspcon_wait_mode(lspcon, DRM_LSPCON_MODE_PCON);
+@@ -554,15 +534,8 @@ bool lspcon_init(struct intel_digital_port *dig_port)
+ {
+ 	struct intel_dp *dp = &dig_port->dp;
+ 	struct intel_lspcon *lspcon = &dig_port->lspcon;
+-	struct drm_device *dev = dig_port->base.base.dev;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct drm_connector *connector = &dp->attached_connector->base;
+ 
+-	if (!HAS_LSPCON(dev_priv)) {
+-		DRM_ERROR("LSPCON is not supported on this platform\n");
+-		return false;
+-	}
+-
+ 	lspcon->active = false;
+ 	lspcon->mode = DRM_LSPCON_MODE_INVALID;
+ 
+@@ -586,3 +559,37 @@ bool lspcon_init(struct intel_digital_port *dig_port)
+ 	DRM_DEBUG_KMS("Success: LSPCON init\n");
+ 	return true;
+ }
++
++void lspcon_resume(struct intel_digital_port *dig_port)
++{
++	struct intel_lspcon *lspcon = &dig_port->lspcon;
++	struct drm_device *dev = dig_port->base.base.dev;
++	struct drm_i915_private *dev_priv = to_i915(dev);
++	enum drm_lspcon_mode expected_mode;
++
++	if (!intel_bios_is_lspcon_present(dev_priv, dig_port->base.port))
++		return;
++
++	if (!lspcon->active) {
++		if (!lspcon_init(dig_port)) {
++			DRM_ERROR("LSPCON init failed on port %c\n",
++				  port_name(dig_port->base.port));
++			return;
++		}
++	}
++
++	if (lspcon_wake_native_aux_ch(lspcon)) {
++		expected_mode = DRM_LSPCON_MODE_PCON;
++		lspcon_resume_in_pcon_wa(lspcon);
++	} else {
++		expected_mode = DRM_LSPCON_MODE_LS;
++	}
++
++	if (lspcon_wait_mode(lspcon, expected_mode) == DRM_LSPCON_MODE_PCON)
++		return;
++
++	if (lspcon_change_mode(lspcon, DRM_LSPCON_MODE_PCON))
++		DRM_ERROR("LSPCON resume failed\n");
++	else
++		DRM_DEBUG_KMS("LSPCON resume success\n");
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_lspcon.h b/drivers/gpu/drm/i915/display/intel_lspcon.h
+index 1cffe8a42a08..0851ea30831a 100644
+--- a/drivers/gpu/drm/i915/display/intel_lspcon.h
++++ b/drivers/gpu/drm/i915/display/intel_lspcon.h
+@@ -15,8 +15,7 @@ struct intel_digital_port;
+ struct intel_encoder;
+ struct intel_lspcon;
+ 
+-bool lspcon_init(struct intel_digital_port *dig_port);
+-void lspcon_resume(struct intel_lspcon *lspcon);
++void lspcon_resume(struct intel_digital_port *dig_port);
+ void lspcon_wait_pcon_mode(struct intel_lspcon *lspcon);
+ void lspcon_write_infoframe(struct intel_encoder *encoder,
+ 			    const struct intel_crtc_state *crtc_state,
+-- 
+2.25.1
+

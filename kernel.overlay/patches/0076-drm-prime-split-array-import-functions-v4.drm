@@ -1,0 +1,297 @@
+From 8a07590bb952f1e8f08ebc14abd08d5695f8c37d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 8 Oct 2020 12:57:32 +0200
+Subject: [PATCH 0076/1087] drm/prime: split array import functions v4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mapping the imported pages of a DMA-buf into an userspace process
+doesn't work as expected.
+
+But we have reoccurring requests on this approach, so split the
+functions for this and  document that dma_buf_mmap() needs to be used
+instead.
+
+v2: split it into two functions
+v3: rebased on latest changes
+v4: update commit message a bit
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/403838/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     |  9 ++-
+ drivers/gpu/drm/drm_prime.c                 | 64 +++++++++++++--------
+ drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c |  3 +-
+ drivers/gpu/drm/mediatek/mtk_drm_gem.c      |  2 +-
+ drivers/gpu/drm/msm/msm_gem.c               |  2 +-
+ drivers/gpu/drm/nouveau/nouveau_bo.c        |  5 +-
+ drivers/gpu/drm/omapdrm/omap_gem.c          |  3 +-
+ drivers/gpu/drm/radeon/radeon_ttm.c         |  9 ++-
+ drivers/gpu/drm/vgem/vgem_drv.c             |  3 +-
+ drivers/gpu/drm/xen/xen_drm_front_gem.c     |  4 +-
+ include/drm/drm_prime.h                     |  7 ++-
+ 11 files changed, 60 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 93a379625647..9427598e7e5a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -918,8 +918,8 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_bo_device *bdev,
+ 		goto release_sg;
+ 
+ 	/* convert SG to linear array of pages and dma addresses */
+-	drm_prime_sg_to_page_addr_arrays(ttm->sg, NULL, gtt->ttm.dma_address,
+-					 ttm->num_pages);
++	drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
++				       ttm->num_pages);
+ 
+ 	return 0;
+ 
+@@ -1265,9 +1265,8 @@ static int amdgpu_ttm_tt_populate(struct ttm_bo_device *bdev,
+ 			ttm->sg = sgt;
+ 		}
+ 
+-		drm_prime_sg_to_page_addr_arrays(ttm->sg, NULL,
+-						 gtt->ttm.dma_address,
+-						 ttm->num_pages);
++		drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
++					       ttm->num_pages);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 7db55fce35d8..683aa29ecd3b 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -978,44 +978,58 @@ struct drm_gem_object *drm_gem_prime_import(struct drm_device *dev,
+ EXPORT_SYMBOL(drm_gem_prime_import);
+ 
+ /**
+- * drm_prime_sg_to_page_addr_arrays - convert an sg table into a page array
++ * drm_prime_sg_to_page_array - convert an sg table into a page array
+  * @sgt: scatter-gather table to convert
+- * @pages: optional array of page pointers to store the page array in
+- * @addrs: optional array to store the dma bus address of each page
++ * @pages: array of page pointers to store the pages in
++ * @max_entries: size of the passed-in array
++ *
++ * Exports an sg table into an array of pages.
++ *
++ * This function is deprecated and strongly discouraged to be used.
++ * The page array is only useful for page faults and those can corrupt fields
++ * in the struct page if they are not handled by the exporting driver.
++ */
++int __deprecated drm_prime_sg_to_page_array(struct sg_table *sgt,
++					    struct page **pages,
++					    int max_entries)
++{
++	struct sg_page_iter page_iter;
++	struct page **p = pages;
++
++	for_each_sgtable_page(sgt, &page_iter, 0) {
++		if (WARN_ON(p - pages >= max_entries))
++			return -1;
++		*p++ = sg_page_iter_page(&page_iter);
++	}
++	return 0;
++}
++EXPORT_SYMBOL(drm_prime_sg_to_page_array);
++
++/**
++ * drm_prime_sg_to_dma_addr_array - convert an sg table into a dma addr array
++ * @sgt: scatter-gather table to convert
++ * @addrs: array to store the dma bus address of each page
+  * @max_entries: size of both the passed-in arrays
+  *
+- * Exports an sg table into an array of pages and addresses. This is currently
+- * required by the TTM driver in order to do correct fault handling.
++ * Exports an sg table into an array of addresses.
+  *
+- * Drivers can use this in their &drm_driver.gem_prime_import_sg_table
++ * Drivers should use this in their &drm_driver.gem_prime_import_sg_table
+  * implementation.
+  */
+-int drm_prime_sg_to_page_addr_arrays(struct sg_table *sgt, struct page **pages,
+-				     dma_addr_t *addrs, int max_entries)
++int drm_prime_sg_to_dma_addr_array(struct sg_table *sgt, dma_addr_t *addrs,
++				   int max_entries)
+ {
+ 	struct sg_dma_page_iter dma_iter;
+-	struct sg_page_iter page_iter;
+-	struct page **p = pages;
+ 	dma_addr_t *a = addrs;
+ 
+-	if (pages) {
+-		for_each_sgtable_page(sgt, &page_iter, 0) {
+-			if (WARN_ON(p - pages >= max_entries))
+-				return -1;
+-			*p++ = sg_page_iter_page(&page_iter);
+-		}
+-	}
+-	if (addrs) {
+-		for_each_sgtable_dma_page(sgt, &dma_iter, 0) {
+-			if (WARN_ON(a - addrs >= max_entries))
+-				return -1;
+-			*a++ = sg_page_iter_dma_address(&dma_iter);
+-		}
++	for_each_sgtable_dma_page(sgt, &dma_iter, 0) {
++		if (WARN_ON(a - addrs >= max_entries))
++			return -1;
++		*a++ = sg_page_iter_dma_address(&dma_iter);
+ 	}
+-
+ 	return 0;
+ }
+-EXPORT_SYMBOL(drm_prime_sg_to_page_addr_arrays);
++EXPORT_SYMBOL(drm_prime_sg_to_dma_addr_array);
+ 
+ /**
+  * drm_prime_gem_destroy - helper to clean up a PRIME-imported GEM object
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c b/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
+index d9bd83203a15..b390dd4d60b7 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
+@@ -135,8 +135,7 @@ struct drm_gem_object *etnaviv_gem_prime_import_sg_table(struct drm_device *dev,
+ 		goto fail;
+ 	}
+ 
+-	ret = drm_prime_sg_to_page_addr_arrays(sgt, etnaviv_obj->pages,
+-					       NULL, npages);
++	ret = drm_prime_sg_to_page_array(sgt, etnaviv_obj->pages, npages);
+ 	if (ret)
+ 		goto fail;
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_gem.c b/drivers/gpu/drm/mediatek/mtk_drm_gem.c
+index 28a2ee1336ef..280ea0d5e840 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_gem.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_gem.c
+@@ -260,7 +260,7 @@ int mtk_drm_gem_prime_vmap(struct drm_gem_object *obj, struct dma_buf_map *map)
+ 		return -ENOMEM;
+ 	}
+ 
+-	drm_prime_sg_to_page_addr_arrays(sgt, mtk_gem->pages, NULL, npages);
++	drm_prime_sg_to_page_array(sgt, mtk_gem->pages, npages);
+ 
+ 	mtk_gem->kvaddr = vmap(mtk_gem->pages, npages, VM_MAP,
+ 			       pgprot_writecombine(PAGE_KERNEL));
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index 9a7c49bc394f..45e23125dfdb 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -1211,7 +1211,7 @@ struct drm_gem_object *msm_gem_import(struct drm_device *dev,
+ 		goto fail;
+ 	}
+ 
+-	ret = drm_prime_sg_to_page_addr_arrays(sgt, msm_obj->pages, NULL, npages);
++	ret = drm_prime_sg_to_page_array(sgt, msm_obj->pages, npages);
+ 	if (ret) {
+ 		msm_gem_unlock(obj);
+ 		goto fail;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index fae3c869b05f..2ca04223fde1 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1232,9 +1232,8 @@ nouveau_ttm_tt_populate(struct ttm_bo_device *bdev,
+ 		return 0;
+ 
+ 	if (slave && ttm->sg) {
+-		drm_prime_sg_to_page_addr_arrays(ttm->sg, NULL,
+-						 ttm_dma->dma_address,
+-						 ttm->num_pages);
++		drm_prime_sg_to_dma_addr_array(ttm->sg, ttm_dma->dma_address,
++					       ttm->num_pages);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/omapdrm/omap_gem.c b/drivers/gpu/drm/omapdrm/omap_gem.c
+index 30d299ca8795..38af6195d959 100644
+--- a/drivers/gpu/drm/omapdrm/omap_gem.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem.c
+@@ -1324,8 +1324,7 @@ struct drm_gem_object *omap_gem_new_dmabuf(struct drm_device *dev, size_t size,
+ 		}
+ 
+ 		omap_obj->pages = pages;
+-		ret = drm_prime_sg_to_page_addr_arrays(sgt, pages, NULL,
+-						       npages);
++		ret = drm_prime_sg_to_page_array(sgt, pages, npages);
+ 		if (ret) {
+ 			omap_gem_free_object(obj);
+ 			obj = ERR_PTR(-ENOMEM);
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index e44b2f03185e..49e7d06898cd 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -396,8 +396,8 @@ static int radeon_ttm_tt_pin_userptr(struct ttm_bo_device *bdev, struct ttm_tt *
+ 	if (r)
+ 		goto release_sg;
+ 
+-	drm_prime_sg_to_page_addr_arrays(ttm->sg, NULL, gtt->ttm.dma_address,
+-					 ttm->num_pages);
++	drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
++				       ttm->num_pages);
+ 
+ 	return 0;
+ 
+@@ -573,9 +573,8 @@ static int radeon_ttm_tt_populate(struct ttm_bo_device *bdev,
+ 	}
+ 
+ 	if (slave && ttm->sg) {
+-		drm_prime_sg_to_page_addr_arrays(ttm->sg, NULL,
+-						 gtt->ttm.dma_address,
+-						 ttm->num_pages);
++		drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
++					       ttm->num_pages);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/vgem/vgem_drv.c b/drivers/gpu/drm/vgem/vgem_drv.c
+index f8635ccaf9a1..a0e75f1d5d01 100644
+--- a/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -356,8 +356,7 @@ static struct drm_gem_object *vgem_prime_import_sg_table(struct drm_device *dev,
+ 	}
+ 
+ 	obj->pages_pin_count++; /* perma-pinned */
+-	drm_prime_sg_to_page_addr_arrays(obj->table, obj->pages, NULL,
+-					npages);
++	drm_prime_sg_to_page_array(obj->table, obj->pages, npages);
+ 	return &obj->base;
+ }
+ 
+diff --git a/drivers/gpu/drm/xen/xen_drm_front_gem.c b/drivers/gpu/drm/xen/xen_drm_front_gem.c
+index 74db5a840bed..b293c67230ef 100644
+--- a/drivers/gpu/drm/xen/xen_drm_front_gem.c
++++ b/drivers/gpu/drm/xen/xen_drm_front_gem.c
+@@ -220,8 +220,8 @@ xen_drm_front_gem_import_sg_table(struct drm_device *dev,
+ 
+ 	xen_obj->sgt_imported = sgt;
+ 
+-	ret = drm_prime_sg_to_page_addr_arrays(sgt, xen_obj->pages,
+-					       NULL, xen_obj->num_pages);
++	ret = drm_prime_sg_to_page_array(sgt, xen_obj->pages,
++					 xen_obj->num_pages);
+ 	if (ret < 0)
+ 		return ERR_PTR(ret);
+ 
+diff --git a/include/drm/drm_prime.h b/include/drm/drm_prime.h
+index 0991a47a1567..54f2c58305d2 100644
+--- a/include/drm/drm_prime.h
++++ b/include/drm/drm_prime.h
+@@ -105,8 +105,9 @@ struct drm_gem_object *drm_gem_prime_import(struct drm_device *dev,
+ 
+ void drm_prime_gem_destroy(struct drm_gem_object *obj, struct sg_table *sg);
+ 
+-int drm_prime_sg_to_page_addr_arrays(struct sg_table *sgt, struct page **pages,
+-				     dma_addr_t *addrs, int max_pages);
+-
++int drm_prime_sg_to_page_array(struct sg_table *sgt, struct page **pages,
++			       int max_pages);
++int drm_prime_sg_to_dma_addr_array(struct sg_table *sgt, dma_addr_t *addrs,
++				   int max_pages);
+ 
+ #endif /* __DRM_PRIME_H__ */
+-- 
+2.17.1
+

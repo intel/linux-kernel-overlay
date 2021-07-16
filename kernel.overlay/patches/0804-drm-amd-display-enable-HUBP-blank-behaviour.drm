@@ -1,0 +1,170 @@
+From b83ee963fd50e6350c1e5fd712dac8e7cb8a7a30 Mon Sep 17 00:00:00 2001
+From: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Date: Wed, 16 Dec 2020 13:52:19 -0500
+Subject: [PATCH 0804/1087] drm/amd/display: enable HUBP blank behaviour
+
+- Reverts "drm/amd/display: Revert HUBP blank behaviour for now"
+- Hubp blank will fail if the pipe is locked (this is the case on
+linux), so add a check to make sure pipe isn't locked, if it is then
+defer the blank to post_unlock.
+
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_optc.c | 11 +++++++++
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_optc.h |  1 +
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    |  8 +++++++
+ .../drm/amd/display/dc/dcn30/dcn30_hwseq.c    | 23 +++++++++++++++++--
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_optc.c |  1 +
+ .../dc/dml/dcn30/display_mode_vba_30.c        |  2 +-
+ .../gpu/drm/amd/display/dc/inc/core_types.h   |  1 +
+ .../amd/display/dc/inc/hw/timing_generator.h  |  1 +
+ 8 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.c
+index f033397a84e9..6138f4887de7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.c
+@@ -659,6 +659,16 @@ void optc1_unlock(struct timing_generator *optc)
+ 			OTG_MASTER_UPDATE_LOCK, 0);
+ }
+ 
++bool optc1_is_locked(struct timing_generator *optc)
++{
++	struct optc *optc1 = DCN10TG_FROM_TG(optc);
++	uint32_t locked;
++
++	REG_GET(OTG_MASTER_UPDATE_LOCK, UPDATE_LOCK_STATUS, &locked);
++
++	return (locked == 1);
++}
++
+ void optc1_get_position(struct timing_generator *optc,
+ 		struct crtc_position *position)
+ {
+@@ -1513,6 +1523,7 @@ static const struct timing_generator_funcs dcn10_tg_funcs = {
+ 		.enable_crtc_reset = optc1_enable_crtc_reset,
+ 		.disable_reset_trigger = optc1_disable_reset_trigger,
+ 		.lock = optc1_lock,
++		.is_locked = optc1_is_locked,
+ 		.unlock = optc1_unlock,
+ 		.enable_optc_clock = optc1_enable_optc_clock,
+ 		.set_drr = optc1_set_drr,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.h
+index b12bd9aae52f..b222c67973d4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_optc.h
+@@ -638,6 +638,7 @@ void optc1_set_blank(struct timing_generator *optc,
+ 		bool enable_blanking);
+ 
+ bool optc1_is_blanked(struct timing_generator *optc);
++bool optc1_is_locked(struct timing_generator *optc);
+ 
+ void optc1_program_blank_color(
+ 		struct timing_generator *optc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index b74f79575cdf..18653c423c96 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -1765,6 +1765,14 @@ void dcn20_post_unlock_program_front_end(
+ 		}
+ 	}
+ 
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (pipe->vtp_locked) {
++			dc->hwss.set_hubp_blank(dc, pipe, true);
++			pipe->vtp_locked = false;
++		}
++	}
+ 	/* WA to apply WM setting*/
+ 	if (hwseq->wa.DEGVIDCN21)
+ 		dc->res_pool->hubbub->funcs->apply_DEDCN21_147_wa(dc->res_pool->hubbub);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+index 7f26c9444933..e5cc8f8c363f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+@@ -891,6 +891,25 @@ void dcn30_set_disp_pattern_generator(const struct dc *dc,
+ 		const struct tg_color *solid_color,
+ 		int width, int height, int offset)
+ {
+-	pipe_ctx->stream_res.opp->funcs->opp_set_disp_pattern_generator(pipe_ctx->stream_res.opp, test_pattern,
+-			color_space, color_depth, solid_color, width, height, offset);
++	struct stream_resource *stream_res = &pipe_ctx->stream_res;
++
++	if (test_pattern != CONTROLLER_DP_TEST_PATTERN_VIDEOMODE) {
++		pipe_ctx->vtp_locked = false;
++		/* turning on DPG */
++		stream_res->opp->funcs->opp_set_disp_pattern_generator(stream_res->opp, test_pattern, color_space,
++				color_depth, solid_color, width, height, offset);
++
++		/* Defer hubp blank if tg is locked */
++		if (stream_res->tg->funcs->is_tg_enabled(stream_res->tg)) {
++			if (stream_res->tg->funcs->is_locked(stream_res->tg))
++				pipe_ctx->vtp_locked = true;
++			else
++				dc->hwss.set_hubp_blank(dc, pipe_ctx, true);
++		}
++	} else {
++		dc->hwss.set_hubp_blank(dc, pipe_ctx, false);
++		/* turning off DPG */
++		stream_res->opp->funcs->opp_set_disp_pattern_generator(stream_res->opp, test_pattern, color_space,
++				color_depth, solid_color, width, height, offset);
++	}
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_optc.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_optc.c
+index 3ba3991ee612..8980c90b2277 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_optc.c
+@@ -309,6 +309,7 @@ static struct timing_generator_funcs dcn30_tg_funcs = {
+ 		.enable_crtc_reset = optc1_enable_crtc_reset,
+ 		.disable_reset_trigger = optc1_disable_reset_trigger,
+ 		.lock = optc3_lock,
++		.is_locked = optc1_is_locked,
+ 		.unlock = optc1_unlock,
+ 		.lock_doublebuffer_enable = optc3_lock_doublebuffer_enable,
+ 		.lock_doublebuffer_disable = optc3_lock_doublebuffer_disable,
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c b/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
+index 319dec59bcd1..1fe3fb14afd4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
+@@ -5558,7 +5558,7 @@ static void CalculateWatermarksAndDRAMSpeedChangeSupport(
+ 		}
+ 	}
+ 
+-	if (mode_lib->vba.MinActiveDRAMClockChangeMargin > 0 && PrefetchMode == 0) {
++	if (mode_lib->vba.MinActiveDRAMClockChangeMargin > 0) {
+ 		*DRAMClockChangeSupport = dm_dram_clock_change_vactive;
+ 	} else if (((mode_lib->vba.SynchronizedVBlank == true || mode_lib->vba.TotalNumberOfActiveOTG == 1 || SecondMinActiveDRAMClockChangeMarginOneDisplayInVBLank > 0) && PrefetchMode == 0)) {
+ 		*DRAMClockChangeSupport = dm_dram_clock_change_vblank;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 2d77eac66cb0..8efa1b80546d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -333,6 +333,7 @@ struct pipe_ctx {
+ 	union pipe_update_flags update_flags;
+ 	struct dwbc *dwbc;
+ 	struct mcif_wb *mcif_wb;
++	bool vtp_locked;
+ };
+ 
+ struct resource_context {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index f7632fe25976..754832d216fd 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -190,6 +190,7 @@ struct timing_generator_funcs {
+ 	void (*set_blank)(struct timing_generator *tg,
+ 					bool enable_blanking);
+ 	bool (*is_blanked)(struct timing_generator *tg);
++	bool (*is_locked)(struct timing_generator *tg);
+ 	void (*set_overscan_blank_color) (struct timing_generator *tg, const struct tg_color *color);
+ 	void (*set_blank_color)(struct timing_generator *tg, const struct tg_color *color);
+ 	void (*set_colors)(struct timing_generator *tg,
+-- 
+2.17.1
+

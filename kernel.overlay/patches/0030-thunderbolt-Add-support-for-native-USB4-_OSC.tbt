@@ -1,0 +1,257 @@
+From e6c8410b6dc3221c0f30b6f8fb66b808efc3a085 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 18 Feb 2020 16:14:42 +0200
+Subject: [PATCH 30/38] thunderbolt: Add support for native USB4 _OSC
+
+ACPI 6.4 introduced a new _OSC capability used to negotiate whether the
+OS is supposed to use Software (native) or Firmware based Connection
+Manager. If the native support is granted then there are set of bits
+that enable/disable different tunnel types that the Software Connection
+Manager is allowed to tunnel.
+
+This adds support for this new USB4 _OSC accordingly. When PCIe
+tunneling is disabled then the driver switches security level to be
+"nopcie" following the security level 5 used in Firmware based
+Connection Manager.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/acpi.c   | 52 ++++++++++++++++++++++++++++++++++++
+ drivers/thunderbolt/nhi.c    | 27 ++++++++++++++++---
+ drivers/thunderbolt/tb.c     | 19 ++++++++++++-
+ drivers/thunderbolt/tb.h     | 10 +++++++
+ drivers/thunderbolt/tunnel.c | 10 ++++---
+ drivers/thunderbolt/usb4.c   | 11 +++++---
+ 6 files changed, 118 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/thunderbolt/acpi.c b/drivers/thunderbolt/acpi.c
+index b5442f979b4d..e270ebd4f4e2 100644
+--- a/drivers/thunderbolt/acpi.c
++++ b/drivers/thunderbolt/acpi.c
+@@ -115,3 +115,55 @@ void tb_acpi_add_links(struct tb_nhi *nhi)
+ 	if (ACPI_FAILURE(status))
+ 		dev_warn(&nhi->pdev->dev, "failed to enumerate tunneled ports\n");
+ }
++
++/**
++ * tb_acpi_is_native() - Did the platform grant native TBT/USB4 control
++ *
++ * Returns %true if the platform granted OS native control over
++ * TBT/USB4. In this case software based connection manager can be used,
++ * otherwise there is firmware based connection manager running.
++ */
++bool tb_acpi_is_native(void)
++{
++	return osc_sb_native_usb4_support_confirmed &&
++	       osc_sb_native_usb4_control;
++}
++
++/**
++ * tb_acpi_may_tunnel_usb3() - Is USB3 tunneling allowed by the platform
++ *
++ * When software based connection manager is used, this function
++ * returns %true if platform allows native USB3 tunneling.
++ */
++bool tb_acpi_may_tunnel_usb3(void)
++{
++	if (tb_acpi_is_native())
++		return osc_sb_native_usb4_control & OSC_USB_USB3_TUNNELING;
++	return true;
++}
++
++/**
++ * tb_acpi_may_tunnel_dp() - Is DisplayPort tunneling allowed by the platform
++ *
++ * When software based connection manager is used, this function
++ * returns %true if platform allows native DP tunneling.
++ */
++bool tb_acpi_may_tunnel_dp(void)
++{
++	if (tb_acpi_is_native())
++		return osc_sb_native_usb4_control & OSC_USB_DP_TUNNELING;
++	return true;
++}
++
++/**
++ * tb_acpi_may_tunnel_pcie() - Is PCIe tunneling allowed by the platform
++ *
++ * When software based connection manager is used, this function
++ * returns %true if platform allows native PCIe tunneling.
++ */
++bool tb_acpi_may_tunnel_pcie(void)
++{
++	if (tb_acpi_is_native())
++		return osc_sb_native_usb4_control & OSC_USB_PCIE_TUNNELING;
++	return true;
++}
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index cfc622da4f83..2ea953c853bd 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -1188,6 +1188,29 @@ static void tb_apple_add_links(struct tb_nhi *nhi)
+ 	}
+ }
+ 
++static struct tb *nhi_select_cm(struct tb_nhi *nhi)
++{
++	struct tb *tb;
++
++	/*
++	 * USB4 case is simple. If we got control of any of the
++	 * capabilities, we use software CM.
++	 */
++	if (tb_acpi_is_native())
++		return tb_probe(nhi);
++
++	/*
++	 * Either firmware based CM is running (we did not get control
++	 * from the firmware) or this is pre-USB4 PC so try first
++	 * firmware CM and then fallback to software CM.
++	 */
++	tb = icm_probe(nhi);
++	if (!tb)
++		tb = tb_probe(nhi);
++
++	return tb;
++}
++
+ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct tb_nhi *nhi;
+@@ -1256,9 +1279,7 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	tb_apple_add_links(nhi);
+ 	tb_acpi_add_links(nhi);
+ 
+-	tb = icm_probe(nhi);
+-	if (!tb)
+-		tb = tb_probe(nhi);
++	tb = nhi_select_cm(nhi);
+ 	if (!tb) {
+ 		dev_err(&nhi->pdev->dev,
+ 			"failed to determine connection manager, aborting\n");
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 91eaeaa35713..a88af1c4dc44 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -437,6 +437,11 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
+ 	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_tunnel *tunnel;
+ 
++	if (!tb_acpi_may_tunnel_usb3()) {
++		tb_dbg(tb, "USB3 tunneling disabled, not creating tunnel\n");
++		return 0;
++	}
++
+ 	up = tb_switch_find_port(sw, TB_TYPE_USB3_UP);
+ 	if (!up)
+ 		return 0;
+@@ -512,6 +517,9 @@ static int tb_create_usb3_tunnels(struct tb_switch *sw)
+ 	struct tb_port *port;
+ 	int ret;
+ 
++	if (!tb_acpi_may_tunnel_usb3())
++		return 0;
++
+ 	if (tb_route(sw)) {
+ 		ret = tb_tunnel_usb3(sw->tb, sw);
+ 		if (ret)
+@@ -841,6 +849,11 @@ static void tb_tunnel_dp(struct tb *tb)
+ 	struct tb_port *port, *in, *out;
+ 	struct tb_tunnel *tunnel;
+ 
++	if (!tb_acpi_may_tunnel_dp()) {
++		tb_dbg(tb, "DP tunneling disabled, not creating tunnel\n");
++		return;
++	}
++
+ 	/*
+ 	 * Find pair of inactive DP IN and DP OUT adapters and then
+ 	 * establish a DP tunnel between them.
+@@ -1549,7 +1562,11 @@ struct tb *tb_probe(struct tb_nhi *nhi)
+ 	if (!tb)
+ 		return NULL;
+ 
+-	tb->security_level = TB_SECURITY_USER;
++	if (tb_acpi_may_tunnel_pcie())
++		tb->security_level = TB_SECURITY_USER;
++	else
++		tb->security_level = TB_SECURITY_NOPCIE;
++
+ 	tb->cm_ops = &tb_cm_ops;
+ 
+ 	tcm = tb_priv(tb);
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 33cddfa5b408..c317b1f2f389 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -1040,8 +1040,18 @@ void tb_check_quirks(struct tb_switch *sw);
+ 
+ #ifdef CONFIG_ACPI
+ void tb_acpi_add_links(struct tb_nhi *nhi);
++
++bool tb_acpi_is_native(void);
++bool tb_acpi_may_tunnel_usb3(void);
++bool tb_acpi_may_tunnel_dp(void);
++bool tb_acpi_may_tunnel_pcie(void);
+ #else
+ static inline void tb_acpi_add_links(struct tb_nhi *nhi) { }
++
++static inline bool tb_acpi_is_native(void) { return true; }
++static inline bool tb_acpi_may_tunnel_usb3(void) { return true; }
++static inline bool tb_acpi_may_tunnel_dp(void) { return true; }
++static inline bool tb_acpi_may_tunnel_pcie(void) { return true; }
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_FS
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index dcdf9c7a9cae..5d3110e604bc 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -932,12 +932,14 @@ static int tb_usb3_activate(struct tb_tunnel *tunnel, bool activate)
+ static int tb_usb3_consumed_bandwidth(struct tb_tunnel *tunnel,
+ 		int *consumed_up, int *consumed_down)
+ {
++	int pcie_enabled = tb_acpi_may_tunnel_pcie();
++
+ 	/*
+-	 * PCIe tunneling affects the USB3 bandwidth so take that it
+-	 * into account here.
++	 * PCIe tunneling, if enabled, affects the USB3 bandwidth so
++	 * take that it into account here.
+ 	 */
+-	*consumed_up = tunnel->allocated_up * (3 + 1) / 3;
+-	*consumed_down = tunnel->allocated_down * (3 + 1) / 3;
++	*consumed_up = tunnel->allocated_up * (3 + pcie_enabled) / 3;
++	*consumed_down = tunnel->allocated_down * (3 + pcie_enabled) / 3;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/thunderbolt/usb4.c b/drivers/thunderbolt/usb4.c
+index 67a2867382ed..680bc738dd66 100644
+--- a/drivers/thunderbolt/usb4.c
++++ b/drivers/thunderbolt/usb4.c
+@@ -331,13 +331,18 @@ int usb4_switch_setup(struct tb_switch *sw)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (sw->link_usb4 && tb_switch_find_port(parent, TB_TYPE_USB3_DOWN)) {
++	if (tb_acpi_may_tunnel_usb3() && sw->link_usb4 &&
++	    tb_switch_find_port(parent, TB_TYPE_USB3_DOWN)) {
+ 		val |= ROUTER_CS_5_UTO;
+ 		xhci = false;
+ 	}
+ 
+-	/* Only enable PCIe tunneling if the parent router supports it */
+-	if (tb_switch_find_port(parent, TB_TYPE_PCIE_DOWN)) {
++	/*
++	 * Only enable PCIe tunneling if the parent router supports it
++	 * and it is not disabled.
++	 */
++	if (tb_acpi_may_tunnel_pcie() &&
++	    tb_switch_find_port(parent, TB_TYPE_PCIE_DOWN)) {
+ 		val |= ROUTER_CS_5_PTO;
+ 		/*
+ 		 * xHCI can be enabled if PCIe tunneling is supported
+-- 
+2.25.1
+

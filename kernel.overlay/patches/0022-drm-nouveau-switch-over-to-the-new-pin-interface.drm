@@ -1,0 +1,168 @@
+From 24023769c71e8875d766c426665fd3e6926b04b2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 21 Sep 2020 15:37:12 +0200
+Subject: [PATCH 0022/1714] drm/nouveau: switch over to the new pin interface
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stop using TTM_PL_FLAG_NO_EVICT.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Huang Rui <ray.huang@amd.com>
+Link: https://patchwork.freedesktop.org/patch/391606/?series=81973&rev=1
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c   | 48 +++++++-------------------
+ drivers/gpu/drm/nouveau/nouveau_bo.h   |  3 --
+ drivers/gpu/drm/nouveau/nouveau_chan.c |  2 +-
+ 3 files changed, 13 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 74fc90f22194..83da72937060 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -139,7 +139,7 @@ nouveau_bo_del_ttm(struct ttm_buffer_object *bo)
+ 	struct drm_device *dev = drm->dev;
+ 	struct nouveau_bo *nvbo = nouveau_bo(bo);
+ 
+-	WARN_ON(nvbo->pin_refcnt > 0);
++	WARN_ON(nvbo->bo.pin_count > 0);
+ 	nouveau_bo_del_io_reserve_lru(bo);
+ 	nv10_bo_put_tile_region(dev, nvbo->tile, NULL);
+ 
+@@ -416,9 +416,8 @@ nouveau_bo_placement_set(struct nouveau_bo *nvbo, uint32_t domain,
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(nvbo->bo.bdev);
+ 	struct ttm_placement *pl = &nvbo->placement;
+-	uint32_t flags = (nvbo->force_coherent ? TTM_PL_FLAG_UNCACHED :
+-						 TTM_PL_MASK_CACHING) |
+-			 (nvbo->pin_refcnt ? TTM_PL_FLAG_NO_EVICT : 0);
++	uint32_t flags = nvbo->force_coherent ? TTM_PL_FLAG_UNCACHED :
++						TTM_PL_MASK_CACHING;
+ 
+ 	pl->placement = nvbo->placements;
+ 	set_placement_list(drm, nvbo->placements, &pl->num_placement,
+@@ -452,7 +451,7 @@ nouveau_bo_pin(struct nouveau_bo *nvbo, uint32_t domain, bool contig)
+ 		}
+ 	}
+ 
+-	if (nvbo->pin_refcnt) {
++	if (nvbo->bo.pin_count) {
+ 		bool error = evict;
+ 
+ 		switch (bo->mem.mem_type) {
+@@ -471,7 +470,7 @@ nouveau_bo_pin(struct nouveau_bo *nvbo, uint32_t domain, bool contig)
+ 				 bo->mem.mem_type, domain);
+ 			ret = -EBUSY;
+ 		}
+-		nvbo->pin_refcnt++;
++		ttm_bo_pin(&nvbo->bo);
+ 		goto out;
+ 	}
+ 
+@@ -482,18 +481,12 @@ nouveau_bo_pin(struct nouveau_bo *nvbo, uint32_t domain, bool contig)
+ 			goto out;
+ 	}
+ 
+-	nvbo->pin_refcnt++;
+ 	nouveau_bo_placement_set(nvbo, domain, 0);
+-
+-	/* drop pin_refcnt temporarily, so we don't trip the assertion
+-	 * in nouveau_bo_move() that makes sure we're not trying to
+-	 * move a pinned buffer
+-	 */
+-	nvbo->pin_refcnt--;
+ 	ret = nouveau_bo_validate(nvbo, false, false);
+ 	if (ret)
+ 		goto out;
+-	nvbo->pin_refcnt++;
++
++	ttm_bo_pin(&nvbo->bo);
+ 
+ 	switch (bo->mem.mem_type) {
+ 	case TTM_PL_VRAM:
+@@ -518,30 +511,14 @@ nouveau_bo_unpin(struct nouveau_bo *nvbo)
+ {
+ 	struct nouveau_drm *drm = nouveau_bdev(nvbo->bo.bdev);
+ 	struct ttm_buffer_object *bo = &nvbo->bo;
+-	int ret, ref;
++	int ret;
+ 
+ 	ret = ttm_bo_reserve(bo, false, false, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+-	ref = --nvbo->pin_refcnt;
+-	WARN_ON_ONCE(ref < 0);
+-	if (ref)
+-		goto out;
+-
+-	switch (bo->mem.mem_type) {
+-	case TTM_PL_VRAM:
+-		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_VRAM, 0);
+-		break;
+-	case TTM_PL_TT:
+-		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_GART, 0);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	ret = nouveau_bo_validate(nvbo, false, false);
+-	if (ret == 0) {
++	ttm_bo_unpin(&nvbo->bo);
++	if (!nvbo->bo.pin_count) {
+ 		switch (bo->mem.mem_type) {
+ 		case TTM_PL_VRAM:
+ 			drm->gem.vram_available += bo->mem.size;
+@@ -554,9 +531,8 @@ nouveau_bo_unpin(struct nouveau_bo *nvbo)
+ 		}
+ 	}
+ 
+-out:
+ 	ttm_bo_unreserve(bo);
+-	return ret;
++	return 0;
+ }
+ 
+ int
+@@ -1065,7 +1041,7 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (nvbo->pin_refcnt)
++	if (nvbo->bo.pin_count)
+ 		NV_WARN(drm, "Moving pinned object %p!\n", nvbo);
+ 
+ 	if (drm->client.device.info.family < NV_DEVICE_INFO_V0_TESLA) {
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.h b/drivers/gpu/drm/nouveau/nouveau_bo.h
+index 2a23c8207436..ff68ded8d590 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.h
+@@ -40,9 +40,6 @@ struct nouveau_bo {
+ 
+ 	struct nouveau_drm_tile *tile;
+ 
+-	/* protect by the ttm reservation lock */
+-	int pin_refcnt;
+-
+ 	struct ttm_bo_kmap_obj dma_buf_vmap;
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_chan.c b/drivers/gpu/drm/nouveau/nouveau_chan.c
+index 8f099601d2f2..5d191e58edf1 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.c
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.c
+@@ -107,7 +107,7 @@ nouveau_channel_del(struct nouveau_channel **pchan)
+ 		nvif_object_dtor(&chan->push.ctxdma);
+ 		nouveau_vma_del(&chan->push.vma);
+ 		nouveau_bo_unmap(chan->push.buffer);
+-		if (chan->push.buffer && chan->push.buffer->pin_refcnt)
++		if (chan->push.buffer && chan->push.buffer->bo.pin_count)
+ 			nouveau_bo_unpin(chan->push.buffer);
+ 		nouveau_bo_ref(NULL, &chan->push.buffer);
+ 		kfree(chan);
+-- 
+2.25.1
+

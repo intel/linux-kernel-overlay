@@ -1,0 +1,160 @@
+From b3c9c38c70546198f43f63545886f750d87c70ec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:11 +0200
+Subject: [PATCH 087/330] drm/i915: Implement async flips for vlv/chv
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add support for async flips on vlv/chv. Unlike all the other
+platforms vlv/chv do not use the async flip bit in DSPCNTR and
+instead we select between async vs. sync flips based on the
+surface address register. The normal DSPSURF generates sync
+flips DSPADDR_VLV generates async flips. And as usual the
+interrupt bits are different from the other platforms.
+
+Cc: Karthik B S <karthik.b.s@intel.com>
+Cc: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-12-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c    | 49 ++++++++++++++++++--
+ drivers/gpu/drm/i915/display/intel_display.c |  4 +-
+ drivers/gpu/drm/i915/i915_irq.c              |  3 ++
+ drivers/gpu/drm/i915/i915_reg.h              |  2 +
+ 4 files changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index 488ed01bb342..d30374df67f0 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -517,6 +517,23 @@ g4x_primary_async_flip(struct intel_plane *plane,
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ }
+ 
++static void
++vlv_primary_async_flip(struct intel_plane *plane,
++		       const struct intel_crtc_state *crtc_state,
++		       const struct intel_plane_state *plane_state,
++		       bool async_flip)
++{
++	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++	u32 dspaddr_offset = plane_state->color_plane[0].offset;
++	enum i9xx_plane_id i9xx_plane = plane->i9xx_plane;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	intel_de_write_fw(dev_priv, DSPADDR_VLV(i9xx_plane),
++			  intel_plane_ggtt_offset(plane_state) + dspaddr_offset);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++}
++
+ static void
+ bdw_primary_enable_flip_done(struct intel_plane *plane)
+ {
+@@ -579,6 +596,28 @@ ilk_primary_disable_flip_done(struct intel_plane *plane)
+ 	spin_unlock_irq(&i915->irq_lock);
+ }
+ 
++static void
++vlv_primary_enable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	i915_enable_pipestat(i915, pipe, PLANE_FLIP_DONE_INT_STATUS_VLV);
++	spin_unlock_irq(&i915->irq_lock);
++}
++
++static void
++vlv_primary_disable_flip_done(struct intel_plane *plane)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	spin_lock_irq(&i915->irq_lock);
++	i915_disable_pipestat(i915, pipe, PLANE_FLIP_DONE_INT_STATUS_VLV);
++	spin_unlock_irq(&i915->irq_lock);
++}
++
+ static bool i9xx_plane_get_hw_state(struct intel_plane *plane,
+ 				    enum pipe *pipe)
+ {
+@@ -792,16 +831,20 @@ intel_primary_plane_create(struct drm_i915_private *dev_priv, enum pipe pipe)
+ 	plane->get_hw_state = i9xx_plane_get_hw_state;
+ 	plane->check_plane = i9xx_plane_check;
+ 
+-	if (IS_BROADWELL(dev_priv)) {
++	if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) {
++		plane->async_flip = vlv_primary_async_flip;
++		plane->enable_flip_done = vlv_primary_enable_flip_done;
++		plane->disable_flip_done = vlv_primary_disable_flip_done;
++	} else if (IS_BROADWELL(dev_priv)) {
+ 		plane->need_async_flip_disable_wa = true;
+ 		plane->async_flip = g4x_primary_async_flip;
+ 		plane->enable_flip_done = bdw_primary_enable_flip_done;
+ 		plane->disable_flip_done = bdw_primary_disable_flip_done;
+-	} else if (IS_HASWELL(dev_priv) || IS_IVYBRIDGE(dev_priv)) {
++	} else if (INTEL_GEN(dev_priv) >= 7) {
+ 		plane->async_flip = g4x_primary_async_flip;
+ 		plane->enable_flip_done = ivb_primary_enable_flip_done;
+ 		plane->disable_flip_done = ivb_primary_disable_flip_done;
+-	} else if (IS_GEN_RANGE(dev_priv, 5, 6)) {
++	} else if (INTEL_GEN(dev_priv) >= 5) {
+ 		plane->async_flip = g4x_primary_async_flip;
+ 		plane->enable_flip_done = ilk_primary_enable_flip_done;
+ 		plane->disable_flip_done = ilk_primary_disable_flip_done;
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index ff010a21f431..88914d429569 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1319,9 +1319,7 @@ static unsigned int intel_linear_alignment(const struct drm_i915_private *dev_pr
+ 
+ static bool has_async_flips(struct drm_i915_private *i915)
+ {
+-	return INTEL_GEN(i915) >= 9 || IS_BROADWELL(i915) ||
+-		IS_HASWELL(i915) || IS_IVYBRIDGE(i915) ||
+-		IS_GEN_RANGE(i915, 5, 6);
++	return INTEL_GEN(i915) >= 5;
+ }
+ 
+ static unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 4e6fb1e2de05..1a701367a718 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1540,6 +1540,9 @@ static void valleyview_pipestat_irq_handler(struct drm_i915_private *dev_priv,
+ 		if (pipe_stats[pipe] & PIPE_START_VBLANK_INTERRUPT_STATUS)
+ 			intel_handle_vblank(dev_priv, pipe);
+ 
++		if (pipe_stats[pipe] & PLANE_FLIP_DONE_INT_STATUS_VLV)
++			flip_done_handler(dev_priv, pipe);
++
+ 		if (pipe_stats[pipe] & PIPE_CRC_DONE_INTERRUPT_STATUS)
+ 			i9xx_pipe_crc_irq_handler(dev_priv, pipe);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index da7d33b5b677..598abd2f5b5f 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6578,6 +6578,7 @@ enum {
+ #define TGL_CURSOR_D_OFFSET 0x73080
+ 
+ /* Display A control */
++#define _DSPAADDR_VLV				0x7017C /* vlv/chv */
+ #define _DSPACNTR				0x70180
+ #define   DISPLAY_PLANE_ENABLE			(1 << 31)
+ #define   DISPLAY_PLANE_DISABLE			0
+@@ -6626,6 +6627,7 @@ enum {
+ #define _DSPASURFLIVE				0x701AC
+ #define _DSPAGAMC				0x701E0
+ 
++#define DSPADDR_VLV(plane)	_MMIO_PIPE2(plane, _DSPAADDR_VLV)
+ #define DSPCNTR(plane)		_MMIO_PIPE2(plane, _DSPACNTR)
+ #define DSPADDR(plane)		_MMIO_PIPE2(plane, _DSPAADDR)
+ #define DSPSTRIDE(plane)	_MMIO_PIPE2(plane, _DSPASTRIDE)
+-- 
+2.25.1
+

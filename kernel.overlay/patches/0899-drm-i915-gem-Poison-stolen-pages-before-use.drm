@@ -1,0 +1,89 @@
+From 6c8d443e51d724d2a1d6af2c52e80971bedd32ca Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 19 Oct 2020 17:50:04 +0100
+Subject: [PATCH 0899/1714] drm/i915/gem: Poison stolen pages before use
+
+When allocating objects from stolen, memset() the backing store to
+POISON_INUSE (0x5a) to help identify any uninitialised use of a stolen
+object.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201019165005.18128-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gem/i915_gem_stolen.c | 45 ++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+index 84b2707d8b17..4f923b8c43fb 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+@@ -497,6 +497,40 @@ static int i915_gem_init_stolen(struct drm_i915_private *i915)
+ 	return 0;
+ }
+ 
++static void dbg_poison(struct i915_ggtt *ggtt,
++		       dma_addr_t addr, resource_size_t size,
++		       u8 x)
++{
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
++	if (!drm_mm_node_allocated(&ggtt->error_capture))
++		return;
++
++	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
++
++	mutex_lock(&ggtt->error_mutex);
++	while (size) {
++		void __iomem *s;
++
++		ggtt->vm.insert_page(&ggtt->vm, addr,
++				     ggtt->error_capture.start,
++				     I915_CACHE_NONE, 0);
++		mb();
++
++		s = io_mapping_map_wc(&ggtt->iomap,
++				      ggtt->error_capture.start,
++				      PAGE_SIZE);
++		memset_io(s, x, PAGE_SIZE);
++		io_mapping_unmap(s);
++
++		addr += PAGE_SIZE;
++		size -= PAGE_SIZE;
++	}
++	mb();
++	ggtt->vm.clear_range(&ggtt->vm, ggtt->error_capture.start, PAGE_SIZE);
++	mutex_unlock(&ggtt->error_mutex);
++#endif
++}
++
+ static struct sg_table *
+ i915_pages_create_for_stolen(struct drm_device *dev,
+ 			     resource_size_t offset, resource_size_t size)
+@@ -540,6 +574,11 @@ static int i915_gem_object_get_pages_stolen(struct drm_i915_gem_object *obj)
+ 	if (IS_ERR(pages))
+ 		return PTR_ERR(pages);
+ 
++	dbg_poison(&to_i915(obj->base.dev)->ggtt,
++		   sg_dma_address(pages->sgl),
++		   sg_dma_len(pages->sgl),
++		   POISON_INUSE);
++
+ 	__i915_gem_object_set_pages(obj, pages, obj->stolen->size);
+ 
+ 	return 0;
+@@ -549,6 +588,12 @@ static void i915_gem_object_put_pages_stolen(struct drm_i915_gem_object *obj,
+ 					     struct sg_table *pages)
+ {
+ 	/* Should only be called from i915_gem_object_release_stolen() */
++
++	dbg_poison(&to_i915(obj->base.dev)->ggtt,
++		   sg_dma_address(pages->sgl),
++		   sg_dma_len(pages->sgl),
++		   POISON_FREE);
++
+ 	sg_free_table(pages);
+ 	kfree(pages);
+ }
+-- 
+2.25.1
+

@@ -1,0 +1,219 @@
+From 11b893b7d7b1c85648e54bfe1f11b251fd2f7ce1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:02 +0200
+Subject: [PATCH 083/330] drm/i915: Limit plane stride to below TILEOFF.x limit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Limit pre-skl plane stride to below 4k or 8k pixels (depending on
+the platform). We do this in order guarantee that TILEOFF/OFFSET.x
+does not get too big.
+
+Currently this is not a problem as we align SURF to 4k, and so
+TILEOFF/OFFSET only have to deal with a single tile's worth of
+pixels. But for async flips we're going to have to bump SURF
+alignment to 256k, and thus we can no longer guarantee
+TILEOFF/OFFSET.x will stay within acceptable bounds. We can avoid
+this by borrowing a trick from the skl+ code and limit the max
+plane stride to whatever value we can fit into TILEOFF/OFFSET.x.
+
+The slight downside is that we may end up doing GTT remapping in
+a few more cases where previously we did not have to. But since
+that will only happen with huge buffers I'm not really concerned
+about it.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-3-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c   | 64 ++++++++++++++++++---
+ drivers/gpu/drm/i915/display/i9xx_plane.h   |  2 +-
+ drivers/gpu/drm/i915/display/intel_sprite.c | 33 +++++++++--
+ 3 files changed, 83 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index b1158ce4df92..7d968ca890da 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -530,21 +530,56 @@ static bool i9xx_plane_get_hw_state(struct intel_plane *plane,
+ 	return ret;
+ }
+ 
++static unsigned int
++hsw_primary_max_stride(struct intel_plane *plane,
++		       u32 pixel_format, u64 modifier,
++		       unsigned int rotation)
++{
++	const struct drm_format_info *info = drm_format_info(pixel_format);
++	int cpp = info->cpp[0];
++
++	/* Limit to 8k pixels to guarantee OFFSET.x doesn't get too big. */
++	return min(8192 * cpp, 32 * 1024);
++}
++
++static unsigned int
++ilk_primary_max_stride(struct intel_plane *plane,
++		       u32 pixel_format, u64 modifier,
++		       unsigned int rotation)
++{
++	const struct drm_format_info *info = drm_format_info(pixel_format);
++	int cpp = info->cpp[0];
++
++	/* Limit to 4k pixels to guarantee TILEOFF.x doesn't get too big. */
++	if (modifier == I915_FORMAT_MOD_X_TILED)
++		return min(4096 * cpp, 32 * 1024);
++	else
++		return 32 * 1024;
++}
++
+ unsigned int
++i965_plane_max_stride(struct intel_plane *plane,
++		      u32 pixel_format, u64 modifier,
++		      unsigned int rotation)
++{
++	const struct drm_format_info *info = drm_format_info(pixel_format);
++	int cpp = info->cpp[0];
++
++	/* Limit to 4k pixels to guarantee TILEOFF.x doesn't get too big. */
++	if (modifier == I915_FORMAT_MOD_X_TILED)
++		return min(4096 * cpp, 16 * 1024);
++	else
++		return 32 * 1024;
++}
++
++static unsigned int
+ i9xx_plane_max_stride(struct intel_plane *plane,
+ 		      u32 pixel_format, u64 modifier,
+ 		      unsigned int rotation)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 
+-	if (!HAS_GMCH(dev_priv)) {
+-		return 32*1024;
+-	} else if (INTEL_GEN(dev_priv) >= 4) {
+-		if (modifier == I915_FORMAT_MOD_X_TILED)
+-			return 16*1024;
+-		else
+-			return 32*1024;
+-	} else if (INTEL_GEN(dev_priv) >= 3) {
++	if (INTEL_GEN(dev_priv) >= 3) {
+ 		if (modifier == I915_FORMAT_MOD_X_TILED)
+ 			return 8*1024;
+ 		else
+@@ -656,7 +691,18 @@ intel_primary_plane_create(struct drm_i915_private *dev_priv, enum pipe pipe)
+ 	else
+ 		plane->min_cdclk = i9xx_plane_min_cdclk;
+ 
+-	plane->max_stride = i9xx_plane_max_stride;
++	if (HAS_GMCH(dev_priv)) {
++		if (INTEL_GEN(dev_priv) >= 4)
++			plane->max_stride = i965_plane_max_stride;
++		else
++			plane->max_stride = i9xx_plane_max_stride;
++	} else {
++		if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++			plane->max_stride = hsw_primary_max_stride;
++		else
++			plane->max_stride = ilk_primary_max_stride;
++	}
++
+ 	plane->update_plane = i9xx_update_plane;
+ 	plane->disable_plane = i9xx_disable_plane;
+ 	plane->get_hw_state = i9xx_plane_get_hw_state;
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.h b/drivers/gpu/drm/i915/display/i9xx_plane.h
+index bc2834a62735..ca963c2a8457 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.h
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.h
+@@ -13,7 +13,7 @@ struct drm_i915_private;
+ struct intel_plane;
+ struct intel_plane_state;
+ 
+-unsigned int i9xx_plane_max_stride(struct intel_plane *plane,
++unsigned int i965_plane_max_stride(struct intel_plane *plane,
+ 				   u32 pixel_format, u64 modifier,
+ 				   unsigned int rotation);
+ int i9xx_check_plane_surface(struct intel_plane_state *plane_state);
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.c b/drivers/gpu/drm/i915/display/intel_sprite.c
+index 9639d8fe32d7..ce3a9c9e0fc9 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.c
++++ b/drivers/gpu/drm/i915/display/intel_sprite.c
+@@ -1896,7 +1896,26 @@ g4x_sprite_max_stride(struct intel_plane *plane,
+ 		      u32 pixel_format, u64 modifier,
+ 		      unsigned int rotation)
+ {
+-	return 16384;
++	const struct drm_format_info *info = drm_format_info(pixel_format);
++	int cpp = info->cpp[0];
++
++	/* Limit to 4k pixels to guarantee TILEOFF.x doesn't get too big. */
++	if (modifier == I915_FORMAT_MOD_X_TILED)
++		return min(4096 * cpp, 16 * 1024);
++	else
++		return 16 * 1024;
++}
++
++static unsigned int
++hsw_sprite_max_stride(struct intel_plane *plane,
++		      u32 pixel_format, u64 modifier,
++		      unsigned int rotation)
++{
++	const struct drm_format_info *info = drm_format_info(pixel_format);
++	int cpp = info->cpp[0];
++
++	/* Limit to 8k pixels to guarantee OFFSET.x doesn't get too big. */
++	return min(8192 * cpp, 16 * 1024);
+ }
+ 
+ static u32 g4x_sprite_ctl_crtc(const struct intel_crtc_state *crtc_state)
+@@ -3453,11 +3472,11 @@ intel_sprite_plane_create(struct drm_i915_private *dev_priv,
+ 		return plane;
+ 
+ 	if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) {
+-		plane->max_stride = i9xx_plane_max_stride;
+ 		plane->update_plane = vlv_update_plane;
+ 		plane->disable_plane = vlv_disable_plane;
+ 		plane->get_hw_state = vlv_plane_get_hw_state;
+ 		plane->check_plane = vlv_sprite_check;
++		plane->max_stride = i965_plane_max_stride;
+ 		plane->min_cdclk = vlv_plane_min_cdclk;
+ 
+ 		if (IS_CHERRYVIEW(dev_priv) && pipe == PIPE_B) {
+@@ -3471,16 +3490,18 @@ intel_sprite_plane_create(struct drm_i915_private *dev_priv,
+ 
+ 		plane_funcs = &vlv_sprite_funcs;
+ 	} else if (INTEL_GEN(dev_priv) >= 7) {
+-		plane->max_stride = g4x_sprite_max_stride;
+ 		plane->update_plane = ivb_update_plane;
+ 		plane->disable_plane = ivb_disable_plane;
+ 		plane->get_hw_state = ivb_plane_get_hw_state;
+ 		plane->check_plane = g4x_sprite_check;
+ 
+-		if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++		if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv)) {
++			plane->max_stride = hsw_sprite_max_stride;
+ 			plane->min_cdclk = hsw_plane_min_cdclk;
+-		else
++		} else {
++			plane->max_stride = g4x_sprite_max_stride;
+ 			plane->min_cdclk = ivb_sprite_min_cdclk;
++		}
+ 
+ 		formats = snb_plane_formats;
+ 		num_formats = ARRAY_SIZE(snb_plane_formats);
+@@ -3488,11 +3509,11 @@ intel_sprite_plane_create(struct drm_i915_private *dev_priv,
+ 
+ 		plane_funcs = &snb_sprite_funcs;
+ 	} else {
+-		plane->max_stride = g4x_sprite_max_stride;
+ 		plane->update_plane = g4x_update_plane;
+ 		plane->disable_plane = g4x_disable_plane;
+ 		plane->get_hw_state = g4x_plane_get_hw_state;
+ 		plane->check_plane = g4x_sprite_check;
++		plane->max_stride = g4x_sprite_max_stride;
+ 		plane->min_cdclk = g4x_sprite_min_cdclk;
+ 
+ 		modifiers = i9xx_plane_format_modifiers;
+-- 
+2.25.1
+

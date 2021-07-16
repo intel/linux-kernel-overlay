@@ -1,0 +1,129 @@
+From 1cd6fb7300e87a253dd573bd4789d52025784ccb Mon Sep 17 00:00:00 2001
+From: Like Xu <like.xu@linux.intel.com>
+Date: Mon, 25 Jan 2021 20:14:58 +0800
+Subject: [PATCH 05/62] x86/perf: Use static_call for x86_pmu.guest_get_msrs
+
+Clean up that CONFIG_RETPOLINE crud and replace the
+indirect call x86_pmu.guest_get_msrs with static_call().
+
+Reported-by: kernel test robot <lkp@intel.com>
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Like Xu <like.xu@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20210125121458.181635-1-like.xu@linux.intel.com
+---
+ arch/x86/events/core.c            | 20 ++++++++++++++++++++
+ arch/x86/events/intel/core.c      | 20 --------------------
+ arch/x86/include/asm/perf_event.h |  6 +-----
+ 3 files changed, 21 insertions(+), 25 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index a88c94d65693..22fdab418230 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -81,6 +81,8 @@ DEFINE_STATIC_CALL_NULL(x86_pmu_swap_task_ctx, *x86_pmu.swap_task_ctx);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_drain_pebs,   *x86_pmu.drain_pebs);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_pebs_aliases, *x86_pmu.pebs_aliases);
+ 
++DEFINE_STATIC_CALL_NULL(x86_pmu_guest_get_msrs,  *x86_pmu.guest_get_msrs);
++
+ u64 __read_mostly hw_cache_event_ids
+ 				[PERF_COUNT_HW_CACHE_MAX]
+ 				[PERF_COUNT_HW_CACHE_OP_MAX]
+@@ -665,6 +667,12 @@ void x86_pmu_disable_all(void)
+ 	}
+ }
+ 
++struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
++{
++	return static_call(x86_pmu_guest_get_msrs)(nr);
++}
++EXPORT_SYMBOL_GPL(perf_guest_get_msrs);
++
+ /*
+  * There may be PMI landing after enabled=0. The PMI hitting could be before or
+  * after disable_all.
+@@ -1923,6 +1931,8 @@ static void x86_pmu_static_call_update(void)
+ 
+ 	static_call_update(x86_pmu_drain_pebs, x86_pmu.drain_pebs);
+ 	static_call_update(x86_pmu_pebs_aliases, x86_pmu.pebs_aliases);
++
++	static_call_update(x86_pmu_guest_get_msrs, x86_pmu.guest_get_msrs);
+ }
+ 
+ static void _x86_pmu_read(struct perf_event *event)
+@@ -1930,6 +1940,13 @@ static void _x86_pmu_read(struct perf_event *event)
+ 	x86_perf_event_update(event);
+ }
+ 
++static inline struct perf_guest_switch_msr *
++perf_guest_get_msrs_nop(int *nr)
++{
++	*nr = 0;
++	return NULL;
++}
++
+ static int __init init_hw_perf_events(void)
+ {
+ 	struct x86_pmu_quirk *quirk;
+@@ -2001,6 +2018,9 @@ static int __init init_hw_perf_events(void)
+ 	if (!x86_pmu.read)
+ 		x86_pmu.read = _x86_pmu_read;
+ 
++	if (!x86_pmu.guest_get_msrs)
++		x86_pmu.guest_get_msrs = perf_guest_get_msrs_nop;
++
+ 	x86_pmu_static_call_update();
+ 
+ 	/*
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 148f4543e966..aacac45d2e41 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -3876,26 +3876,6 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_RETPOLINE
+-static struct perf_guest_switch_msr *core_guest_get_msrs(int *nr);
+-static struct perf_guest_switch_msr *intel_guest_get_msrs(int *nr);
+-#endif
+-
+-struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
+-{
+-#ifdef CONFIG_RETPOLINE
+-	if (x86_pmu.guest_get_msrs == intel_guest_get_msrs)
+-		return intel_guest_get_msrs(nr);
+-	else if (x86_pmu.guest_get_msrs == core_guest_get_msrs)
+-		return core_guest_get_msrs(nr);
+-#endif
+-	if (x86_pmu.guest_get_msrs)
+-		return x86_pmu.guest_get_msrs(nr);
+-	*nr = 0;
+-	return NULL;
+-}
+-EXPORT_SYMBOL_GPL(perf_guest_get_msrs);
+-
+ static struct perf_guest_switch_msr *intel_guest_get_msrs(int *nr)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index d3530eac30bc..544f41a179fb 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -493,11 +493,7 @@ static inline void perf_check_microcode(void) { }
+ extern struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr);
+ extern int x86_perf_get_lbr(struct x86_pmu_lbr *lbr);
+ #else
+-static inline struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
+-{
+-	*nr = 0;
+-	return NULL;
+-}
++struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr);
+ static inline int x86_perf_get_lbr(struct x86_pmu_lbr *lbr)
+ {
+ 	return -1;
+-- 
+2.25.1
+

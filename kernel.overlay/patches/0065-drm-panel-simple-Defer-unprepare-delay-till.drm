@@ -1,0 +1,95 @@
+From 616638630325e36d7db33de40a2e8747fe2ee508 Mon Sep 17 00:00:00 2001
+From: Douglas Anderson <dianders@chromium.org>
+Date: Mon, 9 Nov 2020 17:00:56 -0800
+Subject: [PATCH 0065/1087] drm: panel: simple: Defer unprepare delay till next
+ prepare to shorten it
+
+It is believed that all of the current users of the "unprepare" delay
+don't actually need to wait the amount of time specified directly in
+the unprepare phase.  The purpose of the delay that's specified is to
+allow the panel to fully power off so that we don't try to power it
+back on before it's managed to full power down.
+
+Let's use this observation to avoid the fixed delay that we currently
+have.  Instead of delaying, we'll note the current time when the
+unprepare happens.  If someone then tries to prepare the panel later
+and not enough time has passed, we'll do the delay before starting the
+prepare phase.
+
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Signed-off-by: Sam Ravnborg <sam@ravnborg.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201109170018.v4.2.I06a95d83e7fa1bd919c8edd63dacacb5436e495a@changeid
+---
+ drivers/gpu/drm/panel/panel-simple.c | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-simple.c b/drivers/gpu/drm/panel/panel-simple.c
+index c6f152789a4e..72c120a68266 100644
+--- a/drivers/gpu/drm/panel/panel-simple.c
++++ b/drivers/gpu/drm/panel/panel-simple.c
+@@ -115,6 +115,11 @@ struct panel_desc {
+ 		 *
+ 		 * The time (in milliseconds) that it takes for the panel
+ 		 * to power itself down completely.
++		 *
++		 * This time is used to prevent a future "prepare" from
++		 * starting until at least this many milliseconds has passed.
++		 * If at prepare time less time has passed since unprepare
++		 * finished, the driver waits for the remaining time.
+ 		 */
+ 		unsigned int unprepare;
+ 	} delay;
+@@ -130,6 +135,8 @@ struct panel_simple {
+ 	bool enabled;
+ 	bool no_hpd;
+ 
++	ktime_t unprepared_time;
++
+ 	const struct panel_desc *desc;
+ 
+ 	struct regulator *supply;
+@@ -257,6 +264,20 @@ static int panel_simple_get_non_edid_modes(struct panel_simple *panel,
+ 	return num;
+ }
+ 
++static void panel_simple_wait(ktime_t start_ktime, unsigned int min_ms)
++{
++	ktime_t now_ktime, min_ktime;
++
++	if (!min_ms)
++		return;
++
++	min_ktime = ktime_add(start_ktime, ms_to_ktime(min_ms));
++	now_ktime = ktime_get();
++
++	if (ktime_before(now_ktime, min_ktime))
++		msleep(ktime_to_ms(ktime_sub(min_ktime, now_ktime)) + 1);
++}
++
+ static int panel_simple_disable(struct drm_panel *panel)
+ {
+ 	struct panel_simple *p = to_panel_simple(panel);
+@@ -283,10 +304,8 @@ static int panel_simple_unprepare(struct drm_panel *panel)
+ 
+ 	regulator_disable(p->supply);
+ 
+-	if (p->desc->delay.unprepare)
+-		msleep(p->desc->delay.unprepare);
+-
+ 	p->prepared = false;
++	p->unprepared_time = ktime_get();
+ 
+ 	return 0;
+ }
+@@ -326,6 +345,8 @@ static int panel_simple_prepare(struct drm_panel *panel)
+ 	if (p->prepared)
+ 		return 0;
+ 
++	panel_simple_wait(p->unprepared_time, p->desc->delay.unprepare);
++
+ 	err = regulator_enable(p->supply);
+ 	if (err < 0) {
+ 		dev_err(panel->dev, "failed to enable supply: %d\n", err);
+-- 
+2.17.1
+

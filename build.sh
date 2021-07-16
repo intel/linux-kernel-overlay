@@ -2,13 +2,13 @@
 
 # Global configurations
 KVERSION=5
-KPATCHLEVEL=13
-KSUBLEVEL=0
+KPATCHLEVEL=10
+KSUBLEVEL=47
 KEXTRAVERSION=
 
-KSRC_REPO=https://github.com/torvalds/linux.git
+KSRC_REPO=https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/linux.git
 
-KSRC_TAG=v$KVERSION.$KPATCHLEVEL$KEXTRAVERSION
+KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL
 
 KSRC_MIRROR=
 

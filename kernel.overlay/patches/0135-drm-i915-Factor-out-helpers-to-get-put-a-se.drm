@@ -1,0 +1,280 @@
+From 16e6e6e87f6111f67942fbdd6f8c4048127a2f1e Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 1 Dec 2020 18:13:39 +0200
+Subject: [PATCH 0135/1087] drm/i915: Factor out helpers to get/put a set of
+ tracked power domains
+
+Factor out helper functions to get/put a set of power domains that are
+tracked using their wakeref handles. The same is needed by the next
+patch adding tracking for enabled CRTC power domains.
+
+v2: s/uint64_t/u64/ (Chris)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201201161340.2879202-1-imre.deak@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  | 62 +++++--------------
+ .../drm/i915/display/intel_display_power.c    | 57 +++++++++++++++++
+ .../drm/i915/display/intel_display_power.h    | 29 +++++++++
+ 3 files changed, 100 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 4827ade4def0..69f7be235156 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -11227,16 +11227,13 @@ static void hsw_get_ddi_pll(struct drm_i915_private *dev_priv, enum port port,
+ 
+ static bool hsw_get_transcoder_state(struct intel_crtc *crtc,
+ 				     struct intel_crtc_state *pipe_config,
+-				     u64 *power_domain_mask,
+-				     intel_wakeref_t *wakerefs)
++				     struct intel_display_power_domain_set *power_domain_set)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	enum intel_display_power_domain power_domain;
+ 	unsigned long panel_transcoder_mask = BIT(TRANSCODER_EDP);
+ 	unsigned long enabled_panel_transcoders = 0;
+ 	enum transcoder panel_transcoder;
+-	intel_wakeref_t wf;
+ 	u32 tmp;
+ 
+ 	if (INTEL_GEN(dev_priv) >= 11)
+@@ -11307,16 +11304,10 @@ static bool hsw_get_transcoder_state(struct intel_crtc *crtc,
+ 	drm_WARN_ON(dev, (enabled_panel_transcoders & BIT(TRANSCODER_EDP)) &&
+ 		    enabled_panel_transcoders != BIT(TRANSCODER_EDP));
+ 
+-	power_domain = POWER_DOMAIN_TRANSCODER(pipe_config->cpu_transcoder);
+-	drm_WARN_ON(dev, *power_domain_mask & BIT_ULL(power_domain));
+-
+-	wf = intel_display_power_get_if_enabled(dev_priv, power_domain);
+-	if (!wf)
++	if (!intel_display_power_get_in_set_if_enabled(dev_priv, power_domain_set,
++						       POWER_DOMAIN_TRANSCODER(pipe_config->cpu_transcoder)))
+ 		return false;
+ 
+-	wakerefs[power_domain] = wf;
+-	*power_domain_mask |= BIT_ULL(power_domain);
+-
+ 	tmp = intel_de_read(dev_priv, PIPECONF(pipe_config->cpu_transcoder));
+ 
+ 	return tmp & PIPECONF_ENABLE;
+@@ -11324,14 +11315,11 @@ static bool hsw_get_transcoder_state(struct intel_crtc *crtc,
+ 
+ static bool bxt_get_dsi_transcoder_state(struct intel_crtc *crtc,
+ 					 struct intel_crtc_state *pipe_config,
+-					 u64 *power_domain_mask,
+-					 intel_wakeref_t *wakerefs)
++					 struct intel_display_power_domain_set *power_domain_set)
+ {
+ 	struct drm_device *dev = crtc->base.dev;
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	enum intel_display_power_domain power_domain;
+ 	enum transcoder cpu_transcoder;
+-	intel_wakeref_t wf;
+ 	enum port port;
+ 	u32 tmp;
+ 
+@@ -11341,16 +11329,10 @@ static bool bxt_get_dsi_transcoder_state(struct intel_crtc *crtc,
+ 		else
+ 			cpu_transcoder = TRANSCODER_DSI_C;
+ 
+-		power_domain = POWER_DOMAIN_TRANSCODER(cpu_transcoder);
+-		drm_WARN_ON(dev, *power_domain_mask & BIT_ULL(power_domain));
+-
+-		wf = intel_display_power_get_if_enabled(dev_priv, power_domain);
+-		if (!wf)
++		if (!intel_display_power_get_in_set_if_enabled(dev_priv, power_domain_set,
++							       POWER_DOMAIN_TRANSCODER(cpu_transcoder)))
+ 			continue;
+ 
+-		wakerefs[power_domain] = wf;
+-		*power_domain_mask |= BIT_ULL(power_domain);
+-
+ 		/*
+ 		 * The PLL needs to be enabled with a valid divider
+ 		 * configuration, otherwise accessing DSI registers will hang
+@@ -11433,30 +11415,22 @@ static bool hsw_get_pipe_config(struct intel_crtc *crtc,
+ 				struct intel_crtc_state *pipe_config)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	intel_wakeref_t wakerefs[POWER_DOMAIN_NUM], wf;
+-	enum intel_display_power_domain power_domain;
+-	u64 power_domain_mask;
++	struct intel_display_power_domain_set power_domain_set = { };
+ 	bool active;
+ 	u32 tmp;
+ 
+ 	pipe_config->master_transcoder = INVALID_TRANSCODER;
+ 
+-	power_domain = POWER_DOMAIN_PIPE(crtc->pipe);
+-	wf = intel_display_power_get_if_enabled(dev_priv, power_domain);
+-	if (!wf)
++	if (!intel_display_power_get_in_set_if_enabled(dev_priv, &power_domain_set,
++						       POWER_DOMAIN_PIPE(crtc->pipe)))
+ 		return false;
+ 
+-	wakerefs[power_domain] = wf;
+-	power_domain_mask = BIT_ULL(power_domain);
+-
+ 	pipe_config->shared_dpll = NULL;
+ 
+-	active = hsw_get_transcoder_state(crtc, pipe_config,
+-					  &power_domain_mask, wakerefs);
++	active = hsw_get_transcoder_state(crtc, pipe_config, &power_domain_set);
+ 
+ 	if (IS_GEN9_LP(dev_priv) &&
+-	    bxt_get_dsi_transcoder_state(crtc, pipe_config,
+-					 &power_domain_mask, wakerefs)) {
++	    bxt_get_dsi_transcoder_state(crtc, pipe_config, &power_domain_set)) {
+ 		drm_WARN_ON(&dev_priv->drm, active);
+ 		active = true;
+ 	}
+@@ -11520,14 +11494,8 @@ static bool hsw_get_pipe_config(struct intel_crtc *crtc,
+ 		pipe_config->ips_linetime =
+ 			REG_FIELD_GET(HSW_IPS_LINETIME_MASK, tmp);
+ 
+-	power_domain = POWER_DOMAIN_PIPE_PANEL_FITTER(crtc->pipe);
+-	drm_WARN_ON(&dev_priv->drm, power_domain_mask & BIT_ULL(power_domain));
+-
+-	wf = intel_display_power_get_if_enabled(dev_priv, power_domain);
+-	if (wf) {
+-		wakerefs[power_domain] = wf;
+-		power_domain_mask |= BIT_ULL(power_domain);
+-
++	if (intel_display_power_get_in_set_if_enabled(dev_priv, &power_domain_set,
++						      POWER_DOMAIN_PIPE_PANEL_FITTER(crtc->pipe))) {
+ 		if (INTEL_GEN(dev_priv) >= 9)
+ 			skl_get_pfit_config(pipe_config);
+ 		else
+@@ -11561,9 +11529,7 @@ static bool hsw_get_pipe_config(struct intel_crtc *crtc,
+ 	}
+ 
+ out:
+-	for_each_power_domain(power_domain, power_domain_mask)
+-		intel_display_power_put(dev_priv,
+-					power_domain, wakerefs[power_domain]);
++	intel_display_power_put_all_in_set(dev_priv, &power_domain_set);
+ 
+ 	return active;
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power.c b/drivers/gpu/drm/i915/display/intel_display_power.c
+index fe2d90bba536..b48dbb7bdaf4 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c
+@@ -2412,6 +2412,63 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
+ }
+ #endif
+ 
++void
++intel_display_power_get_in_set(struct drm_i915_private *i915,
++			       struct intel_display_power_domain_set *power_domain_set,
++			       enum intel_display_power_domain domain)
++{
++	intel_wakeref_t __maybe_unused wf;
++
++	drm_WARN_ON(&i915->drm, power_domain_set->mask & BIT_ULL(domain));
++
++	wf = intel_display_power_get(i915, domain);
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
++	power_domain_set->wakerefs[domain] = wf;
++#endif
++	power_domain_set->mask |= BIT_ULL(domain);
++}
++
++bool
++intel_display_power_get_in_set_if_enabled(struct drm_i915_private *i915,
++					  struct intel_display_power_domain_set *power_domain_set,
++					  enum intel_display_power_domain domain)
++{
++	intel_wakeref_t wf;
++
++	drm_WARN_ON(&i915->drm, power_domain_set->mask & BIT_ULL(domain));
++
++	wf = intel_display_power_get_if_enabled(i915, domain);
++	if (!wf)
++		return false;
++
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
++	power_domain_set->wakerefs[domain] = wf;
++#endif
++	power_domain_set->mask |= BIT_ULL(domain);
++
++	return true;
++}
++
++void
++intel_display_power_put_mask_in_set(struct drm_i915_private *i915,
++				    struct intel_display_power_domain_set *power_domain_set,
++				    u64 mask)
++{
++	enum intel_display_power_domain domain;
++
++	drm_WARN_ON(&i915->drm, mask & ~power_domain_set->mask);
++
++	for_each_power_domain(domain, mask) {
++		intel_wakeref_t __maybe_unused wf = -1;
++
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
++		wf = fetch_and_zero(&power_domain_set->wakerefs[domain]);
++#endif
++		intel_display_power_put(i915, domain, wf);
++		power_domain_set->mask &= ~BIT_ULL(domain);
++	}
++}
++
+ #define I830_PIPES_POWER_DOMAINS (		\
+ 	BIT_ULL(POWER_DOMAIN_PIPE_A) |		\
+ 	BIT_ULL(POWER_DOMAIN_PIPE_B) |		\
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power.h b/drivers/gpu/drm/i915/display/intel_display_power.h
+index 4aa0a09cf14f..583d3df57fb2 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power.h
++++ b/drivers/gpu/drm/i915/display/intel_display_power.h
+@@ -224,6 +224,13 @@ struct i915_power_domains {
+ 	struct i915_power_well *power_wells;
+ };
+ 
++struct intel_display_power_domain_set {
++	u64 mask;
++#ifdef CONFIG_DRM_I915_DEBUG_RUNTIME_PM
++	intel_wakeref_t wakerefs[POWER_DOMAIN_NUM];
++#endif
++};
++
+ #define for_each_power_domain(domain, mask)				\
+ 	for ((domain) = 0; (domain) < POWER_DOMAIN_NUM; (domain)++)	\
+ 		for_each_if(BIT_ULL(domain) & (mask))
+@@ -314,6 +321,28 @@ intel_display_power_put_async(struct drm_i915_private *i915,
+ }
+ #endif
+ 
++void
++intel_display_power_get_in_set(struct drm_i915_private *i915,
++			       struct intel_display_power_domain_set *power_domain_set,
++			       enum intel_display_power_domain domain);
++
++bool
++intel_display_power_get_in_set_if_enabled(struct drm_i915_private *i915,
++					  struct intel_display_power_domain_set *power_domain_set,
++					  enum intel_display_power_domain domain);
++
++void
++intel_display_power_put_mask_in_set(struct drm_i915_private *i915,
++				    struct intel_display_power_domain_set *power_domain_set,
++				    u64 mask);
++
++static inline void
++intel_display_power_put_all_in_set(struct drm_i915_private *i915,
++				   struct intel_display_power_domain_set *power_domain_set)
++{
++	intel_display_power_put_mask_in_set(i915, power_domain_set, power_domain_set->mask);
++}
++
+ enum dbuf_slice {
+ 	DBUF_S1,
+ 	DBUF_S2,
+-- 
+2.17.1
+

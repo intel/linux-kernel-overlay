@@ -1,0 +1,235 @@
+From d176ecb501e243c074c78ae5925b3bba5e5fd872 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Tue, 6 Oct 2020 10:25:08 +0100
+Subject: [PATCH 0893/1714] drm/i915: Fix DMA mapped scatterlist lookup
+
+As the previous patch fixed the places where we walk the whole scatterlist
+for DMA addresses, this patch fixes the random lookup functionality.
+
+To achieve this we have to add a second lookup iterator and add a
+i915_gem_object_get_sg_dma helper, to be used analoguous to existing
+i915_gem_object_get_sg_dma. Therefore two lookup caches are maintained per
+object and they are flushed at the same point for simplicity. (Strictly
+speaking the DMA cache should be flushed from i915_gem_gtt_finish_pages,
+but today this conincides with unsetting of the pages in general.)
+
+Partial VMA view is then fixed to use the new DMA lookup and properly
+query sg length.
+
+v2:
+ * Checkpatch.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Matthew Auld <matthew.auld@intel.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: Tom Murphy <murphyt7@tcd.ie>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201006092508.1064287-2-tvrtko.ursulin@linux.intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_object.c    |  2 ++
+ drivers/gpu/drm/i915/gem/i915_gem_object.h    | 20 +++++++++++++++++-
+ .../gpu/drm/i915/gem/i915_gem_object_types.h  | 17 ++++++++-------
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c     | 21 ++++++++++++-------
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          |  4 ++--
+ drivers/gpu/drm/i915/i915_scatterlist.h       |  5 +++++
+ 6 files changed, 51 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.c b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+index 3389ac972d16..00d24000b5e8 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+@@ -82,6 +82,8 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 	obj->mm.madv = I915_MADV_WILLNEED;
+ 	INIT_RADIX_TREE(&obj->mm.get_page.radix, GFP_KERNEL | __GFP_NOWARN);
+ 	mutex_init(&obj->mm.get_page.lock);
++	INIT_RADIX_TREE(&obj->mm.get_dma_page.radix, GFP_KERNEL | __GFP_NOWARN);
++	mutex_init(&obj->mm.get_dma_page.lock);
+ 
+ 	if (IS_ENABLED(CONFIG_LOCKDEP) && i915_gem_object_is_shrinkable(obj))
+ 		i915_gem_shrinker_taints_mutex(to_i915(obj->base.dev),
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index eaf3d4147be0..be14486f63a7 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -272,8 +272,26 @@ int i915_gem_object_set_tiling(struct drm_i915_gem_object *obj,
+ 			       unsigned int tiling, unsigned int stride);
+ 
+ struct scatterlist *
++__i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
++			 struct i915_gem_object_page_iter *iter,
++			 unsigned int n,
++			 unsigned int *offset);
++
++static inline struct scatterlist *
+ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+-		       unsigned int n, unsigned int *offset);
++		       unsigned int n,
++		       unsigned int *offset)
++{
++	return __i915_gem_object_get_sg(obj, &obj->mm.get_page, n, offset);
++}
++
++static inline struct scatterlist *
++i915_gem_object_get_sg_dma(struct drm_i915_gem_object *obj,
++			   unsigned int n,
++			   unsigned int *offset)
++{
++	return __i915_gem_object_get_sg(obj, &obj->mm.get_dma_page, n, offset);
++}
+ 
+ struct page *
+ i915_gem_object_get_page(struct drm_i915_gem_object *obj,
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+index d6711caa7f39..e2d9b7e1e152 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+@@ -82,6 +82,14 @@ struct i915_mmap_offset {
+ 	struct rb_node offset;
+ };
+ 
++struct i915_gem_object_page_iter {
++	struct scatterlist *sg_pos;
++	unsigned int sg_idx; /* in pages, but 32bit eek! */
++
++	struct radix_tree_root radix;
++	struct mutex lock; /* protects this cache */
++};
++
+ struct drm_i915_gem_object {
+ 	struct drm_gem_object base;
+ 
+@@ -248,13 +256,8 @@ struct drm_i915_gem_object {
+ 
+ 		I915_SELFTEST_DECLARE(unsigned int page_mask);
+ 
+-		struct i915_gem_object_page_iter {
+-			struct scatterlist *sg_pos;
+-			unsigned int sg_idx; /* in pages, but 32bit eek! */
+-
+-			struct radix_tree_root radix;
+-			struct mutex lock; /* protects this cache */
+-		} get_page;
++		struct i915_gem_object_page_iter get_page;
++		struct i915_gem_object_page_iter get_dma_page;
+ 
+ 		/**
+ 		 * Element within i915->mm.unbound_list or i915->mm.bound_list,
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index f60ca6dc911f..e2c7b2a7895f 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -33,6 +33,8 @@ void __i915_gem_object_set_pages(struct drm_i915_gem_object *obj,
+ 
+ 	obj->mm.get_page.sg_pos = pages->sgl;
+ 	obj->mm.get_page.sg_idx = 0;
++	obj->mm.get_dma_page.sg_pos = pages->sgl;
++	obj->mm.get_dma_page.sg_idx = 0;
+ 
+ 	obj->mm.pages = pages;
+ 
+@@ -155,6 +157,8 @@ static void __i915_gem_object_reset_page_iter(struct drm_i915_gem_object *obj)
+ 	rcu_read_lock();
+ 	radix_tree_for_each_slot(slot, &obj->mm.get_page.radix, &iter, 0)
+ 		radix_tree_delete(&obj->mm.get_page.radix, iter.index);
++	radix_tree_for_each_slot(slot, &obj->mm.get_dma_page.radix, &iter, 0)
++		radix_tree_delete(&obj->mm.get_dma_page.radix, iter.index);
+ 	rcu_read_unlock();
+ }
+ 
+@@ -438,11 +442,12 @@ void __i915_gem_object_release_map(struct drm_i915_gem_object *obj)
+ }
+ 
+ struct scatterlist *
+-i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+-		       unsigned int n,
+-		       unsigned int *offset)
++__i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
++			 struct i915_gem_object_page_iter *iter,
++			 unsigned int n,
++			 unsigned int *offset)
+ {
+-	struct i915_gem_object_page_iter *iter = &obj->mm.get_page;
++	const bool dma = iter == &obj->mm.get_dma_page;
+ 	struct scatterlist *sg;
+ 	unsigned int idx, count;
+ 
+@@ -471,7 +476,7 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 
+ 	sg = iter->sg_pos;
+ 	idx = iter->sg_idx;
+-	count = __sg_page_count(sg);
++	count = dma ? __sg_dma_page_count(sg) : __sg_page_count(sg);
+ 
+ 	while (idx + count <= n) {
+ 		void *entry;
+@@ -499,7 +504,7 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 
+ 		idx += count;
+ 		sg = ____sg_next(sg);
+-		count = __sg_page_count(sg);
++		count = dma ? __sg_dma_page_count(sg) : __sg_page_count(sg);
+ 	}
+ 
+ scan:
+@@ -517,7 +522,7 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 	while (idx + count <= n) {
+ 		idx += count;
+ 		sg = ____sg_next(sg);
+-		count = __sg_page_count(sg);
++		count = dma ? __sg_dma_page_count(sg) : __sg_page_count(sg);
+ 	}
+ 
+ 	*offset = n - idx;
+@@ -584,7 +589,7 @@ i915_gem_object_get_dma_address_len(struct drm_i915_gem_object *obj,
+ 	struct scatterlist *sg;
+ 	unsigned int offset;
+ 
+-	sg = i915_gem_object_get_sg(obj, n, &offset);
++	sg = i915_gem_object_get_sg_dma(obj, n, &offset);
+ 
+ 	if (len)
+ 		*len = sg_dma_len(sg) - (offset << PAGE_SHIFT);
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index 188a5f70177d..cf94525be2c1 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -1383,7 +1383,7 @@ intel_partial_pages(const struct i915_ggtt_view *view,
+ 	if (ret)
+ 		goto err_sg_alloc;
+ 
+-	iter = i915_gem_object_get_sg(obj, view->partial.offset, &offset);
++	iter = i915_gem_object_get_sg_dma(obj, view->partial.offset, &offset);
+ 	GEM_BUG_ON(!iter);
+ 
+ 	sg = st->sgl;
+@@ -1391,7 +1391,7 @@ intel_partial_pages(const struct i915_ggtt_view *view,
+ 	do {
+ 		unsigned int len;
+ 
+-		len = min(iter->length - (offset << PAGE_SHIFT),
++		len = min(sg_dma_len(iter) - (offset << PAGE_SHIFT),
+ 			  count << PAGE_SHIFT);
+ 		sg_set_page(sg, NULL, len, 0);
+ 		sg_dma_address(sg) =
+diff --git a/drivers/gpu/drm/i915/i915_scatterlist.h b/drivers/gpu/drm/i915/i915_scatterlist.h
+index fd49860cce00..9cb26a224034 100644
+--- a/drivers/gpu/drm/i915/i915_scatterlist.h
++++ b/drivers/gpu/drm/i915/i915_scatterlist.h
+@@ -48,6 +48,11 @@ static inline int __sg_page_count(const struct scatterlist *sg)
+ 	return sg->length >> PAGE_SHIFT;
+ }
+ 
++static inline int __sg_dma_page_count(const struct scatterlist *sg)
++{
++	return sg_dma_len(sg) >> PAGE_SHIFT;
++}
++
+ static inline struct scatterlist *____sg_next(struct scatterlist *sg)
+ {
+ 	++sg;
+-- 
+2.25.1
+

@@ -1,0 +1,119 @@
+From c08a3f6320a321b60b655113ee78b31f7ea667f6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 21 Oct 2020 16:14:40 +0300
+Subject: [PATCH 0468/1714] drm/i915: Read actual GPU frequency from
+ MEMSTAT_ILK on ILK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There is no GEN6_RPSTAT1 on ILK. Instead of reading that let's
+try to get the same information from MEMSTAT_ILK. At least it
+seems to track MEMSWCTL frequency request perfectly on my ILK.
+It needs the same invert trick as the request value.
+
+We don't want to put the invert thing into intel_gpu_freq()
+and intel_freq_opcode() because that would incorrectly invert
+the min/max/etc frequencies also.
+
+One day someone might want to reverse engineer the formula for
+converting these numbers to Hz, but for now we'll just report
+them raw.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201021131443.25616-2-ville.syrjala@linux.intel.com
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+---
+ drivers/gpu/drm/i915/gt/intel_rps.c | 31 +++++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_rps.c b/drivers/gpu/drm/i915/gt/intel_rps.c
+index c1c9cc0ad3b9..323328a16708 100644
+--- a/drivers/gpu/drm/i915/gt/intel_rps.c
++++ b/drivers/gpu/drm/i915/gt/intel_rps.c
+@@ -390,6 +390,16 @@ static void gen5_rps_update(struct intel_rps *rps)
+ 	spin_unlock_irq(&mchdev_lock);
+ }
+ 
++static unsigned int gen5_invert_freq(struct intel_rps *rps,
++				     unsigned int val)
++{
++	/* Invert the frequency bin into an ips delay */
++	val = rps->max_freq - val;
++	val = rps->min_freq + val;
++
++	return val;
++}
++
+ static bool gen5_rps_set(struct intel_rps *rps, u8 val)
+ {
+ 	struct intel_uncore *uncore = rps_to_uncore(rps);
+@@ -404,8 +414,7 @@ static bool gen5_rps_set(struct intel_rps *rps, u8 val)
+ 	}
+ 
+ 	/* Invert the frequency bin into an ips delay */
+-	val = rps->max_freq - val;
+-	val = rps->min_freq + val;
++	val = gen5_invert_freq(rps, val);
+ 
+ 	rgvswctl =
+ 		(MEMCTL_CMD_CHFREQ << MEMCTL_CMD_SHIFT) |
+@@ -1436,8 +1445,10 @@ int intel_gpu_freq(struct intel_rps *rps, int val)
+ 		return chv_gpu_freq(rps, val);
+ 	else if (IS_VALLEYVIEW(i915))
+ 		return byt_gpu_freq(rps, val);
+-	else
++	else if (INTEL_GEN(i915) >= 6)
+ 		return val * GT_FREQUENCY_MULTIPLIER;
++	else
++		return val;
+ }
+ 
+ int intel_freq_opcode(struct intel_rps *rps, int val)
+@@ -1451,8 +1462,10 @@ int intel_freq_opcode(struct intel_rps *rps, int val)
+ 		return chv_freq_opcode(rps, val);
+ 	else if (IS_VALLEYVIEW(i915))
+ 		return byt_freq_opcode(rps, val);
+-	else
++	else if (INTEL_GEN(i915) >= 6)
+ 		return DIV_ROUND_CLOSEST(val, GT_FREQUENCY_MULTIPLIER);
++	else
++		return val;
+ }
+ 
+ static void vlv_init_gpll_ref_freq(struct intel_rps *rps)
+@@ -1868,8 +1881,11 @@ u32 intel_rps_get_cagf(struct intel_rps *rps, u32 rpstat)
+ 		cagf = (rpstat & GEN9_CAGF_MASK) >> GEN9_CAGF_SHIFT;
+ 	else if (IS_HASWELL(i915) || IS_BROADWELL(i915))
+ 		cagf = (rpstat & HSW_CAGF_MASK) >> HSW_CAGF_SHIFT;
+-	else
++	else if (INTEL_GEN(i915) >= 6)
+ 		cagf = (rpstat & GEN6_CAGF_MASK) >> GEN6_CAGF_SHIFT;
++	else
++		cagf = gen5_invert_freq(rps, (rpstat & MEMSTAT_PSTATE_MASK) >>
++					MEMSTAT_PSTATE_SHIFT);
+ 
+ 	return cagf;
+ }
+@@ -1877,14 +1893,17 @@ u32 intel_rps_get_cagf(struct intel_rps *rps, u32 rpstat)
+ static u32 read_cagf(struct intel_rps *rps)
+ {
+ 	struct drm_i915_private *i915 = rps_to_i915(rps);
++	struct intel_uncore *uncore = rps_to_uncore(rps);
+ 	u32 freq;
+ 
+ 	if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915)) {
+ 		vlv_punit_get(i915);
+ 		freq = vlv_punit_read(i915, PUNIT_REG_GPU_FREQ_STS);
+ 		vlv_punit_put(i915);
++	} else if (INTEL_GEN(i915) >= 6) {
++		freq = intel_uncore_read(uncore, GEN6_RPSTAT1);
+ 	} else {
+-		freq = intel_uncore_read(rps_to_uncore(rps), GEN6_RPSTAT1);
++		freq = intel_uncore_read(uncore, MEMSTAT_ILK);
+ 	}
+ 
+ 	return intel_rps_get_cagf(rps, freq);
+-- 
+2.25.1
+

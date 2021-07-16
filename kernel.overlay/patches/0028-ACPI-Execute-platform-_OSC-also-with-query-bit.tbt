@@ -1,0 +1,103 @@
+From e23ca9126504b94ed4b636cb8eb8caa5f1831b42 Mon Sep 17 00:00:00 2001
+From: Mario Limonciello <mario.limonciello@dell.com>
+Date: Mon, 26 Oct 2020 18:01:05 +0300
+Subject: [PATCH 28/38] ACPI: Execute platform _OSC also with query bit clear
+
+The platform _OSC can change hardware state when query bit is not set.
+According to ACPI spec it is recommended that the OS runs _OSC with
+query bit set until the platform does not mask any of the capabilities.
+Then it should run it with query bit clear in order to actually commit
+the changes. At the moment Linux only runs the _OSC with query bit set
+and this is going to cause problems with the USB4 CM (Connection
+Manager) switch that is going to commit the switch only when the OS
+requests control over the feature.
+
+For this reason modify the _OSC support so that we first execute it with
+query bit set, then use the returned valu as base of the features we
+want to control and run the _OSC again with query bit clear.
+
+Also rename the function to better match what it does.
+
+Signed-off-by: Mario Limonciello <mario.limonciello@dell.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/acpi/bus.c | 44 ++++++++++++++++++++++++++++++++------------
+ 1 file changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 1682f8b454a2..039f4ad7f6f8 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -282,9 +282,9 @@ bool osc_pc_lpi_support_confirmed;
+ EXPORT_SYMBOL_GPL(osc_pc_lpi_support_confirmed);
+ 
+ static u8 sb_uuid_str[] = "0811B06E-4A27-44F9-8D60-3CBBC22E7B48";
+-static void acpi_bus_osc_support(void)
++static void acpi_bus_osc_negotiate_platform_control(void)
+ {
+-	u32 capbuf[2];
++	u32 capbuf[2], *capbuf_ret;
+ 	struct acpi_osc_context context = {
+ 		.uuid_str = sb_uuid_str,
+ 		.rev = 1,
+@@ -319,19 +319,39 @@ static void acpi_bus_osc_support(void)
+ 
+ 	if (!ghes_disable)
+ 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_APEI_SUPPORT;
++
+ 	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle)))
+ 		return;
+-	if (ACPI_SUCCESS(acpi_run_osc(handle, &context))) {
+-		u32 *capbuf_ret = context.ret.pointer;
+-		if (context.ret.length > OSC_SUPPORT_DWORD) {
+-			osc_sb_apei_support_acked =
+-				capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_APEI_SUPPORT;
+-			osc_pc_lpi_support_confirmed =
+-				capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_PCLPI_SUPPORT;
+-		}
++
++	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
++		return;
++
++	capbuf_ret = context.ret.pointer;
++	if (context.ret.length <= OSC_SUPPORT_DWORD) {
+ 		kfree(context.ret.pointer);
++		return;
++	}
++
++	/*
++	 * Now run _OSC again with query flag clean and with the caps
++	 * both platform and OS supports.
++	 */
++	capbuf[OSC_QUERY_DWORD] = 0;
++	capbuf[OSC_SUPPORT_DWORD] = capbuf_ret[OSC_SUPPORT_DWORD];
++	kfree(context.ret.pointer);
++
++	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
++		return;
++
++	capbuf_ret = context.ret.pointer;
++	if (context.ret.length > OSC_SUPPORT_DWORD) {
++		osc_sb_apei_support_acked =
++			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_APEI_SUPPORT;
++		osc_pc_lpi_support_confirmed =
++			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_PCLPI_SUPPORT;
+ 	}
+-	/* do we need to check other returned cap? Sounds no */
++
++	kfree(context.ret.pointer);
+ }
+ 
+ /* --------------------------------------------------------------------------
+@@ -1168,7 +1188,7 @@ static int __init acpi_bus_init(void)
+ 	 * _OSC method may exist in module level code,
+ 	 * so it must be run after ACPI_FULL_INITIALIZATION
+ 	 */
+-	acpi_bus_osc_support();
++	acpi_bus_osc_negotiate_platform_control();
+ 
+ 	/*
+ 	 * _PDC control method may load dynamic SSDT tables,
+-- 
+2.25.1
+

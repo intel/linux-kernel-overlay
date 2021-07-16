@@ -1,0 +1,318 @@
+From c76c5e8864647a713effa490f672da1fc68d443d Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 2 Feb 2021 12:09:12 -0800
+Subject: [PATCH 34/62] perf stat: Support L2 Topdown events
+
+The TMA method level 2 metrics is supported from the Intel Sapphire
+Rapids server, which expose four L2 Topdown metrics events to user
+space. There are eight L2 events in total. The other four L2 Topdown
+metrics events are calculated from the corresponding L1 and the exposed
+L2 events.
+
+Now, the --topdown prints the complete top-down metrics that supported
+by the CPU. For the Intel Sapphire Rapids server, there are 4 L1 events
+and 8 L2 events displyed in one line.
+
+Add a new option, --td-level, to display the top-down statistics that
+equal to or lower than the input level.
+
+The L2 event is marked only when both its L1 parent event and itself
+crosse the threshold.
+
+Here is an example:
+
+  $ perf stat --topdown --td-level=2 --no-metric-only sleep 1
+  Topdown accuracy may decrease when measuring long periods.
+  Please print the result regularly, e.g. -I1000
+
+  Performance counter stats for 'sleep 1':
+
+     16,734,390   slots
+      2,100,001   topdown-retiring       # 12.6% retiring
+      2,034,376   topdown-bad-spec       # 12.3% bad speculation
+      4,003,128   topdown-fe-bound       # 24.1% frontend bound
+        328,125   topdown-heavy-ops      #  2.0% heavy operations    #  10.6% light operations
+      1,968,751   topdown-br-mispredict  # 11.9% branch mispredict   #  0.4% machine clears
+      2,953,127   topdown-fetch-lat      # 17.8% fetch latency       #  6.3% fetch bandwidth
+      5,906,255   topdown-mem-bound      # 35.6% memory bound        #  15.4% core bound
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lore.kernel.org/lkml/1612296553-21962-9-git-send-email-kan.liang@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/Documentation/perf-stat.txt | 14 +++-
+ tools/perf/builtin-stat.c              | 34 +++++++++-
+ tools/perf/util/stat-shadow.c          | 92 ++++++++++++++++++++++++++
+ tools/perf/util/stat.c                 |  4 ++
+ tools/perf/util/stat.h                 |  9 +++
+ 5 files changed, 149 insertions(+), 4 deletions(-)
+
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index b138dd192423..85112e8fcfa8 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -357,7 +357,7 @@ See perf list output for the possble metrics and metricgroups.
+ Do not aggregate counts across all monitored CPUs.
+ 
+ --topdown::
+-Print top down level 1 metrics if supported by the CPU. This allows to
++Print complete top-down metrics supported by the CPU. This allows to
+ determine bottle necks in the CPU pipeline for CPU bound workloads,
+ by breaking the cycles consumed down into frontend bound, backend bound,
+ bad speculation and retiring.
+@@ -392,6 +392,18 @@ To interpret the results it is usually needed to know on which
+ CPUs the workload runs on. If needed the CPUs can be forced using
+ taskset.
+ 
++--td-level::
++Print the top-down statistics that equal to or lower than the input level.
++It allows users to print the interested top-down metrics level instead of
++the complete top-down metrics.
++
++The availability of the top-down metrics level depends on the hardware. For
++example, Ice Lake only supports L1 top-down metrics. The Sapphire Rapids
++supports both L1 and L2 top-down metrics.
++
++Default: 0 means the max level that the current hardware support.
++Error out if the input is higher than the supported max level.
++
+ --no-merge::
+ Do not merge results from same PMUs.
+ 
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 86bf3193934c..283bd5666408 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -137,6 +137,19 @@ static const char *topdown_metric_attrs[] = {
+ 	NULL,
+ };
+ 
++static const char *topdown_metric_L2_attrs[] = {
++	"slots",
++	"topdown-retiring",
++	"topdown-bad-spec",
++	"topdown-fe-bound",
++	"topdown-be-bound",
++	"topdown-heavy-ops",
++	"topdown-br-mispredict",
++	"topdown-fetch-lat",
++	"topdown-mem-bound",
++	NULL,
++};
++
+ static const char *smi_cost_attrs = {
+ 	"{"
+ 	"msr/aperf/,"
+@@ -1154,7 +1167,9 @@ static struct option stat_options[] = {
+ 	OPT_BOOLEAN(0, "metric-no-merge", &stat_config.metric_no_merge,
+ 		       "don't try to share events between metrics in a group"),
+ 	OPT_BOOLEAN(0, "topdown", &topdown_run,
+-			"measure topdown level 1 statistics"),
++			"measure top-down statistics"),
++	OPT_UINTEGER(0, "td-level", &stat_config.topdown_level,
++			"Set the metrics level for the top-down statistics (0: max level)"),
+ 	OPT_BOOLEAN(0, "smi-cost", &smi_cost,
+ 			"measure SMI cost"),
+ 	OPT_CALLBACK('M', "metrics", &evsel_list, "metric/metric group list",
+@@ -1707,17 +1722,30 @@ static int add_default_attributes(void)
+ 	}
+ 
+ 	if (topdown_run) {
++		const char **metric_attrs = topdown_metric_attrs;
++		unsigned int max_level = 1;
+ 		char *str = NULL;
+ 		bool warn = false;
+ 
+ 		if (!force_metric_only)
+ 			stat_config.metric_only = true;
+ 
+-		if (topdown_filter_events(topdown_metric_attrs, &str, 1) < 0) {
++		if (pmu_have_event("cpu", topdown_metric_L2_attrs[5])) {
++			metric_attrs = topdown_metric_L2_attrs;
++			max_level = 2;
++		}
++
++		if (stat_config.topdown_level > max_level) {
++			pr_err("Invalid top-down metrics level. The max level is %u.\n", max_level);
++			return -1;
++		} else if (!stat_config.topdown_level)
++			stat_config.topdown_level = max_level;
++
++		if (topdown_filter_events(metric_attrs, &str, 1) < 0) {
+ 			pr_err("Out of memory\n");
+ 			return -1;
+ 		}
+-		if (topdown_metric_attrs[0] && str) {
++		if (metric_attrs[0] && str) {
+ 			if (!stat_config.interval && !stat_config.metric_only) {
+ 				fprintf(stat_config.output,
+ 					"Topdown accuracy may decrease when measuring long periods.\n"
+diff --git a/tools/perf/util/stat-shadow.c b/tools/perf/util/stat-shadow.c
+index 12eafd12a693..6ccf21a72f06 100644
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@ -273,6 +273,18 @@ void perf_stat__update_shadow_stats(struct evsel *counter, u64 count,
+ 	else if (perf_stat_evsel__is(counter, TOPDOWN_BE_BOUND))
+ 		update_runtime_stat(st, STAT_TOPDOWN_BE_BOUND,
+ 				    cpu, count, &rsd);
++	else if (perf_stat_evsel__is(counter, TOPDOWN_HEAVY_OPS))
++		update_runtime_stat(st, STAT_TOPDOWN_HEAVY_OPS,
++				    cpu, count, &rsd);
++	else if (perf_stat_evsel__is(counter, TOPDOWN_BR_MISPREDICT))
++		update_runtime_stat(st, STAT_TOPDOWN_BR_MISPREDICT,
++				    cpu, count, &rsd);
++	else if (perf_stat_evsel__is(counter, TOPDOWN_FETCH_LAT))
++		update_runtime_stat(st, STAT_TOPDOWN_FETCH_LAT,
++				    cpu, count, &rsd);
++	else if (perf_stat_evsel__is(counter, TOPDOWN_MEM_BOUND))
++		update_runtime_stat(st, STAT_TOPDOWN_MEM_BOUND,
++				    cpu, count, &rsd);
+ 	else if (evsel__match(counter, HARDWARE, HW_STALLED_CYCLES_FRONTEND))
+ 		update_runtime_stat(st, STAT_STALLED_CYCLES_FRONT,
+ 				    cpu, count, &rsd);
+@@ -1174,6 +1186,86 @@ void perf_stat__print_shadow_stats(struct perf_stat_config *config,
+ 			color = PERF_COLOR_RED;
+ 		print_metric(config, ctxp, color, "%8.1f%%", "bad speculation",
+ 				bad_spec * 100.);
++	} else if (perf_stat_evsel__is(evsel, TOPDOWN_HEAVY_OPS) &&
++			full_td(cpu, st, &rsd) && (config->topdown_level > 1)) {
++		double retiring = td_metric_ratio(cpu,
++						  STAT_TOPDOWN_RETIRING, st,
++						  &rsd);
++		double heavy_ops = td_metric_ratio(cpu,
++						   STAT_TOPDOWN_HEAVY_OPS, st,
++						   &rsd);
++		double light_ops = retiring - heavy_ops;
++
++		if (retiring > 0.7 && heavy_ops > 0.1)
++			color = PERF_COLOR_GREEN;
++		print_metric(config, ctxp, color, "%8.1f%%", "heavy operations",
++				heavy_ops * 100.);
++		if (retiring > 0.7 && light_ops > 0.6)
++			color = PERF_COLOR_GREEN;
++		else
++			color = NULL;
++		print_metric(config, ctxp, color, "%8.1f%%", "light operations",
++				light_ops * 100.);
++	} else if (perf_stat_evsel__is(evsel, TOPDOWN_BR_MISPREDICT) &&
++			full_td(cpu, st, &rsd) && (config->topdown_level > 1)) {
++		double bad_spec = td_metric_ratio(cpu,
++						  STAT_TOPDOWN_BAD_SPEC, st,
++						  &rsd);
++		double br_mis = td_metric_ratio(cpu,
++						STAT_TOPDOWN_BR_MISPREDICT, st,
++						&rsd);
++		double m_clears = bad_spec - br_mis;
++
++		if (bad_spec > 0.1 && br_mis > 0.05)
++			color = PERF_COLOR_RED;
++		print_metric(config, ctxp, color, "%8.1f%%", "branch mispredict",
++				br_mis * 100.);
++		if (bad_spec > 0.1 && m_clears > 0.05)
++			color = PERF_COLOR_RED;
++		else
++			color = NULL;
++		print_metric(config, ctxp, color, "%8.1f%%", "machine clears",
++				m_clears * 100.);
++	} else if (perf_stat_evsel__is(evsel, TOPDOWN_FETCH_LAT) &&
++			full_td(cpu, st, &rsd) && (config->topdown_level > 1)) {
++		double fe_bound = td_metric_ratio(cpu,
++						  STAT_TOPDOWN_FE_BOUND, st,
++						  &rsd);
++		double fetch_lat = td_metric_ratio(cpu,
++						   STAT_TOPDOWN_FETCH_LAT, st,
++						   &rsd);
++		double fetch_bw = fe_bound - fetch_lat;
++
++		if (fe_bound > 0.2 && fetch_lat > 0.15)
++			color = PERF_COLOR_RED;
++		print_metric(config, ctxp, color, "%8.1f%%", "fetch latency",
++				fetch_lat * 100.);
++		if (fe_bound > 0.2 && fetch_bw > 0.1)
++			color = PERF_COLOR_RED;
++		else
++			color = NULL;
++		print_metric(config, ctxp, color, "%8.1f%%", "fetch bandwidth",
++				fetch_bw * 100.);
++	} else if (perf_stat_evsel__is(evsel, TOPDOWN_MEM_BOUND) &&
++			full_td(cpu, st, &rsd) && (config->topdown_level > 1)) {
++		double be_bound = td_metric_ratio(cpu,
++						  STAT_TOPDOWN_BE_BOUND, st,
++						  &rsd);
++		double mem_bound = td_metric_ratio(cpu,
++						   STAT_TOPDOWN_MEM_BOUND, st,
++						   &rsd);
++		double core_bound = be_bound - mem_bound;
++
++		if (be_bound > 0.2 && mem_bound > 0.2)
++			color = PERF_COLOR_RED;
++		print_metric(config, ctxp, color, "%8.1f%%", "memory bound",
++				mem_bound * 100.);
++		if (be_bound > 0.2 && core_bound > 0.1)
++			color = PERF_COLOR_RED;
++		else
++			color = NULL;
++		print_metric(config, ctxp, color, "%8.1f%%", "Core bound",
++				core_bound * 100.);
+ 	} else if (evsel->metric_expr) {
+ 		generic_metric(config, evsel->metric_expr, evsel->metric_events, NULL,
+ 				evsel->name, evsel->metric_name, NULL, 1, cpu, out, st);
+diff --git a/tools/perf/util/stat.c b/tools/perf/util/stat.c
+index 472e85c68324..23bae942e408 100644
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@ -99,6 +99,10 @@ static const char *id_str[PERF_STAT_EVSEL_ID__MAX] = {
+ 	ID(TOPDOWN_BAD_SPEC, topdown-bad-spec),
+ 	ID(TOPDOWN_FE_BOUND, topdown-fe-bound),
+ 	ID(TOPDOWN_BE_BOUND, topdown-be-bound),
++	ID(TOPDOWN_HEAVY_OPS, topdown-heavy-ops),
++	ID(TOPDOWN_BR_MISPREDICT, topdown-br-mispredict),
++	ID(TOPDOWN_FETCH_LAT, topdown-fetch-lat),
++	ID(TOPDOWN_MEM_BOUND, topdown-mem-bound),
+ 	ID(SMI_NUM, msr/smi/),
+ 	ID(APERF, msr/aperf/),
+ };
+diff --git a/tools/perf/util/stat.h b/tools/perf/util/stat.h
+index 15b88c2c5101..b2bd18cbe093 100644
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@ -33,6 +33,10 @@ enum perf_stat_evsel_id {
+ 	PERF_STAT_EVSEL_ID__TOPDOWN_BAD_SPEC,
+ 	PERF_STAT_EVSEL_ID__TOPDOWN_FE_BOUND,
+ 	PERF_STAT_EVSEL_ID__TOPDOWN_BE_BOUND,
++	PERF_STAT_EVSEL_ID__TOPDOWN_HEAVY_OPS,
++	PERF_STAT_EVSEL_ID__TOPDOWN_BR_MISPREDICT,
++	PERF_STAT_EVSEL_ID__TOPDOWN_FETCH_LAT,
++	PERF_STAT_EVSEL_ID__TOPDOWN_MEM_BOUND,
+ 	PERF_STAT_EVSEL_ID__SMI_NUM,
+ 	PERF_STAT_EVSEL_ID__APERF,
+ 	PERF_STAT_EVSEL_ID__MAX,
+@@ -91,6 +95,10 @@ enum stat_type {
+ 	STAT_TOPDOWN_BAD_SPEC,
+ 	STAT_TOPDOWN_FE_BOUND,
+ 	STAT_TOPDOWN_BE_BOUND,
++	STAT_TOPDOWN_HEAVY_OPS,
++	STAT_TOPDOWN_BR_MISPREDICT,
++	STAT_TOPDOWN_FETCH_LAT,
++	STAT_TOPDOWN_MEM_BOUND,
+ 	STAT_SMI_NUM,
+ 	STAT_APERF,
+ 	STAT_MAX
+@@ -148,6 +156,7 @@ struct perf_stat_config {
+ 	int			 ctl_fd_ack;
+ 	bool			 ctl_fd_close;
+ 	const char		*cgroup_list;
++	unsigned int		topdown_level;
+ };
+ 
+ void perf_stat__set_big_num(int set);
+-- 
+2.25.1
+

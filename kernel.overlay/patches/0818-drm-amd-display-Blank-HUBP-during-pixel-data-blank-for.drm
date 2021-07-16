@@ -1,0 +1,409 @@
+From da87eb35d5c5dfda64a29ed0e11e9c3cabe8a148 Mon Sep 17 00:00:00 2001
+From: Joshua Aberback <joshua.aberback@amd.com>
+Date: Mon, 19 Oct 2020 19:30:03 -0400
+Subject: [PATCH 0818/1714] drm/amd/display: Blank HUBP during pixel data blank
+ for DCN30 v2
+
+[Why]
+Prior commit "Blank HUBP during pixel data blank for DCN30"
+missed the call to set_disp_pattern_generator from
+set_crtc_test_pattern, which re-exposed the issue for which
+we initially blocked active-only p-state switching.
+
+[How]
+ - remove dcn30_blank_pixel_data, set dcn30 back to dcn20 version
+ - new hwss funciton set_disp_pattern_generator
+ - dcn20 version just calls opp_set_disp_pattern_generator
+ - dcn30 version implements the HUBP blank
+
+Signed-off-by: Joshua Aberback <joshua.aberback@amd.com>
+Reviewed-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  | 62 ++++++------
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    | 20 +++-
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.h    |  9 ++
+ .../gpu/drm/amd/display/dc/dcn20/dcn20_init.c |  1 +
+ .../gpu/drm/amd/display/dc/dcn21/dcn21_init.c |  1 +
+ .../drm/amd/display/dc/dcn30/dcn30_hwseq.c    | 96 +++++--------------
+ .../drm/amd/display/dc/dcn30/dcn30_hwseq.h    |  8 +-
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_init.c |  3 +-
+ .../gpu/drm/amd/display/dc/inc/hw_sequencer.h |  8 ++
+ 9 files changed, 100 insertions(+), 108 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index 86d1800c046d..d30ef6ea1947 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -3848,7 +3848,7 @@ static void set_crtc_test_pattern(struct dc_link *link,
+ 		if (pipe_ctx->stream_res.tg->funcs->set_test_pattern)
+ 			pipe_ctx->stream_res.tg->funcs->set_test_pattern(pipe_ctx->stream_res.tg,
+ 				controller_test_pattern, color_depth);
+-		else if (opp->funcs->opp_set_disp_pattern_generator) {
++		else if (link->dc->hwss.set_disp_pattern_generator) {
+ 			struct pipe_ctx *odm_pipe;
+ 			enum controller_dp_color_space controller_color_space;
+ 			int opp_cnt = 1;
+@@ -3878,26 +3878,29 @@ static void set_crtc_test_pattern(struct dc_link *link,
+ 			dpg_width = width / opp_cnt;
+ 			offset = dpg_width;
+ 
+-			opp->funcs->opp_set_disp_pattern_generator(opp,
+-				controller_test_pattern,
+-				controller_color_space,
+-				color_depth,
+-				NULL,
+-				dpg_width,
+-				height,
+-				0);
+-
+-			for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
+-				struct output_pixel_processor *odm_opp = odm_pipe->stream_res.opp;
+-				odm_opp->funcs->opp_program_bit_depth_reduction(odm_opp, &params);
+-				odm_opp->funcs->opp_set_disp_pattern_generator(odm_opp,
++			link->dc->hwss.set_disp_pattern_generator(link->dc,
++					pipe_ctx,
+ 					controller_test_pattern,
+ 					controller_color_space,
+ 					color_depth,
+ 					NULL,
+ 					dpg_width,
+ 					height,
+-					offset);
++					0);
++
++			for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
++				struct output_pixel_processor *odm_opp = odm_pipe->stream_res.opp;
++
++				odm_opp->funcs->opp_program_bit_depth_reduction(odm_opp, &params);
++				link->dc->hwss.set_disp_pattern_generator(link->dc,
++						odm_pipe,
++						controller_test_pattern,
++						controller_color_space,
++						color_depth,
++						NULL,
++						dpg_width,
++						height,
++						offset);
+ 				offset += offset;
+ 			}
+ 		}
+@@ -3913,7 +3916,7 @@ static void set_crtc_test_pattern(struct dc_link *link,
+ 			pipe_ctx->stream_res.tg->funcs->set_test_pattern(pipe_ctx->stream_res.tg,
+ 				CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+ 				color_depth);
+-		else if (opp->funcs->opp_set_disp_pattern_generator) {
++		else if (link->dc->hwss.set_disp_pattern_generator) {
+ 			struct pipe_ctx *odm_pipe;
+ 			int opp_cnt = 1;
+ 			int dpg_width = width;
+@@ -3926,7 +3929,18 @@ static void set_crtc_test_pattern(struct dc_link *link,
+ 				struct output_pixel_processor *odm_opp = odm_pipe->stream_res.opp;
+ 
+ 				odm_opp->funcs->opp_program_bit_depth_reduction(odm_opp, &params);
+-				odm_opp->funcs->opp_set_disp_pattern_generator(odm_opp,
++				link->dc->hwss.set_disp_pattern_generator(link->dc,
++						odm_pipe,
++						CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
++						CONTROLLER_DP_COLOR_SPACE_UDEFINED,
++						color_depth,
++						NULL,
++						dpg_width,
++						height,
++						0);
++			}
++			link->dc->hwss.set_disp_pattern_generator(link->dc,
++					pipe_ctx,
+ 					CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+ 					CONTROLLER_DP_COLOR_SPACE_UDEFINED,
+ 					color_depth,
+@@ -3934,15 +3948,6 @@ static void set_crtc_test_pattern(struct dc_link *link,
+ 					dpg_width,
+ 					height,
+ 					0);
+-			}
+-			opp->funcs->opp_set_disp_pattern_generator(opp,
+-				CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+-				CONTROLLER_DP_COLOR_SPACE_UDEFINED,
+-				color_depth,
+-				NULL,
+-				dpg_width,
+-				height,
+-				0);
+ 		}
+ 	}
+ 	break;
+@@ -3977,10 +3982,7 @@ bool dc_link_dp_set_test_pattern(
+ 		}
+ 	}
+ 
+-	/* Reset CRTC Test Pattern if it is currently running and request
+-	 * is VideoMode Reset DP Phy Test Pattern if it is currently running
+-	 * and request is VideoMode
+-	 */
++	/* Reset CRTC Test Pattern if it is currently running and request is VideoMode */
+ 	if (link->test_pattern_enabled && test_pattern ==
+ 			DP_TEST_PATTERN_VIDEO_MODE) {
+ 		/* Set CRTC Test Pattern */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index a195dfb718dd..62788ad28230 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -1030,8 +1030,8 @@ void dcn20_blank_pixel_data(
+ 		test_pattern = CONTROLLER_DP_TEST_PATTERN_VIDEOMODE;
+ 	}
+ 
+-	stream_res->opp->funcs->opp_set_disp_pattern_generator(
+-			stream_res->opp,
++	dc->hwss.set_disp_pattern_generator(dc,
++			pipe_ctx,
+ 			test_pattern,
+ 			test_pattern_color_space,
+ 			stream->timing.display_color_depth,
+@@ -1041,8 +1041,8 @@ void dcn20_blank_pixel_data(
+ 			0);
+ 
+ 	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
+-		odm_pipe->stream_res.opp->funcs->opp_set_disp_pattern_generator(
+-				odm_pipe->stream_res.opp,
++		dc->hwss.set_disp_pattern_generator(dc,
++				odm_pipe,
+ 				dc->debug.visual_confirm != VISUAL_CONFIRM_DISABLE && blank ?
+ 						CONTROLLER_DP_TEST_PATTERN_COLORRAMP : test_pattern,
+ 				test_pattern_color_space,
+@@ -2569,3 +2569,15 @@ bool dcn20_optimize_timing_for_fsft(struct dc *dc,
+ 	return true;
+ }
+ #endif
++
++void dcn20_set_disp_pattern_generator(const struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		enum controller_dp_test_pattern test_pattern,
++		enum controller_dp_color_space color_space,
++		enum dc_color_depth color_depth,
++		const struct tg_color *solid_color,
++		int width, int height, int offset)
++{
++	pipe_ctx->stream_res.opp->funcs->opp_set_disp_pattern_generator(pipe_ctx->stream_res.opp, test_pattern,
++			color_space, color_depth, solid_color, width, height, offset);
++}
+\ No newline at end of file
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
+index 83220e34c1a9..c69f766a40ce 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
+@@ -137,5 +137,14 @@ bool dcn20_optimize_timing_for_fsft(struct dc *dc,
+ 		struct dc_crtc_timing *timing,
+ 		unsigned int max_input_rate_in_khz);
+ #endif
++
++void dcn20_set_disp_pattern_generator(const struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		enum controller_dp_test_pattern test_pattern,
++		enum controller_dp_color_space color_space,
++		enum dc_color_depth color_depth,
++		const struct tg_color *solid_color,
++		int width, int height, int offset);
++
+ #endif /* __DC_HWSS_DCN20_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+index f4bc2a44f806..de9dcbeea150 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+@@ -93,6 +93,7 @@ static const struct hw_sequencer_funcs dcn20_funcs = {
+ #ifndef TRIM_FSFT
+ 	.optimize_timing_for_fsft = dcn20_optimize_timing_for_fsft,
+ #endif
++	.set_disp_pattern_generator = dcn20_set_disp_pattern_generator,
+ };
+ 
+ static const struct hwseq_private_funcs dcn20_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+index 3e3eca1778cb..074e2713257f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+@@ -98,6 +98,7 @@ static const struct hw_sequencer_funcs dcn21_funcs = {
+ 	.optimize_timing_for_fsft = dcn20_optimize_timing_for_fsft,
+ #endif
+ 	.is_abm_supported = dcn21_is_abm_supported,
++	.set_disp_pattern_generator = dcn20_set_disp_pattern_generator,
+ };
+ 
+ static const struct hwseq_private_funcs dcn21_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+index b07ccc8d4fc4..25dc50f6cd5b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.c
+@@ -816,85 +816,37 @@ void dcn30_hardware_release(struct dc *dc)
+ 				dc->res_pool->hubbub, true, true);
+ }
+ 
+-void dcn30_blank_pixel_data(struct dc *dc, struct pipe_ctx *pipe_ctx, bool blank)
++void dcn30_set_disp_pattern_generator(const struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		enum controller_dp_test_pattern test_pattern,
++		enum controller_dp_color_space color_space,
++		enum dc_color_depth color_depth,
++		const struct tg_color *solid_color,
++		int width, int height, int offset)
+ {
+-	struct tg_color black_color = {0};
+ 	struct stream_resource *stream_res = &pipe_ctx->stream_res;
+-	struct dc_stream_state *stream = pipe_ctx->stream;
+-	enum dc_color_space color_space = stream->output_color_space;
+-	enum controller_dp_test_pattern test_pattern = CONTROLLER_DP_TEST_PATTERN_SOLID_COLOR;
+-	enum controller_dp_color_space test_pattern_color_space = CONTROLLER_DP_COLOR_SPACE_UDEFINED;
+-	struct pipe_ctx *odm_pipe;
+ 	struct pipe_ctx *mpcc_pipe;
+-	int odm_cnt = 1;
+ 
+-	int width = stream->timing.h_addressable + stream->timing.h_border_left + stream->timing.h_border_right;
+-	int height = stream->timing.v_addressable + stream->timing.v_border_bottom + stream->timing.v_border_top;
++	if (test_pattern != CONTROLLER_DP_TEST_PATTERN_VIDEOMODE) {
++		/* turning on DPG */
++		stream_res->opp->funcs->opp_set_disp_pattern_generator(stream_res->opp, test_pattern, color_space,
++				color_depth, solid_color, width, height, 0);
+ 
+-	if (stream->link->test_pattern_enabled)
+-		return;
+-
+-	/* get opp dpg blank color */
+-	color_space_to_black_color(dc, color_space, &black_color);
+-
+-	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe)
+-		odm_cnt++;
+-
+-	width = width / odm_cnt;
+-
+-	if (blank) {
+-		dc->hwss.set_abm_immediate_disable(pipe_ctx);
++		/* wait for the next frame when enabling DPG */
++		if (stream_res->tg->funcs->is_tg_enabled(stream_res->tg))
++			dc->hwseq->funcs.wait_for_blank_complete(stream_res->opp);
+ 
+-		if (dc->debug.visual_confirm != VISUAL_CONFIRM_DISABLE) {
+-			test_pattern = CONTROLLER_DP_TEST_PATTERN_COLORSQUARES;
+-			test_pattern_color_space = CONTROLLER_DP_COLOR_SPACE_RGB;
+-		}
++		/* Blank HUBP to allow p-state during blank on all timings */
++		pipe_ctx->plane_res.hubp->funcs->set_blank(pipe_ctx->plane_res.hubp, true);
++		for (mpcc_pipe = pipe_ctx->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
++			mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, true);
+ 	} else {
+-		test_pattern = CONTROLLER_DP_TEST_PATTERN_VIDEOMODE;
+-	}
++		/* turning off DPG */
++		pipe_ctx->plane_res.hubp->funcs->set_blank(pipe_ctx->plane_res.hubp, false);
++		for (mpcc_pipe = pipe_ctx->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
++			mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, false);
+ 
+-	stream_res->opp->funcs->opp_set_disp_pattern_generator(
+-			stream_res->opp,
+-			test_pattern,
+-			test_pattern_color_space,
+-			stream->timing.display_color_depth,
+-			&black_color,
+-			width,
+-			height,
+-			0);
+-
+-	/* wait for the next frame when enabling DPG */
+-	if (blank && stream_res->tg->funcs->is_tg_enabled(stream_res->tg))
+-		dc->hwseq->funcs.wait_for_blank_complete(pipe_ctx->stream_res.opp);
+-
+-	/* Blank HUBP to allow p-state during blank on all timings */
+-	pipe_ctx->plane_res.hubp->funcs->set_blank(pipe_ctx->plane_res.hubp, blank);
+-	for (mpcc_pipe = pipe_ctx->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
+-		mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, blank);
+-
+-	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
+-		odm_pipe->stream_res.opp->funcs->opp_set_disp_pattern_generator(
+-				odm_pipe->stream_res.opp,
+-				dc->debug.visual_confirm != VISUAL_CONFIRM_DISABLE && blank ?
+-						CONTROLLER_DP_TEST_PATTERN_COLORRAMP : test_pattern,
+-				test_pattern_color_space,
+-				stream->timing.display_color_depth,
+-				&black_color,
+-				width,
+-				height,
+-				0);
+-
+-		if (blank && stream_res->tg->funcs->is_tg_enabled(stream_res->tg))
+-			dc->hwseq->funcs.wait_for_blank_complete(pipe_ctx->stream_res.opp);
+-
+-		odm_pipe->plane_res.hubp->funcs->set_blank(odm_pipe->plane_res.hubp, blank);
+-		for (mpcc_pipe = odm_pipe->bottom_pipe; mpcc_pipe; mpcc_pipe = mpcc_pipe->bottom_pipe)
+-			mpcc_pipe->plane_res.hubp->funcs->set_blank(mpcc_pipe->plane_res.hubp, blank);
++		stream_res->opp->funcs->opp_set_disp_pattern_generator(stream_res->opp, test_pattern, color_space,
++				color_depth, solid_color, width, height, 0);
+ 	}
+-
+-	if (!blank)
+-		if (stream_res->abm) {
+-			dc->hwss.set_pipe(pipe_ctx);
+-			stream_res->abm->funcs->set_abm_level(stream_res->abm, stream->abm_level);
+-		}
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+index 7d9db7cdd2f7..7d32c43aafe0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_hwseq.h
+@@ -69,6 +69,12 @@ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable);
+ 
+ void dcn30_hardware_release(struct dc *dc);
+ 
+-void dcn30_blank_pixel_data(struct dc *dc, struct pipe_ctx *pipe_ctx, bool blank);
++void dcn30_set_disp_pattern_generator(const struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		enum controller_dp_test_pattern test_pattern,
++		enum controller_dp_color_space color_space,
++		enum dc_color_depth color_depth,
++		const struct tg_color *solid_color,
++		int width, int height, int offset);
+ 
+ #endif /* __DC_HWSS_DCN30_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+index 4d1b756f5cbf..6125fe440ad0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+@@ -95,6 +95,7 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
+ 	.set_abm_immediate_disable = dcn21_set_abm_immediate_disable,
+ 	.hardware_release = dcn30_hardware_release,
+ 	.set_pipe = dcn21_set_pipe,
++	.set_disp_pattern_generator = dcn30_set_disp_pattern_generator,
+ };
+ 
+ static const struct hwseq_private_funcs dcn30_private_funcs = {
+@@ -106,7 +107,7 @@ static const struct hwseq_private_funcs dcn30_private_funcs = {
+ 	.set_output_transfer_func = dcn30_set_output_transfer_func,
+ 	.power_down = dce110_power_down,
+ 	.enable_display_power_gating = dcn10_dummy_display_power_gating,
+-	.blank_pixel_data = dcn30_blank_pixel_data,
++	.blank_pixel_data = dcn20_blank_pixel_data,
+ 	.reset_hw_ctx_wrap = dcn20_reset_hw_ctx_wrap,
+ 	.enable_stream_timing = dcn20_enable_stream_timing,
+ 	.edp_backlight_control = dce110_edp_backlight_control,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index f728928cda5a..2313115b5628 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -223,6 +223,14 @@ struct hw_sequencer_funcs {
+ 
+ 	bool (*is_abm_supported)(struct dc *dc,
+ 			struct dc_state *context, struct dc_stream_state *stream);
++
++	void (*set_disp_pattern_generator)(const struct dc *dc,
++			struct pipe_ctx *pipe_ctx,
++			enum controller_dp_test_pattern test_pattern,
++			enum controller_dp_color_space color_space,
++			enum dc_color_depth color_depth,
++			const struct tg_color *solid_color,
++			int width, int height, int offset);
+ };
+ 
+ void color_space_to_black_color(
+-- 
+2.25.1
+

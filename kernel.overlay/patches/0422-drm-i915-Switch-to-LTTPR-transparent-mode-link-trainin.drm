@@ -1,0 +1,148 @@
+From b3e0f9d52aa068dfaf162ecc230e7881e2d0f5be Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Wed, 7 Oct 2020 20:09:16 +0300
+Subject: [PATCH 0422/1714] drm/i915: Switch to LTTPR transparent mode link
+ training
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+By default LTTPRs should be in transparent link training mode,
+nevertheless in this patch we switch to this default mode explicitly.
+
+The DP Standard recommends this, supposedly because an LTTPR may be left
+in the non-transparent mode (by BIOS, previous kernel, or after reset
+due to a firmware bug). I haven't seen this happening, but let's follow
+the DP Standard.
+
+v2:
+- Add a code comment about the explicit disabling of non-transparent
+  mode.
+v3:
+- Move check to prevent initing LTTPRs on eDP to init_dp_lttpr_init().
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201007170917.1764556-6-imre.deak@intel.com
+---
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_dp.c       |  2 +
+ .../drm/i915/display/intel_dp_link_training.c | 55 +++++++++++++++++++
+ .../drm/i915/display/intel_dp_link_training.h |  2 +
+ 4 files changed, 60 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index b6b1ecfca652..d6826607efda 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1302,6 +1302,7 @@ struct intel_dp {
+ 	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
+ 	u8 edp_dpcd[EDP_DISPLAY_CTL_CAP_SIZE];
+ 	u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE];
++	u8 lttpr_common_caps[DP_LTTPR_COMMON_CAP_SIZE];
+ 	u8 fec_capable;
+ 	/* source rates */
+ 	int num_source_rates;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 0c0fd1080d7c..8c2d948b5a40 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -4790,6 +4790,8 @@ intel_dp_get_dpcd(struct intel_dp *intel_dp)
+ {
+ 	int ret;
+ 
++	intel_dp_lttpr_init(intel_dp);
++
+ 	if (drm_dp_read_dpcd_caps(&intel_dp->aux, intel_dp->dpcd))
+ 		return false;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_link_training.c b/drivers/gpu/drm/i915/display/intel_dp_link_training.c
+index 71a8c9a546a3..a19f0fd50c69 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_link_training.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_link_training.c
+@@ -34,6 +34,55 @@ intel_dp_dump_link_status(const u8 link_status[DP_LINK_STATUS_SIZE])
+ 		      link_status[3], link_status[4], link_status[5]);
+ }
+ 
++static bool intel_dp_read_lttpr_common_caps(struct intel_dp *intel_dp)
++{
++	if (drm_dp_read_lttpr_common_caps(&intel_dp->aux,
++					  intel_dp->lttpr_common_caps) < 0) {
++		memset(intel_dp->lttpr_common_caps, 0,
++		       sizeof(intel_dp->lttpr_common_caps));
++		return false;
++	}
++
++	drm_dbg_kms(&dp_to_i915(intel_dp)->drm,
++		    "LTTPR common capabilities: %*ph\n",
++		    (int)sizeof(intel_dp->lttpr_common_caps),
++		    intel_dp->lttpr_common_caps);
++
++	return true;
++}
++
++static bool
++intel_dp_set_lttpr_transparent_mode(struct intel_dp *intel_dp, bool enable)
++{
++	u8 val = enable ? DP_PHY_REPEATER_MODE_TRANSPARENT :
++			  DP_PHY_REPEATER_MODE_NON_TRANSPARENT;
++
++	return drm_dp_dpcd_write(&intel_dp->aux, DP_PHY_REPEATER_MODE, &val, 1) == 1;
++}
++
++/**
++ * intel_dp_lttpr_init - detect LTTPRs and init the LTTPR link training mode
++ * @intel_dp: Intel DP struct
++ *
++ * Read the LTTPR common capabilities and switch to transparent link training
++ * mode.
++ */
++int intel_dp_lttpr_init(struct intel_dp *intel_dp)
++{
++	if (intel_dp_is_edp(intel_dp))
++		return 0;
++
++	intel_dp_read_lttpr_common_caps(intel_dp);
++
++	/*
++	 * See DP Standard v2.0 3.6.6.1. about the explicit disabling of
++	 * non-transparent mode.
++	 */
++	intel_dp_set_lttpr_transparent_mode(intel_dp, true);
++
++	return 0;
++}
++
+ static u8 dp_voltage_max(u8 preemph)
+ {
+ 	switch (preemph & DP_TRAIN_PRE_EMPHASIS_MASK) {
+@@ -492,6 +541,12 @@ static void intel_dp_schedule_fallback_link_training(struct intel_dp *intel_dp,
+ void intel_dp_start_link_train(struct intel_dp *intel_dp,
+ 			       const struct intel_crtc_state *crtc_state)
+ {
++	/*
++	 * TODO: Reiniting LTTPRs here won't be needed once proper connector
++	 * HW state readout is added.
++	 */
++	intel_dp_lttpr_init(intel_dp);
++
+ 	if (!intel_dp_link_train(intel_dp, crtc_state))
+ 		intel_dp_schedule_fallback_link_training(intel_dp, crtc_state);
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_link_training.h b/drivers/gpu/drm/i915/display/intel_dp_link_training.h
+index bf9474e41aed..b3fb1d125b9b 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_link_training.h
++++ b/drivers/gpu/drm/i915/display/intel_dp_link_training.h
+@@ -11,6 +11,8 @@
+ struct intel_crtc_state;
+ struct intel_dp;
+ 
++int intel_dp_lttpr_init(struct intel_dp *intel_dp);
++
+ void intel_dp_get_adjust_train(struct intel_dp *intel_dp,
+ 			       const struct intel_crtc_state *crtc_state,
+ 			       const u8 link_status[DP_LINK_STATUS_SIZE]);
+-- 
+2.25.1
+

@@ -1,0 +1,608 @@
+From 03c4c78d55de71823c5a759be7b49e780879f6ee Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 30 Sep 2020 10:38:48 +0200
+Subject: [PATCH 0154/1714] drm/ttm: set the tt caching state at creation time
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+All drivers can determine the tt caching state at creation time,
+no need to do this on the fly during every validation.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Link: https://patchwork.freedesktop.org/patch/394253/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 11 +++++--
+ drivers/gpu/drm/drm_gem_vram_helper.c      |  2 +-
+ drivers/gpu/drm/nouveau/nouveau_sgdma.c    | 13 ++++++++-
+ drivers/gpu/drm/qxl/qxl_ttm.c              |  2 +-
+ drivers/gpu/drm/radeon/radeon_ttm.c        | 16 ++++++++--
+ drivers/gpu/drm/ttm/ttm_agp_backend.c      |  2 +-
+ drivers/gpu/drm/ttm/ttm_page_alloc.c       | 26 ++++++++---------
+ drivers/gpu/drm/ttm/ttm_page_alloc_dma.c   | 20 ++++++-------
+ drivers/gpu/drm/ttm/ttm_tt.c               | 33 +++++++++++----------
+ drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c |  6 ++--
+ include/drm/ttm/ttm_caching.h              | 34 ++++++++++++++++++++++
+ include/drm/ttm/ttm_tt.h                   | 16 ++++------
+ 13 files changed, 123 insertions(+), 60 deletions(-)
+ create mode 100644 include/drm/ttm/ttm_caching.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 3e4892b7b7d3..6c8089b81f7d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -124,7 +124,7 @@ uint64_t amdgpu_gmc_agp_addr(struct ttm_buffer_object *bo)
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+ 	struct ttm_dma_tt *ttm;
+ 
+-	if (bo->num_pages != 1 || bo->ttm->caching_state == tt_cached)
++	if (bo->num_pages != 1 || bo->ttm->caching == ttm_cached)
+ 		return AMDGPU_BO_INVALID_OFFSET;
+ 
+ 	ttm = container_of(bo->ttm, struct ttm_dma_tt, ttm);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 4be4296a50a0..b713aa9abf19 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1298,7 +1298,9 @@ static void amdgpu_ttm_backend_destroy(struct ttm_bo_device *bdev,
+ static struct ttm_tt *amdgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+ 					   uint32_t page_flags)
+ {
++	struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
+ 	struct amdgpu_ttm_tt *gtt;
++	enum ttm_caching caching;
+ 
+ 	gtt = kzalloc(sizeof(struct amdgpu_ttm_tt), GFP_KERNEL);
+ 	if (gtt == NULL) {
+@@ -1306,8 +1308,13 @@ static struct ttm_tt *amdgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	}
+ 	gtt->gobj = &bo->base;
+ 
++	if (abo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
++		caching = ttm_write_combined;
++	else
++		caching = ttm_cached;
++
+ 	/* allocate space for the uninitialized page entries */
+-	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags)) {
++	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags, caching)) {
+ 		kfree(gtt);
+ 		return NULL;
+ 	}
+@@ -1531,7 +1538,7 @@ uint64_t amdgpu_ttm_tt_pde_flags(struct ttm_tt *ttm, struct ttm_resource *mem)
+ 	if (mem && mem->mem_type == TTM_PL_TT) {
+ 		flags |= AMDGPU_PTE_SYSTEM;
+ 
+-		if (ttm->caching_state == tt_cached)
++		if (ttm->caching == ttm_cached)
+ 			flags |= AMDGPU_PTE_SNOOPED;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/drm_gem_vram_helper.c b/drivers/gpu/drm/drm_gem_vram_helper.c
+index 3213429f8444..ad58d0af5141 100644
+--- a/drivers/gpu/drm/drm_gem_vram_helper.c
++++ b/drivers/gpu/drm/drm_gem_vram_helper.c
+@@ -918,7 +918,7 @@ static struct ttm_tt *bo_driver_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	if (!tt)
+ 		return NULL;
+ 
+-	ret = ttm_tt_init(tt, bo, page_flags);
++	ret = ttm_tt_init(tt, bo, page_flags, ttm_cached);
+ 	if (ret < 0)
+ 		goto err_ttm_tt_init;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_sgdma.c b/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+index 806d9ec310f5..cd6fdebae795 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_sgdma.c
++++ b/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+@@ -5,6 +5,7 @@
+ #include "nouveau_drv.h"
+ #include "nouveau_mem.h"
+ #include "nouveau_ttm.h"
++#include "nouveau_bo.h"
+ 
+ struct nouveau_sgdma_be {
+ 	/* this has to be the first field so populate/unpopulated in
+@@ -67,13 +68,23 @@ nouveau_sgdma_unbind(struct ttm_bo_device *bdev, struct ttm_tt *ttm)
+ struct ttm_tt *
+ nouveau_sgdma_create_ttm(struct ttm_buffer_object *bo, uint32_t page_flags)
+ {
++	struct nouveau_drm *drm = nouveau_bdev(bo->bdev);
++	struct nouveau_bo *nvbo = nouveau_bo(bo);
+ 	struct nouveau_sgdma_be *nvbe;
++	enum ttm_caching caching;
++
++	if (nvbo->force_coherent)
++		caching = ttm_uncached;
++	else if (drm->agp.bridge)
++		caching = ttm_write_combined;
++	else
++		caching = ttm_cached;
+ 
+ 	nvbe = kzalloc(sizeof(*nvbe), GFP_KERNEL);
+ 	if (!nvbe)
+ 		return NULL;
+ 
+-	if (ttm_dma_tt_init(&nvbe->ttm, bo, page_flags)) {
++	if (ttm_dma_tt_init(&nvbe->ttm, bo, page_flags, caching)) {
+ 		kfree(nvbe);
+ 		return NULL;
+ 	}
+diff --git a/drivers/gpu/drm/qxl/qxl_ttm.c b/drivers/gpu/drm/qxl/qxl_ttm.c
+index 669bceb58205..f50863493f64 100644
+--- a/drivers/gpu/drm/qxl/qxl_ttm.c
++++ b/drivers/gpu/drm/qxl/qxl_ttm.c
+@@ -133,7 +133,7 @@ static struct ttm_tt *qxl_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	ttm = kzalloc(sizeof(struct ttm_tt), GFP_KERNEL);
+ 	if (ttm == NULL)
+ 		return NULL;
+-	if (ttm_tt_init(ttm, bo, page_flags)) {
++	if (ttm_tt_init(ttm, bo, page_flags, ttm_cached)) {
+ 		kfree(ttm);
+ 		return NULL;
+ 	}
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 63e38b05a5bc..130a7cea35c3 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -546,7 +546,7 @@ static int radeon_ttm_backend_bind(struct ttm_bo_device *bdev,
+ 		WARN(1, "nothing to bind %lu pages for mreg %p back %p!\n",
+ 		     ttm->num_pages, bo_mem, ttm);
+ 	}
+-	if (ttm->caching_state == tt_cached)
++	if (ttm->caching == ttm_cached)
+ 		flags |= RADEON_GART_PAGE_SNOOP;
+ 	r = radeon_gart_bind(rdev, gtt->offset, ttm->num_pages,
+ 			     ttm->pages, gtt->ttm.dma_address, flags);
+@@ -590,6 +590,10 @@ static struct ttm_tt *radeon_ttm_tt_create(struct ttm_buffer_object *bo,
+ {
+ 	struct radeon_device *rdev;
+ 	struct radeon_ttm_tt *gtt;
++	enum ttm_caching caching;
++	struct radeon_bo *rbo;
++
++	rbo = container_of(bo, struct radeon_bo, tbo);
+ 
+ 	rdev = radeon_get_rdev(bo->bdev);
+ #if IS_ENABLED(CONFIG_AGP)
+@@ -603,7 +607,15 @@ static struct ttm_tt *radeon_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	if (gtt == NULL) {
+ 		return NULL;
+ 	}
+-	if (ttm_dma_tt_init(&gtt->ttm, bo, page_flags)) {
++
++	if (rbo->flags & RADEON_GEM_GTT_UC)
++		caching = ttm_uncached;
++	else if (rbo->flags & RADEON_GEM_GTT_WC)
++		caching = ttm_write_combined;
++	else
++		caching = ttm_cached;
++
++	if (ttm_dma_tt_init(&gtt->ttm, bo, page_flags, caching)) {
+ 		kfree(gtt);
+ 		return NULL;
+ 	}
+diff --git a/drivers/gpu/drm/ttm/ttm_agp_backend.c b/drivers/gpu/drm/ttm/ttm_agp_backend.c
+index a98fd795b752..a723062d37e7 100644
+--- a/drivers/gpu/drm/ttm/ttm_agp_backend.c
++++ b/drivers/gpu/drm/ttm/ttm_agp_backend.c
+@@ -136,7 +136,7 @@ struct ttm_tt *ttm_agp_tt_create(struct ttm_buffer_object *bo,
+ 	agp_be->mem = NULL;
+ 	agp_be->bridge = bridge;
+ 
+-	if (ttm_tt_init(&agp_be->ttm, bo, page_flags)) {
++	if (ttm_tt_init(&agp_be->ttm, bo, page_flags, ttm_write_combined)) {
+ 		kfree(agp_be);
+ 		return NULL;
+ 	}
+diff --git a/drivers/gpu/drm/ttm/ttm_page_alloc.c b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+index 111031cbb6df..c8f6790962b9 100644
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+@@ -220,14 +220,14 @@ static struct ttm_pool_manager *_manager;
+ /**
+  * Select the right pool or requested caching state and ttm flags. */
+ static struct ttm_page_pool *ttm_get_pool(int flags, bool huge,
+-					  enum ttm_caching_state cstate)
++					  enum ttm_caching cstate)
+ {
+ 	int pool_index;
+ 
+-	if (cstate == tt_cached)
++	if (cstate == ttm_cached)
+ 		return NULL;
+ 
+-	if (cstate == tt_wc)
++	if (cstate == ttm_write_combined)
+ 		pool_index = 0x0;
+ 	else
+ 		pool_index = 0x1;
+@@ -441,17 +441,17 @@ static void ttm_pool_mm_shrink_fini(struct ttm_pool_manager *manager)
+ }
+ 
+ static int ttm_set_pages_caching(struct page **pages,
+-		enum ttm_caching_state cstate, unsigned cpages)
++		enum ttm_caching cstate, unsigned cpages)
+ {
+ 	int r = 0;
+ 	/* Set page caching */
+ 	switch (cstate) {
+-	case tt_uncached:
++	case ttm_uncached:
+ 		r = ttm_set_pages_array_uc(pages, cpages);
+ 		if (r)
+ 			pr_err("Failed to set %d pages to uc!\n", cpages);
+ 		break;
+-	case tt_wc:
++	case ttm_write_combined:
+ 		r = ttm_set_pages_array_wc(pages, cpages);
+ 		if (r)
+ 			pr_err("Failed to set %d pages to wc!\n", cpages);
+@@ -486,7 +486,7 @@ static void ttm_handle_caching_failure(struct page **failed_pages,
+  * pages returned in pages array.
+  */
+ static int ttm_alloc_new_pages(struct list_head *pages, gfp_t gfp_flags,
+-			       int ttm_flags, enum ttm_caching_state cstate,
++			       int ttm_flags, enum ttm_caching cstate,
+ 			       unsigned count, unsigned order)
+ {
+ 	struct page **caching_array;
+@@ -566,7 +566,7 @@ static int ttm_alloc_new_pages(struct list_head *pages, gfp_t gfp_flags,
+  * pages is small.
+  */
+ static void ttm_page_pool_fill_locked(struct ttm_page_pool *pool, int ttm_flags,
+-				      enum ttm_caching_state cstate,
++				      enum ttm_caching cstate,
+ 				      unsigned count, unsigned long *irq_flags)
+ {
+ 	struct page *p;
+@@ -626,7 +626,7 @@ static void ttm_page_pool_fill_locked(struct ttm_page_pool *pool, int ttm_flags,
+ static int ttm_page_pool_get_pages(struct ttm_page_pool *pool,
+ 				   struct list_head *pages,
+ 				   int ttm_flags,
+-				   enum ttm_caching_state cstate,
++				   enum ttm_caching cstate,
+ 				   unsigned count, unsigned order)
+ {
+ 	unsigned long irq_flags;
+@@ -703,7 +703,7 @@ static int ttm_page_pool_get_pages(struct ttm_page_pool *pool,
+ 
+ /* Put all pages in pages list to correct pool to wait for reuse */
+ static void ttm_put_pages(struct page **pages, unsigned npages, int flags,
+-			  enum ttm_caching_state cstate)
++			  enum ttm_caching cstate)
+ {
+ 	struct ttm_page_pool *pool = ttm_get_pool(flags, false, cstate);
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@ -821,7 +821,7 @@ static void ttm_put_pages(struct page **pages, unsigned npages, int flags,
+  * cached pages.
+  */
+ static int ttm_get_pages(struct page **pages, unsigned npages, int flags,
+-			 enum ttm_caching_state cstate)
++			 enum ttm_caching cstate)
+ {
+ 	struct ttm_page_pool *pool = ttm_get_pool(flags, false, cstate);
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@ -1040,7 +1040,7 @@ ttm_pool_unpopulate_helper(struct ttm_tt *ttm, unsigned mem_count_update)
+ 
+ put_pages:
+ 	ttm_put_pages(ttm->pages, ttm->num_pages, ttm->page_flags,
+-		      ttm->caching_state);
++		      ttm->caching);
+ 	ttm_tt_set_unpopulated(ttm);
+ }
+ 
+@@ -1057,7 +1057,7 @@ int ttm_pool_populate(struct ttm_tt *ttm, struct ttm_operation_ctx *ctx)
+ 		return -ENOMEM;
+ 
+ 	ret = ttm_get_pages(ttm->pages, ttm->num_pages, ttm->page_flags,
+-			    ttm->caching_state);
++			    ttm->caching);
+ 	if (unlikely(ret != 0)) {
+ 		ttm_pool_unpopulate_helper(ttm, 0);
+ 		return ret;
+diff --git a/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c b/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+index 1045a5c26ee3..6625b43f6256 100644
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+@@ -325,15 +325,15 @@ static struct dma_page *__ttm_dma_alloc_page(struct dma_pool *pool)
+ 	}
+ 	return d_page;
+ }
+-static enum pool_type ttm_to_type(int flags, enum ttm_caching_state cstate)
++static enum pool_type ttm_to_type(int flags, enum ttm_caching cstate)
+ {
+ 	enum pool_type type = IS_UNDEFINED;
+ 
+ 	if (flags & TTM_PAGE_FLAG_DMA32)
+ 		type |= IS_DMA32;
+-	if (cstate == tt_cached)
++	if (cstate == ttm_cached)
+ 		type |= IS_CACHED;
+-	else if (cstate == tt_uncached)
++	else if (cstate == ttm_uncached)
+ 		type |= IS_UC;
+ 	else
+ 		type |= IS_WC;
+@@ -663,7 +663,7 @@ static struct dma_pool *ttm_dma_find_pool(struct device *dev,
+  * are pages that have changed their caching state already put them to the
+  * pool.
+  */
+-static void ttm_dma_handle_caching_state_failure(struct dma_pool *pool,
++static void ttm_dma_handle_caching_failure(struct dma_pool *pool,
+ 						 struct list_head *d_pages,
+ 						 struct page **failed_pages,
+ 						 unsigned cpages)
+@@ -734,7 +734,7 @@ static int ttm_dma_pool_alloc_new_pages(struct dma_pool *pool,
+ 				r = ttm_set_pages_caching(pool, caching_array,
+ 							  cpages);
+ 				if (r)
+-					ttm_dma_handle_caching_state_failure(
++					ttm_dma_handle_caching_failure(
+ 						pool, d_pages, caching_array,
+ 						cpages);
+ 			}
+@@ -760,7 +760,7 @@ static int ttm_dma_pool_alloc_new_pages(struct dma_pool *pool,
+ 				r = ttm_set_pages_caching(pool, caching_array,
+ 							  cpages);
+ 				if (r) {
+-					ttm_dma_handle_caching_state_failure(
++					ttm_dma_handle_caching_failure(
+ 					     pool, d_pages, caching_array,
+ 					     cpages);
+ 					goto out;
+@@ -773,7 +773,7 @@ static int ttm_dma_pool_alloc_new_pages(struct dma_pool *pool,
+ 	if (cpages) {
+ 		r = ttm_set_pages_caching(pool, caching_array, cpages);
+ 		if (r)
+-			ttm_dma_handle_caching_state_failure(pool, d_pages,
++			ttm_dma_handle_caching_failure(pool, d_pages,
+ 					caching_array, cpages);
+ 	}
+ out:
+@@ -904,7 +904,7 @@ int ttm_dma_populate(struct ttm_dma_tt *ttm_dma, struct device *dev,
+ 	INIT_LIST_HEAD(&ttm_dma->pages_list);
+ 	i = 0;
+ 
+-	type = ttm_to_type(ttm->page_flags, ttm->caching_state);
++	type = ttm_to_type(ttm->page_flags, ttm->caching);
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	if (ttm->page_flags & TTM_PAGE_FLAG_DMA32)
+@@ -1000,7 +1000,7 @@ void ttm_dma_unpopulate(struct ttm_dma_tt *ttm_dma, struct device *dev)
+ 	unsigned count, i, npages = 0;
+ 	unsigned long irq_flags;
+ 
+-	type = ttm_to_type(ttm->page_flags, ttm->caching_state);
++	type = ttm_to_type(ttm->page_flags, ttm->caching);
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	pool = ttm_dma_find_pool(dev, type | IS_HUGE);
+@@ -1032,7 +1032,7 @@ void ttm_dma_unpopulate(struct ttm_dma_tt *ttm_dma, struct device *dev)
+ 		return;
+ 
+ 	is_cached = (ttm_dma_find_pool(pool->dev,
+-		     ttm_to_type(ttm->page_flags, tt_cached)) == pool);
++		     ttm_to_type(ttm->page_flags, ttm_cached)) == pool);
+ 
+ 	/* make sure pages array match list and count number of pages */
+ 	count = 0;
+diff --git a/drivers/gpu/drm/ttm/ttm_tt.c b/drivers/gpu/drm/ttm/ttm_tt.c
+index 23e9604bc924..a465f51df027 100644
+--- a/drivers/gpu/drm/ttm/ttm_tt.c
++++ b/drivers/gpu/drm/ttm/ttm_tt.c
+@@ -114,31 +114,30 @@ static int ttm_sg_tt_alloc_page_directory(struct ttm_dma_tt *ttm)
+ 	return 0;
+ }
+ 
+-static int ttm_tt_set_caching(struct ttm_tt *ttm,
+-			      enum ttm_caching_state c_state)
++static int ttm_tt_set_caching(struct ttm_tt *ttm, enum ttm_caching caching)
+ {
+-	if (ttm->caching_state == c_state)
++	if (ttm->caching == caching)
+ 		return 0;
+ 
+ 	/* Can't change the caching state after TT is populated */
+ 	if (WARN_ON_ONCE(ttm_tt_is_populated(ttm)))
+ 		return -EINVAL;
+ 
+-	ttm->caching_state = c_state;
++	ttm->caching = caching;
+ 
+ 	return 0;
+ }
+ 
+ int ttm_tt_set_placement_caching(struct ttm_tt *ttm, uint32_t placement)
+ {
+-	enum ttm_caching_state state;
++	enum ttm_caching state;
+ 
+ 	if (placement & TTM_PL_FLAG_WC)
+-		state = tt_wc;
++		state = ttm_write_combined;
+ 	else if (placement & TTM_PL_FLAG_UNCACHED)
+-		state = tt_uncached;
++		state = ttm_uncached;
+ 	else
+-		state = tt_cached;
++		state = ttm_cached;
+ 
+ 	return ttm_tt_set_caching(ttm, state);
+ }
+@@ -162,20 +161,22 @@ void ttm_tt_destroy(struct ttm_bo_device *bdev, struct ttm_tt *ttm)
+ 
+ static void ttm_tt_init_fields(struct ttm_tt *ttm,
+ 			       struct ttm_buffer_object *bo,
+-			       uint32_t page_flags)
++			       uint32_t page_flags,
++			       enum ttm_caching caching)
+ {
+ 	ttm->num_pages = bo->num_pages;
+-	ttm->caching_state = tt_cached;
++	ttm->caching = ttm_cached;
+ 	ttm->page_flags = page_flags;
+ 	ttm_tt_set_unpopulated(ttm);
+ 	ttm->swap_storage = NULL;
+ 	ttm->sg = bo->sg;
++	ttm->caching = caching;
+ }
+ 
+ int ttm_tt_init(struct ttm_tt *ttm, struct ttm_buffer_object *bo,
+-		uint32_t page_flags)
++		uint32_t page_flags, enum ttm_caching caching)
+ {
+-	ttm_tt_init_fields(ttm, bo, page_flags);
++	ttm_tt_init_fields(ttm, bo, page_flags, caching);
+ 
+ 	if (ttm_tt_alloc_page_directory(ttm)) {
+ 		pr_err("Failed allocating page table\n");
+@@ -193,11 +194,11 @@ void ttm_tt_fini(struct ttm_tt *ttm)
+ EXPORT_SYMBOL(ttm_tt_fini);
+ 
+ int ttm_dma_tt_init(struct ttm_dma_tt *ttm_dma, struct ttm_buffer_object *bo,
+-		    uint32_t page_flags)
++		    uint32_t page_flags, enum ttm_caching caching)
+ {
+ 	struct ttm_tt *ttm = &ttm_dma->ttm;
+ 
+-	ttm_tt_init_fields(ttm, bo, page_flags);
++	ttm_tt_init_fields(ttm, bo, page_flags, caching);
+ 
+ 	INIT_LIST_HEAD(&ttm_dma->pages_list);
+ 	if (ttm_dma_tt_alloc_page_directory(ttm_dma)) {
+@@ -209,12 +210,12 @@ int ttm_dma_tt_init(struct ttm_dma_tt *ttm_dma, struct ttm_buffer_object *bo,
+ EXPORT_SYMBOL(ttm_dma_tt_init);
+ 
+ int ttm_sg_tt_init(struct ttm_dma_tt *ttm_dma, struct ttm_buffer_object *bo,
+-		   uint32_t page_flags)
++		   uint32_t page_flags, enum ttm_caching caching)
+ {
+ 	struct ttm_tt *ttm = &ttm_dma->ttm;
+ 	int ret;
+ 
+-	ttm_tt_init_fields(ttm, bo, page_flags);
++	ttm_tt_init_fields(ttm, bo, page_flags, caching);
+ 
+ 	INIT_LIST_HEAD(&ttm_dma->pages_list);
+ 	if (page_flags & TTM_PAGE_FLAG_SG)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+index bef5aa25949c..70398e7a0b94 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+@@ -641,9 +641,11 @@ static struct ttm_tt *vmw_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	vmw_be->mob = NULL;
+ 
+ 	if (vmw_be->dev_priv->map_mode == vmw_dma_alloc_coherent)
+-		ret = ttm_dma_tt_init(&vmw_be->dma_ttm, bo, page_flags);
++		ret = ttm_dma_tt_init(&vmw_be->dma_ttm, bo, page_flags,
++				      ttm_cached);
+ 	else
+-		ret = ttm_tt_init(&vmw_be->dma_ttm.ttm, bo, page_flags);
++		ret = ttm_tt_init(&vmw_be->dma_ttm.ttm, bo, page_flags,
++				  ttm_cached);
+ 	if (unlikely(ret != 0))
+ 		goto out_no_init;
+ 
+diff --git a/include/drm/ttm/ttm_caching.h b/include/drm/ttm/ttm_caching.h
+new file mode 100644
+index 000000000000..161624dcf6be
+--- /dev/null
++++ b/include/drm/ttm/ttm_caching.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2020 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Christian König
++ */
++
++#ifndef _TTM_CACHING_H_
++#define _TTM_CACHING_H_
++
++enum ttm_caching {
++	ttm_uncached,
++	ttm_write_combined,
++	ttm_cached
++};
++
++#endif
+diff --git a/include/drm/ttm/ttm_tt.h b/include/drm/ttm/ttm_tt.h
+index 5d1835d44084..c39c722d5184 100644
+--- a/include/drm/ttm/ttm_tt.h
++++ b/include/drm/ttm/ttm_tt.h
+@@ -28,6 +28,7 @@
+ #define _TTM_TT_H_
+ 
+ #include <linux/types.h>
++#include <drm/ttm/ttm_caching.h>
+ 
+ struct ttm_tt;
+ struct ttm_resource;
+@@ -42,12 +43,6 @@ struct ttm_operation_ctx;
+ 
+ #define TTM_PAGE_FLAG_PRIV_POPULATED  (1 << 31)
+ 
+-enum ttm_caching_state {
+-	tt_uncached,
+-	tt_wc,
+-	tt_cached
+-};
+-
+ /**
+  * struct ttm_tt
+  *
+@@ -69,7 +64,7 @@ struct ttm_tt {
+ 	unsigned long num_pages;
+ 	struct sg_table *sg; /* for SG objects via dma-buf */
+ 	struct file *swap_storage;
+-	enum ttm_caching_state caching_state;
++	enum ttm_caching caching;
+ };
+ 
+ static inline bool ttm_tt_is_populated(struct ttm_tt *tt)
+@@ -121,6 +116,7 @@ int ttm_tt_create(struct ttm_buffer_object *bo, bool zero_alloc);
+  * @ttm: The struct ttm_tt.
+  * @bo: The buffer object we create the ttm for.
+  * @page_flags: Page flags as identified by TTM_PAGE_FLAG_XX flags.
++ * @caching: the desired caching state of the pages
+  *
+  * Create a struct ttm_tt to back data with system memory pages.
+  * No pages are actually allocated.
+@@ -128,11 +124,11 @@ int ttm_tt_create(struct ttm_buffer_object *bo, bool zero_alloc);
+  * NULL: Out of memory.
+  */
+ int ttm_tt_init(struct ttm_tt *ttm, struct ttm_buffer_object *bo,
+-		uint32_t page_flags);
++		uint32_t page_flags, enum ttm_caching caching);
+ int ttm_dma_tt_init(struct ttm_dma_tt *ttm_dma, struct ttm_buffer_object *bo,
+-		    uint32_t page_flags);
++		    uint32_t page_flags, enum ttm_caching caching);
+ int ttm_sg_tt_init(struct ttm_dma_tt *ttm_dma, struct ttm_buffer_object *bo,
+-		   uint32_t page_flags);
++		   uint32_t page_flags, enum ttm_caching caching);
+ 
+ /**
+  * ttm_tt_fini
+-- 
+2.25.1
+

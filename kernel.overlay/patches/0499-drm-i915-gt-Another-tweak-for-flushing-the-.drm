@@ -1,0 +1,88 @@
+From 7326d3d08be81dcaff5b96c28254a5992e1df035 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sun, 20 Dec 2020 13:48:58 +0000
+Subject: [PATCH 0499/1087] drm/i915/gt: Another tweak for flushing the
+ tasklets
+
+tasklet_kill() ensures that we _yield_ the processor until a remote
+tasklet is completed. However, this leads to a starvation condition as
+being at the bottom of the scheduler's runqueue means that anything else
+is able to run, including all hogs keeping the tasklet occupied.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201220134858.10510-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gt/intel_engine.h    |  7 ++++++-
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c | 10 +++++-----
+ drivers/gpu/drm/i915/i915_request.c       |  2 +-
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine.h b/drivers/gpu/drm/i915/gt/intel_engine.h
+index 6606b1dbf3d6..47ee8578e511 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine.h
+@@ -232,7 +232,12 @@ static inline void __intel_engine_reset(struct intel_engine_cs *engine,
+ 
+ bool intel_engines_are_idle(struct intel_gt *gt);
+ bool intel_engine_is_idle(struct intel_engine_cs *engine);
+-void intel_engine_flush_submission(struct intel_engine_cs *engine);
++
++void __intel_engine_flush_submission(struct intel_engine_cs *engine, bool sync);
++static inline void intel_engine_flush_submission(struct intel_engine_cs *engine)
++{
++	__intel_engine_flush_submission(engine, true);
++}
+ 
+ void intel_engines_reset_default_submission(struct intel_gt *gt);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index 97ceaf7116e8..bb1c1adad78a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -1190,17 +1190,13 @@ static bool ring_is_idle(struct intel_engine_cs *engine)
+ 	return idle;
+ }
+ 
+-void intel_engine_flush_submission(struct intel_engine_cs *engine)
++void __intel_engine_flush_submission(struct intel_engine_cs *engine, bool sync)
+ {
+ 	struct tasklet_struct *t = &engine->execlists.tasklet;
+ 
+ 	if (!t->func)
+ 		return;
+ 
+-	/* Synchronise and wait for the tasklet on another CPU */
+-	tasklet_kill(t);
+-
+-	/* Having cancelled the tasklet, ensure that is run */
+ 	local_bh_disable();
+ 	if (tasklet_trylock(t)) {
+ 		/* Must wait for any GPU reset in progress. */
+@@ -1209,6 +1205,10 @@ void intel_engine_flush_submission(struct intel_engine_cs *engine)
+ 		tasklet_unlock(t);
+ 	}
+ 	local_bh_enable();
++
++	/* Synchronise and wait for the tasklet on another CPU */
++	if (sync)
++		tasklet_unlock_wait(t);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index aab42c7cf391..33a3d7ed4bde 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -1825,7 +1825,7 @@ long i915_request_wait(struct i915_request *rq,
+ 	 * for unhappy HW.
+ 	 */
+ 	if (i915_request_is_ready(rq))
+-		intel_engine_flush_submission(rq->engine);
++		__intel_engine_flush_submission(rq->engine, false);
+ 
+ 	for (;;) {
+ 		set_current_state(state);
+-- 
+2.17.1
+

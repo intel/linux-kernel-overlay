@@ -1,0 +1,207 @@
+From 51d58728bf916b8923cc3b7f52662f7b972f6238 Mon Sep 17 00:00:00 2001
+From: Matthew Auld <matthew.auld@intel.com>
+Date: Tue, 19 Jan 2021 13:31:06 +0000
+Subject: [PATCH 1018/1087] drm/i915/pool: constrain pool objects by mapping
+ type
+
+In a few places we always end up mapping the pool object with the FORCE
+constraint(to prevent hitting -EBUSY) which will destroy the cached
+mapping if it has a different type. As a simple first step, make the
+mapping type part of the pool interface, where the behaviour is to only
+give out pool objects which match the requested mapping type.
+
+Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210119133106.66294-4-matthew.auld@intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c      | 13 +++++++------
+ drivers/gpu/drm/i915/gem/i915_gem_object_blt.c      |  8 ++++----
+ drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c      | 12 +++++++++---
+ drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h      |  3 ++-
+ .../gpu/drm/i915/gt/intel_gt_buffer_pool_types.h    |  4 ++--
+ drivers/gpu/drm/i915/i915_cmd_parser.c              |  2 +-
+ 6 files changed, 25 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index b91b32195dcf..d70ca36f74f6 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -1276,7 +1276,10 @@ static int __reloc_gpu_alloc(struct i915_execbuffer *eb,
+ 	int err;
+ 
+ 	if (!pool) {
+-		pool = intel_gt_get_buffer_pool(engine->gt, PAGE_SIZE);
++		pool = intel_gt_get_buffer_pool(engine->gt, PAGE_SIZE,
++						cache->has_llc ?
++						I915_MAP_WB :
++						I915_MAP_WC);
+ 		if (IS_ERR(pool))
+ 			return PTR_ERR(pool);
+ 	}
+@@ -1286,10 +1289,7 @@ static int __reloc_gpu_alloc(struct i915_execbuffer *eb,
+ 	if (err)
+ 		goto err_pool;
+ 
+-	cmd = i915_gem_object_pin_map(pool->obj,
+-				      cache->has_llc ?
+-				      I915_MAP_FORCE_WB :
+-				      I915_MAP_FORCE_WC);
++	cmd = i915_gem_object_pin_map(pool->obj, pool->type);
+ 	if (IS_ERR(cmd)) {
+ 		err = PTR_ERR(cmd);
+ 		goto err_pool;
+@@ -2458,7 +2458,8 @@ static int eb_parse(struct i915_execbuffer *eb)
+ 		return -EINVAL;
+ 
+ 	if (!pool) {
+-		pool = intel_gt_get_buffer_pool(eb->engine->gt, len);
++		pool = intel_gt_get_buffer_pool(eb->engine->gt, len,
++						I915_MAP_WB);
+ 		if (IS_ERR(pool))
+ 			return PTR_ERR(pool);
+ 		eb->batch_pool = pool;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c b/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
+index 10cac9fac79b..d6dac21fce0b 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
+@@ -35,7 +35,7 @@ struct i915_vma *intel_emit_vma_fill_blt(struct intel_context *ce,
+ 	count = div_u64(round_up(vma->size, block_size), block_size);
+ 	size = (1 + 8 * count) * sizeof(u32);
+ 	size = round_up(size, PAGE_SIZE);
+-	pool = intel_gt_get_buffer_pool(ce->engine->gt, size);
++	pool = intel_gt_get_buffer_pool(ce->engine->gt, size, I915_MAP_WC);
+ 	if (IS_ERR(pool)) {
+ 		err = PTR_ERR(pool);
+ 		goto out_pm;
+@@ -55,7 +55,7 @@ struct i915_vma *intel_emit_vma_fill_blt(struct intel_context *ce,
+ 	if (unlikely(err))
+ 		goto out_put;
+ 
+-	cmd = i915_gem_object_pin_map(pool->obj, I915_MAP_WC);
++	cmd = i915_gem_object_pin_map(pool->obj, pool->type);
+ 	if (IS_ERR(cmd)) {
+ 		err = PTR_ERR(cmd);
+ 		goto out_unpin;
+@@ -257,7 +257,7 @@ struct i915_vma *intel_emit_vma_copy_blt(struct intel_context *ce,
+ 	count = div_u64(round_up(dst->size, block_size), block_size);
+ 	size = (1 + 11 * count) * sizeof(u32);
+ 	size = round_up(size, PAGE_SIZE);
+-	pool = intel_gt_get_buffer_pool(ce->engine->gt, size);
++	pool = intel_gt_get_buffer_pool(ce->engine->gt, size, I915_MAP_WC);
+ 	if (IS_ERR(pool)) {
+ 		err = PTR_ERR(pool);
+ 		goto out_pm;
+@@ -277,7 +277,7 @@ struct i915_vma *intel_emit_vma_copy_blt(struct intel_context *ce,
+ 	if (unlikely(err))
+ 		goto out_put;
+ 
+-	cmd = i915_gem_object_pin_map(pool->obj, I915_MAP_WC);
++	cmd = i915_gem_object_pin_map(pool->obj, pool->type);
+ 	if (IS_ERR(cmd)) {
+ 		err = PTR_ERR(cmd);
+ 		goto out_unpin;
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
+index 104cb30e8c13..06d84cf09570 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
+@@ -145,7 +145,8 @@ static void pool_retire(struct i915_active *ref)
+ }
+ 
+ static struct intel_gt_buffer_pool_node *
+-node_create(struct intel_gt_buffer_pool *pool, size_t sz)
++node_create(struct intel_gt_buffer_pool *pool, size_t sz,
++	    enum i915_map_type type)
+ {
+ 	struct intel_gt *gt = to_gt(pool);
+ 	struct intel_gt_buffer_pool_node *node;
+@@ -169,12 +170,14 @@ node_create(struct intel_gt_buffer_pool *pool, size_t sz)
+ 
+ 	i915_gem_object_set_readonly(obj);
+ 
++	node->type = type;
+ 	node->obj = obj;
+ 	return node;
+ }
+ 
+ struct intel_gt_buffer_pool_node *
+-intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size)
++intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size,
++			 enum i915_map_type type)
+ {
+ 	struct intel_gt_buffer_pool *pool = &gt->buffer_pool;
+ 	struct intel_gt_buffer_pool_node *node;
+@@ -191,6 +194,9 @@ intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size)
+ 		if (node->obj->base.size < size)
+ 			continue;
+ 
++		if (node->type != type)
++			continue;
++
+ 		age = READ_ONCE(node->age);
+ 		if (!age)
+ 			continue;
+@@ -205,7 +211,7 @@ intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size)
+ 	rcu_read_unlock();
+ 
+ 	if (&node->link == list) {
+-		node = node_create(pool, size);
++		node = node_create(pool, size, type);
+ 		if (IS_ERR(node))
+ 			return node;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
+index 42cbac003e8a..6068f8f1762e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
+@@ -15,7 +15,8 @@ struct intel_gt;
+ struct i915_request;
+ 
+ struct intel_gt_buffer_pool_node *
+-intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size);
++intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size,
++			 enum i915_map_type type);
+ 
+ static inline int
+ intel_gt_buffer_pool_mark_active(struct intel_gt_buffer_pool_node *node,
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
+index bcf1658c9633..d8d82c890da8 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
+@@ -11,10 +11,9 @@
+ #include <linux/spinlock.h>
+ #include <linux/workqueue.h>
+ 
++#include "gem/i915_gem_object_types.h"
+ #include "i915_active_types.h"
+ 
+-struct drm_i915_gem_object;
+-
+ struct intel_gt_buffer_pool {
+ 	spinlock_t lock;
+ 	struct list_head cache_list[4];
+@@ -31,6 +30,7 @@ struct intel_gt_buffer_pool_node {
+ 		struct rcu_head rcu;
+ 	};
+ 	unsigned long age;
++	enum i915_map_type type;
+ };
+ 
+ #endif /* INTEL_GT_BUFFER_POOL_TYPES_H */
+diff --git a/drivers/gpu/drm/i915/i915_cmd_parser.c b/drivers/gpu/drm/i915/i915_cmd_parser.c
+index 82d0f19e86df..ced9a96d7c34 100644
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@ -1143,7 +1143,7 @@ static u32 *copy_batch(struct drm_i915_gem_object *dst_obj,
+ 	void *dst, *src;
+ 	int ret;
+ 
+-	dst = i915_gem_object_pin_map(dst_obj, I915_MAP_FORCE_WB);
++	dst = i915_gem_object_pin_map(dst_obj, I915_MAP_WB);
+ 	if (IS_ERR(dst))
+ 		return dst;
+ 
+-- 
+2.17.1
+

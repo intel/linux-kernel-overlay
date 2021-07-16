@@ -1,0 +1,174 @@
+From 58b58807c242f9466282163fb590ad68e96968f6 Mon Sep 17 00:00:00 2001
+From: Jun Lei <jun.lei@amd.com>
+Date: Wed, 16 Dec 2020 12:56:38 -0500
+Subject: [PATCH 113/330] drm/amd/display: implement support for DID2.0 dsc
+ passthrough
+
+[Why]
+Some panels contain active converters (e.g. DP to MIPI) which only support
+restricted DSC configurations.  DID2.0 adds support for such displays to
+explicitly define per timing BPP restrictions on DSC.  Ignoring these
+restrictions leads to blackscreen.
+
+[How]
+Add parsing in DID2.0 parser to get this bpp info.
+Add support in DSC module to constraint target bpp based
+on this info.
+
+Signed-off-by: Jun Lei <jun.lei@amd.com>
+Reviewed-by: Wenjing Liu <Wenjing.Liu@amd.com>
+Acked-by: Anson Jacob <Anson.Jacob@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dc_dsc.h      |  7 +++--
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h |  1 +
+ drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c  | 29 ++++++++++++--------
+ 3 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dsc.h b/drivers/gpu/drm/amd/display/dc/dc_dsc.h
+index ec55b77727d5..e99273bff46d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dsc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_dsc.h
+@@ -51,6 +51,7 @@ struct dc_dsc_policy {
+ 	int min_slice_height; // Must not be less than 8
+ 	uint32_t max_target_bpp;
+ 	uint32_t min_target_bpp;
++	uint32_t preferred_bpp_x16;
+ 	bool enable_dsc_when_not_needed;
+ };
+ 
+@@ -62,8 +63,8 @@ bool dc_dsc_parse_dsc_dpcd(const struct dc *dc,
+ bool dc_dsc_compute_bandwidth_range(
+ 		const struct display_stream_compressor *dsc,
+ 		uint32_t dsc_min_slice_height_override,
+-		uint32_t min_bpp,
+-		uint32_t max_bpp,
++		uint32_t min_bpp_x16,
++		uint32_t max_bpp_x16,
+ 		const struct dsc_dec_dpcd_caps *dsc_sink_caps,
+ 		const struct dc_crtc_timing *timing,
+ 		struct dc_dsc_bw_range *range);
+@@ -78,7 +79,7 @@ bool dc_dsc_compute_config(
+ 		struct dc_dsc_config *dsc_cfg);
+ 
+ void dc_dsc_get_policy_for_timing(const struct dc_crtc_timing *timing,
+-		uint32_t max_target_bpp_limit_override,
++		uint32_t max_target_bpp_limit_override_x16,
+ 		struct dc_dsc_policy *policy);
+ 
+ void dc_dsc_policy_set_max_target_bpp_limit(uint32_t limit);
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index b41e6367b15e..09e8be5f7a1e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -769,6 +769,7 @@ struct dc_crtc_timing {
+ #endif
+ 
+ 	struct dc_crtc_timing_flags flags;
++	uint32_t dsc_fixed_bits_per_pixel_x16; /* DSC target bitrate in 1/16 of bpp (e.g. 128 -> 8bpp) */
+ 	struct dc_dsc_config dsc_cfg;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c b/drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c
+index c62d0eddc9c6..82a805088204 100644
+--- a/drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c
++++ b/drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c
+@@ -369,6 +369,11 @@ static bool decide_dsc_target_bpp_x16(
+ 		/* enough bandwidth without dsc */
+ 		*target_bpp_x16 = 0;
+ 		should_use_dsc = false;
++	} else if (policy->preferred_bpp_x16 > 0 &&
++			policy->preferred_bpp_x16 <= range.max_target_bpp_x16 &&
++			policy->preferred_bpp_x16 >= range.min_target_bpp_x16) {
++		*target_bpp_x16 = policy->preferred_bpp_x16;
++		should_use_dsc = true;
+ 	} else if (target_bandwidth_kbps >= range.max_kbps) {
+ 		/* use max target bpp allowed */
+ 		*target_bpp_x16 = range.max_target_bpp_x16;
+@@ -545,7 +550,7 @@ static bool setup_dsc_config(
+ 		int target_bandwidth_kbps,
+ 		const struct dc_crtc_timing *timing,
+ 		int min_slice_height_override,
+-		int max_dsc_target_bpp_limit_override,
++		int max_dsc_target_bpp_limit_override_x16,
+ 		struct dc_dsc_config *dsc_cfg)
+ {
+ 	struct dsc_enc_caps dsc_common_caps;
+@@ -564,7 +569,7 @@ static bool setup_dsc_config(
+ 
+ 	memset(dsc_cfg, 0, sizeof(struct dc_dsc_config));
+ 
+-	dc_dsc_get_policy_for_timing(timing, max_dsc_target_bpp_limit_override, &policy);
++	dc_dsc_get_policy_for_timing(timing, max_dsc_target_bpp_limit_override_x16, &policy);
+ 	pic_width = timing->h_addressable + timing->h_border_left + timing->h_border_right;
+ 	pic_height = timing->v_addressable + timing->v_border_top + timing->v_border_bottom;
+ 
+@@ -865,8 +870,8 @@ bool dc_dsc_parse_dsc_dpcd(const struct dc *dc, const uint8_t *dpcd_dsc_basic_da
+ bool dc_dsc_compute_bandwidth_range(
+ 		const struct display_stream_compressor *dsc,
+ 		uint32_t dsc_min_slice_height_override,
+-		uint32_t min_bpp,
+-		uint32_t max_bpp,
++		uint32_t min_bpp_x16,
++		uint32_t max_bpp_x16,
+ 		const struct dsc_dec_dpcd_caps *dsc_sink_caps,
+ 		const struct dc_crtc_timing *timing,
+ 		struct dc_dsc_bw_range *range)
+@@ -883,10 +888,10 @@ bool dc_dsc_compute_bandwidth_range(
+ 
+ 	if (is_dsc_possible)
+ 		is_dsc_possible = setup_dsc_config(dsc_sink_caps, &dsc_enc_caps, 0, timing,
+-				dsc_min_slice_height_override, max_bpp, &config);
++				dsc_min_slice_height_override, max_bpp_x16, &config);
+ 
+ 	if (is_dsc_possible)
+-		get_dsc_bandwidth_range(min_bpp, max_bpp, &dsc_common_caps, timing, range);
++		get_dsc_bandwidth_range(min_bpp_x16, max_bpp_x16, &dsc_common_caps, timing, range);
+ 
+ 	return is_dsc_possible;
+ }
+@@ -895,7 +900,7 @@ bool dc_dsc_compute_config(
+ 		const struct display_stream_compressor *dsc,
+ 		const struct dsc_dec_dpcd_caps *dsc_sink_caps,
+ 		uint32_t dsc_min_slice_height_override,
+-		uint32_t max_target_bpp_limit_override,
++		uint32_t max_target_bpp_limit_override_x16,
+ 		uint32_t target_bandwidth_kbps,
+ 		const struct dc_crtc_timing *timing,
+ 		struct dc_dsc_config *dsc_cfg)
+@@ -908,11 +913,11 @@ bool dc_dsc_compute_config(
+ 			&dsc_enc_caps,
+ 			target_bandwidth_kbps,
+ 			timing, dsc_min_slice_height_override,
+-			max_target_bpp_limit_override, dsc_cfg);
++			max_target_bpp_limit_override_x16, dsc_cfg);
+ 	return is_dsc_possible;
+ }
+ 
+-void dc_dsc_get_policy_for_timing(const struct dc_crtc_timing *timing, uint32_t max_target_bpp_limit_override, struct dc_dsc_policy *policy)
++void dc_dsc_get_policy_for_timing(const struct dc_crtc_timing *timing, uint32_t max_target_bpp_limit_override_x16, struct dc_dsc_policy *policy)
+ {
+ 	uint32_t bpc = 0;
+ 
+@@ -967,13 +972,15 @@ void dc_dsc_get_policy_for_timing(const struct dc_crtc_timing *timing, uint32_t
+ 		return;
+ 	}
+ 
++	policy->preferred_bpp_x16 = timing->dsc_fixed_bits_per_pixel_x16;
++
+ 	/* internal upper limit, default 16 bpp */
+ 	if (policy->max_target_bpp > dsc_policy_max_target_bpp_limit)
+ 		policy->max_target_bpp = dsc_policy_max_target_bpp_limit;
+ 
+ 	/* apply override */
+-	if (max_target_bpp_limit_override && policy->max_target_bpp > max_target_bpp_limit_override)
+-		policy->max_target_bpp = max_target_bpp_limit_override;
++	if (max_target_bpp_limit_override_x16 && policy->max_target_bpp > max_target_bpp_limit_override_x16 / 16)
++		policy->max_target_bpp = max_target_bpp_limit_override_x16 / 16;
+ 
+ 	/* enable DSC when not needed, default false */
+ 	if (dsc_policy_enable_dsc_when_not_needed)
+-- 
+2.25.1
+

@@ -1,0 +1,141 @@
+From d903fecf010ca1ed3e233e94b61ad00fd72d2498 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 16 Nov 2020 20:12:03 +0100
+Subject: [PATCH 1594/1714] drm/amdgpu: fix check order in amdgpu_bo_move
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reorder the code to fix checking if blitting is available.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Link: https://patchwork.freedesktop.org/patch/401019/
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 53 +++++++++++--------------
+ 1 file changed, 23 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index b848f9e97613..4d8f19ab1014 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -551,25 +551,12 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	struct ttm_resource *old_mem = &bo->mem;
+ 	int r;
+ 
+-	if ((old_mem->mem_type == TTM_PL_SYSTEM &&
+-	     new_mem->mem_type == TTM_PL_VRAM) ||
+-	    (old_mem->mem_type == TTM_PL_VRAM &&
+-	     new_mem->mem_type == TTM_PL_SYSTEM)) {
+-		hop->fpfn = 0;
+-		hop->lpfn = 0;
+-		hop->mem_type = TTM_PL_TT;
+-		hop->flags = 0;
+-		return -EMULTIHOP;
+-	}
+-
+ 	if (new_mem->mem_type == TTM_PL_TT) {
+ 		r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, new_mem);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+-	amdgpu_bo_move_notify(bo, evict, new_mem);
+-
+ 	/* Can't move a pinned BO */
+ 	abo = ttm_to_amdgpu_bo(bo);
+ 	if (WARN_ON_ONCE(abo->tbo.pin_count > 0))
+@@ -579,24 +566,23 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
+ 		ttm_bo_move_null(bo, new_mem);
+-		return 0;
++		goto out;
+ 	}
+ 	if (old_mem->mem_type == TTM_PL_SYSTEM &&
+ 	    new_mem->mem_type == TTM_PL_TT) {
+ 		ttm_bo_move_null(bo, new_mem);
+-		return 0;
++		goto out;
+ 	}
+-
+ 	if (old_mem->mem_type == TTM_PL_TT &&
+ 	    new_mem->mem_type == TTM_PL_SYSTEM) {
+ 		r = ttm_bo_wait_ctx(bo, ctx);
+ 		if (r)
+-			goto fail;
++			return r;
+ 
+ 		amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+ 		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_mem);
+-		return 0;
++		goto out;
+ 	}
+ 
+ 	if (old_mem->mem_type == AMDGPU_PL_GDS ||
+@@ -607,27 +593,37 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	    new_mem->mem_type == AMDGPU_PL_OA) {
+ 		/* Nothing to save here */
+ 		ttm_bo_move_null(bo, new_mem);
+-		return 0;
++		goto out;
+ 	}
+ 
+-	if (!adev->mman.buffer_funcs_enabled) {
++	if (adev->mman.buffer_funcs_enabled) {
++		if (((old_mem->mem_type == TTM_PL_SYSTEM &&
++		      new_mem->mem_type == TTM_PL_VRAM) ||
++		     (old_mem->mem_type == TTM_PL_VRAM &&
++		      new_mem->mem_type == TTM_PL_SYSTEM))) {
++			hop->fpfn = 0;
++			hop->lpfn = 0;
++			hop->mem_type = TTM_PL_TT;
++			hop->flags = 0;
++			return -EMULTIHOP;
++		}
++
++		r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
++	} else {
+ 		r = -ENODEV;
+-		goto memcpy;
+ 	}
+ 
+-	r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
+ 	if (r) {
+-memcpy:
+ 		/* Check that all memory is CPU accessible */
+ 		if (!amdgpu_mem_visible(adev, old_mem) ||
+ 		    !amdgpu_mem_visible(adev, new_mem)) {
+ 			pr_err("Move buffer fallback to memcpy unavailable\n");
+-			goto fail;
++			return r;
+ 		}
+ 
+ 		r = ttm_bo_move_memcpy(bo, ctx, new_mem);
+ 		if (r)
+-			goto fail;
++			return r;
+ 	}
+ 
+ 	if (bo->type == ttm_bo_type_device &&
+@@ -639,14 +635,11 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		abo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+ 	}
+ 
++out:
+ 	/* update statistics */
+ 	atomic64_add((u64)bo->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
++	amdgpu_bo_move_notify(bo, evict, new_mem);
+ 	return 0;
+-fail:
+-	swap(*new_mem, bo->mem);
+-	amdgpu_bo_move_notify(bo, false, new_mem);
+-	swap(*new_mem, bo->mem);
+-	return r;
+ }
+ 
+ /*
+-- 
+2.25.1
+

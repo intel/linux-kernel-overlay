@@ -1,0 +1,273 @@
+From d1874e6effdfd47f1bce0cc8802a2dd15e45051c Mon Sep 17 00:00:00 2001
+From: Bas Nieuwenhuizen <bas@basnieuwenhuizen.nl>
+Date: Wed, 2 Sep 2020 14:22:38 +0200
+Subject: [PATCH 0795/1714] drm/amd/display: Store tiling_flags in the
+ framebuffer.
+
+This moves the tiling_flags to the framebuffer creation.
+This way the time of the "tiling" decision is the same as it
+would be with modifiers.
+
+Signed-off-by: Bas Nieuwenhuizen <bas@basnieuwenhuizen.nl>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Nicholas Kazlauskas <nicholas.kazlauskas@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c   | 48 +++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h      |  3 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 73 +++----------------
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  2 -
+ 4 files changed, 59 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index e7838ec3062c..5f2255db90fc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -537,6 +537,39 @@ uint32_t amdgpu_display_supported_domains(struct amdgpu_device *adev,
+ 	return domain;
+ }
+ 
++static int amdgpu_display_get_fb_info(const struct amdgpu_framebuffer *amdgpu_fb,
++				      uint64_t *tiling_flags, bool *tmz_surface)
++{
++	struct amdgpu_bo *rbo;
++	int r;
++
++	if (!amdgpu_fb) {
++		*tiling_flags = 0;
++		*tmz_surface = false;
++		return 0;
++	}
++
++	rbo = gem_to_amdgpu_bo(amdgpu_fb->base.obj[0]);
++	r = amdgpu_bo_reserve(rbo, false);
++
++	if (unlikely(r)) {
++		/* Don't show error message when returning -ERESTARTSYS */
++		if (r != -ERESTARTSYS)
++			DRM_ERROR("Unable to reserve buffer: %d\n", r);
++		return r;
++	}
++
++	if (tiling_flags)
++		amdgpu_bo_get_tiling_flags(rbo, tiling_flags);
++
++	if (tmz_surface)
++		*tmz_surface = amdgpu_bo_encrypted(rbo);
++
++	amdgpu_bo_unreserve(rbo);
++
++	return r;
++}
++
+ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 				    struct amdgpu_framebuffer *rfb,
+ 				    const struct drm_mode_fb_cmd2 *mode_cmd,
+@@ -546,11 +579,18 @@ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 	rfb->base.obj[0] = obj;
+ 	drm_helper_mode_fill_fb_struct(dev, &rfb->base, mode_cmd);
+ 	ret = drm_framebuffer_init(dev, &rfb->base, &amdgpu_fb_funcs);
+-	if (ret) {
+-		rfb->base.obj[0] = NULL;
+-		return ret;
+-	}
++	if (ret)
++		goto fail;
++
++	ret = amdgpu_display_get_fb_info(rfb, &rfb->tiling_flags, &rfb->tmz_surface);
++	if (ret)
++		goto fail;
++
+ 	return 0;
++
++fail:
++	rfb->base.obj[0] = NULL;
++	return ret;
+ }
+ 
+ struct drm_framebuffer *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index a04decb934b0..319cb19e1b99 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -302,6 +302,9 @@ struct amdgpu_display_funcs {
+ struct amdgpu_framebuffer {
+ 	struct drm_framebuffer base;
+ 
++	uint64_t tiling_flags;
++	bool tmz_surface;
++
+ 	/* caching for later use */
+ 	uint64_t address;
+ };
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 51779db94c25..7e2047c14a6f 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3759,39 +3759,6 @@ static int fill_dc_scaling_info(const struct drm_plane_state *state,
+ 	return 0;
+ }
+ 
+-static int get_fb_info(const struct amdgpu_framebuffer *amdgpu_fb,
+-		       uint64_t *tiling_flags, bool *tmz_surface)
+-{
+-	struct amdgpu_bo *rbo;
+-	int r;
+-
+-	if (!amdgpu_fb) {
+-		*tiling_flags = 0;
+-		*tmz_surface = false;
+-		return 0;
+-	}
+-
+-	rbo = gem_to_amdgpu_bo(amdgpu_fb->base.obj[0]);
+-	r = amdgpu_bo_reserve(rbo, false);
+-
+-	if (unlikely(r)) {
+-		/* Don't show error message when returning -ERESTARTSYS */
+-		if (r != -ERESTARTSYS)
+-			DRM_ERROR("Unable to reserve buffer: %d\n", r);
+-		return r;
+-	}
+-
+-	if (tiling_flags)
+-		amdgpu_bo_get_tiling_flags(rbo, tiling_flags);
+-
+-	if (tmz_surface)
+-		*tmz_surface = amdgpu_bo_encrypted(rbo);
+-
+-	amdgpu_bo_unreserve(rbo);
+-
+-	return r;
+-}
+-
+ static inline uint64_t get_dcc_address(uint64_t address, uint64_t tiling_flags)
+ {
+ 	uint32_t offset = AMDGPU_TILING_GET(tiling_flags, DCC_OFFSET_256B);
+@@ -4207,7 +4174,7 @@ static int fill_dc_plane_attributes(struct amdgpu_device *adev,
+ 				    struct drm_crtc_state *crtc_state)
+ {
+ 	struct dm_crtc_state *dm_crtc_state = to_dm_crtc_state(crtc_state);
+-	struct dm_plane_state *dm_plane_state = to_dm_plane_state(plane_state);
++	struct amdgpu_framebuffer *afb = (struct amdgpu_framebuffer *)plane_state->fb;
+ 	struct dc_scaling_info scaling_info;
+ 	struct dc_plane_info plane_info;
+ 	int ret;
+@@ -4224,10 +4191,10 @@ static int fill_dc_plane_attributes(struct amdgpu_device *adev,
+ 
+ 	force_disable_dcc = adev->asic_type == CHIP_RAVEN && adev->in_suspend;
+ 	ret = fill_dc_plane_info_and_addr(adev, plane_state,
+-					  dm_plane_state->tiling_flags,
++					  afb->tiling_flags,
+ 					  &plane_info,
+ 					  &dc_plane_state->address,
+-					  dm_plane_state->tmz_surface,
++					  afb->tmz_surface,
+ 					  force_disable_dcc);
+ 	if (ret)
+ 		return ret;
+@@ -5829,10 +5796,6 @@ dm_drm_plane_duplicate_state(struct drm_plane *plane)
+ 		dc_plane_state_retain(dm_plane_state->dc_state);
+ 	}
+ 
+-	/* Framebuffer hasn't been updated yet, so retain old flags. */
+-	dm_plane_state->tiling_flags = old_dm_plane_state->tiling_flags;
+-	dm_plane_state->tmz_surface = old_dm_plane_state->tmz_surface;
+-
+ 	return &dm_plane_state->base;
+ }
+ 
+@@ -5937,10 +5900,10 @@ static int dm_plane_helper_prepare_fb(struct drm_plane *plane,
+ 
+ 		fill_plane_buffer_attributes(
+ 			adev, afb, plane_state->format, plane_state->rotation,
+-			dm_plane_state_new->tiling_flags,
++			afb->tiling_flags,
+ 			&plane_state->tiling_info, &plane_state->plane_size,
+ 			&plane_state->dcc, &plane_state->address,
+-			dm_plane_state_new->tmz_surface, force_disable_dcc);
++			afb->tmz_surface, force_disable_dcc);
+ 	}
+ 
+ 	return 0;
+@@ -7203,6 +7166,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 		struct drm_crtc *crtc = new_plane_state->crtc;
+ 		struct drm_crtc_state *new_crtc_state;
+ 		struct drm_framebuffer *fb = new_plane_state->fb;
++		struct amdgpu_framebuffer *afb = (struct amdgpu_framebuffer *)fb;
+ 		bool plane_needs_flip;
+ 		struct dc_plane_state *dc_plane;
+ 		struct dm_plane_state *dm_new_plane_state = to_dm_plane_state(new_plane_state);
+@@ -7257,10 +7221,10 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 
+ 		fill_dc_plane_info_and_addr(
+ 			dm->adev, new_plane_state,
+-			dm_new_plane_state->tiling_flags,
++			afb->tiling_flags,
+ 			&bundle->plane_infos[planes_count],
+ 			&bundle->flip_addrs[planes_count].address,
+-			dm_new_plane_state->tmz_surface, false);
++			afb->tmz_surface, false);
+ 
+ 		DRM_DEBUG_DRIVER("plane: id=%d dcc_en=%d\n",
+ 				 new_plane_state->plane->index,
+@@ -8403,8 +8367,7 @@ static bool should_reset_plane(struct drm_atomic_state *state,
+ 	 * TODO: Come up with a more elegant solution for this.
+ 	 */
+ 	for_each_oldnew_plane_in_state(state, other, old_other_state, new_other_state, i) {
+-		struct dm_plane_state *old_dm_plane_state, *new_dm_plane_state;
+-
++		struct amdgpu_framebuffer *old_afb, *new_afb;
+ 		if (other->type == DRM_PLANE_TYPE_CURSOR)
+ 			continue;
+ 
+@@ -8448,12 +8411,11 @@ static bool should_reset_plane(struct drm_atomic_state *state,
+ 		if (old_other_state->fb->format != new_other_state->fb->format)
+ 			return true;
+ 
+-		old_dm_plane_state = to_dm_plane_state(old_other_state);
+-		new_dm_plane_state = to_dm_plane_state(new_other_state);
++		old_afb = (struct amdgpu_framebuffer *)old_other_state->fb;
++		new_afb = (struct amdgpu_framebuffer *)new_other_state->fb;
+ 
+ 		/* Tiling and DCC changes also require bandwidth updates. */
+-		if (old_dm_plane_state->tiling_flags !=
+-		    new_dm_plane_state->tiling_flags)
++		if (old_afb->tiling_flags != new_afb->tiling_flags)
+ 			return true;
+ 	}
+ 
+@@ -8779,17 +8741,6 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 		}
+ 	}
+ 
+-	/* Prepass for updating tiling flags on new planes. */
+-	for_each_new_plane_in_state(state, plane, new_plane_state, i) {
+-		struct dm_plane_state *new_dm_plane_state = to_dm_plane_state(new_plane_state);
+-		struct amdgpu_framebuffer *new_afb = to_amdgpu_framebuffer(new_plane_state->fb);
+-
+-		ret = get_fb_info(new_afb, &new_dm_plane_state->tiling_flags,
+-				  &new_dm_plane_state->tmz_surface);
+-		if (ret)
+-			goto fail;
+-	}
+-
+ 	/* Remove exiting planes if they are modified */
+ 	for_each_oldnew_plane_in_state_reverse(state, plane, old_plane_state, new_plane_state, i) {
+ 		ret = dm_update_plane_state(dc, state, plane,
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index a8a0e8cb1a11..03e7e4f23178 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -420,8 +420,6 @@ struct dc_plane_state;
+ struct dm_plane_state {
+ 	struct drm_plane_state base;
+ 	struct dc_plane_state *dc_state;
+-	uint64_t tiling_flags;
+-	bool tmz_surface;
+ };
+ 
+ struct dm_crtc_state {
+-- 
+2.25.1
+

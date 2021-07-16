@@ -1,0 +1,184 @@
+From 3dc73efc14978b8879de022b3d0092024d820091 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 11 Jan 2021 18:37:07 +0200
+Subject: [PATCH 056/128] drm/i915: Reuse the async_flip() hook for the async
+ flip disable w/a
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On some platforms we need to trigger an extra async flip with
+the async flip bit disabled, and then wait for the next vblank
+until the async flip bit off state will actually latch.
+
+Currently the w/a is just open coded for skl+ universal planes.
+Instead of doing that lets reuse the .async_flip() hook for this
+purpose since it needs to write the exact same set of registers.
+In order to do this we'll just have the caller pass in the state
+of the async flip bit explicitly.
+
+Cc: Karthik B S <karthik.b.s@intel.com>
+Cc: Vandita Kulkarni <vandita.kulkarni@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111163711.12913-8-ville.syrjala@linux.intel.com
+Reviewed-by: Karthik B S <karthik.b.s@intel.com>
+---
+ .../gpu/drm/i915/display/intel_atomic_plane.c |  2 +-
+ drivers/gpu/drm/i915/display/intel_display.c  | 59 ++++++++-----------
+ .../drm/i915/display/intel_display_types.h    |  4 +-
+ drivers/gpu/drm/i915/display/intel_sprite.c   |  7 ++-
+ 4 files changed, 35 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.c b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+index b5e1ee99535c..4683f98f7e54 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+@@ -452,7 +452,7 @@ void intel_update_plane(struct intel_plane *plane,
+ 	trace_intel_update_plane(&plane->base, crtc);
+ 
+ 	if (crtc_state->uapi.async_flip && plane->async_flip)
+-		plane->async_flip(plane, crtc_state, plane_state);
++		plane->async_flip(plane, crtc_state, plane_state, true);
+ 	else
+ 		plane->update_plane(plane, crtc_state, plane_state);
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index a0940af6b70d..574f73bec8dd 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -4816,41 +4816,36 @@ static void intel_crtc_disable_flip_done(struct intel_atomic_state *state,
+ 	}
+ }
+ 
+-static void skl_disable_async_flip_wa(struct intel_atomic_state *state,
+-				      struct intel_crtc *crtc,
+-				      const struct intel_crtc_state *new_crtc_state)
++static void intel_crtc_async_flip_disable_wa(struct intel_atomic_state *state,
++					     struct intel_crtc *crtc)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct drm_i915_private *i915 = to_i915(state->base.dev);
++	const struct intel_crtc_state *old_crtc_state =
++		intel_atomic_get_old_crtc_state(state, crtc);
++	const struct intel_crtc_state *new_crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
++	u8 update_planes = new_crtc_state->update_planes;
++	const struct intel_plane_state *old_plane_state;
+ 	struct intel_plane *plane;
+-	struct intel_plane_state *new_plane_state;
++	bool need_vbl_wait = false;
+ 	int i;
+ 
+-	for_each_new_intel_plane_in_state(state, plane, new_plane_state, i) {
+-		u32 update_mask = new_crtc_state->update_planes;
+-		u32 plane_ctl, surf_addr;
+-		enum plane_id plane_id;
+-		unsigned long irqflags;
+-		enum pipe pipe;
+-
+-		if (crtc->pipe != plane->pipe ||
+-		    !(update_mask & BIT(plane->id)))
+-			continue;
+-
+-		plane_id = plane->id;
+-		pipe = plane->pipe;
+-
+-		spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+-		plane_ctl = intel_de_read_fw(dev_priv, PLANE_CTL(pipe, plane_id));
+-		surf_addr = intel_de_read_fw(dev_priv, PLANE_SURF(pipe, plane_id));
+-
+-		plane_ctl &= ~PLANE_CTL_ASYNC_FLIP;
+-
+-		intel_de_write_fw(dev_priv, PLANE_CTL(pipe, plane_id), plane_ctl);
+-		intel_de_write_fw(dev_priv, PLANE_SURF(pipe, plane_id), surf_addr);
+-		spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++	for_each_old_intel_plane_in_state(state, plane, old_plane_state, i) {
++		if (plane->need_async_flip_disable_wa &&
++		    plane->pipe == crtc->pipe &&
++		    update_planes & BIT(plane->id)) {
++			/*
++			 * Apart from the async flip bit we want to
++			 * preserve the old state for the plane.
++			 */
++			plane->async_flip(plane, old_crtc_state,
++					  old_plane_state, false);
++			need_vbl_wait = true;
++		}
+ 	}
+ 
+-	intel_wait_for_vblank(dev_priv, crtc->pipe);
++	if (need_vbl_wait)
++		intel_wait_for_vblank(i915, crtc->pipe);
+ }
+ 
+ static void intel_pre_plane_update(struct intel_atomic_state *state,
+@@ -4943,10 +4938,8 @@ static void intel_pre_plane_update(struct intel_atomic_state *state,
+ 	 * WA for platforms where async address update enable bit
+ 	 * is double buffered and only latched at start of vblank.
+ 	 */
+-	if (old_crtc_state->uapi.async_flip &&
+-	    !new_crtc_state->uapi.async_flip &&
+-	    IS_GEN_RANGE(dev_priv, 9, 10))
+-		skl_disable_async_flip_wa(state, crtc, new_crtc_state);
++	if (old_crtc_state->uapi.async_flip && !new_crtc_state->uapi.async_flip)
++		intel_crtc_async_flip_disable_wa(state, crtc);
+ }
+ 
+ static void intel_crtc_disable_planes(struct intel_atomic_state *state,
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index ac04ee2a6403..85bed8ac901f 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1231,6 +1231,7 @@ struct intel_plane {
+ 	enum pipe pipe;
+ 	bool has_fbc;
+ 	bool has_ccs;
++	bool need_async_flip_disable_wa;
+ 	u32 frontbuffer_bit;
+ 
+ 	struct {
+@@ -1267,7 +1268,8 @@ struct intel_plane {
+ 			 const struct intel_plane_state *plane_state);
+ 	void (*async_flip)(struct intel_plane *plane,
+ 			   const struct intel_crtc_state *crtc_state,
+-			   const struct intel_plane_state *plane_state);
++			   const struct intel_plane_state *plane_state,
++			   bool async_flip);
+ 	void (*enable_flip_done)(struct intel_plane *plane);
+ 	void (*disable_flip_done)(struct intel_plane *plane);
+ };
+diff --git a/drivers/gpu/drm/i915/display/intel_sprite.c b/drivers/gpu/drm/i915/display/intel_sprite.c
+index 2798ee005ca0..adc5f088d458 100644
+--- a/drivers/gpu/drm/i915/display/intel_sprite.c
++++ b/drivers/gpu/drm/i915/display/intel_sprite.c
+@@ -771,7 +771,8 @@ icl_program_input_csc(struct intel_plane *plane,
+ static void
+ skl_plane_async_flip(struct intel_plane *plane,
+ 		     const struct intel_crtc_state *crtc_state,
+-		     const struct intel_plane_state *plane_state)
++		     const struct intel_plane_state *plane_state,
++		     bool async_flip)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 	unsigned long irqflags;
+@@ -782,7 +783,8 @@ skl_plane_async_flip(struct intel_plane *plane,
+ 
+ 	plane_ctl |= skl_plane_ctl_crtc(crtc_state);
+ 
+-	plane_ctl |= PLANE_CTL_ASYNC_FLIP;
++	if (async_flip)
++		plane_ctl |= PLANE_CTL_ASYNC_FLIP;
+ 
+ 	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+ 
+@@ -3316,6 +3318,7 @@ skl_universal_plane_create(struct drm_i915_private *dev_priv,
+ 	plane->min_cdclk = skl_plane_min_cdclk;
+ 
+ 	if (plane_id == PLANE_PRIMARY) {
++		plane->need_async_flip_disable_wa = IS_GEN_RANGE(dev_priv, 9, 10);
+ 		plane->async_flip = skl_plane_async_flip;
+ 		plane->enable_flip_done = skl_plane_enable_flip_done;
+ 		plane->disable_flip_done = skl_plane_disable_flip_done;
+-- 
+2.17.1
+

@@ -1,0 +1,120 @@
+From 7691d5b04cbfc64b3a20bc9efc9afa05fca0b789 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Thu, 28 Jan 2021 14:40:09 -0800
+Subject: [PATCH 03/62] perf/x86/intel: Filter unsupported Topdown metrics
+ event
+
+Intel Sapphire Rapids server will introduce 8 metrics events. Intel
+Ice Lake only supports 4 metrics events. A perf tool user may mistakenly
+use the unsupported events via RAW format on Ice Lake. The user can
+still get a value from the unsupported Topdown metrics event once the
+following Sapphire Rapids enabling patch is applied.
+
+To enable the 8 metrics events on Intel Sapphire Rapids, the
+INTEL_TD_METRIC_MAX has to be updated, which impacts the
+is_metric_event(). The is_metric_event() is a generic function.
+On Ice Lake, the newly added SPR metrics events will be mistakenly
+accepted as metric events on creation. At runtime, the unsupported
+Topdown metrics events will be updated.
+
+Add a variable num_topdown_events in x86_pmu to indicate the available
+number of the Topdown metrics event on the platform. Apply the number
+into is_metric_event(). Only the supported Topdown metrics events
+should be created as metrics events.
+
+Apply the num_topdown_events in icl_update_topdown_event() as well. The
+function can be reused by the following patch.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/1611873611-156687-4-git-send-email-kan.liang@linux.intel.com
+---
+ arch/x86/events/intel/core.c      | 15 +++++++++++++--
+ arch/x86/events/perf_event.h      |  1 +
+ arch/x86/include/asm/perf_event.h | 10 ++++++++--
+ 3 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 76a17a8ba970..3923ff70b7d3 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -2409,7 +2409,8 @@ static u64 intel_update_topdown_event(struct perf_event *event, int metric_end)
+ 
+ static u64 icl_update_topdown_event(struct perf_event *event)
+ {
+-	return intel_update_topdown_event(event, INTEL_PMC_IDX_TD_BE_BOUND);
++	return intel_update_topdown_event(event, INTEL_PMC_IDX_METRIC_BASE +
++						 x86_pmu.num_topdown_events - 1);
+ }
+ 
+ static void intel_pmu_read_topdown_event(struct perf_event *event)
+@@ -3556,6 +3557,15 @@ static int core_pmu_hw_config(struct perf_event *event)
+ 	return intel_pmu_bts_config(event);
+ }
+ 
++#define INTEL_TD_METRIC_AVAILABLE_MAX	(INTEL_TD_METRIC_RETIRING + \
++					 ((x86_pmu.num_topdown_events - 1) << 8))
++
++static bool is_available_metric_event(struct perf_event *event)
++{
++	return is_metric_event(event) &&
++		event->attr.config <= INTEL_TD_METRIC_AVAILABLE_MAX;
++}
++
+ static int intel_pmu_hw_config(struct perf_event *event)
+ {
+ 	int ret = x86_pmu_hw_config(event);
+@@ -3629,7 +3639,7 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 		if (event->attr.config & X86_ALL_EVENT_FLAGS)
+ 			return -EINVAL;
+ 
+-		if (is_metric_event(event)) {
++		if (is_available_metric_event(event)) {
+ 			struct perf_event *leader = event->group_leader;
+ 
+ 			/* The metric events don't support sampling. */
+@@ -5478,6 +5488,7 @@ __init int intel_pmu_init(void)
+ 		x86_pmu.rtm_abort_event = X86_CONFIG(.event=0xc9, .umask=0x04);
+ 		x86_pmu.lbr_pt_coexist = true;
+ 		intel_pmu_pebs_data_source_skl(pmem);
++		x86_pmu.num_topdown_events = 4;
+ 		x86_pmu.update_topdown_event = icl_update_topdown_event;
+ 		x86_pmu.set_topdown_event_period = icl_set_topdown_event_period;
+ 		pr_cont("Icelake events, ");
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 7895cf4c59a7..18b8b66e8b1e 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -776,6 +776,7 @@ struct x86_pmu {
+ 	/*
+ 	 * Intel perf metrics
+ 	 */
++	int		num_topdown_events;
+ 	u64		(*update_topdown_event)(struct perf_event *event);
+ 	int		(*set_topdown_event_period)(struct perf_event *event);
+ 
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index b9a7fd0a27e2..790129a1b441 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -280,8 +280,14 @@ struct x86_pmu_capability {
+ #define INTEL_TD_METRIC_BAD_SPEC		0x8100	/* Bad speculation metric */
+ #define INTEL_TD_METRIC_FE_BOUND		0x8200	/* FE bound metric */
+ #define INTEL_TD_METRIC_BE_BOUND		0x8300	/* BE bound metric */
+-#define INTEL_TD_METRIC_MAX			INTEL_TD_METRIC_BE_BOUND
+-#define INTEL_TD_METRIC_NUM			4
++/* Level 2 metrics */
++#define INTEL_TD_METRIC_HEAVY_OPS		0x8400  /* Heavy Operations metric */
++#define INTEL_TD_METRIC_BR_MISPREDICT		0x8500  /* Branch Mispredict metric */
++#define INTEL_TD_METRIC_FETCH_LAT		0x8600  /* Fetch Latency metric */
++#define INTEL_TD_METRIC_MEM_BOUND		0x8700  /* Memory bound metric */
++
++#define INTEL_TD_METRIC_MAX			INTEL_TD_METRIC_MEM_BOUND
++#define INTEL_TD_METRIC_NUM			8
+ 
+ static inline bool is_metric_idx(int idx)
+ {
+-- 
+2.25.1
+

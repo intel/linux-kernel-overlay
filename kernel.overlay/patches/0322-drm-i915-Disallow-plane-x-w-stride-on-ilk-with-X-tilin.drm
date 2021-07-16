@@ -1,0 +1,138 @@
+From e058a74fdc419c134668bf1a1500f05f1a74fddd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 9 Feb 2021 04:19:16 +0200
+Subject: [PATCH 322/330] drm/i915: Disallow plane x+w>stride on ilk+ with
+ X-tiling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ilk+ planes get notably unhappy when the plane x+w exceeds
+the stride. This wasn't a problem previously because we
+always aligned SURF to the closest tile boundary so the
+x offset never got particularly large. But now with async
+flips we have to align to 256KiB instead and thus this
+becomes a real issue.
+
+On ilk/snb/ivb it looks like the accesses just wrap
+early to the next tile row when scanout goes past the
+SURF+n*stride boundary, hsw/bdw suffer more heavily and
+start to underrun constantly. i965/g4x appear to be immune.
+vlv/chv I've not yet checked.
+
+Let's borrow another trick from the skl+ code and search
+backwards for a better SURF offset in the hopes of getting the
+x offset below the limit. IIRC when I ran into a similar issue
+on skl years ago it was causing the hardware to fall over
+pretty hard as well.
+
+And let's be consistent and include i965/g4x in the check
+as well, just in case I just got super lucky somehow when
+I wasn't able to reproduce the issue. Not that it really
+matters since we still use 4k SURF alignment for i965/g4x
+anyway.
+
+Fixes: 6ede6b0616b2 ("drm/i915: Implement async flips for vlv/chv")
+Fixes: 4bb18054adc4 ("drm/i915: Implement async flip for ilk/snb")
+Fixes: 2a636e240c77 ("drm/i915: Implement async flip for ivb/hsw")
+Fixes: cda195f13abd ("drm/i915: Implement async flips for bdw")
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210209021918.16234-1-ville.syrjala@linux.intel.com
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 59fb8218c8e5001f854e7d5fdb5fb135cba58102)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+[Rodrigo also exported some functions from intel_display.c during backport]
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c    | 27 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_display.c | 12 ++++-----
+ drivers/gpu/drm/i915/display/intel_display.h |  6 +++++
+ 3 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index d30374df67f0..e3e69e6cef65 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -255,6 +255,33 @@ int i9xx_check_plane_surface(struct intel_plane_state *plane_state)
+ 	else
+ 		offset = 0;
+ 
++	/*
++	 * When using an X-tiled surface the plane starts to
++	 * misbehave if the x offset + width exceeds the stride.
++	 * hsw/bdw: underrun galore
++	 * ilk/snb/ivb: wrap to the next tile row mid scanout
++	 * i965/g4x: so far appear immune to this
++	 * vlv/chv: TODO check
++	 *
++	 * Linear surfaces seem to work just fine, even on hsw/bdw
++	 * despite them not using the linear offset anymore.
++	 */
++	if (INTEL_GEN(dev_priv) >= 4 && fb->modifier == I915_FORMAT_MOD_X_TILED) {
++		u32 alignment = intel_surf_alignment(fb, 0);
++		int cpp = fb->format->cpp[0];
++
++		while ((src_x + src_w) * cpp > plane_state->color_plane[0].stride) {
++			if (offset == 0) {
++				drm_dbg_kms(&dev_priv->drm,
++					    "Unable to find suitable display surface offset due to X-tiling\n");
++				return -EINVAL;
++			}
++
++			offset = intel_plane_adjust_aligned_offset(&src_x, &src_y, plane_state, 0,
++								   offset, offset - alignment);
++		}
++	}
++
+ 	/*
+ 	 * Put the final coordinates back so that the src
+ 	 * coordinate checks will see the right values.
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 88914d429569..a32c9777dcbc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1322,8 +1322,8 @@ static bool has_async_flips(struct drm_i915_private *i915)
+ 	return INTEL_GEN(i915) >= 5;
+ }
+ 
+-static unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+-					 int color_plane)
++unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
++				  int color_plane)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(fb->dev);
+ 
+@@ -1590,10 +1590,10 @@ static u32 intel_adjust_aligned_offset(int *x, int *y,
+  * Adjust the tile offset by moving the difference into
+  * the x/y offsets.
+  */
+-static u32 intel_plane_adjust_aligned_offset(int *x, int *y,
+-					     const struct intel_plane_state *state,
+-					     int color_plane,
+-					     u32 old_offset, u32 new_offset)
++u32 intel_plane_adjust_aligned_offset(int *x, int *y,
++				      const struct intel_plane_state *state,
++				      int color_plane,
++				      u32 old_offset, u32 new_offset)
+ {
+ 	return intel_adjust_aligned_offset(x, y, state->hw.fb, color_plane,
+ 					   state->hw.rotation,
+diff --git a/drivers/gpu/drm/i915/display/intel_display.h b/drivers/gpu/drm/i915/display/intel_display.h
+index 64ffa34544a7..76f8a805b0a3 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -653,6 +653,12 @@ void intel_plane_unpin_fb(struct intel_plane_state *old_plane_state);
+ struct intel_encoder *
+ intel_get_crtc_new_encoder(const struct intel_atomic_state *state,
+ 			   const struct intel_crtc_state *crtc_state);
++unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
++				  int color_plane);
++u32 intel_plane_adjust_aligned_offset(int *x, int *y,
++				      const struct intel_plane_state *state,
++				      int color_plane,
++				      u32 old_offset, u32 new_offset);
+ 
+ /* modesetting */
+ void intel_modeset_init_hw(struct drm_i915_private *i915);
+-- 
+2.25.1
+

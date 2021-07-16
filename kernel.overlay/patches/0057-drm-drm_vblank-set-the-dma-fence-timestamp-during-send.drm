@@ -1,0 +1,187 @@
+From 5a6cd46fa64c029f8f80d02ee66edf1ced13a1b7 Mon Sep 17 00:00:00 2001
+From: Veera Sundaram Sankaran <veeras@codeaurora.org>
+Date: Fri, 15 Jan 2021 16:31:47 -0800
+Subject: [PATCH 057/105] drm/drm_vblank: set the dma-fence timestamp during
+ send_vblank_event
+
+The explicit out-fences in crtc are signaled as part of vblank event,
+indicating all framebuffers present on the Atomic Commit request are
+scanned out on the screen. Though the fence signal and the vblank event
+notification happens at the same time, triggered by the same hardware
+vsync event, the timestamp set in both are different. With drivers
+supporting precise vblank timestamp the difference between the two
+timestamps would be even higher. This might have an impact on use-mode
+frameworks using these fence timestamps for purposes other than simple
+buffer usage. For instance, the Android framework [1] uses the
+retire-fences as an alternative to vblank when frame-updates are in
+progress. Set the fence timestamp during send vblank event using a new
+drm_send_event_timestamp_locked variant to avoid discrepancies.
+
+[1] https://android.googlesource.com/platform/frameworks/native/+/master/
+services/surfaceflinger/Scheduler/Scheduler.cpp#397
+
+Changes in v2:
+- Use drm_send_event_timestamp_locked to update fence timestamp
+- add more information to commit text
+
+Changes in v3:
+- use same backend helper function for variants of drm_send_event to
+avoid code duplications
+
+Changes in v4:
+- remove WARN_ON from drm_send_event_timestamp_locked
+
+Signed-off-by: Veera Sundaram Sankaran <veeras@codeaurora.org>
+Reviewed-by: John Stultz <john.stultz@linaro.org>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+  [sumits: minor parenthesis alignment correction]
+Link: https://patchwork.freedesktop.org/patch/msgid/1610757107-11892-2-git-send-email-veeras@codeaurora.org
+(cherry picked from commit a78e7a51d2fa9d2f482b462be4299784c884d988)
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+---
+ drivers/gpu/drm/drm_file.c   | 68 +++++++++++++++++++++++++++++-------
+ drivers/gpu/drm/drm_vblank.c |  9 ++++-
+ include/drm/drm_file.h       |  3 ++
+ 3 files changed, 67 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index 6b116bfd747c..7efbccffc2ea 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -775,20 +775,19 @@ void drm_event_cancel_free(struct drm_device *dev,
+ EXPORT_SYMBOL(drm_event_cancel_free);
+ 
+ /**
+- * drm_send_event_locked - send DRM event to file descriptor
++ * drm_send_event_helper - send DRM event to file descriptor
+  * @dev: DRM device
+  * @e: DRM event to deliver
++ * @timestamp: timestamp to set for the fence event in kernel's CLOCK_MONOTONIC
++ * time domain
+  *
+- * This function sends the event @e, initialized with drm_event_reserve_init(),
+- * to its associated userspace DRM file. Callers must already hold
+- * &drm_device.event_lock, see drm_send_event() for the unlocked version.
+- *
+- * Note that the core will take care of unlinking and disarming events when the
+- * corresponding DRM file is closed. Drivers need not worry about whether the
+- * DRM file for this event still exists and can call this function upon
+- * completion of the asynchronous work unconditionally.
++ * This helper function sends the event @e, initialized with
++ * drm_event_reserve_init(), to its associated userspace DRM file.
++ * The timestamp variant of dma_fence_signal is used when the caller
++ * sends a valid timestamp.
+  */
+-void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e)
++void drm_send_event_helper(struct drm_device *dev,
++			   struct drm_pending_event *e, ktime_t timestamp)
+ {
+ 	assert_spin_locked(&dev->event_lock);
+ 
+@@ -799,7 +798,10 @@ void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e)
+ 	}
+ 
+ 	if (e->fence) {
+-		dma_fence_signal(e->fence);
++		if (timestamp)
++			dma_fence_signal_timestamp(e->fence, timestamp);
++		else
++			dma_fence_signal(e->fence);
+ 		dma_fence_put(e->fence);
+ 	}
+ 
+@@ -814,6 +816,48 @@ void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e)
+ 	wake_up_interruptible_poll(&e->file_priv->event_wait,
+ 		EPOLLIN | EPOLLRDNORM);
+ }
++
++/**
++ * drm_send_event_timestamp_locked - send DRM event to file descriptor
++ * @dev: DRM device
++ * @e: DRM event to deliver
++ * @timestamp: timestamp to set for the fence event in kernel's CLOCK_MONOTONIC
++ * time domain
++ *
++ * This function sends the event @e, initialized with drm_event_reserve_init(),
++ * to its associated userspace DRM file. Callers must already hold
++ * &drm_device.event_lock.
++ *
++ * Note that the core will take care of unlinking and disarming events when the
++ * corresponding DRM file is closed. Drivers need not worry about whether the
++ * DRM file for this event still exists and can call this function upon
++ * completion of the asynchronous work unconditionally.
++ */
++void drm_send_event_timestamp_locked(struct drm_device *dev,
++				     struct drm_pending_event *e, ktime_t timestamp)
++{
++	drm_send_event_helper(dev, e, timestamp);
++}
++EXPORT_SYMBOL(drm_send_event_timestamp_locked);
++
++/**
++ * drm_send_event_locked - send DRM event to file descriptor
++ * @dev: DRM device
++ * @e: DRM event to deliver
++ *
++ * This function sends the event @e, initialized with drm_event_reserve_init(),
++ * to its associated userspace DRM file. Callers must already hold
++ * &drm_device.event_lock, see drm_send_event() for the unlocked version.
++ *
++ * Note that the core will take care of unlinking and disarming events when the
++ * corresponding DRM file is closed. Drivers need not worry about whether the
++ * DRM file for this event still exists and can call this function upon
++ * completion of the asynchronous work unconditionally.
++ */
++void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e)
++{
++	drm_send_event_helper(dev, e, 0);
++}
+ EXPORT_SYMBOL(drm_send_event_locked);
+ 
+ /**
+@@ -836,7 +880,7 @@ void drm_send_event(struct drm_device *dev, struct drm_pending_event *e)
+ 	unsigned long irqflags;
+ 
+ 	spin_lock_irqsave(&dev->event_lock, irqflags);
+-	drm_send_event_locked(dev, e);
++	drm_send_event_helper(dev, e, 0);
+ 	spin_unlock_irqrestore(&dev->event_lock, irqflags);
+ }
+ EXPORT_SYMBOL(drm_send_event);
+diff --git a/drivers/gpu/drm/drm_vblank.c b/drivers/gpu/drm/drm_vblank.c
+index 30912d8f82a5..893165eeddf3 100644
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -1006,7 +1006,14 @@ static void send_vblank_event(struct drm_device *dev,
+ 		break;
+ 	}
+ 	trace_drm_vblank_event_delivered(e->base.file_priv, e->pipe, seq);
+-	drm_send_event_locked(dev, &e->base);
++	/*
++	 * Use the same timestamp for any associated fence signal to avoid
++	 * mismatch in timestamps for vsync & fence events triggered by the
++	 * same HW event. Frameworks like SurfaceFlinger in Android expects the
++	 * retire-fence timestamp to match exactly with HW vsync as it uses it
++	 * for its software vsync modeling.
++	 */
++	drm_send_event_timestamp_locked(dev, &e->base, now);
+ }
+ 
+ /**
+diff --git a/include/drm/drm_file.h b/include/drm/drm_file.h
+index 716990bace10..b81b3bfb08c8 100644
+--- a/include/drm/drm_file.h
++++ b/include/drm/drm_file.h
+@@ -399,6 +399,9 @@ void drm_event_cancel_free(struct drm_device *dev,
+ 			   struct drm_pending_event *p);
+ void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e);
+ void drm_send_event(struct drm_device *dev, struct drm_pending_event *e);
++void drm_send_event_timestamp_locked(struct drm_device *dev,
++				     struct drm_pending_event *e,
++				     ktime_t timestamp);
+ 
+ struct file *mock_drm_getfile(struct drm_minor *minor, unsigned int flags);
+ 
+-- 
+2.25.1
+

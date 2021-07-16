@@ -1,0 +1,176 @@
+From c07480f46c22ae9cf76fbc7fa048c176a342d9dd Mon Sep 17 00:00:00 2001
+From: Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+Date: Mon, 30 Nov 2020 13:47:21 +0000
+Subject: [PATCH 0459/1087] drm/i915/lmem: Limit block size to 4G
+
+Block sizes are only limited by the largest power-of-two that will fit
+in the region size, but to construct an object we also require feeding
+it into an sg list, where the upper limit of the sg entry is at most
+UINT_MAX. Therefore to prevent issues with allocating blocks that are
+too large, add the flag I915_ALLOC_MAX_SEGMENT_SIZE which should limit
+block sizes to the i915_sg_segment_size().
+
+v2: (matt)
+  - query the max segment.
+  - prefer flag to limit block size to 4G, since it's best not to assume
+    the user will feed the blocks into an sg list.
+  - simple selftest so we don't have to guess.
+
+Cc: Niranjana Vishwanathapura <niranjana.vishwanathapura@intel.com>
+Cc: Matthew Auld <matthew.auld@intel.com>
+Cc: CQ Tang <cq.tang@intel.com>
+Signed-off-by: Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201130134721.54457-1-matthew.auld@intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_region.c    |  2 +-
+ drivers/gpu/drm/i915/intel_memory_region.c    | 18 ++++++-
+ drivers/gpu/drm/i915/intel_memory_region.h    |  5 +-
+ .../drm/i915/selftests/intel_memory_region.c  | 51 +++++++++++++++++++
+ 4 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_region.c b/drivers/gpu/drm/i915/gem/i915_gem_region.c
+index 1515384d7e0e..e72d78074c9e 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_region.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_region.c
+@@ -42,7 +42,7 @@ i915_gem_object_get_pages_buddy(struct drm_i915_gem_object *obj)
+ 		return -ENOMEM;
+ 	}
+ 
+-	flags = I915_ALLOC_MIN_PAGE_SIZE;
++	flags = I915_ALLOC_MIN_PAGE_SIZE | I915_ALLOC_MAX_SEGMENT_SIZE;
+ 	if (obj->flags & I915_BO_ALLOC_CONTIGUOUS)
+ 		flags |= I915_ALLOC_CONTIGUOUS;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_memory_region.c b/drivers/gpu/drm/i915/intel_memory_region.c
+index b326993a1026..ae36e2f6d6e3 100644
+--- a/drivers/gpu/drm/i915/intel_memory_region.c
++++ b/drivers/gpu/drm/i915/intel_memory_region.c
+@@ -72,6 +72,7 @@ __intel_memory_region_get_pages_buddy(struct intel_memory_region *mem,
+ 				      struct list_head *blocks)
+ {
+ 	unsigned int min_order = 0;
++	unsigned int max_order;
+ 	unsigned long n_pages;
+ 
+ 	GEM_BUG_ON(!IS_ALIGNED(size, mem->mm.chunk_size));
+@@ -92,13 +93,28 @@ __intel_memory_region_get_pages_buddy(struct intel_memory_region *mem,
+ 
+ 	n_pages = size >> ilog2(mem->mm.chunk_size);
+ 
++	/*
++	 * If we going to feed this into an sg list we should limit the block
++	 * sizes such that we don't exceed the i915_sg_segment_size().
++	 */
++	if (flags & I915_ALLOC_MAX_SEGMENT_SIZE) {
++		unsigned int max_segment = i915_sg_segment_size();
++
++		if (GEM_WARN_ON(max_segment < mem->mm.chunk_size))
++			max_order = 0;
++		else
++			max_order = ilog2(max_segment) - ilog2(mem->mm.chunk_size);
++	} else {
++		max_order = mem->mm.max_order;
++	}
++
+ 	mutex_lock(&mem->mm_lock);
+ 
+ 	do {
+ 		struct i915_buddy_block *block;
+ 		unsigned int order;
+ 
+-		order = fls(n_pages) - 1;
++		order = min_t(u32, fls(n_pages) - 1, max_order);
+ 		GEM_BUG_ON(order > mem->mm.max_order);
+ 		GEM_BUG_ON(order < min_order);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_memory_region.h b/drivers/gpu/drm/i915/intel_memory_region.h
+index 232490d89a83..5fb9bcf86b97 100644
+--- a/drivers/gpu/drm/i915/intel_memory_region.h
++++ b/drivers/gpu/drm/i915/intel_memory_region.h
+@@ -44,8 +44,9 @@ enum intel_region_id {
+ #define MEMORY_TYPE_FROM_REGION(r) (ilog2((r) >> INTEL_MEMORY_TYPE_SHIFT))
+ #define MEMORY_INSTANCE_FROM_REGION(r) (ilog2((r) & 0xffff))
+ 
+-#define I915_ALLOC_MIN_PAGE_SIZE  BIT(0)
+-#define I915_ALLOC_CONTIGUOUS     BIT(1)
++#define I915_ALLOC_MIN_PAGE_SIZE	BIT(0)
++#define I915_ALLOC_CONTIGUOUS		BIT(1)
++#define I915_ALLOC_MAX_SEGMENT_SIZE	BIT(2)
+ 
+ #define for_each_memory_region(mr, i915, id) \
+ 	for (id = 0; id < ARRAY_SIZE((i915)->mm.regions); id++) \
+diff --git a/drivers/gpu/drm/i915/selftests/intel_memory_region.c b/drivers/gpu/drm/i915/selftests/intel_memory_region.c
+index 0aeba8e3af28..55ccd957a009 100644
+--- a/drivers/gpu/drm/i915/selftests/intel_memory_region.c
++++ b/drivers/gpu/drm/i915/selftests/intel_memory_region.c
+@@ -337,6 +337,56 @@ static int igt_mock_splintered_region(void *arg)
+ 	return err;
+ }
+ 
++#define SZ_8G BIT_ULL(33)
++
++static int igt_mock_max_segment(void *arg)
++{
++	struct intel_memory_region *mem = arg;
++	struct drm_i915_private *i915 = mem->i915;
++	struct drm_i915_gem_object *obj;
++	struct i915_buddy_block *block;
++	LIST_HEAD(objects);
++	u64 size;
++	int err = 0;
++
++	/*
++	 * The size of block are only limited by the largest power-of-two that
++	 * will fit in the region size, but to construct an object we also
++	 * require feeding it into an sg list, where the upper limit of the sg
++	 * entry is at most UINT_MAX, therefore when allocating with
++	 * I915_ALLOC_MAX_SEGMENT_SIZE we shouldn't see blocks larger than
++	 * i915_sg_segment_size().
++	 */
++
++	size = SZ_8G;
++	mem = mock_region_create(i915, 0, size, PAGE_SIZE, 0);
++	if (IS_ERR(mem))
++		return PTR_ERR(mem);
++
++	obj = igt_object_create(mem, &objects, size, 0);
++	if (IS_ERR(obj)) {
++		err = PTR_ERR(obj);
++		goto out_put;
++	}
++
++	list_for_each_entry(block, &obj->mm.blocks, link) {
++		if (i915_buddy_block_size(&mem->mm, block) > i915_sg_segment_size()) {
++			pr_err("%s found block size(%llu) larger than max sg_segment_size(%u)",
++			       __func__,
++			       i915_buddy_block_size(&mem->mm, block),
++			       i915_sg_segment_size());
++			err = -EINVAL;
++			goto out_close;
++		}
++	}
++
++out_close:
++	close_objects(mem, &objects);
++out_put:
++	intel_memory_region_put(mem);
++	return err;
++}
++
+ static int igt_gpu_write_dw(struct intel_context *ce,
+ 			    struct i915_vma *vma,
+ 			    u32 dword,
+@@ -848,6 +898,7 @@ int intel_memory_region_mock_selftests(void)
+ 		SUBTEST(igt_mock_fill),
+ 		SUBTEST(igt_mock_contiguous),
+ 		SUBTEST(igt_mock_splintered_region),
++		SUBTEST(igt_mock_max_segment),
+ 	};
+ 	struct intel_memory_region *mem;
+ 	struct drm_i915_private *i915;
+-- 
+2.17.1
+

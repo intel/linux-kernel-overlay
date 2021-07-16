@@ -1,0 +1,213 @@
+From 1998121ad755410f4a617676863177d7e4cc0cc6 Mon Sep 17 00:00:00 2001
+From: John Stultz <john.stultz@linaro.org>
+Date: Tue, 19 Jan 2021 20:45:08 +0000
+Subject: [PATCH 055/105] dma-buf: heaps: Rework heap allocation hooks to
+ return struct dma_buf instead of fd
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every heap needs to create a dmabuf and then export it to a fd
+via dma_buf_fd(), so to consolidate things a bit, have the heaps
+just return a struct dmabuf * and let the top level
+dma_heap_buffer_alloc() call handle creating the fd via
+dma_buf_fd().
+
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Cc: Liam Mark <lmark@codeaurora.org>
+Cc: Laura Abbott <labbott@kernel.org>
+Cc: Brian Starkey <Brian.Starkey@arm.com>
+Cc: Hridya Valsaraju <hridya@google.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Sandeep Patil <sspatil@google.com>
+Cc: Daniel Mentz <danielmentz@google.com>
+Cc: Chris Goldsworthy <cgoldswo@codeaurora.org>
+Cc: Ørjan Eide <orjan.eide@arm.com>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Ezequiel Garcia <ezequiel@collabora.com>
+Cc: Simon Ser <contact@emersion.fr>
+Cc: James Jones <jajones@nvidia.com>
+Cc: linux-media@vger.kernel.org
+Cc: dri-devel@lists.freedesktop.org
+Signed-off-by: John Stultz <john.stultz@linaro.org>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+ [sumits: minor reword of commit message]
+
+Link: https://patchwork.freedesktop.org/patch/msgid/20210119204508.9256-3-john.stultz@linaro.org
+(cherry picked from commit c7f59e3dd60313071a989227dcb69094f499d310)
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+---
+ drivers/dma-buf/dma-heap.c          | 14 +++++++++++++-
+ drivers/dma-buf/heaps/cma_heap.c    | 22 +++++++---------------
+ drivers/dma-buf/heaps/system_heap.c | 21 +++++++--------------
+ include/linux/dma-heap.h            | 12 ++++++------
+ 4 files changed, 33 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-heap.c b/drivers/dma-buf/dma-heap.c
+index afd22c9dbdcf..6b5db954569f 100644
+--- a/drivers/dma-buf/dma-heap.c
++++ b/drivers/dma-buf/dma-heap.c
+@@ -52,6 +52,9 @@ static int dma_heap_buffer_alloc(struct dma_heap *heap, size_t len,
+ 				 unsigned int fd_flags,
+ 				 unsigned int heap_flags)
+ {
++	struct dma_buf *dmabuf;
++	int fd;
++
+ 	/*
+ 	 * Allocations from all heaps have to begin
+ 	 * and end on page boundaries.
+@@ -60,7 +63,16 @@ static int dma_heap_buffer_alloc(struct dma_heap *heap, size_t len,
+ 	if (!len)
+ 		return -EINVAL;
+ 
+-	return heap->ops->allocate(heap, len, fd_flags, heap_flags);
++	dmabuf = heap->ops->allocate(heap, len, fd_flags, heap_flags);
++	if (IS_ERR(dmabuf))
++		return PTR_ERR(dmabuf);
++
++	fd = dma_buf_fd(dmabuf, fd_flags);
++	if (fd < 0) {
++		dma_buf_put(dmabuf);
++		/* just return, as put will call release and that will free */
++	}
++	return fd;
+ }
+ 
+ static int dma_heap_open(struct inode *inode, struct file *file)
+diff --git a/drivers/dma-buf/heaps/cma_heap.c b/drivers/dma-buf/heaps/cma_heap.c
+index 5e7c3436310c..06171a938bad 100644
+--- a/drivers/dma-buf/heaps/cma_heap.c
++++ b/drivers/dma-buf/heaps/cma_heap.c
+@@ -267,10 +267,10 @@ static const struct dma_buf_ops cma_heap_buf_ops = {
+ 	.release = cma_heap_dma_buf_release,
+ };
+ 
+-static int cma_heap_allocate(struct dma_heap *heap,
+-				  unsigned long len,
+-				  unsigned long fd_flags,
+-				  unsigned long heap_flags)
++static struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
++					 unsigned long len,
++					 unsigned long fd_flags,
++					 unsigned long heap_flags)
+ {
+ 	struct cma_heap *cma_heap = dma_heap_get_drvdata(heap);
+ 	struct cma_heap_buffer *buffer;
+@@ -285,7 +285,7 @@ static int cma_heap_allocate(struct dma_heap *heap,
+ 
+ 	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+ 	if (!buffer)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&buffer->attachments);
+ 	mutex_init(&buffer->lock);
+@@ -344,15 +344,7 @@ static int cma_heap_allocate(struct dma_heap *heap,
+ 		ret = PTR_ERR(dmabuf);
+ 		goto free_pages;
+ 	}
+-
+-	ret = dma_buf_fd(dmabuf, fd_flags);
+-	if (ret < 0) {
+-		dma_buf_put(dmabuf);
+-		/* just return, as put will call release and that will free */
+-		return ret;
+-	}
+-
+-	return ret;
++	return dmabuf;
+ 
+ free_pages:
+ 	kfree(buffer->pages);
+@@ -361,7 +353,7 @@ static int cma_heap_allocate(struct dma_heap *heap,
+ free_buffer:
+ 	kfree(buffer);
+ 
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ 
+ static const struct dma_heap_ops cma_heap_ops = {
+diff --git a/drivers/dma-buf/heaps/system_heap.c b/drivers/dma-buf/heaps/system_heap.c
+index 405351aad2a8..29e49ac17251 100644
+--- a/drivers/dma-buf/heaps/system_heap.c
++++ b/drivers/dma-buf/heaps/system_heap.c
+@@ -331,10 +331,10 @@ static struct page *alloc_largest_available(unsigned long size,
+ 	return NULL;
+ }
+ 
+-static int system_heap_allocate(struct dma_heap *heap,
+-				unsigned long len,
+-				unsigned long fd_flags,
+-				unsigned long heap_flags)
++static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
++					    unsigned long len,
++					    unsigned long fd_flags,
++					    unsigned long heap_flags)
+ {
+ 	struct system_heap_buffer *buffer;
+ 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+@@ -349,7 +349,7 @@ static int system_heap_allocate(struct dma_heap *heap,
+ 
+ 	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+ 	if (!buffer)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&buffer->attachments);
+ 	mutex_init(&buffer->lock);
+@@ -399,14 +399,7 @@ static int system_heap_allocate(struct dma_heap *heap,
+ 		ret = PTR_ERR(dmabuf);
+ 		goto free_pages;
+ 	}
+-
+-	ret = dma_buf_fd(dmabuf, fd_flags);
+-	if (ret < 0) {
+-		dma_buf_put(dmabuf);
+-		/* just return, as put will call release and that will free */
+-		return ret;
+-	}
+-	return ret;
++	return dmabuf;
+ 
+ free_pages:
+ 	for_each_sgtable_sg(table, sg, i) {
+@@ -420,7 +413,7 @@ static int system_heap_allocate(struct dma_heap *heap,
+ 		__free_pages(page, compound_order(page));
+ 	kfree(buffer);
+ 
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ 
+ static const struct dma_heap_ops system_heap_ops = {
+diff --git a/include/linux/dma-heap.h b/include/linux/dma-heap.h
+index 454e354d1ffb..5bc5c946af58 100644
+--- a/include/linux/dma-heap.h
++++ b/include/linux/dma-heap.h
+@@ -16,15 +16,15 @@ struct dma_heap;
+ 
+ /**
+  * struct dma_heap_ops - ops to operate on a given heap
+- * @allocate:		allocate dmabuf and return fd
++ * @allocate:		allocate dmabuf and return struct dma_buf ptr
+  *
+- * allocate returns dmabuf fd  on success, -errno on error.
++ * allocate returns dmabuf on success, ERR_PTR(-errno) on error.
+  */
+ struct dma_heap_ops {
+-	int (*allocate)(struct dma_heap *heap,
+-			unsigned long len,
+-			unsigned long fd_flags,
+-			unsigned long heap_flags);
++	struct dma_buf *(*allocate)(struct dma_heap *heap,
++				    unsigned long len,
++				    unsigned long fd_flags,
++				    unsigned long heap_flags);
+ };
+ 
+ /**
+-- 
+2.25.1
+

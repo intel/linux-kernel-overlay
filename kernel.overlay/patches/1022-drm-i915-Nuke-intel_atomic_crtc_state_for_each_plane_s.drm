@@ -1,0 +1,151 @@
+From 241366567d49ef0669f713f6b5d6ec409be15e9b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 6 Nov 2020 19:30:38 +0200
+Subject: [PATCH 1022/1714] drm/i915: Nuke
+ intel_atomic_crtc_state_for_each_plane_state() from skl+ wm code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+intel_atomic_crtc_state_for_each_plane_state() peeks at the
+plane's current state without holding the plane's mutex, trusting
+that the crtc's mutex will protect it. In practice that does work
+since our planes can't move between pipes, but it sets a bad
+example. intel_atomic_crtc_state_for_each_plane_state() also
+relies on crtc_state.uapi.plane_mask which may be full of lies
+when it comes to the bigjoiner stuff, so soon we can't use it as
+is anyway. So best to just get rid of it entirely. Which we can
+easily do by switching to the g4x/vlv "raw" watermark approach.
+
+Later on we should even be able to move the "raw" watermark
+computation into the normal .plane_check() code, leaving only
+the merging/clamping of the final watermarks to the later
+stages. But that will require adjusting the ilk+ wm code
+similarly as well.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Signed-off-by: Manasi Navare <manasi.d.navare@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201106173042.7534-3-ville.syrjala@linux.intel.com
+---
+ .../drm/i915/display/intel_display_types.h    |  2 +
+ drivers/gpu/drm/i915/intel_pm.c               | 41 +++++++++++--------
+ 2 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 35ab5944a3f7..3d91b116aadc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -755,6 +755,8 @@ struct intel_crtc_wm_state {
+ 		} ilk;
+ 
+ 		struct {
++			/* "raw" watermarks */
++			struct skl_pipe_wm raw;
+ 			/* gen9+ only needs 1-step wm programming */
+ 			struct skl_pipe_wm optimal;
+ 			struct skl_ddb_entry ddb;
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 24813bd3847e..5a04be58e0b9 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -5480,7 +5480,7 @@ static int skl_build_plane_wm_single(struct intel_crtc_state *crtc_state,
+ {
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	struct skl_plane_wm *wm = &crtc_state->wm.skl.optimal.planes[plane_id];
++	struct skl_plane_wm *wm = &crtc_state->wm.skl.raw.planes[plane_id];
+ 	struct skl_wm_params wm_params;
+ 	int ret;
+ 
+@@ -5503,7 +5503,7 @@ static int skl_build_plane_wm_uv(struct intel_crtc_state *crtc_state,
+ 				 const struct intel_plane_state *plane_state,
+ 				 enum plane_id plane_id)
+ {
+-	struct skl_plane_wm *wm = &crtc_state->wm.skl.optimal.planes[plane_id];
++	struct skl_plane_wm *wm = &crtc_state->wm.skl.raw.planes[plane_id];
+ 	struct skl_wm_params wm_params;
+ 	int ret;
+ 
+@@ -5524,10 +5524,13 @@ static int skl_build_plane_wm(struct intel_crtc_state *crtc_state,
+ 			      const struct intel_plane_state *plane_state)
+ {
+ 	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+-	const struct drm_framebuffer *fb = plane_state->hw.fb;
+ 	enum plane_id plane_id = plane->id;
++	struct skl_plane_wm *wm = &crtc_state->wm.skl.raw.planes[plane_id];
++	const struct drm_framebuffer *fb = plane_state->hw.fb;
+ 	int ret;
+ 
++	memset(wm, 0, sizeof(*wm));
++
+ 	if (!intel_wm_plane_visible(crtc_state, plane_state))
+ 		return 0;
+ 
+@@ -5549,10 +5552,14 @@ static int skl_build_plane_wm(struct intel_crtc_state *crtc_state,
+ static int icl_build_plane_wm(struct intel_crtc_state *crtc_state,
+ 			      const struct intel_plane_state *plane_state)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
+-	enum plane_id plane_id = to_intel_plane(plane_state->uapi.plane)->id;
++	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
++	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++	enum plane_id plane_id = plane->id;
++	struct skl_plane_wm *wm = &crtc_state->wm.skl.raw.planes[plane_id];
+ 	int ret;
+ 
++	memset(wm, 0, sizeof(*wm));
++
+ 	/* Watermarks calculated in master */
+ 	if (plane_state->planar_slave)
+ 		return 0;
+@@ -5591,19 +5598,18 @@ static int skl_build_pipe_wm(struct intel_atomic_state *state,
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct intel_crtc_state *crtc_state =
+ 		intel_atomic_get_new_crtc_state(state, crtc);
+-	struct skl_pipe_wm *pipe_wm = &crtc_state->wm.skl.optimal;
+-	struct intel_plane *plane;
+ 	const struct intel_plane_state *plane_state;
+-	int ret;
+-
+-	/*
+-	 * We'll only calculate watermarks for planes that are actually
+-	 * enabled, so make sure all other planes are set as disabled.
+-	 */
+-	memset(pipe_wm->planes, 0, sizeof(pipe_wm->planes));
++	struct intel_plane *plane;
++	int ret, i;
+ 
+-	intel_atomic_crtc_state_for_each_plane_state(plane, plane_state,
+-						     crtc_state) {
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		/*
++		 * FIXME should perhaps check {old,new}_plane_crtc->hw.crtc
++		 * instead but we don't populate that correctly for NV12 Y
++		 * planes so for now hack this.
++		 */
++		if (plane->pipe != crtc->pipe)
++			continue;
+ 
+ 		if (INTEL_GEN(dev_priv) >= 11)
+ 			ret = icl_build_plane_wm(crtc_state, plane_state);
+@@ -5613,6 +5619,8 @@ static int skl_build_pipe_wm(struct intel_atomic_state *state,
+ 			return ret;
+ 	}
+ 
++	crtc_state->wm.skl.optimal = crtc_state->wm.skl.raw;
++
+ 	return 0;
+ }
+ 
+@@ -6273,6 +6281,7 @@ void skl_wm_get_hw_state(struct drm_i915_private *dev_priv)
+ 		crtc_state = to_intel_crtc_state(crtc->base.state);
+ 
+ 		skl_pipe_wm_get_hw_state(crtc, &crtc_state->wm.skl.optimal);
++		crtc_state->wm.skl.raw = crtc_state->wm.skl.optimal;
+ 	}
+ 
+ 	if (dev_priv->active_pipes) {
+-- 
+2.25.1
+

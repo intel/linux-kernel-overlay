@@ -1,0 +1,137 @@
+From 3ed027d053738011606c5d7cfb578d73e92c4591 Mon Sep 17 00:00:00 2001
+From: Anshuman Gupta <anshuman.gupta@intel.com>
+Date: Mon, 11 Jan 2021 13:41:19 +0530
+Subject: [PATCH 021/128] drm/i915/hdcp: Configure HDCP2.2 MST steram
+ encryption status
+
+Authenticate and enable port encryption only once for
+an active HDCP 2.2 session, once port is authenticated
+and encrypted enable encryption for each stream that
+requires encryption on this port.
+
+Similarly disable the stream encryption for each encrypted
+stream, once all encrypted stream encryption is disabled,
+disable the port HDCP encryption and deauthenticate the port.
+
+v2:
+- Add connector details in drm_err. [Ram]
+- 's/port_auth/hdcp_auth_status'. [Ram]
+- Added a debug print for stream enc.
+v3:
+- uniformity for connector detail in DMESG. [Ram]
+
+Cc: Ramalingam C <ramalingam.c@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Reviewed-by: Ramalingam C <ramalingam.c@intel.com>
+Tested-by: Karthik B S <karthik.b.s@intel.com>
+Signed-off-by: Anshuman Gupta <anshuman.gupta@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111081120.28417-19-anshuman.gupta@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_hdcp.c | 51 ++++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_hdcp.c b/drivers/gpu/drm/i915/display/intel_hdcp.c
+index 3a71577d50cd..576c3777c52f 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdcp.c
++++ b/drivers/gpu/drm/i915/display/intel_hdcp.c
+@@ -1700,6 +1700,36 @@ static int hdcp2_authenticate_sink(struct intel_connector *connector)
+ 	return ret;
+ }
+ 
++static int hdcp2_enable_stream_encryption(struct intel_connector *connector)
++{
++	struct intel_digital_port *dig_port = intel_attached_dig_port(connector);
++	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
++	struct intel_hdcp *hdcp = &connector->hdcp;
++	enum transcoder cpu_transcoder = hdcp->cpu_transcoder;
++	enum port port = dig_port->base.port;
++	int ret = 0;
++
++	if (!(intel_de_read(dev_priv, HDCP2_STATUS(dev_priv, cpu_transcoder, port)) &
++			    LINK_ENCRYPTION_STATUS)) {
++		drm_err(&dev_priv->drm, "[%s:%d] HDCP 2.2 Link is not encrypted\n",
++			connector->base.name, connector->base.base.id);
++		return -EPERM;
++	}
++
++	if (hdcp->shim->stream_2_2_encryption) {
++		ret = hdcp->shim->stream_2_2_encryption(connector, true);
++		if (ret) {
++			drm_err(&dev_priv->drm, "[%s:%d] Failed to enable HDCP 2.2 stream enc\n",
++				connector->base.name, connector->base.base.id);
++			return ret;
++		}
++		drm_dbg_kms(&dev_priv->drm, "HDCP 2.2 transcoder: %s stream encrypted\n",
++			    transcoder_name(hdcp->stream_transcoder));
++	}
++
++	return ret;
++}
++
+ static int hdcp2_enable_encryption(struct intel_connector *connector)
+ {
+ 	struct intel_digital_port *dig_port = intel_attached_dig_port(connector);
+@@ -1838,7 +1868,7 @@ static int hdcp2_authenticate_and_encrypt(struct intel_connector *connector)
+ 			drm_dbg_kms(&i915->drm, "Port deauth failed.\n");
+ 	}
+ 
+-	if (!ret) {
++	if (!ret && !dig_port->hdcp_auth_status) {
+ 		/*
+ 		 * Ensuring the required 200mSec min time interval between
+ 		 * Session Key Exchange and encryption.
+@@ -1853,6 +1883,8 @@ static int hdcp2_authenticate_and_encrypt(struct intel_connector *connector)
+ 		}
+ 	}
+ 
++	ret = hdcp2_enable_stream_encryption(connector);
++
+ 	return ret;
+ }
+ 
+@@ -1898,11 +1930,26 @@ static int _intel_hdcp2_disable(struct intel_connector *connector)
+ 	struct intel_digital_port *dig_port = intel_attached_dig_port(connector);
+ 	struct drm_i915_private *i915 = to_i915(connector->base.dev);
+ 	struct hdcp_port_data *data = &dig_port->hdcp_port_data;
++	struct intel_hdcp *hdcp = &connector->hdcp;
+ 	int ret;
+ 
+ 	drm_dbg_kms(&i915->drm, "[%s:%d] HDCP2.2 is being Disabled\n",
+ 		    connector->base.name, connector->base.base.id);
+ 
++	if (hdcp->shim->stream_2_2_encryption) {
++		ret = hdcp->shim->stream_2_2_encryption(connector, false);
++		if (ret) {
++			drm_err(&i915->drm, "[%s:%d] Failed to disable HDCP 2.2 stream enc\n",
++				connector->base.name, connector->base.base.id);
++			return ret;
++		}
++		drm_dbg_kms(&i915->drm, "HDCP 2.2 transcoder: %s stream encryption disabled\n",
++			    transcoder_name(hdcp->stream_transcoder));
++	}
++
++	if (dig_port->num_hdcp_streams > 0)
++		return ret;
++
+ 	ret = hdcp2_disable_encryption(connector);
+ 
+ 	if (hdcp2_deauthenticate_port(connector) < 0)
+@@ -1926,6 +1973,7 @@ static int intel_hdcp2_check_link(struct intel_connector *connector)
+ 	int ret = 0;
+ 
+ 	mutex_lock(&hdcp->mutex);
++	mutex_lock(&dig_port->hdcp_mutex);
+ 	cpu_transcoder = hdcp->cpu_transcoder;
+ 
+ 	/* hdcp2_check_link is expected only when HDCP2.2 is Enabled */
+@@ -2003,6 +2051,7 @@ static int intel_hdcp2_check_link(struct intel_connector *connector)
+ 	}
+ 
+ out:
++	mutex_unlock(&dig_port->hdcp_mutex);
+ 	mutex_unlock(&hdcp->mutex);
+ 	return ret;
+ }
+-- 
+2.17.1
+

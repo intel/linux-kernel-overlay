@@ -1,0 +1,112 @@
+From a7e95cd742c614a21a6ecc2daab757869d259c13 Mon Sep 17 00:00:00 2001
+From: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Date: Mon, 23 Nov 2020 17:56:35 -0500
+Subject: [PATCH 1579/1714] drm/amd/display: Only one display lights up while
+ using MST hub
+
+[Why]
+With the addition of dc_lock acquire before dc_link_handle_hpd_rx_irq,
+there will be a deadlock situation where commit state sends a request
+for payload allocation on MST and wait for HPD to process DOWN_REP.
+
+[How]
+Move forward the MST message handling in handle_hpd_rx_irq so that
+it will not rely on call to dc_link_handle_hpd_rx_irq.
+
+Signed-off-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+Acked-by: Eryk Brol <eryk.brol@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 21 ++++++++++++++-----
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  |  2 +-
+ drivers/gpu/drm/amd/display/dc/dc_link.h      |  4 ++++
+ 3 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index c8e279f05c72..508457cca343 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2563,11 +2563,9 @@ static void handle_hpd_rx_irq(void *param)
+ 	bool result = false;
+ 	enum dc_connection_type new_connection_type = dc_connection_none;
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+-#ifdef CONFIG_DRM_AMD_DC_HDCP
+ 	union hpd_irq_data hpd_irq_data;
+ 
+ 	memset(&hpd_irq_data, 0, sizeof(hpd_irq_data));
+-#endif
+ 
+ 	/*
+ 	 * TODO:Temporary add mutex to protect hpd interrupt not have a gpio
+@@ -2577,6 +2575,21 @@ static void handle_hpd_rx_irq(void *param)
+ 	if (dc_link->type != dc_connection_mst_branch)
+ 		mutex_lock(&aconnector->hpd_lock);
+ 
++	read_hpd_rx_irq_data(dc_link, &hpd_irq_data);
++
++	if ((dc_link->cur_link_settings.lane_count != LANE_COUNT_UNKNOWN) ||
++		(dc_link->type == dc_connection_mst_branch)) {
++		if (hpd_irq_data.bytes.device_service_irq.bits.UP_REQ_MSG_RDY) {
++			result = true;
++			dm_handle_hpd_rx_irq(aconnector);
++			goto out;
++		} else if (hpd_irq_data.bytes.device_service_irq.bits.DOWN_REP_MSG_RDY) {
++			result = false;
++			dm_handle_hpd_rx_irq(aconnector);
++			goto out;
++		}
++	}
++
+ 	mutex_lock(&adev->dm.dc_lock);
+ #ifdef CONFIG_DRM_AMD_DC_HDCP
+ 	result = dc_link_handle_hpd_rx_irq(dc_link, &hpd_irq_data, NULL);
+@@ -2585,6 +2598,7 @@ static void handle_hpd_rx_irq(void *param)
+ #endif
+ 	mutex_unlock(&adev->dm.dc_lock);
+ 
++out:
+ 	if (result && !is_mst_root_connector) {
+ 		/* Downstream Port status changed. */
+ 		if (!dc_link_detect_sink(dc_link, &new_connection_type))
+@@ -2625,9 +2639,6 @@ static void handle_hpd_rx_irq(void *param)
+ 			hdcp_handle_cpirq(adev->dm.hdcp_workqueue,  aconnector->base.index);
+ 	}
+ #endif
+-	if ((dc_link->cur_link_settings.lane_count != LANE_COUNT_UNKNOWN) ||
+-	    (dc_link->type == dc_connection_mst_branch))
+-		dm_handle_hpd_rx_irq(aconnector);
+ 
+ 	if (dc_link->type != dc_connection_mst_branch) {
+ 		drm_dp_cec_irq(&aconnector->dm_dp_aux.aux);
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index dbbc0ec0b699..6b11d4af54af 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -1874,7 +1874,7 @@ static struct dc_link_settings get_max_link_cap(struct dc_link *link)
+ 	return max_link_cap;
+ }
+ 
+-static enum dc_status read_hpd_rx_irq_data(
++enum dc_status read_hpd_rx_irq_data(
+ 	struct dc_link *link,
+ 	union hpd_irq_data *irq_data)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_link.h b/drivers/gpu/drm/amd/display/dc/dc_link.h
+index 66445e34fd37..6d9a60c9dcc0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_link.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_link.h
+@@ -259,6 +259,10 @@ enum dc_status dc_link_reallocate_mst_payload(struct dc_link *link);
+ bool dc_link_handle_hpd_rx_irq(struct dc_link *dc_link,
+ 		union hpd_irq_data *hpd_irq_dpcd_data, bool *out_link_loss);
+ 
++enum dc_status read_hpd_rx_irq_data(
++	struct dc_link *link,
++	union hpd_irq_data *irq_data);
++
+ struct dc_sink_init_data;
+ 
+ struct dc_sink *dc_link_add_remote_sink(
+-- 
+2.25.1
+

@@ -1,0 +1,211 @@
+From 619daea5a9705359ba66354dd926963e9b720fd8 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 20 Oct 2020 11:03:15 +1000
+Subject: [PATCH 0210/1714] drm/ttm: add move to system into drivers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This moves the to system move into the drivers, and moves all
+the unbinds in the move path under driver control
+
+Note: radeon/nouveau already wait so don't duplicate it.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201020010319.1692445-4-airlied@gmail.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 12 +++++++++---
+ drivers/gpu/drm/nouveau/nouveau_bo.c       | 10 ++++++----
+ drivers/gpu/drm/radeon/radeon_ttm.c        | 12 +++++++-----
+ drivers/gpu/drm/ttm/ttm_bo_util.c          | 21 ---------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c |  5 ++++-
+ include/drm/ttm/ttm_bo_driver.h            |  2 --
+ 6 files changed, 26 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 7753904b9d70..681dde288f52 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -66,6 +66,8 @@
+ static int amdgpu_ttm_backend_bind(struct ttm_bo_device *bdev,
+ 				   struct ttm_tt *ttm,
+ 				   struct ttm_resource *bo_mem);
++static void amdgpu_ttm_backend_unbind(struct ttm_bo_device *bdev,
++				      struct ttm_tt *ttm);
+ 
+ static int amdgpu_ttm_init_on_chip(struct amdgpu_device *adev,
+ 				    unsigned int type,
+@@ -561,11 +563,12 @@ static int amdgpu_move_vram_ram(struct ttm_buffer_object *bo, bool evict,
+ 		goto out_cleanup;
+ 	}
+ 
+-	/* move BO (in tmp_mem) to new_mem */
+-	r = ttm_bo_move_to_system(bo, ctx);
++	r = ttm_bo_wait_ctx(bo, ctx);
+ 	if (unlikely(r))
+ 		goto out_cleanup;
+ 
++	amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
++	ttm_resource_free(bo, &bo->mem);
+ 	ttm_bo_assign_mem(bo, new_mem);
+ out_cleanup:
+ 	ttm_resource_free(bo, &tmp_mem);
+@@ -682,9 +685,12 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (old_mem->mem_type == TTM_PL_TT &&
+ 	    new_mem->mem_type == TTM_PL_SYSTEM) {
+-		r = ttm_bo_move_to_system(bo, ctx);
++		r = ttm_bo_wait_ctx(bo, ctx);
+ 		if (r)
+ 			return r;
++
++		amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
++		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_mem);
+ 		return 0;
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 8a4f2f1603dc..46cb6824e90a 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -46,6 +46,7 @@
+ 
+ static int nouveau_ttm_tt_bind(struct ttm_bo_device *bdev, struct ttm_tt *ttm,
+ 			       struct ttm_resource *reg);
++static void nouveau_ttm_tt_unbind(struct ttm_bo_device *bdev, struct ttm_tt *ttm);
+ 
+ /*
+  * NV10-NV40 tiling helpers
+@@ -897,10 +898,12 @@ nouveau_bo_move_flipd(struct ttm_buffer_object *bo, bool evict,
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = ttm_bo_move_to_system(bo, ctx);
++	ret = ttm_bo_wait_ctx(bo, ctx);
+ 	if (ret)
+ 		goto out;
+ 
++	nouveau_ttm_tt_unbind(bo->bdev, bo->ttm);
++	ttm_resource_free(bo, &bo->mem);
+ 	ttm_bo_assign_mem(bo, &tmp_reg);
+ out:
+ 	ttm_resource_free(bo, &tmp_reg);
+@@ -1056,9 +1059,8 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (old_reg->mem_type == TTM_PL_TT &&
+ 	    new_reg->mem_type == TTM_PL_SYSTEM) {
+-		ret = ttm_bo_move_to_system(bo, ctx);
+-		if (ret)
+-			return ret;
++		nouveau_ttm_tt_unbind(bo->bdev, bo->ttm);
++		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_reg);
+ 		goto out;
+ 	}
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index c1cdee33be11..42c85afe7955 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -59,6 +59,8 @@ static void radeon_ttm_debugfs_fini(struct radeon_device *rdev);
+ static int radeon_ttm_tt_bind(struct ttm_bo_device *bdev,
+ 			      struct ttm_tt *ttm,
+ 			      struct ttm_resource *bo_mem);
++static void radeon_ttm_tt_unbind(struct ttm_bo_device *bdev,
++				 struct ttm_tt *ttm);
+ 
+ struct radeon_device *radeon_get_rdev(struct ttm_bo_device *bdev)
+ {
+@@ -244,10 +246,12 @@ static int radeon_move_vram_ram(struct ttm_buffer_object *bo,
+ 	if (unlikely(r)) {
+ 		goto out_cleanup;
+ 	}
+-	r = ttm_bo_move_to_system(bo, ctx);
++	r = ttm_bo_wait_ctx(bo, ctx);
+ 	if (unlikely(r))
+ 		goto out_cleanup;
+ 
++	radeon_ttm_tt_unbind(bo->bdev, bo->ttm);
++	ttm_resource_free(bo, &bo->mem);
+ 	ttm_bo_assign_mem(bo, new_mem);
+ out_cleanup:
+ 	ttm_resource_free(bo, &tmp_mem);
+@@ -329,10 +333,8 @@ static int radeon_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (old_mem->mem_type == TTM_PL_TT &&
+ 	    new_mem->mem_type == TTM_PL_SYSTEM) {
+-		r = ttm_bo_move_to_system(bo, ctx);
+-		if (r)
+-			return r;
+-
++		radeon_ttm_tt_unbind(bo->bdev, bo->ttm);
++		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_mem);
+ 		return 0;
+ 	}
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index 5cfcb92a6d30..65f042d6da7c 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -65,27 +65,6 @@ int ttm_bo_move_to_new_tt_mem(struct ttm_buffer_object *bo,
+ 	return 0;
+ }
+ 
+-int ttm_bo_move_to_system(struct ttm_buffer_object *bo,
+-			  struct ttm_operation_ctx *ctx)
+-{
+-	int ret;
+-
+-	if (bo->mem.mem_type == TTM_PL_SYSTEM)
+-		return 0;
+-
+-	ret = ttm_bo_wait_ctx(bo, ctx);
+-	if (unlikely(ret != 0)) {
+-		if (ret != -ERESTARTSYS)
+-			pr_err("Failed to expire sync object before unbinding TTM\n");
+-		return ret;
+-	}
+-
+-	ttm_bo_tt_unbind(bo);
+-	ttm_resource_free(bo, &bo->mem);
+-	return 0;
+-}
+-EXPORT_SYMBOL(ttm_bo_move_to_system);
+-
+ int ttm_mem_io_reserve(struct ttm_bo_device *bdev,
+ 		       struct ttm_resource *mem)
+ {
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+index 30fd52451e20..17b6d354b28c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ttm_buffer.c
+@@ -736,9 +736,12 @@ static int vmw_move(struct ttm_buffer_object *bo,
+ 			ttm_bo_assign_mem(bo, new_mem);
+ 			return 0;
+ 		}
+-		ret = ttm_bo_move_to_system(bo, ctx);
++		ret = ttm_bo_wait_ctx(bo, ctx);
+ 		if (ret)
+ 			return ret;
++
++		vmw_ttm_unbind(bo->bdev, bo->ttm);
++		ttm_resource_free(bo, &bo->mem);
+ 		ttm_bo_assign_mem(bo, new_mem);
+ 		return 0;
+ 	} else {
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index a89728cb9a23..81a1618b9535 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -574,8 +574,6 @@ void ttm_mem_io_free(struct ttm_bo_device *bdev,
+ int ttm_bo_move_to_new_tt_mem(struct ttm_buffer_object *bo,
+ 			      struct ttm_operation_ctx *ctx,
+ 			      struct ttm_resource *new_mem);
+-int ttm_bo_move_to_system(struct ttm_buffer_object *bo,
+-			  struct ttm_operation_ctx *ctx);
+ 
+ /**
+  * ttm_bo_move_memcpy
+-- 
+2.25.1
+

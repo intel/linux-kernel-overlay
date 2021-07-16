@@ -1,0 +1,228 @@
+From a94bf246e1d7cd57e5927cb04b4e755b6140a9de Mon Sep 17 00:00:00 2001
+From: Likun Gao <Likun.Gao@amd.com>
+Date: Mon, 28 Dec 2020 16:42:40 +0800
+Subject: [PATCH 0615/1087] drm/amdgpu: add hdp version 4 functions
+
+Unify hdp related function into hdp structure for hdp version 4.
+V2: Add function to remap hdp registers for nbio version 6.1
+
+Signed-off-by: Likun Gao <Likun.Gao@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c  | 137 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/hdp_v4_0.h  |  31 ++++++
+ drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c |  10 ++
+ 3 files changed, 178 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/hdp_v4_0.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c b/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c
+new file mode 100644
+index 000000000000..e46621fed5b9
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c
+@@ -0,0 +1,137 @@
++/*
++ * Copyright 2020 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include "amdgpu.h"
++#include "amdgpu_atombios.h"
++#include "hdp_v4_0.h"
++#include "amdgpu_ras.h"
++
++#include "hdp/hdp_4_0_offset.h"
++#include "hdp/hdp_4_0_sh_mask.h"
++#include <uapi/linux/kfd_ioctl.h>
++
++/* for Vega20 register name change */
++#define mmHDP_MEM_POWER_CTRL    0x00d4
++#define HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK  0x00000001L
++#define HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK    0x00000002L
++#define HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK   0x00010000L
++#define HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK     0x00020000L
++#define mmHDP_MEM_POWER_CTRL_BASE_IDX   0
++
++static void hdp_v4_0_flush_hdp(struct amdgpu_device *adev,
++				struct amdgpu_ring *ring)
++{
++	if (!ring || !ring->funcs->emit_wreg)
++		WREG32_NO_KIQ((adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) >> 2, 0);
++	else
++		amdgpu_ring_emit_wreg(ring, (adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) >> 2, 0);
++}
++
++static void hdp_v4_0_invalidate_hdp(struct amdgpu_device *adev,
++				    struct amdgpu_ring *ring)
++{
++	if (!ring || !ring->funcs->emit_wreg)
++		WREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_READ_CACHE_INVALIDATE, 1);
++	else
++		amdgpu_ring_emit_wreg(ring, SOC15_REG_OFFSET(
++			HDP, 0, mmHDP_READ_CACHE_INVALIDATE), 1);
++}
++
++static void hdp_v4_0_reset_ras_error_count(struct amdgpu_device *adev)
++{
++	if (!amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__HDP))
++		return;
++	/*read back hdp ras counter to reset it to 0 */
++	RREG32_SOC15(HDP, 0, mmHDP_EDC_CNT);
++}
++
++static void hdp_v4_0_update_clock_gating(struct amdgpu_device *adev,
++					 bool enable)
++{
++	uint32_t def, data;
++
++	if (adev->asic_type == CHIP_VEGA10 ||
++	    adev->asic_type == CHIP_VEGA12 ||
++	    adev->asic_type == CHIP_RAVEN) {
++		def = data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS));
++
++		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS))
++			data |= HDP_MEM_POWER_LS__LS_ENABLE_MASK;
++		else
++			data &= ~HDP_MEM_POWER_LS__LS_ENABLE_MASK;
++
++		if (def != data)
++			WREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS), data);
++	} else {
++		def = data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_CTRL));
++
++		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS))
++			data |= HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK |
++				HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK |
++				HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK |
++				HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK;
++		else
++			data &= ~(HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK |
++				  HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK |
++				  HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK |
++				  HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK);
++
++		if (def != data)
++			WREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_CTRL), data);
++	}
++}
++
++static void hdp_v4_0_get_clockgating_state(struct amdgpu_device *adev,
++					    u32 *flags)
++{
++	int data;
++
++	/* AMD_CG_SUPPORT_HDP_LS */
++	data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS));
++	if (data & HDP_MEM_POWER_LS__LS_ENABLE_MASK)
++		*flags |= AMD_CG_SUPPORT_HDP_LS;
++}
++
++static void hdp_v4_0_init_registers(struct amdgpu_device *adev)
++{
++	switch (adev->asic_type) {
++	case CHIP_ARCTURUS:
++		WREG32_FIELD15(HDP, 0, HDP_MMHUB_CNTL, HDP_MMHUB_GCC, 1);
++		break;
++	default:
++		break;
++	}
++
++	WREG32_FIELD15(HDP, 0, HDP_MISC_CNTL, FLUSH_INVALIDATE_CACHE, 1);
++
++	WREG32_SOC15(HDP, 0, mmHDP_NONSURFACE_BASE, (adev->gmc.vram_start >> 8));
++	WREG32_SOC15(HDP, 0, mmHDP_NONSURFACE_BASE_HI, (adev->gmc.vram_start >> 40));
++}
++
++const struct amdgpu_hdp_funcs hdp_v4_0_funcs = {
++	.flush_hdp = hdp_v4_0_flush_hdp,
++	.invalidate_hdp = hdp_v4_0_invalidate_hdp,
++	.reset_ras_error_count = hdp_v4_0_reset_ras_error_count,
++	.update_clock_gating = hdp_v4_0_update_clock_gating,
++	.get_clock_gating_state = hdp_v4_0_get_clockgating_state,
++	.init_registers = hdp_v4_0_init_registers,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.h b/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.h
+new file mode 100644
+index 000000000000..d1e6399e8c46
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2020 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __HDP_V4_0_H__
++#define __HDP_V4_0_H__
++
++#include "soc15_common.h"
++
++extern const struct amdgpu_hdp_funcs hdp_v4_0_funcs;
++
++#endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+index d2f1fe55d388..7fc5043de494 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+@@ -29,6 +29,15 @@
+ #include "nbio/nbio_6_1_sh_mask.h"
+ #include "nbio/nbio_6_1_smn.h"
+ #include "vega10_enum.h"
++#include <uapi/linux/kfd_ioctl.h>
++
++static void nbio_v6_1_remap_hdp_registers(struct amdgpu_device *adev)
++{
++	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
++		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
++		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++}
+ 
+ static u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev)
+ {
+@@ -277,4 +286,5 @@ const struct amdgpu_nbio_funcs nbio_v6_1_funcs = {
+ 	.get_clockgating_state = nbio_v6_1_get_clockgating_state,
+ 	.ih_control = nbio_v6_1_ih_control,
+ 	.init_registers = nbio_v6_1_init_registers,
++	.remap_hdp_registers = nbio_v6_1_remap_hdp_registers,
+ };
+-- 
+2.17.1
+

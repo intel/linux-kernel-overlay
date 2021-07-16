@@ -1,0 +1,198 @@
+From d66795b87a0636fc1d3cb7aa1ca32c69d522d054 Mon Sep 17 00:00:00 2001
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Fri, 15 Jan 2021 16:11:39 +0900
+Subject: [PATCH 33/62] perf stat: Take cgroups into account for shadow stats
+
+As of now it doesn't consider cgroups when collecting shadow stats and
+metrics so counter values from different cgroups will be saved in a same
+slot.  This resulted in incorrect numbers when those cgroups have
+different workloads.
+
+For example, let's look at the scenario below: cgroups A and C runs same
+workload which burns a cpu while cgroup B runs a light workload.
+
+  $ perf stat -a -e cycles,instructions --for-each-cgroup A,B,C  sleep 1
+
+   Performance counter stats for 'system wide':
+
+     3,958,116,522      cycles                A
+     6,722,650,929      instructions          A #    2.53  insn per cycle
+         1,132,741      cycles                B
+           571,743      instructions          B #    0.00  insn per cycle
+     4,007,799,935      cycles                C
+     6,793,181,523      instructions          C #    2.56  insn per cycle
+
+       1.001050869 seconds time elapsed
+
+When I run 'perf stat' with single workload, it usually shows IPC around
+1.7.  We can verify it (6,722,650,929.0 / 3,958,116,522 = 1.698) for cgroup A.
+
+But in this case, since cgroups are ignored, cycles are averaged so it
+used the lower value for IPC calculation and resulted in around 2.5.
+
+  avg cycle: (3958116522 + 1132741 + 4007799935) / 3 = 2655683066
+  IPC (A)  :  6722650929 / 2655683066 = 2.531
+  IPC (B)  :      571743 / 2655683066 = 0.0002
+  IPC (C)  :  6793181523 / 2655683066 = 2.557
+
+We can simply compare cgroup pointers in the evsel and it'll be NULL
+when cgroups are not specified.  With this patch, I can see correct
+numbers like below:
+
+  $ perf stat -a -e cycles,instructions --for-each-cgroup A,B,C  sleep 1
+
+  Performance counter stats for 'system wide':
+
+     4,171,051,687      cycles                A
+     7,219,793,922      instructions          A #    1.73  insn per cycle
+         1,051,189      cycles                B
+           583,102      instructions          B #    0.55  insn per cycle
+     4,171,124,710      cycles                C
+     7,192,944,580      instructions          C #    1.72  insn per cycle
+
+       1.007909814 seconds time elapsed
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lore.kernel.org/lkml/20210115071139.257042-2-namhyung@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/stat-shadow.c | 26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/tools/perf/util/stat-shadow.c b/tools/perf/util/stat-shadow.c
+index a1565b6e38f2..12eafd12a693 100644
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@ -8,6 +8,7 @@
+ #include "evlist.h"
+ #include "expr.h"
+ #include "metricgroup.h"
++#include "cgroup.h"
+ #include <linux/zalloc.h>
+ 
+ /*
+@@ -28,6 +29,7 @@ struct saved_value {
+ 	enum stat_type type;
+ 	int ctx;
+ 	int cpu;
++	struct cgroup *cgrp;
+ 	struct runtime_stat *stat;
+ 	struct stats stats;
+ 	u64 metric_total;
+@@ -57,6 +59,9 @@ static int saved_value_cmp(struct rb_node *rb_node, const void *entry)
+ 	if (a->ctx != b->ctx)
+ 		return a->ctx - b->ctx;
+ 
++	if (a->cgrp != b->cgrp)
++		return (char *)a->cgrp < (char *)b->cgrp ? -1 : +1;
++
+ 	if (a->evsel == NULL && b->evsel == NULL) {
+ 		if (a->stat == b->stat)
+ 			return 0;
+@@ -100,7 +105,8 @@ static struct saved_value *saved_value_lookup(struct evsel *evsel,
+ 					      bool create,
+ 					      enum stat_type type,
+ 					      int ctx,
+-					      struct runtime_stat *st)
++					      struct runtime_stat *st,
++					      struct cgroup *cgrp)
+ {
+ 	struct rblist *rblist;
+ 	struct rb_node *nd;
+@@ -110,6 +116,7 @@ static struct saved_value *saved_value_lookup(struct evsel *evsel,
+ 		.type = type,
+ 		.ctx = ctx,
+ 		.stat = st,
++		.cgrp = cgrp,
+ 	};
+ 
+ 	rblist = &st->value_list;
+@@ -197,6 +204,7 @@ void perf_stat__reset_shadow_per_stat(struct runtime_stat *st)
+ 
+ struct runtime_stat_data {
+ 	int ctx;
++	struct cgroup *cgrp;
+ };
+ 
+ static void update_runtime_stat(struct runtime_stat *st,
+@@ -205,7 +213,7 @@ static void update_runtime_stat(struct runtime_stat *st,
+ 				struct runtime_stat_data *rsd)
+ {
+ 	struct saved_value *v = saved_value_lookup(NULL, cpu, true, type,
+-						   rsd->ctx, st);
++						   rsd->ctx, st, rsd->cgrp);
+ 
+ 	if (v)
+ 		update_stats(&v->stats, count);
+@@ -223,6 +231,7 @@ void perf_stat__update_shadow_stats(struct evsel *counter, u64 count,
+ 	struct saved_value *v;
+ 	struct runtime_stat_data rsd = {
+ 		.ctx = evsel_context(counter),
++		.cgrp = counter->cgrp,
+ 	};
+ 
+ 	count *= counter->scale;
+@@ -290,13 +299,14 @@ void perf_stat__update_shadow_stats(struct evsel *counter, u64 count,
+ 		update_runtime_stat(st, STAT_APERF, cpu, count, &rsd);
+ 
+ 	if (counter->collect_stat) {
+-		v = saved_value_lookup(counter, cpu, true, STAT_NONE, 0, st);
++		v = saved_value_lookup(counter, cpu, true, STAT_NONE, 0, st,
++				       rsd.cgrp);
+ 		update_stats(&v->stats, count);
+ 		if (counter->metric_leader)
+ 			v->metric_total += count;
+ 	} else if (counter->metric_leader) {
+ 		v = saved_value_lookup(counter->metric_leader,
+-				       cpu, true, STAT_NONE, 0, st);
++				       cpu, true, STAT_NONE, 0, st, rsd.cgrp);
+ 		v->metric_total += count;
+ 		v->metric_other++;
+ 	}
+@@ -438,7 +448,7 @@ static double runtime_stat_avg(struct runtime_stat *st,
+ {
+ 	struct saved_value *v;
+ 
+-	v = saved_value_lookup(NULL, cpu, false, type, rsd->ctx, st);
++	v = saved_value_lookup(NULL, cpu, false, type, rsd->ctx, st, rsd->cgrp);
+ 	if (!v)
+ 		return 0.0;
+ 
+@@ -451,7 +461,7 @@ static double runtime_stat_n(struct runtime_stat *st,
+ {
+ 	struct saved_value *v;
+ 
+-	v = saved_value_lookup(NULL, cpu, false, type, rsd->ctx, st);
++	v = saved_value_lookup(NULL, cpu, false, type, rsd->ctx, st, rsd->cgrp);
+ 	if (!v)
+ 		return 0.0;
+ 
+@@ -805,7 +815,8 @@ static int prepare_metric(struct evsel **metric_events,
+ 			scale = 1e-9;
+ 		} else {
+ 			v = saved_value_lookup(metric_events[i], cpu, false,
+-					       STAT_NONE, 0, st);
++					       STAT_NONE, 0, st,
++					       metric_events[i]->cgrp);
+ 			if (!v)
+ 				break;
+ 			stats = &v->stats;
+@@ -933,6 +944,7 @@ void perf_stat__print_shadow_stats(struct perf_stat_config *config,
+ 	const char *color = NULL;
+ 	struct runtime_stat_data rsd = {
+ 		.ctx = evsel_context(evsel),
++		.cgrp = evsel->cgrp,
+ 	};
+ 	struct metric_event *me;
+ 	int num = 1;
+-- 
+2.25.1
+

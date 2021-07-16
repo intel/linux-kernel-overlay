@@ -1,4 +1,4 @@
-From 4d811184c2e000b144413509925b1608c57e861d Mon Sep 17 00:00:00 2001
+From 40e8151431caa054e18304f4b4935d5cebaf81ee Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
 Subject: [PATCH 2/9] tcc: this is kernel driver to interface to TCC PTCM
@@ -21,10 +21,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  create mode 100644 drivers/tcc/tcc_buffer.c
 
 diff --git a/drivers/Kconfig b/drivers/Kconfig
-index 47980c6b1945..fc073bccb034 100644
+index dcecc9f6e33f..156372465f34 100644
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -238,4 +238,6 @@ source "drivers/interconnect/Kconfig"
+@@ -235,4 +235,6 @@ source "drivers/interconnect/Kconfig"
  source "drivers/counter/Kconfig"
  
  source "drivers/most/Kconfig"
@@ -32,10 +32,10 @@ index 47980c6b1945..fc073bccb034 100644
 +source "drivers/tcc/Kconfig"
  endmenu
 diff --git a/drivers/Makefile b/drivers/Makefile
-index 5a6d613e868d..35e59104daa9 100644
+index 576228037718..3aa6a22c3a65 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -190,3 +190,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
  obj-$(CONFIG_INTERCONNECT)	+= interconnect/
  obj-$(CONFIG_COUNTER)		+= counter/
  obj-$(CONFIG_MOST)		+= most/
@@ -769,5 +769,5 @@ index 000000000000..4d4e0557dddc
 +
 +MODULE_LICENSE("GPL v2");
 -- 
-2.27.0
+2.25.1
 

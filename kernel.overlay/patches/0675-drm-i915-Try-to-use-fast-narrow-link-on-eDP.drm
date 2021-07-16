@@ -1,0 +1,173 @@
+From 0d65c37b242a786f213a418d6770f46b9ece0340 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 7 Jan 2021 20:20:25 +0200
+Subject: [PATCH 0675/1087] drm/i915: Try to use fast+narrow link on eDP again
+ and fall back to the old max strategy on failure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some new eDP panels don't like to operate at the max parameters, and
+instead we need to go for an optimal confiugration. That unfortunately
+doesn't work with older eDP panels which are generally only guaranteed
+to work at the max parameters.
+
+To solve these two conflicting requirements let's start with the optimal
+setup, and if that fails we start again with the max parameters. The
+downside is probably an extra modeset when we switch strategies but
+I don't see a good way to avoid that.
+
+For a bit of history we first tried to go for the fast+narrow in
+commit 7769db588384 ("drm/i915/dp: optimize eDP 1.4+ link config
+fast and narrow"). but that had to be reverted due to regression
+on older panels in commit f11cb1c19ad0 ("drm/i915/dp: revert back
+to max link rate and lane count on eDP"). So now we try to get
+the best of both worlds by using both strategies.
+
+v2: Deal with output_bpp and uapi vs. hw state split
+    Reword some comments
+v3: Rebase
+
+Cc: Jani Nikula <jani.nikula@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Albert Astals Cid <aacid@kde.org> # v5.0 backport
+Cc: Emanuele Panigati <ilpanich@gmail.com> # v5.0 backport
+Cc: Matteo Iervasi <matteoiervasi@gmail.com> # v5.0 backport
+Cc: Timo Aaltonen <tjaalton@ubuntu.com>
+Cc: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+References: https://bugs.freedesktop.org/show_bug.cgi?id=105267
+References: https://bugs.freedesktop.org/show_bug.cgi?id=109959
+References: https://gitlab.freedesktop.org/drm/intel/issues/272
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210107182026.24848-1-ville.syrjala@linux.intel.com
+---
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_dp.c       | 75 ++++++++++++++++---
+ 2 files changed, 67 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 1067bd073c95..9dfad41eb3dc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1354,6 +1354,7 @@ struct intel_dp {
+ 	bool has_hdmi_sink;
+ 	bool has_audio;
+ 	bool reset_link_params;
++	bool use_max_params;
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	u8 psr_dpcd[EDP_PSR_RECEIVER_CAP_SIZE];
+ 	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 4f190a82d4ad..469e765a1b7b 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -480,6 +480,13 @@ int intel_dp_get_link_train_fallback_values(struct intel_dp *intel_dp,
+ 		return -1;
+ 	}
+ 
++	if (intel_dp_is_edp(intel_dp) && !intel_dp->use_max_params) {
++		drm_dbg_kms(&i915->drm,
++			    "Retrying Link training for eDP with max parameters\n");
++		intel_dp->use_max_params = true;
++		return 0;
++	}
++
+ 	index = intel_dp_rate_index(intel_dp->common_rates,
+ 				    intel_dp->num_common_rates,
+ 				    link_rate);
+@@ -2286,6 +2293,44 @@ intel_dp_compute_link_config_wide(struct intel_dp *intel_dp,
+ 	return -EINVAL;
+ }
+ 
++/* Optimize link config in order: max bpp, min lanes, min clock */
++static int
++intel_dp_compute_link_config_fast(struct intel_dp *intel_dp,
++				  struct intel_crtc_state *pipe_config,
++				  const struct link_config_limits *limits)
++{
++	const struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
++	int bpp, clock, lane_count;
++	int mode_rate, link_clock, link_avail;
++
++	for (bpp = limits->max_bpp; bpp >= limits->min_bpp; bpp -= 2 * 3) {
++		int output_bpp = intel_dp_output_bpp(pipe_config->output_format, bpp);
++
++		mode_rate = intel_dp_link_required(adjusted_mode->crtc_clock,
++						   output_bpp);
++
++		for (lane_count = limits->min_lane_count;
++		     lane_count <= limits->max_lane_count;
++		     lane_count <<= 1) {
++			for (clock = limits->min_clock; clock <= limits->max_clock; clock++) {
++				link_clock = intel_dp->common_rates[clock];
++				link_avail = intel_dp_max_data_rate(link_clock,
++								    lane_count);
++
++				if (mode_rate <= link_avail) {
++					pipe_config->lane_count = lane_count;
++					pipe_config->pipe_bpp = bpp;
++					pipe_config->port_clock = link_clock;
++
++					return 0;
++				}
++			}
++		}
++	}
++
++	return -EINVAL;
++}
++
+ static int intel_dp_dsc_compute_bpp(struct intel_dp *intel_dp, u8 dsc_max_bpc)
+ {
+ 	int i, num_bpc;
+@@ -2509,13 +2554,14 @@ intel_dp_compute_link_config(struct intel_encoder *encoder,
+ 	limits.min_bpp = intel_dp_min_bpp(pipe_config->output_format);
+ 	limits.max_bpp = intel_dp_max_bpp(intel_dp, pipe_config);
+ 
+-	if (intel_dp_is_edp(intel_dp)) {
++	if (intel_dp->use_max_params) {
+ 		/*
+ 		 * Use the maximum clock and number of lanes the eDP panel
+-		 * advertizes being capable of. The panels are generally
++		 * advertizes being capable of in case the initial fast
++		 * optimal params failed us. The panels are generally
+ 		 * designed to support only a single clock and lane
+-		 * configuration, and typically these values correspond to the
+-		 * native resolution of the panel.
++		 * configuration, and typically on older panels these
++		 * values correspond to the native resolution of the panel.
+ 		 */
+ 		limits.min_lane_count = limits.max_lane_count;
+ 		limits.min_clock = limits.max_clock;
+@@ -2534,11 +2580,22 @@ intel_dp_compute_link_config(struct intel_encoder *encoder,
+ 	    intel_dp_can_bigjoiner(intel_dp))
+ 		pipe_config->bigjoiner = true;
+ 
+-	/*
+-	 * Optimize for slow and wide. This is the place to add alternative
+-	 * optimization policy.
+-	 */
+-	ret = intel_dp_compute_link_config_wide(intel_dp, pipe_config, &limits);
++	if (intel_dp_is_edp(intel_dp))
++		/*
++		 * Optimize for fast and narrow. eDP 1.3 section 3.3 and eDP 1.4
++		 * section A.1: "It is recommended that the minimum number of
++		 * lanes be used, using the minimum link rate allowed for that
++		 * lane configuration."
++		 *
++		 * Note that we fall back to the max clock and lane count for eDP
++		 * panels that fail with the fast optimal settings (see
++		 * intel_dp->use_max_params), in which case the fast vs. wide
++		 * choice doesn't matter.
++		 */
++		ret = intel_dp_compute_link_config_fast(intel_dp, pipe_config, &limits);
++	else
++		/* Optimize for slow and wide. */
++		ret = intel_dp_compute_link_config_wide(intel_dp, pipe_config, &limits);
+ 
+ 	/* enable compression if the mode doesn't fit available BW */
+ 	drm_dbg_kms(&i915->drm, "Force DSC en = %d\n", intel_dp->force_dsc_en);
+-- 
+2.17.1
+

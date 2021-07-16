@@ -1,0 +1,195 @@
+From 7e5d69f8a7530dfb85686e0a3b7efa6f6fc6d591 Mon Sep 17 00:00:00 2001
+From: Kuogee Hsieh <khsieh@codeaurora.org>
+Date: Fri, 5 Feb 2021 12:44:38 -0800
+Subject: [PATCH 039/105] drm/msm/dp: reset dp controller only at boot up and
+ pm_resume
+
+DP_SW_RESET is the global SW reset that is used to initialize DP
+controller. If DP_SW_RESET executed during connection setup,
+two HPD related side effects may occurred,
+1) pending HPD interrupts cleared unexpected
+2) re start debounce logic which trigger another interrupt
+This patch only issue DP_SW_RESET at boot up and pm_resume.
+This patch also reinit video_comp before configure dp controller
+to avoid missing VIDEO_READY interrupt.
+
+Fixes: 9fc418430c65 ("drm/msm/dp: unplug interrupt missed after irq_hpd handler")
+Signed-off-by: Kuogee Hsieh <khsieh@codeaurora.org>
+Reviewed-by: Stephen Boyd <swboyd@chromium.org>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 22 +++++++++-------------
+ drivers/gpu/drm/msm/dp/dp_ctrl.h    |  2 +-
+ drivers/gpu/drm/msm/dp/dp_display.c | 14 +++++++-------
+ 3 files changed, 17 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 44ce763b7eae..d8f90c2c597a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1296,8 +1296,6 @@ static int dp_ctrl_setup_main_link(struct dp_ctrl_private *ctrl,
+ 	 * transitioned to PUSH_IDLE. In order to start transmitting
+ 	 * a link training pattern, we have to first do soft reset.
+ 	 */
+-	if (*training_step == DP_TRAINING_1)
+-		dp_catalog_ctrl_reset(ctrl->catalog);
+ 
+ 	ret = dp_ctrl_link_train(ctrl, cr, training_step);
+ 
+@@ -1366,7 +1364,7 @@ static int dp_ctrl_enable_stream_clocks(struct dp_ctrl_private *ctrl)
+ 	return ret;
+ }
+ 
+-int dp_ctrl_host_init(struct dp_ctrl *dp_ctrl, bool flip)
++int dp_ctrl_host_init(struct dp_ctrl *dp_ctrl, bool flip, bool reset)
+ {
+ 	struct dp_ctrl_private *ctrl;
+ 	struct dp_io *dp_io;
+@@ -1383,6 +1381,9 @@ int dp_ctrl_host_init(struct dp_ctrl *dp_ctrl, bool flip)
+ 
+ 	ctrl->dp_ctrl.orientation = flip;
+ 
++	if (reset)
++		dp_catalog_ctrl_reset(ctrl->catalog);
++
+ 	dp_catalog_ctrl_phy_reset(ctrl->catalog);
+ 	phy_init(phy);
+ 	dp_catalog_ctrl_enable_irq(ctrl->catalog, true);
+@@ -1490,18 +1491,14 @@ static int dp_ctrl_deinitialize_mainlink(struct dp_ctrl_private *ctrl)
+ 	return 0;
+ }
+ 
+-static void dp_ctrl_link_idle_reset(struct dp_ctrl_private *ctrl)
+-{
+-	dp_ctrl_push_idle(&ctrl->dp_ctrl);
+-	dp_catalog_ctrl_reset(ctrl->catalog);
+-}
+-
+ static int dp_ctrl_link_maintenance(struct dp_ctrl_private *ctrl)
+ {
+ 	int ret = 0;
+ 	struct dp_cr_status cr;
+ 	int training_step = DP_TRAINING_NONE;
+ 
++	dp_ctrl_push_idle(&ctrl->dp_ctrl);
++
+ 	ctrl->dp_ctrl.pixel_rate = ctrl->panel->dp_mode.drm_mode.clock;
+ 
+ 	ret = dp_ctrl_setup_main_link(ctrl, &cr, &training_step);
+@@ -1628,7 +1625,6 @@ void dp_ctrl_handle_sink_request(struct dp_ctrl *dp_ctrl)
+ 
+ 	if (sink_request & DP_TEST_LINK_TRAINING) {
+ 		dp_link_send_test_response(ctrl->link);
+-		dp_ctrl_link_idle_reset(ctrl);
+ 		if (dp_ctrl_link_maintenance(ctrl)) {
+ 			DRM_ERROR("LM failed: TEST_LINK_TRAINING\n");
+ 			return;
+@@ -1682,7 +1678,7 @@ int dp_ctrl_on_link(struct dp_ctrl *dp_ctrl)
+ 			break;
+ 		}
+ 
+-		training_step = DP_TRAINING_1;
++		training_step = DP_TRAINING_NONE;
+ 		rc = dp_ctrl_setup_main_link(ctrl, &cr, &training_step);
+ 		if (rc == 0) {
+ 			/* training completed successfully */
+@@ -1790,14 +1786,14 @@ int dp_ctrl_on_stream(struct dp_ctrl *dp_ctrl)
+ 	 * Set up transfer unit values and set controller state to send
+ 	 * video.
+ 	 */
++	reinit_completion(&ctrl->video_comp);
++
+ 	dp_ctrl_configure_source_params(ctrl);
+ 
+ 	dp_catalog_ctrl_config_msa(ctrl->catalog,
+ 		ctrl->link->link_params.rate,
+ 		ctrl->dp_ctrl.pixel_rate, dp_ctrl_use_fixed_nvid(ctrl));
+ 
+-	reinit_completion(&ctrl->video_comp);
+-
+ 	dp_ctrl_setup_tr_unit(ctrl);
+ 
+ 	dp_catalog_ctrl_state_ctrl(ctrl->catalog, DP_STATE_CTRL_SEND_VIDEO);
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.h b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+index f60ba93c8678..a836bd358447 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+@@ -19,7 +19,7 @@ struct dp_ctrl {
+ 	u32 pixel_rate;
+ };
+ 
+-int dp_ctrl_host_init(struct dp_ctrl *dp_ctrl, bool flip);
++int dp_ctrl_host_init(struct dp_ctrl *dp_ctrl, bool flip, bool reset);
+ void dp_ctrl_host_deinit(struct dp_ctrl *dp_ctrl);
+ int dp_ctrl_on_link(struct dp_ctrl *dp_ctrl);
+ int dp_ctrl_on_stream(struct dp_ctrl *dp_ctrl);
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index d9216f80cdad..5a39da6e1eaf 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -350,7 +350,7 @@ static int dp_display_process_hpd_high(struct dp_display_private *dp)
+ 	return rc;
+ }
+ 
+-static void dp_display_host_init(struct dp_display_private *dp)
++static void dp_display_host_init(struct dp_display_private *dp, int reset)
+ {
+ 	bool flip = false;
+ 
+@@ -365,7 +365,7 @@ static void dp_display_host_init(struct dp_display_private *dp)
+ 	dp_display_set_encoder_mode(dp);
+ 
+ 	dp_power_init(dp->power, flip);
+-	dp_ctrl_host_init(dp->ctrl, flip);
++	dp_ctrl_host_init(dp->ctrl, flip, reset);
+ 	dp_aux_init(dp->aux);
+ 	dp->core_initialized = true;
+ }
+@@ -403,7 +403,7 @@ static int dp_display_usbpd_configure_cb(struct device *dev)
+ 		goto end;
+ 	}
+ 
+-	dp_display_host_init(dp);
++	dp_display_host_init(dp, false);
+ 
+ 	/*
+ 	 * set sink to normal operation mode -- D0
+@@ -700,7 +700,7 @@ static int dp_irq_hpd_handle(struct dp_display_private *dp, u32 data)
+ 		return 0;
+ 	}
+ 
+-	if (state == ST_CONNECT_PENDING) {
++	if (state == ST_CONNECT_PENDING || state == ST_DISCONNECT_PENDING) {
+ 		/* wait until ST_CONNECTED */
+ 		dp_add_event(dp, EV_IRQ_HPD_INT, 0, 1); /* delay = 1 */
+ 		mutex_unlock(&dp->event_mutex);
+@@ -1012,7 +1012,7 @@ int dp_display_get_test_bpp(struct msm_dp *dp)
+ static void dp_display_config_hpd(struct dp_display_private *dp)
+ {
+ 
+-	dp_display_host_init(dp);
++	dp_display_host_init(dp, true);
+ 	dp_catalog_ctrl_hpd_config(dp->catalog);
+ 
+ 	/* Enable interrupt first time
+@@ -1266,7 +1266,7 @@ static int dp_pm_resume(struct device *dev)
+ 	dp->hpd_state = ST_DISCONNECTED;
+ 
+ 	/* turn on dp ctrl/phy */
+-	dp_display_host_init(dp);
++	dp_display_host_init(dp, true);
+ 
+ 	dp_catalog_ctrl_hpd_config(dp->catalog);
+ 
+@@ -1449,7 +1449,7 @@ int msm_dp_display_enable(struct msm_dp *dp, struct drm_encoder *encoder)
+ 	state =  dp_display->hpd_state;
+ 
+ 	if (state == ST_DISPLAY_OFF)
+-		dp_display_host_init(dp_display);
++		dp_display_host_init(dp_display, true);
+ 
+ 	dp_display_enable(dp_display, 0);
+ 
+-- 
+2.25.1
+

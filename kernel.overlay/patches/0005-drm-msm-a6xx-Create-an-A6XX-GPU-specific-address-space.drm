@@ -1,0 +1,164 @@
+From 3150d0d8a2429f2969eeaa126fa0f96941c9d344 Mon Sep 17 00:00:00 2001
+From: Sai Prakash Ranjan <saiprakash.ranjan@codeaurora.org>
+Date: Mon, 11 Jan 2021 17:34:09 +0530
+Subject: [PATCH 005/105] drm/msm/a6xx: Create an A6XX GPU specific address
+ space
+
+A6XX GPUs have support for last level cache(LLC) also known
+as system cache and need to set the bus attributes to
+use it. Currently we use a generic adreno iommu address space
+implementation which are also used by older GPU generations
+which do not have LLC and might introduce issues accidentally
+and is not clean in a way that anymore additions of GPUs
+supporting LLC would have to be guarded under ifdefs. So keep
+the generic code separate and make the address space creation
+A6XX specific. We also have a helper to set the llc attributes
+so that if the newer GPU generations do support them, we can
+use it instead of open coding domain attribute setting for each
+GPU.
+
+Signed-off-by: Sai Prakash Ranjan <saiprakash.ranjan@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c   | 46 ++++++++++++++++++++++++-
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c | 23 +++++--------
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h |  7 ++--
+ 3 files changed, 55 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 3a64b4557478..0a51cad42642 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1244,6 +1244,50 @@ static unsigned long a6xx_gpu_busy(struct msm_gpu *gpu)
+ 	return (unsigned long)busy_time;
+ }
+ 
++static struct msm_gem_address_space *
++a6xx_create_address_space(struct msm_gpu *gpu, struct platform_device *pdev)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct iommu_domain *iommu;
++	struct msm_mmu *mmu;
++	struct msm_gem_address_space *aspace;
++	u64 start, size;
++
++	iommu = iommu_domain_alloc(&platform_bus_type);
++	if (!iommu)
++		return NULL;
++
++	/*
++	 * This allows GPU to set the bus attributes required to use system
++	 * cache on behalf of the iommu page table walker.
++	 */
++	if (!IS_ERR_OR_NULL(a6xx_gpu->htw_llc_slice))
++		adreno_set_llc_attributes(iommu);
++
++	mmu = msm_iommu_new(&pdev->dev, iommu);
++	if (IS_ERR(mmu)) {
++		iommu_domain_free(iommu);
++		return ERR_CAST(mmu);
++	}
++
++	/*
++	 * Use the aperture start or SZ_16M, whichever is greater. This will
++	 * ensure that we align with the allocated pagetable range while still
++	 * allowing room in the lower 32 bits for GMEM and whatnot
++	 */
++	start = max_t(u64, SZ_16M, iommu->geometry.aperture_start);
++	size = iommu->geometry.aperture_end - start + 1;
++
++	aspace = msm_gem_address_space_create(mmu, "gpu",
++		start & GENMASK_ULL(48, 0), size);
++
++	if (IS_ERR(aspace) && !IS_ERR(mmu))
++		mmu->funcs->destroy(mmu);
++
++	return aspace;
++}
++
+ static struct msm_gem_address_space *
+ a6xx_create_private_address_space(struct msm_gpu *gpu)
+ {
+@@ -1362,7 +1406,7 @@ static const struct adreno_gpu_funcs funcs = {
+ 		.gpu_state_get = a6xx_gpu_state_get,
+ 		.gpu_state_put = a6xx_gpu_state_put,
+ #endif
+-		.create_address_space = adreno_iommu_create_address_space,
++		.create_address_space = a6xx_create_address_space,
+ 		.create_private_address_space = a6xx_create_private_address_space,
+ 		.get_rptr = a6xx_get_rptr,
+ 	},
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.c b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+index b35914de1b27..0f184c3dd9d9 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -186,11 +186,18 @@ int adreno_zap_shader_load(struct msm_gpu *gpu, u32 pasid)
+ 	return zap_shader_load_mdt(gpu, adreno_gpu->info->zapfw, pasid);
+ }
+ 
++void adreno_set_llc_attributes(struct iommu_domain *iommu)
++{
++	struct io_pgtable_domain_attr pgtbl_cfg;
++
++	pgtbl_cfg.quirks = IO_PGTABLE_QUIRK_ARM_OUTER_WBWA;
++	iommu_domain_set_attr(iommu, DOMAIN_ATTR_IO_PGTABLE_CFG, &pgtbl_cfg);
++}
++
+ struct msm_gem_address_space *
+ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 		struct platform_device *pdev)
+ {
+-	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct iommu_domain *iommu;
+ 	struct msm_mmu *mmu;
+ 	struct msm_gem_address_space *aspace;
+@@ -200,20 +207,6 @@ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 	if (!iommu)
+ 		return NULL;
+ 
+-	if (adreno_is_a6xx(adreno_gpu)) {
+-		struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+-		struct io_pgtable_domain_attr pgtbl_cfg;
+-
+-		/*
+-		 * This allows GPU to set the bus attributes required to use system
+-		 * cache on behalf of the iommu page table walker.
+-		 */
+-		if (!IS_ERR_OR_NULL(a6xx_gpu->htw_llc_slice)) {
+-			pgtbl_cfg.quirks = IO_PGTABLE_QUIRK_ARM_OUTER_WBWA;
+-			iommu_domain_set_attr(iommu, DOMAIN_ATTR_IO_PGTABLE_CFG, &pgtbl_cfg);
+-		}
+-	}
+-
+ 	mmu = msm_iommu_new(&pdev->dev, iommu);
+ 	if (IS_ERR(mmu)) {
+ 		iommu_domain_free(iommu);
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index b3d9a333591b..2a3d049b46b5 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -212,11 +212,6 @@ static inline int adreno_is_a540(struct adreno_gpu *gpu)
+ 	return gpu->revn == 540;
+ }
+ 
+-static inline bool adreno_is_a6xx(struct adreno_gpu *gpu)
+-{
+-	return ((gpu->revn < 700 && gpu->revn > 599));
+-}
+-
+ static inline int adreno_is_a618(struct adreno_gpu *gpu)
+ {
+        return gpu->revn == 618;
+@@ -278,6 +273,8 @@ struct msm_gem_address_space *
+ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 		struct platform_device *pdev);
+ 
++void adreno_set_llc_attributes(struct iommu_domain *iommu);
++
+ /*
+  * For a5xx and a6xx targets load the zap shader that is used to pull the GPU
+  * out of secure mode
+-- 
+2.25.1
+

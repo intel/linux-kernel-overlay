@@ -1,0 +1,247 @@
+From 82184af2c42b35db863a09034589cf8ac9a7f8d6 Mon Sep 17 00:00:00 2001
+From: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Date: Tue, 15 Sep 2020 12:33:43 -0400
+Subject: [PATCH 0702/1714] drm/amd/display: Decouple amdgpu_dm_trace from
+ service
+
+Our DC currently uses some of the tracepoint function inside a DC
+header, which means that many other files implicitly include part of the
+trace function. This situation limits how we can expand this feature for
+other parts of the driver by generating multiple compilation errors when
+we try to reuse some of the existing structures. This commit decouples
+part of the amdgpu_dm_trace from DC core to simplify the trace
+enlargement in future changes.
+
+Signed-off-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 39 +++++++++++++++++
+ .../display/amdgpu_dm/amdgpu_dm_services.c    | 17 +++++---
+ .../amd/display/amdgpu_dm/amdgpu_dm_trace.h   |  2 +-
+ drivers/gpu/drm/amd/display/dc/dc_helper.c    | 26 ------------
+ drivers/gpu/drm/amd/display/dc/dm_services.h  | 42 +++++--------------
+ 5 files changed, 61 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8f9bec9d37df..acd78a63fcac 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -34,6 +34,7 @@
+ #include "dc/inc/hw/dmcu.h"
+ #include "dc/inc/hw/abm.h"
+ #include "dc/dc_dmub_srv.h"
++#include "amdgpu_dm_trace.h"
+ 
+ #include "vid.h"
+ #include "amdgpu.h"
+@@ -9240,3 +9241,41 @@ void amdgpu_dm_trigger_timing_sync(struct drm_device *dev)
+ 	}
+ 	mutex_unlock(&adev->dm.dc_lock);
+ }
++
++void dm_write_reg_func(const struct dc_context *ctx, uint32_t address,
++		       uint32_t value, const char *func_name)
++{
++#ifdef DM_CHECK_ADDR_0
++	if (address == 0) {
++		DC_ERR("invalid register write. address = 0");
++		return;
++	}
++#endif
++	cgs_write_register(ctx->cgs_device, address, value);
++	trace_amdgpu_dc_wreg(&ctx->perf_trace->write_count, address, value);
++}
++
++uint32_t dm_read_reg_func(const struct dc_context *ctx, uint32_t address,
++			  const char *func_name)
++{
++	uint32_t value;
++#ifdef DM_CHECK_ADDR_0
++	if (address == 0) {
++		DC_ERR("invalid register read; address = 0\n");
++		return 0;
++	}
++#endif
++
++	if (ctx->dmub_srv &&
++	    ctx->dmub_srv->reg_helper_offload.gather_in_progress &&
++	    !ctx->dmub_srv->reg_helper_offload.should_burst_write) {
++		ASSERT(false);
++		return 0;
++	}
++
++	value = cgs_read_register(ctx->cgs_device, address);
++
++	trace_amdgpu_dc_rreg(&ctx->perf_trace->read_count, address, value);
++
++	return value;
++}
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
+index 51f57420fadd..d9e33c6bccd9 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c
+@@ -33,18 +33,23 @@
+ #include "amdgpu_dm.h"
+ #include "amdgpu_dm_irq.h"
+ #include "amdgpu_pm.h"
++#include "amdgpu_dm_trace.h"
+ 
+-
+-
+-unsigned long long dm_get_elapse_time_in_ns(struct dc_context *ctx,
+-		unsigned long long current_time_stamp,
+-		unsigned long long last_time_stamp)
++	unsigned long long
++	dm_get_elapse_time_in_ns(struct dc_context *ctx,
++				 unsigned long long current_time_stamp,
++				 unsigned long long last_time_stamp)
+ {
+ 	return current_time_stamp - last_time_stamp;
+ }
+ 
+-void dm_perf_trace_timestamp(const char *func_name, unsigned int line)
++void dm_perf_trace_timestamp(const char *func_name, unsigned int line, struct dc_context *ctx)
+ {
++	trace_amdgpu_dc_performance(ctx->perf_trace->read_count,
++				    ctx->perf_trace->write_count,
++				    &ctx->perf_trace->last_entry_read,
++				    &ctx->perf_trace->last_entry_write,
++				    func_name, line);
+ }
+ 
+ /**** power component interfaces ****/
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_trace.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_trace.h
+index d898981684d5..1151e03365a3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_trace.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_trace.h
+@@ -26,7 +26,7 @@
+ #undef TRACE_SYSTEM
+ #define TRACE_SYSTEM amdgpu_dm
+ 
+-#if !defined(_AMDGPU_DM_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#if !defined(_AMDGPU_DM_TRACE_H_) || defined(TRACE_HEADER_MULTI_READ)
+ #define _AMDGPU_DM_TRACE_H_
+ 
+ #include <linux/tracepoint.h>
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_helper.c b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+index 85a0170be544..57edb25fc381 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_helper.c
+@@ -296,32 +296,6 @@ uint32_t generic_reg_set_ex(const struct dc_context *ctx,
+ 	return reg_val;
+ }
+ 
+-uint32_t dm_read_reg_func(
+-	const struct dc_context *ctx,
+-	uint32_t address,
+-	const char *func_name)
+-{
+-	uint32_t value;
+-#ifdef DM_CHECK_ADDR_0
+-	if (address == 0) {
+-		DC_ERR("invalid register read; address = 0\n");
+-		return 0;
+-	}
+-#endif
+-
+-	if (ctx->dmub_srv &&
+-	    ctx->dmub_srv->reg_helper_offload.gather_in_progress &&
+-	    !ctx->dmub_srv->reg_helper_offload.should_burst_write) {
+-		ASSERT(false);
+-		return 0;
+-	}
+-
+-	value = cgs_read_register(ctx->cgs_device, address);
+-	trace_amdgpu_dc_rreg(&ctx->perf_trace->read_count, address, value);
+-
+-	return value;
+-}
+-
+ uint32_t generic_reg_get(const struct dc_context *ctx, uint32_t addr,
+ 		uint8_t shift, uint32_t mask, uint32_t *field_value)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dm_services.h b/drivers/gpu/drm/amd/display/dc/dm_services.h
+index fdd1943c828d..9a3f2a44f882 100644
+--- a/drivers/gpu/drm/amd/display/dc/dm_services.h
++++ b/drivers/gpu/drm/amd/display/dc/dm_services.h
+@@ -31,8 +31,6 @@
+ 
+ #define __DM_SERVICES_H__
+ 
+-#include "amdgpu_dm_trace.h"
+-
+ /* TODO: remove when DC is complete. */
+ #include "dm_services_types.h"
+ #include "logger_interface.h"
+@@ -49,43 +47,26 @@ irq_handler_idx dm_register_interrupt(
+ 	interrupt_handler ih,
+ 	void *handler_args);
+ 
+-
+ /*
+  *
+  * GPU registers access
+  *
+  */
+-uint32_t dm_read_reg_func(
+-	const struct dc_context *ctx,
+-	uint32_t address,
+-	const char *func_name);
++uint32_t dm_read_reg_func(const struct dc_context *ctx, uint32_t address,
++			  const char *func_name);
++
+ /* enable for debugging new code, this adds 50k to the driver size. */
+ /* #define DM_CHECK_ADDR_0 */
+ 
+-#define dm_read_reg(ctx, address)	\
+-		dm_read_reg_func(ctx, address, __func__)
+-
++void dm_write_reg_func(const struct dc_context *ctx, uint32_t address,
++		       uint32_t value, const char *func_name);
+ 
++#define dm_read_reg(ctx, address)	\
++	dm_read_reg_func(ctx, address, __func__)
+ 
+ #define dm_write_reg(ctx, address, value)	\
+ 	dm_write_reg_func(ctx, address, value, __func__)
+ 
+-static inline void dm_write_reg_func(
+-	const struct dc_context *ctx,
+-	uint32_t address,
+-	uint32_t value,
+-	const char *func_name)
+-{
+-#ifdef DM_CHECK_ADDR_0
+-	if (address == 0) {
+-		DC_ERR("invalid register write. address = 0");
+-		return;
+-	}
+-#endif
+-	cgs_write_register(ctx->cgs_device, address, value);
+-	trace_amdgpu_dc_wreg(&ctx->perf_trace->write_count, address, value);
+-}
+-
+ static inline uint32_t dm_read_index_reg(
+ 	const struct dc_context *ctx,
+ 	enum cgs_ind_reg addr_space,
+@@ -287,13 +268,10 @@ unsigned long long dm_get_elapse_time_in_ns(struct dc_context *ctx,
+ /*
+  * performance tracing
+  */
+-#define PERF_TRACE()	trace_amdgpu_dc_performance(CTX->perf_trace->read_count,\
+-		CTX->perf_trace->write_count, &CTX->perf_trace->last_entry_read,\
+-		&CTX->perf_trace->last_entry_write, __func__, __LINE__)
+-#define PERF_TRACE_CTX(__CTX)	trace_amdgpu_dc_performance(__CTX->perf_trace->read_count,\
+-		__CTX->perf_trace->write_count, &__CTX->perf_trace->last_entry_read,\
+-		&__CTX->perf_trace->last_entry_write, __func__, __LINE__)
++void dm_perf_trace_timestamp(const char *func_name, unsigned int line, struct dc_context *ctx);
+ 
++#define PERF_TRACE()	dm_perf_trace_timestamp(__func__, __LINE__, CTX)
++#define PERF_TRACE_CTX(__CTX)	dm_perf_trace_timestamp(__func__, __LINE__, __CTX)
+ 
+ /*
+  * Debug and verification hooks
+-- 
+2.25.1
+

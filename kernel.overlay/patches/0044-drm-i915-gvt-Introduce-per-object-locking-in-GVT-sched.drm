@@ -1,0 +1,142 @@
+From 7bcae8ec7f5d03d66dfefaf354560eb2b8c053cd Mon Sep 17 00:00:00 2001
+From: Zhi Wang <zhi.wang.linux@gmail.com>
+Date: Sun, 10 Jan 2021 23:43:05 +0200
+Subject: [PATCH 044/105] drm/i915/gvt: Introduce per object locking in GVT
+ scheduler.
+
+To support ww locking and per-object implemented in i915, GVT scheduler needs
+to be refined. Most of the changes are located in shadow batch buffer, shadow
+wa context in GVT-g, where use quite a lot of i915 gem object APIs.
+
+v2:
+
+- Adjust the usage of ww lock on context pin/unpin. (maarten)
+- Rebase the patch on the newest staging branch.
+
+Fixes: 6b05030496f7 ("drm/i915: Convert i915_gem_object/client_blt.c to use ww locking as well, v2.")
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1610314985-26065-1-git-send-email-zhi.wang.linux@gmail.com
+Reviewed-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gvt/scheduler.c | 49 +++++++++++++++++++++++-----
+ 1 file changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/scheduler.c b/drivers/gpu/drm/i915/gvt/scheduler.c
+index a55ae50dbbe1..fc735692f21f 100644
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -412,7 +412,9 @@ static void release_shadow_wa_ctx(struct intel_shadow_wa_ctx *wa_ctx)
+ 	if (!wa_ctx->indirect_ctx.obj)
+ 		return;
+ 
++	i915_gem_object_lock(wa_ctx->indirect_ctx.obj, NULL);
+ 	i915_gem_object_unpin_map(wa_ctx->indirect_ctx.obj);
++	i915_gem_object_unlock(wa_ctx->indirect_ctx.obj);
+ 	i915_gem_object_put(wa_ctx->indirect_ctx.obj);
+ 
+ 	wa_ctx->indirect_ctx.obj = NULL;
+@@ -520,6 +522,7 @@ static int prepare_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ 	struct intel_gvt *gvt = workload->vgpu->gvt;
+ 	const int gmadr_bytes = gvt->device_info.gmadr_bytes_in_cmd;
+ 	struct intel_vgpu_shadow_bb *bb;
++	struct i915_gem_ww_ctx ww;
+ 	int ret;
+ 
+ 	list_for_each_entry(bb, &workload->shadow_bb, list) {
+@@ -544,10 +547,19 @@ static int prepare_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ 		 * directly
+ 		 */
+ 		if (!bb->ppgtt) {
+-			bb->vma = i915_gem_object_ggtt_pin(bb->obj,
+-							   NULL, 0, 0, 0);
++			i915_gem_ww_ctx_init(&ww, false);
++retry:
++			i915_gem_object_lock(bb->obj, &ww);
++
++			bb->vma = i915_gem_object_ggtt_pin_ww(bb->obj, &ww,
++							      NULL, 0, 0, 0);
+ 			if (IS_ERR(bb->vma)) {
+ 				ret = PTR_ERR(bb->vma);
++				if (ret == -EDEADLK) {
++					ret = i915_gem_ww_ctx_backoff(&ww);
++					if (!ret)
++						goto retry;
++				}
+ 				goto err;
+ 			}
+ 
+@@ -561,13 +573,15 @@ static int prepare_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ 						      0);
+ 			if (ret)
+ 				goto err;
+-		}
+ 
+-		/* No one is going to touch shadow bb from now on. */
+-		i915_gem_object_flush_map(bb->obj);
++			/* No one is going to touch shadow bb from now on. */
++			i915_gem_object_flush_map(bb->obj);
++			i915_gem_object_unlock(bb->obj);
++		}
+ 	}
+ 	return 0;
+ err:
++	i915_gem_ww_ctx_fini(&ww);
+ 	release_shadow_batch_buffer(workload);
+ 	return ret;
+ }
+@@ -594,14 +608,29 @@ static int prepare_shadow_wa_ctx(struct intel_shadow_wa_ctx *wa_ctx)
+ 	unsigned char *per_ctx_va =
+ 		(unsigned char *)wa_ctx->indirect_ctx.shadow_va +
+ 		wa_ctx->indirect_ctx.size;
++	struct i915_gem_ww_ctx ww;
++	int ret;
+ 
+ 	if (wa_ctx->indirect_ctx.size == 0)
+ 		return 0;
+ 
+-	vma = i915_gem_object_ggtt_pin(wa_ctx->indirect_ctx.obj, NULL,
+-				       0, CACHELINE_BYTES, 0);
+-	if (IS_ERR(vma))
+-		return PTR_ERR(vma);
++	i915_gem_ww_ctx_init(&ww, false);
++retry:
++	i915_gem_object_lock(wa_ctx->indirect_ctx.obj, &ww);
++
++	vma = i915_gem_object_ggtt_pin_ww(wa_ctx->indirect_ctx.obj, &ww, NULL,
++					  0, CACHELINE_BYTES, 0);
++	if (IS_ERR(vma)) {
++		ret = PTR_ERR(vma);
++		if (ret == -EDEADLK) {
++			ret = i915_gem_ww_ctx_backoff(&ww);
++			if (!ret)
++				goto retry;
++		}
++		return ret;
++	}
++
++	i915_gem_object_unlock(wa_ctx->indirect_ctx.obj);
+ 
+ 	/* FIXME: we are not tracking our pinned VMA leaving it
+ 	 * up to the core to fix up the stray pin_count upon
+@@ -635,12 +664,14 @@ static void release_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ 
+ 	list_for_each_entry_safe(bb, pos, &workload->shadow_bb, list) {
+ 		if (bb->obj) {
++			i915_gem_object_lock(bb->obj, NULL);
+ 			if (bb->va && !IS_ERR(bb->va))
+ 				i915_gem_object_unpin_map(bb->obj);
+ 
+ 			if (bb->vma && !IS_ERR(bb->vma))
+ 				i915_vma_unpin(bb->vma);
+ 
++			i915_gem_object_unlock(bb->obj);
+ 			i915_gem_object_put(bb->obj);
+ 		}
+ 		list_del(&bb->list);
+-- 
+2.25.1
+

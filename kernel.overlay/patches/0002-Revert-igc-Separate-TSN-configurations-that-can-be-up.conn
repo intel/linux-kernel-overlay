@@ -1,0 +1,294 @@
+From 4f1bb4255e709ecce334a62a207ed5de880836b4 Mon Sep 17 00:00:00 2001
+From: Muhammad Husaini Zulkifli <muhammad.husaini.zulkifli@intel.com>
+Date: Fri, 9 Apr 2021 08:59:56 +0800
+Subject: [PATCH 02/27] Revert "igc: Separate TSN configurations that can be
+ updated"
+
+This reverts commit cecabe05c104509675a8ae29ef33b9f8f92c9c4e.
+---
+ drivers/net/ethernet/intel/igc/igc_main.c |  21 ++--
+ drivers/net/ethernet/intel/igc/igc_tsn.c  | 139 +++++++---------------
+ drivers/net/ethernet/intel/igc/igc_tsn.h  |   1 -
+ 3 files changed, 59 insertions(+), 102 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index bba271394c3a..eaaa5137b5ea 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -118,7 +118,7 @@ void igc_reset(struct igc_adapter *adapter)
+ 	igc_ptp_reset(adapter);
+ 
+ 	/* Re-enable TSN offloading, where applicable. */
+-	igc_tsn_reset(adapter);
++	igc_tsn_offload_apply(adapter);
+ 
+ 	igc_get_phy_info(hw);
+ }
+@@ -5580,11 +5580,6 @@ static int igc_save_frame_preemption(struct igc_adapter *adapter,
+ 	u32 preempt;
+ 	int i;
+ 
+-	/* What we want here is just to save the configuration, so
+-	 * when frame preemption is enabled via ethtool, which queues
+-	 * are marked as preemptible is saved.
+-	 */
+-
+ 	preempt = qopt->preemptible_queues;
+ 
+ 	for (i = 0; i < adapter->num_tx_queues; i++) {
+@@ -5612,6 +5607,18 @@ static int igc_tsn_enable_qbv_scheduling(struct igc_adapter *adapter,
+ 	return igc_tsn_offload_apply(adapter);
+ }
+ 
++static int igc_tsn_enable_frame_preemption(struct igc_adapter *adapter,
++					   struct tc_preempt_qopt_offload *qopt)
++{
++	int err;
++
++	err = igc_save_frame_preemption(adapter, qopt);
++	if (err)
++		return err;
++
++	return igc_tsn_offload_apply(adapter);
++}
++
+ static int igc_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 			void *type_data)
+ {
+@@ -5625,7 +5632,7 @@ static int igc_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 		return igc_tsn_enable_launchtime(adapter, type_data);
+ 
+ 	case TC_SETUP_PREEMPT:
+-		return igc_save_frame_preemption(adapter, type_data);
++		return igc_tsn_enable_frame_preemption(adapter, type_data);
+ 
+ 	default:
+ 		return -EOPNOTSUPP;
+diff --git a/drivers/net/ethernet/intel/igc/igc_tsn.c b/drivers/net/ethernet/intel/igc/igc_tsn.c
+index 65d5a842a62d..d9c59d56d99a 100644
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -18,24 +18,8 @@ static bool is_any_launchtime(struct igc_adapter *adapter)
+ 	return false;
+ }
+ 
+-static unsigned int igc_tsn_new_flags(struct igc_adapter *adapter)
+-{
+-	unsigned int new_flags = adapter->flags & ~IGC_FLAG_TSN_ANY_ENABLED;
+-
+-	if (adapter->base_time)
+-		new_flags |= IGC_FLAG_TSN_QBV_ENABLED;
+-
+-	if (is_any_launchtime(adapter))
+-		new_flags |= IGC_FLAG_TSN_QBV_ENABLED;
+-
+-	if (adapter->frame_preemption_active)
+-		new_flags |= IGC_FLAG_TSN_PREEMPT_ENABLED;
+-
+-	return new_flags;
+-}
+-
+ /* Returns the TSN specific registers to their default values after
+- * the adapter is reset.
++ * TSN offloading is disabled.
+  */
+ static int igc_tsn_disable_offload(struct igc_adapter *adapter)
+ {
+@@ -43,6 +27,9 @@ static int igc_tsn_disable_offload(struct igc_adapter *adapter)
+ 	u32 tqavctrl, rxpbs;
+ 	int i;
+ 
++	if (!(adapter->flags & IGC_FLAG_TSN_QBV_ENABLED))
++		return 0;
++
+ 	adapter->base_time = 0;
+ 	adapter->cycle_time = 0;
+ 	adapter->frame_preemption_active = false;
+@@ -78,25 +65,38 @@ static int igc_tsn_disable_offload(struct igc_adapter *adapter)
+ 	wr32(IGC_QBVCYCLET_S, NSEC_PER_MSEC);
+ 	wr32(IGC_QBVCYCLET, NSEC_PER_MSEC);
+ 
+-	adapter->flags &= ~IGC_FLAG_TSN_ANY_ENABLED;
++	adapter->flags &= ~IGC_FLAG_TSN_QBV_ENABLED;
+ 
+ 	return 0;
+ }
+ 
+-static int igc_tsn_update_params(struct igc_adapter *adapter)
++static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ {
+ 	struct igc_hw *hw = &adapter->hw;
+-	unsigned int flags;
++	u32 tqavctrl, baset_l, baset_h;
++	u32 sec, nsec, cycle, rxpbs;
++	ktime_t base_time, systim;
+ 	u8 frag_size_mult;
+-	u32 tqavctrl;
+ 	int i;
+ 
+-	flags = igc_tsn_new_flags(adapter) & IGC_FLAG_TSN_ANY_ENABLED;
+-	if (!flags)
++	if (adapter->flags & IGC_FLAG_TSN_QBV_ENABLED)
+ 		return 0;
+ 
++	cycle = adapter->cycle_time;
++	base_time = adapter->base_time;
++
++	wr32(IGC_TSAUXC, 0);
++	wr32(IGC_DTXMXPKTSZ, IGC_DTXMXPKTSZ_TSN);
++	wr32(IGC_TXPBS, IGC_TXPBSIZE_TSN);
++
++	rxpbs = rd32(IGC_RXPBS) & ~IGC_RXPBSIZE_SIZE_MASK;
++	rxpbs |= IGC_RXPBSIZE_TSN;
++
++	wr32(IGC_RXPBS, rxpbs);
++
+ 	tqavctrl = rd32(IGC_TQAVCTRL) &
+ 		~(IGC_TQAVCTRL_MIN_FRAG_MASK | IGC_TQAVCTRL_PREEMPT_ENA);
++	tqavctrl |= IGC_TQAVCTRL_TRANSMIT_MODE_TSN | IGC_TQAVCTRL_ENHANCED_QAV;
+ 
+ 	if (adapter->frame_preemption_active)
+ 		tqavctrl |= IGC_TQAVCTRL_PREEMPT_ENA;
+@@ -107,6 +107,9 @@ static int igc_tsn_update_params(struct igc_adapter *adapter)
+ 
+ 	wr32(IGC_TQAVCTRL, tqavctrl);
+ 
++	wr32(IGC_QBVCYCLET_S, cycle);
++	wr32(IGC_QBVCYCLET, cycle);
++
+ 	for (i = 0; i < adapter->num_tx_queues; i++) {
+ 		struct igc_ring *ring = adapter->tx_ring[i];
+ 		u32 txqctl = 0;
+@@ -127,47 +130,12 @@ static int igc_tsn_update_params(struct igc_adapter *adapter)
+ 		if (ring->launchtime_enable)
+ 			txqctl |= IGC_TXQCTL_QUEUE_MODE_LAUNCHT;
+ 
+-		if (adapter->frame_preemption_active && ring->preemptible)
++		if (ring->preemptible)
+ 			txqctl |= IGC_TXQCTL_PREEMPTIBLE;
+ 
+ 		wr32(IGC_TXQCTL(i), txqctl);
+ 	}
+ 
+-	adapter->flags = igc_tsn_new_flags(adapter);
+-
+-	return 0;
+-}
+-
+-static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+-{
+-	struct igc_hw *hw = &adapter->hw;
+-	u32 baset_l, baset_h, tqavctrl;
+-	u32 sec, nsec, cycle, rxpbs;
+-	ktime_t base_time, systim;
+-
+-	tqavctrl = rd32(IGC_TQAVCTRL);
+-	tqavctrl |= IGC_TQAVCTRL_TRANSMIT_MODE_TSN | IGC_TQAVCTRL_ENHANCED_QAV;
+-
+-	wr32(IGC_TQAVCTRL, tqavctrl);
+-
+-	wr32(IGC_TSAUXC, 0);
+-	wr32(IGC_DTXMXPKTSZ, IGC_DTXMXPKTSZ_TSN);
+-	wr32(IGC_TXPBS, IGC_TXPBSIZE_TSN);
+-
+-	rxpbs = rd32(IGC_RXPBS) & ~IGC_RXPBSIZE_SIZE_MASK;
+-	rxpbs |= IGC_RXPBSIZE_TSN;
+-
+-	wr32(IGC_RXPBS, rxpbs);
+-
+-	if (!adapter->base_time)
+-		goto done;
+-
+-	cycle = adapter->cycle_time;
+-	base_time = adapter->base_time;
+-
+-	wr32(IGC_QBVCYCLET_S, cycle);
+-	wr32(IGC_QBVCYCLET, cycle);
+-
+ 	nsec = rd32(IGC_SYSTIML);
+ 	sec = rd32(IGC_SYSTIMH);
+ 
+@@ -185,51 +153,34 @@ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ 	wr32(IGC_BASET_H, baset_h);
+ 	wr32(IGC_BASET_L, baset_l);
+ 
+-done:
+-	igc_tsn_update_params(adapter);
++	adapter->flags |= IGC_FLAG_TSN_QBV_ENABLED;
+ 
+ 	return 0;
+ }
+ 
+-int igc_tsn_reset(struct igc_adapter *adapter)
+-{
+-	unsigned int new_flags;
+-	int err = 0;
+-
+-	new_flags = igc_tsn_new_flags(adapter);
+-
+-	if (!(new_flags & IGC_FLAG_TSN_ANY_ENABLED))
+-		return igc_tsn_disable_offload(adapter);
+-
+-	err = igc_tsn_enable_offload(adapter);
+-	if (err < 0)
+-		return err;
+-
+-	adapter->flags = new_flags;
+-
+-	return err;
+-}
+-
+ int igc_tsn_offload_apply(struct igc_adapter *adapter)
+ {
+-	unsigned int new_flags, old_flags;
+-
+-	old_flags = adapter->flags;
+-	new_flags = igc_tsn_new_flags(adapter);
++	bool is_any_enabled = adapter->base_time ||
++		is_any_launchtime(adapter) || adapter->frame_preemption_active;
+ 
+-	if (old_flags == new_flags)
+-		return igc_tsn_update_params(adapter);
++	if (!(adapter->flags & IGC_FLAG_TSN_QBV_ENABLED) && !is_any_enabled)
++		return 0;
+ 
+-	/* Enabling features work without resetting the adapter */
+-	if (new_flags > old_flags)
+-		return igc_tsn_enable_offload(adapter);
++	if (!is_any_enabled) {
++		int err = igc_tsn_disable_offload(adapter);
+ 
+-	adapter->flags = new_flags;
++		if (err < 0)
++			return err;
+ 
+-	if (!netif_running(adapter->netdev))
+-		return igc_tsn_enable_offload(adapter);
++		/* The BASET registers aren't cleared when writing
++		 * into them, force a reset if the interface is
++		 * running.
++		 */
++		if (netif_running(adapter->netdev))
++			schedule_work(&adapter->reset_task);
+ 
+-	schedule_work(&adapter->reset_task);
++		return 0;
++	}
+ 
+-	return 0;
++	return igc_tsn_enable_offload(adapter);
+ }
+diff --git a/drivers/net/ethernet/intel/igc/igc_tsn.h b/drivers/net/ethernet/intel/igc/igc_tsn.h
+index 1512307f5a52..f76bc86ddccd 100644
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.h
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.h
+@@ -5,6 +5,5 @@
+ #define _IGC_TSN_H_
+ 
+ int igc_tsn_offload_apply(struct igc_adapter *adapter);
+-int igc_tsn_reset(struct igc_adapter *adapter);
+ 
+ #endif /* _IGC_BASE_H */
+-- 
+2.25.1
+

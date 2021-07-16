@@ -1,0 +1,121 @@
+From a91082b478525e227be8e1030adc8b726c8cab0c Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Thu, 19 Nov 2020 16:56:16 +0000
+Subject: [PATCH 0446/1087] drm/i915: Show timeline dependencies for debug
+
+Include the signalers each request in the timeline is waiting on, as a
+means to try and identify the cause of a stall. This can be quite
+verbose, even as for now we only show each request in the timeline and
+its immediate antecedents.
+
+This generates output like:
+
+Timeline 886: { count 1, ready: 0, inflight: 0, seqno: { current: 664, last: 666 }, engine: rcs0 }
+  U 886:29a-  prio=0 @ 134ms: gem_exec_parall<4621>
+    U bc1:27a-  prio=0 @ 134ms: gem_exec_parall[4917]
+Timeline 825: { count 1, ready: 0, inflight: 0, seqno: { current: 802, last: 804 }, engine: vcs0 }
+  U 825:324  prio=0 @ 107ms: gem_exec_parall<4518>
+    U b75:140-  prio=0 @ 110ms: gem_exec_parall<5486>
+Timeline b46: { count 1, ready: 0, inflight: 0, seqno: { current: 782, last: 784 }, engine: vcs0 }
+  U b46:310-  prio=0 @ 70ms: gem_exec_parall<5428>
+    U c11:170-  prio=0 @ 70ms: gem_exec_parall[5501]
+Timeline 96b: { count 1, ready: 0, inflight: 0, seqno: { current: 632, last: 634 }, engine: vcs0 }
+  U 96b:27a-  prio=0 @ 67ms: gem_exec_parall<4878>
+    U b75:19e-  prio=0 @ 67ms: gem_exec_parall<5486>
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201119165616.10834-6-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c   |  3 ++-
+ drivers/gpu/drm/i915/i915_scheduler.c | 28 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |  7 +++++++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 90fadbd64ed1..f48df3545e39 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -45,6 +45,7 @@
+ #include "i915_debugfs.h"
+ #include "i915_debugfs_params.h"
+ #include "i915_irq.h"
++#include "i915_scheduler.h"
+ #include "i915_trace.h"
+ #include "intel_pm.h"
+ #include "intel_sideband.h"
+@@ -867,7 +868,7 @@ static int i915_engine_info(struct seq_file *m, void *unused)
+ 	for_each_uabi_engine(engine, i915)
+ 		intel_engine_dump(engine, &p, "%s\n", engine->name);
+ 
+-	intel_gt_show_timelines(&i915->gt, &p, NULL);
++	intel_gt_show_timelines(&i915->gt, &p, i915_request_show_with_schedule);
+ 
+ 	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index cbb880b10c65..b9cf9931ebd7 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -504,6 +504,34 @@ void i915_sched_node_fini(struct i915_sched_node *node)
+ 	spin_unlock_irq(&schedule_lock);
+ }
+ 
++void i915_request_show_with_schedule(struct drm_printer *m,
++				     const struct i915_request *rq,
++				     const char *prefix,
++				     int indent)
++{
++	struct i915_dependency *dep;
++
++	i915_request_show(m, rq, prefix, indent);
++	if (i915_request_completed(rq))
++		return;
++
++	rcu_read_lock();
++	for_each_signaler(dep, rq) {
++		const struct i915_request *signaler =
++			node_to_request(dep->signaler);
++
++		/* Dependencies along the same timeline are expected. */
++		if (signaler->timeline == rq->timeline)
++			continue;
++
++		if (i915_request_completed(signaler))
++			continue;
++
++		i915_request_show(m, signaler, prefix, indent + 2);
++	}
++	rcu_read_unlock();
++}
++
+ static void i915_global_scheduler_shrink(void)
+ {
+ 	kmem_cache_shrink(global.slab_dependencies);
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 6f0bf00fc569..4501e5ac2637 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -13,6 +13,8 @@
+ 
+ #include "i915_scheduler_types.h"
+ 
++struct drm_printer;
++
+ #define priolist_for_each_request(it, plist, idx) \
+ 	for (idx = 0; idx < ARRAY_SIZE((plist)->requests); idx++) \
+ 		list_for_each_entry(it, &(plist)->requests[idx], sched.link)
+@@ -54,4 +56,9 @@ static inline void i915_priolist_free(struct i915_priolist *p)
+ 		__i915_priolist_free(p);
+ }
+ 
++void i915_request_show_with_schedule(struct drm_printer *m,
++				     const struct i915_request *rq,
++				     const char *prefix,
++				     int indent);
++
+ #endif /* _I915_SCHEDULER_H_ */
+-- 
+2.17.1
+

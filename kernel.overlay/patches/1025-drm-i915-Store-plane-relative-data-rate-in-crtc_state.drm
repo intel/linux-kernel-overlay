@@ -1,0 +1,206 @@
+From 0a7b41d10ae2e9d033ad8fc4ebe425eaf6178a96 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 6 Nov 2020 19:30:41 +0200
+Subject: [PATCH 1025/1714] drm/i915: Store plane relative data rate in
+ crtc_state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Store the relative data rate for planes in the crtc state
+so that we don't have to use
+intel_atomic_crtc_state_for_each_plane_state() to compute
+it even for the planes that are no part of the current state.
+
+Should probably just nuke this stuff entirely an use the normal
+plane data rate instead. The two are slightly different since this
+relative data rate doesn't factor in the actual pixel clock, so
+it's a bit odd thing to even call a "data rate". And since the
+watermarks are computed based on the actual data rate anyway
+I don't really see what the point of this relative data rate
+is. But that's for the future...
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201106173042.7534-6-ville.syrjala@linux.intel.com
+Reviewed-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+---
+ .../drm/i915/display/intel_display_types.h    |  4 +
+ drivers/gpu/drm/i915/intel_pm.c               | 83 ++++++++++---------
+ 2 files changed, 50 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 86de89d621d8..5bb7adc1ff3e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1031,6 +1031,10 @@ struct intel_crtc_state {
+ 
+ 	u32 data_rate[I915_MAX_PLANES];
+ 
++	/* FIXME unify with data_rate[] */
++	u64 plane_data_rate[I915_MAX_PLANES];
++	u64 uv_plane_data_rate[I915_MAX_PLANES];
++
+ 	/* Gamma mode programmed on the pipe */
+ 	u32 gamma_mode;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 6e64580a1a8c..6ccacd07ab94 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4696,50 +4696,63 @@ skl_plane_relative_data_rate(const struct intel_crtc_state *crtc_state,
+ }
+ 
+ static u64
+-skl_get_total_relative_data_rate(struct intel_crtc_state *crtc_state,
+-				 u64 *plane_data_rate,
+-				 u64 *uv_plane_data_rate)
++skl_get_total_relative_data_rate(struct intel_atomic_state *state,
++				 struct intel_crtc *crtc)
+ {
+-	struct intel_plane *plane;
++	struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
+ 	const struct intel_plane_state *plane_state;
++	struct intel_plane *plane;
+ 	u64 total_data_rate = 0;
++	enum plane_id plane_id;
++	int i;
+ 
+ 	/* Calculate and cache data rate for each plane */
+-	intel_atomic_crtc_state_for_each_plane_state(plane, plane_state, crtc_state) {
+-		enum plane_id plane_id = plane->id;
+-		u64 rate;
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		if (plane->pipe != crtc->pipe)
++			continue;
++
++		plane_id = plane->id;
+ 
+ 		/* packed/y */
+-		rate = skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+-		plane_data_rate[plane_id] = rate;
+-		total_data_rate += rate;
++		crtc_state->plane_data_rate[plane_id] =
++			skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+ 
+ 		/* uv-plane */
+-		rate = skl_plane_relative_data_rate(crtc_state, plane_state, 1);
+-		uv_plane_data_rate[plane_id] = rate;
+-		total_data_rate += rate;
++		crtc_state->uv_plane_data_rate[plane_id] =
++			skl_plane_relative_data_rate(crtc_state, plane_state, 1);
++	}
++
++	for_each_plane_id_on_crtc(crtc, plane_id) {
++		total_data_rate += crtc_state->plane_data_rate[plane_id];
++		total_data_rate += crtc_state->uv_plane_data_rate[plane_id];
+ 	}
+ 
+ 	return total_data_rate;
+ }
+ 
+ static u64
+-icl_get_total_relative_data_rate(struct intel_crtc_state *crtc_state,
+-				 u64 *plane_data_rate)
++icl_get_total_relative_data_rate(struct intel_atomic_state *state,
++				 struct intel_crtc *crtc)
+ {
+-	struct intel_plane *plane;
++	struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
+ 	const struct intel_plane_state *plane_state;
++	struct intel_plane *plane;
+ 	u64 total_data_rate = 0;
++	enum plane_id plane_id;
++	int i;
+ 
+ 	/* Calculate and cache data rate for each plane */
+-	intel_atomic_crtc_state_for_each_plane_state(plane, plane_state, crtc_state) {
+-		enum plane_id plane_id = plane->id;
+-		u64 rate;
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		if (plane->pipe != crtc->pipe)
++			continue;
++
++		plane_id = plane->id;
+ 
+ 		if (!plane_state->planar_linked_plane) {
+-			rate = skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+-			plane_data_rate[plane_id] = rate;
+-			total_data_rate += rate;
++			crtc_state->plane_data_rate[plane_id] =
++				skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+ 		} else {
+ 			enum plane_id y_plane_id;
+ 
+@@ -4754,17 +4767,18 @@ icl_get_total_relative_data_rate(struct intel_crtc_state *crtc_state,
+ 				continue;
+ 
+ 			/* Y plane rate is calculated on the slave */
+-			rate = skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+ 			y_plane_id = plane_state->planar_linked_plane->id;
+-			plane_data_rate[y_plane_id] = rate;
+-			total_data_rate += rate;
++			crtc_state->plane_data_rate[y_plane_id] =
++				skl_plane_relative_data_rate(crtc_state, plane_state, 0);
+ 
+-			rate = skl_plane_relative_data_rate(crtc_state, plane_state, 1);
+-			plane_data_rate[plane_id] = rate;
+-			total_data_rate += rate;
++			crtc_state->plane_data_rate[plane_id] =
++				skl_plane_relative_data_rate(crtc_state, plane_state, 1);
+ 		}
+ 	}
+ 
++	for_each_plane_id_on_crtc(crtc, plane_id)
++		total_data_rate += crtc_state->plane_data_rate[plane_id];
++
+ 	return total_data_rate;
+ }
+ 
+@@ -4796,8 +4810,6 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 	u64 total_data_rate;
+ 	enum plane_id plane_id;
+ 	int num_active;
+-	u64 plane_data_rate[I915_MAX_PLANES] = {};
+-	u64 uv_plane_data_rate[I915_MAX_PLANES] = {};
+ 	u32 blocks;
+ 	int level;
+ 	int ret;
+@@ -4837,13 +4849,10 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 
+ 	if (INTEL_GEN(dev_priv) >= 11)
+ 		total_data_rate =
+-			icl_get_total_relative_data_rate(crtc_state,
+-							 plane_data_rate);
++			icl_get_total_relative_data_rate(state, crtc);
+ 	else
+ 		total_data_rate =
+-			skl_get_total_relative_data_rate(crtc_state,
+-							 plane_data_rate,
+-							 uv_plane_data_rate);
++			skl_get_total_relative_data_rate(state, crtc);
+ 
+ 	ret = skl_ddb_get_pipe_allocation_limits(dev_priv, crtc_state,
+ 						 total_data_rate,
+@@ -4924,7 +4933,7 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 		if (total_data_rate == 0)
+ 			break;
+ 
+-		rate = plane_data_rate[plane_id];
++		rate = crtc_state->plane_data_rate[plane_id];
+ 		extra = min_t(u16, alloc_size,
+ 			      DIV64_U64_ROUND_UP(alloc_size * rate,
+ 						 total_data_rate));
+@@ -4935,7 +4944,7 @@ skl_allocate_pipe_ddb(struct intel_atomic_state *state,
+ 		if (total_data_rate == 0)
+ 			break;
+ 
+-		rate = uv_plane_data_rate[plane_id];
++		rate = crtc_state->uv_plane_data_rate[plane_id];
+ 		extra = min_t(u16, alloc_size,
+ 			      DIV64_U64_ROUND_UP(alloc_size * rate,
+ 						 total_data_rate));
+-- 
+2.25.1
+

@@ -1,0 +1,168 @@
+From 5466cf6dbf365ff670ffb52c7fcec9b10da11360 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Thu, 10 Dec 2020 21:43:28 +0100
+Subject: [PATCH 26/67] perf tools: Add
+ evlist__disable_evsel/evlist__enable_evsel
+
+Adding interface to enable/disable single event in the evlist based on
+its name. It will be used later in new control enable/disable interface.
+
+Keeping the evlist::enabled true when one or more events are enabled so
+the toggle can work properly and toggle evlist to disabled state.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Acked-by: Alexei Budankov <abudankov@huawei.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Michael Petlan <mpetlan@redhat.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Stephane Eranian <eranian@google.com>
+Link: https://lore.kernel.org/r/20201210204330.233864-2-jolsa@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/evlist.c | 69 ++++++++++++++++++++++++++++++++++++++--
+ tools/perf/util/evlist.h |  2 ++
+ 2 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 60bf209d6dd3..d973305a53ca 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -387,7 +387,30 @@ bool evsel__cpu_iter_skip(struct evsel *ev, int cpu)
+ 	return true;
+ }
+ 
+-void evlist__disable(struct evlist *evlist)
++static int evsel__strcmp(struct evsel *pos, char *evsel_name)
++{
++	if (!evsel_name)
++		return 0;
++	if (evsel__is_dummy_event(pos))
++		return 1;
++	return strcmp(pos->name, evsel_name);
++}
++
++static int evlist__is_enabled(struct evlist *evlist)
++{
++	struct evsel *pos;
++
++	evlist__for_each_entry(evlist, pos) {
++		if (!evsel__is_group_leader(pos) || !pos->core.fd)
++			continue;
++		/* If at least one event is enabled, evlist is enabled. */
++		if (!pos->disabled)
++			return true;
++	}
++	return false;
++}
++
++static void __evlist__disable(struct evlist *evlist, char *evsel_name)
+ {
+ 	struct evsel *pos;
+ 	struct affinity affinity;
+@@ -403,6 +426,8 @@ void evlist__disable(struct evlist *evlist)
+ 			affinity__set(&affinity, cpu);
+ 
+ 			evlist__for_each_entry(evlist, pos) {
++				if (evsel__strcmp(pos, evsel_name))
++					continue;
+ 				if (evsel__cpu_iter_skip(pos, cpu))
+ 					continue;
+ 				if (pos->disabled || !evsel__is_group_leader(pos) || !pos->core.fd)
+@@ -420,15 +445,34 @@ void evlist__disable(struct evlist *evlist)
+ 
+ 	affinity__cleanup(&affinity);
+ 	evlist__for_each_entry(evlist, pos) {
++		if (evsel__strcmp(pos, evsel_name))
++			continue;
+ 		if (!evsel__is_group_leader(pos) || !pos->core.fd)
+ 			continue;
+ 		pos->disabled = true;
+ 	}
+ 
+-	evlist->enabled = false;
++	/*
++	 * If we disabled only single event, we need to check
++	 * the enabled state of the evlist manually.
++	 */
++	if (evsel_name)
++		evlist->enabled = evlist__is_enabled(evlist);
++	else
++		evlist->enabled = false;
++}
++
++void evlist__disable(struct evlist *evlist)
++{
++	__evlist__disable(evlist, NULL);
++}
++
++void evlist__disable_evsel(struct evlist *evlist, char *evsel_name)
++{
++	__evlist__disable(evlist, evsel_name);
+ }
+ 
+-void evlist__enable(struct evlist *evlist)
++static void __evlist__enable(struct evlist *evlist, char *evsel_name)
+ {
+ 	struct evsel *pos;
+ 	struct affinity affinity;
+@@ -441,6 +485,8 @@ void evlist__enable(struct evlist *evlist)
+ 		affinity__set(&affinity, cpu);
+ 
+ 		evlist__for_each_entry(evlist, pos) {
++			if (evsel__strcmp(pos, evsel_name))
++				continue;
+ 			if (evsel__cpu_iter_skip(pos, cpu))
+ 				continue;
+ 			if (!evsel__is_group_leader(pos) || !pos->core.fd)
+@@ -450,14 +496,31 @@ void evlist__enable(struct evlist *evlist)
+ 	}
+ 	affinity__cleanup(&affinity);
+ 	evlist__for_each_entry(evlist, pos) {
++		if (evsel__strcmp(pos, evsel_name))
++			continue;
+ 		if (!evsel__is_group_leader(pos) || !pos->core.fd)
+ 			continue;
+ 		pos->disabled = false;
+ 	}
+ 
++	/*
++	 * Even single event sets the 'enabled' for evlist,
++	 * so the toggle can work properly and toggle to
++	 * 'disabled' state.
++	 */
+ 	evlist->enabled = true;
+ }
+ 
++void evlist__enable(struct evlist *evlist)
++{
++	__evlist__enable(evlist, NULL);
++}
++
++void evlist__enable_evsel(struct evlist *evlist, char *evsel_name)
++{
++	__evlist__enable(evlist, evsel_name);
++}
++
+ void evlist__toggle_enable(struct evlist *evlist)
+ {
+ 	(evlist->enabled ? evlist__disable : evlist__enable)(evlist);
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index fb0610b12975..17e781174325 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -210,6 +210,8 @@ size_t evlist__mmap_size(unsigned long pages);
+ void evlist__disable(struct evlist *evlist);
+ void evlist__enable(struct evlist *evlist);
+ void evlist__toggle_enable(struct evlist *evlist);
++void evlist__disable_evsel(struct evlist *evlist, char *evsel_name);
++void evlist__enable_evsel(struct evlist *evlist, char *evsel_name);
+ 
+ int perf_evlist__enable_event_idx(struct evlist *evlist,
+ 				  struct evsel *evsel, int idx);
+-- 
+2.25.1
+

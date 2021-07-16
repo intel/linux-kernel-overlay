@@ -1,0 +1,186 @@
+From c78c5e531a7f821ff336424b5ef2c384476c6468 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 5 Jan 2021 11:57:49 -0800
+Subject: [PATCH 10/62] perf record: Add support for PERF_SAMPLE_CODE_PAGE_SIZE
+
+Adds the infrastructure to sample the code address page size.
+
+Introduce a new --code-page-size option for perf record.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Originally-by: Stephane Eranian <eranian@google.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210105195752.43489-4-kan.liang@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/Documentation/perf-record.txt  |  3 +++
+ tools/perf/builtin-record.c               |  2 ++
+ tools/perf/util/event.h                   |  1 +
+ tools/perf/util/evsel.c                   | 18 +++++++++++++++++-
+ tools/perf/util/evsel.h                   |  1 +
+ tools/perf/util/perf_event_attr_fprintf.c |  2 +-
+ tools/perf/util/record.h                  |  1 +
+ tools/perf/util/synthetic-events.c        |  8 ++++++++
+ 8 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index 2d30e525a600..27acf27ec1e2 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -296,6 +296,9 @@ OPTIONS
+ --data-page-size::
+ 	Record the sampled data address data page size.
+ 
++--code-page-size::
++	Record the sampled code address (ip) page size
++
+ -T::
+ --timestamp::
+ 	Record the sample timestamps. Use it with 'perf report -D' to see the
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 8132c93d9984..1d5d62e11a22 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -2478,6 +2478,8 @@ static struct option __record_options[] = {
+ 		    "Record the sample physical addresses"),
+ 	OPT_BOOLEAN(0, "data-page-size", &record.opts.sample_data_page_size,
+ 		    "Record the sampled data address data page size"),
++	OPT_BOOLEAN(0, "code-page-size", &record.opts.sample_code_page_size,
++		    "Record the sampled code address (ip) page size"),
+ 	OPT_BOOLEAN(0, "sample-cpu", &record.opts.sample_cpu, "Record the sample cpu"),
+ 	OPT_BOOLEAN_SET('T', "timestamp", &record.opts.sample_time,
+ 			&record.opts.sample_time_set,
+diff --git a/tools/perf/util/event.h b/tools/perf/util/event.h
+index ff403ea578e1..2afea7247dd3 100644
+--- a/tools/perf/util/event.h
++++ b/tools/perf/util/event.h
+@@ -136,6 +136,7 @@ struct perf_sample {
+ 	u64 data_src;
+ 	u64 phys_addr;
+ 	u64 data_page_size;
++	u64 code_page_size;
+ 	u64 cgroup;
+ 	u32 flags;
+ 	u16 insn_len;
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 5fdf3f4f8aad..c60569bd1c2c 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -1191,6 +1191,9 @@ void evsel__config(struct evsel *evsel, struct record_opts *opts,
+ 	if (opts->sample_data_page_size)
+ 		evsel__set_sample_bit(evsel, DATA_PAGE_SIZE);
+ 
++	if (opts->sample_code_page_size)
++		evsel__set_sample_bit(evsel, CODE_PAGE_SIZE);
++
+ 	if (opts->record_switch_events)
+ 		attr->context_switch = track;
+ 
+@@ -1873,7 +1876,12 @@ static int evsel__open_cpu(struct evsel *evsel, struct perf_cpu_map *cpus,
+ 	 * Must probe features in the order they were added to the
+ 	 * perf_event_attr interface.
+ 	 */
+-        if (!perf_missing_features.data_page_size &&
++	if (!perf_missing_features.code_page_size &&
++	    (evsel->core.attr.sample_type & PERF_SAMPLE_CODE_PAGE_SIZE)) {
++		perf_missing_features.code_page_size = true;
++		pr_debug2_peo("Kernel has no PERF_SAMPLE_CODE_PAGE_SIZE support, bailing out\n");
++		goto out_close;
++	} else if (!perf_missing_features.data_page_size &&
+ 	    (evsel->core.attr.sample_type & PERF_SAMPLE_DATA_PAGE_SIZE)) {
+ 		perf_missing_features.data_page_size = true;
+ 		pr_debug2_peo("Kernel has no PERF_SAMPLE_DATA_PAGE_SIZE support, bailing out\n");
+@@ -2369,6 +2377,12 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
+ 		array++;
+ 	}
+ 
++	data->code_page_size = 0;
++	if (type & PERF_SAMPLE_CODE_PAGE_SIZE) {
++		data->code_page_size = *array;
++		array++;
++	}
++
+ 	if (type & PERF_SAMPLE_AUX) {
+ 		OVERFLOW_CHECK_u64(array);
+ 		sz = *array++;
+@@ -2678,6 +2692,8 @@ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 	"We found oprofile daemon running, please stop it and try again.");
+ 		break;
+ 	case EINVAL:
++		if (evsel->core.attr.sample_type & PERF_SAMPLE_CODE_PAGE_SIZE && perf_missing_features.code_page_size)
++			return scnprintf(msg, size, "Asking for the code page size isn't supported by this kernel.");
+ 		if (evsel->core.attr.sample_type & PERF_SAMPLE_DATA_PAGE_SIZE && perf_missing_features.data_page_size)
+ 			return scnprintf(msg, size, "Asking for the data page size isn't supported by this kernel.");
+ 		if (evsel->core.attr.write_backward && perf_missing_features.write_backward)
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index cd1d8dd43199..157d7c27d6e3 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -145,6 +145,7 @@ struct perf_missing_features {
+ 	bool branch_hw_idx;
+ 	bool cgroup;
+ 	bool data_page_size;
++	bool code_page_size;
+ };
+ 
+ extern struct perf_missing_features perf_missing_features;
+diff --git a/tools/perf/util/perf_event_attr_fprintf.c b/tools/perf/util/perf_event_attr_fprintf.c
+index fb0bb6684438..3a2eb25d07a7 100644
+--- a/tools/perf/util/perf_event_attr_fprintf.c
++++ b/tools/perf/util/perf_event_attr_fprintf.c
+@@ -35,7 +35,7 @@ static void __p_sample_type(char *buf, size_t size, u64 value)
+ 		bit_name(BRANCH_STACK), bit_name(REGS_USER), bit_name(STACK_USER),
+ 		bit_name(IDENTIFIER), bit_name(REGS_INTR), bit_name(DATA_SRC),
+ 		bit_name(WEIGHT), bit_name(PHYS_ADDR), bit_name(AUX),
+-		bit_name(CGROUP), bit_name(DATA_PAGE_SIZE),
++		bit_name(CGROUP), bit_name(DATA_PAGE_SIZE), bit_name(CODE_PAGE_SIZE),
+ 		{ .name = NULL, }
+ 	};
+ #undef bit_name
+diff --git a/tools/perf/util/record.h b/tools/perf/util/record.h
+index 694b351dcd27..22dc86b1dab5 100644
+--- a/tools/perf/util/record.h
++++ b/tools/perf/util/record.h
+@@ -23,6 +23,7 @@ struct record_opts {
+ 	bool	      sample_address;
+ 	bool	      sample_phys_addr;
+ 	bool	      sample_data_page_size;
++	bool	      sample_code_page_size;
+ 	bool	      sample_weight;
+ 	bool	      sample_time;
+ 	bool	      sample_time_set;
+diff --git a/tools/perf/util/synthetic-events.c b/tools/perf/util/synthetic-events.c
+index 15cf45377923..5cff2d8888e7 100644
+--- a/tools/perf/util/synthetic-events.c
++++ b/tools/perf/util/synthetic-events.c
+@@ -1412,6 +1412,9 @@ size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
+ 	if (type & PERF_SAMPLE_DATA_PAGE_SIZE)
+ 		result += sizeof(u64);
+ 
++	if (type & PERF_SAMPLE_CODE_PAGE_SIZE)
++		result += sizeof(u64);
++
+ 	if (type & PERF_SAMPLE_AUX) {
+ 		result += sizeof(u64);
+ 		result += sample->aux_sample.size;
+@@ -1596,6 +1599,11 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type, u64 read_fo
+ 		array++;
+ 	}
+ 
++	if (type & PERF_SAMPLE_CODE_PAGE_SIZE) {
++		*array = sample->code_page_size;
++		array++;
++	}
++
+ 	if (type & PERF_SAMPLE_AUX) {
+ 		sz = sample->aux_sample.size;
+ 		*array++ = sz;
+-- 
+2.25.1
+

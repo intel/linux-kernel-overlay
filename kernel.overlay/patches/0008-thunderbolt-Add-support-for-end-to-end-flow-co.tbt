@@ -1,0 +1,182 @@
+From 848137dc6d8e3caab862db33cdab1462efaef157 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Mon, 19 Oct 2020 19:15:20 +0300
+Subject: [PATCH 08/38] thunderbolt: Add support for end-to-end flow control
+
+USB4 spec defines end-to-end (E2E) flow control that can be used between
+hosts to prevent overflow of a RX ring. We previously had this partially
+implemented but that code was removed with commit 53f13319d131
+("thunderbolt: Get rid of E2E workaround") with the idea that we add it
+back properly if there ever is need. Now that we are going to add DMA
+traffic test driver (in subsequent patches) this can be useful.
+
+For this reason we modify tb_ring_alloc_rx/tx() so that they accept
+RING_FLAG_E2E and configure the hardware ring accordingly. The RX side
+also requires passing TX HopID (e2e_tx_hop) used in the credit grant
+packets.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Acked-by: Yehezkel Bernat <YehezkelShB@gmail.com>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/thunderbolt.c   |  2 +-
+ drivers/thunderbolt/ctl.c   |  4 ++--
+ drivers/thunderbolt/nhi.c   | 36 ++++++++++++++++++++++++++++++++----
+ include/linux/thunderbolt.h |  8 +++++++-
+ 4 files changed, 42 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/thunderbolt.c b/drivers/net/thunderbolt.c
+index 3160443ef3b9..d7b5f87eaa15 100644
+--- a/drivers/net/thunderbolt.c
++++ b/drivers/net/thunderbolt.c
+@@ -866,7 +866,7 @@ static int tbnet_open(struct net_device *dev)
+ 	eof_mask = BIT(TBIP_PDF_FRAME_END);
+ 
+ 	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, TBNET_RING_SIZE,
+-				RING_FLAG_FRAME, sof_mask, eof_mask,
++				RING_FLAG_FRAME, 0, sof_mask, eof_mask,
+ 				tbnet_start_poll, net);
+ 	if (!ring) {
+ 		netdev_err(dev, "failed to allocate Rx ring\n");
+diff --git a/drivers/thunderbolt/ctl.c b/drivers/thunderbolt/ctl.c
+index 9894b8f63064..1d86e27a0ef3 100644
+--- a/drivers/thunderbolt/ctl.c
++++ b/drivers/thunderbolt/ctl.c
+@@ -628,8 +628,8 @@ struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, event_cb cb, void *cb_data)
+ 	if (!ctl->tx)
+ 		goto err;
+ 
+-	ctl->rx = tb_ring_alloc_rx(nhi, 0, 10, RING_FLAG_NO_SUSPEND, 0xffff,
+-				0xffff, NULL, NULL);
++	ctl->rx = tb_ring_alloc_rx(nhi, 0, 10, RING_FLAG_NO_SUSPEND, 0, 0xffff,
++				   0xffff, NULL, NULL);
+ 	if (!ctl->rx)
+ 		goto err;
+ 
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index db80dc5dfeba..cfc622da4f83 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -494,7 +494,7 @@ static int nhi_alloc_hop(struct tb_nhi *nhi, struct tb_ring *ring)
+ 
+ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 				     bool transmit, unsigned int flags,
+-				     u16 sof_mask, u16 eof_mask,
++				     int e2e_tx_hop, u16 sof_mask, u16 eof_mask,
+ 				     void (*start_poll)(void *),
+ 				     void *poll_data)
+ {
+@@ -517,6 +517,7 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	ring->is_tx = transmit;
+ 	ring->size = size;
+ 	ring->flags = flags;
++	ring->e2e_tx_hop = e2e_tx_hop;
+ 	ring->sof_mask = sof_mask;
+ 	ring->eof_mask = eof_mask;
+ 	ring->head = 0;
+@@ -561,7 +562,7 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+ 				 unsigned int flags)
+ {
+-	return tb_ring_alloc(nhi, hop, size, true, flags, 0, 0, NULL, NULL);
++	return tb_ring_alloc(nhi, hop, size, true, flags, 0, 0, 0, NULL, NULL);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_alloc_tx);
+ 
+@@ -571,6 +572,7 @@ EXPORT_SYMBOL_GPL(tb_ring_alloc_tx);
+  * @hop: HopID (ring) to allocate. Pass %-1 for automatic allocation.
+  * @size: Number of entries in the ring
+  * @flags: Flags for the ring
++ * @e2e_tx_hop: Transmit HopID when E2E is enabled in @flags
+  * @sof_mask: Mask of PDF values that start a frame
+  * @eof_mask: Mask of PDF values that end a frame
+  * @start_poll: If not %NULL the ring will call this function when an
+@@ -579,10 +581,11 @@ EXPORT_SYMBOL_GPL(tb_ring_alloc_tx);
+  * @poll_data: Optional data passed to @start_poll
+  */
+ struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+-				 unsigned int flags, u16 sof_mask, u16 eof_mask,
++				 unsigned int flags, int e2e_tx_hop,
++				 u16 sof_mask, u16 eof_mask,
+ 				 void (*start_poll)(void *), void *poll_data)
+ {
+-	return tb_ring_alloc(nhi, hop, size, false, flags, sof_mask, eof_mask,
++	return tb_ring_alloc(nhi, hop, size, false, flags, e2e_tx_hop, sof_mask, eof_mask,
+ 			     start_poll, poll_data);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_alloc_rx);
+@@ -629,6 +632,31 @@ void tb_ring_start(struct tb_ring *ring)
+ 		ring_iowrite32options(ring, sof_eof_mask, 4);
+ 		ring_iowrite32options(ring, flags, 0);
+ 	}
++
++	/*
++	 * Now that the ring valid bit is set we can configure E2E if
++	 * enabled for the ring.
++	 */
++	if (ring->flags & RING_FLAG_E2E) {
++		if (!ring->is_tx) {
++			u32 hop;
++
++			hop = ring->e2e_tx_hop << REG_RX_OPTIONS_E2E_HOP_SHIFT;
++			hop &= REG_RX_OPTIONS_E2E_HOP_MASK;
++			flags |= hop;
++
++			dev_dbg(&ring->nhi->pdev->dev,
++				"enabling E2E for %s %d with TX HopID %d\n",
++				RING_TYPE(ring), ring->hop, ring->e2e_tx_hop);
++		} else {
++			dev_dbg(&ring->nhi->pdev->dev, "enabling E2E for %s %d\n",
++				RING_TYPE(ring), ring->hop);
++		}
++
++		flags |= RING_FLAG_E2E_FLOW_CONTROL;
++		ring_iowrite32options(ring, flags, 0);
++	}
++
+ 	ring_interrupt_active(ring, true);
+ 	ring->running = true;
+ err:
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index a844fd5d96ab..034dccf93955 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -481,6 +481,8 @@ struct tb_nhi {
+  * @irq: MSI-X irq number if the ring uses MSI-X. %0 otherwise.
+  * @vector: MSI-X vector number the ring uses (only set if @irq is > 0)
+  * @flags: Ring specific flags
++ * @e2e_tx_hop: Transmit HopID when E2E is enabled. Only applicable to
++ *		RX ring. For TX ring this should be set to %0.
+  * @sof_mask: Bit mask used to detect start of frame PDF
+  * @eof_mask: Bit mask used to detect end of frame PDF
+  * @start_poll: Called when ring interrupt is triggered to start
+@@ -504,6 +506,7 @@ struct tb_ring {
+ 	int irq;
+ 	u8 vector;
+ 	unsigned int flags;
++	int e2e_tx_hop;
+ 	u16 sof_mask;
+ 	u16 eof_mask;
+ 	void (*start_poll)(void *data);
+@@ -514,6 +517,8 @@ struct tb_ring {
+ #define RING_FLAG_NO_SUSPEND	BIT(0)
+ /* Configure the ring to be in frame mode */
+ #define RING_FLAG_FRAME		BIT(1)
++/* Enable end-to-end flow control */
++#define RING_FLAG_E2E		BIT(2)
+ 
+ struct ring_frame;
+ typedef void (*ring_cb)(struct tb_ring *, struct ring_frame *, bool canceled);
+@@ -562,7 +567,8 @@ struct ring_frame {
+ struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+ 				 unsigned int flags);
+ struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+-				 unsigned int flags, u16 sof_mask, u16 eof_mask,
++				 unsigned int flags, int e2e_tx_hop,
++				 u16 sof_mask, u16 eof_mask,
+ 				 void (*start_poll)(void *), void *poll_data);
+ void tb_ring_start(struct tb_ring *ring);
+ void tb_ring_stop(struct tb_ring *ring);
+-- 
+2.25.1
+

@@ -1,0 +1,116 @@
+From df25a5399f152e3c9724a386c4a31ae7f17cab50 Mon Sep 17 00:00:00 2001
+From: Iskren Chernev <iskren.chernev@gmail.com>
+Date: Thu, 26 Nov 2020 15:02:23 +0200
+Subject: [PATCH 1167/1714] drm/msm: Fix use-after-free in msm_gem with
+ carveout
+
+When using gem with vram carveout the page allocation is managed via
+drm_mm. The necessary drm_mm_node is allocated in add_vma, but it is
+referenced in msm_gem_object as well. It is freed before the drm_mm_node
+has been deallocated leading to use-after-free on every single vram
+allocation.
+
+Currently put_iova is called before put_pages in both
+msm_gem_free_object and msm_gem_purge:
+
+	put_iova -> del_vma -> kfree(vma) // vma holds drm_mm_node
+	/* later */
+	put_pages -> put_pages_vram -> drm_mm_remove_node(
+						msm_obj->vram_node)
+				 	// vram_node is a ref to
+					// drm_mm_node; in _msm_gem_new
+
+It looks like del_vma does nothing else other than freeing the vma
+object and removing it from it's list, so delaying the deletion should
+be harmless.
+
+This patch splits put_iova in put_iova_spaces and put_iova_vmas, so the
+vma can be freed after the mm_node has been deallocated with the mm.
+
+Note: The breaking commit separated the vma allocation from within
+msm_gem_object to outside, so the vram_node reference became outside the
+msm_gem_object allocation, and freeing order was therefore overlooked.
+
+Fixes: 4b85f7f5cf7 ("drm/msm: support for an arbitrary number of address spaces")
+Signed-off-by: Iskren Chernev <iskren.chernev@gmail.com>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_gem.c | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index 74808b8974ed..82cbaf337b50 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -358,18 +358,31 @@ static void del_vma(struct msm_gem_vma *vma)
+ 
+ /* Called with msm_obj locked */
+ static void
+-put_iova(struct drm_gem_object *obj)
++put_iova_spaces(struct drm_gem_object *obj)
+ {
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+-	struct msm_gem_vma *vma, *tmp;
++	struct msm_gem_vma *vma;
+ 
+ 	WARN_ON(!msm_gem_is_locked(obj));
+ 
+-	list_for_each_entry_safe(vma, tmp, &msm_obj->vmas, list) {
++	list_for_each_entry(vma, &msm_obj->vmas, list) {
+ 		if (vma->aspace) {
+ 			msm_gem_purge_vma(vma->aspace, vma);
+ 			msm_gem_close_vma(vma->aspace, vma);
+ 		}
++	}
++}
++
++/* Called with msm_obj locked */
++static void
++put_iova_vmas(struct drm_gem_object *obj)
++{
++	struct msm_gem_object *msm_obj = to_msm_bo(obj);
++	struct msm_gem_vma *vma, *tmp;
++
++	WARN_ON(!msm_gem_is_locked(obj));
++
++	list_for_each_entry_safe(vma, tmp, &msm_obj->vmas, list) {
+ 		del_vma(vma);
+ 	}
+ }
+@@ -697,12 +710,14 @@ void msm_gem_purge(struct drm_gem_object *obj)
+ 	WARN_ON(!is_purgeable(msm_obj));
+ 	WARN_ON(obj->import_attach);
+ 
+-	put_iova(obj);
++	put_iova_spaces(obj);
+ 
+ 	msm_gem_vunmap(obj);
+ 
+ 	put_pages(obj);
+ 
++	put_iova_vmas(obj);
++
+ 	msm_obj->madv = __MSM_MADV_PURGED;
+ 
+ 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
+@@ -964,7 +979,7 @@ void msm_gem_free_object(struct drm_gem_object *obj)
+ 	/* object should not be on active list: */
+ 	WARN_ON(is_active(msm_obj));
+ 
+-	put_iova(obj);
++	put_iova_spaces(obj);
+ 
+ 	if (obj->import_attach) {
+ 		WARN_ON(msm_obj->vaddr);
+@@ -987,6 +1002,8 @@ void msm_gem_free_object(struct drm_gem_object *obj)
+ 		msm_gem_unlock(obj);
+ 	}
+ 
++	put_iova_vmas(obj);
++
+ 	drm_gem_object_release(obj);
+ 
+ 	kfree(msm_obj);
+-- 
+2.25.1
+

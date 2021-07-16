@@ -1,0 +1,186 @@
+From 1207357bf726a23cc1e35f5bee11da62e4806300 Mon Sep 17 00:00:00 2001
+From: Sebastian Reichel <sebastian.reichel@collabora.com>
+Date: Tue, 15 Dec 2020 12:45:41 +0200
+Subject: [PATCH 0244/1087] drm/omap: dsi: drop virtual channel logic
+
+This drops the virtual channel logic. Afterwards DSI clients
+request their channel number and get the virtual channel with
+the same number or -EBUSY if already in use.
+
+The change here is not strictly speaking correct, as it combines the VC
+(DSI's "configuration block") and virtual channel ID (the ID sent in the
+DSI packets). But as we currently only support a single DSI command mode
+panel, this works fine: we always use VC0, and VC ID 0.
+
+This needs more work to support video mode panels, but that can be done
+after moving to DRM bridge and panel model, after which we can do that
+work with the proper APIs.
+
+Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201215104657.802264-9-tomi.valkeinen@ti.com
+---
+ .../gpu/drm/omapdrm/displays/panel-dsi-cm.c   | 11 ++---
+ drivers/gpu/drm/omapdrm/dss/dsi.c             | 46 ++++---------------
+ drivers/gpu/drm/omapdrm/dss/omapdss.h         |  4 +-
+ 3 files changed, 12 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c b/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
+index 6dc5a5f32e57..704d0d3309ad 100644
+--- a/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
++++ b/drivers/gpu/drm/omapdrm/displays/panel-dsi-cm.c
+@@ -768,19 +768,12 @@ static int dsicm_connect(struct omap_dss_device *src,
+ 	struct device *dev = &ddata->pdev->dev;
+ 	int r;
+ 
+-	r = src->ops->dsi.request_vc(src, &ddata->channel);
++	r = src->ops->dsi.request_vc(src, ddata->channel);
+ 	if (r) {
+ 		dev_err(dev, "failed to get virtual channel\n");
+ 		return r;
+ 	}
+ 
+-	r = src->ops->dsi.set_vc_id(src, ddata->channel, TCH);
+-	if (r) {
+-		dev_err(dev, "failed to set VC_ID\n");
+-		src->ops->dsi.release_vc(src, ddata->channel);
+-		return r;
+-	}
+-
+ 	ddata->src = src;
+ 	return 0;
+ }
+@@ -1215,6 +1208,8 @@ static int dsicm_probe_of(struct platform_device *pdev)
+ 	struct display_timing timing;
+ 	int err;
+ 
++	ddata->channel = TCH;
++
+ 	ddata->reset_gpio = devm_gpiod_get(&pdev->dev, "reset", GPIOD_OUT_LOW);
+ 	if (IS_ERR(ddata->reset_gpio)) {
+ 		err = PTR_ERR(ddata->reset_gpio);
+diff --git a/drivers/gpu/drm/omapdrm/dss/dsi.c b/drivers/gpu/drm/omapdrm/dss/dsi.c
+index d2566992d065..84688e977a5c 100644
+--- a/drivers/gpu/drm/omapdrm/dss/dsi.c
++++ b/drivers/gpu/drm/omapdrm/dss/dsi.c
+@@ -350,7 +350,6 @@ struct dsi_data {
+ 		struct omap_dss_device *dssdev;
+ 		enum fifo_size tx_fifo_size;
+ 		enum fifo_size rx_fifo_size;
+-		int vc_id;
+ 	} vc[4];
+ 
+ 	struct mutex lock;
+@@ -2581,7 +2580,7 @@ static inline void dsi_vc_write_long_header(struct dsi_data *dsi, int channel,
+ 
+ 	WARN_ON(!dsi_bus_is_locked(dsi));
+ 
+-	data_id = data_type | dsi->vc[channel].vc_id << 6;
++	data_id = data_type | channel << 6;
+ 
+ 	val = FLD_VAL(data_id, 7, 0) | FLD_VAL(len, 23, 8) |
+ 		FLD_VAL(ecc, 31, 24);
+@@ -2685,7 +2684,7 @@ static int dsi_vc_send_short(struct dsi_data *dsi, int channel, u8 data_type,
+ 		return -EINVAL;
+ 	}
+ 
+-	data_id = data_type | dsi->vc[channel].vc_id << 6;
++	data_id = data_type | channel << 6;
+ 
+ 	r = (data_id << 0) | (data << 8) | (ecc << 24);
+ 
+@@ -4787,45 +4786,19 @@ static enum omap_channel dsi_get_channel(struct dsi_data *dsi)
+ 	}
+ }
+ 
+-static int dsi_request_vc(struct omap_dss_device *dssdev, int *channel)
++static int dsi_request_vc(struct omap_dss_device *dssdev, int channel)
+ {
+ 	struct dsi_data *dsi = to_dsi_data(dssdev);
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(dsi->vc); i++) {
+-		if (!dsi->vc[i].dssdev) {
+-			dsi->vc[i].dssdev = dssdev;
+-			*channel = i;
+-			return 0;
+-		}
+-	}
+ 
+-	DSSERR("cannot get VC for display %s", dssdev->name);
+-	return -ENOSPC;
+-}
+-
+-static int dsi_set_vc_id(struct omap_dss_device *dssdev, int channel, int vc_id)
+-{
+-	struct dsi_data *dsi = to_dsi_data(dssdev);
+-
+-	if (vc_id < 0 || vc_id > 3) {
+-		DSSERR("VC ID out of range\n");
+-		return -EINVAL;
+-	}
+-
+-	if (channel < 0 || channel > 3) {
+-		DSSERR("Virtual Channel out of range\n");
++	if (channel < 0 || channel > 3)
+ 		return -EINVAL;
+-	}
+ 
+-	if (dsi->vc[channel].dssdev != dssdev) {
+-		DSSERR("Virtual Channel not allocated to display %s\n",
+-			dssdev->name);
+-		return -EINVAL;
++	if (dsi->vc[channel].dssdev) {
++		DSSERR("cannot get VC for display %s", dssdev->name);
++		return -EBUSY;
+ 	}
+ 
+-	dsi->vc[channel].vc_id = vc_id;
+-
++	dsi->vc[channel].dssdev = dssdev;
+ 	return 0;
+ }
+ 
+@@ -4836,7 +4809,6 @@ static void dsi_release_vc(struct omap_dss_device *dssdev, int channel)
+ 	if ((channel >= 0 && channel <= 3) &&
+ 		dsi->vc[channel].dssdev == dssdev) {
+ 		dsi->vc[channel].dssdev = NULL;
+-		dsi->vc[channel].vc_id = 0;
+ 	}
+ }
+ 
+@@ -4943,7 +4915,6 @@ static const struct omap_dss_device_ops dsi_ops = {
+ 		.enable_te = dsi_enable_te,
+ 
+ 		.request_vc = dsi_request_vc,
+-		.set_vc_id = dsi_set_vc_id,
+ 		.release_vc = dsi_release_vc,
+ 
+ 		.transfer = omap_dsi_transfer,
+@@ -5399,7 +5370,6 @@ static int dsi_probe(struct platform_device *pdev)
+ 	for (i = 0; i < ARRAY_SIZE(dsi->vc); i++) {
+ 		dsi->vc[i].source = DSI_VC_SOURCE_L4;
+ 		dsi->vc[i].dssdev = NULL;
+-		dsi->vc[i].vc_id = 0;
+ 	}
+ 
+ 	r = dsi_get_clocks(dsi);
+diff --git a/drivers/gpu/drm/omapdrm/dss/omapdss.h b/drivers/gpu/drm/omapdrm/dss/omapdss.h
+index 74f4d3bf13e4..dcb2e7b8a7e7 100644
+--- a/drivers/gpu/drm/omapdrm/dss/omapdss.h
++++ b/drivers/gpu/drm/omapdrm/dss/omapdss.h
+@@ -305,9 +305,7 @@ struct omapdss_dsi_ops {
+ 	void (*disable_video_output)(struct omap_dss_device *dssdev,
+ 			int channel);
+ 
+-	int (*request_vc)(struct omap_dss_device *dssdev, int *channel);
+-	int (*set_vc_id)(struct omap_dss_device *dssdev, int channel,
+-			int vc_id);
++	int (*request_vc)(struct omap_dss_device *dssdev, int channel);
+ 	void (*release_vc)(struct omap_dss_device *dssdev, int channel);
+ 
+ 	/* data transfer */
+-- 
+2.17.1
+

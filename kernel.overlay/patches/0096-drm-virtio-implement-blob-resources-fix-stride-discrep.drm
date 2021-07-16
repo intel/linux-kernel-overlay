@@ -1,0 +1,199 @@
+From d6a29989b6d1c16d33c4577ac36e74ecd2e85603 Mon Sep 17 00:00:00 2001
+From: Gurchetan Singh <gurchetansingh@chromium.org>
+Date: Wed, 23 Sep 2020 17:32:11 -0700
+Subject: [PATCH 0096/1714] drm/virtio: implement blob resources: fix stride
+ discrepancy
+
+The old transfer ioctls may work on blob resources, and there is no
+TRANSFER_BLOB hypercall now for simplicity.
+
+The guest may have a image view on the blob resources such that the
+stride is not equal to width * bytes_per_pixel.
+
+For host-only blobs, we can repurpose the transfer ioctls to synchronize
+caches as well.  For guest-only blobs, these operations are undefined
+for now so leave them out.
+
+Also, with seamless Wayland integration between guest/host looking
+increasingly attractive, it also makes sense to keep track of
+one value for stride.
+
+Signed-off-by: Gurchetan Singh <gurchetansingh@chromium.org>
+Acked-by: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20200924003214.662-16-gurchetansingh@chromium.org
+Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h   |  4 +++
+ drivers/gpu/drm/virtio/virtgpu_ioctl.c | 35 +++++++++++++++++++++++---
+ drivers/gpu/drm/virtio/virtgpu_vq.c    | 14 +++++++++--
+ 3 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index bbbe28f8b943..ad16cef9a39b 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -351,12 +351,16 @@ void virtio_gpu_cmd_submit(struct virtio_gpu_device *vgdev,
+ void virtio_gpu_cmd_transfer_from_host_3d(struct virtio_gpu_device *vgdev,
+ 					  uint32_t ctx_id,
+ 					  uint64_t offset, uint32_t level,
++					  uint32_t stride,
++					  uint32_t layer_stride,
+ 					  struct drm_virtgpu_3d_box *box,
+ 					  struct virtio_gpu_object_array *objs,
+ 					  struct virtio_gpu_fence *fence);
+ void virtio_gpu_cmd_transfer_to_host_3d(struct virtio_gpu_device *vgdev,
+ 					uint32_t ctx_id,
+ 					uint64_t offset, uint32_t level,
++					uint32_t stride,
++					uint32_t layer_stride,
+ 					struct drm_virtgpu_3d_box *box,
+ 					struct virtio_gpu_object_array *objs,
+ 					struct virtio_gpu_fence *fence);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+index c8da7adc6b30..0bf789f2bfde 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -312,6 +312,7 @@ static int virtio_gpu_transfer_from_host_ioctl(struct drm_device *dev,
+ 	struct virtio_gpu_device *vgdev = dev->dev_private;
+ 	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
+ 	struct drm_virtgpu_3d_transfer_from_host *args = data;
++	struct virtio_gpu_object *bo;
+ 	struct virtio_gpu_object_array *objs;
+ 	struct virtio_gpu_fence *fence;
+ 	int ret;
+@@ -325,6 +326,17 @@ static int virtio_gpu_transfer_from_host_ioctl(struct drm_device *dev,
+ 	if (objs == NULL)
+ 		return -ENOENT;
+ 
++	bo = gem_to_virtio_gpu_obj(objs->objs[0]);
++	if (bo->guest_blob && !bo->host3d_blob) {
++		ret = -EINVAL;
++		goto err_put_free;
++	}
++
++	if (!bo->host3d_blob && (args->stride || args->layer_stride)) {
++		ret = -EINVAL;
++		goto err_put_free;
++	}
++
+ 	ret = virtio_gpu_array_lock_resv(objs);
+ 	if (ret != 0)
+ 		goto err_put_free;
+@@ -334,9 +346,10 @@ static int virtio_gpu_transfer_from_host_ioctl(struct drm_device *dev,
+ 		ret = -ENOMEM;
+ 		goto err_unlock;
+ 	}
++
+ 	virtio_gpu_cmd_transfer_from_host_3d
+-		(vgdev, vfpriv->ctx_id, offset, args->level,
+-		 &args->box, objs, fence);
++		(vgdev, vfpriv->ctx_id, offset, args->level, args->stride,
++		 args->layer_stride, &args->box, objs, fence);
+ 	dma_fence_put(&fence->f);
+ 	virtio_gpu_notify(vgdev);
+ 	return 0;
+@@ -354,6 +367,7 @@ static int virtio_gpu_transfer_to_host_ioctl(struct drm_device *dev, void *data,
+ 	struct virtio_gpu_device *vgdev = dev->dev_private;
+ 	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
+ 	struct drm_virtgpu_3d_transfer_to_host *args = data;
++	struct virtio_gpu_object *bo;
+ 	struct virtio_gpu_object_array *objs;
+ 	struct virtio_gpu_fence *fence;
+ 	int ret;
+@@ -363,6 +377,12 @@ static int virtio_gpu_transfer_to_host_ioctl(struct drm_device *dev, void *data,
+ 	if (objs == NULL)
+ 		return -ENOENT;
+ 
++	bo = gem_to_virtio_gpu_obj(objs->objs[0]);
++	if (bo->guest_blob && !bo->host3d_blob) {
++		ret = -EINVAL;
++		goto err_put_free;
++	}
++
+ 	if (!vgdev->has_virgl_3d) {
+ 		virtio_gpu_cmd_transfer_to_host_2d
+ 			(vgdev, offset,
+@@ -370,6 +390,12 @@ static int virtio_gpu_transfer_to_host_ioctl(struct drm_device *dev, void *data,
+ 			 objs, NULL);
+ 	} else {
+ 		virtio_gpu_create_context(dev, file);
++
++		if (!bo->host3d_blob && (args->stride || args->layer_stride)) {
++			ret = -EINVAL;
++			goto err_put_free;
++		}
++
+ 		ret = virtio_gpu_array_lock_resv(objs);
+ 		if (ret != 0)
+ 			goto err_put_free;
+@@ -381,8 +407,9 @@ static int virtio_gpu_transfer_to_host_ioctl(struct drm_device *dev, void *data,
+ 
+ 		virtio_gpu_cmd_transfer_to_host_3d
+ 			(vgdev,
+-			 vfpriv ? vfpriv->ctx_id : 0, offset,
+-			 args->level, &args->box, objs, fence);
++			 vfpriv ? vfpriv->ctx_id : 0, offset, args->level,
++			 args->stride, args->layer_stride, &args->box, objs,
++			 fence);
+ 		dma_fence_put(&fence->f);
+ 	}
+ 	virtio_gpu_notify(vgdev);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index 8f62880902d2..3148940560fe 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -1016,6 +1016,8 @@ virtio_gpu_cmd_resource_create_3d(struct virtio_gpu_device *vgdev,
+ void virtio_gpu_cmd_transfer_to_host_3d(struct virtio_gpu_device *vgdev,
+ 					uint32_t ctx_id,
+ 					uint64_t offset, uint32_t level,
++					uint32_t stride,
++					uint32_t layer_stride,
+ 					struct drm_virtgpu_3d_box *box,
+ 					struct virtio_gpu_object_array *objs,
+ 					struct virtio_gpu_fence *fence)
+@@ -1024,11 +1026,13 @@ void virtio_gpu_cmd_transfer_to_host_3d(struct virtio_gpu_device *vgdev,
+ 	struct virtio_gpu_transfer_host_3d *cmd_p;
+ 	struct virtio_gpu_vbuffer *vbuf;
+ 	bool use_dma_api = !virtio_has_dma_quirk(vgdev->vdev);
+-	struct virtio_gpu_object_shmem *shmem = to_virtio_gpu_shmem(bo);
+ 
+-	if (use_dma_api)
++	if (virtio_gpu_is_shmem(bo) && use_dma_api) {
++		struct virtio_gpu_object_shmem *shmem = to_virtio_gpu_shmem(bo);
++
+ 		dma_sync_sgtable_for_device(vgdev->vdev->dev.parent,
+ 					    shmem->pages, DMA_TO_DEVICE);
++	}
+ 
+ 	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
+ 	memset(cmd_p, 0, sizeof(*cmd_p));
+@@ -1041,6 +1045,8 @@ void virtio_gpu_cmd_transfer_to_host_3d(struct virtio_gpu_device *vgdev,
+ 	convert_to_hw_box(&cmd_p->box, box);
+ 	cmd_p->offset = cpu_to_le64(offset);
+ 	cmd_p->level = cpu_to_le32(level);
++	cmd_p->stride = cpu_to_le32(stride);
++	cmd_p->layer_stride = cpu_to_le32(layer_stride);
+ 
+ 	virtio_gpu_queue_fenced_ctrl_buffer(vgdev, vbuf, fence);
+ }
+@@ -1048,6 +1054,8 @@ void virtio_gpu_cmd_transfer_to_host_3d(struct virtio_gpu_device *vgdev,
+ void virtio_gpu_cmd_transfer_from_host_3d(struct virtio_gpu_device *vgdev,
+ 					  uint32_t ctx_id,
+ 					  uint64_t offset, uint32_t level,
++					  uint32_t stride,
++					  uint32_t layer_stride,
+ 					  struct drm_virtgpu_3d_box *box,
+ 					  struct virtio_gpu_object_array *objs,
+ 					  struct virtio_gpu_fence *fence)
+@@ -1067,6 +1075,8 @@ void virtio_gpu_cmd_transfer_from_host_3d(struct virtio_gpu_device *vgdev,
+ 	convert_to_hw_box(&cmd_p->box, box);
+ 	cmd_p->offset = cpu_to_le64(offset);
+ 	cmd_p->level = cpu_to_le32(level);
++	cmd_p->stride = cpu_to_le32(stride);
++	cmd_p->layer_stride = cpu_to_le32(layer_stride);
+ 
+ 	virtio_gpu_queue_fenced_ctrl_buffer(vgdev, vbuf, fence);
+ }
+-- 
+2.25.1
+

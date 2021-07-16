@@ -1,0 +1,209 @@
+From d1762df74785e97938eea87c1b172482a4db3790 Mon Sep 17 00:00:00 2001
+From: Kuogee Hsieh <khsieh@codeaurora.org>
+Date: Tue, 20 Oct 2020 15:04:54 -0700
+Subject: [PATCH 1090/1714] drm/msm/dp: add opp_table corner voting support
+ base on dp_ink_clk rate
+
+Set link rate by using OPP set rate api so that CX level will be set
+accordingly based on the link rate.
+
+Changes in v2:
+-- remove dev from dp_ctrl_put() parameters
+-- Add more information to commit message
+
+Changes in v3:
+-- return when dev_pm_opp_set_clkname() failed
+
+Signed-off-by: Kuogee Hsieh <khsieh@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 28 ++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_display.c |  2 +-
+ drivers/gpu/drm/msm/dp/dp_power.c   | 44 ++++++++++++++++++++++++++---
+ drivers/gpu/drm/msm/dp/dp_power.h   |  2 +-
+ 4 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 872b12689e31..7572264a7156 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -10,6 +10,7 @@
+ #include <linux/delay.h>
+ #include <linux/phy/phy.h>
+ #include <linux/phy/phy-dp.h>
++#include <linux/pm_opp.h>
+ #include <drm/drm_fixed.h>
+ #include <drm/drm_dp_helper.h>
+ #include <drm/drm_print.h>
+@@ -76,6 +77,8 @@ struct dp_ctrl_private {
+ 	struct dp_parser *parser;
+ 	struct dp_catalog *catalog;
+ 
++	struct opp_table *opp_table;
++
+ 	struct completion idle_comp;
+ 	struct completion video_comp;
+ };
+@@ -1833,6 +1836,7 @@ struct dp_ctrl *dp_ctrl_get(struct device *dev, struct dp_link *link,
+ 			struct dp_parser *parser)
+ {
+ 	struct dp_ctrl_private *ctrl;
++	int ret;
+ 
+ 	if (!dev || !panel || !aux ||
+ 	    !link || !catalog) {
+@@ -1846,6 +1850,21 @@ struct dp_ctrl *dp_ctrl_get(struct device *dev, struct dp_link *link,
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	ctrl->opp_table = dev_pm_opp_set_clkname(dev, "ctrl_link");
++	if (IS_ERR(ctrl->opp_table)) {
++		dev_err(dev, "invalid DP OPP table in device tree\n");
++		/* caller do PTR_ERR(ctrl->opp_table) */
++		return (struct dp_ctrl *)ctrl->opp_table;
++	}
++
++	/* OPP table is optional */
++	ret = dev_pm_opp_of_add_table(dev);
++	if (ret) {
++		dev_err(dev, "failed to add DP OPP table\n");
++		dev_pm_opp_put_clkname(ctrl->opp_table);
++		ctrl->opp_table = NULL;
++	}
++
+ 	init_completion(&ctrl->idle_comp);
+ 	init_completion(&ctrl->video_comp);
+ 
+@@ -1863,4 +1882,13 @@ struct dp_ctrl *dp_ctrl_get(struct device *dev, struct dp_link *link,
+ 
+ void dp_ctrl_put(struct dp_ctrl *dp_ctrl)
+ {
++	struct dp_ctrl_private *ctrl;
++
++	ctrl = container_of(dp_ctrl, struct dp_ctrl_private, dp_ctrl);
++
++	if (ctrl->opp_table) {
++		dev_pm_opp_of_remove_table(ctrl->dev);
++		dev_pm_opp_put_clkname(ctrl->opp_table);
++		ctrl->opp_table = NULL;
++	}
+ }
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index ae9989ece73f..764d871fd8a7 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -699,7 +699,7 @@ static int dp_init_sub_modules(struct dp_display_private *dp)
+ 		goto error;
+ 	}
+ 
+-	dp->power = dp_power_get(dp->parser);
++	dp->power = dp_power_get(dev, dp->parser);
+ 	if (IS_ERR(dp->power)) {
+ 		rc = PTR_ERR(dp->power);
+ 		DRM_ERROR("failed to initialize power, rc = %d\n", rc);
+diff --git a/drivers/gpu/drm/msm/dp/dp_power.c b/drivers/gpu/drm/msm/dp/dp_power.c
+index 17c1fc6a2d44..9c4ea00a5f2a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_power.c
++++ b/drivers/gpu/drm/msm/dp/dp_power.c
+@@ -8,12 +8,14 @@
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/pm_opp.h>
+ #include "dp_power.h"
+ #include "msm_drv.h"
+ 
+ struct dp_power_private {
+ 	struct dp_parser *parser;
+ 	struct platform_device *pdev;
++	struct device *dev;
+ 	struct clk *link_clk_src;
+ 	struct clk *pixel_provider;
+ 	struct clk *link_provider;
+@@ -148,18 +150,51 @@ static int dp_power_clk_deinit(struct dp_power_private *power)
+ 	return 0;
+ }
+ 
++static int dp_power_clk_set_link_rate(struct dp_power_private *power,
++			struct dss_clk *clk_arry, int num_clk, int enable)
++{
++	u32 rate;
++	int i, rc = 0;
++
++	for (i = 0; i < num_clk; i++) {
++		if (clk_arry[i].clk) {
++			if (clk_arry[i].type == DSS_CLK_PCLK) {
++				if (enable)
++					rate = clk_arry[i].rate;
++				else
++					rate = 0;
++
++				rc = dev_pm_opp_set_rate(power->dev, rate);
++				if (rc)
++					break;
++			}
++
++		}
++	}
++	return rc;
++}
++
+ static int dp_power_clk_set_rate(struct dp_power_private *power,
+ 		enum dp_pm_type module, bool enable)
+ {
+ 	int rc = 0;
+ 	struct dss_module_power *mp = &power->parser->mp[module];
+ 
+-	if (enable) {
+-		rc = msm_dss_clk_set_rate(mp->clk_config, mp->num_clk);
++	if (module == DP_CTRL_PM) {
++		rc = dp_power_clk_set_link_rate(power, mp->clk_config, mp->num_clk, enable);
+ 		if (rc) {
+-			DRM_ERROR("failed to set clks rate.\n");
++			DRM_ERROR("failed to set link clks rate\n");
+ 			return rc;
+ 		}
++	} else {
++
++		if (enable) {
++			rc = msm_dss_clk_set_rate(mp->clk_config, mp->num_clk);
++			if (rc) {
++				DRM_ERROR("failed to set clks rate\n");
++				return rc;
++			}
++		}
+ 	}
+ 
+ 	rc = msm_dss_enable_clk(mp->clk_config, mp->num_clk, enable);
+@@ -349,7 +384,7 @@ int dp_power_deinit(struct dp_power *dp_power)
+ 	return 0;
+ }
+ 
+-struct dp_power *dp_power_get(struct dp_parser *parser)
++struct dp_power *dp_power_get(struct device *dev, struct dp_parser *parser)
+ {
+ 	struct dp_power_private *power;
+ 	struct dp_power *dp_power;
+@@ -365,6 +400,7 @@ struct dp_power *dp_power_get(struct dp_parser *parser)
+ 
+ 	power->parser = parser;
+ 	power->pdev = parser->pdev;
++	power->dev = dev;
+ 
+ 	dp_power = &power->dp_power;
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_power.h b/drivers/gpu/drm/msm/dp/dp_power.h
+index 76743d755833..7d0327bbc0d5 100644
+--- a/drivers/gpu/drm/msm/dp/dp_power.h
++++ b/drivers/gpu/drm/msm/dp/dp_power.h
+@@ -102,6 +102,6 @@ void dp_power_client_deinit(struct dp_power *power);
+  * methods to be called by the client to configure the power related
+  * modueles.
+  */
+-struct dp_power *dp_power_get(struct dp_parser *parser);
++struct dp_power *dp_power_get(struct device *dev, struct dp_parser *parser);
+ 
+ #endif /* _DP_POWER_H_ */
+-- 
+2.25.1
+

@@ -1,0 +1,126 @@
+From 75a8e255a2e59c5cc06ce0f51a0c0501d7375f53 Mon Sep 17 00:00:00 2001
+From: Anshuman Gupta <anshuman.gupta@intel.com>
+Date: Mon, 11 Jan 2021 13:41:06 +0530
+Subject: [PATCH 008/128] drm/i915/hdcp: DP MST transcoder for link and stream
+
+Gen12 has H/W delta with respect to HDCP{1.x,2.x} display engine
+instances lies in Transcoder instead of DDI as in Gen11.
+
+This requires hdcp driver to use mst_master_transcoder for link
+authentication and stream transcoder for stream encryption
+separately.
+
+This will be used for both HDCP 1.4 and HDCP 2.2 over DP MST
+on Gen12.
+
+Cc: Ramalingam C <ramalingam.c@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Reviewed-by: Ramalingam C <ramalingam.c@intel.com>
+Tested-by: Karthik B S <karthik.b.s@intel.com>
+Signed-off-by: Anshuman Gupta <anshuman.gupta@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210111081120.28417-6-anshuman.gupta@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c          |  2 +-
+ .../gpu/drm/i915/display/intel_display_types.h    |  2 ++
+ drivers/gpu/drm/i915/display/intel_dp_mst.c       |  2 +-
+ drivers/gpu/drm/i915/display/intel_hdcp.c         | 15 +++++++++++----
+ drivers/gpu/drm/i915/display/intel_hdcp.h         |  2 +-
+ 5 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index ef9848001418..a3bf76d06196 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -4326,7 +4326,7 @@ static void intel_enable_ddi(struct intel_atomic_state *state,
+ 	if (conn_state->content_protection ==
+ 	    DRM_MODE_CONTENT_PROTECTION_DESIRED)
+ 		intel_hdcp_enable(to_intel_connector(conn_state->connector),
+-				  crtc_state->cpu_transcoder,
++				  crtc_state,
+ 				  (u8)conn_state->hdcp_content_type);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 9dfad41eb3dc..9b4821dca30e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -436,6 +436,8 @@ struct intel_hdcp {
+ 	 * Hence caching the transcoder here.
+ 	 */
+ 	enum transcoder cpu_transcoder;
++	/* Only used for DP MST stream encryption */
++	enum transcoder stream_transcoder;
+ };
+ 
+ struct intel_connector {
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 27f04aed8764..47beb442094f 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -569,7 +569,7 @@ static void intel_mst_enable_dp(struct intel_atomic_state *state,
+ 	if (conn_state->content_protection ==
+ 	    DRM_MODE_CONTENT_PROTECTION_DESIRED)
+ 		intel_hdcp_enable(to_intel_connector(conn_state->connector),
+-				  pipe_config->cpu_transcoder,
++				  pipe_config,
+ 				  (u8)conn_state->hdcp_content_type);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hdcp.c b/drivers/gpu/drm/i915/display/intel_hdcp.c
+index 7d63e9495956..293f72d1d215 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdcp.c
++++ b/drivers/gpu/drm/i915/display/intel_hdcp.c
+@@ -2095,7 +2095,7 @@ int intel_hdcp_init(struct intel_connector *connector,
+ }
+ 
+ int intel_hdcp_enable(struct intel_connector *connector,
+-		      enum transcoder cpu_transcoder, u8 content_type)
++		      const struct intel_crtc_state *pipe_config, u8 content_type)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
+ 	struct intel_digital_port *dig_port = intel_attached_dig_port(connector);
+@@ -2117,10 +2117,17 @@ int intel_hdcp_enable(struct intel_connector *connector,
+ 	drm_WARN_ON(&dev_priv->drm,
+ 		    hdcp->value == DRM_MODE_CONTENT_PROTECTION_ENABLED);
+ 	hdcp->content_type = content_type;
+-	hdcp->cpu_transcoder = cpu_transcoder;
++
++	if (intel_crtc_has_type(pipe_config, INTEL_OUTPUT_DP_MST)) {
++		hdcp->cpu_transcoder = pipe_config->mst_master_transcoder;
++		hdcp->stream_transcoder = pipe_config->cpu_transcoder;
++	} else {
++		hdcp->cpu_transcoder = pipe_config->cpu_transcoder;
++		hdcp->stream_transcoder = INVALID_TRANSCODER;
++	}
+ 
+ 	if (INTEL_GEN(dev_priv) >= 12)
+-		hdcp->port_data.fw_tc = intel_get_mei_fw_tc(cpu_transcoder);
++		hdcp->port_data.fw_tc = intel_get_mei_fw_tc(hdcp->cpu_transcoder);
+ 
+ 	/*
+ 	 * Considering that HDCP2.2 is more secure than HDCP1.4, If the setup
+@@ -2240,7 +2247,7 @@ void intel_hdcp_update_pipe(struct intel_atomic_state *state,
+ 
+ 	if (desired_and_not_enabled || content_protection_type_changed)
+ 		intel_hdcp_enable(connector,
+-				  crtc_state->cpu_transcoder,
++				  crtc_state,
+ 				  (u8)conn_state->hdcp_content_type);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hdcp.h b/drivers/gpu/drm/i915/display/intel_hdcp.h
+index 1bbf5b67ed0a..bc51c1e9b481 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdcp.h
++++ b/drivers/gpu/drm/i915/display/intel_hdcp.h
+@@ -25,7 +25,7 @@ void intel_hdcp_atomic_check(struct drm_connector *connector,
+ int intel_hdcp_init(struct intel_connector *connector, enum port port,
+ 		    const struct intel_hdcp_shim *hdcp_shim);
+ int intel_hdcp_enable(struct intel_connector *connector,
+-		      enum transcoder cpu_transcoder, u8 content_type);
++		      const struct intel_crtc_state *pipe_config, u8 content_type);
+ int intel_hdcp_disable(struct intel_connector *connector);
+ void intel_hdcp_update_pipe(struct intel_atomic_state *state,
+ 			    struct intel_encoder *encoder,
+-- 
+2.17.1
+

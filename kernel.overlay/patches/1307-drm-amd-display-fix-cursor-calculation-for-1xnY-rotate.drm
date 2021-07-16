@@ -1,0 +1,130 @@
+From bc625a7851b8fc7c6d4ab1bbedeaeecbfa42ca29 Mon Sep 17 00:00:00 2001
+From: Samson Tam <Samson.Tam@amd.com>
+Date: Fri, 30 Oct 2020 12:30:09 -0400
+Subject: [PATCH 1307/1714] drm/amd/display: fix cursor calculation for 1xnY
+ rotated display groups
+
+[Why]
+Cursor is missing on displays 2 and up when doing rotated
+ display groups in 1xnY setup.  Calculation puts cursor
+ out of bounds so it is not enabled.
+
+[How]
+In dcn10_set_cursor_position(), add in viewport.y into cursor
+ calculations for 1xnY rotated display groups.
+For pipe split, check viewport.y for both pipes and use lower one
+ to normalize cursor position before calculations.
+Add odm 2:1 support ( using same calculations as pipe split ).
+
+Signed-off-by: Samson Tam <Samson.Tam@amd.com>
+Acked-by: Bindu Ramamurthy <bindu.r@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../amd/display/dc/dcn10/dcn10_hw_sequencer.c | 64 +++++++++++++++++--
+ 1 file changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 8eb88a50af51..1e18f0bb40b6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -3279,6 +3279,8 @@ void dcn10_set_cursor_position(struct pipe_ctx *pipe_ctx)
+ 	};
+ 	bool pipe_split_on = (pipe_ctx->top_pipe != NULL) ||
+ 		(pipe_ctx->bottom_pipe != NULL);
++	bool odm_combine_on = (pipe_ctx->next_odm_pipe != NULL) ||
++		(pipe_ctx->prev_odm_pipe != NULL);
+ 
+ 	int x_plane = pipe_ctx->plane_state->dst_rect.x;
+ 	int y_plane = pipe_ctx->plane_state->dst_rect.y;
+@@ -3362,16 +3364,56 @@ void dcn10_set_cursor_position(struct pipe_ctx *pipe_ctx)
+ 		uint32_t temp_y = pos_cpy.y;
+ 		int viewport_height =
+ 			pipe_ctx->plane_res.scl_data.viewport.height;
+-
+-		if (pipe_split_on) {
++		int viewport_y =
++			pipe_ctx->plane_res.scl_data.viewport.y;
++
++		/**
++		 * Display groups that are 1xnY, have pos_cpy.x > 2 * viewport.height
++		 * For pipe split cases:
++		 * - apply offset of viewport.y to normalize pos_cpy.x
++		 * - calculate the pos_cpy.y as before
++		 * - shift pos_cpy.y back by same offset to get final value
++		 * - since we iterate through both pipes, use the lower
++		 *   viewport.y for offset
++		 * For non pipe split cases, use the same calculation for
++		 *  pos_cpy.y as the 180 degree rotation case below,
++		 *  but use pos_cpy.x as our input because we are rotating
++		 *  270 degrees
++		 */
++		if (pipe_split_on || odm_combine_on) {
++			int pos_cpy_x_offset;
++			int other_pipe_viewport_y;
++
++			if (pipe_split_on) {
++				if (pipe_ctx->bottom_pipe) {
++					other_pipe_viewport_y =
++						pipe_ctx->bottom_pipe->plane_res.scl_data.viewport.y;
++				} else {
++					other_pipe_viewport_y =
++						pipe_ctx->top_pipe->plane_res.scl_data.viewport.y;
++				}
++			} else {
++				if (pipe_ctx->next_odm_pipe) {
++					other_pipe_viewport_y =
++						pipe_ctx->next_odm_pipe->plane_res.scl_data.viewport.y;
++				} else {
++					other_pipe_viewport_y =
++						pipe_ctx->prev_odm_pipe->plane_res.scl_data.viewport.y;
++				}
++			}
++			pos_cpy_x_offset = (viewport_y > other_pipe_viewport_y) ?
++				other_pipe_viewport_y : viewport_y;
++			pos_cpy.x -= pos_cpy_x_offset;
+ 			if (pos_cpy.x > viewport_height) {
+ 				pos_cpy.x = pos_cpy.x - viewport_height;
+ 				pos_cpy.y = viewport_height - pos_cpy.x;
+ 			} else {
+ 				pos_cpy.y = 2 * viewport_height - pos_cpy.x;
+ 			}
+-		} else
+-			pos_cpy.y = viewport_height - pos_cpy.x;
++			pos_cpy.y += pos_cpy_x_offset;
++		} else {
++			pos_cpy.y = (2 * viewport_y) + viewport_height - pos_cpy.x;
++		}
+ 		pos_cpy.x = temp_y;
+ 	}
+ 	// Mirror horizontally and vertically
+@@ -3381,7 +3423,7 @@ void dcn10_set_cursor_position(struct pipe_ctx *pipe_ctx)
+ 		int viewport_x =
+ 			pipe_ctx->plane_res.scl_data.viewport.x;
+ 
+-		if (pipe_split_on) {
++		if (pipe_split_on || odm_combine_on) {
+ 			if (pos_cpy.x >= viewport_width + viewport_x) {
+ 				pos_cpy.x = 2 * viewport_width
+ 						- pos_cpy.x + 2 * viewport_x;
+@@ -3399,7 +3441,17 @@ void dcn10_set_cursor_position(struct pipe_ctx *pipe_ctx)
+ 		} else {
+ 			pos_cpy.x = viewport_width - pos_cpy.x + 2 * viewport_x;
+ 		}
+-		pos_cpy.y = pipe_ctx->plane_res.scl_data.viewport.height - pos_cpy.y;
++
++		/**
++		 * Display groups that are 1xnY, have pos_cpy.y > viewport.height
++		 * Calculation:
++		 *   delta_from_bottom = viewport.y + viewport.height - pos_cpy.y
++		 *   pos_cpy.y_new = viewport.y + delta_from_bottom
++		 * Simplify it as:
++		 *   pos_cpy.y = viewport.y * 2 + viewport.height - pos_cpy.y
++		 */
++		pos_cpy.y = (2 * pipe_ctx->plane_res.scl_data.viewport.y) +
++			pipe_ctx->plane_res.scl_data.viewport.height - pos_cpy.y;
+ 	}
+ 
+ 	hubp->funcs->set_cursor_position(hubp, &pos_cpy, &param);
+-- 
+2.25.1
+
