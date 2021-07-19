@@ -1,0 +1,332 @@
+From b22d2086e09086fd9f31e8a499de544da837b177 Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Date: Fri, 19 Jun 2020 15:26:30 -0700
+Subject: [PATCH 64/82] ACPI: Add SVKL table support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For highly secure systems like (TDX), the storage volume will
+typically be an encrypted volume. In that case, by design, the
+Firmware will need to support quote generation and attestation
+to be able to fetch a set of storage-volume key(s) from a
+remote-key server during boot and pass the key to the OS. Also
+by design, the key is stored in the memory, and the information
+of the key is passed from Firmware to OS via an ACPI table. You
+can find more details about ACPI Storage Volume Key Label (SVKL)
+table in TDX spec titled "Guest-Host-Communication Interface (GHCI)
+for Intel® Trust Domain Extensions (Intel® TDX)", sec 4.4.
+
+Also, in order to pass the received storage keys to userspace, we
+define following set of IOCTLs.
+
+/* Get the total number of keys */
+   #define ACPI_SVKL_GET_KEY_COUNT _IOW('E', 0x01, __u32)
+/* Get the key header (by index) */
+   #define ACPI_SVKL_GET_KEY_INFO  _IOWR('E', 0x02, key_info_size)
+/* Get the key data (by index) */
+   #define ACPI_SVKL_GET_KEY_DATA  _IOR('E', 0x03, __u64)
+/* Clear the key data (by index) */
+   #define ACPI_SVKL_CLEAR_KEY     _IOR('E', 0x04, __u32)
+
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+---
+ drivers/acpi/Makefile |   1 +
+ drivers/acpi/svkl.c   | 179 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/acpi/tables.c |   2 +-
+ include/acpi/actbl2.h |  30 +++++++
+ include/linux/svkl.h  |  23 ++++++
+ 5 files changed, 234 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/acpi/svkl.c
+ create mode 100644 include/linux/svkl.h
+
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index 700b41adf2db..689745aa8520 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -96,6 +96,7 @@ obj-$(CONFIG_ACPI_CPPC_LIB)	+= cppc_acpi.o
+ obj-$(CONFIG_ACPI_SPCR_TABLE)	+= spcr.o
+ obj-$(CONFIG_ACPI_DEBUGGER_USER) += acpi_dbg.o
+ obj-$(CONFIG_ACPI_PPTT) 	+= pptt.o
++obj-$(CONFIG_ACPI) 		+= svkl.o
+ 
+ # processor has its own "processor." module_param namespace
+ processor-y			:= processor_driver.o
+diff --git a/drivers/acpi/svkl.c b/drivers/acpi/svkl.c
+new file mode 100644
+index 000000000000..2833f8ddd43e
+--- /dev/null
++++ b/drivers/acpi/svkl.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * svkl.c - ACPI SVKL interface driver.
++ *
++ * Copyright (C) 2020 Intel Corporation
++ *
++ * Parses the ACPI SVKL table and adds support to access/modify
++ * the SVKL table entries via set of user IOCTLs.
++ *
++ * Author:
++ *     Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
++ */
++
++#define pr_fmt(fmt) "SVKL: " fmt
++
++#include <linux/acpi.h>
++#include <linux/miscdevice.h>
++#include <linux/uaccess.h>
++#include <linux/svkl.h>
++#include <linux/fs.h>
++
++/* SVKL table header */
++static struct acpi_table_header *svkl_tbl_hdr;
++/* Lock to protect access to SVKL table */
++static struct mutex svkl_lock;
++
++static void dump_svkl_header(void)
++{
++	struct acpi_table_svkl *svkl_ktbl;
++	struct acpi_svkl_header *svkl_khdr;
++	int i;
++
++	svkl_ktbl = (struct acpi_table_svkl *) svkl_tbl_hdr;
++	svkl_khdr = (struct acpi_svkl_header *) (&svkl_ktbl[1]);
++
++	pr_info("Key Count   :%x\n", svkl_ktbl->count);
++
++	mutex_lock(&svkl_lock);
++	for (i = 0; i < svkl_ktbl->count; i++) {
++		svkl_khdr = &svkl_khdr[i];
++		pr_info("Key%d Type   :%x\n", i, svkl_khdr->type);
++		pr_info("Key%d Format :%x\n", i, svkl_khdr->format);
++		pr_info("Key%d Size   :%d\n", i, svkl_khdr->size);
++		pr_info("Key%d Addr   :%llx\n", i, svkl_khdr->address);
++	}
++	mutex_unlock(&svkl_lock);
++}
++
++static int get_index(void __user *argp, u32 *index)
++{
++	struct acpi_table_svkl *svkl_ktbl;
++
++	svkl_ktbl = (struct acpi_table_svkl *) svkl_tbl_hdr;
++
++	if (get_user(*index, (u32 __user *)argp))
++		return -EFAULT;
++
++	if (*index >= svkl_ktbl->count)
++		return -EINVAL;
++
++	return 0;
++
++}
++
++static long acpi_svkl_ioctl(struct file *f, unsigned int cmd,
++			    unsigned long arg)
++{
++	void __user *argp = (void __user *)arg;
++	struct acpi_table_svkl *svkl_ktbl;
++	struct acpi_svkl_header *svkl_khdr;
++	struct acpi_svkl_key_info *kinfo;
++	char *kdata;
++	int ret = 0;
++	u32 index = 0;
++
++	svkl_ktbl = (struct acpi_table_svkl *) svkl_tbl_hdr;
++	/* SVKL Key headers are at svkl_tbl_hdr + sizeof(*svkl_ktbl) */
++	svkl_khdr = (struct acpi_svkl_header *) (&svkl_ktbl[1]);
++
++	mutex_lock(&svkl_lock);
++	switch (cmd) {
++	case ACPI_SVKL_GET_KEY_COUNT:
++		if (put_user(svkl_ktbl->count, (u32 __user *)argp))
++			ret = -EFAULT;
++		break;
++	case ACPI_SVKL_GET_KEY_INFO:
++		ret = get_index(argp, &index);
++		if (ret)
++			break;
++		kinfo = (struct acpi_svkl_key_info *) (&svkl_khdr[index]);
++		if (copy_to_user(argp, kinfo, sizeof(*kinfo)))
++			ret = -EFAULT;
++		break;
++	case ACPI_SVKL_GET_KEY_DATA:
++		ret = get_index(argp, &index);
++		if (ret)
++			break;
++		svkl_khdr = (struct acpi_svkl_header *) (&svkl_khdr[index]);
++		kdata = memremap(svkl_khdr->address, svkl_khdr->size,
++				MEMREMAP_WB);
++		if (!kdata) {
++			ret = -ENOMEM;
++			break;
++		}
++		if (copy_to_user(argp, kdata, svkl_khdr->size))
++			ret = -EFAULT;
++		memunmap(kdata);
++		break;
++	case ACPI_SVKL_CLEAR_KEY:
++		ret = get_index(argp, &index);
++		if (ret)
++			break;
++		svkl_khdr = (struct acpi_svkl_header *) (&svkl_khdr[index]);
++		kdata = memremap(svkl_khdr->address, svkl_khdr->size,
++				MEMREMAP_WB);
++		if (!kdata) {
++			ret = -ENOMEM;
++			break;
++		}
++		memset(kdata, 0, svkl_khdr->size);
++		memunmap(kdata);
++		break;
++	}
++	mutex_unlock(&svkl_lock);
++
++	return ret;
++}
++
++static const struct file_operations acpi_svkl_ops = {
++	.owner		= THIS_MODULE,
++	.unlocked_ioctl	= acpi_svkl_ioctl,
++	.llseek		= no_llseek,
++};
++
++static struct miscdevice acpi_svkl_dev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "svkl",
++	.fops	= &acpi_svkl_ops,
++};
++
++static int __init acpi_svkl_init(void)
++{
++	acpi_status status = AE_OK;
++	int ret;
++
++	ret = misc_register(&acpi_svkl_dev);
++	if (ret) {
++		pr_err("SVKL: can't misc_register on minor=%d\n",
++			MISC_DYNAMIC_MINOR);
++		return ret;
++	}
++
++	mutex_init(&svkl_lock);
++
++	status = acpi_get_table(ACPI_SIG_SVKL, 0, &svkl_tbl_hdr);
++	if (ACPI_FAILURE(status) || !svkl_tbl_hdr) {
++		pr_err("get table failed\n");
++		return -ENODEV;
++	}
++
++	dump_svkl_header();
++
++	pr_info("ACPI: SVKL module loaded\n");
++
++	return 0;
++}
++
++static void __exit acpi_svkl_exit(void)
++{
++	acpi_put_table(svkl_tbl_hdr);
++	misc_deregister(&acpi_svkl_dev);
++}
++
++module_init(acpi_svkl_init);
++module_exit(acpi_svkl_exit);
++
++MODULE_AUTHOR(" Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>");
++MODULE_DESCRIPTION("ACPI SVKL table interface driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/acpi/tables.c b/drivers/acpi/tables.c
+index 206df4ad8b2b..5ca2b219e1f9 100644
+--- a/drivers/acpi/tables.c
++++ b/drivers/acpi/tables.c
+@@ -501,7 +501,7 @@ static const char table_sigs[][ACPI_NAMESEG_SIZE] __initconst = {
+ 	ACPI_SIG_WDDT, ACPI_SIG_WDRT, ACPI_SIG_DSDT, ACPI_SIG_FADT,
+ 	ACPI_SIG_PSDT, ACPI_SIG_RSDT, ACPI_SIG_XSDT, ACPI_SIG_SSDT,
+ 	ACPI_SIG_IORT, ACPI_SIG_NFIT, ACPI_SIG_HMAT, ACPI_SIG_PPTT,
+-	ACPI_SIG_NHLT };
++	ACPI_SIG_NHLT, ACPI_SIG_SVKL };
+ 
+ #define ACPI_HEADER_SIZE sizeof(struct acpi_table_header)
+ 
+diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
+index 3b6f45a2edc8..580010cbdeea 100644
+--- a/include/acpi/actbl2.h
++++ b/include/acpi/actbl2.h
+@@ -44,6 +44,7 @@
+ #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
+ #define ACPI_SIG_SDEV           "SDEV"	/* Secure Devices table */
+ #define ACPI_SIG_NHLT           "NHLT"	/* Non-HDAudio Link Table */
++#define ACPI_SIG_SVKL           "SVKL"	/* Storage Volume Key Location Table  */
+ 
+ /*
+  * All tables must be byte-packed to match the ACPI specification, since
+@@ -1913,6 +1914,35 @@ struct acpi_sdev_pcie_path {
+ 	u8 function;
+ };
+ 
++/*******************************************************************************
++ *
++ * SVKL - Storage Volume Key Location Table (ACPI 6.x)
++ *        Version 1
++ *
++ ******************************************************************************/
++
++struct acpi_table_svkl {
++	struct acpi_table_header header;	/* Common ACPI table header */
++	u32 count;
++};
++
++struct acpi_svkl_header {
++	u16 type;
++	u16 format;
++	u32 size;
++	u64 address;
++};
++
++enum acpi_svkl_type {
++	ACPI_SVKL_TYPE_MAIN_STORAGE = 0,
++	ACPI_SVKL_TYPE_RESERVED = 1	/* 1 and greater are reserved */
++};
++
++enum acpi_svkl_format {
++	ACPI_SVKL_FORMAT_RAW_BINARY = 0,
++	ACPI_SVKL_FORMAT_RESERVED = 1	/* 1 and greater are reserved */
++};
++
+ /* Reset to default packing */
+ 
+ #pragma pack()
+diff --git a/include/linux/svkl.h b/include/linux/svkl.h
+new file mode 100644
+index 000000000000..426a1c75a81e
+--- /dev/null
++++ b/include/linux/svkl.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * svkl.h - Linux ACPI SVKL Interface
++ */
++
++#ifndef ACPI_SVKL_H
++#define ACPI_SVKL_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++struct acpi_svkl_key_info {
++	__u16 type;
++	__u16 format;
++	__u32 size;
++} __packed;
++
++#define ACPI_SVKL_GET_KEY_COUNT	_IOW('E', 0x01, __u32)
++#define ACPI_SVKL_GET_KEY_INFO	_IOWR('E', 0x02, struct acpi_svkl_key_info)
++#define ACPI_SVKL_GET_KEY_DATA	_IOR('E', 0x03, __u64)
++#define ACPI_SVKL_CLEAR_KEY	_IOR('E', 0x04, __u32)
++
++#endif
+-- 
+2.27.0
+

@@ -1,0 +1,144 @@
+From b47e6c51059ec18206f881f1ea6983cef703832f Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Date: Sat, 4 Jan 2020 00:24:55 -0800
+Subject: [PATCH 02/82] x86/cpufeatures: Add TDX Guest CPU feature
+
+Add CPU feature detection for Trusted Domain Extensions support. TDX
+feature adds capabilities to keep guest register state and memory
+isolated from hypervisor.
+
+For TDX guest platforms, executing CPUID(eax=0x21, ecx=0) will return
+following values in EAX, EBX, ECX and EDX.
+
+EAX:  Maximum sub-leaf number:  0
+EBX/EDX/ECX:  Vendor string:
+
+EBX =  "Inte"
+EDX =  "lTDX"
+ECX =  "    "
+
+So when above condition is true, set X86_FEATURE_TDX_GUEST feature cap
+bit.
+
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+---
+ arch/x86/include/asm/cpufeatures.h |  1 +
+ arch/x86/include/asm/tdx.h         | 20 ++++++++++++++++++++
+ arch/x86/kernel/Makefile           |  1 +
+ arch/x86/kernel/head64.c           |  3 +++
+ arch/x86/kernel/tdx.c              | 29 +++++++++++++++++++++++++++++
+ 5 files changed, 54 insertions(+)
+ create mode 100644 arch/x86/include/asm/tdx.h
+ create mode 100644 arch/x86/kernel/tdx.c
+
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index ac37830ae941..dddc3a27cc8a 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -238,6 +238,7 @@
+ #define X86_FEATURE_VMW_VMMCALL		( 8*32+19) /* "" VMware prefers VMMCALL hypercall instruction */
+ #define X86_FEATURE_PVUNLOCK		( 8*32+20) /* "" PV unlock function */
+ #define X86_FEATURE_VCPUPREEMPT		( 8*32+21) /* "" PV vcpu_is_preempted function */
++#define X86_FEATURE_TDX_GUEST		( 8*32+22) /* Trusted Domain Extensions Guest */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:0 (EBX), word 9 */
+ #define X86_FEATURE_FSGSBASE		( 9*32+ 0) /* RDFSBASE, WRFSBASE, RDGSBASE, WRGSBASE instructions*/
+diff --git a/arch/x86/include/asm/tdx.h b/arch/x86/include/asm/tdx.h
+new file mode 100644
+index 000000000000..c738bde944d1
+--- /dev/null
++++ b/arch/x86/include/asm/tdx.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2020 Intel Corporation */
++#ifndef _ASM_X86_TDX_H
++#define _ASM_X86_TDX_H
++
++#include <linux/cpufeature.h>
++
++#define TDX_CPUID_LEAF_ID	0x21
++
++#ifdef CONFIG_INTEL_TDX_GUEST
++
++void __init tdx_early_init(void);
++
++#else
++
++static inline void tdx_early_init(void) { };
++
++#endif /* CONFIG_INTEL_TDX_GUEST */
++
++#endif /* _ASM_X86_TDX_H */
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 0f66682ac02a..af09ce93a641 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -126,6 +126,7 @@ obj-$(CONFIG_PARAVIRT_CLOCK)	+= pvclock.o
+ obj-$(CONFIG_X86_PMEM_LEGACY_DEVICE) += pmem.o
+ 
+ obj-$(CONFIG_JAILHOUSE_GUEST)	+= jailhouse.o
++obj-$(CONFIG_INTEL_TDX_GUEST)	+= tdx.o
+ 
+ obj-$(CONFIG_EISA)		+= eisa.o
+ obj-$(CONFIG_PCSPKR_PLATFORM)	+= pcspeaker.o
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index de01903c3735..d1a4942ae160 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -40,6 +40,7 @@
+ #include <asm/extable.h>
+ #include <asm/trapnr.h>
+ #include <asm/sev.h>
++#include <asm/tdx.h>
+ 
+ /*
+  * Manage page tables very early on.
+@@ -491,6 +492,8 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
+ 
+ 	kasan_early_init();
+ 
++	tdx_early_init();
++
+ 	idt_setup_early_handler();
+ 
+ 	copy_bootdata(__va(real_mode_data));
+diff --git a/arch/x86/kernel/tdx.c b/arch/x86/kernel/tdx.c
+new file mode 100644
+index 000000000000..b1492e076168
+--- /dev/null
++++ b/arch/x86/kernel/tdx.c
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2020 Intel Corporation */
++
++#undef pr_fmt
++#define pr_fmt(fmt)     "x86/tdx: " fmt
++
++#include <asm/tdx.h>
++
++static inline bool cpuid_has_tdx_guest(void)
++{
++	u32 eax, sig[3];
++
++	if (cpuid_eax(0) < TDX_CPUID_LEAF_ID)
++		return false;
++
++	cpuid_count(TDX_CPUID_LEAF_ID, 0, &eax, &sig[0], &sig[1], &sig[2]);
++
++	return !memcmp("IntelTDX    ", sig, 12);
++}
++
++void __init tdx_early_init(void)
++{
++	if (!cpuid_has_tdx_guest())
++		return;
++
++	setup_force_cpu_cap(X86_FEATURE_TDX_GUEST);
++
++	pr_info("Guest initialized\n");
++}
+-- 
+2.27.0
+
