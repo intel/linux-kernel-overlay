@@ -1,0 +1,208 @@
+From 9c99b2aac5d409eac55612f80492ef1bb5c12874 Mon Sep 17 00:00:00 2001
+From: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Date: Tue, 8 Jun 2021 11:54:14 +0300
+Subject: [PATCH 357/363] drm/i915/display: Introduce new
+ intel_psr_pause/resume function
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This introduces the following function that can exit and activate a psr
+source when intel_psr is already enabled.
+
+- intel_psr_pause(): Pause current PSR. It deactivates current psr state.
+- intel_psr_resume(): Resume paused PSR. It activates paused psr state.
+
+v2: Address Jose's review comment.
+  - Remove unneeded changes around the intel_psr_enable().
+  - Add intel_psr_post_exit() which processes waiting until PSR is idle
+    and WA for SelectiveFetch.
+v3: Address Jose's review comment.
+  - Rename intel_psr_post_exit() to intel_psr_wait_exit_locked().
+  - Move WA_1408330847 to intel_psr_disable_locked()
+  - If the PSR is paused by an explicit intel_psr_paused() call, make the
+    intel_psr_flush() not to activate PSR.
+v4: Address Jose's review comment.
+  - In order to avoid the scenario of PSR is not active but there is a
+    scheduled psr->work, it changes the check routine of intel_psr_pause()
+    for PSR's enablement from "psr->active" to "psr->enable".
+
+Cc: José Roberto de Souza <jose.souza@intel.com>
+Cc: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210608085415.515342-1-gwan-gyeong.mun@intel.com
+---
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_psr.c      | 94 ++++++++++++++++---
+ drivers/gpu/drm/i915/display/intel_psr.h      |  2 +
+ 3 files changed, 86 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index b8d1f702d808..ee7cbdd7db87 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1482,6 +1482,7 @@ struct intel_psr {
+ 	bool sink_support;
+ 	bool source_support;
+ 	bool enabled;
++	bool paused;
+ 	enum pipe pipe;
+ 	enum transcoder transcoder;
+ 	bool active;
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 000e1ffe8c05..77865cf6641f 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -1113,6 +1113,7 @@ static void intel_psr_enable_locked(struct intel_dp *intel_dp,
+ 	intel_psr_enable_sink(intel_dp);
+ 	intel_psr_enable_source(intel_dp);
+ 	intel_dp->psr.enabled = true;
++	intel_dp->psr.paused = false;
+ 
+ 	intel_psr_activate(intel_dp);
+ }
+@@ -1182,22 +1183,12 @@ static void intel_psr_exit(struct intel_dp *intel_dp)
+ 	intel_dp->psr.active = false;
+ }
+ 
+-static void intel_psr_disable_locked(struct intel_dp *intel_dp)
++static void intel_psr_wait_exit_locked(struct intel_dp *intel_dp)
+ {
+ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ 	i915_reg_t psr_status;
+ 	u32 psr_status_mask;
+ 
+-	lockdep_assert_held(&intel_dp->psr.lock);
+-
+-	if (!intel_dp->psr.enabled)
+-		return;
+-
+-	drm_dbg_kms(&dev_priv->drm, "Disabling PSR%s\n",
+-		    intel_dp->psr.psr2_enabled ? "2" : "1");
+-
+-	intel_psr_exit(intel_dp);
+-
+ 	if (intel_dp->psr.psr2_enabled) {
+ 		psr_status = EDP_PSR2_STATUS(intel_dp->psr.transcoder);
+ 		psr_status_mask = EDP_PSR2_STATUS_STATE_MASK;
+@@ -1210,6 +1201,22 @@ static void intel_psr_disable_locked(struct intel_dp *intel_dp)
+ 	if (intel_de_wait_for_clear(dev_priv, psr_status,
+ 				    psr_status_mask, 2000))
+ 		drm_err(&dev_priv->drm, "Timed out waiting PSR idle state\n");
++}
++
++static void intel_psr_disable_locked(struct intel_dp *intel_dp)
++{
++	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
++
++	lockdep_assert_held(&intel_dp->psr.lock);
++
++	if (!intel_dp->psr.enabled)
++		return;
++
++	drm_dbg_kms(&dev_priv->drm, "Disabling PSR%s\n",
++		    intel_dp->psr.psr2_enabled ? "2" : "1");
++
++	intel_psr_exit(intel_dp);
++	intel_psr_wait_exit_locked(intel_dp);
+ 
+ 	/* WA 1408330847 */
+ 	if (intel_dp->psr.psr2_sel_fetch_enabled &&
+@@ -1254,6 +1261,61 @@ void intel_psr_disable(struct intel_dp *intel_dp,
+ 	cancel_delayed_work_sync(&intel_dp->psr.dc3co_work);
+ }
+ 
++/**
++ * intel_psr_pause - Pause PSR
++ * @intel_dp: Intel DP
++ *
++ * This function need to be called after enabling psr.
++ */
++void intel_psr_pause(struct intel_dp *intel_dp)
++{
++	struct intel_psr *psr = &intel_dp->psr;
++
++	if (!CAN_PSR(intel_dp))
++		return;
++
++	mutex_lock(&psr->lock);
++
++	if (!psr->enabled) {
++		mutex_unlock(&psr->lock);
++		return;
++	}
++
++	intel_psr_exit(intel_dp);
++	intel_psr_wait_exit_locked(intel_dp);
++	psr->paused = true;
++
++	mutex_unlock(&psr->lock);
++
++	cancel_work_sync(&psr->work);
++	cancel_delayed_work_sync(&psr->dc3co_work);
++}
++
++/**
++ * intel_psr_resume - Resume PSR
++ * @intel_dp: Intel DP
++ *
++ * This function need to be called after pausing psr.
++ */
++void intel_psr_resume(struct intel_dp *intel_dp)
++{
++	struct intel_psr *psr = &intel_dp->psr;
++
++	if (!CAN_PSR(intel_dp))
++		return;
++
++	mutex_lock(&psr->lock);
++
++	if (!psr->paused)
++		goto unlock;
++
++	psr->paused = false;
++	intel_psr_activate(intel_dp);
++
++unlock:
++	mutex_unlock(&psr->lock);
++}
++
+ static void psr_force_hw_tracking_exit(struct intel_dp *intel_dp)
+ {
+ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+@@ -1908,6 +1970,16 @@ void intel_psr_flush(struct drm_i915_private *dev_priv,
+ 			INTEL_FRONTBUFFER_ALL_MASK(intel_dp->psr.pipe);
+ 		intel_dp->psr.busy_frontbuffer_bits &= ~pipe_frontbuffer_bits;
+ 
++		/*
++		 * If the PSR is paused by an explicit intel_psr_paused() call,
++		 * we have to ensure that the PSR is not activated until
++		 * intel_psr_resume() is called.
++		 */
++		if (intel_dp->psr.paused) {
++			mutex_unlock(&intel_dp->psr.lock);
++			continue;
++		}
++
+ 		/* By definition flush = invalidate + flush */
+ 		if (pipe_frontbuffer_bits)
+ 			psr_force_hw_tracking_exit(intel_dp);
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.h b/drivers/gpu/drm/i915/display/intel_psr.h
+index e3db85e97f4c..641521b101c8 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@ -51,5 +51,7 @@ void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+ 					const struct intel_crtc_state *crtc_state,
+ 					const struct intel_plane_state *plane_state,
+ 					int color_plane);
++void intel_psr_pause(struct intel_dp *intel_dp);
++void intel_psr_resume(struct intel_dp *intel_dp);
+ 
+ #endif /* __INTEL_PSR_H__ */
+-- 
+2.27.0
+

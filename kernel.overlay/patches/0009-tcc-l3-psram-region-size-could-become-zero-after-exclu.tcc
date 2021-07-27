@@ -1,8 +1,8 @@
-From f0911173a5d880b1e507d06709cbc17e91f27e62 Mon Sep 17 00:00:00 2001
+From ec90f4b0b6783c8eb2ca8c550294472eb9e02480 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 17:04:16 +0800
-Subject: [PATCH 9/9] tcc: l3 psram region size could become zero after exclude
- l2 inclusive regions
+Subject: [PATCH 09/15] tcc: l3 psram region size could become zero after
+ exclude l2 inclusive regions
 
 Zero size psram region will still be reported since it's specified in PTCT.
 

@@ -1,7 +1,7 @@
-From 986bc95c3ed8125026c1d130915ea586d41ff9af Mon Sep 17 00:00:00 2001
+From 58167add2129ece224d7652cf43e5136f2e8e4f2 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 8 Jun 2020 00:40:45 +0800
-Subject: [PATCH 3/9] tcc: update license header
+Subject: [PATCH 03/15] tcc: update license header
 
 Fix error/warning in static analyze tool checking.
 Update license header to be dual license.

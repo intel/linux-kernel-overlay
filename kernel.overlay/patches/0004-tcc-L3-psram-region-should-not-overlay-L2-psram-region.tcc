@@ -1,7 +1,8 @@
-From 6af4b6f15186e8af63c657a6157c1cf614c3ca6f Mon Sep 17 00:00:00 2001
+From af6e80a9f940e4c6e2ef180e302776353aac71c9 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 11 Jun 2020 02:09:09 +0800
-Subject: [PATCH 4/9] tcc: L3 psram region should not overlay L2 psram region.
+Subject: [PATCH 04/15] tcc: L3 psram region should not overlay L2 psram
+ region.
 
 Update logic to calculate L3 cache region size for inclusive case.
 L3 psram region exposed to user should not overlay L2 psram resion.

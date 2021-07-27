@@ -1,7 +1,8 @@
-From ec324516795f629750921ac3fc8b5366dedd9a5a Mon Sep 17 00:00:00 2001
+From 987fec990044e1b131ad8ca7b83862b51e11dc30 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 15 Jun 2020 09:55:13 +0800
-Subject: [PATCH 5/9] tcc: driver should exit if no psram entry found in PTCT.
+Subject: [PATCH 05/15] tcc: driver should exit if no psram entry found in
+ PTCT.
 
 In TCC SKU BIOS, PTCT is always presented in ACPI. If TCC option
 is enabled in BIOS, there will be psram entry in PTCT; if TCC option

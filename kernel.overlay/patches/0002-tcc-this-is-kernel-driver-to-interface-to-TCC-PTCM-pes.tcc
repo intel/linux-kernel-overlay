@@ -1,7 +1,7 @@
-From 4d811184c2e000b144413509925b1608c57e861d Mon Sep 17 00:00:00 2001
+From 83d934d2679eaebf92d92f63394d778273c2f86b Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
-Subject: [PATCH 2/9] tcc: this is kernel driver to interface to TCC PTCM
+Subject: [PATCH 02/15] tcc: this is kernel driver to interface to TCC PTCM
  pesudo SRAM
 
 ACPI may include PTCT table. It PTCT is included, then there will

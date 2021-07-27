@@ -1,7 +1,7 @@
-From c9afd9f9581b218326c5335b58b56994a795e876 Mon Sep 17 00:00:00 2001
+From 4955c833eff440cca3de70a003c3815f1c48a172 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
-Date: Fri, 16 Oct 2020 14:43:41 +0800
-Subject: [PATCH 1/9] tcc: parse PTCT table and record pesudo sram ranges
+Date: Thu, 22 Jul 2021 16:02:33 +0800
+Subject: [PATCH 01/15] tcc: parse PTCT table and record pesudo sram ranges
 
 ACPI may include PTCT table. If PTCT is included, this table need to be parsed
 and records all pesudo SRAM ranges indicated in the table. These pesudo SRAM
@@ -129,14 +129,14 @@ index e90310cbe73a..6f7af786d41e 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index 18cafe3ebddc..fbdd8428e487 100644
+index 18cafe3ebddc..af5b1d3e048d 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
 @@ -39,6 +39,7 @@
  #define ACPI_SIG_PHAT           "PHAT"	/* Platform Health Assessment Table */
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
-+#define ACPI_SIG_PTCT           "PTCT"	/* Platform Tuning Configuration Table */
++#define ACPI_SIG_PTCT           "PTCT"  /* Platform Tuning Configuration Table */
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
  #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
@@ -195,7 +195,7 @@ index 18cafe3ebddc..fbdd8428e487 100644
 +#define PTCT_ENTRY_PSRAM_SIZE	sizeof(struct acpi_ptct_psram)
 +#define PTCT_ACPI_HEADER_SIZE	sizeof(struct acpi_table_header)
 +#define PSRAM_REGION_INFO_SIZE	sizeof(struct ptct_psram_region)
-+#define MAX_PSRAM_REGIONS		20
++#define MAX_PSRAM_REGIONS	20
 +
  /*******************************************************************************
   *
