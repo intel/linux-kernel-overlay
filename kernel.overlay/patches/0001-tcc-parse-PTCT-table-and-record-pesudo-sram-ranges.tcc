@@ -1,4 +1,4 @@
-From 4955c833eff440cca3de70a003c3815f1c48a172 Mon Sep 17 00:00:00 2001
+From fde5d8c16e8e9bfa01f6cc4734522cf88e016507 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 16:02:33 +0800
 Subject: [PATCH 01/15] tcc: parse PTCT table and record pesudo sram ranges
@@ -16,10 +16,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index e90310cbe73a..6f7af786d41e 100644
+index e55e0c1fad8c..bc0df2e1d396 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1232,6 +1232,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
+@@ -1218,6 +1218,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
  }
  #endif	/* !CONFIG_X86_IO_APIC */
  
@@ -116,7 +116,7 @@ index e90310cbe73a..6f7af786d41e 100644
  static void __init early_acpi_process_madt(void)
  {
  #ifdef CONFIG_X86_LOCAL_APIC
-@@ -1622,6 +1712,11 @@ int __init acpi_boot_init(void)
+@@ -1600,6 +1690,11 @@ int __init acpi_boot_init(void)
  	if (IS_ENABLED(CONFIG_ACPI_BGRT) && !acpi_nobgrt)
  		acpi_table_parse(ACPI_SIG_BGRT, acpi_parse_bgrt);
  
@@ -129,19 +129,19 @@ index e90310cbe73a..6f7af786d41e 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index 18cafe3ebddc..af5b1d3e048d 100644
+index 2069ac38a4e2..76f6657252ff 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
-@@ -39,6 +39,7 @@
- #define ACPI_SIG_PHAT           "PHAT"	/* Platform Health Assessment Table */
+@@ -41,6 +41,7 @@
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
+ #define ACPI_SIG_PRMT           "PRMT"	/* Platform Runtime Mechanism Table */
 +#define ACPI_SIG_PTCT           "PTCT"  /* Platform Tuning Configuration Table */
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
+ #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
- #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
-@@ -1673,6 +1674,59 @@ struct acpi_pptt_id {
- 	u16 spin_rev;
+@@ -1753,6 +1754,59 @@ struct acpi_prmt_handler_info {
+ 	u64 acpi_param_buffer_address;
  };
  
 +/*******************************************************************************

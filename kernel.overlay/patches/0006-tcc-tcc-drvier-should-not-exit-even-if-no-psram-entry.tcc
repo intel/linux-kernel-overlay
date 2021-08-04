@@ -1,4 +1,4 @@
-From 7537b3322f313fd5a7ce1b8f2484c1b1c7015526 Mon Sep 17 00:00:00 2001
+From 0e2dbb9f34959def237a4456d81bdbbb23ac96da Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 10 Jul 2020 17:48:35 +0800
 Subject: [PATCH 06/15] tcc: tcc drvier should not exit even if no psram entry.
@@ -13,10 +13,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 1 insertion(+), 6 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index b2a2fc7d80b0..7fdcdaebe781 100644
+index cd660f88383d..5951c7bf2c24 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1285,7 +1285,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1271,7 +1271,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  
  		ptr += entry->size;
  	}

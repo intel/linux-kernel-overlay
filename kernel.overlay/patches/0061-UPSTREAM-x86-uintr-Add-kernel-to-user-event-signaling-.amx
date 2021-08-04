@@ -1,0 +1,178 @@
+From adfc0a7892682fbcee5fb2fe79217669048190f4 Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Tue, 25 May 2021 16:57:41 -0700
+Subject: [PATCH 61/88] !UPSTREAM: x86/uintr: Add kernel to user event
+ signaling support
+
+The kernel can use User Interrupts instead of eventfd or signals to
+delivery event notifications in certain cases. Provide a in-kernel
+mechanism to generate a User Interrupt for event signaling. For example,
+we can deliver events such as IO_URING completions or external
+interrupts as User Interrupts to applications.
+
+Any kernel entity with access to uintr_fd would be able to generate a
+User Interrupt in the receiver task with the vector associated with
+uintr_fd.
+
+On upcoming Sapphire Rapids silicon this would save some latency since
+the receiver task won't need to block with the kernel to get these
+events delivered. The savings are expected to come from waking up a task
+from the wait queue and scheduling it back to ring 3.
+
+Also with future hardware enhancements using the same user interface we
+can deliver these interrupts directly to user applications without
+entering the kernel.
+
+<Currently, there is no user for this API. IO_URING is a potential user
+but the code is still in development. I can remove this patch if it is
+not suitable for this RFC.>
+
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+ arch/x86/include/asm/uintr.h |  4 +++
+ arch/x86/kernel/uintr_core.c | 50 ++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/uintr_fd.c   | 45 ++++++++++++++++++++++++++++++++
+ 3 files changed, 99 insertions(+)
+
+diff --git a/arch/x86/include/asm/uintr.h b/arch/x86/include/asm/uintr.h
+index 64113ef523ca..5f0ff39b8605 100644
+--- a/arch/x86/include/asm/uintr.h
++++ b/arch/x86/include/asm/uintr.h
+@@ -61,6 +61,10 @@ void uintr_free(struct task_struct *task);
+ void switch_uintr_prepare(struct task_struct *prev);
+ void switch_uintr_return(void);
+ 
++struct file *uintrfd_fget(int uintr_fd);
++int uintr_notify(struct file *uintr_f);
++int uintr_notify_receiver(struct uintr_receiver_info *r_info);
++
+ int uintr_receiver_wait(void);
+ void uintr_wake_up_process(void);
+ 
+diff --git a/arch/x86/kernel/uintr_core.c b/arch/x86/kernel/uintr_core.c
+index 4e5545e6d903..a7b112cac0e2 100644
+--- a/arch/x86/kernel/uintr_core.c
++++ b/arch/x86/kernel/uintr_core.c
+@@ -116,6 +116,35 @@ static inline u32 cpu_to_ndst(int cpu)
+ 	return apicid;
+ }
+ 
++/* TODO: Find a more efficient way rather than iterating over each cpu */
++static int convert_apicid_to_cpu(int apic_id)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		if (per_cpu(x86_cpu_to_apicid, i) == apic_id)
++			return i;
++	}
++	return -1;
++}
++
++static inline int ndst_to_cpu(u32 ndst)
++{
++	int apic_id;
++	int cpu;
++
++	if (!x2apic_enabled())
++		apic_id = (ndst >> 8) & 0xFF;
++	else
++		apic_id = ndst;
++
++	cpu = convert_apicid_to_cpu(apic_id);
++
++	WARN_ON_ONCE(cpu == -1);
++
++	return cpu;
++}
++
+ static void free_upid(struct uintr_upid_ctx *upid_ctx)
+ {
+ 	put_task_struct(upid_ctx->task);
+@@ -689,6 +718,27 @@ int do_uintr_register_handler(u64 handler)
+ 	return 0;
+ }
+ 
++int uintr_notify_receiver(struct uintr_receiver_info *r_info)
++{
++	struct uintr_upid_ctx *upid_ctx = r_info->upid_ctx;
++	struct uintr_upid *upid = upid_ctx->upid;
++
++	set_bit((unsigned long)r_info->uvec, (unsigned long *)&upid->puir);
++
++	test_bit(UPID_SN, (unsigned long *)&upid->nc.status);
++
++	/* TODO: Use atomics for UPID since we are doing read-modify-write */
++	if (!test_bit(UPID_SN, (unsigned long *)&upid->nc.status) &&
++	    !test_bit(UPID_ON, (unsigned long *)&upid->nc.status)) {
++
++		set_bit(UPID_ON, (unsigned long *)&upid->nc.status);
++
++		/* Check: If directly writing to the APIC is better? */
++		apic->send_IPI(ndst_to_cpu(upid->nc.ndst), upid->nc.nv);
++	}
++	return 0;
++}
++
+ void do_uintr_unregister_vector(struct uintr_receiver_info *r_info)
+ {
+ 	int ret;
+diff --git a/arch/x86/kernel/uintr_fd.c b/arch/x86/kernel/uintr_fd.c
+index a7e55d98c0c7..da82c5262879 100644
+--- a/arch/x86/kernel/uintr_fd.c
++++ b/arch/x86/kernel/uintr_fd.c
+@@ -284,6 +284,51 @@ SYSCALL_DEFINE2(uintr_unregister_sender, int, uintrfd, unsigned int, flags)
+ 	return ret;
+ }
+ 
++/**
++ * uintr_notify - Notify a user interrupt receiver.
++ * @uintr_f: [in] File pertaining to the uintr_fd.
++ *
++ * Returns <tbd>
++ */
++int uintr_notify(struct file *uintr_f)
++{
++	struct uintrfd_ctx *uintrfd_ctx;
++
++	if (uintr_f->f_op != &uintrfd_fops)
++		return -EINVAL;
++
++	uintrfd_ctx = (struct uintrfd_ctx *)uintr_f->private_data;
++
++	return uintr_notify_receiver(uintrfd_ctx->r_info);
++}
++EXPORT_SYMBOL_GPL(uintr_notify);
++
++/**
++ * uintrfd_fget - Acquire a reference of an uintrfd file descriptor.
++ * @fd: [in] uintrfd file descriptor.
++ *
++ * Returns a pointer to the uintrfd file structure in case of success, or the
++ * following error pointer:
++ *
++ * -EBADF    : Invalid @fd file descriptor.
++ * -EINVAL   : The @fd file descriptor is not an uintrfd file.
++ */
++struct file *uintrfd_fget(int fd)
++{
++	struct file *file;
++
++	file = fget(fd);
++	if (!file)
++		return ERR_PTR(-EBADF);
++	if (file->f_op != &uintrfd_fops) {
++		fput(file);
++		return ERR_PTR(-EINVAL);
++	}
++
++	return file;
++}
++EXPORT_SYMBOL_GPL(uintrfd_fget);
++
+ /*
+  * sys_uintr_wait - Wait for a user interrupt
+  */
+-- 
+2.27.0
+

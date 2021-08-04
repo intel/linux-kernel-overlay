@@ -1,4 +1,4 @@
-From 2a2990c305164dcfcd5ac00296855e8bc50e5fc8 Mon Sep 17 00:00:00 2001
+From 63f6c2e0373bb7687453e47a2a5fd8d625e8ccda Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 16:56:12 +0800
 Subject: [PATCH 07/15] tcc: update tcc range end_address.
@@ -11,10 +11,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 7fdcdaebe781..9ff5e0d411b9 100644
+index 5951c7bf2c24..648574d48ff1 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1300,7 +1300,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1286,7 +1286,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  		if ((entry->type == ACPI_PTCT_ENTRY_PSEUDO_SRAM) && (id < total_psram_region)) {
  			psram = (struct acpi_ptct_psram *)(ptr+PTCT_ENTRY_HEADER_SIZE);
  			ptct_psram_regions[id].phyaddr_start = ((u64)(psram->phyaddr_lo))|((u64)(psram->phyaddr_hi)<<32);

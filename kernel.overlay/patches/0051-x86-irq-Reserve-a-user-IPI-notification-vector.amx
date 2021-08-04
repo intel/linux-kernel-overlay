@@ -1,0 +1,158 @@
+From f0bbe597df9d49945b26ac2120077083a7f93703 Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Tue, 25 May 2021 16:57:38 -0700
+Subject: [PATCH 51/88] x86/irq: Reserve a user IPI notification vector
+
+A user interrupt notification vector is used on the receiver's cpu to
+identify an interrupt as a user interrupt (and not a kernel interrupt).
+Hardware uses the same notification vector to generate an IPI from a
+sender's cpu core when the SENDUIPI instruction is executed.
+
+Typically, the kernel shouldn't receive an interrupt with this vector.
+However, there is a slight possibility that the kernel might receive
+this vector.
+
+Scenario that can cause the spurious interrupt:
+
+Step	cpu 0 (receiver task)		cpu 1 (sender task)
+----	---------------------		-------------------
+1	task is running
+2					executes SENDUIPI
+3					IPI sent
+4	context switched out
+5	IPI delivered
+	(kernel interrupt detected)
+
+A kernel interrupt can be detected, if a receiver task gets scheduled
+out after the SENDUIPI-based IPI was sent but before the IPI was
+delivered.
+
+The kernel doesn't need to do anything in this case other than receiving
+the interrupt and clearing the local APIC. The user interrupt is always
+stored in the receiver's UPID before the IPI is generated. When the
+receiver gets scheduled back the interrupt would be delivered based on
+its UPID.
+
+Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+ arch/x86/include/asm/hardirq.h     |  3 +++
+ arch/x86/include/asm/idtentry.h    |  4 ++++
+ arch/x86/include/asm/irq_vectors.h |  5 ++++-
+ arch/x86/kernel/idt.c              |  3 +++
+ arch/x86/kernel/irq.c              | 33 ++++++++++++++++++++++++++++++
+ 5 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/hardirq.h b/arch/x86/include/asm/hardirq.h
+index 275e7fd20310..279afc01f1ac 100644
+--- a/arch/x86/include/asm/hardirq.h
++++ b/arch/x86/include/asm/hardirq.h
+@@ -19,6 +19,9 @@ typedef struct {
+ 	unsigned int kvm_posted_intr_ipis;
+ 	unsigned int kvm_posted_intr_wakeup_ipis;
+ 	unsigned int kvm_posted_intr_nested_ipis;
++#endif
++#ifdef CONFIG_X86_USER_INTERRUPTS
++	unsigned int uintr_spurious_count;
+ #endif
+ 	unsigned int x86_platform_ipis;	/* arch dependent */
+ 	unsigned int apic_perf_irqs;
+diff --git a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+index a90791433152..b7a458105af1 100644
+--- a/arch/x86/include/asm/idtentry.h
++++ b/arch/x86/include/asm/idtentry.h
+@@ -675,6 +675,10 @@ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_NESTED_VECTOR,	sysvec_kvm_posted_intr_nested_ipi);
+ #endif
+ 
++#ifdef CONFIG_X86_USER_INTERRUPTS
++DECLARE_IDTENTRY_SYSVEC(UINTR_NOTIFICATION_VECTOR,	sysvec_uintr_spurious_interrupt);
++#endif
++
+ #if IS_ENABLED(CONFIG_HYPERV)
+ DECLARE_IDTENTRY_SYSVEC(HYPERVISOR_CALLBACK_VECTOR,	sysvec_hyperv_callback);
+ DECLARE_IDTENTRY_SYSVEC(HYPERV_REENLIGHTENMENT_VECTOR,	sysvec_hyperv_reenlightenment);
+diff --git a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+index 43dcb9284208..d26faa504931 100644
+--- a/arch/x86/include/asm/irq_vectors.h
++++ b/arch/x86/include/asm/irq_vectors.h
+@@ -104,7 +104,10 @@
+ #define HYPERV_STIMER0_VECTOR		0xed
+ #endif
+ 
+-#define LOCAL_TIMER_VECTOR		0xec
++/* Vector for User interrupt notifications */
++#define UINTR_NOTIFICATION_VECTOR       0xec
++
++#define LOCAL_TIMER_VECTOR		0xeb
+ 
+ #define NR_VECTORS			 256
+ 
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index 9f1bdaabc246..2f63d6128ec1 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -151,6 +151,9 @@ static const __initconst struct idt_data apic_idts[] = {
+ 	INTG(POSTED_INTR_WAKEUP_VECTOR,		asm_sysvec_kvm_posted_intr_wakeup_ipi),
+ 	INTG(POSTED_INTR_NESTED_VECTOR,		asm_sysvec_kvm_posted_intr_nested_ipi),
+ # endif
++#ifdef CONFIG_X86_USER_INTERRUPTS
++	INTG(UINTR_NOTIFICATION_VECTOR,		asm_sysvec_uintr_spurious_interrupt),
++#endif
+ # ifdef CONFIG_IRQ_WORK
+ 	INTG(IRQ_WORK_VECTOR,			asm_sysvec_irq_work),
+ # endif
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index e28f6a5d14f1..c15ce8e8c889 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -181,6 +181,12 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 		seq_printf(p, "%10u ",
+ 			   irq_stats(j)->kvm_posted_intr_wakeup_ipis);
+ 	seq_puts(p, "  Posted-interrupt wakeup event\n");
++#endif
++#ifdef CONFIG_X86_USER_INTERRUPTS
++	seq_printf(p, "%*s: ", prec, "UIS");
++	for_each_online_cpu(j)
++		seq_printf(p, "%10u ", irq_stats(j)->uintr_spurious_count);
++	seq_puts(p, "  User-interrupt spurious event\n");
+ #endif
+ 	return 0;
+ }
+@@ -325,6 +331,33 @@ DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_nested_ipi)
+ }
+ #endif
+ 
++#ifdef CONFIG_X86_USER_INTERRUPTS
++/*
++ * Handler for UINTR_NOTIFICATION_VECTOR.
++ *
++ * The notification vector is used by the cpu to detect a User Interrupt. In
++ * the typical usage, the cpu would handle this interrupt and clear the local
++ * apic.
++ *
++ * However, there is a small possibility that the kernel might receive this
++ * vector. This can happen if the receiver thread was running when the
++ * interrupt was sent but it got scheduled out before the interrupt was
++ * delivered. The kernel doesn't need to do anything other than clearing the
++ * local APIC. A pending user interrupt is always saved in the receiver's UPID
++ * which can be referenced when the receiver gets scheduled back.
++ *
++ * If the kernel receives a storm of these, it could mean an issue with the
++ * kernel's saving and restoring of the User Interrupt MSR state; Specifically,
++ * the notification vector bits in the IA32_UINTR_MISC_MSR.
++ */
++DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_uintr_spurious_interrupt)
++{
++	/* TODO: Add entry-exit tracepoints */
++	ack_APIC_irq();
++	inc_irq_stat(uintr_spurious_count);
++}
++#endif
++
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+ /* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
+-- 
+2.27.0
+

@@ -2,9 +2,9 @@
 
 # Global configurations
 KVERSION=5
-KPATCHLEVEL=13
+KPATCHLEVEL=14
 KSUBLEVEL=0
-KEXTRAVERSION=
+KEXTRAVERSION=-rc4
 
 KSRC_REPO=https://github.com/torvalds/linux.git
 

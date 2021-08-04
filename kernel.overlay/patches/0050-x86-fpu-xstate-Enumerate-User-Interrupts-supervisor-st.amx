@@ -1,0 +1,146 @@
+From 2a3b68d69841d63f97544c0e98b98b28857e096d Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Tue, 25 May 2021 16:57:38 -0700
+Subject: [PATCH 50/88] x86/fpu/xstate: Enumerate User Interrupts supervisor
+ state
+
+Enable xstate supervisor support for User Interrupts by default.
+
+The user interrupt state for a task consists of the MSR state and the
+User Interrupt Flag (UIF) value. XSAVES and XRSTORS handle saving and
+restoring both of these states.
+
+<TODO: Bugs have been reported recently in the XSTATE code for WRPKRU
+and PASID. The Uintr context switching code would need rework and
+additional testing in that regard.>
+
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+ arch/x86/include/asm/fpu/types.h  | 20 +++++++++++++++++++-
+ arch/x86/include/asm/fpu/xstate.h |  3 ++-
+ arch/x86/kernel/fpu/xstate.c      | 14 +++++++++++---
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/types.h b/arch/x86/include/asm/fpu/types.h
+index 035eb0ec665e..0539060b3422 100644
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@ -118,7 +118,7 @@ enum xfeature {
+ 	XFEATURE_CET_USER,
+ 	XFEATURE_CET_KERNEL,
+ 	XFEATURE_RSRVD_COMP_13,
+-	XFEATURE_RSRVD_COMP_14,
++	XFEATURE_UINTR,
+ 	XFEATURE_LBR,
+ 
+ 	XFEATURE_MAX,
+@@ -137,6 +137,7 @@ enum xfeature {
+ #define XFEATURE_MASK_PASID		(1 << XFEATURE_PASID)
+ #define XFEATURE_MASK_CET_USER		(1 << XFEATURE_CET_USER)
+ #define XFEATURE_MASK_CET_KERNEL	(1 << XFEATURE_CET_KERNEL)
++#define XFEATURE_MASK_UINTR		(1 << XFEATURE_UINTR)
+ #define XFEATURE_MASK_LBR		(1 << XFEATURE_LBR)
+ 
+ #define XFEATURE_MASK_FPSSE		(XFEATURE_MASK_FP | XFEATURE_MASK_SSE)
+@@ -256,6 +257,23 @@ struct cet_kernel_state {
+ 	u64 pl2_ssp;			/* privilege level 2 shadow stack */
+ };
+ 
++/*
++ * State component 14 is supervisor state used for User Interrupts state.
++ * The size of this state is 48 bytes
++ */
++struct uintr_state {
++	u64 handler;
++	u64 stack_adjust;
++	u32 uitt_size;
++	u8  uinv;
++	u8  pad1;
++	u8  pad2;
++	u8  uif_pad3;		/* bit 7 - UIF, bits 6:0 - reserved */
++	u64 upid_addr;
++	u64 uirr;
++	u64 uitt_addr;
++} __packed;
++
+ /*
+  * State component 15: Architectural LBR configuration state.
+  * The size of Arch LBR state depends on the number of LBRs (lbr_depth).
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 18cf228ec33c..286cdd41b92a 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -45,7 +45,8 @@
+ 
+ /* All currently supported supervisor features */
+ #define XFEATURE_MASK_SUPERVISOR_SUPPORTED (XFEATURE_MASK_PASID | \
+-					    XFEATURE_MASK_CET_USER)
++					    XFEATURE_MASK_CET_USER | \
++					    XFEATURE_MASK_UINTR)
+ 
+ /*
+  * A supervisor state component may not always contain valuable information,
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 389bdfed03c1..0b299f08096a 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -40,6 +40,8 @@ static const char *xfeature_names[] =
+ 	"PASID state",
+ 	"Control-flow User registers"	,
+ 	"Control-flow Kernel registers"	,
++	"unknown xstate feature 13",
++	"User Interrupts registers",
+ 	"unknown xstate feature"	,
+ };
+ 
+@@ -57,6 +59,8 @@ static short xsave_cpuid_features[] __initdata = {
+ 	X86_FEATURE_ENQCMD,
+ 	X86_FEATURE_SHSTK, /* XFEATURE_CET_USER */
+ 	X86_FEATURE_SHSTK, /* XFEATURE_CET_KERNEL */
++	-1,			/* Unknown 13 */
++	X86_FEATURE_UINTR,
+ };
+ 
+ /*
+@@ -242,6 +246,7 @@ static void __init print_xstate_features(void)
+ 	print_xstate_feature(XFEATURE_MASK_PASID);
+ 	print_xstate_feature(XFEATURE_MASK_CET_USER);
+ 	print_xstate_feature(XFEATURE_MASK_CET_KERNEL);
++	print_xstate_feature(XFEATURE_MASK_UINTR);
+ }
+ 
+ /*
+@@ -379,7 +384,8 @@ static void __init print_xstate_offset_size(void)
+ 	 XFEATURE_MASK_BNDREGS |		\
+ 	 XFEATURE_MASK_BNDCSR |			\
+ 	 XFEATURE_MASK_CET_USER |		\
+-	 XFEATURE_MASK_PASID)
++	 XFEATURE_MASK_PASID |			\
++	 XFEATURE_MASK_UINTR)
+ 
+ /*
+  * setup the xstate image representing the init state
+@@ -541,6 +547,7 @@ static void check_xstate_against_struct(int nr)
+ 	XCHECK_SZ(sz, nr, XFEATURE_PASID,     struct ia32_pasid_state);
+ 	XCHECK_SZ(sz, nr, XFEATURE_CET_USER,   struct cet_user_state);
+ 	XCHECK_SZ(sz, nr, XFEATURE_CET_KERNEL, struct cet_kernel_state);
++	XCHECK_SZ(sz, nr, XFEATURE_UINTR,     struct uintr_state);
+ 
+ 	/*
+ 	 * Make *SURE* to add any feature numbers in below if
+@@ -548,9 +555,10 @@ static void check_xstate_against_struct(int nr)
+ 	 * numbers.
+ 	 */
+ 	if ((nr < XFEATURE_YMM) ||
+-	    (nr >= XFEATURE_MAX) ||
+ 	    (nr == XFEATURE_PT_UNIMPLEMENTED_SO_FAR) ||
+-	    ((nr >= XFEATURE_RSRVD_COMP_13) && (nr <= XFEATURE_LBR))) {
++	    (nr == XFEATURE_RSRVD_COMP_13) ||
++	    (nr == XFEATURE_LBR) ||
++	    (nr >= XFEATURE_MAX)) {
+ 		WARN_ONCE(1, "no structure for xstate: %d\n", nr);
+ 		XSTATE_WARN_ON(1);
+ 	}
+-- 
+2.27.0
+
