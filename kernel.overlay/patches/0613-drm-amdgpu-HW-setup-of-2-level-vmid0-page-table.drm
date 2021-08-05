@@ -1,0 +1,170 @@
+From 97d4ecd316d666afd1c64b4766ead47c8cf18686 Mon Sep 17 00:00:00 2001
+From: Oak Zeng <Oak.Zeng@amd.com>
+Date: Thu, 17 Sep 2020 23:12:56 -0500
+Subject: [PATCH 0613/2740] drm/amdgpu: HW setup of 2-level vmid0 page table
+
+Set up HW for 2-level vmid0 page table: 1. Set up
+PAGE_TABLE_START/END registers. Currently only plan
+to do 2-level page table for ALDEBARAN, so only gfxhub1.0
+and mmhub1.7 is changed. 2. Set page table base register.
+For 2-level page table, the page table base should point
+to PDB0. 3. Disable AGP and FB aperture as they are not
+used.
+
+Signed-off-by: Oak Zeng <Oak.Zeng@amd.com>
+Reviewed-by: Christian Konig <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c | 52 +++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c  | 50 +++++++++++++++++++----
+ 2 files changed, 83 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
+index 5382c36c93d7..62019885bda5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c
+@@ -53,19 +53,39 @@ static void gfxhub_v1_0_setup_vm_pt_regs(struct amdgpu_device *adev,
+ 
+ static void gfxhub_v1_0_init_gart_aperture_regs(struct amdgpu_device *adev)
+ {
+-	uint64_t pt_base = amdgpu_gmc_pd_addr(adev->gart.bo);
++	uint64_t pt_base;
+ 
+-	gfxhub_v1_0_setup_vm_pt_regs(adev, 0, pt_base);
++	if (adev->gmc.pdb0_bo)
++		pt_base = amdgpu_gmc_pd_addr(adev->gmc.pdb0_bo);
++	else
++		pt_base = amdgpu_gmc_pd_addr(adev->gart.bo);
+ 
+-	WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
+-		     (u32)(adev->gmc.gart_start >> 12));
+-	WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
+-		     (u32)(adev->gmc.gart_start >> 44));
++	gfxhub_v1_0_setup_vm_pt_regs(adev, 0, pt_base);
+ 
+-	WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+-		     (u32)(adev->gmc.gart_end >> 12));
+-	WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
+-		     (u32)(adev->gmc.gart_end >> 44));
++	/* If use GART for FB translation, vmid0 page table covers both
++	 * vram and system memory (gart)
++	 */
++	if (adev->gmc.pdb0_bo) {
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
++				(u32)(adev->gmc.fb_start >> 12));
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
++				(u32)(adev->gmc.fb_start >> 44));
++
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
++				(u32)(adev->gmc.gart_end >> 12));
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
++				(u32)(adev->gmc.gart_end >> 44));
++	} else {
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
++				(u32)(adev->gmc.gart_start >> 12));
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
++				(u32)(adev->gmc.gart_start >> 44));
++
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
++				(u32)(adev->gmc.gart_end >> 12));
++		WREG32_SOC15(GC, 0, mmVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
++				(u32)(adev->gmc.gart_end >> 44));
++	}
+ }
+ 
+ static void gfxhub_v1_0_init_system_aperture_regs(struct amdgpu_device *adev)
+@@ -116,6 +136,18 @@ static void gfxhub_v1_0_init_system_aperture_regs(struct amdgpu_device *adev)
+ 		WREG32_FIELD15(GC, 0, VM_L2_PROTECTION_FAULT_CNTL2,
+ 			       ACTIVE_PAGE_MIGRATION_PTE_READ_RETRY, 1);
+ 	}
++
++	/* In the case squeezing vram into GART aperture, we don't use
++	 * FB aperture and AGP aperture. Disable them.
++	 */
++	if (adev->gmc.pdb0_bo) {
++		WREG32_SOC15(GC, 0, mmMC_VM_FB_LOCATION_TOP, 0);
++		WREG32_SOC15(GC, 0, mmMC_VM_FB_LOCATION_BASE, 0x00FFFFFF);
++		WREG32_SOC15(GC, 0, mmMC_VM_AGP_TOP, 0);
++		WREG32_SOC15(GC, 0, mmMC_VM_AGP_BOT, 0xFFFFFF);
++		WREG32_SOC15(GC, 0, mmMC_VM_SYSTEM_APERTURE_LOW_ADDR, 0x3FFFFFFF);
++		WREG32_SOC15(GC, 0, mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR, 0);
++	}
+ }
+ 
+ static void gfxhub_v1_0_init_tlb_regs(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c
+index 3a89bf76d22e..d53b3751418d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c
++++ b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c
+@@ -65,19 +65,40 @@ void mmhub_v1_7_setup_vm_pt_regs(struct amdgpu_device *adev, uint32_t vmid,
+ 
+ static void mmhub_v1_7_init_gart_aperture_regs(struct amdgpu_device *adev)
+ {
+-	uint64_t pt_base = amdgpu_gmc_pd_addr(adev->gart.bo);
++	uint64_t pt_base;
++
++	if (adev->gmc.pdb0_bo)
++		pt_base = amdgpu_gmc_pd_addr(adev->gmc.pdb0_bo);
++	else
++		pt_base = amdgpu_gmc_pd_addr(adev->gart.bo);
+ 
+ 	mmhub_v1_7_setup_vm_pt_regs(adev, 0, pt_base);
+ 
+-	WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
+-		     (u32)(adev->gmc.gart_start >> 12));
+-	WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
+-		     (u32)(adev->gmc.gart_start >> 44));
++	/* If use GART for FB translation, vmid0 page table covers both
++	 * vram and system memory (gart)
++	 */
++	if (adev->gmc.pdb0_bo) {
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
++				(u32)(adev->gmc.fb_start >> 12));
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
++				(u32)(adev->gmc.fb_start >> 44));
++
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
++				(u32)(adev->gmc.gart_end >> 12));
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
++				(u32)(adev->gmc.gart_end >> 44));
+ 
+-	WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+-		     (u32)(adev->gmc.gart_end >> 12));
+-	WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
+-		     (u32)(adev->gmc.gart_end >> 44));
++	} else {
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
++				(u32)(adev->gmc.gart_start >> 12));
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
++				(u32)(adev->gmc.gart_start >> 44));
++
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
++				(u32)(adev->gmc.gart_end >> 12));
++		WREG32_SOC15(MMHUB, 0, regVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
++				(u32)(adev->gmc.gart_end >> 44));
++	}
+ }
+ 
+ static void mmhub_v1_7_init_system_aperture_regs(struct amdgpu_device *adev)
+@@ -97,6 +118,17 @@ static void mmhub_v1_7_init_system_aperture_regs(struct amdgpu_device *adev)
+ 	WREG32_SOC15(MMHUB, 0, regMC_VM_SYSTEM_APERTURE_HIGH_ADDR,
+ 		     max(adev->gmc.fb_end, adev->gmc.agp_end) >> 18);
+ 
++	/* In the case squeezing vram into GART aperture, we don't use
++	 * FB aperture and AGP aperture. Disable them.
++	 */
++	if (adev->gmc.pdb0_bo) {
++		WREG32_SOC15(MMHUB, 0, regMC_VM_AGP_BOT, 0xFFFFFF);
++		WREG32_SOC15(MMHUB, 0, regMC_VM_AGP_TOP, 0);
++		WREG32_SOC15(MMHUB, 0, regMC_VM_FB_LOCATION_TOP, 0);
++		WREG32_SOC15(MMHUB, 0, regMC_VM_FB_LOCATION_BASE, 0x00FFFFFF);
++		WREG32_SOC15(MMHUB, 0, regMC_VM_SYSTEM_APERTURE_LOW_ADDR, 0x3FFFFFFF);
++		WREG32_SOC15(MMHUB, 0, regMC_VM_SYSTEM_APERTURE_HIGH_ADDR, 0);
++	}
+ 	if (amdgpu_sriov_vf(adev))
+ 		return;
+ 
+-- 
+2.25.1
+

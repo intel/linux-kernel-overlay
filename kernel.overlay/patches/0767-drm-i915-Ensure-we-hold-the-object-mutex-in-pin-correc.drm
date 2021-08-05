@@ -1,0 +1,86 @@
+From c3dea750b54630dddb642ca5a5a32cf49fa2bed2 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:49:54 +0100
+Subject: [PATCH 0767/2740] drm/i915: Ensure we hold the object mutex in pin
+ correctly.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently we have a lot of places where we hold the gem object lock,
+but haven't yet been converted to the ww dance. Complain loudly about
+those places.
+
+i915_vma_pin shouldn't have the obj lock held, so we can do a ww dance,
+while i915_vma_pin_ww should.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com> #irc
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-6-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/gt/intel_renderstate.c |  2 +-
+ drivers/gpu/drm/i915/i915_vma.c             | 11 ++++++++++-
+ drivers/gpu/drm/i915/i915_vma.h             |  3 +++
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_renderstate.c b/drivers/gpu/drm/i915/gt/intel_renderstate.c
+index ca816ba22197..334c557673dd 100644
+--- a/drivers/gpu/drm/i915/gt/intel_renderstate.c
++++ b/drivers/gpu/drm/i915/gt/intel_renderstate.c
+@@ -197,7 +197,7 @@ int intel_renderstate_init(struct intel_renderstate *so,
+ 	if (err)
+ 		goto err_context;
+ 
+-	err = i915_vma_pin(so->vma, 0, 0, PIN_GLOBAL | PIN_HIGH);
++	err = i915_vma_pin_ww(so->vma, &so->ww, 0, 0, PIN_GLOBAL | PIN_HIGH);
+ 	if (err)
+ 		goto err_context;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index ee0028c697f6..82b73dbc9737 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -865,6 +865,8 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ #ifdef CONFIG_PROVE_LOCKING
+ 	if (debug_locks && lockdep_is_held(&vma->vm->i915->drm.struct_mutex))
+ 		WARN_ON(!ww);
++	if (debug_locks && ww && vma->resv)
++		assert_vma_held(vma);
+ #endif
+ 
+ 	BUILD_BUG_ON(PIN_GLOBAL != I915_VMA_GLOBAL_BIND);
+@@ -1020,8 +1022,15 @@ int i915_ggtt_pin(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 
+ 	GEM_BUG_ON(!i915_vma_is_ggtt(vma));
+ 
++#ifdef CONFIG_LOCKDEP
++	WARN_ON(!ww && vma->resv && dma_resv_held(vma->resv));
++#endif
++
+ 	do {
+-		err = i915_vma_pin_ww(vma, ww, 0, align, flags | PIN_GLOBAL);
++		if (ww)
++			err = i915_vma_pin_ww(vma, ww, 0, align, flags | PIN_GLOBAL);
++		else
++			err = i915_vma_pin(vma, 0, align, flags | PIN_GLOBAL);
+ 		if (err != -ENOSPC) {
+ 			if (!err) {
+ 				err = i915_vma_wait_for_bind(vma);
+diff --git a/drivers/gpu/drm/i915/i915_vma.h b/drivers/gpu/drm/i915/i915_vma.h
+index a64adc8c883b..3c914c9de9a9 100644
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -243,6 +243,9 @@ i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ static inline int __must_check
+ i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
+ {
++#ifdef CONFIG_LOCKDEP
++	WARN_ON_ONCE(vma->resv && dma_resv_held(vma->resv));
++#endif
+ 	return i915_vma_pin_ww(vma, NULL, size, alignment, flags);
+ }
+ 
+-- 
+2.25.1
+

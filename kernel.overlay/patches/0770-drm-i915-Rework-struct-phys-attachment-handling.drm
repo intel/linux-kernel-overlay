@@ -1,0 +1,295 @@
+From 1e4664c68e589d05aebc22138ac9a66f7f19dca2 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:49:57 +0100
+Subject: [PATCH 0770/2740] drm/i915: Rework struct phys attachment handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of creating a separate object type, we make changes to
+the shmem type, to clear struct page backing. This will allow us to
+ensure we never run into a race when we exchange obj->ops with other
+function pointers.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-9-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_object.h    |   8 ++
+ drivers/gpu/drm/i915/gem/i915_gem_phys.c      | 102 +++++++++---------
+ drivers/gpu/drm/i915/gem/i915_gem_shmem.c     |  22 +++-
+ .../drm/i915/gem/selftests/i915_gem_phys.c    |   6 --
+ 4 files changed, 78 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index 25c785e388fc..60905e7e0907 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -37,7 +37,15 @@ void __i915_gem_object_release_shmem(struct drm_i915_gem_object *obj,
+ 				     struct sg_table *pages,
+ 				     bool needs_clflush);
+ 
++int i915_gem_object_pwrite_phys(struct drm_i915_gem_object *obj,
++				const struct drm_i915_gem_pwrite *args);
++int i915_gem_object_pread_phys(struct drm_i915_gem_object *obj,
++			       const struct drm_i915_gem_pread *args);
++
+ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align);
++void i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
++				    struct sg_table *pages);
++
+ 
+ void i915_gem_flush_free_objects(struct drm_i915_private *i915);
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_phys.c b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+index d1bf543d111a..ed283e168f2f 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_phys.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+@@ -76,6 +76,8 @@ static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
+ 
+ 	intel_gt_chipset_flush(&to_i915(obj->base.dev)->gt);
+ 
++	/* We're no longer struct page backed */
++	obj->flags &= ~I915_BO_ALLOC_STRUCT_PAGE;
+ 	__i915_gem_object_set_pages(obj, st, sg->length);
+ 
+ 	return 0;
+@@ -89,7 +91,7 @@ static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
+ 	return -ENOMEM;
+ }
+ 
+-static void
++void
+ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
+ 			       struct sg_table *pages)
+ {
+@@ -134,9 +136,8 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
+ 			  vaddr, dma);
+ }
+ 
+-static int
+-phys_pwrite(struct drm_i915_gem_object *obj,
+-	    const struct drm_i915_gem_pwrite *args)
++int i915_gem_object_pwrite_phys(struct drm_i915_gem_object *obj,
++				const struct drm_i915_gem_pwrite *args)
+ {
+ 	void *vaddr = sg_page(obj->mm.pages->sgl) + args->offset;
+ 	char __user *user_data = u64_to_user_ptr(args->data_ptr);
+@@ -165,9 +166,8 @@ phys_pwrite(struct drm_i915_gem_object *obj,
+ 	return 0;
+ }
+ 
+-static int
+-phys_pread(struct drm_i915_gem_object *obj,
+-	   const struct drm_i915_gem_pread *args)
++int i915_gem_object_pread_phys(struct drm_i915_gem_object *obj,
++			       const struct drm_i915_gem_pread *args)
+ {
+ 	void *vaddr = sg_page(obj->mm.pages->sgl) + args->offset;
+ 	char __user *user_data = u64_to_user_ptr(args->data_ptr);
+@@ -186,86 +186,82 @@ phys_pread(struct drm_i915_gem_object *obj,
+ 	return 0;
+ }
+ 
+-static void phys_release(struct drm_i915_gem_object *obj)
++static int i915_gem_object_shmem_to_phys(struct drm_i915_gem_object *obj)
+ {
+-	fput(obj->base.filp);
+-}
++	struct sg_table *pages;
++	int err;
+ 
+-static const struct drm_i915_gem_object_ops i915_gem_phys_ops = {
+-	.name = "i915_gem_object_phys",
+-	.get_pages = i915_gem_object_get_pages_phys,
+-	.put_pages = i915_gem_object_put_pages_phys,
++	pages = __i915_gem_object_unset_pages(obj);
++
++	err = i915_gem_object_get_pages_phys(obj);
++	if (err)
++		goto err_xfer;
+ 
+-	.pread  = phys_pread,
+-	.pwrite = phys_pwrite,
++	/* Perma-pin (until release) the physical set of pages */
++	__i915_gem_object_pin_pages(obj);
+ 
+-	.release = phys_release,
+-};
++	if (!IS_ERR_OR_NULL(pages))
++		i915_gem_shmem_ops.put_pages(obj, pages);
++
++	i915_gem_object_release_memory_region(obj);
++	return 0;
++
++err_xfer:
++	if (!IS_ERR_OR_NULL(pages)) {
++		unsigned int sg_page_sizes = i915_sg_page_sizes(pages->sgl);
++
++		__i915_gem_object_set_pages(obj, pages, sg_page_sizes);
++	}
++	return err;
++}
+ 
+ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ {
+-	struct sg_table *pages;
+ 	int err;
+ 
+ 	if (align > obj->base.size)
+ 		return -EINVAL;
+ 
+-	if (obj->ops == &i915_gem_phys_ops)
+-		return 0;
+-
+ 	if (!i915_gem_object_is_shmem(obj))
+ 		return -EINVAL;
+ 
++	if (!i915_gem_object_has_struct_page(obj))
++		return 0;
++
+ 	err = i915_gem_object_unbind(obj, I915_GEM_OBJECT_UNBIND_ACTIVE);
+ 	if (err)
+ 		return err;
+ 
+ 	mutex_lock_nested(&obj->mm.lock, I915_MM_GET_PAGES);
+ 
++	if (unlikely(!i915_gem_object_has_struct_page(obj)))
++		goto out;
++
+ 	if (obj->mm.madv != I915_MADV_WILLNEED) {
+ 		err = -EFAULT;
+-		goto err_unlock;
++		goto out;
+ 	}
+ 
+ 	if (i915_gem_object_has_tiling_quirk(obj)) {
+ 		err = -EFAULT;
+-		goto err_unlock;
++		goto out;
+ 	}
+ 
+-	if (obj->mm.mapping) {
++	if (obj->mm.mapping || i915_gem_object_has_pinned_pages(obj)) {
+ 		err = -EBUSY;
+-		goto err_unlock;
++		goto out;
+ 	}
+ 
+-	pages = __i915_gem_object_unset_pages(obj);
+-
+-	obj->ops = &i915_gem_phys_ops;
+-	obj->flags &= ~I915_BO_ALLOC_STRUCT_PAGE;
+-
+-	err = ____i915_gem_object_get_pages(obj);
+-	if (err)
+-		goto err_xfer;
+-
+-	/* Perma-pin (until release) the physical set of pages */
+-	__i915_gem_object_pin_pages(obj);
+-
+-	if (!IS_ERR_OR_NULL(pages))
+-		i915_gem_shmem_ops.put_pages(obj, pages);
+-
+-	i915_gem_object_release_memory_region(obj);
+-
+-	mutex_unlock(&obj->mm.lock);
+-	return 0;
++	if (unlikely(obj->mm.madv != I915_MADV_WILLNEED)) {
++		drm_dbg(obj->base.dev,
++			"Attempting to obtain a purgeable object\n");
++		err = -EFAULT;
++		goto out;
++	}
+ 
+-err_xfer:
+-	obj->ops = &i915_gem_shmem_ops;
+-	obj->flags |= I915_BO_ALLOC_STRUCT_PAGE;
+-	if (!IS_ERR_OR_NULL(pages)) {
+-		unsigned int sg_page_sizes = i915_sg_page_sizes(pages->sgl);
++	err = i915_gem_object_shmem_to_phys(obj);
+ 
+-		__i915_gem_object_set_pages(obj, pages, sg_page_sizes);
+-	}
+-err_unlock:
++out:
+ 	mutex_unlock(&obj->mm.lock);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c b/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+index bb82b3bc8830..c9820c19c5f2 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+@@ -303,6 +303,11 @@ shmem_put_pages(struct drm_i915_gem_object *obj, struct sg_table *pages)
+ 	struct pagevec pvec;
+ 	struct page *page;
+ 
++	if (unlikely(!i915_gem_object_has_struct_page(obj))) {
++		i915_gem_object_put_pages_phys(obj, pages);
++		return;
++	}
++
+ 	__i915_gem_object_release_shmem(obj, pages, true);
+ 
+ 	i915_gem_gtt_finish_pages(obj, pages);
+@@ -343,6 +348,9 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
+ 	/* Caller already validated user args */
+ 	GEM_BUG_ON(!access_ok(user_data, arg->size));
+ 
++	if (!i915_gem_object_has_struct_page(obj))
++		return i915_gem_object_pwrite_phys(obj, arg);
++
+ 	/*
+ 	 * Before we instantiate/pin the backing store for our use, we
+ 	 * can prepopulate the shmemfs filp efficiently using a write into
+@@ -421,9 +429,20 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
+ 	return 0;
+ }
+ 
++static int
++shmem_pread(struct drm_i915_gem_object *obj,
++	    const struct drm_i915_gem_pread *arg)
++{
++	if (!i915_gem_object_has_struct_page(obj))
++		return i915_gem_object_pread_phys(obj, arg);
++
++	return -ENODEV;
++}
++
+ static void shmem_release(struct drm_i915_gem_object *obj)
+ {
+-	i915_gem_object_release_memory_region(obj);
++	if (obj->flags & I915_BO_ALLOC_STRUCT_PAGE)
++		i915_gem_object_release_memory_region(obj);
+ 
+ 	fput(obj->base.filp);
+ }
+@@ -438,6 +457,7 @@ const struct drm_i915_gem_object_ops i915_gem_shmem_ops = {
+ 	.writeback = shmem_writeback,
+ 
+ 	.pwrite = shmem_pwrite,
++	.pread = shmem_pread,
+ 
+ 	.release = shmem_release,
+ };
+diff --git a/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c b/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
+index fb6a17701310..0cfa082047fe 100644
+--- a/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
++++ b/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
+@@ -38,12 +38,6 @@ static int mock_phys_object(void *arg)
+ 	}
+ 
+ 	if (i915_gem_object_has_struct_page(obj)) {
+-		err = -EINVAL;
+-		pr_err("shmem has a struct page\n");
+-		goto out_obj;
+-	}
+-
+-	if (obj->ops != &i915_gem_phys_ops) {
+ 		pr_err("i915_gem_object_attach_phys did not create a phys object\n");
+ 		err = -EINVAL;
+ 		goto out_obj;
+-- 
+2.25.1
+

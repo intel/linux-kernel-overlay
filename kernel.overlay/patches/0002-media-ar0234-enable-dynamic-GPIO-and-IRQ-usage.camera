@@ -1,0 +1,181 @@
+From 5217cb4bac4babf91e28bd2bee0ec89ea2aa7f46 Mon Sep 17 00:00:00 2001
+From: Ng Khai Wen <khai.wen.ng@intel.com>
+Date: Wed, 14 Jul 2021 13:34:03 +0800
+Subject: [PATCH 02/14] media: ar0234: enable dynamic GPIO and IRQ usage
+
+Change Description:
+enable dynamic usage of GPIO and IRQ,
+add conditional check instead of using macro.
+
+Signed-off-by: Ng Khai Wen <khai.wen.ng@intel.com>
+---
+ drivers/media/i2c/ar0234.c                    | 62 +++++++++++++++++++
+ .../media/platform/intel/ipu6-tglrvp-pdata.c  | 16 ++---
+ 2 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/i2c/ar0234.c b/drivers/media/i2c/ar0234.c
+index 3ae408937406..8b36e579e7bd 100644
+--- a/drivers/media/i2c/ar0234.c
++++ b/drivers/media/i2c/ar0234.c
+@@ -1542,11 +1542,21 @@ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
+ 		break;
+ 
+ 	case V4L2_CID_FLASH_STROBE:
++		if (ar0234->platform_data->gpios[0] != -1) {
++			if (ar0234->strobe_source->val ==
++					V4L2_FLASH_STROBE_SOURCE_SOFTWARE)
++				gpio_set_value(ar0234->platform_data->gpios[0], 1);
++		}
+ 		dev_info(&client->dev, "turn on led %d\n", ctrl->val);
+ 
+ 		break;
+ 
+ 	case V4L2_CID_FLASH_STROBE_STOP:
++		if (ar0234->platform_data->gpios[0] != -1) {
++			if (ar0234->strobe_source->val ==
++					V4L2_FLASH_STROBE_SOURCE_SOFTWARE)
++				gpio_set_value(ar0234->platform_data->gpios[0], 0);
++		}
+ 		dev_info(&client->dev, "turn off led %d\n", ctrl->val);
+ 		break;
+ 
+@@ -1796,6 +1806,11 @@ static void ar0234_stop_streaming(struct ar0234 *ar0234)
+ 	if (ar0234_write_reg(ar0234, AR0234_REG_MODE_SELECT,
+ 			     AR0234_REG_VALUE_16BIT, AR0234_MODE_STANDBY))
+ 		dev_err(&client->dev, "failed to set stream");
++	/*
++	 * turn off flash, clear possible noise.
++	 */
++	if (ar0234->platform_data->gpios[0] != -1)
++		gpio_set_value(ar0234->platform_data->gpios[0], 0);
+ }
+ 
+ static int ar0234_set_stream(struct v4l2_subdev *sd, int enable)
+@@ -2101,6 +2116,24 @@ static int ar0234_remove(struct i2c_client *client)
+ 
+ irqreturn_t ar0234_threaded_irq_fn(int irq, void *dev_id)
+ {
++	struct ar0234 *ar0234 = dev_id;
++
++	if ((ar0234->platform_data->gpios[0] != -1) && (ar0234->platform_data->irq_pin != -1)) {
++		mutex_lock(&ar0234->mutex);
++		if (ar0234->streaming == false) {
++			gpio_set_value(ar0234->platform_data->gpios[0], 0);
++			goto ar0234_irq_handled;
++		}
++
++		if (ar0234->strobe_source->val == V4L2_FLASH_STROBE_SOURCE_EXTERNAL) {
++			gpio_set_value(ar0234->platform_data->gpios[0],
++					gpio_get_value(ar0234->platform_data->irq_pin));
++		}
++
++ar0234_irq_handled:
++		mutex_unlock(&ar0234->mutex);
++	}
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -2149,6 +2182,35 @@ static int ar0234_probe(struct i2c_client *client)
+ 		goto probe_error_v4l2_ctrl_handler_free;
+ 	}
+ 
++	if ((ar0234->platform_data->gpios[0] != -1) && (ar0234->platform_data->irq_pin != -1)) {
++		ret = devm_gpio_request(&client->dev,
++				ar0234->platform_data->irq_pin,
++				ar0234->platform_data->irq_pin_name);
++		if (ret) {
++			dev_err(&client->dev, "IRQ pin request failed!\n");
++			goto probe_error_v4l2_ctrl_handler_free;
++		}
++		gpio_direction_input(ar0234->platform_data->irq_pin);
++		ret = devm_request_threaded_irq(&client->dev,
++				gpio_to_irq(ar0234->platform_data->irq_pin),
++				NULL, ar0234_threaded_irq_fn,
++				ar0234->platform_data->irq_pin_flags,
++				ar0234->platform_data->irq_pin_name,
++				ar0234);
++		if (ret) {
++			dev_err(&client->dev, "IRQ request failed!\n");
++			goto probe_error_v4l2_ctrl_handler_free;
++		}
++
++		ret = devm_gpio_request_one(&client->dev,
++				ar0234->platform_data->gpios[0],
++				GPIOF_OUT_INIT_LOW, "LED");
++		if (ret) {
++			dev_err(&client->dev, "LED GPIO pin request failed!\n");
++			goto probe_error_v4l2_ctrl_handler_free;
++		}
++	}
++
+ 	ret = v4l2_async_register_subdev_sensor_common(&ar0234->sd);
+ 	if (ret < 0) {
+ 		dev_err(&client->dev, "failed to register V4L2 subdev: %d",
+diff --git a/drivers/media/platform/intel/ipu6-tglrvp-pdata.c b/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+index b7dd8dd3f288..cba0a523dd01 100644
+--- a/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
++++ b/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+@@ -48,12 +48,12 @@ static struct ar0234_platform_data ar0234_pdata_1 = {
+ 	.port = 1,
+ 	.lanes = 2,
+ 	.i2c_slave_address = AR0234_I2C_ADDRESS,
+-	.irq_pin = 338,
++	.irq_pin = -1,
+ 	.irq_pin_name = "B23",
+ 	.irq_pin_flags = IRQF_TRIGGER_RISING
+ 		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 	.suffix = 'a',
+-	.gpios = {258, 0, 0, 0},
++	.gpios = {-1, 0, 0, 0},
+ };
+ 
+ static struct ipu_isys_subdev_info ar0234_sd_1 = {
+@@ -77,12 +77,12 @@ static struct ar0234_platform_data ar0234_pdata_2 = {
+ 	.port = 2,
+ 	.lanes = 2,
+ 	.i2c_slave_address = AR0234_I2C_ADDRESS,
+-	.irq_pin = 330,
++	.irq_pin = -1,
+ 	.irq_pin_name = "R6",
+ 	.irq_pin_flags = IRQF_TRIGGER_RISING
+ 		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 	.suffix = 'b',
+-	.gpios = {501, 0, 0, 0},
++	.gpios = {-1, 0, 0, 0},
+ };
+ 
+ static struct ipu_isys_subdev_info ar0234_sd_2 = {
+@@ -106,12 +106,12 @@ static struct ar0234_platform_data ar0234_pdata_3 = {
+ 	.port = 4,
+ 	.lanes = 2,
+ 	.i2c_slave_address = AR0234_I2C_ADDRESS,
+-	.irq_pin = 332,
++	.irq_pin = -1,
+ 	.irq_pin_name = "IMGCLKOUT_3",
+ 	.irq_pin_flags = IRQF_TRIGGER_RISING
+ 		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 	.suffix = 'c',
+-	.gpios = {253, 0, 0, 0},
++	.gpios = {-1, 0, 0, 0},
+ };
+ 
+ static struct ipu_isys_subdev_info ar0234_sd_3 = {
+@@ -135,12 +135,12 @@ static struct ar0234_platform_data ar0234_pdata_4 = {
+ 	.port = 5,
+ 	.lanes = 2,
+ 	.i2c_slave_address = AR0234_I2C_ADDRESS_2,
+-	.irq_pin = 331,
++	.irq_pin = -1,
+ 	.irq_pin_name = "H15",
+ 	.irq_pin_flags = IRQF_TRIGGER_RISING
+ 		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+ 	.suffix = 'd',
+-	.gpios = {325, 0, 0, 0},
++	.gpios = {-1, 0, 0, 0},
+ };
+ 
+ static struct ipu_isys_subdev_info ar0234_sd_4 = {
+-- 
+2.25.1
+

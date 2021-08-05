@@ -1,0 +1,219 @@
+From 558c823ce351239638f60f855849298907bf1451 Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 24 Feb 2021 23:57:33 -0500
+Subject: [PATCH 1821/2740] drm/amdkfd: multiple gpu migrate vram to vram
+
+If prefetch range to gpu with acutal location is another gpu, or GPU
+retry fault restore pages to migrate the range with acutal location is
+gpu, then migrate from one gpu to another gpu.
+
+Use system memory as bridge because sdma engine may not able to access
+another gpu vram, use sdma of source gpu to migrate to system memory,
+then use sdma of destination gpu to migrate from system memory to gpu.
+
+Print out gpuid or gpuidx in debug messages.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.c | 47 +++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.h |  4 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c     | 51 +++++++++++++++++++-----
+ 3 files changed, 87 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+index 3726a671d7d8..d44a46eb00d6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+@@ -487,8 +487,9 @@ svm_migrate_vma_to_vram(struct amdgpu_device *adev, struct svm_range *prange,
+  * Return:
+  * 0 - OK, otherwise error code
+  */
+-int svm_migrate_ram_to_vram(struct svm_range *prange, uint32_t best_loc,
+-			    struct mm_struct *mm)
++static int
++svm_migrate_ram_to_vram(struct svm_range *prange, uint32_t best_loc,
++			struct mm_struct *mm)
+ {
+ 	unsigned long addr, start, end;
+ 	struct vm_area_struct *vma;
+@@ -742,6 +743,48 @@ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm)
+ 	return r;
+ }
+ 
++/**
++ * svm_migrate_vram_to_vram - migrate svm range from device to device
++ * @prange: range structure
++ * @best_loc: the device to migrate to
++ * @mm: process mm, use current->mm if NULL
++ *
++ * Context: Process context, caller hold mmap read lock, svms lock, prange lock
++ *
++ * Return:
++ * 0 - OK, otherwise error code
++ */
++static int
++svm_migrate_vram_to_vram(struct svm_range *prange, uint32_t best_loc,
++			 struct mm_struct *mm)
++{
++	int r;
++
++	/*
++	 * TODO: for both devices with PCIe large bar or on same xgmi hive, skip
++	 * system memory as migration bridge
++	 */
++
++	pr_debug("from gpu 0x%x to gpu 0x%x\n", prange->actual_loc, best_loc);
++
++	r = svm_migrate_vram_to_ram(prange, mm);
++	if (r)
++		return r;
++
++	return svm_migrate_ram_to_vram(prange, best_loc, mm);
++}
++
++int
++svm_migrate_to_vram(struct svm_range *prange, uint32_t best_loc,
++		    struct mm_struct *mm)
++{
++	if  (!prange->actual_loc)
++		return svm_migrate_ram_to_vram(prange, best_loc, mm);
++	else
++		return svm_migrate_vram_to_vram(prange, best_loc, mm);
++
++}
++
+ /**
+  * svm_migrate_to_ram - CPU page fault handler
+  * @vmf: CPU vm fault vma, address
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+index 53c899b80b85..37ad99cb073d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+@@ -38,8 +38,8 @@ enum MIGRATION_COPY_DIR {
+ 	FROM_VRAM_TO_RAM
+ };
+ 
+-int svm_migrate_ram_to_vram(struct svm_range *prange,  uint32_t best_loc,
+-			    struct mm_struct *mm);
++int svm_migrate_to_vram(struct svm_range *prange,  uint32_t best_loc,
++			struct mm_struct *mm);
+ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm);
+ unsigned long
+ svm_migrate_addr_to_pfn(struct amdgpu_device *adev, unsigned long addr);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index 0694211a118b..0e0b4ffd20ab 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -348,8 +348,11 @@ static void svm_range_bo_unref(struct svm_range_bo *svm_bo)
+ 	kref_put(&svm_bo->kref, svm_range_bo_release);
+ }
+ 
+-static bool svm_range_validate_svm_bo(struct svm_range *prange)
++static bool
++svm_range_validate_svm_bo(struct amdgpu_device *adev, struct svm_range *prange)
+ {
++	struct amdgpu_device *bo_adev;
++
+ 	mutex_lock(&prange->lock);
+ 	if (!prange->svm_bo) {
+ 		mutex_unlock(&prange->lock);
+@@ -361,6 +364,22 @@ static bool svm_range_validate_svm_bo(struct svm_range *prange)
+ 		return true;
+ 	}
+ 	if (svm_bo_ref_unless_zero(prange->svm_bo)) {
++		/*
++		 * Migrate from GPU to GPU, remove range from source bo_adev
++		 * svm_bo range list, and return false to allocate svm_bo from
++		 * destination adev.
++		 */
++		bo_adev = amdgpu_ttm_adev(prange->svm_bo->bo->tbo.bdev);
++		if (bo_adev != adev) {
++			mutex_unlock(&prange->lock);
++
++			spin_lock(&prange->svm_bo->list_lock);
++			list_del_init(&prange->svm_bo_list);
++			spin_unlock(&prange->svm_bo->list_lock);
++
++			svm_range_bo_unref(prange->svm_bo);
++			return false;
++		}
+ 		if (READ_ONCE(prange->svm_bo->evicting)) {
+ 			struct dma_fence *f;
+ 			struct svm_range_bo *svm_bo;
+@@ -434,7 +453,7 @@ svm_range_vram_node_new(struct amdgpu_device *adev, struct svm_range *prange,
+ 	pr_debug("pasid: %x svms 0x%p [0x%lx 0x%lx]\n", p->pasid, prange->svms,
+ 		 prange->start, prange->last);
+ 
+-	if (svm_range_validate_svm_bo(prange))
++	if (svm_range_validate_svm_bo(adev, prange))
+ 		return 0;
+ 
+ 	svm_bo = svm_range_bo_new();
+@@ -1173,6 +1192,7 @@ static int svm_range_map_to_gpus(struct svm_range *prange,
+ 
+ 	p = container_of(prange->svms, struct kfd_process, svms);
+ 	for_each_set_bit(gpuidx, bitmap, MAX_GPU_INSTANCE) {
++		pr_debug("mapping to gpu idx 0x%x\n", gpuidx);
+ 		pdd = kfd_process_device_from_gpuidx(p, gpuidx);
+ 		if (!pdd) {
+ 			pr_debug("failed to find device idx %d\n", gpuidx);
+@@ -2198,7 +2218,7 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 
+ 	if (prange->actual_loc != best_loc) {
+ 		if (best_loc) {
+-			r = svm_migrate_ram_to_vram(prange, best_loc, mm);
++			r = svm_migrate_to_vram(prange, best_loc, mm);
+ 			if (r) {
+ 				pr_debug("svm_migrate_to_vram failed (%d) at %llx, falling back to system memory\n",
+ 					 r, addr);
+@@ -2406,6 +2426,11 @@ svm_range_best_prefetch_location(struct svm_range *prange)
+ 		goto out;
+ 
+ 	bo_adev = svm_range_get_adev_by_id(prange, best_loc);
++	if (!bo_adev) {
++		WARN_ONCE(1, "failed to get device by id 0x%x\n", best_loc);
++		best_loc = 0;
++		goto out;
++	}
+ 	bitmap_or(bitmap, prange->bitmap_access, prange->bitmap_aip,
+ 		  MAX_GPU_INSTANCE);
+ 
+@@ -2493,20 +2518,24 @@ svm_range_trigger_migration(struct mm_struct *mm, struct svm_range *prange,
+ 	    best_loc == prange->actual_loc)
+ 		return 0;
+ 
++	/*
++	 * Prefetch to GPU without host access flag, set actual_loc to gpu, then
++	 * validate on gpu and map to gpus will be handled afterwards.
++	 */
+ 	if (best_loc && !prange->actual_loc &&
+-	    !(prange->flags & KFD_IOCTL_SVM_FLAG_HOST_ACCESS))
++	    !(prange->flags & KFD_IOCTL_SVM_FLAG_HOST_ACCESS)) {
++		prange->actual_loc = best_loc;
+ 		return 0;
++	}
+ 
+-	if (best_loc) {
+-		pr_debug("migrate from ram to vram\n");
+-		r = svm_migrate_ram_to_vram(prange, best_loc, mm);
+-	} else {
+-		pr_debug("migrate from vram to ram\n");
++	if (!best_loc) {
+ 		r = svm_migrate_vram_to_ram(prange, mm);
++		*migrated = !r;
++		return r;
+ 	}
+ 
+-	if (!r)
+-		*migrated = true;
++	r = svm_migrate_to_vram(prange, best_loc, mm);
++	*migrated = !r;
+ 
+ 	return r;
+ }
+-- 
+2.25.1
+

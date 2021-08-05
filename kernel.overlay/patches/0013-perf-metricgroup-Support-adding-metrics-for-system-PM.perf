@@ -1,0 +1,151 @@
+From c8dc35111f567321448d9b2c588772a9e7b4ff60 Mon Sep 17 00:00:00 2001
+From: John Garry <john.garry@huawei.com>
+Date: Fri, 4 Dec 2020 19:10:15 +0800
+Subject: [PATCH 13/37] perf metricgroup: Support adding metrics for system
+ PMUs
+
+Currently adding metrics for core- or uncore-based events matched by CPUID
+is supported.
+
+Extend this for system events.
+
+Signed-off-by: John Garry <john.garry@huawei.com>
+Acked-by: Kajol Jain <kjain@linux.ibm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Joakim Zhang <qiangqing.zhang@nxp.com>
+Cc: Kan Liang <kan.liang@linux.intel.com>
+Cc: Kim Phillips <kim.phillips@amd.com>
+Cc: Leo Yan <leo.yan@linaro.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linuxarm@huawei.com
+Link: http://lore.kernel.org/lkml/1607080216-36968-10-git-send-email-john.garry@huawei.com
+[ Reorder 'struct metricgroup_add_iter_data' field to avoid alignment holes ]
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/metricgroup.c | 66 +++++++++++++++++++++++++++++++----
+ 1 file changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/tools/perf/util/metricgroup.c b/tools/perf/util/metricgroup.c
+index 4dc293705fe6..67451ba390b1 100644
+--- a/tools/perf/util/metricgroup.c
++++ b/tools/perf/util/metricgroup.c
+@@ -413,6 +413,12 @@ static bool match_metric(const char *n, const char *list)
+ 	return false;
+ }
+ 
++static bool match_pe_metric(struct pmu_event *pe, const char *metric)
++{
++	return match_metric(pe->metric_group, metric) ||
++	       match_metric(pe->metric_name, metric);
++}
++
+ struct mep {
+ 	struct rb_node nd;
+ 	const char *name;
+@@ -699,6 +705,16 @@ int __weak arch_get_runtimeparam(struct pmu_event *pe __maybe_unused)
+ 	return 1;
+ }
+ 
++struct metricgroup_add_iter_data {
++	struct list_head *metric_list;
++	const char *metric;
++	struct metric **m;
++	struct expr_ids *ids;
++	int *ret;
++	bool *has_match;
++	bool metric_no_group;
++};
++
+ static int __add_metric(struct list_head *metric_list,
+ 			struct pmu_event *pe,
+ 			bool metric_no_group,
+@@ -808,10 +824,11 @@ static int __add_metric(struct list_head *metric_list,
+ 	return 0;
+ }
+ 
+-#define map_for_each_event(__pe, __idx, __map)				\
+-	for (__idx = 0, __pe = &__map->table[__idx];			\
+-	     __pe->name || __pe->metric_group || __pe->metric_name;	\
+-	     __pe = &__map->table[++__idx])
++#define map_for_each_event(__pe, __idx, __map)					\
++	if (__map)								\
++		for (__idx = 0, __pe = &__map->table[__idx];			\
++		     __pe->name || __pe->metric_group || __pe->metric_name;	\
++		     __pe = &__map->table[++__idx])
+ 
+ #define map_for_each_metric(__pe, __idx, __map, __metric)		\
+ 	map_for_each_event(__pe, __idx, __map)				\
+@@ -980,6 +997,29 @@ static int add_metric(struct list_head *metric_list,
+ 	return ret;
+ }
+ 
++static int metricgroup__add_metric_sys_event_iter(struct pmu_event *pe,
++						  void *data)
++{
++	struct metricgroup_add_iter_data *d = data;
++	int ret;
++
++	if (!match_pe_metric(pe, d->metric))
++		return 0;
++
++	ret = add_metric(d->metric_list, pe, d->metric_no_group, d->m, NULL, d->ids);
++	if (ret)
++		return ret;
++
++	ret = resolve_metric(d->metric_no_group,
++				     d->metric_list, NULL, d->ids);
++	if (ret)
++		return ret;
++
++	*(d->has_match) = true;
++
++	return *d->ret;
++}
++
+ static int metricgroup__add_metric(const char *metric, bool metric_no_group,
+ 				   struct strbuf *events,
+ 				   struct list_head *metric_list,
+@@ -1010,6 +1050,22 @@ static int metricgroup__add_metric(const char *metric, bool metric_no_group,
+ 			goto out;
+ 	}
+ 
++	{
++		struct metricgroup_iter_data data = {
++			.fn = metricgroup__add_metric_sys_event_iter,
++			.data = (void *) &(struct metricgroup_add_iter_data) {
++				.metric_list = &list,
++				.metric = metric,
++				.metric_no_group = metric_no_group,
++				.m = &m,
++				.ids = &ids,
++				.has_match = &has_match,
++				.ret = &ret,
++			},
++		};
++
++		pmu_for_each_sys_event(metricgroup__sys_event_iter, &data);
++	}
+ 	/* End of pmu events. */
+ 	if (!has_match) {
+ 		ret = -EINVAL;
+@@ -1136,8 +1192,6 @@ int metricgroup__parse_groups(const struct option *opt,
+ 	struct evlist *perf_evlist = *(struct evlist **)opt->value;
+ 	struct pmu_events_map *map = perf_pmu__find_map(NULL);
+ 
+-	if (!map)
+-		return 0;
+ 
+ 	return parse_groups(perf_evlist, str, metric_no_group,
+ 			    metric_no_merge, NULL, metric_events, map);
+-- 
+2.25.1
+

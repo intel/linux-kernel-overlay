@@ -1,0 +1,193 @@
+From 820d2c620b5bfe34319d26de7db81eb8eab42050 Mon Sep 17 00:00:00 2001
+From: Jake Wang <haonan.wang2@amd.com>
+Date: Fri, 23 Apr 2021 16:42:35 -0400
+Subject: [PATCH 2362/2740] drm/amd/display: Added support for individual
+ control for multiple back-light instances.
+
+[Why & How]
+Added support for individual control for multiple back-light instances.
+
+Signed-off-by: Jake Wang <haonan.wang2@amd.com>
+Reviewed-by: Anthony Koo <Anthony.Koo@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 26 +++++++++++--------
+ drivers/gpu/drm/amd/display/dc/dc_link.h      | 17 ++++++++++++
+ drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c | 10 +++----
+ drivers/gpu/drm/amd/display/dc/inc/hw/abm.h   |  3 ++-
+ .../amd/display/modules/power/power_helpers.c | 15 ++++++-----
+ .../amd/display/modules/power/power_helpers.h |  3 ++-
+ 6 files changed, 47 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index caed33a9bf89..06974e6ef4a2 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1717,7 +1717,6 @@ static int dm_late_init(void *handle)
+ 	unsigned int linear_lut[16];
+ 	int i;
+ 	struct dmcu *dmcu = NULL;
+-	bool ret = true;
+ 
+ 	dmcu = adev->dm.dc->res_pool->dmcu;
+ 
+@@ -1734,18 +1733,23 @@ static int dm_late_init(void *handle)
+ 	 * 0xFFFF x 0.01 = 0x28F
+ 	 */
+ 	params.min_abm_backlight = 0x28F;
+-
+ 	/* In the case where abm is implemented on dmcub,
+-	 * dmcu object will be null.
+-	 * ABM 2.4 and up are implemented on dmcub.
+-	 */
+-	if (dmcu)
+-		ret = dmcu_load_iram(dmcu, params);
+-	else if (adev->dm.dc->ctx->dmub_srv)
+-		ret = dmub_init_abm_config(adev->dm.dc->res_pool, params);
++	* dmcu object will be null.
++	* ABM 2.4 and up are implemented on dmcub.
++	*/
++	if (dmcu) {
++		if (!dmcu_load_iram(dmcu, params))
++			return -EINVAL;
++	} else if (adev->dm.dc->ctx->dmub_srv) {
++		struct dc_link *edp_links[MAX_NUM_EDP];
++		int edp_num;
+ 
+-	if (!ret)
+-		return -EINVAL;
++		get_edp_links(adev->dm.dc, edp_links, &edp_num);
++		for (i = 0; i < edp_num; i++) {
++			if (!dmub_init_abm_config(adev->dm.dc->res_pool, params, i))
++				return -EINVAL;
++		}
++	}
+ 
+ 	return detect_mst_link_for_all_connectors(adev_to_drm(adev));
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_link.h b/drivers/gpu/drm/amd/display/dc/dc_link.h
+index c871923e7db0..c617e9ae68a3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_link.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_link.h
+@@ -216,6 +216,23 @@ static inline void get_edp_links(const struct dc *dc,
+ 	}
+ }
+ 
++static inline bool dc_get_edp_link_panel_inst(const struct dc *dc,
++		const struct dc_link *link,
++		unsigned int *inst_out)
++{
++	struct dc_link *edp_links[MAX_NUM_EDP];
++	int edp_num;
++
++	if (link->connector_signal != SIGNAL_TYPE_EDP)
++		return false;
++	get_edp_links(dc, edp_links, &edp_num);
++	if ((edp_num > 1) && (link->link_index > edp_links[0]->link_index))
++		*inst_out = 1;
++	else
++		*inst_out = 0;
++	return true;
++}
++
+ /* Set backlight level of an embedded panel (eDP, LVDS).
+  * backlight_pwm_u16_16 is unsigned 32 bit with 16 bit integer
+  * and 16 bit fractional, where 1.0 is max backlight value.
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c b/drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c
+index 6939ca2e8212..54a1408c8015 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c
+@@ -172,16 +172,12 @@ static bool dmub_abm_set_level(struct abm *abm, uint32_t level)
+ 
+ static bool dmub_abm_init_config(struct abm *abm,
+ 	const char *src,
+-	unsigned int bytes)
++	unsigned int bytes,
++	unsigned int inst)
+ {
+ 	union dmub_rb_cmd cmd;
+ 	struct dc_context *dc = abm->ctx;
+-	uint32_t edp_id_count = dc->dc_edp_id_count;
+-	int i;
+-	uint8_t panel_mask = 0;
+-
+-	for (i = 0; i < edp_id_count; i++)
+-		panel_mask |= 0x01 << i;
++	uint8_t panel_mask = 0x01 << inst;
+ 
+ 	// TODO: Optimize by only reading back final 4 bytes
+ 	dmub_flush_buffer_mem(&dc->dmub_srv->dmub->scratch_mem_fb);
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+index e8ce8c85adf1..142753644377 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/abm.h
+@@ -52,7 +52,8 @@ struct abm_funcs {
+ 	unsigned int (*get_target_backlight)(struct abm *abm);
+ 	bool (*init_abm_config)(struct abm *abm,
+ 			const char *src,
+-			unsigned int bytes);
++			unsigned int bytes,
++			unsigned int inst);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/modules/power/power_helpers.c b/drivers/gpu/drm/amd/display/modules/power/power_helpers.c
+index 6270ecbd2438..5e7331be1c0d 100644
+--- a/drivers/gpu/drm/amd/display/modules/power/power_helpers.c
++++ b/drivers/gpu/drm/amd/display/modules/power/power_helpers.c
+@@ -660,7 +660,8 @@ static void fill_iram_v_2_3(struct iram_table_v_2_2 *ram_table, struct dmcu_iram
+ }
+ 
+ bool dmub_init_abm_config(struct resource_pool *res_pool,
+-	struct dmcu_iram_parameters params)
++	struct dmcu_iram_parameters params,
++	unsigned int inst)
+ {
+ 	struct iram_table_v_2_2 ram_table;
+ 	struct abm_config_table config;
+@@ -669,7 +670,7 @@ bool dmub_init_abm_config(struct resource_pool *res_pool,
+ 	uint32_t i, j = 0;
+ 
+ #if defined(CONFIG_DRM_AMD_DC_DCN)
+-	if (res_pool->abm == NULL && res_pool->multiple_abms[0] == NULL)
++	if (res_pool->abm == NULL && res_pool->multiple_abms[inst] == NULL)
+ 		return false;
+ #else
+ 	if (res_pool->abm == NULL)
+@@ -728,13 +729,13 @@ bool dmub_init_abm_config(struct resource_pool *res_pool,
+ 	config.min_abm_backlight = ram_table.min_abm_backlight;
+ 
+ #if defined(CONFIG_DRM_AMD_DC_DCN)
+-	if (res_pool->multiple_abms[0])
+-		result = res_pool->multiple_abms[0]->funcs->init_abm_config(
+-			res_pool->multiple_abms[0], (char *)(&config), sizeof(struct abm_config_table));
+-	else
++	if (res_pool->multiple_abms[inst]) {
++		result = res_pool->multiple_abms[inst]->funcs->init_abm_config(
++			res_pool->multiple_abms[inst], (char *)(&config), sizeof(struct abm_config_table), inst);
++	} else
+ #endif
+ 		result = res_pool->abm->funcs->init_abm_config(
+-			res_pool->abm, (char *)(&config), sizeof(struct abm_config_table));
++			res_pool->abm, (char *)(&config), sizeof(struct abm_config_table), 0);
+ 
+ 	return result;
+ }
+diff --git a/drivers/gpu/drm/amd/display/modules/power/power_helpers.h b/drivers/gpu/drm/amd/display/modules/power/power_helpers.h
+index 6f2eecce6baa..2a9f8e2d8080 100644
+--- a/drivers/gpu/drm/amd/display/modules/power/power_helpers.h
++++ b/drivers/gpu/drm/amd/display/modules/power/power_helpers.h
+@@ -49,6 +49,7 @@ struct dmcu_iram_parameters {
+ bool dmcu_load_iram(struct dmcu *dmcu,
+ 		struct dmcu_iram_parameters params);
+ bool dmub_init_abm_config(struct resource_pool *res_pool,
+-		struct dmcu_iram_parameters params);
++		struct dmcu_iram_parameters params,
++		unsigned int inst);
+ 
+ #endif /* MODULES_POWER_POWER_HELPERS_H_ */
+-- 
+2.25.1
+

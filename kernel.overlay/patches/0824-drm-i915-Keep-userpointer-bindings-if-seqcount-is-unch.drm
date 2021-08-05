@@ -1,0 +1,70 @@
+From 74c9e15788e48655bf242690869f67d493111681 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:50:51 +0100
+Subject: [PATCH 0824/2740] drm/i915: Keep userpointer bindings if seqcount is
+ unchanged, v2.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of force unbinding and rebinding every time, we try to check
+if our notifier seqcount is still correct when pages are bound. This
+way we only rebind userptr when we need to, and prevent stalls.
+
+Changes since v1:
+- Missing mutex_unlock, reported by kbuild.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@intel.com>
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-63-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_userptr.c | 27 ++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_userptr.c b/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+index 4afd08c1fe09..8ebdd252d6b8 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+@@ -281,12 +281,33 @@ int i915_gem_object_userptr_submit_init(struct drm_i915_gem_object *obj)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Make sure userptr is unbound for next attempt, so we don't use stale pages. */
+-	ret = i915_gem_object_userptr_unbind(obj, false);
++	/* optimistically try to preserve current pages while unlocked */
++	if (i915_gem_object_has_pages(obj) &&
++	    !mmu_interval_check_retry(&obj->userptr.notifier,
++				      obj->userptr.notifier_seq)) {
++		spin_lock(&i915->mm.notifier_lock);
++		if (obj->userptr.pvec &&
++		    !mmu_interval_read_retry(&obj->userptr.notifier,
++					     obj->userptr.notifier_seq)) {
++			obj->userptr.page_ref++;
++
++			/* We can keep using the current binding, this is the fastpath */
++			ret = 1;
++		}
++		spin_unlock(&i915->mm.notifier_lock);
++	}
++
++	if (!ret) {
++		/* Make sure userptr is unbound for next attempt, so we don't use stale pages. */
++		ret = i915_gem_object_userptr_unbind(obj, false);
++	}
+ 	i915_gem_object_unlock(obj);
+-	if (ret)
++	if (ret < 0)
+ 		return ret;
+ 
++	if (ret > 0)
++		return 0;
++
+ 	notifier_seq = mmu_interval_read_begin(&obj->userptr.notifier);
+ 
+ 	pvec = kvmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
+-- 
+2.25.1
+

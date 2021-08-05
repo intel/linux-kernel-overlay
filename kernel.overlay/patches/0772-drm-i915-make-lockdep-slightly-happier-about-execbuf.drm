@@ -1,0 +1,170 @@
+From d7bebcd598713dc9735c082a28173afbfe383486 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:49:59 +0100
+Subject: [PATCH 0772/2740] drm/i915: make lockdep slightly happier about
+ execbuf.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As soon as we install fences, we should stop allocating memory
+in order to prevent any potential deadlocks.
+
+This is required later on, when we start adding support for
+dma-fence annotations.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-11-maarten.lankhorst@linux.intel.com
+---
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    | 24 ++++++++++++++-----
+ drivers/gpu/drm/i915/i915_active.c            | 20 ++++++++--------
+ drivers/gpu/drm/i915/i915_vma.c               |  8 ++++---
+ drivers/gpu/drm/i915/i915_vma.h               |  3 +++
+ 4 files changed, 36 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index c070fd860b51..d6cacfd968ac 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -50,11 +50,12 @@ enum {
+ #define DBG_FORCE_RELOC 0 /* choose one of the above! */
+ };
+ 
+-#define __EXEC_OBJECT_HAS_PIN		BIT(31)
+-#define __EXEC_OBJECT_HAS_FENCE		BIT(30)
+-#define __EXEC_OBJECT_NEEDS_MAP		BIT(29)
+-#define __EXEC_OBJECT_NEEDS_BIAS	BIT(28)
+-#define __EXEC_OBJECT_INTERNAL_FLAGS	(~0u << 28) /* all of the above */
++/* __EXEC_OBJECT_NO_RESERVE is BIT(31), defined in i915_vma.h */
++#define __EXEC_OBJECT_HAS_PIN		BIT(30)
++#define __EXEC_OBJECT_HAS_FENCE		BIT(29)
++#define __EXEC_OBJECT_NEEDS_MAP		BIT(28)
++#define __EXEC_OBJECT_NEEDS_BIAS	BIT(27)
++#define __EXEC_OBJECT_INTERNAL_FLAGS	(~0u << 27) /* all of the above + */
+ #define __EXEC_OBJECT_RESERVED (__EXEC_OBJECT_HAS_PIN | __EXEC_OBJECT_HAS_FENCE)
+ 
+ #define __EXEC_HAS_RELOC	BIT(31)
+@@ -935,6 +936,12 @@ static int eb_validate_vmas(struct i915_execbuffer *eb)
+ 			}
+ 		}
+ 
++		if (!(ev->flags & EXEC_OBJECT_WRITE)) {
++			err = dma_resv_reserve_shared(vma->resv, 1);
++			if (err)
++				return err;
++		}
++
+ 		GEM_BUG_ON(drm_mm_node_allocated(&vma->node) &&
+ 			   eb_vma_misplaced(&eb->exec[i], vma, ev->flags));
+ 	}
+@@ -2202,7 +2209,8 @@ static int eb_move_to_gpu(struct i915_execbuffer *eb)
+ 		}
+ 
+ 		if (err == 0)
+-			err = i915_vma_move_to_active(vma, eb->request, flags);
++			err = i915_vma_move_to_active(vma, eb->request,
++						      flags | __EXEC_OBJECT_NO_RESERVE);
+ 	}
+ 
+ 	if (unlikely(err))
+@@ -2454,6 +2462,10 @@ static int eb_parse_pipeline(struct i915_execbuffer *eb,
+ 	if (err)
+ 		goto err_commit;
+ 
++	err = dma_resv_reserve_shared(shadow->resv, 1);
++	if (err)
++		goto err_commit;
++
+ 	/* Wait for all writes (and relocs) into the batch to complete */
+ 	err = i915_sw_fence_await_reservation(&pw->base.chain,
+ 					      pw->batch->resv, NULL, false,
+diff --git a/drivers/gpu/drm/i915/i915_active.c b/drivers/gpu/drm/i915/i915_active.c
+index 3bc616cc1ad2..cf9a3d384971 100644
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@ -293,18 +293,13 @@ static struct active_node *__active_lookup(struct i915_active *ref, u64 idx)
+ static struct i915_active_fence *
+ active_instance(struct i915_active *ref, u64 idx)
+ {
+-	struct active_node *node, *prealloc;
++	struct active_node *node;
+ 	struct rb_node **p, *parent;
+ 
+ 	node = __active_lookup(ref, idx);
+ 	if (likely(node))
+ 		return &node->base;
+ 
+-	/* Preallocate a replacement, just in case */
+-	prealloc = kmem_cache_alloc(global.slab_cache, GFP_KERNEL);
+-	if (!prealloc)
+-		return NULL;
+-
+ 	spin_lock_irq(&ref->tree_lock);
+ 	GEM_BUG_ON(i915_active_is_idle(ref));
+ 
+@@ -314,10 +309,8 @@ active_instance(struct i915_active *ref, u64 idx)
+ 		parent = *p;
+ 
+ 		node = rb_entry(parent, struct active_node, node);
+-		if (node->timeline == idx) {
+-			kmem_cache_free(global.slab_cache, prealloc);
++		if (node->timeline == idx)
+ 			goto out;
+-		}
+ 
+ 		if (node->timeline < idx)
+ 			p = &parent->rb_right;
+@@ -325,7 +318,14 @@ active_instance(struct i915_active *ref, u64 idx)
+ 			p = &parent->rb_left;
+ 	}
+ 
+-	node = prealloc;
++	/*
++	 * XXX: We should preallocate this before i915_active_ref() is ever
++	 *  called, but we cannot call into fs_reclaim() anyway, so use GFP_ATOMIC.
++	 */
++	node = kmem_cache_alloc(global.slab_cache, GFP_ATOMIC);
++	if (!node)
++		goto out;
++
+ 	__i915_active_fence_init(&node->base, NULL, node_retire);
+ 	node->ref = ref;
+ 	node->timeline = idx;
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 82b73dbc9737..4215714ae19c 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1247,9 +1247,11 @@ int i915_vma_move_to_active(struct i915_vma *vma,
+ 		obj->write_domain = I915_GEM_DOMAIN_RENDER;
+ 		obj->read_domains = 0;
+ 	} else {
+-		err = dma_resv_reserve_shared(vma->resv, 1);
+-		if (unlikely(err))
+-			return err;
++		if (!(flags & __EXEC_OBJECT_NO_RESERVE)) {
++			err = dma_resv_reserve_shared(vma->resv, 1);
++			if (unlikely(err))
++				return err;
++		}
+ 
+ 		dma_resv_add_shared_fence(vma->resv, &rq->fence);
+ 		obj->write_domain = 0;
+diff --git a/drivers/gpu/drm/i915/i915_vma.h b/drivers/gpu/drm/i915/i915_vma.h
+index 3c914c9de9a9..6b48f5c42488 100644
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -52,6 +52,9 @@ static inline bool i915_vma_is_active(const struct i915_vma *vma)
+ 	return !i915_active_is_idle(&vma->active);
+ }
+ 
++/* do not reserve memory to prevent deadlocks */
++#define __EXEC_OBJECT_NO_RESERVE BIT(31)
++
+ int __must_check __i915_vma_move_to_active(struct i915_vma *vma,
+ 					   struct i915_request *rq);
+ int __must_check i915_vma_move_to_active(struct i915_vma *vma,
+-- 
+2.25.1
+

@@ -1,0 +1,202 @@
+From b33768ddbe6f0912d998035421265b9cd8e613ab Mon Sep 17 00:00:00 2001
+From: Rob Herring <robh@kernel.org>
+Date: Wed, 14 Apr 2021 11:07:37 -0500
+Subject: [PATCH 20/37] libperf: Add evsel mmap support
+
+In order to support usersapce access, an event must be mmapped. While
+there's already mmap support for evlist, the usecase is a bit different
+than the self monitoring with userspace access. So let's add new
+perf_evsel__mmap()/perf_evsel_munmap() functions to mmap/munmap an
+evsel. This allows implementing userspace access as a fastpath for
+perf_evsel__read().
+
+The mmapped address is returned by perf_evsel__mmap_base() which
+primarily for users/tests to check if userspace access is enabled.
+
+Signed-off-by: Rob Herring <robh@kernel.org>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Itaru Kitayama <itaru.kitayama@gmail.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Will Deacon <will@kernel.org>
+Link: http://lore.kernel.org/lkml/20210414155412.3697605-2-robh@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/lib/perf/Documentation/libperf.txt |  3 +
+ tools/lib/perf/evsel.c                   | 76 ++++++++++++++++++++++++
+ tools/lib/perf/include/internal/evsel.h  |  1 +
+ tools/lib/perf/include/perf/evsel.h      |  3 +
+ tools/lib/perf/libperf.map               |  3 +
+ 5 files changed, 86 insertions(+)
+
+diff --git a/tools/lib/perf/Documentation/libperf.txt b/tools/lib/perf/Documentation/libperf.txt
+index 0c74c30ed23a..63ae5e0195ce 100644
+--- a/tools/lib/perf/Documentation/libperf.txt
++++ b/tools/lib/perf/Documentation/libperf.txt
+@@ -136,6 +136,9 @@ SYNOPSIS
+                        struct perf_thread_map *threads);
+   void perf_evsel__close(struct perf_evsel *evsel);
+   void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu);
++  int perf_evsel__mmap(struct perf_evsel *evsel, int pages);
++  void perf_evsel__munmap(struct perf_evsel *evsel);
++  void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, int thread);
+   int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
+                        struct perf_counts_values *count);
+   int perf_evsel__enable(struct perf_evsel *evsel);
+diff --git a/tools/lib/perf/evsel.c b/tools/lib/perf/evsel.c
+index 4dc06289f4c7..cd203998e875 100644
+--- a/tools/lib/perf/evsel.c
++++ b/tools/lib/perf/evsel.c
+@@ -11,10 +11,12 @@
+ #include <stdlib.h>
+ #include <internal/xyarray.h>
+ #include <internal/cpumap.h>
++#include <internal/mmap.h>
+ #include <internal/threadmap.h>
+ #include <internal/lib.h>
+ #include <linux/string.h>
+ #include <sys/ioctl.h>
++#include <sys/mman.h>
+ 
+ void perf_evsel__init(struct perf_evsel *evsel, struct perf_event_attr *attr)
+ {
+@@ -38,6 +40,7 @@ void perf_evsel__delete(struct perf_evsel *evsel)
+ }
+ 
+ #define FD(e, x, y) (*(int *) xyarray__entry(e->fd, x, y))
++#define MMAP(e, x, y) (e->mmap ? ((struct perf_mmap *) xyarray__entry(e->mmap, x, y)) : NULL)
+ 
+ int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
+ {
+@@ -55,6 +58,13 @@ int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
+ 	return evsel->fd != NULL ? 0 : -ENOMEM;
+ }
+ 
++static int perf_evsel__alloc_mmap(struct perf_evsel *evsel, int ncpus, int nthreads)
++{
++	evsel->mmap = xyarray__new(ncpus, nthreads, sizeof(struct perf_mmap));
++
++	return evsel->mmap != NULL ? 0 : -ENOMEM;
++}
++
+ static int
+ sys_perf_event_open(struct perf_event_attr *attr,
+ 		    pid_t pid, int cpu, int group_fd,
+@@ -156,6 +166,72 @@ void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu)
+ 	perf_evsel__close_fd_cpu(evsel, cpu);
+ }
+ 
++void perf_evsel__munmap(struct perf_evsel *evsel)
++{
++	int cpu, thread;
++
++	if (evsel->fd == NULL || evsel->mmap == NULL)
++		return;
++
++	for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++) {
++		for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++) {
++			int fd = FD(evsel, cpu, thread);
++			struct perf_mmap *map = MMAP(evsel, cpu, thread);
++
++			if (fd < 0)
++				continue;
++
++			perf_mmap__munmap(map);
++		}
++	}
++
++	xyarray__delete(evsel->mmap);
++	evsel->mmap = NULL;
++}
++
++int perf_evsel__mmap(struct perf_evsel *evsel, int pages)
++{
++	int ret, cpu, thread;
++	struct perf_mmap_param mp = {
++		.prot = PROT_READ | PROT_WRITE,
++		.mask = (pages * page_size) - 1,
++	};
++
++	if (evsel->fd == NULL || evsel->mmap)
++		return -EINVAL;
++
++	if (perf_evsel__alloc_mmap(evsel, xyarray__max_x(evsel->fd), xyarray__max_y(evsel->fd)) < 0)
++		return -ENOMEM;
++
++	for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++) {
++		for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++) {
++			int fd = FD(evsel, cpu, thread);
++			struct perf_mmap *map = MMAP(evsel, cpu, thread);
++
++			if (fd < 0)
++				continue;
++
++			perf_mmap__init(map, NULL, false, NULL);
++
++			ret = perf_mmap__mmap(map, &mp, fd, cpu);
++			if (ret) {
++				perf_evsel__munmap(evsel);
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
++
++void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, int thread)
++{
++	if (FD(evsel, cpu, thread) < 0 || MMAP(evsel, cpu, thread) == NULL)
++		return NULL;
++
++	return MMAP(evsel, cpu, thread)->base;
++}
++
+ int perf_evsel__read_size(struct perf_evsel *evsel)
+ {
+ 	u64 read_format = evsel->attr.read_format;
+diff --git a/tools/lib/perf/include/internal/evsel.h b/tools/lib/perf/include/internal/evsel.h
+index 1ffd083b235e..1c067d088bc6 100644
+--- a/tools/lib/perf/include/internal/evsel.h
++++ b/tools/lib/perf/include/internal/evsel.h
+@@ -41,6 +41,7 @@ struct perf_evsel {
+ 	struct perf_cpu_map	*own_cpus;
+ 	struct perf_thread_map	*threads;
+ 	struct xyarray		*fd;
++	struct xyarray		*mmap;
+ 	struct xyarray		*sample_id;
+ 	u64			*id;
+ 	u32			 ids;
+diff --git a/tools/lib/perf/include/perf/evsel.h b/tools/lib/perf/include/perf/evsel.h
+index c82ec39a4ad0..60eae25076d3 100644
+--- a/tools/lib/perf/include/perf/evsel.h
++++ b/tools/lib/perf/include/perf/evsel.h
+@@ -27,6 +27,9 @@ LIBPERF_API int perf_evsel__open(struct perf_evsel *evsel, struct perf_cpu_map *
+ 				 struct perf_thread_map *threads);
+ LIBPERF_API void perf_evsel__close(struct perf_evsel *evsel);
+ LIBPERF_API void perf_evsel__close_cpu(struct perf_evsel *evsel, int cpu);
++LIBPERF_API int perf_evsel__mmap(struct perf_evsel *evsel, int pages);
++LIBPERF_API void perf_evsel__munmap(struct perf_evsel *evsel);
++LIBPERF_API void *perf_evsel__mmap_base(struct perf_evsel *evsel, int cpu, int thread);
+ LIBPERF_API int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
+ 				 struct perf_counts_values *count);
+ LIBPERF_API int perf_evsel__enable(struct perf_evsel *evsel);
+diff --git a/tools/lib/perf/libperf.map b/tools/lib/perf/libperf.map
+index 7be1af8a546c..c0c7ceb11060 100644
+--- a/tools/lib/perf/libperf.map
++++ b/tools/lib/perf/libperf.map
+@@ -23,6 +23,9 @@ LIBPERF_0.0.1 {
+ 		perf_evsel__disable;
+ 		perf_evsel__open;
+ 		perf_evsel__close;
++		perf_evsel__mmap;
++		perf_evsel__munmap;
++		perf_evsel__mmap_base;
+ 		perf_evsel__read;
+ 		perf_evsel__cpus;
+ 		perf_evsel__threads;
+-- 
+2.25.1
+

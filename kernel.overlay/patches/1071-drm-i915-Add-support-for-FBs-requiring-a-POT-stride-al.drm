@@ -1,0 +1,407 @@
+From 5369c1cbcee342374523fea49a2ef69c8e7a71ad Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 25 Mar 2021 23:48:06 +0200
+Subject: [PATCH 1071/2740] drm/i915: Add support for FBs requiring a POT
+ stride alignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An upcoming platform has a restriction that the FB stride must be
+power-of-two aligned. To support framebuffer layouts that are not in
+this layout add a logic that pads the tile rows to the POT aligned size.
+
+The HW won't read the padding PTEs, so these don't have to point to an
+allocated address, or even have their valid flag set. So use a NULL PTE
+instead for instance the scratch page, which is simple and keeps the SG
+table compact.
+
+v2:
+- Simplify plane_view_dst_stride(). (Ville)
+- Pass pitch_tiles as unsigned int.
+v3:
+- Drop unintentional s/plane_state->rotation/plane_config->rotation/
+  change.
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210325214808.2071517-24-imre.deak@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  |  4 +-
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_fb.c       | 50 ++++++++++++++---
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          | 56 ++++++++++++++++---
+ drivers/gpu/drm/i915/i915_debugfs.c           |  8 ++-
+ drivers/gpu/drm/i915/i915_vma_types.h         |  2 +-
+ drivers/gpu/drm/i915/selftests/i915_vma.c     | 13 +++++
+ 7 files changed, 112 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 374bdd233db0..d74b263c5f4e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -933,7 +933,7 @@ unsigned int intel_rotation_info_size(const struct intel_rotation_info *rot_info
+ 	int i;
+ 
+ 	for (i = 0 ; i < ARRAY_SIZE(rot_info->plane); i++)
+-		size += rot_info->plane[i].width * rot_info->plane[i].height;
++		size += rot_info->plane[i].dst_stride * rot_info->plane[i].width;
+ 
+ 	return size;
+ }
+@@ -944,7 +944,7 @@ unsigned int intel_remapped_info_size(const struct intel_remapped_info *rem_info
+ 	int i;
+ 
+ 	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++)
+-		size += rem_info->plane[i].width * rem_info->plane[i].height;
++		size += rem_info->plane[i].dst_stride * rem_info->plane[i].height;
+ 
+ 	return size;
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 8008fd6f489e..e2e707c4dff5 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -128,6 +128,7 @@ struct intel_framebuffer {
+ 	/* Params to remap the FB pages and program the plane registers in each view. */
+ 	struct intel_fb_view normal_view;
+ 	struct intel_fb_view rotated_view;
++	struct intel_fb_view remapped_view;
+ };
+ 
+ struct intel_fbdev {
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.c b/drivers/gpu/drm/i915/display/intel_fb.c
+index 41ba835fabfb..fca41ac5b8e1 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@ -486,10 +486,17 @@ static bool intel_plane_can_remap(const struct intel_plane_state *plane_state)
+ 	return true;
+ }
+ 
++static bool intel_fb_needs_pot_stride_remap(const struct intel_framebuffer *fb)
++{
++	return false;
++}
++
+ static int intel_fb_pitch(const struct intel_framebuffer *fb, int color_plane, unsigned int rotation)
+ {
+ 	if (drm_rotation_90_or_270(rotation))
+ 		return fb->rotated_view.color_plane[color_plane].stride;
++	else if (intel_fb_needs_pot_stride_remap(fb))
++		return fb->remapped_view.color_plane[color_plane].stride;
+ 	else
+ 		return fb->normal_view.color_plane[color_plane].stride;
+ }
+@@ -597,6 +604,16 @@ plane_view_src_stride_tiles(const struct intel_framebuffer *fb, int color_plane,
+ 			    dims->tile_width * fb->base.format->cpp[color_plane]);
+ }
+ 
++static unsigned int
++plane_view_dst_stride_tiles(const struct intel_framebuffer *fb, int color_plane,
++			    unsigned int pitch_tiles)
++{
++	if (intel_fb_needs_pot_stride_remap(fb))
++		return roundup_pow_of_two(pitch_tiles);
++	else
++		return pitch_tiles;
++}
++
+ static unsigned int
+ plane_view_width_tiles(const struct intel_framebuffer *fb, int color_plane,
+ 		       const struct fb_plane_view_dims *dims,
+@@ -629,8 +646,8 @@ static u32 calc_plane_remap_info(const struct intel_framebuffer *fb, int color_p
+ 	unsigned int tile_width = dims->tile_width;
+ 	unsigned int tile_height = dims->tile_height;
+ 	unsigned int tile_size = intel_tile_size(i915);
+-	unsigned int pitch_tiles;
+ 	struct drm_rect r;
++	u32 size;
+ 
+ 	assign_chk_ovf(i915, remap_info->offset, obj_offset);
+ 	assign_chk_ovf(i915, remap_info->src_stride, plane_view_src_stride_tiles(fb, color_plane, dims));
+@@ -640,6 +657,9 @@ static u32 calc_plane_remap_info(const struct intel_framebuffer *fb, int color_p
+ 	if (view->gtt.type == I915_GGTT_VIEW_ROTATED) {
+ 		check_array_bounds(i915, view->gtt.rotated.plane, color_plane);
+ 
++		assign_chk_ovf(i915, remap_info->dst_stride,
++			       plane_view_dst_stride_tiles(fb, color_plane, remap_info->height));
++
+ 		/* rotate the x/y offsets to match the GTT view */
+ 		drm_rect_init(&r, x, y, dims->width, dims->height);
+ 		drm_rect_rotate(&r,
+@@ -650,8 +670,9 @@ static u32 calc_plane_remap_info(const struct intel_framebuffer *fb, int color_p
+ 		color_plane_info->x = r.x1;
+ 		color_plane_info->y = r.y1;
+ 
+-		pitch_tiles = remap_info->height;
+-		color_plane_info->stride = pitch_tiles * tile_height;
++		color_plane_info->stride = remap_info->dst_stride * tile_height;
++
++		size = remap_info->dst_stride * remap_info->width;
+ 
+ 		/* rotate the tile dimensions to match the GTT view */
+ 		swap(tile_width, tile_height);
+@@ -660,12 +681,16 @@ static u32 calc_plane_remap_info(const struct intel_framebuffer *fb, int color_p
+ 
+ 		check_array_bounds(i915, view->gtt.remapped.plane, color_plane);
+ 
++		assign_chk_ovf(i915, remap_info->dst_stride,
++			       plane_view_dst_stride_tiles(fb, color_plane, remap_info->width));
++
+ 		color_plane_info->x = x;
+ 		color_plane_info->y = y;
+ 
+-		pitch_tiles = remap_info->width;
+-		color_plane_info->stride = pitch_tiles * tile_width *
+-					  fb->base.format->cpp[color_plane];
++		color_plane_info->stride = remap_info->dst_stride * tile_width *
++					   fb->base.format->cpp[color_plane];
++
++		size = remap_info->dst_stride * remap_info->height;
+ 	}
+ 
+ 	/*
+@@ -675,10 +700,10 @@ static u32 calc_plane_remap_info(const struct intel_framebuffer *fb, int color_p
+ 	 */
+ 	intel_adjust_tile_offset(&color_plane_info->x, &color_plane_info->y,
+ 				 tile_width, tile_height,
+-				 tile_size, pitch_tiles,
++				 tile_size, remap_info->dst_stride,
+ 				 gtt_offset * tile_size, 0);
+ 
+-	return remap_info->width * remap_info->height;
++	return size;
+ }
+ 
+ #undef assign_chk_ovf
+@@ -723,12 +748,14 @@ int intel_fill_fb_info(struct drm_i915_private *i915, struct drm_framebuffer *fb
+ 	struct intel_framebuffer *intel_fb = to_intel_framebuffer(fb);
+ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ 	u32 gtt_offset_rotated = 0;
++	u32 gtt_offset_remapped = 0;
+ 	unsigned int max_size = 0;
+ 	int i, num_planes = fb->format->num_planes;
+ 	unsigned int tile_size = intel_tile_size(i915);
+ 
+ 	intel_fb_view_init(&intel_fb->normal_view, I915_GGTT_VIEW_NORMAL);
+ 	intel_fb_view_init(&intel_fb->rotated_view, I915_GGTT_VIEW_ROTATED);
++	intel_fb_view_init(&intel_fb->remapped_view, I915_GGTT_VIEW_REMAPPED);
+ 
+ 	for (i = 0; i < num_planes; i++) {
+ 		struct fb_plane_view_dims view_dims;
+@@ -776,6 +803,11 @@ int intel_fill_fb_info(struct drm_i915_private *i915, struct drm_framebuffer *fb
+ 								    offset, gtt_offset_rotated, x, y,
+ 								    &intel_fb->rotated_view);
+ 
++		if (intel_fb_needs_pot_stride_remap(intel_fb))
++			gtt_offset_remapped += calc_plane_remap_info(intel_fb, i, &view_dims,
++								     offset, gtt_offset_remapped, x, y,
++								     &intel_fb->remapped_view);
++
+ 		size = calc_plane_normal_size(intel_fb, i, &view_dims, x, y);
+ 		/* how many tiles in total needed in the bo */
+ 		max_size = max(max_size, offset + size);
+@@ -859,6 +891,8 @@ void intel_fb_fill_view(const struct intel_framebuffer *fb, unsigned int rotatio
+ {
+ 	if (drm_rotation_90_or_270(rotation))
+ 		*view = fb->rotated_view;
++	else if (intel_fb_needs_pot_stride_remap(fb))
++		*view = fb->remapped_view;
+ 	else
+ 		*view = fb->normal_view;
+ }
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index cb048d0e369c..670c1271e7d5 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -1267,14 +1267,16 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt)
+ static struct scatterlist *
+ rotate_pages(struct drm_i915_gem_object *obj, unsigned int offset,
+ 	     unsigned int width, unsigned int height,
+-	     unsigned int stride,
++	     unsigned int src_stride, unsigned int dst_stride,
+ 	     struct sg_table *st, struct scatterlist *sg)
+ {
+ 	unsigned int column, row;
+ 	unsigned int src_idx;
+ 
+ 	for (column = 0; column < width; column++) {
+-		src_idx = stride * (height - 1) + column + offset;
++		unsigned int left;
++
++		src_idx = src_stride * (height - 1) + column + offset;
+ 		for (row = 0; row < height; row++) {
+ 			st->nents++;
+ 			/*
+@@ -1287,8 +1289,25 @@ rotate_pages(struct drm_i915_gem_object *obj, unsigned int offset,
+ 				i915_gem_object_get_dma_address(obj, src_idx);
+ 			sg_dma_len(sg) = I915_GTT_PAGE_SIZE;
+ 			sg = sg_next(sg);
+-			src_idx -= stride;
++			src_idx -= src_stride;
+ 		}
++
++		left = (dst_stride - height) * I915_GTT_PAGE_SIZE;
++
++		if (!left)
++			continue;
++
++		st->nents++;
++
++		/*
++		 * The DE ignores the PTEs for the padding tiles, the sg entry
++		 * here is just a conenience to indicate how many padding PTEs
++		 * to insert at this spot.
++		 */
++		sg_set_page(sg, NULL, left, 0);
++		sg_dma_address(sg) = 0;
++		sg_dma_len(sg) = left;
++		sg = sg_next(sg);
+ 	}
+ 
+ 	return sg;
+@@ -1317,11 +1336,12 @@ intel_rotate_pages(struct intel_rotation_info *rot_info,
+ 	st->nents = 0;
+ 	sg = st->sgl;
+ 
+-	for (i = 0 ; i < ARRAY_SIZE(rot_info->plane); i++) {
++	for (i = 0 ; i < ARRAY_SIZE(rot_info->plane); i++)
+ 		sg = rotate_pages(obj, rot_info->plane[i].offset,
+ 				  rot_info->plane[i].width, rot_info->plane[i].height,
+-				  rot_info->plane[i].src_stride, st, sg);
+-	}
++				  rot_info->plane[i].src_stride,
++				  rot_info->plane[i].dst_stride,
++				  st, sg);
+ 
+ 	return st;
+ 
+@@ -1339,7 +1359,7 @@ intel_rotate_pages(struct intel_rotation_info *rot_info,
+ static struct scatterlist *
+ remap_pages(struct drm_i915_gem_object *obj, unsigned int offset,
+ 	    unsigned int width, unsigned int height,
+-	    unsigned int stride,
++	    unsigned int src_stride, unsigned int dst_stride,
+ 	    struct sg_table *st, struct scatterlist *sg)
+ {
+ 	unsigned int row;
+@@ -1372,7 +1392,24 @@ remap_pages(struct drm_i915_gem_object *obj, unsigned int offset,
+ 			left -= length;
+ 		}
+ 
+-		offset += stride - width;
++		offset += src_stride - width;
++
++		left = (dst_stride - width) * I915_GTT_PAGE_SIZE;
++
++		if (!left)
++			continue;
++
++		st->nents++;
++
++		/*
++		 * The DE ignores the PTEs for the padding tiles, the sg entry
++		 * here is just a conenience to indicate how many padding PTEs
++		 * to insert at this spot.
++		 */
++		sg_set_page(sg, NULL, left, 0);
++		sg_dma_address(sg) = 0;
++		sg_dma_len(sg) = left;
++		sg = sg_next(sg);
+ 	}
+ 
+ 	return sg;
+@@ -1404,7 +1441,8 @@ intel_remap_pages(struct intel_remapped_info *rem_info,
+ 	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++) {
+ 		sg = remap_pages(obj, rem_info->plane[i].offset,
+ 				 rem_info->plane[i].width, rem_info->plane[i].height,
+-				 rem_info->plane[i].src_stride, st, sg);
++				 rem_info->plane[i].src_stride, rem_info->plane[i].dst_stride,
++				 st, sg);
+ 	}
+ 
+ 	i915_sg_trim(st);
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 9c4b9d475793..b654b7498bcd 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -173,26 +173,30 @@ i915_debugfs_describe_obj(struct seq_file *m, struct drm_i915_gem_object *obj)
+ 				break;
+ 
+ 			case I915_GGTT_VIEW_ROTATED:
+-				seq_printf(m, ", rotated [(%ux%u, stride=%u, offset=%u), (%ux%u, stride=%u, offset=%u)]",
++				seq_printf(m, ", rotated [(%ux%u, src_stride=%u, dst_stride=%u, offset=%u), (%ux%u, src_stride=%u, dst_stride=%u, offset=%u)]",
+ 					   vma->ggtt_view.rotated.plane[0].width,
+ 					   vma->ggtt_view.rotated.plane[0].height,
+ 					   vma->ggtt_view.rotated.plane[0].src_stride,
++					   vma->ggtt_view.rotated.plane[0].dst_stride,
+ 					   vma->ggtt_view.rotated.plane[0].offset,
+ 					   vma->ggtt_view.rotated.plane[1].width,
+ 					   vma->ggtt_view.rotated.plane[1].height,
+ 					   vma->ggtt_view.rotated.plane[1].src_stride,
++					   vma->ggtt_view.rotated.plane[1].dst_stride,
+ 					   vma->ggtt_view.rotated.plane[1].offset);
+ 				break;
+ 
+ 			case I915_GGTT_VIEW_REMAPPED:
+-				seq_printf(m, ", remapped [(%ux%u, stride=%u, offset=%u), (%ux%u, stride=%u, offset=%u)]",
++				seq_printf(m, ", remapped [(%ux%u, src_stride=%u, dst_stride=%u, offset=%u), (%ux%u, src_stride=%u, dst_stride=%u, offset=%u)]",
+ 					   vma->ggtt_view.remapped.plane[0].width,
+ 					   vma->ggtt_view.remapped.plane[0].height,
+ 					   vma->ggtt_view.remapped.plane[0].src_stride,
++					   vma->ggtt_view.remapped.plane[0].dst_stride,
+ 					   vma->ggtt_view.remapped.plane[0].offset,
+ 					   vma->ggtt_view.remapped.plane[1].width,
+ 					   vma->ggtt_view.remapped.plane[1].height,
+ 					   vma->ggtt_view.remapped.plane[1].src_stride,
++					   vma->ggtt_view.remapped.plane[1].dst_stride,
+ 					   vma->ggtt_view.remapped.plane[1].offset);
+ 				break;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_vma_types.h b/drivers/gpu/drm/i915/i915_vma_types.h
+index f7f2aa168c9e..6b1bfa230b82 100644
+--- a/drivers/gpu/drm/i915/i915_vma_types.h
++++ b/drivers/gpu/drm/i915/i915_vma_types.h
+@@ -101,7 +101,7 @@ struct intel_remapped_plane_info {
+ 	u16 width;
+ 	u16 height;
+ 	u16 src_stride;
+-	u16 unused_mbz;
++	u16 dst_stride;
+ } __packed;
+ 
+ struct intel_remapped_info {
+diff --git a/drivers/gpu/drm/i915/selftests/i915_vma.c b/drivers/gpu/drm/i915/selftests/i915_vma.c
+index 9aaf7201e242..6aadcd31d75a 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_vma.c
++++ b/drivers/gpu/drm/i915/selftests/i915_vma.c
+@@ -528,6 +528,15 @@ static int igt_vma_rotate_remap(void *arg)
+ 			GEM_BUG_ON(max_offset > max_pages);
+ 			max_offset = max_pages - max_offset;
+ 
++			if (!plane_info[0].dst_stride)
++				plane_info[0].dst_stride = view.type == I915_GGTT_VIEW_ROTATED ?
++									plane_info[0].height :
++									plane_info[0].width;
++			if (!plane_info[1].dst_stride)
++				plane_info[1].dst_stride = view.type == I915_GGTT_VIEW_ROTATED ?
++									plane_info[1].height :
++									plane_info[1].width;
++
+ 			for_each_prime_number_from(plane_info[0].offset, 0, max_offset) {
+ 				for_each_prime_number_from(plane_info[1].offset, 0, max_offset) {
+ 					struct scatterlist *sg;
+@@ -902,6 +911,10 @@ static int igt_vma_remapped_gtt(void *arg)
+ 			if (err)
+ 				goto out;
+ 
++			if (!plane_info[0].dst_stride)
++				plane_info[0].dst_stride = *t == I915_GGTT_VIEW_ROTATED ?
++								 p->height : p->width;
++
+ 			vma = i915_gem_object_ggtt_pin(obj, &view, 0, 0, PIN_MAPPABLE);
+ 			if (IS_ERR(vma)) {
+ 				err = PTR_ERR(vma);
+-- 
+2.25.1
+

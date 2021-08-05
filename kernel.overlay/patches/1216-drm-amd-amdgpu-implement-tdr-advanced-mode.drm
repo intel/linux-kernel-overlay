@@ -1,0 +1,330 @@
+From 4ed87b2ec34753353e256cb4ad9187de96cd636a Mon Sep 17 00:00:00 2001
+From: Jack Zhang <Jack.Zhang1@amd.com>
+Date: Mon, 8 Mar 2021 12:41:27 +0800
+Subject: [PATCH 1216/2740] drm/amd/amdgpu implement tdr advanced mode
+
+[Why]
+Previous tdr design treats the first job in job_timeout as the bad job.
+But sometimes a later bad compute job can block a good gfx job and
+cause an unexpected gfx job timeout because gfx and compute ring share
+internal GC HW mutually.
+
+[How]
+This patch implements an advanced tdr mode.It involves an additinal
+synchronous pre-resubmit step(Step0 Resubmit) before normal resubmit
+step in order to find the real bad job.
+
+1. At Step0 Resubmit stage, it synchronously submits and pends for the
+first job being signaled. If it gets timeout, we identify it as guilty
+and do hw reset. After that, we would do the normal resubmit step to
+resubmit left jobs.
+
+2. For whole gpu reset(vram lost), do resubmit as the old way.
+
+v2: squash in build fix (Alex)
+
+Signed-off-by: Jack Zhang <Jack.Zhang1@amd.com>
+Reviewed-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  81 ++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c    |   2 +-
+ drivers/gpu/drm/scheduler/sched_main.c     | 103 ++++++++++++++-------
+ include/drm/gpu_scheduler.h                |   3 +
+ 4 files changed, 156 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 165192b2c336..3cbe8137a6af 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4575,6 +4575,73 @@ static int amdgpu_device_suspend_display_audio(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++void amdgpu_device_recheck_guilty_jobs(struct amdgpu_device *adev,
++			       struct amdgpu_hive_info *hive,
++			       struct list_head *device_list_handle,
++			       bool *need_full_reset)
++{
++	int i, r = 0;
++
++	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
++		struct amdgpu_ring *ring = adev->rings[i];
++		int ret = 0;
++		struct drm_sched_job *s_job;
++
++		if (!ring || !ring->sched.thread)
++			continue;
++
++		s_job = list_first_entry_or_null(&ring->sched.pending_list,
++				struct drm_sched_job, list);
++		if (s_job == NULL)
++			continue;
++
++		/* clear job's guilty and depend the folowing step to decide the real one */
++		drm_sched_reset_karma(s_job);
++		drm_sched_resubmit_jobs_ext(&ring->sched, 1);
++
++		ret = dma_fence_wait_timeout(s_job->s_fence->parent, false, ring->sched.timeout);
++		if (ret == 0) { /* timeout */
++			DRM_ERROR("Found the real bad job! ring:%s, job_id:%llx\n",
++						ring->sched.name, s_job->id);
++
++			/* set guilty */
++			drm_sched_increase_karma(s_job);
++retry:
++			/* do hw reset */
++			if (amdgpu_sriov_vf(adev)) {
++				amdgpu_virt_fini_data_exchange(adev);
++				r = amdgpu_device_reset_sriov(adev, false);
++				if (r)
++					adev->asic_reset_res = r;
++			} else {
++				r  = amdgpu_do_asic_reset(hive, device_list_handle,
++						need_full_reset, false);
++				if (r && r == -EAGAIN)
++					goto retry;
++			}
++
++			/*
++			 * add reset counter so that the following
++			 * resubmitted job could flush vmid
++			 */
++			atomic_inc(&adev->gpu_reset_counter);
++			continue;
++		}
++
++		/* got the hw fence, signal finished fence */
++		atomic_dec(ring->sched.score);
++		dma_fence_get(&s_job->s_fence->finished);
++		dma_fence_signal(&s_job->s_fence->finished);
++		dma_fence_put(&s_job->s_fence->finished);
++
++		/* remove node from list and free the job */
++		spin_lock(&ring->sched.job_list_lock);
++		list_del_init(&s_job->list);
++		spin_unlock(&ring->sched.job_list_lock);
++		ring->sched.ops->free_job(s_job);
++	}
++}
++
+ /**
+  * amdgpu_device_gpu_recover - reset the asic and recover scheduler
+  *
+@@ -4597,6 +4664,7 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+ 	int i, r = 0;
+ 	bool need_emergency_restart = false;
+ 	bool audio_suspended = false;
++	int tmp_vram_lost_counter;
+ 
+ 	/*
+ 	 * Special case: RAS triggered and full reset isn't supported
+@@ -4748,6 +4816,7 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
++	tmp_vram_lost_counter = atomic_read(&((adev)->vram_lost_counter));
+ 	/* Actual ASIC resets if needed.*/
+ 	/* TODO Implement XGMI hive reset logic for SRIOV */
+ 	if (amdgpu_sriov_vf(adev)) {
+@@ -4765,6 +4834,18 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+ 	/* Post ASIC reset for all devs .*/
+ 	list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
+ 
++		/*
++		 * Sometimes a later bad compute job can block a good gfx job as gfx
++		 * and compute ring share internal GC HW mutually. We add an additional
++		 * guilty jobs recheck step to find the real guilty job, it synchronously
++		 * submits and pends for the first job being signaled. If it gets timeout,
++		 * we identify it as a real guilty job.
++		 */
++		if (amdgpu_gpu_recovery == 2 &&
++			!(tmp_vram_lost_counter < atomic_read(&adev->vram_lost_counter)))
++			amdgpu_device_recheck_guilty_jobs(tmp_adev, hive,
++					device_list_handle, &need_full_reset);
++
+ 		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 			struct amdgpu_ring *ring = tmp_adev->rings[i];
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 02b75fa64d7d..0e10c3958f94 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -516,7 +516,7 @@ module_param_named(compute_multipipe, amdgpu_compute_multipipe, int, 0444);
+  * DOC: gpu_recovery (int)
+  * Set to enable GPU recovery mechanism (1 = enable, 0 = disable). The default is -1 (auto, disabled except SRIOV).
+  */
+-MODULE_PARM_DESC(gpu_recovery, "Enable GPU recovery mechanism, (1 = enable, 0 = disable, -1 = auto)");
++MODULE_PARM_DESC(gpu_recovery, "Enable GPU recovery mechanism, (2 = advanced tdr mode, 1 = enable, 0 = disable, -1 = auto)");
+ module_param_named(gpu_recovery, amdgpu_gpu_recovery, int, 0444);
+ 
+ /**
+diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
+index d82a7ebf6099..92d8de24d0a1 100644
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -361,40 +361,16 @@ static void drm_sched_job_timedout(struct work_struct *work)
+   */
+ void drm_sched_increase_karma(struct drm_sched_job *bad)
+ {
+-	int i;
+-	struct drm_sched_entity *tmp;
+-	struct drm_sched_entity *entity;
+-	struct drm_gpu_scheduler *sched = bad->sched;
+-
+-	/* don't increase @bad's karma if it's from KERNEL RQ,
+-	 * because sometimes GPU hang would cause kernel jobs (like VM updating jobs)
+-	 * corrupt but keep in mind that kernel jobs always considered good.
+-	 */
+-	if (bad->s_priority != DRM_SCHED_PRIORITY_KERNEL) {
+-		atomic_inc(&bad->karma);
+-		for (i = DRM_SCHED_PRIORITY_MIN; i < DRM_SCHED_PRIORITY_KERNEL;
+-		     i++) {
+-			struct drm_sched_rq *rq = &sched->sched_rq[i];
+-
+-			spin_lock(&rq->lock);
+-			list_for_each_entry_safe(entity, tmp, &rq->entities, list) {
+-				if (bad->s_fence->scheduled.context ==
+-				    entity->fence_context) {
+-					if (atomic_read(&bad->karma) >
+-					    bad->sched->hang_limit)
+-						if (entity->guilty)
+-							atomic_set(entity->guilty, 1);
+-					break;
+-				}
+-			}
+-			spin_unlock(&rq->lock);
+-			if (&entity->list != &rq->entities)
+-				break;
+-		}
+-	}
++	drm_sched_increase_karma_ext(bad, 1);
+ }
+ EXPORT_SYMBOL(drm_sched_increase_karma);
+ 
++void drm_sched_reset_karma(struct drm_sched_job *bad)
++{
++	drm_sched_increase_karma_ext(bad, 0);
++}
++EXPORT_SYMBOL(drm_sched_reset_karma);
++
+ /**
+  * drm_sched_stop - stop the scheduler
+  *
+@@ -533,15 +509,32 @@ EXPORT_SYMBOL(drm_sched_start);
+  *
+  */
+ void drm_sched_resubmit_jobs(struct drm_gpu_scheduler *sched)
++{
++	drm_sched_resubmit_jobs_ext(sched, INT_MAX);
++}
++EXPORT_SYMBOL(drm_sched_resubmit_jobs);
++
++/**
++ * drm_sched_resubmit_jobs_ext - helper to relunch certain number of jobs from mirror ring list
++ *
++ * @sched: scheduler instance
++ * @max: job numbers to relaunch
++ *
++ */
++void drm_sched_resubmit_jobs_ext(struct drm_gpu_scheduler *sched, int max)
+ {
+ 	struct drm_sched_job *s_job, *tmp;
+ 	uint64_t guilty_context;
+ 	bool found_guilty = false;
+ 	struct dma_fence *fence;
++	int i = 0;
+ 
+ 	list_for_each_entry_safe(s_job, tmp, &sched->pending_list, list) {
+ 		struct drm_sched_fence *s_fence = s_job->s_fence;
+ 
++		if (i >= max)
++			break;
++
+ 		if (!found_guilty && atomic_read(&s_job->karma) > sched->hang_limit) {
+ 			found_guilty = true;
+ 			guilty_context = s_job->s_fence->scheduled.context;
+@@ -552,6 +545,7 @@ void drm_sched_resubmit_jobs(struct drm_gpu_scheduler *sched)
+ 
+ 		dma_fence_put(s_job->s_fence->parent);
+ 		fence = sched->ops->run_job(s_job);
++		i++;
+ 
+ 		if (IS_ERR_OR_NULL(fence)) {
+ 			if (IS_ERR(fence))
+@@ -563,7 +557,7 @@ void drm_sched_resubmit_jobs(struct drm_gpu_scheduler *sched)
+ 		}
+ 	}
+ }
+-EXPORT_SYMBOL(drm_sched_resubmit_jobs);
++EXPORT_SYMBOL(drm_sched_resubmit_jobs_ext);
+ 
+ /**
+  * drm_sched_job_init - init a scheduler job
+@@ -903,3 +897,48 @@ void drm_sched_fini(struct drm_gpu_scheduler *sched)
+ 	sched->ready = false;
+ }
+ EXPORT_SYMBOL(drm_sched_fini);
++
++/**
++ * drm_sched_increase_karma_ext - Update sched_entity guilty flag
++ *
++ * @bad: The job guilty of time out
++ * @type: type for increase/reset karma
++ *
++ */
++void drm_sched_increase_karma_ext(struct drm_sched_job *bad, int type)
++{
++	int i;
++	struct drm_sched_entity *tmp;
++	struct drm_sched_entity *entity;
++	struct drm_gpu_scheduler *sched = bad->sched;
++
++	/* don't change @bad's karma if it's from KERNEL RQ,
++	 * because sometimes GPU hang would cause kernel jobs (like VM updating jobs)
++	 * corrupt but keep in mind that kernel jobs always considered good.
++	 */
++	if (bad->s_priority != DRM_SCHED_PRIORITY_KERNEL) {
++		if (type == 0)
++			atomic_set(&bad->karma, 0);
++		else if (type == 1)
++			atomic_inc(&bad->karma);
++
++		for (i = DRM_SCHED_PRIORITY_MIN; i < DRM_SCHED_PRIORITY_KERNEL;
++		     i++) {
++			struct drm_sched_rq *rq = &sched->sched_rq[i];
++
++			spin_lock(&rq->lock);
++			list_for_each_entry_safe(entity, tmp, &rq->entities, list) {
++				if (bad->s_fence->scheduled.context ==
++				    entity->fence_context) {
++					if (entity->guilty)
++						atomic_set(entity->guilty, type);
++					break;
++				}
++			}
++			spin_unlock(&rq->lock);
++			if (&entity->list != &rq->entities)
++				break;
++		}
++	}
++}
++EXPORT_SYMBOL(drm_sched_increase_karma_ext);
+diff --git a/include/drm/gpu_scheduler.h b/include/drm/gpu_scheduler.h
+index f888b5e9583a..10225a0a35d0 100644
+--- a/include/drm/gpu_scheduler.h
++++ b/include/drm/gpu_scheduler.h
+@@ -322,7 +322,10 @@ void drm_sched_wakeup(struct drm_gpu_scheduler *sched);
+ void drm_sched_stop(struct drm_gpu_scheduler *sched, struct drm_sched_job *bad);
+ void drm_sched_start(struct drm_gpu_scheduler *sched, bool full_recovery);
+ void drm_sched_resubmit_jobs(struct drm_gpu_scheduler *sched);
++void drm_sched_resubmit_jobs_ext(struct drm_gpu_scheduler *sched, int max);
+ void drm_sched_increase_karma(struct drm_sched_job *bad);
++void drm_sched_reset_karma(struct drm_sched_job *bad);
++void drm_sched_increase_karma_ext(struct drm_sched_job *bad, int type);
+ bool drm_sched_dependency_optimized(struct dma_fence* fence,
+ 				    struct drm_sched_entity *entity);
+ void drm_sched_fault(struct drm_gpu_scheduler *sched);
+-- 
+2.25.1
+

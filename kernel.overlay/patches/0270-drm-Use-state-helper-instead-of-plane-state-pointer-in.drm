@@ -1,0 +1,217 @@
+From 9088328b3ac94d7a9fa4a14bcd77c530a72b2051 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime@cerno.tech>
+Date: Fri, 19 Feb 2021 13:00:26 +0100
+Subject: [PATCH 0270/2740] drm: Use state helper instead of plane state
+ pointer in atomic_check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Many drivers reference the plane->state pointer in order to get the
+current plane state in their atomic_check hook, which would be the old
+plane state in the global atomic state since _swap_state hasn't happened
+when atomic_check is run.
+
+Use the drm_atomic_get_old_plane_state helper to get that state to make
+it more obvious.
+
+This was made using the coccinelle script below:
+
+@ plane_atomic_func @
+identifier helpers;
+identifier func;
+@@
+
+static struct drm_plane_helper_funcs helpers = {
+	...,
+	.atomic_check = func,
+	...,
+};
+
+@ replaces_old_state @
+identifier plane_atomic_func.func;
+identifier plane, state, plane_state;
+@@
+
+ func(struct drm_plane *plane, struct drm_atomic_state *state) {
+ 	...
+-	struct drm_plane_state *plane_state = plane->state;
++	struct drm_plane_state *plane_state = drm_atomic_get_old_plane_state(state, plane);
+ 	...
+ }
+
+@@
+identifier plane_atomic_func.func;
+identifier plane, state, plane_state;
+@@
+
+ func(struct drm_plane *plane, struct drm_atomic_state *state) {
+ 	struct drm_plane_state *plane_state = drm_atomic_get_old_plane_state(state, plane);
+ 	<...
+-	plane->state
++	plane_state
+ 	...>
+ }
+
+@ adds_old_state @
+identifier plane_atomic_func.func;
+identifier plane, state;
+@@
+
+ func(struct drm_plane *plane, struct drm_atomic_state *state) {
++	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+ 	<...
+-	plane->state
++	old_plane_state
+ 	...>
+ }
+
+@ include depends on adds_old_state || replaces_old_state @
+@@
+
+ #include <drm/drm_atomic.h>
+
+@ no_include depends on !include && (adds_old_state || replaces_old_state) @
+@@
+
++ #include <drm/drm_atomic.h>
+  #include <drm/...>
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210219120032.260676-6-maxime@cerno.tech
+---
+ drivers/gpu/drm/imx/ipuv3-plane.c          |  3 ++-
+ drivers/gpu/drm/ingenic/ingenic-drm-drv.c  | 16 +++++++++-------
+ drivers/gpu/drm/ingenic/ingenic-ipu.c      |  8 +++++---
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c |  4 +++-
+ drivers/gpu/drm/tilcdc/tilcdc_plane.c      |  3 ++-
+ 5 files changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/ipuv3-plane.c b/drivers/gpu/drm/imx/ipuv3-plane.c
+index b69ebf41f570..4ce15b761dfa 100644
+--- a/drivers/gpu/drm/imx/ipuv3-plane.c
++++ b/drivers/gpu/drm/imx/ipuv3-plane.c
+@@ -341,7 +341,8 @@ static int ipu_plane_atomic_check(struct drm_plane *plane,
+ {
+ 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
+ 									   plane);
+-	struct drm_plane_state *old_state = plane->state;
++	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
++									   plane);
+ 	struct drm_crtc_state *crtc_state;
+ 	struct device *dev = plane->dev->dev;
+ 	struct drm_framebuffer *fb = new_state->fb;
+diff --git a/drivers/gpu/drm/ingenic/ingenic-drm-drv.c b/drivers/gpu/drm/ingenic/ingenic-drm-drv.c
+index 68f7f874a633..496f87ebabe3 100644
+--- a/drivers/gpu/drm/ingenic/ingenic-drm-drv.c
++++ b/drivers/gpu/drm/ingenic/ingenic-drm-drv.c
+@@ -362,11 +362,13 @@ static void ingenic_drm_crtc_atomic_flush(struct drm_crtc *crtc,
+ static int ingenic_drm_plane_atomic_check(struct drm_plane *plane,
+ 					  struct drm_atomic_state *state)
+ {
++	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
++										 plane);
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+ 	struct ingenic_drm *priv = drm_device_get_priv(plane->dev);
+ 	struct drm_crtc_state *crtc_state;
+-	struct drm_crtc *crtc = new_plane_state->crtc ?: plane->state->crtc;
++	struct drm_crtc *crtc = new_plane_state->crtc ?: old_plane_state->crtc;
+ 	int ret;
+ 
+ 	if (!crtc)
+@@ -400,12 +402,12 @@ static int ingenic_drm_plane_atomic_check(struct drm_plane *plane,
+ 	 * its position, size or depth.
+ 	 */
+ 	if (priv->soc_info->has_osd &&
+-	    (!plane->state->fb || !new_plane_state->fb ||
+-	     plane->state->crtc_x != new_plane_state->crtc_x ||
+-	     plane->state->crtc_y != new_plane_state->crtc_y ||
+-	     plane->state->crtc_w != new_plane_state->crtc_w ||
+-	     plane->state->crtc_h != new_plane_state->crtc_h ||
+-	     plane->state->fb->format->format != new_plane_state->fb->format->format))
++	    (!old_plane_state->fb || !new_plane_state->fb ||
++	     old_plane_state->crtc_x != new_plane_state->crtc_x ||
++	     old_plane_state->crtc_y != new_plane_state->crtc_y ||
++	     old_plane_state->crtc_w != new_plane_state->crtc_w ||
++	     old_plane_state->crtc_h != new_plane_state->crtc_h ||
++	     old_plane_state->fb->format->format != new_plane_state->fb->format->format))
+ 		crtc_state->mode_changed = true;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/ingenic/ingenic-ipu.c b/drivers/gpu/drm/ingenic/ingenic-ipu.c
+index effba5d08738..98e7d3ec4c85 100644
+--- a/drivers/gpu/drm/ingenic/ingenic-ipu.c
++++ b/drivers/gpu/drm/ingenic/ingenic-ipu.c
+@@ -516,11 +516,13 @@ static void ingenic_ipu_plane_atomic_update(struct drm_plane *plane,
+ static int ingenic_ipu_plane_atomic_check(struct drm_plane *plane,
+ 					  struct drm_atomic_state *state)
+ {
++	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
++										 plane);
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+ 	unsigned int num_w, denom_w, num_h, denom_h, xres, yres, max_w, max_h;
+ 	struct ingenic_ipu *ipu = plane_to_ingenic_ipu(plane);
+-	struct drm_crtc *crtc = new_plane_state->crtc ?: plane->state->crtc;
++	struct drm_crtc *crtc = new_plane_state->crtc ?: old_plane_state->crtc;
+ 	struct drm_crtc_state *crtc_state;
+ 
+ 	if (!crtc)
+@@ -531,7 +533,7 @@ static int ingenic_ipu_plane_atomic_check(struct drm_plane *plane,
+ 		return -EINVAL;
+ 
+ 	/* Request a full modeset if we are enabling or disabling the IPU. */
+-	if (!plane->state->crtc ^ !new_plane_state->crtc)
++	if (!old_plane_state->crtc ^ !new_plane_state->crtc)
+ 		crtc_state->mode_changed = true;
+ 
+ 	if (!new_plane_state->crtc ||
+@@ -552,7 +554,7 @@ static int ingenic_ipu_plane_atomic_check(struct drm_plane *plane,
+ 	if (((new_plane_state->src_w >> 16) & 1) || (new_plane_state->crtc_w & 1))
+ 		return -EINVAL;
+ 
+-	if (!osd_changed(new_plane_state, plane->state))
++	if (!osd_changed(new_plane_state, old_plane_state))
+ 		return 0;
+ 
+ 	crtc_state->mode_changed = true;
+diff --git a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+index 4aac6217a5ad..6ce6ce09fecc 100644
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+@@ -406,12 +406,14 @@ static int mdp5_plane_atomic_check_with_state(struct drm_crtc_state *crtc_state,
+ static int mdp5_plane_atomic_check(struct drm_plane *plane,
+ 				   struct drm_atomic_state *state)
+ {
++	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
++										 plane);
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *crtc_state;
+ 
+-	crtc = new_plane_state->crtc ? new_plane_state->crtc : plane->state->crtc;
++	crtc = new_plane_state->crtc ? new_plane_state->crtc : old_plane_state->crtc;
+ 	if (!crtc)
+ 		return 0;
+ 
+diff --git a/drivers/gpu/drm/tilcdc/tilcdc_plane.c b/drivers/gpu/drm/tilcdc/tilcdc_plane.c
+index ebdd42dcaf82..c86258132432 100644
+--- a/drivers/gpu/drm/tilcdc/tilcdc_plane.c
++++ b/drivers/gpu/drm/tilcdc/tilcdc_plane.c
+@@ -26,7 +26,8 @@ static int tilcdc_plane_atomic_check(struct drm_plane *plane,
+ 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
+ 									   plane);
+ 	struct drm_crtc_state *crtc_state;
+-	struct drm_plane_state *old_state = plane->state;
++	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
++									   plane);
+ 	unsigned int pitch;
+ 
+ 	if (!new_state->crtc)
+-- 
+2.25.1
+
