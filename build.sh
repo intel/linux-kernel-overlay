@@ -3,7 +3,7 @@
 # Global configurations
 KVERSION=5
 KPATCHLEVEL=10
-KSUBLEVEL=47
+KSUBLEVEL=52
 KEXTRAVERSION=
 
 KSRC_REPO=https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/linux.git
