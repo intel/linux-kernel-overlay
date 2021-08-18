@@ -1,0 +1,222 @@
+From 5ea777f9b72d3e99edf9294acb1cf3ad1ee89cb7 Mon Sep 17 00:00:00 2001
+From: Oak Zeng <Oak.Zeng@amd.com>
+Date: Tue, 7 Jul 2020 18:29:37 -0500
+Subject: [PATCH 0624/2740] drm/amdkfd: Check HIQ's MQD for queue preemption
+ status
+
+MEC firmware can silently fail the queue preemption request
+without time out. In this case, HIQ's MQD's queue_doorbell_id
+will be set. Check this field to see whether last queue preemption
+was successful or not.
+
+Signed-off-by: Oak Zeng <Oak.Zeng@amd.com>
+Suggested-by: Jay Cornwall <Jay.Cornwall@amd.com>
+Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/amdkfd/kfd_device_queue_manager.c | 17 ++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h  |  1 +
+ .../gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c  |  8 +++++
+ .../gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c  |  8 +++++
+ .../gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c   |  8 +++++
+ .../gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c   |  8 +++++
+ drivers/gpu/drm/amd/include/vi_structs.h      | 32 +++++++++----------
+ 7 files changed, 66 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index cba44ec5d2b0..37de451447b1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1393,6 +1393,7 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 				uint32_t filter_param)
+ {
+ 	int retval = 0;
++	struct mqd_manager *mqd_mgr;
+ 
+ 	if (!dqm->sched_running)
+ 		return 0;
+@@ -1424,6 +1425,22 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 		return retval;
+ 	}
+ 
++	/* In the current MEC firmware implementation, if compute queue
++	 * doesn't response to the preemption request in time, HIQ will
++	 * abandon the unmap request without returning any timeout error
++	 * to driver. Instead, MEC firmware will log the doorbell of the
++	 * unresponding compute queue to HIQ.MQD.queue_doorbell_id fields.
++	 * To make sure the queue unmap was successful, driver need to
++	 * check those fields
++	 */
++	mqd_mgr = dqm->mqd_mgrs[KFD_MQD_TYPE_HIQ];
++	if (mqd_mgr->read_doorbell_id(dqm->packets.priv_queue->queue->mqd)) {
++		pr_err("HIQ MQD's queue_doorbell_id0 is not 0, Queue preemption time out\n");
++		while (halt_if_hws_hang)
++			schedule();
++		return -ETIME;
++	}
++
+ 	pm_release_ib(&dqm->packets);
+ 	dqm->active_runlist = false;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+index fbdb16418847..b5e2ea7550d4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -101,6 +101,7 @@ struct mqd_manager {
+ #if defined(CONFIG_DEBUG_FS)
+ 	int	(*debugfs_show_mqd)(struct seq_file *m, void *data);
+ #endif
++	uint32_t (*read_doorbell_id)(void *mqd);
+ 
+ 	struct mutex	mqd_mutex;
+ 	struct kfd_dev	*dev;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+index 19f0fe547c57..064914e1e8d6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -226,6 +226,13 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
+ 	__update_mqd(mm, mqd, q, 1);
+ }
+ 
++static uint32_t read_doorbell_id(void *mqd)
++{
++	struct cik_mqd *m = (struct cik_mqd *)mqd;
++
++	return m->queue_doorbell_id0;
++}
++
+ static void update_mqd_hawaii(struct mqd_manager *mm, void *mqd,
+ 			struct queue_properties *q)
+ {
+@@ -398,6 +405,7 @@ struct mqd_manager *mqd_manager_init_cik(enum KFD_MQD_TYPE type,
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
++		mqd->read_doorbell_id = read_doorbell_id;
+ 		break;
+ 	case KFD_MQD_TYPE_DIQ:
+ 		mqd->allocate_mqd = allocate_mqd;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c
+index 18e08d82d978..c7fb59ca597f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c
+@@ -224,6 +224,13 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
+ 	q->is_active = QUEUE_IS_ACTIVE(*q);
+ }
+ 
++static uint32_t read_doorbell_id(void *mqd)
++{
++	struct v10_compute_mqd *m = (struct v10_compute_mqd *)mqd;
++
++	return m->queue_doorbell_id0;
++}
++
+ static int destroy_mqd(struct mqd_manager *mm, void *mqd,
+ 		       enum kfd_preempt_type type,
+ 		       unsigned int timeout, uint32_t pipe_id,
+@@ -425,6 +432,7 @@ struct mqd_manager *mqd_manager_init_v10(enum KFD_MQD_TYPE type,
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
++		mqd->read_doorbell_id = read_doorbell_id;
+ 		pr_debug("%s@%i\n", __func__, __LINE__);
+ 		break;
+ 	case KFD_MQD_TYPE_DIQ:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
+index 3b6f5963180d..7f4e102ff4bd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
+@@ -276,6 +276,13 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
+ }
+ 
+ 
++static uint32_t read_doorbell_id(void *mqd)
++{
++	struct v9_mqd *m = (struct v9_mqd *)mqd;
++
++	return m->queue_doorbell_id0;
++}
++
+ static int destroy_mqd(struct mqd_manager *mm, void *mqd,
+ 			enum kfd_preempt_type type,
+ 			unsigned int timeout, uint32_t pipe_id,
+@@ -477,6 +484,7 @@ struct mqd_manager *mqd_manager_init_v9(enum KFD_MQD_TYPE type,
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
++		mqd->read_doorbell_id = read_doorbell_id;
+ 		break;
+ 	case KFD_MQD_TYPE_DIQ:
+ 		mqd->allocate_mqd = allocate_mqd;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+index 31799e5f3b3c..33dbd22d290f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -243,6 +243,13 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
+ 	__update_mqd(mm, mqd, q, MTYPE_CC, 1);
+ }
+ 
++static uint32_t read_doorbell_id(void *mqd)
++{
++	struct vi_mqd *m = (struct vi_mqd *)mqd;
++
++	return m->queue_doorbell_id0;
++}
++
+ static void update_mqd_tonga(struct mqd_manager *mm, void *mqd,
+ 			struct queue_properties *q)
+ {
+@@ -446,6 +453,7 @@ struct mqd_manager *mqd_manager_init_vi(enum KFD_MQD_TYPE type,
+ #if defined(CONFIG_DEBUG_FS)
+ 		mqd->debugfs_show_mqd = debugfs_show_mqd;
+ #endif
++		mqd->read_doorbell_id = read_doorbell_id;
+ 		break;
+ 	case KFD_MQD_TYPE_DIQ:
+ 		mqd->allocate_mqd = allocate_mqd;
+diff --git a/drivers/gpu/drm/amd/include/vi_structs.h b/drivers/gpu/drm/amd/include/vi_structs.h
+index c17613287cd0..50ebf885fa7c 100644
+--- a/drivers/gpu/drm/amd/include/vi_structs.h
++++ b/drivers/gpu/drm/amd/include/vi_structs.h
+@@ -397,22 +397,22 @@ struct vi_mqd {
+ 	uint32_t reserved60;
+ 	uint32_t reserved61;
+ 	uint32_t reserved62;
+-	uint32_t reserved63;
+-	uint32_t reserved64;
+-	uint32_t reserved65;
+-	uint32_t reserved66;
+-	uint32_t reserved67;
+-	uint32_t reserved68;
+-	uint32_t reserved69;
+-	uint32_t reserved70;
+-	uint32_t reserved71;
+-	uint32_t reserved72;
+-	uint32_t reserved73;
+-	uint32_t reserved74;
+-	uint32_t reserved75;
+-	uint32_t reserved76;
+-	uint32_t reserved77;
+-	uint32_t reserved78;
++	uint32_t queue_doorbell_id0;
++	uint32_t queue_doorbell_id1;
++	uint32_t queue_doorbell_id2;
++	uint32_t queue_doorbell_id3;
++	uint32_t queue_doorbell_id4;
++	uint32_t queue_doorbell_id5;
++	uint32_t queue_doorbell_id6;
++	uint32_t queue_doorbell_id7;
++	uint32_t queue_doorbell_id8;
++	uint32_t queue_doorbell_id9;
++	uint32_t queue_doorbell_id10;
++	uint32_t queue_doorbell_id11;
++	uint32_t queue_doorbell_id12;
++	uint32_t queue_doorbell_id13;
++	uint32_t queue_doorbell_id14;
++	uint32_t queue_doorbell_id15;
+ 	uint32_t reserved_t[256];
+ };
+ 
+-- 
+2.25.1
+

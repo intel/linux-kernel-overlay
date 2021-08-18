@@ -1,0 +1,205 @@
+From 38d1613019d0054b82aa4cd4dac87705ed0e63b7 Mon Sep 17 00:00:00 2001
+From: Sathishkumar S <sathishkumar.sundararaju@amd.com>
+Date: Sun, 30 May 2021 09:45:26 +0530
+Subject: [PATCH 2523/2740] drm/amd/pm: sysfs attrs to read ss powershare (v6)
+
+add sysfs attrs to read smartshift APU and DGPU power share.
+document the sysfs device attributes.
+
+V2: change variable/macro name for stapm power limit (Lijo)
+V3: files to be exposed as sysfs device attributes (Alex)
+V4: check ret value of sysfs create and remove only if created.
+V5: add ss attrs in amdgpu_device_attrs and use attr_update (Lijo)
+V6: all checks for ss support to be in if else if statements. (Lijo)
+
+Signed-off-by: Sathishkumar S <sathishkumar.sundararaju@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ Documentation/gpu/amdgpu.rst                  |  15 +++
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |   2 +
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            | 110 ++++++++++++++++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h       |   2 +
+ 4 files changed, 129 insertions(+)
+
+diff --git a/Documentation/gpu/amdgpu.rst b/Documentation/gpu/amdgpu.rst
+index 2062a6023678..6cce26b5621e 100644
+--- a/Documentation/gpu/amdgpu.rst
++++ b/Documentation/gpu/amdgpu.rst
+@@ -300,4 +300,19 @@ pcie_replay_count
+ .. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+    :doc: pcie_replay_count
+ 
+++GPU SmartShift Information
++============================
++
++GPU SmartShift information via sysfs
+ 
++smartshift_apu_power
++--------------------
++
++.. kernel-doc:: drivers/gpu/drm/amd/pm/amdgpu_pm.c
++   :doc: smartshift_apu_power
++
++smartshift_dgpu_power
++---------------------
++
++.. kernel-doc:: drivers/gpu/drm/amd/pm/amdgpu_pm.c
++   :doc: smartshift_dgpu_power
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index b1cd52a9d684..7bc7492f37b9 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -124,6 +124,8 @@ enum amd_pp_sensors {
+ 	AMDGPU_PP_SENSOR_VCE_POWER,
+ 	AMDGPU_PP_SENSOR_UVD_POWER,
+ 	AMDGPU_PP_SENSOR_GPU_POWER,
++	AMDGPU_PP_SENSOR_SS_APU_SHARE,
++	AMDGPU_PP_SENSOR_SS_DGPU_SHARE,
+ 	AMDGPU_PP_SENSOR_STABLE_PSTATE_SCLK,
+ 	AMDGPU_PP_SENSOR_STABLE_PSTATE_MCLK,
+ 	AMDGPU_PP_SENSOR_ENABLED_SMC_FEATURES_MASK,
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index f48132bc089d..bf9da642622c 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -1817,6 +1817,112 @@ static ssize_t amdgpu_get_gpu_metrics(struct device *dev,
+ 	return size;
+ }
+ 
++/**
++ * DOC: smartshift_apu_power
++ *
++ * The amdgpu driver provides a sysfs API for reporting APU power
++ * share if it supports smartshift. The value is expressed as
++ * the proportion of stapm limit where stapm limit is the total APU
++ * power limit. The result is in percentage. If APU power is 130% of
++ * STAPM, then APU is using 30% of the dGPU's headroom.
++ */
++
++static ssize_t amdgpu_get_smartshift_apu_power(struct device *dev, struct device_attribute *attr,
++					       char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++	uint32_t ss_power, size;
++	int r = 0;
++
++	if (amdgpu_in_reset(adev))
++		return -EPERM;
++	if (adev->in_suspend && !adev->in_runpm)
++		return -EPERM;
++
++	r = pm_runtime_get_sync(ddev->dev);
++	if (r < 0) {
++		pm_runtime_put_autosuspend(ddev->dev);
++		return r;
++	}
++
++	r = amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_SS_APU_SHARE,
++				   (void *)&ss_power, &size);
++	if (r)
++		goto out;
++
++	r = sysfs_emit(buf, "%u%%\n", ss_power);
++
++out:
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
++	return r;
++}
++
++/**
++ * DOC: smartshift_dgpu_power
++ *
++ * The amdgpu driver provides a sysfs API for reporting the dGPU power
++ * share if the device is in HG and supports smartshift. The value
++ * is expressed as the proportion of stapm limit where stapm limit
++ * is the total APU power limit. The value is in percentage. If dGPU
++ * power is 20% higher than STAPM power(120%), it's using 20% of the
++ * APU's power headroom.
++ */
++
++static ssize_t amdgpu_get_smartshift_dgpu_power(struct device *dev, struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++	uint32_t ss_power, size;
++	int r = 0;
++
++	if (amdgpu_in_reset(adev))
++		return -EPERM;
++	if (adev->in_suspend && !adev->in_runpm)
++		return -EPERM;
++
++	r = pm_runtime_get_sync(ddev->dev);
++	if (r < 0) {
++		pm_runtime_put_autosuspend(ddev->dev);
++		return r;
++	}
++
++	r = amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_SS_DGPU_SHARE,
++				   (void *)&ss_power, &size);
++
++	if (r)
++		goto out;
++
++	r = sysfs_emit(buf, "%u%%\n", ss_power);
++
++out:
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
++	return r;
++}
++
++static int ss_power_attr_update(struct amdgpu_device *adev, struct amdgpu_device_attr *attr,
++				uint32_t mask, enum amdgpu_device_attr_states *states)
++{
++	uint32_t ss_power, size;
++
++	if (!amdgpu_acpi_is_power_shift_control_supported())
++		*states = ATTR_STATE_UNSUPPORTED;
++	else if ((adev->flags & AMD_IS_PX) &&
++		 !amdgpu_device_supports_smart_shift(adev_to_drm(adev)))
++		*states = ATTR_STATE_UNSUPPORTED;
++	else if (amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_SS_APU_SHARE,
++		 (void *)&ss_power, &size))
++		*states = ATTR_STATE_UNSUPPORTED;
++	else if (amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_SS_DGPU_SHARE,
++		 (void *)&ss_power, &size))
++		*states = ATTR_STATE_UNSUPPORTED;
++
++	return 0;
++}
++
+ static struct amdgpu_device_attr amdgpu_device_attrs[] = {
+ 	AMDGPU_DEVICE_ATTR_RW(power_dpm_state,				ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+ 	AMDGPU_DEVICE_ATTR_RW(power_dpm_force_performance_level,	ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+@@ -1843,6 +1949,10 @@ static struct amdgpu_device_attr amdgpu_device_attrs[] = {
+ 	AMDGPU_DEVICE_ATTR_RO(unique_id,				ATTR_FLAG_BASIC),
+ 	AMDGPU_DEVICE_ATTR_RW(thermal_throttling_logging,		ATTR_FLAG_BASIC),
+ 	AMDGPU_DEVICE_ATTR_RO(gpu_metrics,				ATTR_FLAG_BASIC),
++	AMDGPU_DEVICE_ATTR_RO(smartshift_apu_power,			ATTR_FLAG_BASIC,
++			      .attr_update = ss_power_attr_update),
++	AMDGPU_DEVICE_ATTR_RO(smartshift_dgpu_power,			ATTR_FLAG_BASIC,
++			      .attr_update = ss_power_attr_update),
+ };
+ 
+ static int default_attr_update(struct amdgpu_device *adev, struct amdgpu_device_attr *attr,
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index 523f9d2982e9..71adb9e76a95 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -1218,6 +1218,8 @@ typedef enum {
+ 	METRICS_CURR_FANSPEED,
+ 	METRICS_VOLTAGE_VDDSOC,
+ 	METRICS_VOLTAGE_VDDGFX,
++	METRICS_SS_APU_SHARE,
++	METRICS_SS_DGPU_SHARE,
+ } MetricsMember_t;
+ 
+ enum smu_cmn2asic_mapping_type {
+-- 
+2.25.1
+

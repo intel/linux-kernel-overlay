@@ -1,0 +1,139 @@
+From 661ed6789610aa7eea84a62f9fe96b5434549542 Mon Sep 17 00:00:00 2001
+From: Michael Strauss <michael.strauss@amd.com>
+Date: Tue, 9 Mar 2021 14:35:05 -0500
+Subject: [PATCH 1338/2740] drm/amd/display: Disable boot optimizations if ILR
+ optimzation is required
+
+[Why]
+VBIOS currently sets the max link rate found in eDP 1.4 SUPPORTED_LINK_RATES table
+If eDP fastboot optimizations are enabled, the link rate remains at max after init
+
+[How]
+Determine optimal link rate during boot, disable seamless boot
+and eDP fastboot optimizations if link rate optimization is required
+
+Signed-off-by: Michael Strauss <michael.strauss@amd.com>
+Acked-by: Bindu Ramamurthy <bindur12@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      |  5 +++
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  | 43 +++++++++++++++++++
+ .../display/dc/dce110/dce110_hw_sequencer.c   |  6 ++-
+ .../gpu/drm/amd/display/dc/inc/dc_link_dp.h   |  2 +
+ 4 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 8f0a13807d05..e74027a9354e 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -55,6 +55,7 @@
+ #include "link_encoder.h"
+ #include "link_enc_cfg.h"
+ 
++#include "dc_link.h"
+ #include "dc_link_ddc.h"
+ #include "dm_helpers.h"
+ #include "mem_input.h"
+@@ -1429,6 +1430,10 @@ bool dc_validate_seamless_boot_timing(const struct dc *dc,
+ 		return false;
+ 	}
+ 
++	if (is_edp_ilr_optimization_required(link, crtc_timing)) {
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index 5aa16114a676..2e4740648e3c 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -4718,3 +4718,46 @@ bool dc_link_set_default_brightness_aux(struct dc_link *link)
+ 	}
+ 	return false;
+ }
++
++bool is_edp_ilr_optimization_required(struct dc_link *link, struct dc_crtc_timing *crtc_timing)
++{
++	struct dc_link_settings link_setting;
++	uint8_t link_bw_set;
++	uint8_t link_rate_set;
++	uint32_t req_bw;
++	union lane_count_set lane_count_set = { {0} };
++
++	ASSERT(link || crtc_timing); // invalid input
++
++	if (link->dpcd_caps.edp_supported_link_rates_count == 0 ||
++			!link->dc->debug.optimize_edp_link_rate)
++		return false;
++
++
++	// Read DPCD 00100h to find if standard link rates are set
++	core_link_read_dpcd(link, DP_LINK_BW_SET,
++				&link_bw_set, sizeof(link_bw_set));
++
++	if (link_bw_set)
++		return true;
++
++	// Read DPCD 00115h to find the edp link rate set used
++	core_link_read_dpcd(link, DP_LINK_RATE_SET,
++			    &link_rate_set, sizeof(link_rate_set));
++
++	// Read DPCD 00101h to find out the number of lanes currently set
++	core_link_read_dpcd(link, DP_LANE_COUNT_SET,
++				&lane_count_set.raw, sizeof(lane_count_set));
++
++	req_bw = dc_bandwidth_in_kbps_from_timing(crtc_timing);
++
++	decide_edp_link_settings(link, &link_setting, req_bw);
++
++	if (link->dpcd_caps.edp_supported_link_rates[link_rate_set] != link_setting.link_rate ||
++			lane_count_set.bits.LANE_COUNT_SET != link_setting.lane_count)
++		return true;
++
++	return false;
++}
++
++
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 873c6f2d2cd9..dd903b267ca5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -48,6 +48,7 @@
+ #include "stream_encoder.h"
+ #include "link_encoder.h"
+ #include "link_hwss.h"
++#include "dc_link_dp.h"
+ #include "clock_source.h"
+ #include "clk_mgr.h"
+ #include "abm.h"
+@@ -1714,8 +1715,9 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
+ 				/* Set optimization flag on eDP stream*/
+ 				if (edp_stream_num && edp_link->link_status.link_active) {
+ 					edp_stream = edp_streams[0];
+-					edp_stream->apply_edp_fast_boot_optimization = true;
+-					can_apply_edp_fast_boot = true;
++					can_apply_edp_fast_boot = !is_edp_ilr_optimization_required(edp_stream->link, &edp_stream->timing);
++					edp_stream->apply_edp_fast_boot_optimization = can_apply_edp_fast_boot;
++
+ 					break;
+ 				}
+ 			}
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/dc_link_dp.h b/drivers/gpu/drm/amd/display/dc/inc/dc_link_dp.h
+index b970a32177af..d3901403c30b 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/dc_link_dp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/dc_link_dp.h
+@@ -71,6 +71,8 @@ void detect_edp_sink_caps(struct dc_link *link);
+ 
+ bool is_dp_active_dongle(const struct dc_link *link);
+ 
++bool is_edp_ilr_optimization_required(struct dc_link *link, struct dc_crtc_timing *crtc_timing);
++
+ void dp_enable_mst_on_sink(struct dc_link *link, bool enable);
+ 
+ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link);
+-- 
+2.25.1
+

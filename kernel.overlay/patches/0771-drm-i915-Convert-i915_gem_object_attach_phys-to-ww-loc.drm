@@ -1,0 +1,125 @@
+From ccc455af2d751a08fda229cb8894ecb917e60013 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:49:58 +0100
+Subject: [PATCH 0771/2740] drm/i915: Convert i915_gem_object_attach_phys() to
+ ww locking, v2.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Simple adding of i915_gem_object_lock, we may start to pass ww to
+get_pages() in the future, but that won't be the case here;
+We override shmem's get_pages() handling by calling
+i915_gem_object_get_pages_phys(), no ww is needed.
+
+Changes since v1:
+- Call shmem put pages directly, the callback would
+  go down the phys free path.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-10-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_object.h |  3 ++-
+ drivers/gpu/drm/i915/gem/i915_gem_phys.c   | 12 ++++++++++--
+ drivers/gpu/drm/i915/gem/i915_gem_shmem.c  | 17 ++++++++++-------
+ 3 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index 60905e7e0907..2c7ca527f4ad 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -43,10 +43,11 @@ int i915_gem_object_pread_phys(struct drm_i915_gem_object *obj,
+ 			       const struct drm_i915_gem_pread *args);
+ 
+ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align);
++void i915_gem_object_put_pages_shmem(struct drm_i915_gem_object *obj,
++				     struct sg_table *pages);
+ void i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
+ 				    struct sg_table *pages);
+ 
+-
+ void i915_gem_flush_free_objects(struct drm_i915_private *i915);
+ 
+ struct sg_table *
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_phys.c b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+index ed283e168f2f..06c481ff79d8 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_phys.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+@@ -201,7 +201,7 @@ static int i915_gem_object_shmem_to_phys(struct drm_i915_gem_object *obj)
+ 	__i915_gem_object_pin_pages(obj);
+ 
+ 	if (!IS_ERR_OR_NULL(pages))
+-		i915_gem_shmem_ops.put_pages(obj, pages);
++		i915_gem_object_put_pages_shmem(obj, pages);
+ 
+ 	i915_gem_object_release_memory_region(obj);
+ 	return 0;
+@@ -232,7 +232,13 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ 	if (err)
+ 		return err;
+ 
+-	mutex_lock_nested(&obj->mm.lock, I915_MM_GET_PAGES);
++	err = i915_gem_object_lock_interruptible(obj, NULL);
++	if (err)
++		return err;
++
++	err = mutex_lock_interruptible_nested(&obj->mm.lock, I915_MM_GET_PAGES);
++	if (err)
++		goto err_unlock;
+ 
+ 	if (unlikely(!i915_gem_object_has_struct_page(obj)))
+ 		goto out;
+@@ -263,6 +269,8 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ 
+ out:
+ 	mutex_unlock(&obj->mm.lock);
++err_unlock:
++	i915_gem_object_unlock(obj);
+ 	return err;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c b/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+index c9820c19c5f2..59fb16a82270 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+@@ -296,18 +296,12 @@ __i915_gem_object_release_shmem(struct drm_i915_gem_object *obj,
+ 	__start_cpu_write(obj);
+ }
+ 
+-static void
+-shmem_put_pages(struct drm_i915_gem_object *obj, struct sg_table *pages)
++void i915_gem_object_put_pages_shmem(struct drm_i915_gem_object *obj, struct sg_table *pages)
+ {
+ 	struct sgt_iter sgt_iter;
+ 	struct pagevec pvec;
+ 	struct page *page;
+ 
+-	if (unlikely(!i915_gem_object_has_struct_page(obj))) {
+-		i915_gem_object_put_pages_phys(obj, pages);
+-		return;
+-	}
+-
+ 	__i915_gem_object_release_shmem(obj, pages, true);
+ 
+ 	i915_gem_gtt_finish_pages(obj, pages);
+@@ -336,6 +330,15 @@ shmem_put_pages(struct drm_i915_gem_object *obj, struct sg_table *pages)
+ 	kfree(pages);
+ }
+ 
++static void
++shmem_put_pages(struct drm_i915_gem_object *obj, struct sg_table *pages)
++{
++	if (likely(i915_gem_object_has_struct_page(obj)))
++		i915_gem_object_put_pages_shmem(obj, pages);
++	else
++		i915_gem_object_put_pages_phys(obj, pages);
++}
++
+ static int
+ shmem_pwrite(struct drm_i915_gem_object *obj,
+ 	     const struct drm_i915_gem_pwrite *arg)
+-- 
+2.25.1
+

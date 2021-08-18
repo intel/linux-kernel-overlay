@@ -1,0 +1,211 @@
+From de6db98db821a4f81c0473e522d7c41bbeb4d75a Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Tue, 1 Dec 2020 13:58:32 -0800
+Subject: [PATCH 2/2] bpf: Prepare for memcg-based memory accounting for bpf
+ maps
+
+Bpf maps can be updated from an interrupt context and in such
+case there is no process which can be charged. It makes the memory
+accounting of bpf maps non-trivial.
+
+Fortunately, after commit 4127c6504f25 ("mm: kmem: enable kernel
+memcg accounting from interrupt contexts") and commit b87d8cefe43c
+("mm, memcg: rework remote charging API to support nesting")
+it's finally possible.
+
+To make the ownership model simple and consistent, when the map
+is created, the memory cgroup of the current process is recorded.
+All subsequent allocations related to the bpf map are charged to
+the same memory cgroup. It includes allocations made by any processes
+(even if they do belong to a different cgroup) and from interrupts.
+
+This commit introduces 3 new helpers, which will be used by following
+commits to enable the accounting of bpf maps memory:
+  - bpf_map_kmalloc_node()
+  - bpf_map_kzalloc()
+  - bpf_map_alloc_percpu()
+
+They are wrapping popular memory allocation functions. They set
+the active memory cgroup to the map's memory cgroup and add
+__GFP_ACCOUNT to the passed gfp flags. Then they call into
+the corresponding memory allocation function and restore
+the original active memory cgroup.
+
+These helpers are supposed to use everywhere except the map creation
+path. During the map creation when the map structure is allocated by
+itself, it cannot be passed to those helpers. In those cases default
+memory allocation function will be used with the __GFP_ACCOUNT flag.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-7-guro@fb.com
+---
+ include/linux/bpf.h  | 34 ++++++++++++++++++++++++
+ kernel/bpf/syscall.c | 63 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 8ad819132dde..e686d2b77cb4 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -20,6 +20,8 @@
+ #include <linux/module.h>
+ #include <linux/kallsyms.h>
+ #include <linux/capability.h>
++#include <linux/sched/mm.h>
++#include <linux/slab.h>
+ #include <linux/percpu-refcount.h>
+ 
+ struct bpf_verifier_env;
+@@ -37,6 +39,7 @@ struct seq_operations;
+ struct bpf_iter_aux_info;
+ struct bpf_local_storage;
+ struct bpf_local_storage_map;
++struct mem_cgroup;
+ 
+ extern struct idr btf_idr;
+ extern spinlock_t btf_idr_lock;
+@@ -160,6 +163,9 @@ struct bpf_map {
+ 	u32 btf_value_type_id;
+ 	struct btf *btf;
+ 	struct bpf_map_memory memory;
++#ifdef CONFIG_MEMCG_KMEM
++	struct mem_cgroup *memcg;
++#endif
+ 	char name[BPF_OBJ_NAME_LEN];
+ 	u32 btf_vmlinux_value_type_id;
+ 	bool bypass_spec_v1;
+@@ -1252,6 +1258,34 @@ int  generic_map_delete_batch(struct bpf_map *map,
+ struct bpf_map *bpf_map_get_curr_or_next(u32 *id);
+ struct bpf_prog *bpf_prog_get_curr_or_next(u32 *id);
+ 
++#ifdef CONFIG_MEMCG_KMEM
++void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
++			   int node);
++void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags);
++void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
++				    size_t align, gfp_t flags);
++#else
++static inline void *
++bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
++		     int node)
++{
++	return kmalloc_node(size, flags, node);
++}
++
++static inline void *
++bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
++{
++	return kzalloc(size, flags);
++}
++
++static inline void __percpu *
++bpf_map_alloc_percpu(const struct bpf_map *map, size_t size, size_t align,
++		     gfp_t flags)
++{
++	return __alloc_percpu_gfp(size, align, flags);
++}
++#endif
++
+ extern int sysctl_unprivileged_bpf_disabled;
+ 
+ static inline bool bpf_allow_ptr_leaks(void)
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 9433ab9995cd..65bba14aa583 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -31,6 +31,7 @@
+ #include <linux/poll.h>
+ #include <linux/bpf-netns.h>
+ #include <linux/rcupdate_trace.h>
++#include <linux/memcontrol.h>
+ 
+ #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+ 			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+@@ -456,6 +457,65 @@ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock)
+ 		__release(&map_idr_lock);
+ }
+ 
++#ifdef CONFIG_MEMCG_KMEM
++static void bpf_map_save_memcg(struct bpf_map *map)
++{
++	map->memcg = get_mem_cgroup_from_mm(current->mm);
++}
++
++static void bpf_map_release_memcg(struct bpf_map *map)
++{
++	mem_cgroup_put(map->memcg);
++}
++
++void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
++			   int node)
++{
++	struct mem_cgroup *old_memcg;
++	void *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = kmalloc_node(size, flags | __GFP_ACCOUNT, node);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
++{
++	struct mem_cgroup *old_memcg;
++	void *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = kzalloc(size, flags | __GFP_ACCOUNT);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
++				    size_t align, gfp_t flags)
++{
++	struct mem_cgroup *old_memcg;
++	void __percpu *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = __alloc_percpu_gfp(size, align, flags | __GFP_ACCOUNT);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++#else
++static void bpf_map_save_memcg(struct bpf_map *map)
++{
++}
++
++static void bpf_map_release_memcg(struct bpf_map *map)
++{
++}
++#endif
++
+ /* called from workqueue */
+ static void bpf_map_free_deferred(struct work_struct *work)
+ {
+@@ -464,6 +524,7 @@ static void bpf_map_free_deferred(struct work_struct *work)
+ 
+ 	bpf_map_charge_move(&mem, &map->memory);
+ 	security_bpf_map_free(map);
++	bpf_map_release_memcg(map);
+ 	/* implementation dependent freeing */
+ 	map->ops->map_free(map);
+ 	bpf_map_charge_finish(&mem);
+@@ -874,6 +935,8 @@ static int map_create(union bpf_attr *attr)
+ 	if (err)
+ 		goto free_map_sec;
+ 
++	bpf_map_save_memcg(map);
++
+ 	err = bpf_map_new_fd(map, f_flags);
+ 	if (err < 0) {
+ 		/* failed to allocate fd.
+-- 
+2.25.1
+

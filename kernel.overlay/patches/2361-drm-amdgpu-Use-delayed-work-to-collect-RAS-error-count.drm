@@ -1,0 +1,188 @@
+From 6bf890b1629e2a0821448f2c94b20438a1703c3a Mon Sep 17 00:00:00 2001
+From: Luben Tuikov <luben.tuikov@amd.com>
+Date: Fri, 21 May 2021 11:53:09 -0400
+Subject: [PATCH 2361/2740] drm/amdgpu: Use delayed work to collect RAS error
+ counters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On Context Query2 IOCTL return the correctable and
+uncorrectable errors in O(1) fashion, from cached
+values, and schedule a delayed work function to
+calculate and cache them for the next such IOCTL.
+
+v2: Cancel pending delayed work at ras_fini().
+v3: Remove conditionals when dealing with delayed
+    work manipulation as they're inherently racy.
+
+Cc: Alexander Deucher <Alexander.Deucher@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: John Clements <john.clements@amd.com>
+Cc: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Luben Tuikov <luben.tuikov@amd.com>
+Reviewed-by: Alexander Deucher <Alexander.Deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c | 31 +++++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c | 40 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h |  5 ++++
+ 3 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+index bb0cfe871aba..e7a010b7ca1f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c
+@@ -331,10 +331,13 @@ static int amdgpu_ctx_query(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++#define AMDGPU_RAS_COUNTE_DELAY_MS 3000
++
+ static int amdgpu_ctx_query2(struct amdgpu_device *adev,
+-	struct amdgpu_fpriv *fpriv, uint32_t id,
+-	union drm_amdgpu_ctx_out *out)
++			     struct amdgpu_fpriv *fpriv, uint32_t id,
++			     union drm_amdgpu_ctx_out *out)
+ {
++	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
+ 	struct amdgpu_ctx *ctx;
+ 	struct amdgpu_ctx_mgr *mgr;
+ 
+@@ -361,6 +364,30 @@ static int amdgpu_ctx_query2(struct amdgpu_device *adev,
+ 	if (atomic_read(&ctx->guilty))
+ 		out->state.flags |= AMDGPU_CTX_QUERY2_FLAGS_GUILTY;
+ 
++	if (adev->ras_enabled && con) {
++		/* Return the cached values in O(1),
++		 * and schedule delayed work to cache
++		 * new vaues.
++		 */
++		int ce_count, ue_count;
++
++		ce_count = atomic_read(&con->ras_ce_count);
++		ue_count = atomic_read(&con->ras_ue_count);
++
++		if (ce_count != ctx->ras_counter_ce) {
++			ctx->ras_counter_ce = ce_count;
++			out->state.flags |= AMDGPU_CTX_QUERY2_FLAGS_RAS_CE;
++		}
++
++		if (ue_count != ctx->ras_counter_ue) {
++			ctx->ras_counter_ue = ue_count;
++			out->state.flags |= AMDGPU_CTX_QUERY2_FLAGS_RAS_UE;
++		}
++
++		schedule_delayed_work(&con->ras_counte_delay_work,
++				      msecs_to_jiffies(AMDGPU_RAS_COUNTE_DELAY_MS));
++	}
++
+ 	mutex_unlock(&mgr->lock);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index ba7ab654672b..9dfc1ebb41a9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -27,6 +27,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/reboot.h>
+ #include <linux/syscalls.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "amdgpu.h"
+ #include "amdgpu_ras.h"
+@@ -2116,6 +2117,30 @@ static void amdgpu_ras_check_supported(struct amdgpu_device *adev)
+ 		adev->ras_hw_enabled & amdgpu_ras_mask;
+ }
+ 
++static void amdgpu_ras_counte_dw(struct work_struct *work)
++{
++	struct amdgpu_ras *con = container_of(work, struct amdgpu_ras,
++					      ras_counte_delay_work.work);
++	struct amdgpu_device *adev = con->adev;
++	struct drm_device *dev = &adev->ddev;
++	unsigned long ce_count, ue_count;
++	int res;
++
++	res = pm_runtime_get_sync(dev->dev);
++	if (res < 0)
++		goto Out;
++
++	/* Cache new values.
++	 */
++	amdgpu_ras_query_error_count(adev, &ce_count, &ue_count);
++	atomic_set(&con->ras_ce_count, ce_count);
++	atomic_set(&con->ras_ue_count, ue_count);
++
++	pm_runtime_mark_last_busy(dev->dev);
++Out:
++	pm_runtime_put_autosuspend(dev->dev);
++}
++
+ int amdgpu_ras_init(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
+@@ -2130,6 +2155,11 @@ int amdgpu_ras_init(struct amdgpu_device *adev)
+ 	if (!con)
+ 		return -ENOMEM;
+ 
++	con->adev = adev;
++	INIT_DELAYED_WORK(&con->ras_counte_delay_work, amdgpu_ras_counte_dw);
++	atomic_set(&con->ras_ce_count, 0);
++	atomic_set(&con->ras_ue_count, 0);
++
+ 	con->objs = (struct ras_manager *)(con + 1);
+ 
+ 	amdgpu_ras_set_context(adev, con);
+@@ -2233,6 +2263,8 @@ int amdgpu_ras_late_init(struct amdgpu_device *adev,
+ 			 struct ras_fs_if *fs_info,
+ 			 struct ras_ih_if *ih_info)
+ {
++	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
++	unsigned long ue_count, ce_count;
+ 	int r;
+ 
+ 	/* disable RAS feature per IP block if it is not supported */
+@@ -2273,6 +2305,12 @@ int amdgpu_ras_late_init(struct amdgpu_device *adev,
+ 	if (r)
+ 		goto sysfs;
+ 
++	/* Those are the cached values at init.
++	 */
++	amdgpu_ras_query_error_count(adev, &ce_count, &ue_count);
++	atomic_set(&con->ras_ce_count, ce_count);
++	atomic_set(&con->ras_ue_count, ue_count);
++
+ 	return 0;
+ cleanup:
+ 	amdgpu_ras_sysfs_remove(adev, ras_block);
+@@ -2391,6 +2429,8 @@ int amdgpu_ras_fini(struct amdgpu_device *adev)
+ 	if (con->features)
+ 		amdgpu_ras_disable_all_features(adev, 1);
+ 
++	cancel_delayed_work_sync(&con->ras_counte_delay_work);
++
+ 	amdgpu_ras_set_context(adev, NULL);
+ 	kfree(con);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+index 10fca0393106..256cea5d34f2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+@@ -340,6 +340,11 @@ struct amdgpu_ras {
+ 
+ 	/* disable ras error count harvest in recovery */
+ 	bool disable_ras_err_cnt_harvest;
++
++	/* RAS count errors delayed work */
++	struct delayed_work ras_counte_delay_work;
++	atomic_t ras_ue_count;
++	atomic_t ras_ce_count;
+ };
+ 
+ struct ras_fs_data {
+-- 
+2.25.1
+

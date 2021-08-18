@@ -1,0 +1,153 @@
+From b75a17f6da7a00e1ac3d77706a5542f241661741 Mon Sep 17 00:00:00 2001
+From: Gerd Hoffmann <kraxel@redhat.com>
+Date: Wed, 17 Feb 2021 13:32:05 +0100
+Subject: [PATCH 0230/2740] drm/qxl: use ttm bo priorities
+
+Allow to set priorities for buffer objects.  Use priority 1 for surface
+and cursor command releases.  Use priority 0 for drawing command
+releases.  That way the short-living drawing commands are first in line
+when it comes to eviction, making it *much* less likely that
+ttm_bo_mem_force_space() picks something which can't be evicted and
+throws an error after waiting a while without success.
+
+Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: http://patchwork.freedesktop.org/patch/msgid/20210217123213.2199186-4-kraxel@redhat.com
+---
+ drivers/gpu/drm/qxl/qxl_cmd.c     |  2 +-
+ drivers/gpu/drm/qxl/qxl_display.c |  4 ++--
+ drivers/gpu/drm/qxl/qxl_gem.c     |  2 +-
+ drivers/gpu/drm/qxl/qxl_object.c  |  5 +++--
+ drivers/gpu/drm/qxl/qxl_object.h  |  1 +
+ drivers/gpu/drm/qxl/qxl_release.c | 18 ++++++++++++------
+ 6 files changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/qxl/qxl_cmd.c b/drivers/gpu/drm/qxl/qxl_cmd.c
+index 7e22a81bfb36..7b00c955cd82 100644
+--- a/drivers/gpu/drm/qxl/qxl_cmd.c
++++ b/drivers/gpu/drm/qxl/qxl_cmd.c
+@@ -269,7 +269,7 @@ int qxl_alloc_bo_reserved(struct qxl_device *qdev,
+ 	int ret;
+ 
+ 	ret = qxl_bo_create(qdev, size, false /* not kernel - device */,
+-			    false, QXL_GEM_DOMAIN_VRAM, NULL, &bo);
++			    false, QXL_GEM_DOMAIN_VRAM, 0, NULL, &bo);
+ 	if (ret) {
+ 		DRM_ERROR("failed to allocate VRAM BO\n");
+ 		return ret;
+diff --git a/drivers/gpu/drm/qxl/qxl_display.c b/drivers/gpu/drm/qxl/qxl_display.c
+index 9a65a7049dae..fdbc1a9ddc8d 100644
+--- a/drivers/gpu/drm/qxl/qxl_display.c
++++ b/drivers/gpu/drm/qxl/qxl_display.c
+@@ -800,8 +800,8 @@ static int qxl_plane_prepare_fb(struct drm_plane *plane,
+ 				qdev->dumb_shadow_bo = NULL;
+ 			}
+ 			qxl_bo_create(qdev, surf.height * surf.stride,
+-				      true, true, QXL_GEM_DOMAIN_SURFACE, &surf,
+-				      &qdev->dumb_shadow_bo);
++				      true, true, QXL_GEM_DOMAIN_SURFACE, 0,
++				      &surf, &qdev->dumb_shadow_bo);
+ 		}
+ 		if (user_bo->shadow != qdev->dumb_shadow_bo) {
+ 			if (user_bo->shadow) {
+diff --git a/drivers/gpu/drm/qxl/qxl_gem.c b/drivers/gpu/drm/qxl/qxl_gem.c
+index 48e096285b4c..a08da0bd9098 100644
+--- a/drivers/gpu/drm/qxl/qxl_gem.c
++++ b/drivers/gpu/drm/qxl/qxl_gem.c
+@@ -55,7 +55,7 @@ int qxl_gem_object_create(struct qxl_device *qdev, int size,
+ 	/* At least align on page size */
+ 	if (alignment < PAGE_SIZE)
+ 		alignment = PAGE_SIZE;
+-	r = qxl_bo_create(qdev, size, kernel, false, initial_domain, surf, &qbo);
++	r = qxl_bo_create(qdev, size, kernel, false, initial_domain, 0, surf, &qbo);
+ 	if (r) {
+ 		if (r != -ERESTARTSYS)
+ 			DRM_ERROR(
+diff --git a/drivers/gpu/drm/qxl/qxl_object.c b/drivers/gpu/drm/qxl/qxl_object.c
+index 705b51535492..7eada4ad217b 100644
+--- a/drivers/gpu/drm/qxl/qxl_object.c
++++ b/drivers/gpu/drm/qxl/qxl_object.c
+@@ -103,8 +103,8 @@ static const struct drm_gem_object_funcs qxl_object_funcs = {
+ 	.print_info = drm_gem_ttm_print_info,
+ };
+ 
+-int qxl_bo_create(struct qxl_device *qdev,
+-		  unsigned long size, bool kernel, bool pinned, u32 domain,
++int qxl_bo_create(struct qxl_device *qdev, unsigned long size,
++		  bool kernel, bool pinned, u32 domain, u32 priority,
+ 		  struct qxl_surface *surf,
+ 		  struct qxl_bo **bo_ptr)
+ {
+@@ -137,6 +137,7 @@ int qxl_bo_create(struct qxl_device *qdev,
+ 
+ 	qxl_ttm_placement_from_domain(bo, domain);
+ 
++	bo->tbo.priority = priority;
+ 	r = ttm_bo_init_reserved(&qdev->mman.bdev, &bo->tbo, size, type,
+ 				 &bo->placement, 0, &ctx, NULL, NULL,
+ 				 &qxl_ttm_bo_destroy);
+diff --git a/drivers/gpu/drm/qxl/qxl_object.h b/drivers/gpu/drm/qxl/qxl_object.h
+index e60a8f88e226..dc1659e717f1 100644
+--- a/drivers/gpu/drm/qxl/qxl_object.h
++++ b/drivers/gpu/drm/qxl/qxl_object.h
+@@ -61,6 +61,7 @@ static inline u64 qxl_bo_mmap_offset(struct qxl_bo *bo)
+ extern int qxl_bo_create(struct qxl_device *qdev,
+ 			 unsigned long size,
+ 			 bool kernel, bool pinned, u32 domain,
++			 u32 priority,
+ 			 struct qxl_surface *surf,
+ 			 struct qxl_bo **bo_ptr);
+ extern int qxl_bo_kmap(struct qxl_bo *bo, struct dma_buf_map *map);
+diff --git a/drivers/gpu/drm/qxl/qxl_release.c b/drivers/gpu/drm/qxl/qxl_release.c
+index fa0a380e031c..f5845c96d414 100644
+--- a/drivers/gpu/drm/qxl/qxl_release.c
++++ b/drivers/gpu/drm/qxl/qxl_release.c
+@@ -160,11 +160,12 @@ qxl_release_free(struct qxl_device *qdev,
+ }
+ 
+ static int qxl_release_bo_alloc(struct qxl_device *qdev,
+-				struct qxl_bo **bo)
++				struct qxl_bo **bo,
++				u32 priority)
+ {
+ 	/* pin releases bo's they are too messy to evict */
+ 	return qxl_bo_create(qdev, PAGE_SIZE, false, true,
+-			     QXL_GEM_DOMAIN_VRAM, NULL, bo);
++			     QXL_GEM_DOMAIN_VRAM, priority, NULL, bo);
+ }
+ 
+ int qxl_release_list_add(struct qxl_release *release, struct qxl_bo *bo)
+@@ -287,13 +288,18 @@ int qxl_alloc_release_reserved(struct qxl_device *qdev, unsigned long size,
+ 	int ret = 0;
+ 	union qxl_release_info *info;
+ 	int cur_idx;
++	u32 priority;
+ 
+-	if (type == QXL_RELEASE_DRAWABLE)
++	if (type == QXL_RELEASE_DRAWABLE) {
+ 		cur_idx = 0;
+-	else if (type == QXL_RELEASE_SURFACE_CMD)
++		priority = 0;
++	} else if (type == QXL_RELEASE_SURFACE_CMD) {
+ 		cur_idx = 1;
+-	else if (type == QXL_RELEASE_CURSOR_CMD)
++		priority = 1;
++	} else if (type == QXL_RELEASE_CURSOR_CMD) {
+ 		cur_idx = 2;
++		priority = 1;
++	}
+ 	else {
+ 		DRM_ERROR("got illegal type: %d\n", type);
+ 		return -EINVAL;
+@@ -314,7 +320,7 @@ int qxl_alloc_release_reserved(struct qxl_device *qdev, unsigned long size,
+ 		qdev->current_release_bo[cur_idx] = NULL;
+ 	}
+ 	if (!qdev->current_release_bo[cur_idx]) {
+-		ret = qxl_release_bo_alloc(qdev, &qdev->current_release_bo[cur_idx]);
++		ret = qxl_release_bo_alloc(qdev, &qdev->current_release_bo[cur_idx], priority);
+ 		if (ret) {
+ 			mutex_unlock(&qdev->release_mutex);
+ 			if (free_bo) {
+-- 
+2.25.1
+

@@ -1,0 +1,97 @@
+From 03e61de1ed8004075bcd9c3de58dcae9acf2a3f1 Mon Sep 17 00:00:00 2001
+From: Dennis Li <Dennis.Li@amd.com>
+Date: Tue, 11 May 2021 15:35:49 +0800
+Subject: [PATCH 1988/2740] drm/amdkfd: refine the poison data consumption
+ handling
+
+The user applications maybe register the KFD_EVENT_TYPE_HW_EXCEPTION and
+KFD_EVENT_TYPE_MEMORY events, driver could notify them when poison data
+consumed. Beside that, some applications maybe register SIGBUS signal
+hander. These applications will handle poison data by themselves, exit
+or re-create context to re-dispatch works.
+
+Signed-off-by: Dennis Li <Dennis.Li@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c       | 39 +++++++++++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_int_process_v9.c   |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h         |  2 +
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index ba2c2ce0c55a..4d210f23c33c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -1050,3 +1050,42 @@ void kfd_signal_reset_event(struct kfd_dev *dev)
+ 	}
+ 	srcu_read_unlock(&kfd_processes_srcu, idx);
+ }
++
++void kfd_signal_poison_consumed_event(struct kfd_dev *dev, u32 pasid)
++{
++	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
++	struct kfd_hsa_memory_exception_data memory_exception_data;
++	struct kfd_hsa_hw_exception_data hw_exception_data;
++	struct kfd_event *ev;
++	uint32_t id = KFD_FIRST_NONSIGNAL_EVENT_ID;
++
++	if (!p)
++		return; /* Presumably process exited. */
++
++	memset(&hw_exception_data, 0, sizeof(hw_exception_data));
++	hw_exception_data.gpu_id = dev->id;
++	hw_exception_data.memory_lost = 1;
++	hw_exception_data.reset_cause = KFD_HW_EXCEPTION_ECC;
++
++	memset(&memory_exception_data, 0, sizeof(memory_exception_data));
++	memory_exception_data.ErrorType = KFD_MEM_ERR_POISON_CONSUMED;
++	memory_exception_data.gpu_id = dev->id;
++	memory_exception_data.failure.imprecise = true;
++
++	mutex_lock(&p->event_mutex);
++	idr_for_each_entry_continue(&p->event_idr, ev, id) {
++		if (ev->type == KFD_EVENT_TYPE_HW_EXCEPTION) {
++			ev->hw_exception_data = hw_exception_data;
++			set_event(ev);
++		}
++
++		if (ev->type == KFD_EVENT_TYPE_MEMORY) {
++			ev->memory_exception_data = memory_exception_data;
++			set_event(ev);
++		}
++	}
++	mutex_unlock(&p->event_mutex);
++
++	/* user application will handle SIGBUS signal */
++	send_sig(SIGBUS, p->lead_thread, 0);
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+index 97c36e3c8c80..9f9b1dfb9c37 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+@@ -230,7 +230,7 @@ static void event_interrupt_wq_v9(struct kfd_dev *dev,
+ 					sq_intr_err);
+ 				if (sq_intr_err != SQ_INTERRUPT_ERROR_TYPE_ILLEGAL_INST &&
+ 					sq_intr_err != SQ_INTERRUPT_ERROR_TYPE_MEMVIOL) {
+-					kfd_signal_hw_exception_event(pasid);
++					kfd_signal_poison_consumed_event(dev, pasid);
+ 					amdgpu_amdkfd_gpu_reset(dev->kgd);
+ 					return;
+ 				}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 64552f6b8ba4..daa9d47514c6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1144,6 +1144,8 @@ void kfd_signal_vm_fault_event(struct kfd_dev *dev, u32 pasid,
+ 
+ void kfd_signal_reset_event(struct kfd_dev *dev);
+ 
++void kfd_signal_poison_consumed_event(struct kfd_dev *dev, u32 pasid);
++
+ void kfd_flush_tlb(struct kfd_process_device *pdd);
+ 
+ int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p);
+-- 
+2.25.1
+

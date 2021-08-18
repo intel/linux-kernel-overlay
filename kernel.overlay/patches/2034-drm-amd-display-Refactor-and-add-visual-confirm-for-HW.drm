@@ -1,0 +1,343 @@
+From 53a65f2f92d0ba237a29985d5c7d1bfc0566fc66 Mon Sep 17 00:00:00 2001
+From: Wyatt Wood <wyatt.wood@amd.com>
+Date: Thu, 6 May 2021 16:11:16 -0400
+Subject: [PATCH 2034/2740] drm/amd/display: Refactor and add visual confirm
+ for HW Flip Queue
+
+[Why]
+Visual confirm will indicate if driver is programming
+the surface address.
+Refactor is required because much of the visual confirm
+logic is buried deep in the mpcc files.
+In addition, visual confirm is not updated during fast updates.
+
+[How]
+In order to have visual confirm for driver flips, visual confirm
+needs to be updated on every frame, including fast updates.
+Add a new hw sequencer interface update_visual_confirm_color,
+and a new mpc function pointer set_bg_color.
+
+v2: drop unused variable (Alex)
+
+Signed-off-by: Wyatt Wood <wyatt.wood@amd.com>
+Reviewed-by: Aric Cyr <Aric.Cyr@amd.com>
+Acked-by: Stylon Wang <stylon.wang@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../amd/display/dc/dcn10/dcn10_hw_sequencer.c | 32 +++++++++++--------
+ .../amd/display/dc/dcn10/dcn10_hw_sequencer.h |  6 ++++
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_init.c |  1 +
+ .../gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c  |  5 +++
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    | 29 +++++++++++------
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.h    |  5 +++
+ .../gpu/drm/amd/display/dc/dcn20/dcn20_init.c |  1 +
+ .../gpu/drm/amd/display/dc/dcn20/dcn20_mpc.c  |  2 +-
+ .../gpu/drm/amd/display/dc/dcn21/dcn21_init.c |  1 +
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_init.c |  1 +
+ .../gpu/drm/amd/display/dc/dcn30/dcn30_mpc.c  |  2 +-
+ .../drm/amd/display/dc/dcn301/dcn301_init.c   |  1 +
+ drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h   |  3 ++
+ .../gpu/drm/amd/display/dc/inc/hw_sequencer.h |  4 +++
+ 14 files changed, 68 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 8f11e2b58cd7..81803463ca9b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -2502,9 +2502,25 @@ static void dcn10_update_dpp(struct dpp *dpp, struct dc_plane_state *plane_state
+ 		dpp->funcs->dpp_program_bias_and_scale(dpp, &bns_params);
+ }
+ 
+-void dcn10_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
++void dcn10_update_visual_confirm_color(struct dc *dc, struct pipe_ctx *pipe_ctx, struct tg_color *color, int mpcc_id)
+ {
+ 	struct dce_hwseq *hws = dc->hwseq;
++	struct mpc *mpc = dc->res_pool->mpc;
++
++	if (dc->debug.visual_confirm == VISUAL_CONFIRM_HDR)
++		hws->funcs.get_hdr_visual_confirm_color(pipe_ctx, color);
++	else if (dc->debug.visual_confirm == VISUAL_CONFIRM_SURFACE)
++		hws->funcs.get_surface_visual_confirm_color(pipe_ctx, color);
++	else
++		color_space_to_black_color(
++				dc, pipe_ctx->stream->output_color_space, color);
++
++	if (mpc->funcs->set_bg_color)
++		mpc->funcs->set_bg_color(mpc, color, mpcc_id);
++}
++
++void dcn10_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
++{
+ 	struct hubp *hubp = pipe_ctx->plane_res.hubp;
+ 	struct mpcc_blnd_cfg blnd_cfg = {{0}};
+ 	bool per_pixel_alpha = pipe_ctx->plane_state->per_pixel_alpha && pipe_ctx->bottom_pipe;
+@@ -2513,18 +2529,6 @@ void dcn10_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	struct mpc *mpc = dc->res_pool->mpc;
+ 	struct mpc_tree *mpc_tree_params = &(pipe_ctx->stream_res.opp->mpc_tree_params);
+ 
+-	if (dc->debug.visual_confirm == VISUAL_CONFIRM_HDR) {
+-		hws->funcs.get_hdr_visual_confirm_color(
+-				pipe_ctx, &blnd_cfg.black_color);
+-	} else if (dc->debug.visual_confirm == VISUAL_CONFIRM_SURFACE) {
+-		hws->funcs.get_surface_visual_confirm_color(
+-				pipe_ctx, &blnd_cfg.black_color);
+-	} else {
+-		color_space_to_black_color(
+-				dc, pipe_ctx->stream->output_color_space,
+-				&blnd_cfg.black_color);
+-	}
+-
+ 	if (per_pixel_alpha)
+ 		blnd_cfg.alpha_mode = MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA;
+ 	else
+@@ -2556,6 +2560,8 @@ void dcn10_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	 */
+ 	mpcc_id = hubp->inst;
+ 
++	dc->hwss.update_visual_confirm_color(dc, pipe_ctx, &blnd_cfg.black_color, mpcc_id);
++
+ 	/* If there is no full update, don't need to touch MPC tree*/
+ 	if (!pipe_ctx->plane_state->update_flags.bits.full_update) {
+ 		mpc->funcs->update_blending(mpc, &blnd_cfg, mpcc_id);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.h
+index c9bdffe5989b..478180b96d8d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.h
+@@ -206,4 +206,10 @@ void dcn10_verify_allow_pstate_change_high(struct dc *dc);
+ 
+ void dcn10_get_dcc_en_bits(struct dc *dc, int *dcc_en_bits);
+ 
++void dcn10_update_visual_confirm_color(
++		struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		struct tg_color *color,
++		int mpcc_id);
++
+ #endif /* __DC_HWSS_DCN10_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
+index 680ca53455a2..4ff3ebc25438 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_init.c
+@@ -82,6 +82,7 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
+ 	.set_abm_immediate_disable = dce110_set_abm_immediate_disable,
+ 	.set_pipe = dce110_set_pipe,
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
++	.update_visual_confirm_color = dcn10_update_visual_confirm_color,
+ };
+ 
+ static const struct hwseq_private_funcs dcn10_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+index b096011acb49..da74269feb75 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_mpc.c
+@@ -64,6 +64,8 @@ void mpc1_set_bg_color(struct mpc *mpc,
+ 			MPCC_BG_G_Y, bg_g_y);
+ 	REG_SET(MPCC_BG_B_CB[bottommost_mpcc->mpcc_id], 0,
+ 			MPCC_BG_B_CB, bg_b_cb);
++
++	bottommost_mpcc->blnd_cfg.black_color = *bg_color;
+ }
+ 
+ static void mpc1_update_blending(
+@@ -246,6 +248,8 @@ struct mpcc *mpc1_insert_plane(
+ 		}
+ 	}
+ 
++	mpc->funcs->set_bg_color(mpc, &blnd_cfg->black_color, mpcc_id);
++
+ 	/* update the blending configuration */
+ 	mpc->funcs->update_blending(mpc, blnd_cfg, mpcc_id);
+ 
+@@ -495,6 +499,7 @@ static const struct mpc_funcs dcn10_mpc_funcs = {
+ 	.set_output_csc = NULL,
+ 	.set_output_gamma = NULL,
+ 	.get_mpc_out_mux = mpc1_get_mpc_out_mux,
++	.set_bg_color = mpc1_set_bg_color,
+ };
+ 
+ void dcn10_mpc_construct(struct dcn10_mpc *mpc10,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index 484a30592987..25de15158801 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -2267,9 +2267,25 @@ void dcn20_get_mpctree_visual_confirm_color(
+ 	*color = pipe_colors[top_pipe->pipe_idx];
+ }
+ 
+-void dcn20_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
++void dcn20_update_visual_confirm_color(struct dc *dc, struct pipe_ctx *pipe_ctx, struct tg_color *color, int mpcc_id)
+ {
+ 	struct dce_hwseq *hws = dc->hwseq;
++	struct mpc *mpc = dc->res_pool->mpc;
++
++	/* input to MPCC is always RGB, by default leave black_color at 0 */
++	if (dc->debug.visual_confirm == VISUAL_CONFIRM_HDR)
++		hws->funcs.get_hdr_visual_confirm_color(pipe_ctx, color);
++	else if (dc->debug.visual_confirm == VISUAL_CONFIRM_SURFACE)
++		hws->funcs.get_surface_visual_confirm_color(pipe_ctx, color);
++	else if (dc->debug.visual_confirm == VISUAL_CONFIRM_MPCTREE)
++		dcn20_get_mpctree_visual_confirm_color(pipe_ctx, color);
++
++	if (mpc->funcs->set_bg_color)
++		mpc->funcs->set_bg_color(mpc, color, mpcc_id);
++}
++
++void dcn20_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
++{
+ 	struct hubp *hubp = pipe_ctx->plane_res.hubp;
+ 	struct mpcc_blnd_cfg blnd_cfg = { {0} };
+ 	bool per_pixel_alpha = pipe_ctx->plane_state->per_pixel_alpha;
+@@ -2278,15 +2294,6 @@ void dcn20_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	struct mpc *mpc = dc->res_pool->mpc;
+ 	struct mpc_tree *mpc_tree_params = &(pipe_ctx->stream_res.opp->mpc_tree_params);
+ 
+-	// input to MPCC is always RGB, by default leave black_color at 0
+-	if (dc->debug.visual_confirm == VISUAL_CONFIRM_HDR) {
+-		hws->funcs.get_hdr_visual_confirm_color(pipe_ctx, &blnd_cfg.black_color);
+-	} else if (dc->debug.visual_confirm == VISUAL_CONFIRM_SURFACE) {
+-		hws->funcs.get_surface_visual_confirm_color(pipe_ctx, &blnd_cfg.black_color);
+-	} else if (dc->debug.visual_confirm == VISUAL_CONFIRM_MPCTREE) {
+-		dcn20_get_mpctree_visual_confirm_color(pipe_ctx, &blnd_cfg.black_color);
+-	}
+-
+ 	if (per_pixel_alpha)
+ 		blnd_cfg.alpha_mode = MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA;
+ 	else
+@@ -2320,6 +2327,8 @@ void dcn20_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	 */
+ 	mpcc_id = hubp->inst;
+ 
++	dc->hwss.update_visual_confirm_color(dc, pipe_ctx, &blnd_cfg.black_color, mpcc_id);
++
+ 	/* If there is no full update, don't need to touch MPC tree*/
+ 	if (!pipe_ctx->plane_state->update_flags.bits.full_update &&
+ 		!pipe_ctx->update_flags.bits.mpcc) {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
+index c69f766a40ce..6bba191cd33e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.h
+@@ -146,5 +146,10 @@ void dcn20_set_disp_pattern_generator(const struct dc *dc,
+ 		const struct tg_color *solid_color,
+ 		int width, int height, int offset);
+ 
++void dcn20_update_visual_confirm_color(struct dc *dc,
++		struct pipe_ctx *pipe_ctx,
++		struct tg_color *color,
++		int mpcc_id);
++
+ #endif /* __DC_HWSS_DCN20_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+index b5bb613eed4d..2f59f10e5f09 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_init.c
+@@ -96,6 +96,7 @@ static const struct hw_sequencer_funcs dcn20_funcs = {
+ #endif
+ 	.set_disp_pattern_generator = dcn20_set_disp_pattern_generator,
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
++	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ };
+ 
+ static const struct hwseq_private_funcs dcn20_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_mpc.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_mpc.c
+index 6a99fdd55e8c..947eb0df3f12 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_mpc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_mpc.c
+@@ -67,7 +67,6 @@ void mpc2_update_blending(
+ 	REG_SET(MPCC_BOT_GAIN_INSIDE[mpcc_id], 0, MPCC_BOT_GAIN_INSIDE, blnd_cfg->bottom_inside_gain);
+ 	REG_SET(MPCC_BOT_GAIN_OUTSIDE[mpcc_id], 0, MPCC_BOT_GAIN_OUTSIDE, blnd_cfg->bottom_outside_gain);
+ 
+-	mpc1_set_bg_color(mpc, &blnd_cfg->black_color, mpcc_id);
+ 	mpcc->blnd_cfg = *blnd_cfg;
+ }
+ 
+@@ -557,6 +556,7 @@ const struct mpc_funcs dcn20_mpc_funcs = {
+ 	.set_output_gamma = mpc2_set_output_gamma,
+ 	.power_on_mpc_mem_pwr = mpc20_power_on_ogam_lut,
+ 	.get_mpc_out_mux = mpc1_get_mpc_out_mux,
++	.set_bg_color = mpc1_set_bg_color,
+ };
+ 
+ void dcn20_mpc_construct(struct dcn20_mpc *mpc20,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+index 4f20a85ff396..523e25f7e410 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_init.c
+@@ -100,6 +100,7 @@ static const struct hw_sequencer_funcs dcn21_funcs = {
+ 	.is_abm_supported = dcn21_is_abm_supported,
+ 	.set_disp_pattern_generator = dcn20_set_disp_pattern_generator,
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
++	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ };
+ 
+ static const struct hwseq_private_funcs dcn21_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+index bf7fa98b39eb..a978d848d370 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_init.c
+@@ -99,6 +99,7 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
+ 	.set_pipe = dcn21_set_pipe,
+ 	.set_disp_pattern_generator = dcn30_set_disp_pattern_generator,
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
++	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ };
+ 
+ static const struct hwseq_private_funcs dcn30_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mpc.c b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mpc.c
+index 950c9bfd53de..a82319f4d081 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mpc.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mpc.c
+@@ -1431,7 +1431,7 @@ const struct mpc_funcs dcn30_mpc_funcs = {
+ 	.release_rmu = mpcc3_release_rmu,
+ 	.power_on_mpc_mem_pwr = mpc3_power_on_ogam_lut,
+ 	.get_mpc_out_mux = mpc1_get_mpc_out_mux,
+-
++	.set_bg_color = mpc1_set_bg_color,
+ };
+ 
+ void dcn30_mpc_construct(struct dcn30_mpc *mpc30,
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c b/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
+index 70b053d9ba40..181f2175ac95 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_init.c
+@@ -101,6 +101,7 @@ static const struct hw_sequencer_funcs dcn301_funcs = {
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
+ 	.optimize_pwr_state = dcn21_optimize_pwr_state,
+ 	.exit_optimized_pwr_state = dcn21_exit_optimized_pwr_state,
++	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ };
+ 
+ static const struct hwseq_private_funcs dcn301_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+index 75c77ad9cbfe..640bb432bd6a 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+@@ -363,6 +363,9 @@ struct mpc_funcs {
+ 			struct mpc *mpc,
+ 			int opp_id);
+ 
++	void (*set_bg_color)(struct mpc *mpc,
++			struct tg_color *bg_color,
++			int mpcc_id);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 1d5853c95448..43284d410687 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -235,6 +235,10 @@ struct hw_sequencer_funcs {
+ 			enum dc_color_depth color_depth,
+ 			const struct tg_color *solid_color,
+ 			int width, int height, int offset);
++	void (*update_visual_confirm_color)(struct dc *dc,
++			struct pipe_ctx *pipe_ctx,
++			struct tg_color *color,
++			int mpcc_id);
+ };
+ 
+ void color_space_to_black_color(
+-- 
+2.25.1
+

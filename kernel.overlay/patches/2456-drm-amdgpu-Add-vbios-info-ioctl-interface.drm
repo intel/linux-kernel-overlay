@@ -1,0 +1,359 @@
+From fb4d34ba11aeb53b455835ef7e9ed9df1111618f Mon Sep 17 00:00:00 2001
+From: Jiawei Gu <Jiawei.Gu@amd.com>
+Date: Wed, 14 Apr 2021 16:44:36 +0800
+Subject: [PATCH 2456/2740] drm/amdgpu: Add vbios info ioctl interface
+
+Add AMDGPU_INFO_VBIOS_INFO subquery id for detailed vbios info.
+
+Provides a way for the user application to get the VBIOS
+information without having to parse the binary.
+It is useful for the user to be able to display in a simple way the VBIOS
+version in their system if they happen to encounter an issue.
+
+V2:
+Use numeric serial.
+Parse and expose vbios version string.
+
+V3:
+Remove redundant data in drm_amdgpu_info_vbios struct.
+
+V4:
+64 bit alignment in drm_amdgpu_info_vbios.
+
+v5: squash together all the reverts, etc. (Alex)
+
+Signed-off-by: Jiawei Gu <Jiawei.Gu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c    |  15 ++
+ drivers/gpu/drm/amd/amdgpu/atom.c          | 172 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/atom.h          |  10 ++
+ drivers/gpu/drm/amd/include/atomfirmware.h |  17 +-
+ include/uapi/drm/amdgpu_drm.h              |  11 ++
+ 5 files changed, 219 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 847a63ac38cc..425596c2f6f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -868,6 +868,21 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 					    min((size_t)size, (size_t)(bios_size - bios_offset)))
+ 					? -EFAULT : 0;
+ 		}
++		case AMDGPU_INFO_VBIOS_INFO: {
++			struct drm_amdgpu_info_vbios vbios_info = {};
++			struct atom_context *atom_context;
++
++			atom_context = adev->mode_info.atom_context;
++			memcpy(vbios_info.name, atom_context->name, sizeof(atom_context->name));
++			memcpy(vbios_info.vbios_pn, atom_context->vbios_pn, sizeof(atom_context->vbios_pn));
++			vbios_info.version = atom_context->version;
++			memcpy(vbios_info.vbios_ver_str, atom_context->vbios_ver_str,
++						sizeof(atom_context->vbios_ver_str));
++			memcpy(vbios_info.date, atom_context->date, sizeof(atom_context->date));
++
++			return copy_to_user(out, &vbios_info,
++						min((size_t)size, sizeof(vbios_info))) ? -EFAULT : 0;
++		}
+ 		default:
+ 			DRM_DEBUG_KMS("Invalid request %d\n",
+ 					info->vbios_info.type);
+diff --git a/drivers/gpu/drm/amd/amdgpu/atom.c b/drivers/gpu/drm/amd/amdgpu/atom.c
+index 3dcb8b32f48b..6fa2229b7229 100644
+--- a/drivers/gpu/drm/amd/amdgpu/atom.c
++++ b/drivers/gpu/drm/amd/amdgpu/atom.c
+@@ -31,6 +31,7 @@
+ 
+ #define ATOM_DEBUG
+ 
++#include "atomfirmware.h"
+ #include "atom.h"
+ #include "atom-names.h"
+ #include "atom-bits.h"
+@@ -1299,12 +1300,168 @@ static void atom_index_iio(struct atom_context *ctx, int base)
+ 	}
+ }
+ 
++static void atom_get_vbios_name(struct atom_context *ctx)
++{
++	unsigned char *p_rom;
++	unsigned char str_num;
++	unsigned short off_to_vbios_str;
++	unsigned char *c_ptr;
++	int name_size;
++	int i;
++
++	const char *na = "--N/A--";
++	char *back;
++
++	p_rom = ctx->bios;
++
++	str_num = *(p_rom + OFFSET_TO_GET_ATOMBIOS_NUMBER_OF_STRINGS);
++	if (str_num != 0) {
++		off_to_vbios_str =
++			*(unsigned short *)(p_rom + OFFSET_TO_GET_ATOMBIOS_STRING_START);
++
++		c_ptr = (unsigned char *)(p_rom + off_to_vbios_str);
++	} else {
++		/* do not know where to find name */
++		memcpy(ctx->name, na, 7);
++		ctx->name[7] = 0;
++		return;
++	}
++
++	/*
++	 * skip the atombios strings, usually 4
++	 * 1st is P/N, 2nd is ASIC, 3rd is PCI type, 4th is Memory type
++	 */
++	for (i = 0; i < str_num; i++) {
++		while (*c_ptr != 0)
++			c_ptr++;
++		c_ptr++;
++	}
++
++	/* skip the following 2 chars: 0x0D 0x0A */
++	c_ptr += 2;
++
++	name_size = strnlen(c_ptr, STRLEN_LONG - 1);
++	memcpy(ctx->name, c_ptr, name_size);
++	back = ctx->name + name_size;
++	while ((*--back) == ' ')
++		;
++	*(back + 1) = '\0';
++}
++
++static void atom_get_vbios_date(struct atom_context *ctx)
++{
++	unsigned char *p_rom;
++	unsigned char *date_in_rom;
++
++	p_rom = ctx->bios;
++
++	date_in_rom = p_rom + OFFSET_TO_VBIOS_DATE;
++
++	ctx->date[0] = '2';
++	ctx->date[1] = '0';
++	ctx->date[2] = date_in_rom[6];
++	ctx->date[3] = date_in_rom[7];
++	ctx->date[4] = '/';
++	ctx->date[5] = date_in_rom[0];
++	ctx->date[6] = date_in_rom[1];
++	ctx->date[7] = '/';
++	ctx->date[8] = date_in_rom[3];
++	ctx->date[9] = date_in_rom[4];
++	ctx->date[10] = ' ';
++	ctx->date[11] = date_in_rom[9];
++	ctx->date[12] = date_in_rom[10];
++	ctx->date[13] = date_in_rom[11];
++	ctx->date[14] = date_in_rom[12];
++	ctx->date[15] = date_in_rom[13];
++	ctx->date[16] = '\0';
++}
++
++static unsigned char *atom_find_str_in_rom(struct atom_context *ctx, char *str, int start,
++					   int end, int maxlen)
++{
++	unsigned long str_off;
++	unsigned char *p_rom;
++	unsigned short str_len;
++
++	str_off = 0;
++	str_len = strnlen(str, maxlen);
++	p_rom = ctx->bios;
++
++	for (; start <= end; ++start) {
++		for (str_off = 0; str_off < str_len; ++str_off) {
++			if (str[str_off] != *(p_rom + start + str_off))
++				break;
++		}
++
++		if (str_off == str_len || str[str_off] == 0)
++			return p_rom + start;
++	}
++	return NULL;
++}
++
++static void atom_get_vbios_pn(struct atom_context *ctx)
++{
++	unsigned char *p_rom;
++	unsigned short off_to_vbios_str;
++	unsigned char *vbios_str;
++	int count;
++
++	off_to_vbios_str = 0;
++	p_rom = ctx->bios;
++
++	if (*(p_rom + OFFSET_TO_GET_ATOMBIOS_NUMBER_OF_STRINGS) != 0) {
++		off_to_vbios_str =
++			*(unsigned short *)(p_rom + OFFSET_TO_GET_ATOMBIOS_STRING_START);
++
++		vbios_str = (unsigned char *)(p_rom + off_to_vbios_str);
++	} else {
++		vbios_str = p_rom + OFFSET_TO_VBIOS_PART_NUMBER;
++	}
++
++	if (*vbios_str == 0) {
++		vbios_str = atom_find_str_in_rom(ctx, BIOS_ATOM_PREFIX, 3, 1024, 64);
++		if (vbios_str == NULL)
++			vbios_str += sizeof(BIOS_ATOM_PREFIX) - 1;
++	}
++	if (vbios_str != NULL && *vbios_str == 0)
++		vbios_str++;
++
++	if (vbios_str != NULL) {
++		count = 0;
++		while ((count < BIOS_STRING_LENGTH) && vbios_str[count] >= ' ' &&
++		       vbios_str[count] <= 'z') {
++			ctx->vbios_pn[count] = vbios_str[count];
++			count++;
++		}
++
++		ctx->vbios_pn[count] = 0;
++	}
++}
++
++static void atom_get_vbios_version(struct atom_context *ctx)
++{
++	unsigned char *vbios_ver;
++
++	/* find anchor ATOMBIOSBK-AMD */
++	vbios_ver = atom_find_str_in_rom(ctx, BIOS_VERSION_PREFIX, 3, 1024, 64);
++	if (vbios_ver != NULL) {
++		/* skip ATOMBIOSBK-AMD VER */
++		vbios_ver += 18;
++		memcpy(ctx->vbios_ver_str, vbios_ver, STRLEN_NORMAL);
++	} else {
++		ctx->vbios_ver_str[0] = '\0';
++	}
++}
++
+ struct atom_context *amdgpu_atom_parse(struct card_info *card, void *bios)
+ {
+ 	int base;
+ 	struct atom_context *ctx =
+ 	    kzalloc(sizeof(struct atom_context), GFP_KERNEL);
+ 	char *str;
++	struct _ATOM_ROM_HEADER *atom_rom_header;
++	struct _ATOM_MASTER_DATA_TABLE *master_table;
++	struct _ATOM_FIRMWARE_INFO *atom_fw_info;
+ 	u16 idx;
+ 
+ 	if (!ctx)
+@@ -1353,6 +1510,21 @@ struct atom_context *amdgpu_atom_parse(struct card_info *card, void *bios)
+ 		strlcpy(ctx->vbios_version, str, sizeof(ctx->vbios_version));
+ 	}
+ 
++	atom_rom_header = (struct _ATOM_ROM_HEADER *)CSTR(base);
++	if (atom_rom_header->usMasterDataTableOffset != 0) {
++		master_table = (struct _ATOM_MASTER_DATA_TABLE *)
++				CSTR(atom_rom_header->usMasterDataTableOffset);
++		if (master_table->ListOfDataTables.FirmwareInfo != 0) {
++			atom_fw_info = (struct _ATOM_FIRMWARE_INFO *)
++					CSTR(master_table->ListOfDataTables.FirmwareInfo);
++			ctx->version = atom_fw_info->ulFirmwareRevision;
++		}
++	}
++
++	atom_get_vbios_name(ctx);
++	atom_get_vbios_pn(ctx);
++	atom_get_vbios_date(ctx);
++	atom_get_vbios_version(ctx);
+ 
+ 	return ctx;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/atom.h b/drivers/gpu/drm/amd/amdgpu/atom.h
+index d279759cab47..0c1839824520 100644
+--- a/drivers/gpu/drm/amd/amdgpu/atom.h
++++ b/drivers/gpu/drm/amd/amdgpu/atom.h
+@@ -112,6 +112,10 @@ struct drm_device;
+ #define ATOM_IO_SYSIO		2
+ #define ATOM_IO_IIO		0x80
+ 
++#define STRLEN_NORMAL		32
++#define STRLEN_LONG		64
++#define STRLEN_VERYLONG		254
++
+ struct card_info {
+ 	struct drm_device *dev;
+ 	void (* reg_write)(struct card_info *, uint32_t, uint32_t);   /*  filled by driver */
+@@ -140,6 +144,12 @@ struct atom_context {
+ 	uint32_t *scratch;
+ 	int scratch_size_bytes;
+ 	char vbios_version[20];
++
++	uint8_t name[STRLEN_LONG];
++	uint8_t vbios_pn[STRLEN_LONG];
++	uint32_t version;
++	uint8_t vbios_ver_str[STRLEN_NORMAL];
++	uint8_t date[STRLEN_NORMAL];
+ };
+ 
+ extern int amdgpu_atom_debug;
+diff --git a/drivers/gpu/drm/amd/include/atomfirmware.h b/drivers/gpu/drm/amd/include/atomfirmware.h
+index 2aa6d27ed68f..28deecc2f990 100644
+--- a/drivers/gpu/drm/amd/include/atomfirmware.h
++++ b/drivers/gpu/drm/amd/include/atomfirmware.h
+@@ -197,6 +197,9 @@ enum atom_dp_vs_preemph_def{
+   DP_VS_LEVEL0_PREEMPH_LEVEL3 = 0x18,
+ };
+ 
++#define BIOS_ATOM_PREFIX   "ATOMBIOS"
++#define BIOS_VERSION_PREFIX  "ATOMBIOSBK-AMD"
++#define BIOS_STRING_LENGTH 43
+ 
+ /*
+ enum atom_string_def{
+@@ -209,12 +212,14 @@ atom_bios_string          = "ATOM"
+ #pragma pack(1)                          /* BIOS data must use byte aligment*/
+ 
+ enum atombios_image_offset{
+-OFFSET_TO_ATOM_ROM_HEADER_POINTER          =0x00000048,
+-OFFSET_TO_ATOM_ROM_IMAGE_SIZE              =0x00000002,
+-OFFSET_TO_ATOMBIOS_ASIC_BUS_MEM_TYPE       =0x94,
+-MAXSIZE_OF_ATOMBIOS_ASIC_BUS_MEM_TYPE      =20,  /*including the terminator 0x0!*/
+-OFFSET_TO_GET_ATOMBIOS_NUMBER_OF_STRINGS   =0x2f,
+-OFFSET_TO_GET_ATOMBIOS_STRING_START        =0x6e,
++  OFFSET_TO_ATOM_ROM_HEADER_POINTER          = 0x00000048,
++  OFFSET_TO_ATOM_ROM_IMAGE_SIZE              = 0x00000002,
++  OFFSET_TO_ATOMBIOS_ASIC_BUS_MEM_TYPE       = 0x94,
++  MAXSIZE_OF_ATOMBIOS_ASIC_BUS_MEM_TYPE      = 20,  /*including the terminator 0x0!*/
++  OFFSET_TO_GET_ATOMBIOS_NUMBER_OF_STRINGS   = 0x2f,
++  OFFSET_TO_GET_ATOMBIOS_STRING_START        = 0x6e,
++  OFFSET_TO_VBIOS_PART_NUMBER                = 0x80,
++  OFFSET_TO_VBIOS_DATE                       = 0x50,
+ };
+ 
+ /****************************************************************************   
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index dc61537d7547..91a23187902e 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -757,6 +757,8 @@ struct drm_amdgpu_cs_chunk_data {
+ 	#define AMDGPU_INFO_VBIOS_SIZE		0x1
+ 	/* Subquery id: Query vbios image */
+ 	#define AMDGPU_INFO_VBIOS_IMAGE		0x2
++	/* Subquery id: Query vbios info */
++	#define AMDGPU_INFO_VBIOS_INFO		0x3
+ /* Query UVD handles */
+ #define AMDGPU_INFO_NUM_HANDLES			0x1C
+ /* Query sensor related information */
+@@ -950,6 +952,15 @@ struct drm_amdgpu_info_firmware {
+ 	__u32 feature;
+ };
+ 
++struct drm_amdgpu_info_vbios {
++	__u8 name[64];
++	__u8 vbios_pn[64];
++	__u32 version;
++	__u32 pad;
++	__u8 vbios_ver_str[32];
++	__u8 date[32];
++};
++
+ #define AMDGPU_VRAM_TYPE_UNKNOWN 0
+ #define AMDGPU_VRAM_TYPE_GDDR1 1
+ #define AMDGPU_VRAM_TYPE_DDR2  2
+-- 
+2.25.1
+

@@ -1,0 +1,147 @@
+From 64fb6bb8306019f373f1da7ab51ab5babe058d9b Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 11 May 2021 11:37:09 -0400
+Subject: [PATCH 2099/2740] drm/amdgpu/display: add helper functions to get/set
+ backlight (v2)
+
+And cache the value.  These can be used by the backlight callbacks
+and modesetting functions.
+
+v2: rebase on latest backlight changes.
+
+Bug: https://gitlab.freedesktop.org/drm/amd/-/issues/1337
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 42 ++++++++++++++-----
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  7 ++++
+ 2 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f92f73708031..4a5d328d18b9 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3468,26 +3468,28 @@ static u32 convert_brightness_to_user(const struct amdgpu_dm_backlight_caps *cap
+ 				 max - min);
+ }
+ 
+-static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
++static int amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
++					 u32 user_brightness)
+ {
+-	struct amdgpu_display_manager *dm = bl_get_data(bd);
+ 	struct amdgpu_dm_backlight_caps caps;
+ 	struct dc_link *link[AMDGPU_DM_MAX_NUM_EDP];
+-	u32 brightness;
++	u32 brightness[AMDGPU_DM_MAX_NUM_EDP];
+ 	bool rc;
+ 	int i;
+ 
+ 	amdgpu_dm_update_backlight_caps(dm);
+ 	caps = dm->backlight_caps;
+ 
+-	for (i = 0; i < dm->num_of_edps; i++)
++	for (i = 0; i < dm->num_of_edps; i++) {
++		dm->brightness[i] = user_brightness;
++		brightness[i] = convert_brightness_from_user(&caps, dm->brightness[i]);
+ 		link[i] = (struct dc_link *)dm->backlight_link[i];
++	}
+ 
+-	brightness = convert_brightness_from_user(&caps, bd->props.brightness);
+-	// Change brightness based on AUX property
++	/* Change brightness based on AUX property */
+ 	if (caps.aux_support) {
+ 		for (i = 0; i < dm->num_of_edps; i++) {
+-			rc = dc_link_set_backlight_level_nits(link[i], true, brightness,
++			rc = dc_link_set_backlight_level_nits(link[i], true, brightness[i],
+ 				AUX_BL_DEFAULT_TRANSITION_TIME_MS);
+ 			if (!rc) {
+ 				DRM_ERROR("DM: Failed to update backlight via AUX on eDP[%d]\n", i);
+@@ -3496,7 +3498,7 @@ static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
+ 		}
+ 	} else {
+ 		for (i = 0; i < dm->num_of_edps; i++) {
+-			rc = dc_link_set_backlight_level(dm->backlight_link[i], brightness, 0);
++			rc = dc_link_set_backlight_level(dm->backlight_link[i], brightness[i], 0);
+ 			if (!rc) {
+ 				DRM_ERROR("DM: Failed to update backlight on eDP[%d]\n", i);
+ 				break;
+@@ -3507,9 +3509,17 @@ static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
+ 	return rc ? 0 : 1;
+ }
+ 
+-static int amdgpu_dm_backlight_get_brightness(struct backlight_device *bd)
++static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
+ {
+ 	struct amdgpu_display_manager *dm = bl_get_data(bd);
++
++	amdgpu_dm_backlight_set_level(dm, bd->props.brightness);
++
++	return 0;
++}
++
++static u32 amdgpu_dm_backlight_get_level(struct amdgpu_display_manager *dm)
++{
+ 	struct amdgpu_dm_backlight_caps caps;
+ 
+ 	amdgpu_dm_update_backlight_caps(dm);
+@@ -3522,17 +3532,24 @@ static int amdgpu_dm_backlight_get_brightness(struct backlight_device *bd)
+ 
+ 		rc = dc_link_get_backlight_level_nits(link, &avg, &peak);
+ 		if (!rc)
+-			return bd->props.brightness;
++			return dm->brightness[0];
+ 		return convert_brightness_to_user(&caps, avg);
+ 	} else {
+ 		int ret = dc_link_get_backlight_level(dm->backlight_link[0]);
+ 
+ 		if (ret == DC_ERROR_UNEXPECTED)
+-			return bd->props.brightness;
++			return dm->brightness[0];
+ 		return convert_brightness_to_user(&caps, ret);
+ 	}
+ }
+ 
++static int amdgpu_dm_backlight_get_brightness(struct backlight_device *bd)
++{
++	struct amdgpu_display_manager *dm = bl_get_data(bd);
++
++	return amdgpu_dm_backlight_get_level(dm);
++}
++
+ static const struct backlight_ops amdgpu_dm_backlight_ops = {
+ 	.options = BL_CORE_SUSPENDRESUME,
+ 	.get_brightness = amdgpu_dm_backlight_get_brightness,
+@@ -3544,8 +3561,11 @@ amdgpu_dm_register_backlight_device(struct amdgpu_display_manager *dm)
+ {
+ 	char bl_name[16];
+ 	struct backlight_properties props = { 0 };
++	int i;
+ 
+ 	amdgpu_dm_update_backlight_caps(dm);
++	for (i = 0; i < dm->num_of_edps; i++)
++		dm->brightness[i] = AMDGPU_MAX_BL_LEVEL;
+ 
+ 	props.max_brightness = AMDGPU_MAX_BL_LEVEL;
+ 	props.brightness = AMDGPU_MAX_BL_LEVEL;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index c6f79c7dfac4..721c8b49730c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -436,6 +436,13 @@ struct amdgpu_display_manager {
+ 	 */
+ 	struct list_head da_list;
+ 	struct completion dmub_aux_transfer_done;
++
++	/**
++	 * @brightness:
++	 *
++	 * cached backlight values.
++	 */
++	u32 brightness[AMDGPU_DM_MAX_NUM_EDP];
+ };
+ 
+ enum dsc_clock_force_state {
+-- 
+2.25.1
+

@@ -1,0 +1,394 @@
+From 52cf58d29c0cd328fd034ac3a7fe80682c7c310b Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 24 Mar 2021 12:13:30 +0000
+Subject: [PATCH 0827/2740] drm/i915: Individual request cancellation
+
+Currently, we cancel outstanding requests within a context when the
+context is closed. We may also want to cancel individual requests using
+the same graceful preemption mechanism.
+
+v2 (Tvrtko):
+ * Cancel waiters carefully considering no timeline lock and RCU.
+ * Fixed selftests.
+
+v3 (Tvrtko):
+ * Remove error propagation to waiters for now.
+
+v4 (Tvrtko):
+ * Rebase for extracted i915_request_active_engine. (Matt)
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+[danvet: Resolve conflict because intel_engine_flush_scheduler is
+still called intel_engine_flush_submission]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210324121335.2307063-3-tvrtko.ursulin@linux.intel.com
+---
+ .../gpu/drm/i915/gt/intel_engine_heartbeat.c  |   1 +
+ .../drm/i915/gt/intel_execlists_submission.c  |   9 +-
+ drivers/gpu/drm/i915/i915_request.c           |  33 ++-
+ drivers/gpu/drm/i915/i915_request.h           |   4 +-
+ drivers/gpu/drm/i915/selftests/i915_request.c | 201 ++++++++++++++++++
+ 5 files changed, 242 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c b/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
+index d7be2b9339f9..876394cce276 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
+@@ -279,6 +279,7 @@ int intel_engine_pulse(struct intel_engine_cs *engine)
+ 		mutex_unlock(&ce->timeline->mutex);
+ 	}
+ 
++	intel_engine_flush_submission(engine);
+ 	intel_engine_pm_put(engine);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index 77edca578e76..4ba6b8674012 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -470,6 +470,11 @@ static void reset_active(struct i915_request *rq,
+ 	ce->lrc.lrca = lrc_update_regs(ce, engine, head);
+ }
+ 
++static bool bad_request(const struct i915_request *rq)
++{
++	return rq->fence.error && i915_request_started(rq);
++}
++
+ static struct intel_engine_cs *
+ __execlists_schedule_in(struct i915_request *rq)
+ {
+@@ -482,7 +487,7 @@ __execlists_schedule_in(struct i915_request *rq)
+ 		     !intel_engine_has_heartbeat(engine)))
+ 		intel_context_set_banned(ce);
+ 
+-	if (unlikely(intel_context_is_banned(ce)))
++	if (unlikely(intel_context_is_banned(ce) || bad_request(rq)))
+ 		reset_active(rq, engine);
+ 
+ 	if (IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM))
+@@ -1208,7 +1213,7 @@ static unsigned long active_preempt_timeout(struct intel_engine_cs *engine,
+ 		return 0;
+ 
+ 	/* Force a fast reset for terminated contexts (ignoring sysfs!) */
+-	if (unlikely(intel_context_is_banned(rq->context)))
++	if (unlikely(intel_context_is_banned(rq->context) || bad_request(rq)))
+ 		return 1;
+ 
+ 	return READ_ONCE(engine->props.preempt_timeout_ms);
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index 1acbe2294d97..0316de3cb3be 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -33,7 +33,10 @@
+ #include "gem/i915_gem_context.h"
+ #include "gt/intel_breadcrumbs.h"
+ #include "gt/intel_context.h"
++#include "gt/intel_engine.h"
++#include "gt/intel_engine_heartbeat.h"
+ #include "gt/intel_gpu_commands.h"
++#include "gt/intel_reset.h"
+ #include "gt/intel_ring.h"
+ #include "gt/intel_rps.h"
+ 
+@@ -542,20 +545,22 @@ void __i915_request_skip(struct i915_request *rq)
+ 	rq->infix = rq->postfix;
+ }
+ 
+-void i915_request_set_error_once(struct i915_request *rq, int error)
++bool i915_request_set_error_once(struct i915_request *rq, int error)
+ {
+ 	int old;
+ 
+ 	GEM_BUG_ON(!IS_ERR_VALUE((long)error));
+ 
+ 	if (i915_request_signaled(rq))
+-		return;
++		return false;
+ 
+ 	old = READ_ONCE(rq->fence.error);
+ 	do {
+ 		if (fatal_error(old))
+-			return;
++			return false;
+ 	} while (!try_cmpxchg(&rq->fence.error, &old, error));
++
++	return true;
+ }
+ 
+ void i915_request_mark_eio(struct i915_request *rq)
+@@ -722,6 +727,28 @@ void i915_request_unsubmit(struct i915_request *request)
+ 	spin_unlock_irqrestore(&engine->active.lock, flags);
+ }
+ 
++static void __cancel_request(struct i915_request *rq)
++{
++	struct intel_engine_cs *engine = NULL;
++
++	i915_request_active_engine(rq, &engine);
++
++	if (engine && intel_engine_pulse(engine))
++		intel_gt_handle_error(engine->gt, engine->mask, 0,
++				      "request cancellation by %s",
++				      current->comm);
++}
++
++void i915_request_cancel(struct i915_request *rq, int error)
++{
++	if (!i915_request_set_error_once(rq, error))
++		return;
++
++	set_bit(I915_FENCE_FLAG_SENTINEL, &rq->fence.flags);
++
++	__cancel_request(rq);
++}
++
+ static int __i915_sw_fence_call
+ submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_request.h b/drivers/gpu/drm/i915/i915_request.h
+index cf4bd07f749e..e4d190ab76b2 100644
+--- a/drivers/gpu/drm/i915/i915_request.h
++++ b/drivers/gpu/drm/i915/i915_request.h
+@@ -300,7 +300,7 @@ struct i915_request * __must_check
+ i915_request_create(struct intel_context *ce);
+ 
+ void __i915_request_skip(struct i915_request *rq);
+-void i915_request_set_error_once(struct i915_request *rq, int error);
++bool i915_request_set_error_once(struct i915_request *rq, int error);
+ void i915_request_mark_eio(struct i915_request *rq);
+ 
+ struct i915_request *__i915_request_commit(struct i915_request *request);
+@@ -356,6 +356,8 @@ void i915_request_submit(struct i915_request *request);
+ void __i915_request_unsubmit(struct i915_request *request);
+ void i915_request_unsubmit(struct i915_request *request);
+ 
++void i915_request_cancel(struct i915_request *rq, int error);
++
+ long i915_request_wait(struct i915_request *rq,
+ 		       unsigned int flags,
+ 		       long timeout)
+diff --git a/drivers/gpu/drm/i915/selftests/i915_request.c b/drivers/gpu/drm/i915/selftests/i915_request.c
+index 9a9e92a775c8..ee8e753d98ce 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_request.c
+@@ -609,6 +609,206 @@ static int live_nop_request(void *arg)
+ 	return err;
+ }
+ 
++static int __cancel_inactive(struct intel_engine_cs *engine)
++{
++	struct intel_context *ce;
++	struct igt_spinner spin;
++	struct i915_request *rq;
++	int err = 0;
++
++	if (igt_spinner_init(&spin, engine->gt))
++		return -ENOMEM;
++
++	ce = intel_context_create(engine);
++	if (IS_ERR(ce)) {
++		err = PTR_ERR(ce);
++		goto out_spin;
++	}
++
++	rq = igt_spinner_create_request(&spin, ce, MI_ARB_CHECK);
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
++		goto out_ce;
++	}
++
++	pr_debug("%s: Cancelling inactive request\n", engine->name);
++	i915_request_cancel(rq, -EINTR);
++	i915_request_get(rq);
++	i915_request_add(rq);
++
++	if (i915_request_wait(rq, 0, HZ / 5) < 0) {
++		struct drm_printer p = drm_info_printer(engine->i915->drm.dev);
++
++		pr_err("%s: Failed to cancel inactive request\n", engine->name);
++		intel_engine_dump(engine, &p, "%s\n", engine->name);
++		err = -ETIME;
++		goto out_rq;
++	}
++
++	if (rq->fence.error != -EINTR) {
++		pr_err("%s: fence not cancelled (%u)\n",
++		       engine->name, rq->fence.error);
++		err = -EINVAL;
++	}
++
++out_rq:
++	i915_request_put(rq);
++out_ce:
++	intel_context_put(ce);
++out_spin:
++	igt_spinner_fini(&spin);
++	if (err)
++		pr_err("%s: %s error %d\n", __func__, engine->name, err);
++	return err;
++}
++
++static int __cancel_active(struct intel_engine_cs *engine)
++{
++	struct intel_context *ce;
++	struct igt_spinner spin;
++	struct i915_request *rq;
++	int err = 0;
++
++	if (igt_spinner_init(&spin, engine->gt))
++		return -ENOMEM;
++
++	ce = intel_context_create(engine);
++	if (IS_ERR(ce)) {
++		err = PTR_ERR(ce);
++		goto out_spin;
++	}
++
++	rq = igt_spinner_create_request(&spin, ce, MI_ARB_CHECK);
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
++		goto out_ce;
++	}
++
++	pr_debug("%s: Cancelling active request\n", engine->name);
++	i915_request_get(rq);
++	i915_request_add(rq);
++	if (!igt_wait_for_spinner(&spin, rq)) {
++		struct drm_printer p = drm_info_printer(engine->i915->drm.dev);
++
++		pr_err("Failed to start spinner on %s\n", engine->name);
++		intel_engine_dump(engine, &p, "%s\n", engine->name);
++		err = -ETIME;
++		goto out_rq;
++	}
++	i915_request_cancel(rq, -EINTR);
++
++	if (i915_request_wait(rq, 0, HZ / 5) < 0) {
++		struct drm_printer p = drm_info_printer(engine->i915->drm.dev);
++
++		pr_err("%s: Failed to cancel active request\n", engine->name);
++		intel_engine_dump(engine, &p, "%s\n", engine->name);
++		err = -ETIME;
++		goto out_rq;
++	}
++
++	if (rq->fence.error != -EINTR) {
++		pr_err("%s: fence not cancelled (%u)\n",
++		       engine->name, rq->fence.error);
++		err = -EINVAL;
++	}
++
++out_rq:
++	i915_request_put(rq);
++out_ce:
++	intel_context_put(ce);
++out_spin:
++	igt_spinner_fini(&spin);
++	if (err)
++		pr_err("%s: %s error %d\n", __func__, engine->name, err);
++	return err;
++}
++
++static int __cancel_completed(struct intel_engine_cs *engine)
++{
++	struct intel_context *ce;
++	struct igt_spinner spin;
++	struct i915_request *rq;
++	int err = 0;
++
++	if (igt_spinner_init(&spin, engine->gt))
++		return -ENOMEM;
++
++	ce = intel_context_create(engine);
++	if (IS_ERR(ce)) {
++		err = PTR_ERR(ce);
++		goto out_spin;
++	}
++
++	rq = igt_spinner_create_request(&spin, ce, MI_ARB_CHECK);
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
++		goto out_ce;
++	}
++	igt_spinner_end(&spin);
++	i915_request_get(rq);
++	i915_request_add(rq);
++
++	if (i915_request_wait(rq, 0, HZ / 5) < 0) {
++		err = -ETIME;
++		goto out_rq;
++	}
++
++	pr_debug("%s: Cancelling completed request\n", engine->name);
++	i915_request_cancel(rq, -EINTR);
++	if (rq->fence.error) {
++		pr_err("%s: fence not cancelled (%u)\n",
++		       engine->name, rq->fence.error);
++		err = -EINVAL;
++	}
++
++out_rq:
++	i915_request_put(rq);
++out_ce:
++	intel_context_put(ce);
++out_spin:
++	igt_spinner_fini(&spin);
++	if (err)
++		pr_err("%s: %s error %d\n", __func__, engine->name, err);
++	return err;
++}
++
++static int live_cancel_request(void *arg)
++{
++	struct drm_i915_private *i915 = arg;
++	struct intel_engine_cs *engine;
++
++	/*
++	 * Check cancellation of requests. We expect to be able to immediately
++	 * cancel active requests, even if they are currently on the GPU.
++	 */
++
++	for_each_uabi_engine(engine, i915) {
++		struct igt_live_test t;
++		int err, err2;
++
++		if (!intel_engine_has_preemption(engine))
++			continue;
++
++		err = igt_live_test_begin(&t, i915, __func__, engine->name);
++		if (err)
++			return err;
++
++		err = __cancel_inactive(engine);
++		if (err == 0)
++			err = __cancel_active(engine);
++		if (err == 0)
++			err = __cancel_completed(engine);
++
++		err2 = igt_live_test_end(&t);
++		if (err)
++			return err;
++		if (err2)
++			return err2;
++	}
++
++	return 0;
++}
++
+ static struct i915_vma *empty_batch(struct drm_i915_private *i915)
+ {
+ 	struct drm_i915_gem_object *obj;
+@@ -1486,6 +1686,7 @@ int i915_request_live_selftests(struct drm_i915_private *i915)
+ 		SUBTEST(live_sequential_engines),
+ 		SUBTEST(live_parallel_engines),
+ 		SUBTEST(live_empty_request),
++		SUBTEST(live_cancel_request),
+ 		SUBTEST(live_breadcrumbs_smoketest),
+ 	};
+ 
+-- 
+2.25.1
+
