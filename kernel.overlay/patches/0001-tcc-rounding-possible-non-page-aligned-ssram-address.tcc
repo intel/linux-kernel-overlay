@@ -1,7 +1,7 @@
 From a70bb6a927c84079200a53c29462319293d3df1d Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Sun, 8 Aug 2021 03:13:01 +0800
-Subject: [PATCH 26/26] tcc: rounding possible non page-aligned ssram address
+Subject: [PATCH] tcc: rounding possible non page-aligned ssram address
 
 ssram address and size could be not aligned to page boundary for some skus.
 
@@ -37,5 +37,5 @@ index e54723f00fec..644dcfdc432e 100644
  		}
  		ptr += entry->size;
 -- 
-2.17.1
+2.27.0
 
