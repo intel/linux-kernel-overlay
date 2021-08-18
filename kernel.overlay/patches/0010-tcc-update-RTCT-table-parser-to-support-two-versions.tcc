@@ -1,7 +1,7 @@
-From fe09fa14eb4386224c37f7a1c96c69f4572024e5 Mon Sep 17 00:00:00 2001
+From 190aeac37ccf2c51af00fb87bb1af3bd93699d27 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 18:48:46 +0800
-Subject: [PATCH 10/15] tcc: update RTCT table parser to support two versions
+Subject: [PATCH 10/16] tcc: update RTCT table parser to support two versions
 
 Reject request if size is not kernel page size aligned;
 Clear memory by affinity cpu;
@@ -1024,5 +1024,5 @@ index 76f6657252ff..0ff9532b8d80 100644
  /*******************************************************************************
   *
 -- 
-2.27.0
+2.32.0
 

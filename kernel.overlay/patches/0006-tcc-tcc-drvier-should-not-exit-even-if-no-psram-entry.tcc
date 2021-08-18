@@ -1,7 +1,7 @@
-From 0e2dbb9f34959def237a4456d81bdbbb23ac96da Mon Sep 17 00:00:00 2001
+From b5db5bf4057af679e3695bd086993541641ce367 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 10 Jul 2020 17:48:35 +0800
-Subject: [PATCH 06/15] tcc: tcc drvier should not exit even if no psram entry.
+Subject: [PATCH 06/16] tcc: tcc drvier should not exit even if no psram entry.
 
 Driver should work even no pSRAM regions are created, because it is used
 by tcc_cache_configurator to read RTCT and configure pSRAM.
@@ -42,5 +42,5 @@ index 544ab59b3a94..ce5d565b68ee 100644
  	l2_end = 0;
  
 -- 
-2.27.0
+2.32.0
 

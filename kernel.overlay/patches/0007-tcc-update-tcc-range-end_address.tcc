@@ -1,7 +1,7 @@
-From 63f6c2e0373bb7687453e47a2a5fd8d625e8ccda Mon Sep 17 00:00:00 2001
+From 219c5f6d17bc2827bf2b7726faaee04cafbab82a Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 16:56:12 +0800
-Subject: [PATCH 07/15] tcc: update tcc range end_address.
+Subject: [PATCH 07/16] tcc: update tcc range end_address.
 
 To report tcc range, start_address is inclusive; but end_address is not.
 
@@ -24,5 +24,5 @@ index 5951c7bf2c24..648574d48ff1 100644
  		}
  		ptr += entry->size;
 -- 
-2.27.0
+2.32.0
 

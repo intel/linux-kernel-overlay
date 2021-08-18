@@ -1,7 +1,7 @@
-From fde5d8c16e8e9bfa01f6cc4734522cf88e016507 Mon Sep 17 00:00:00 2001
+From a78ac93961c3ce4415711d3aa6561ccee18ecc91 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 16:02:33 +0800
-Subject: [PATCH 01/15] tcc: parse PTCT table and record pesudo sram ranges
+Subject: [PATCH 01/16] tcc: parse PTCT table and record pesudo sram ranges
 
 ACPI may include PTCT table. If PTCT is included, this table need to be parsed
 and records all pesudo SRAM ranges indicated in the table. These pesudo SRAM
@@ -201,5 +201,5 @@ index 2069ac38a4e2..76f6657252ff 100644
   *
   * RASF - RAS Feature Table (ACPI 5.0)
 -- 
-2.27.0
+2.32.0
 

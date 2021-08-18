@@ -1,7 +1,7 @@
-From 9ce3a427219466cc19b67389efba7dcf1d530e14 Mon Sep 17 00:00:00 2001
+From 23c2c9fc9af4131e7afc55b22e6be157aad3b972 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 8 Jun 2020 00:40:45 +0800
-Subject: [PATCH 03/15] tcc: update license header
+Subject: [PATCH 03/16] tcc: update license header
 
 Fix error/warning in static analyze tool checking.
 Update license header to be dual license.
@@ -150,5 +150,5 @@ index 4d4e0557dddc..cd4a83f6e7e0 100644
  	p_memslot->minor = UNDEFINED_DEVNODE;
  	vaddr = memremap(p_memslot->paddr, p_memslot->size, MEMREMAP_WB);
 -- 
-2.27.0
+2.32.0
 

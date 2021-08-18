@@ -1,0 +1,153 @@
+From 7d99f56782cee44a0ea7ae659ac8443ae59a9f76 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Tue, 10 Aug 2021 07:41:45 -0700
+Subject: [PATCH 6/6] sched/fair: Consider SMT in ASYM_PACKING load balance
+
+When deciding to pull tasks in ASYM_PACKING, it is necessary not only to
+check for the idle state of the destination CPU, dst_cpu, but also of
+its SMT siblings.
+
+If dst_cpu is idle but its SMT siblings are busy, performance suffers
+if it pulls tasks from a medium priority CPU that does not have SMT
+siblings.
+
+Implement asym_smt_can_pull_tasks() to inspect the state of the SMT
+siblings of both dst_cpu and the CPUs in the candidate busiest group.
+
+Cc: Aubrey Li <aubrey.li@intel.com>
+Cc: Ben Segall <bsegall@google.com>
+Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Quentin Perret <qperret@google.com>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Reviewed-by: Len Brown <len.brown@intel.com>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/fair.c | 95 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 9e1157d4b2b3..128375efcfcf 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8531,10 +8531,99 @@ group_type group_classify(unsigned int imbalance_pct,
+ 	return group_has_spare;
+ }
+ 
++/**
++ * asym_smt_can_pull_tasks - Check whether the load balancing CPU can pull tasks
++ * @dst_cpu:	Destination CPU of the load balancing
++ * @sds:	Load-balancing data with statistics of the local group
++ * @sgs:	Load-balancing statistics of the candidate busiest group
++ * @sg:		The candidate busiet group
++ *
++ * Check the state of the SMT siblings of both @sds::local and @sg and decide
++ * if @dst_cpu can pull tasks. If @dst_cpu does not have SMT siblings, it can
++ * pull tasks if two or more of the SMT siblings of @sg are busy. If only one
++ * CPU in @sg is busy, pull tasks only if @dst_cpu has higher priority.
++ *
++ * If both @dst_cpu and @sg have SMT siblings, even the number of idle CPUs
++ * between @sds::local and @sg. Thus, pull tasks from @sg if the difference
++ * between the number of busy CPUs is 2 or more. If the difference is of 1,
++ * only pull if @dst_cpu has higher priority. If @sg does not have SMT siblings
++ * only pull tasks if all of the SMT siblings of @dst_cpu are idle and @sg
++ * has lower priority.
++ */
++static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
++				    struct sg_lb_stats *sgs,
++				    struct sched_group *sg)
++{
++#ifdef CONFIG_SCHED_SMT
++	bool local_is_smt, sg_is_smt;
++	int sg_busy_cpus;
++
++	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
++	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
++
++	sg_busy_cpus = sgs->group_weight - sgs->idle_cpus;
++
++	if (!local_is_smt) {
++		/*
++		 * If we are here, @dst_cpu is idle and does not have SMT
++		 * siblings. Pull tasks if candidate group has two or more
++		 * busy CPUs.
++		 */
++		if (sg_is_smt && sg_busy_cpus >= 2)
++			return true;
++
++		/*
++		 * @dst_cpu does not have SMT siblings. @sg may have SMT
++		 * siblings and only one is busy. In such case, @dst_cpu
++		 * can help if it has higher priority and is idle.
++		 */
++		return !sds->local_stat.group_util &&
++		       sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++	}
++
++	/* @dst_cpu has SMT siblings. */
++
++	if (sg_is_smt) {
++		int local_busy_cpus = sds->local->group_weight -
++				      sds->local_stat.idle_cpus;
++		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
++
++		/* Local can always help to even the number busy CPUs. */
++		if (busy_cpus_delta >= 2)
++			return true;
++
++		if (busy_cpus_delta == 1)
++			return sched_asym_prefer(dst_cpu,
++						 sg->asym_prefer_cpu);
++
++		return false;
++	}
++
++	/*
++	 * @sg does not have SMT siblings. Ensure that @sds::local does not end
++	 * up with more than one busy SMT sibling and only pull tasks if there
++	 * are not busy CPUs. As CPUs move in and out of idle state frequently,
++	 * also check the group utilization to smoother the decision.
++	 */
++	if (!sds->local_stat.group_util)
++		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++
++	return false;
++#else
++	/* Always return false so that callers deal with non-SMT cases. */
++	return false;
++#endif
++}
++
+ static inline bool
+ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs,
+ 	   struct sched_group *group)
+ {
++	/* Only do SMT checks if either local or candidate have SMT siblings */
++	if ((sds->local->flags & SD_SHARE_CPUCAPACITY) ||
++	    (group->flags & SD_SHARE_CPUCAPACITY))
++		return asym_smt_can_pull_tasks(env->dst_cpu, sds, sgs, group);
++
+ 	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
+ }
+ 
+@@ -9540,6 +9629,12 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		    nr_running == 1)
+ 			continue;
+ 
++		/* Make sure we only pull tasks from a CPU of lower priority */
++		if ((env->sd->flags & SD_ASYM_PACKING) &&
++		    sched_asym_prefer(i, env->dst_cpu) &&
++		    nr_running == 1)
++			continue;
++
+ 		switch (env->migration_type) {
+ 		case migrate_load:
+ 			/*
+-- 
+2.32.0
+
