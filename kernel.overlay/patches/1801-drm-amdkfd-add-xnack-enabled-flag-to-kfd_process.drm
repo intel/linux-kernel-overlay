@@ -1,0 +1,146 @@
+From 40076882031d2b346c46b05b7671164c05501c95 Mon Sep 17 00:00:00 2001
+From: Alex Sierra <alex.sierra@amd.com>
+Date: Thu, 28 May 2020 18:03:15 -0500
+Subject: [PATCH 1801/2740] drm/amdkfd: add xnack enabled flag to kfd_process
+
+XNACK mode controls the SQ RETRY_DISABLE setting that determines,
+whether recoverable page faults can be supported on GFXv9 hardware.
+Only on Aldebaran we can support different processes running with
+different XNACK modes. On older chips all processes must use the same
+RETRY_DISABLE setting. However, processes not relying on recoverable
+page faults can work with RETRY enabled. This means XNACK off is always
+available as a fallback so we can use the same mode on all GPUs in a
+process.
+
+Signed-off-by: Alex Sierra <alex.sierra@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../amd/amdkfd/kfd_device_queue_manager_v9.c  | 13 ++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h         |  4 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c      | 53 +++++++++++++++++++
+ 3 files changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v9.c
+index eca6331efa94..b5c3d13643f1 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v9.c
+@@ -61,10 +61,19 @@ static int update_qpd_v9(struct device_queue_manager *dqm,
+ 		qpd->sh_mem_config =
+ 				SH_MEM_ALIGNMENT_MODE_UNALIGNED <<
+ 					SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT;
+-		if (dqm->dev->noretry &&
+-		    !dqm->dev->use_iommu_v2)
++
++		if (dqm->dev->device_info->asic_family == CHIP_ALDEBARAN) {
++			/* Aldebaran can safely support different XNACK modes
++			 * per process
++			 */
++			if (!pdd->process->xnack_enabled)
++				qpd->sh_mem_config |=
++					1 << SH_MEM_CONFIG__RETRY_DISABLE__SHIFT;
++		} else if (dqm->dev->noretry &&
++			   !dqm->dev->use_iommu_v2) {
+ 			qpd->sh_mem_config |=
+ 				1 << SH_MEM_CONFIG__RETRY_DISABLE__SHIFT;
++		}
+ 
+ 		qpd->sh_mem_ape1_limit = 0;
+ 		qpd->sh_mem_ape1_base = 0;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 81f71c4079a6..59423c886930 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -824,6 +824,8 @@ struct kfd_process {
+ 	/* shared virtual memory registered by this process */
+ 	struct svm_range_list svms;
+ 	bool svm_disabled;
++
++	bool xnack_enabled;
+ };
+ 
+ #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
+@@ -883,6 +885,8 @@ struct kfd_process_device *kfd_get_process_device_data(struct kfd_dev *dev,
+ struct kfd_process_device *kfd_create_process_device_data(struct kfd_dev *dev,
+ 							struct kfd_process *p);
+ 
++bool kfd_process_xnack_mode(struct kfd_process *p, bool supported);
++
+ int kfd_reserved_mem_mmap(struct kfd_dev *dev, struct kfd_process *process,
+ 			  struct vm_area_struct *vma);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 3c72e9dc6422..b8db509e2bbd 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1193,6 +1193,56 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
+ 	}
+ }
+ 
++bool kfd_process_xnack_mode(struct kfd_process *p, bool supported)
++{
++	int i;
++
++	/* On most GFXv9 GPUs, the retry mode in the SQ must match the
++	 * boot time retry setting. Mixing processes with different
++	 * XNACK/retry settings can hang the GPU.
++	 *
++	 * Different GPUs can have different noretry settings depending
++	 * on HW bugs or limitations. We need to find at least one
++	 * XNACK mode for this process that's compatible with all GPUs.
++	 * Fortunately GPUs with retry enabled (noretry=0) can run code
++	 * built for XNACK-off. On GFXv9 it may perform slower.
++	 *
++	 * Therefore applications built for XNACK-off can always be
++	 * supported and will be our fallback if any GPU does not
++	 * support retry.
++	 */
++	for (i = 0; i < p->n_pdds; i++) {
++		struct kfd_dev *dev = p->pdds[i]->dev;
++
++		/* Only consider GFXv9 and higher GPUs. Older GPUs don't
++		 * support the SVM APIs and don't need to be considered
++		 * for the XNACK mode selection.
++		 */
++		if (dev->device_info->asic_family < CHIP_VEGA10)
++			continue;
++		/* Aldebaran can always support XNACK because it can support
++		 * per-process XNACK mode selection. But let the dev->noretry
++		 * setting still influence the default XNACK mode.
++		 */
++		if (supported &&
++		    dev->device_info->asic_family == CHIP_ALDEBARAN)
++			continue;
++
++		/* GFXv10 and later GPUs do not support shader preemption
++		 * during page faults. This can lead to poor QoS for queue
++		 * management and memory-manager-related preemptions or
++		 * even deadlocks.
++		 */
++		if (dev->device_info->asic_family >= CHIP_NAVI10)
++			return false;
++
++		if (dev->noretry)
++			return false;
++	}
++
++	return true;
++}
++
+ /*
+  * On return the kfd_process is fully operational and will be freed when the
+  * mm is released
+@@ -1232,6 +1282,9 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	if (err != 0)
+ 		goto err_init_apertures;
+ 
++	/* Check XNACK support after PDDs are created in kfd_init_apertures */
++	process->xnack_enabled = kfd_process_xnack_mode(process, false);
++
+ 	err = svm_range_list_init(process);
+ 	if (err)
+ 		goto err_init_svm_range_list;
+-- 
+2.25.1
+

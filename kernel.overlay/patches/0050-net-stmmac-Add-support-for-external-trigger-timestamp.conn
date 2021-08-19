@@ -1,0 +1,296 @@
+From acfbfe3d5972f9bbfb1625d0e533d0939468fcb2 Mon Sep 17 00:00:00 2001
+From: Tan Tee Min <tee.min.tan@intel.com>
+Date: Wed, 14 Apr 2021 08:16:17 +0800
+Subject: [PATCH 50/60] net: stmmac: Add support for external trigger
+ timestamping
+
+The Synopsis MAC controller supports auxiliary snapshot feature that
+allows user to store a snapshot of the system time based on an external
+event.
+
+This patch add supports to the above mentioned feature. Users will be
+able to triggered capturing the time snapshot from user-space using
+application such as testptp or any other applications that uses the
+PTP_EXTTS_REQUEST ioctl request.
+
+Cc: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: Tan Tee Min <tee.min.tan@intel.com>
+Co-developed-by: Wong Vee Khee <vee.khee.wong@linux.intel.com>
+Signed-off-by: Wong Vee Khee <vee.khee.wong@linux.intel.com>
+Acked-by: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ .../net/ethernet/stmicro/stmmac/dwmac-intel.c | 10 +++++
+ drivers/net/ethernet/stmicro/stmmac/hwif.h    |  5 +++
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  3 ++
+ .../ethernet/stmicro/stmmac/stmmac_hwtstamp.c | 39 ++++++++++++++++++
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c |  2 +
+ .../net/ethernet/stmicro/stmmac/stmmac_ptp.c  | 40 ++++++++++++++++++-
+ .../net/ethernet/stmicro/stmmac/stmmac_ptp.h  |  1 +
+ include/linux/stmmac.h                        |  2 +
+ 8 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+index 60566598d644..ec140fc4a0f5 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+@@ -296,6 +296,13 @@ static int intel_crosststamp(ktime_t *device,
+ 
+ 	intel_priv = priv->plat->bsp_priv;
+ 
++	/* Both internal crosstimestamping and external triggered event
++	 * timestamping cannot be run concurrently.
++	 */
++	if (priv->plat->ext_snapshot_en)
++		return -EBUSY;
++
++	mutex_lock(&priv->aux_ts_lock);
+ 	/* Enable Internal snapshot trigger */
+ 	acr_value = readl(ptpaddr + PTP_ACR);
+ 	acr_value &= ~PTP_ACR_MASK;
+@@ -321,6 +328,8 @@ static int intel_crosststamp(ktime_t *device,
+ 	acr_value = readl(ptpaddr + PTP_ACR);
+ 	acr_value |= PTP_ACR_ATSFC;
+ 	writel(acr_value, ptpaddr + PTP_ACR);
++	/* Release the mutex */
++	mutex_unlock(&priv->aux_ts_lock);
+ 
+ 	/* Trigger Internal snapshot signal
+ 	 * Create a rising edge by just toggle the GPO1 to low
+@@ -520,6 +529,7 @@ static int intel_mgbe_common_data(struct pci_dev *pdev,
+ 	plat->mdio_bus_data->phy_mask |= 1 << INTEL_MGBE_XPCS_ADDR;
+ 
+ 	plat->int_snapshot_num = AUX_SNAPSHOT1;
++	plat->ext_snapshot_num = AUX_SNAPSHOT0;
+ 
+ 	plat->has_crossts = true;
+ 	plat->crosststamp = intel_crosststamp;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index 2b5022ef1e52..2cc91759b91f 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -504,6 +504,8 @@ struct stmmac_ops {
+ #define stmmac_fpe_irq_status(__priv, __args...) \
+ 	stmmac_do_callback(__priv, mac, fpe_irq_status, __args)
+ 
++struct stmmac_priv;
++
+ /* PTP and HW Timer helpers */
+ struct stmmac_hwtimestamp {
+ 	void (*config_hw_tstamping) (void __iomem *ioaddr, u32 data);
+@@ -515,6 +517,7 @@ struct stmmac_hwtimestamp {
+ 			       int add_sub, int gmac4);
+ 	void (*get_systime) (void __iomem *ioaddr, u64 *systime);
+ 	void (*get_ptptime)(void __iomem *ioaddr, u64 *ptp_time);
++	void (*timestamp_interrupt)(struct stmmac_priv *priv);
+ };
+ 
+ #define stmmac_config_hw_tstamping(__priv, __args...) \
+@@ -531,6 +534,8 @@ struct stmmac_hwtimestamp {
+ 	stmmac_do_void_callback(__priv, ptp, get_systime, __args)
+ #define stmmac_get_ptptime(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, ptp, get_ptptime, __args)
++#define stmmac_timestamp_interrupt(__priv, __args...) \
++	stmmac_do_void_callback(__priv, ptp, timestamp_interrupt, __args)
+ 
+ /* Helpers to manage the descriptors for chain and ring modes */
+ struct stmmac_mode_ops {
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index 3d9ceb6234eb..dbf93835943e 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -250,6 +250,9 @@ struct stmmac_priv {
+ 	int use_riwt;
+ 	int irq_wake;
+ 	spinlock_t ptp_lock;
++	/* Protects auxiliary snapshot registers from concurrent access. */
++	struct mutex aux_ts_lock;
++
+ 	void __iomem *mmcaddr;
+ 	void __iomem *ptpaddr;
+ 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+index 113c51bcc0b5..074e2cdfb0fa 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+@@ -12,8 +12,11 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/delay.h>
++#include <linux/ptp_clock_kernel.h>
+ #include "common.h"
+ #include "stmmac_ptp.h"
++#include "dwmac4.h"
++#include "stmmac.h"
+ 
+ static void config_hw_tstamping(void __iomem *ioaddr, u32 data)
+ {
+@@ -163,6 +166,41 @@ static void get_ptptime(void __iomem *ptpaddr, u64 *ptp_time)
+ 	*ptp_time = ns;
+ }
+ 
++static void timestamp_interrupt(struct stmmac_priv *priv)
++{
++	u32 num_snapshot, ts_status, tsync_int;
++	struct ptp_clock_event event;
++	unsigned long flags;
++	u64 ptp_time;
++	int i;
++
++	tsync_int = readl(priv->ioaddr + GMAC_INT_STATUS) & GMAC_INT_TSIE;
++
++	if (!tsync_int)
++		return;
++
++	/* Read timestamp status to clear interrupt from either external
++	 * timestamp or start/end of PPS.
++	 */
++	ts_status = readl(priv->ioaddr + GMAC_TIMESTAMP_STATUS);
++
++	if (!priv->plat->ext_snapshot_en)
++		return;
++
++	num_snapshot = (ts_status & GMAC_TIMESTAMP_ATSNS_MASK) >>
++		       GMAC_TIMESTAMP_ATSNS_SHIFT;
++
++	for (i = 0; i < num_snapshot; i++) {
++		spin_lock_irqsave(&priv->ptp_lock, flags);
++		get_ptptime(priv->ptpaddr, &ptp_time);
++		spin_unlock_irqrestore(&priv->ptp_lock, flags);
++		event.type = PTP_CLOCK_EXTTS;
++		event.index = 0;
++		event.timestamp = ptp_time;
++		ptp_clock_event(priv->ptp_clock, &event);
++	}
++}
++
+ const struct stmmac_hwtimestamp stmmac_ptp = {
+ 	.config_hw_tstamping = config_hw_tstamping,
+ 	.init_systime = init_systime,
+@@ -171,4 +209,5 @@ const struct stmmac_hwtimestamp stmmac_ptp = {
+ 	.adjust_systime = adjust_systime,
+ 	.get_systime = get_systime,
+ 	.get_ptptime = get_ptptime,
++	.timestamp_interrupt = timestamp_interrupt,
+ };
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 81086584c76b..1846829b2b5d 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5673,6 +5673,8 @@ static void stmmac_common_interrupt(struct stmmac_priv *priv)
+ 			else
+ 				netif_carrier_off(priv->dev);
+ 		}
++
++		stmmac_timestamp_interrupt(priv, priv);
+ 	}
+ }
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+index b164ae22e35f..4e86cdf2bc9f 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+@@ -135,7 +135,10 @@ static int stmmac_enable(struct ptp_clock_info *ptp,
+ {
+ 	struct stmmac_priv *priv =
+ 	    container_of(ptp, struct stmmac_priv, ptp_clock_ops);
++	void __iomem *ptpaddr = priv->ptpaddr;
++	void __iomem *ioaddr = priv->hw->pcsr;
+ 	struct stmmac_pps_cfg *cfg;
++	u32 intr_value, acr_value;
+ 	int ret = -EOPNOTSUPP;
+ 	unsigned long flags;
+ 
+@@ -159,6 +162,37 @@ static int stmmac_enable(struct ptp_clock_info *ptp,
+ 					     priv->systime_flags);
+ 		spin_unlock_irqrestore(&priv->ptp_lock, flags);
+ 		break;
++	case PTP_CLK_REQ_EXTTS:
++		priv->plat->ext_snapshot_en = on;
++		mutex_lock(&priv->aux_ts_lock);
++		acr_value = readl(ptpaddr + PTP_ACR);
++		acr_value &= ~PTP_ACR_MASK;
++		if (on) {
++			/* Enable External snapshot trigger */
++			acr_value |= priv->plat->ext_snapshot_num;
++			acr_value |= PTP_ACR_ATSFC;
++			netdev_dbg(priv->dev, "Auxiliary Snapshot %d enabled.\n",
++				   priv->plat->ext_snapshot_num >>
++				   PTP_ACR_ATSEN_SHIFT);
++			/* Enable Timestamp Interrupt */
++			intr_value = readl(ioaddr + GMAC_INT_EN);
++			intr_value |= GMAC_INT_TSIE;
++			writel(intr_value, ioaddr + GMAC_INT_EN);
++
++		} else {
++			netdev_dbg(priv->dev, "Auxiliary Snapshot %d disabled.\n",
++				   priv->plat->ext_snapshot_num >>
++				   PTP_ACR_ATSEN_SHIFT);
++			/* Disable Timestamp Interrupt */
++			intr_value = readl(ioaddr + GMAC_INT_EN);
++			intr_value &= ~GMAC_INT_TSIE;
++			writel(intr_value, ioaddr + GMAC_INT_EN);
++		}
++		writel(acr_value, ptpaddr + PTP_ACR);
++		mutex_unlock(&priv->aux_ts_lock);
++		ret = 0;
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -202,7 +236,7 @@ static struct ptp_clock_info stmmac_ptp_clock_ops = {
+ 	.name = "stmmac ptp",
+ 	.max_adj = 62500000,
+ 	.n_alarm = 0,
+-	.n_ext_ts = 0,
++	.n_ext_ts = 0, /* will be overwritten in stmmac_ptp_register */
+ 	.n_per_out = 0, /* will be overwritten in stmmac_ptp_register */
+ 	.n_pins = 0,
+ 	.pps = 0,
+@@ -237,8 +271,10 @@ void stmmac_ptp_register(struct stmmac_priv *priv)
+ 		stmmac_ptp_clock_ops.max_adj = priv->plat->ptp_max_adj;
+ 
+ 	stmmac_ptp_clock_ops.n_per_out = priv->dma_cap.pps_out_num;
++	stmmac_ptp_clock_ops.n_ext_ts = priv->dma_cap.aux_snapshot_n;
+ 
+ 	spin_lock_init(&priv->ptp_lock);
++	mutex_init(&priv->aux_ts_lock);
+ 	priv->ptp_clock_ops = stmmac_ptp_clock_ops;
+ 
+ 	priv->ptp_clock = ptp_clock_register(&priv->ptp_clock_ops,
+@@ -264,4 +300,6 @@ void stmmac_ptp_unregister(struct stmmac_priv *priv)
+ 		pr_debug("Removed PTP HW clock successfully on %s\n",
+ 			 priv->dev->name);
+ 	}
++
++	mutex_destroy(&priv->aux_ts_lock);
+ }
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.h b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.h
+index f88727ce4d30..53172a439810 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.h
+@@ -73,6 +73,7 @@
+ #define	PTP_ACR_ATSEN1		BIT(5)	/* Auxiliary Snapshot 1 Enable */
+ #define	PTP_ACR_ATSEN2		BIT(6)	/* Auxiliary Snapshot 2 Enable */
+ #define	PTP_ACR_ATSEN3		BIT(7)	/* Auxiliary Snapshot 3 Enable */
++#define	PTP_ACR_ATSEN_SHIFT	5	/* Auxiliary Snapshot shift */
+ #define	PTP_ACR_MASK		GENMASK(7, 4)	/* Aux Snapshot Mask */
+ #define	PMC_ART_VALUE0		0x01	/* PMC_ART[15:0] timer value */
+ #define	PMC_ART_VALUE1		0x02	/* PMC_ART[31:16] timer value */
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index e338ef7abc00..97edb31d6310 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -238,6 +238,8 @@ struct plat_stmmacenet_data {
+ 	struct pci_dev *pdev;
+ 	bool has_crossts;
+ 	int int_snapshot_num;
++	int ext_snapshot_num;
++	bool ext_snapshot_en;
+ 	bool multi_msi_en;
+ 	int msi_mac_vec;
+ 	int msi_wol_vec;
+-- 
+2.25.1
+

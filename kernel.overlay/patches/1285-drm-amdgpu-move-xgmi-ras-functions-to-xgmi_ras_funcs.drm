@@ -1,0 +1,213 @@
+From ffcecb88da826856887113d7aab804a69fe3437f Mon Sep 17 00:00:00 2001
+From: Hawking Zhang <Hawking.Zhang@amd.com>
+Date: Thu, 18 Mar 2021 20:18:19 +0800
+Subject: [PATCH 1285/2740] drm/amdgpu: move xgmi ras functions to
+ xgmi_ras_funcs
+
+xgmi ras is not managed by gpu driver when gpu is
+connected to cpu through xgmi. move all xgmi ras
+functions to xgmi_ras_funcs so gpu driver only
+initializes xgmi ras functions when it manages
+xgmi ras.
+
+Signed-off-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Dennis Li <Dennis.Li@amd.com>
+Reviewed-by: John Clements <John.Clements@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c  | 16 ++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h  |  9 +++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c  |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c | 21 ++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h |  7 +------
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    |  2 +-
+ 6 files changed, 42 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index b9d68fd2610c..082f9d03a94a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -403,14 +403,26 @@ int amdgpu_gmc_ras_late_init(struct amdgpu_device *adev)
+ 			return r;
+ 	}
+ 
+-	return amdgpu_xgmi_ras_late_init(adev);
++	if (!adev->gmc.xgmi.connected_to_cpu)
++		adev->gmc.xgmi.ras_funcs = &xgmi_ras_funcs;
++
++	if (adev->gmc.xgmi.ras_funcs &&
++	    adev->gmc.xgmi.ras_funcs->ras_late_init) {
++		r = adev->gmc.xgmi.ras_funcs->ras_late_init(adev);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ void amdgpu_gmc_ras_fini(struct amdgpu_device *adev)
+ {
+ 	amdgpu_umc_ras_fini(adev);
+ 	amdgpu_mmhub_ras_fini(adev);
+-	amdgpu_xgmi_ras_fini(adev);
++	if (adev->gmc.xgmi.ras_funcs &&
++	    adev->gmc.xgmi.ras_funcs->ras_fini)
++		adev->gmc.xgmi.ras_funcs->ras_fini(adev);
+ }
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 7e248a4e2fa3..cbb7735c6988 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -135,6 +135,14 @@ struct amdgpu_gmc_funcs {
+ 	unsigned int (*get_vbios_fb_size)(struct amdgpu_device *adev);
+ };
+ 
++struct amdgpu_xgmi_ras_funcs {
++	int (*ras_late_init)(struct amdgpu_device *adev);
++	void (*ras_fini)(struct amdgpu_device *adev);
++	int (*query_ras_error_count)(struct amdgpu_device *adev,
++				     void *ras_error_status);
++	void (*reset_ras_error_count)(struct amdgpu_device *adev);
++};
++
+ struct amdgpu_xgmi {
+ 	/* from psp */
+ 	u64 node_id;
+@@ -151,6 +159,7 @@ struct amdgpu_xgmi {
+ 	struct ras_common_if *ras_if;
+ 	bool connected_to_cpu;
+ 	bool pending_reset;
++	const struct amdgpu_xgmi_ras_funcs *ras_funcs;
+ };
+ 
+ struct amdgpu_gmc {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index ac3f4c3266bc..172738cc99db 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -809,7 +809,9 @@ int amdgpu_ras_query_error_status(struct amdgpu_device *adev,
+ 			adev->nbio.ras_funcs->query_ras_error_count(adev, &err_data);
+ 		break;
+ 	case AMDGPU_RAS_BLOCK__XGMI_WAFL:
+-		amdgpu_xgmi_query_ras_error_count(adev, &err_data);
++		if (adev->gmc.xgmi.ras_funcs &&
++		    adev->gmc.xgmi.ras_funcs->query_ras_error_count)
++			adev->gmc.xgmi.ras_funcs->query_ras_error_count(adev, &err_data);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+index 5a1b598f4d30..8567d5d77346 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+@@ -628,7 +628,7 @@ int amdgpu_xgmi_remove_device(struct amdgpu_device *adev)
+ 	return psp_xgmi_terminate(&adev->psp);
+ }
+ 
+-int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev)
++static int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 	struct ras_ih_if ih_info = {
+@@ -642,7 +642,7 @@ int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev)
+ 	    adev->gmc.xgmi.num_physical_nodes == 0)
+ 		return 0;
+ 
+-	amdgpu_xgmi_reset_ras_error_count(adev);
++	adev->gmc.xgmi.ras_funcs->reset_ras_error_count(adev);
+ 
+ 	if (!adev->gmc.xgmi.ras_if) {
+ 		adev->gmc.xgmi.ras_if = kmalloc(sizeof(struct ras_common_if), GFP_KERNEL);
+@@ -664,7 +664,7 @@ int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev)
+ 	return r;
+ }
+ 
+-void amdgpu_xgmi_ras_fini(struct amdgpu_device *adev)
++static void amdgpu_xgmi_ras_fini(struct amdgpu_device *adev)
+ {
+ 	if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__XGMI_WAFL) &&
+ 			adev->gmc.xgmi.ras_if) {
+@@ -691,7 +691,7 @@ static void pcs_clear_status(struct amdgpu_device *adev, uint32_t pcs_status_reg
+ 	WREG32_PCIE(pcs_status_reg, 0);
+ }
+ 
+-void amdgpu_xgmi_reset_ras_error_count(struct amdgpu_device *adev)
++static void amdgpu_xgmi_reset_ras_error_count(struct amdgpu_device *adev)
+ {
+ 	uint32_t i;
+ 
+@@ -751,8 +751,8 @@ static int amdgpu_xgmi_query_pcs_error_status(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
+-int amdgpu_xgmi_query_ras_error_count(struct amdgpu_device *adev,
+-				      void *ras_error_status)
++static int amdgpu_xgmi_query_ras_error_count(struct amdgpu_device *adev,
++					     void *ras_error_status)
+ {
+ 	struct ras_err_data *err_data = (struct ras_err_data *)ras_error_status;
+ 	int i;
+@@ -801,10 +801,17 @@ int amdgpu_xgmi_query_ras_error_count(struct amdgpu_device *adev,
+ 		break;
+ 	}
+ 
+-	amdgpu_xgmi_reset_ras_error_count(adev);
++	adev->gmc.xgmi.ras_funcs->reset_ras_error_count(adev);
+ 
+ 	err_data->ue_count += ue_cnt;
+ 	err_data->ce_count += ce_cnt;
+ 
+ 	return 0;
+ }
++
++const struct amdgpu_xgmi_ras_funcs xgmi_ras_funcs = {
++	.ras_late_init = amdgpu_xgmi_ras_late_init,
++	.ras_fini = amdgpu_xgmi_ras_fini,
++	.query_ras_error_count = amdgpu_xgmi_query_ras_error_count,
++	.reset_ras_error_count = amdgpu_xgmi_reset_ras_error_count,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+index 148560d63554..12969c0830d5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+@@ -50,6 +50,7 @@ struct amdgpu_pcs_ras_field {
+ 	uint32_t pcs_err_shift;
+ };
+ 
++extern const struct amdgpu_xgmi_ras_funcs xgmi_ras_funcs;
+ struct amdgpu_hive_info *amdgpu_get_xgmi_hive(struct amdgpu_device *adev);
+ void amdgpu_put_xgmi_hive(struct amdgpu_hive_info *hive);
+ int amdgpu_xgmi_update_topology(struct amdgpu_hive_info *hive, struct amdgpu_device *adev);
+@@ -58,14 +59,8 @@ int amdgpu_xgmi_remove_device(struct amdgpu_device *adev);
+ int amdgpu_xgmi_set_pstate(struct amdgpu_device *adev, int pstate);
+ int amdgpu_xgmi_get_hops_count(struct amdgpu_device *adev,
+ 		struct amdgpu_device *peer_adev);
+-int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev);
+-void amdgpu_xgmi_ras_fini(struct amdgpu_device *adev);
+ uint64_t amdgpu_xgmi_get_relative_phy_addr(struct amdgpu_device *adev,
+ 					   uint64_t addr);
+-int amdgpu_xgmi_query_ras_error_count(struct amdgpu_device *adev,
+-				      void *ras_error_status);
+-void amdgpu_xgmi_reset_ras_error_count(struct amdgpu_device *adev);
+-
+ static inline bool amdgpu_xgmi_same_hive(struct amdgpu_device *adev,
+ 		struct amdgpu_device *bo_adev)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 468acc06b681..6d784c6098bd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -1208,7 +1208,7 @@ static int gmc_v9_0_early_init(void *handle)
+ 		adev->gmc.xgmi.supported = true;
+ 		adev->gmc.xgmi.connected_to_cpu =
+ 			adev->smuio.funcs->is_host_gpu_xgmi_supported(adev);
+-        }
++	}
+ 
+ 	adev->gmc.shared_aperture_start = 0x2000000000000000ULL;
+ 	adev->gmc.shared_aperture_end =
+-- 
+2.25.1
+

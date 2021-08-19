@@ -1,0 +1,253 @@
+From c50116b17ac240d27f1bec8d435080370dace55e Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 25 Mar 2021 23:48:01 +0200
+Subject: [PATCH 1066/2740] drm/i915: Simplify copying the FB view state to the
+ plane state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of copying separately the GTT remapped and color plane view info
+from the FB to the plane state, do this by copying the whole
+intel_fb_view struct. For this we make sure the FB view state is fully
+inited (that is also including the view type) already during FB
+creation, so this init is not required during atomic check time. This
+also means the we don't need to reset the unused color plane info during
+atomic check, as these are already reset during FB creation.
+
+I noticed that initial FBs will only work atm if they are page aligned
+(which BIOS most probably always ensures), but add a comment to sanitize
+this part once. Also we won't disable the plane if
+get_initial_plane_config() failed for some reason (for instance due to
+unsupported rotation), add a TODO: comment for this too.
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210325214808.2071517-19-imre.deak@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  | 11 ++--
+ drivers/gpu/drm/i915/display/intel_fb.c       | 59 ++++++++-----------
+ drivers/gpu/drm/i915/display/intel_fb.h       | 10 ++--
+ .../drm/i915/display/skl_universal_plane.c    |  8 +--
+ 4 files changed, 35 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 06657e3b4b20..374bdd233db0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1629,6 +1629,11 @@ intel_find_initial_plane_obj(struct intel_crtc *intel_crtc,
+ 	struct drm_framebuffer *fb;
+ 	struct i915_vma *vma;
+ 
++	/*
++	 * TODO:
++	 *   Disable planes if get_initial_plane_config() failed.
++	 *   Make sure things work if the surface base is not page aligned.
++	 */
+ 	if (!plane_config->fb)
+ 		return;
+ 
+@@ -1680,10 +1685,8 @@ intel_find_initial_plane_obj(struct intel_crtc *intel_crtc,
+ 
+ valid_fb:
+ 	plane_state->rotation = plane_config->rotation;
+-	intel_fill_fb_ggtt_view(&intel_state->view.gtt, fb,
+-				plane_state->rotation);
+-	intel_state->view.color_plane[0].stride =
+-		intel_fb_pitch(fb, 0, plane_state->rotation);
++	intel_fb_fill_view(to_intel_framebuffer(fb), plane_state->rotation,
++			   &intel_state->view);
+ 
+ 	__i915_vma_pin(vma);
+ 	intel_state->vma = i915_vma_get(vma);
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.c b/drivers/gpu/drm/i915/display/intel_fb.c
+index a31934b3b293..576fbcafae12 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@ -484,10 +484,8 @@ static bool intel_plane_can_remap(const struct intel_plane_state *plane_state)
+ 	return true;
+ }
+ 
+-int intel_fb_pitch(const struct drm_framebuffer *drm_fb, int color_plane, unsigned int rotation)
++static int intel_fb_pitch(const struct intel_framebuffer *fb, int color_plane, unsigned int rotation)
+ {
+-	struct intel_framebuffer *fb = to_intel_framebuffer(drm_fb);
+-
+ 	if (drm_rotation_90_or_270(rotation))
+ 		return fb->rotated_view.color_plane[color_plane].stride;
+ 	else
+@@ -497,7 +495,7 @@ int intel_fb_pitch(const struct drm_framebuffer *drm_fb, int color_plane, unsign
+ static bool intel_plane_needs_remap(const struct intel_plane_state *plane_state)
+ {
+ 	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+-	const struct drm_framebuffer *fb = plane_state->hw.fb;
++	const struct intel_framebuffer *fb = to_intel_framebuffer(plane_state->hw.fb);
+ 	unsigned int rotation = plane_state->hw.rotation;
+ 	u32 stride, max_stride;
+ 
+@@ -516,8 +514,8 @@ static bool intel_plane_needs_remap(const struct intel_plane_state *plane_state)
+ 	 * unclear in Bspec, for now no checking.
+ 	 */
+ 	stride = intel_fb_pitch(fb, 0, rotation);
+-	max_stride = plane->max_stride(plane, fb->format->format,
+-				       fb->modifier, rotation);
++	max_stride = plane->max_stride(plane, fb->base.format->format,
++				       fb->base.modifier, rotation);
+ 
+ 	return stride > max_stride;
+ }
+@@ -702,6 +700,12 @@ calc_plane_normal_size(const struct intel_framebuffer *fb, int color_plane,
+ 	return tiles;
+ }
+ 
++static void intel_fb_view_init(struct intel_fb_view *view, enum i915_ggtt_view_type view_type)
++{
++	memset(view, 0, sizeof(*view));
++	view->gtt.type = view_type;
++}
++
+ int intel_fill_fb_info(struct drm_i915_private *i915, struct drm_framebuffer *fb)
+ {
+ 	struct intel_framebuffer *intel_fb = to_intel_framebuffer(fb);
+@@ -711,6 +715,9 @@ int intel_fill_fb_info(struct drm_i915_private *i915, struct drm_framebuffer *fb
+ 	int i, num_planes = fb->format->num_planes;
+ 	unsigned int tile_size = intel_tile_size(i915);
+ 
++	intel_fb_view_init(&intel_fb->normal_view, I915_GGTT_VIEW_NORMAL);
++	intel_fb_view_init(&intel_fb->rotated_view, I915_GGTT_VIEW_ROTATED);
++
+ 	for (i = 0; i < num_planes; i++) {
+ 		struct fb_plane_view_dims view_dims;
+ 		unsigned int width, height;
+@@ -796,9 +803,9 @@ static void intel_plane_remap_gtt(struct intel_plane_state *plane_state)
+ 	unsigned int src_w, src_h;
+ 	u32 gtt_offset = 0;
+ 
+-	memset(&plane_state->view.gtt, 0, sizeof(plane_state->view.gtt));
+-	plane_state->view.gtt.type = drm_rotation_90_or_270(rotation) ?
+-		I915_GGTT_VIEW_ROTATED : I915_GGTT_VIEW_REMAPPED;
++	intel_fb_view_init(&plane_state->view,
++			   drm_rotation_90_or_270(rotation) ? I915_GGTT_VIEW_ROTATED :
++							      I915_GGTT_VIEW_REMAPPED);
+ 
+ 	src_x = plane_state->uapi.src.x1 >> 16;
+ 	src_y = plane_state->uapi.src.y1 >> 16;
+@@ -889,17 +896,13 @@ static void intel_plane_remap_gtt(struct intel_plane_state *plane_state)
+ 	}
+ }
+ 
+-void intel_fill_fb_ggtt_view(struct i915_ggtt_view *view,
+-			     const struct drm_framebuffer *fb,
+-			     unsigned int rotation)
++void intel_fb_fill_view(const struct intel_framebuffer *fb, unsigned int rotation,
++			struct intel_fb_view *view)
+ {
+-	memset(view, 0, sizeof(*view));
+-
+-	view->type = I915_GGTT_VIEW_NORMAL;
+-	if (drm_rotation_90_or_270(rotation)) {
+-		view->type = I915_GGTT_VIEW_ROTATED;
+-		view->rotated = to_intel_framebuffer(fb)->rotated_view.gtt.rotated;
+-	}
++	if (drm_rotation_90_or_270(rotation))
++		*view = fb->rotated_view;
++	else
++		*view = fb->normal_view;
+ }
+ 
+ static int intel_plane_check_stride(const struct intel_plane_state *plane_state)
+@@ -939,13 +942,10 @@ int intel_plane_compute_gtt(struct intel_plane_state *plane_state)
+ 	const struct intel_framebuffer *fb =
+ 		to_intel_framebuffer(plane_state->hw.fb);
+ 	unsigned int rotation = plane_state->hw.rotation;
+-	int i, num_planes;
+ 
+ 	if (!fb)
+ 		return 0;
+ 
+-	num_planes = fb->base.format->num_planes;
+-
+ 	if (intel_plane_needs_remap(plane_state)) {
+ 		intel_plane_remap_gtt(plane_state);
+ 
+@@ -958,20 +958,7 @@ int intel_plane_compute_gtt(struct intel_plane_state *plane_state)
+ 		return intel_plane_check_stride(plane_state);
+ 	}
+ 
+-	intel_fill_fb_ggtt_view(&plane_state->view.gtt, &fb->base, rotation);
+-
+-	for (i = 0; i < num_planes; i++) {
+-		plane_state->view.color_plane[i].stride = intel_fb_pitch(&fb->base, i, rotation);
+-		plane_state->view.color_plane[i].offset = 0;
+-
+-		if (drm_rotation_90_or_270(rotation)) {
+-			plane_state->view.color_plane[i].x = fb->rotated_view.color_plane[i].x;
+-			plane_state->view.color_plane[i].y = fb->rotated_view.color_plane[i].y;
+-		} else {
+-			plane_state->view.color_plane[i].x = fb->normal_view.color_plane[i].x;
+-			plane_state->view.color_plane[i].y = fb->normal_view.color_plane[i].y;
+-		}
+-	}
++	intel_fb_fill_view(fb, rotation, &plane_state->view);
+ 
+ 	/* Rotate src coordinates to match rotated GTT view */
+ 	if (drm_rotation_90_or_270(rotation))
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.h b/drivers/gpu/drm/i915/display/intel_fb.h
+index bd1551c694eb..6acf792a8c44 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.h
++++ b/drivers/gpu/drm/i915/display/intel_fb.h
+@@ -12,8 +12,8 @@ struct drm_framebuffer;
+ 
+ struct drm_i915_private;
+ 
+-struct i915_ggtt_view;
+-
++struct intel_fb_view;
++struct intel_framebuffer;
+ struct intel_plane_state;
+ 
+ bool is_ccs_plane(const struct drm_framebuffer *fb, int plane);
+@@ -46,11 +46,9 @@ u32 intel_plane_compute_aligned_offset(int *x, int *y,
+ 				       const struct intel_plane_state *state,
+ 				       int color_plane);
+ 
+-int intel_fb_pitch(const struct drm_framebuffer *fb, int color_plane, unsigned int rotation);
+-
+ int intel_fill_fb_info(struct drm_i915_private *i915, struct drm_framebuffer *fb);
+-void intel_fill_fb_ggtt_view(struct i915_ggtt_view *view, const struct drm_framebuffer *fb,
+-			     unsigned int rotation);
++void intel_fb_fill_view(const struct intel_framebuffer *fb, unsigned int rotation,
++			struct intel_fb_view *view);
+ int intel_plane_compute_gtt(struct intel_plane_state *plane_state);
+ 
+ #endif /* __INTEL_FB_H__ */
+diff --git a/drivers/gpu/drm/i915/display/skl_universal_plane.c b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+index 2e808985d1ac..7ffd7b570b54 100644
+--- a/drivers/gpu/drm/i915/display/skl_universal_plane.c
++++ b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+@@ -1538,7 +1538,7 @@ static int skl_check_ccs_aux_surface(struct intel_plane_state *plane_state)
+ static int skl_check_plane_surface(struct intel_plane_state *plane_state)
+ {
+ 	const struct drm_framebuffer *fb = plane_state->hw.fb;
+-	int ret, i;
++	int ret;
+ 
+ 	ret = intel_plane_compute_gtt(plane_state);
+ 	if (ret)
+@@ -1564,12 +1564,6 @@ static int skl_check_plane_surface(struct intel_plane_state *plane_state)
+ 			return ret;
+ 	}
+ 
+-	for (i = fb->format->num_planes; i < ARRAY_SIZE(plane_state->view.color_plane); i++) {
+-		plane_state->view.color_plane[i].offset = 0;
+-		plane_state->view.color_plane[i].x = 0;
+-		plane_state->view.color_plane[i].y = 0;
+-	}
+-
+ 	ret = skl_check_main_surface(plane_state);
+ 	if (ret)
+ 		return ret;
+-- 
+2.25.1
+

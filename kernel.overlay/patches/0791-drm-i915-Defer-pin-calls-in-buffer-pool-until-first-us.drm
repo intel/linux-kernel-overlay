@@ -1,0 +1,183 @@
+From 73181d0e4376325a25eb357aa0641e7c0d5ca86d Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:50:18 +0100
+Subject: [PATCH 0791/2740] drm/i915: Defer pin calls in buffer pool until
+ first use by caller.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We need to take the obj lock to pin pages, so wait until the callers
+have done so, before making the object unshrinkable.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-30-maarten.lankhorst@linux.intel.com
+---
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    |  2 +
+ .../gpu/drm/i915/gem/i915_gem_object_blt.c    |  6 +++
+ .../gpu/drm/i915/gt/intel_gt_buffer_pool.c    | 47 +++++++++----------
+ .../gpu/drm/i915/gt/intel_gt_buffer_pool.h    |  5 ++
+ .../drm/i915/gt/intel_gt_buffer_pool_types.h  |  1 +
+ 5 files changed, 35 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index f30c87758c64..5964e67c7d36 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -1349,6 +1349,7 @@ static int __reloc_gpu_alloc(struct i915_execbuffer *eb,
+ 		err = PTR_ERR(cmd);
+ 		goto err_pool;
+ 	}
++	intel_gt_buffer_pool_mark_used(pool);
+ 
+ 	memset32(cmd, 0, pool->obj->base.size / sizeof(u32));
+ 
+@@ -2644,6 +2645,7 @@ static int eb_parse(struct i915_execbuffer *eb)
+ 		err = PTR_ERR(shadow);
+ 		goto err;
+ 	}
++	intel_gt_buffer_pool_mark_used(pool);
+ 	i915_gem_object_set_readonly(shadow->obj);
+ 	shadow->private = pool;
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c b/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
+index d6dac21fce0b..df8e8c18c6c9 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_blt.c
+@@ -55,6 +55,9 @@ struct i915_vma *intel_emit_vma_fill_blt(struct intel_context *ce,
+ 	if (unlikely(err))
+ 		goto out_put;
+ 
++	/* we pinned the pool, mark it as such */
++	intel_gt_buffer_pool_mark_used(pool);
++
+ 	cmd = i915_gem_object_pin_map(pool->obj, pool->type);
+ 	if (IS_ERR(cmd)) {
+ 		err = PTR_ERR(cmd);
+@@ -277,6 +280,9 @@ struct i915_vma *intel_emit_vma_copy_blt(struct intel_context *ce,
+ 	if (unlikely(err))
+ 		goto out_put;
+ 
++	/* we pinned the pool, mark it as such */
++	intel_gt_buffer_pool_mark_used(pool);
++
+ 	cmd = i915_gem_object_pin_map(pool->obj, pool->type);
+ 	if (IS_ERR(cmd)) {
+ 		err = PTR_ERR(cmd);
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
+index 06d84cf09570..c59468107598 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.c
+@@ -98,28 +98,6 @@ static void pool_free_work(struct work_struct *wrk)
+ 				      round_jiffies_up_relative(HZ));
+ }
+ 
+-static int pool_active(struct i915_active *ref)
+-{
+-	struct intel_gt_buffer_pool_node *node =
+-		container_of(ref, typeof(*node), active);
+-	struct dma_resv *resv = node->obj->base.resv;
+-	int err;
+-
+-	if (dma_resv_trylock(resv)) {
+-		dma_resv_add_excl_fence(resv, NULL);
+-		dma_resv_unlock(resv);
+-	}
+-
+-	err = i915_gem_object_pin_pages(node->obj);
+-	if (err)
+-		return err;
+-
+-	/* Hide this pinned object from the shrinker until retired */
+-	i915_gem_object_make_unshrinkable(node->obj);
+-
+-	return 0;
+-}
+-
+ __i915_active_call
+ static void pool_retire(struct i915_active *ref)
+ {
+@@ -129,10 +107,13 @@ static void pool_retire(struct i915_active *ref)
+ 	struct list_head *list = bucket_for_size(pool, node->obj->base.size);
+ 	unsigned long flags;
+ 
+-	i915_gem_object_unpin_pages(node->obj);
++	if (node->pinned) {
++		i915_gem_object_unpin_pages(node->obj);
+ 
+-	/* Return this object to the shrinker pool */
+-	i915_gem_object_make_purgeable(node->obj);
++		/* Return this object to the shrinker pool */
++		i915_gem_object_make_purgeable(node->obj);
++		node->pinned = false;
++	}
+ 
+ 	GEM_BUG_ON(node->age);
+ 	spin_lock_irqsave(&pool->lock, flags);
+@@ -144,6 +125,19 @@ static void pool_retire(struct i915_active *ref)
+ 			      round_jiffies_up_relative(HZ));
+ }
+ 
++void intel_gt_buffer_pool_mark_used(struct intel_gt_buffer_pool_node *node)
++{
++	assert_object_held(node->obj);
++
++	if (node->pinned)
++		return;
++
++	__i915_gem_object_pin_pages(node->obj);
++	/* Hide this pinned object from the shrinker until retired */
++	i915_gem_object_make_unshrinkable(node->obj);
++	node->pinned = true;
++}
++
+ static struct intel_gt_buffer_pool_node *
+ node_create(struct intel_gt_buffer_pool *pool, size_t sz,
+ 	    enum i915_map_type type)
+@@ -159,7 +153,8 @@ node_create(struct intel_gt_buffer_pool *pool, size_t sz,
+ 
+ 	node->age = 0;
+ 	node->pool = pool;
+-	i915_active_init(&node->active, pool_active, pool_retire);
++	node->pinned = false;
++	i915_active_init(&node->active, NULL, pool_retire);
+ 
+ 	obj = i915_gem_object_create_internal(gt->i915, sz);
+ 	if (IS_ERR(obj)) {
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
+index 6068f8f1762e..487b8a5520f1 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool.h
+@@ -18,10 +18,15 @@ struct intel_gt_buffer_pool_node *
+ intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size,
+ 			 enum i915_map_type type);
+ 
++void intel_gt_buffer_pool_mark_used(struct intel_gt_buffer_pool_node *node);
++
+ static inline int
+ intel_gt_buffer_pool_mark_active(struct intel_gt_buffer_pool_node *node,
+ 				 struct i915_request *rq)
+ {
++	/* did we call mark_used? */
++	GEM_WARN_ON(!node->pinned);
++
+ 	return i915_active_add_request(&node->active, rq);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
+index d8d82c890da8..2c27a3319bed 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_buffer_pool_types.h
+@@ -31,6 +31,7 @@ struct intel_gt_buffer_pool_node {
+ 	};
+ 	unsigned long age;
+ 	enum i915_map_type type;
++	u32 pinned;
+ };
+ 
+ #endif /* INTEL_GT_BUFFER_POOL_TYPES_H */
+-- 
+2.25.1
+

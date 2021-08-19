@@ -1,0 +1,383 @@
+From 6148740bb41944c0d6a0569edea4cc3d495b30f1 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:50:11 +0100
+Subject: [PATCH 0784/2740] drm/i915: Pass ww ctx to intel_pin_to_display_plane
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of multiple lockings, lock the object once,
+and perform the ww dance around attach_phys and pin_pages.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-23-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  | 69 ++++++++++++-------
+ drivers/gpu/drm/i915/display/intel_display.h  |  2 +-
+ drivers/gpu/drm/i915/display/intel_fbdev.c    |  2 +-
+ drivers/gpu/drm/i915/display/intel_overlay.c  | 34 +++++++--
+ drivers/gpu/drm/i915/gem/i915_gem_domain.c    | 30 ++------
+ drivers/gpu/drm/i915/gem/i915_gem_object.h    |  1 +
+ drivers/gpu/drm/i915/gem/i915_gem_phys.c      | 10 +--
+ .../drm/i915/gem/selftests/i915_gem_phys.c    |  2 +
+ 8 files changed, 86 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 111d7a7a95da..aa524eff20e1 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1091,6 +1091,7 @@ static bool intel_plane_uses_fence(const struct intel_plane_state *plane_state)
+ 
+ struct i915_vma *
+ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
++			   bool phys_cursor,
+ 			   const struct i915_ggtt_view *view,
+ 			   bool uses_fence,
+ 			   unsigned long *out_flags)
+@@ -1099,14 +1100,19 @@ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ 	intel_wakeref_t wakeref;
++	struct i915_gem_ww_ctx ww;
+ 	struct i915_vma *vma;
+ 	unsigned int pinctl;
+ 	u32 alignment;
++	int ret;
+ 
+ 	if (drm_WARN_ON(dev, !i915_gem_object_is_framebuffer(obj)))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	alignment = intel_surf_alignment(fb, 0);
++	if (phys_cursor)
++		alignment = intel_cursor_alignment(dev_priv);
++	else
++		alignment = intel_surf_alignment(fb, 0);
+ 	if (drm_WARN_ON(dev, alignment && !is_power_of_2(alignment)))
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -1141,14 +1147,26 @@ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
+ 	if (HAS_GMCH(dev_priv))
+ 		pinctl |= PIN_MAPPABLE;
+ 
+-	vma = i915_gem_object_pin_to_display_plane(obj,
+-						   alignment, view, pinctl);
+-	if (IS_ERR(vma))
++	i915_gem_ww_ctx_init(&ww, true);
++retry:
++	ret = i915_gem_object_lock(obj, &ww);
++	if (!ret && phys_cursor)
++		ret = i915_gem_object_attach_phys(obj, alignment);
++	if (!ret)
++		ret = i915_gem_object_pin_pages(obj);
++	if (ret)
+ 		goto err;
+ 
+-	if (uses_fence && i915_vma_is_map_and_fenceable(vma)) {
+-		int ret;
++	if (!ret) {
++		vma = i915_gem_object_pin_to_display_plane(obj, &ww, alignment,
++							   view, pinctl);
++		if (IS_ERR(vma)) {
++			ret = PTR_ERR(vma);
++			goto err_unpin;
++		}
++	}
+ 
++	if (uses_fence && i915_vma_is_map_and_fenceable(vma)) {
+ 		/*
+ 		 * Install a fence for tiled scan-out. Pre-i965 always needs a
+ 		 * fence, whereas 965+ only requires a fence if using
+@@ -1169,16 +1187,28 @@ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
+ 		ret = i915_vma_pin_fence(vma);
+ 		if (ret != 0 && INTEL_GEN(dev_priv) < 4) {
+ 			i915_vma_unpin(vma);
+-			vma = ERR_PTR(ret);
+-			goto err;
++			goto err_unpin;
+ 		}
++		ret = 0;
+ 
+-		if (ret == 0 && vma->fence)
++		if (vma->fence)
+ 			*out_flags |= PLANE_HAS_FENCE;
+ 	}
+ 
+ 	i915_vma_get(vma);
++
++err_unpin:
++	i915_gem_object_unpin_pages(obj);
+ err:
++	if (ret == -EDEADLK) {
++		ret = i915_gem_ww_ctx_backoff(&ww);
++		if (!ret)
++			goto retry;
++	}
++	i915_gem_ww_ctx_fini(&ww);
++	if (ret)
++		vma = ERR_PTR(ret);
++
+ 	atomic_dec(&dev_priv->gpu_error.pending_fb_pin);
+ 	intel_runtime_pm_put(&dev_priv->runtime_pm, wakeref);
+ 	return vma;
+@@ -11333,19 +11363,11 @@ int intel_plane_pin_fb(struct intel_plane_state *plane_state)
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 	struct drm_framebuffer *fb = plane_state->hw.fb;
+ 	struct i915_vma *vma;
++	bool phys_cursor =
++		plane->id == PLANE_CURSOR &&
++		INTEL_INFO(dev_priv)->display.cursor_needs_physical;
+ 
+-	if (plane->id == PLANE_CURSOR &&
+-	    INTEL_INFO(dev_priv)->display.cursor_needs_physical) {
+-		struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+-		const int align = intel_cursor_alignment(dev_priv);
+-		int err;
+-
+-		err = i915_gem_object_attach_phys(obj, align);
+-		if (err)
+-			return err;
+-	}
+-
+-	vma = intel_pin_and_fence_fb_obj(fb,
++	vma = intel_pin_and_fence_fb_obj(fb, phys_cursor,
+ 					 &plane_state->view,
+ 					 intel_plane_uses_fence(plane_state),
+ 					 &plane_state->flags);
+@@ -11437,13 +11459,8 @@ intel_prepare_plane_fb(struct drm_plane *_plane,
+ 	if (!obj)
+ 		return 0;
+ 
+-	ret = i915_gem_object_pin_pages(obj);
+-	if (ret)
+-		return ret;
+ 
+ 	ret = intel_plane_pin_fb(new_plane_state);
+-
+-	i915_gem_object_unpin_pages(obj);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.h b/drivers/gpu/drm/i915/display/intel_display.h
+index 431770eeadb4..f056e19cf559 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -573,7 +573,7 @@ void intel_release_load_detect_pipe(struct drm_connector *connector,
+ 				    struct intel_load_detect_pipe *old,
+ 				    struct drm_modeset_acquire_ctx *ctx);
+ struct i915_vma *
+-intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
++intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb, bool phys_cursor,
+ 			   const struct i915_ggtt_view *view,
+ 			   bool uses_fence,
+ 			   unsigned long *out_flags);
+diff --git a/drivers/gpu/drm/i915/display/intel_fbdev.c b/drivers/gpu/drm/i915/display/intel_fbdev.c
+index 07db8e83f98e..ccd00e65a5fe 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -211,7 +211,7 @@ static int intelfb_create(struct drm_fb_helper *helper,
+ 	 * This also validates that any existing fb inherited from the
+ 	 * BIOS is suitable for own access.
+ 	 */
+-	vma = intel_pin_and_fence_fb_obj(&ifbdev->fb->base,
++	vma = intel_pin_and_fence_fb_obj(&ifbdev->fb->base, false,
+ 					 &view, false, &flags);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+diff --git a/drivers/gpu/drm/i915/display/intel_overlay.c b/drivers/gpu/drm/i915/display/intel_overlay.c
+index ef8f44f5e751..4b77a23451dd 100644
+--- a/drivers/gpu/drm/i915/display/intel_overlay.c
++++ b/drivers/gpu/drm/i915/display/intel_overlay.c
+@@ -755,6 +755,32 @@ static u32 overlay_cmd_reg(struct drm_intel_overlay_put_image *params)
+ 	return cmd;
+ }
+ 
++static struct i915_vma *intel_overlay_pin_fb(struct drm_i915_gem_object *new_bo)
++{
++	struct i915_gem_ww_ctx ww;
++	struct i915_vma *vma;
++	int ret;
++
++	i915_gem_ww_ctx_init(&ww, true);
++retry:
++	ret = i915_gem_object_lock(new_bo, &ww);
++	if (!ret) {
++		vma = i915_gem_object_pin_to_display_plane(new_bo, &ww, 0,
++							   NULL, PIN_MAPPABLE);
++		ret = PTR_ERR_OR_ZERO(vma);
++	}
++	if (ret == -EDEADLK) {
++		ret = i915_gem_ww_ctx_backoff(&ww);
++		if (!ret)
++			goto retry;
++	}
++	i915_gem_ww_ctx_fini(&ww);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return vma;
++}
++
+ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 				      struct drm_i915_gem_object *new_bo,
+ 				      struct drm_intel_overlay_put_image *params)
+@@ -776,12 +802,10 @@ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 
+ 	atomic_inc(&dev_priv->gpu_error.pending_fb_pin);
+ 
+-	vma = i915_gem_object_pin_to_display_plane(new_bo,
+-						   0, NULL, PIN_MAPPABLE);
+-	if (IS_ERR(vma)) {
+-		ret = PTR_ERR(vma);
++	vma = intel_overlay_pin_fb(new_bo);
++	if (IS_ERR(vma))
+ 		goto out_pin_section;
+-	}
++
+ 	i915_gem_object_flush_frontbuffer(new_bo, ORIGIN_DIRTYFB);
+ 
+ 	if (!overlay->active) {
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_domain.c b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+index b649560ae522..b7ed3d1fc79a 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_domain.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+@@ -366,12 +366,12 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
+  */
+ struct i915_vma *
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
++				     struct i915_gem_ww_ctx *ww,
+ 				     u32 alignment,
+ 				     const struct i915_ggtt_view *view,
+ 				     unsigned int flags)
+ {
+ 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+-	struct i915_gem_ww_ctx ww;
+ 	struct i915_vma *vma;
+ 	int ret;
+ 
+@@ -379,11 +379,6 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 	if (HAS_LMEM(i915) && !i915_gem_object_is_lmem(obj))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	i915_gem_ww_ctx_init(&ww, true);
+-retry:
+-	ret = i915_gem_object_lock(obj, &ww);
+-	if (ret)
+-		goto err;
+ 	/*
+ 	 * The display engine is not coherent with the LLC cache on gen6.  As
+ 	 * a result, we make sure that the pinning that is about to occur is
+@@ -398,7 +393,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 					      HAS_WT(i915) ?
+ 					      I915_CACHE_WT : I915_CACHE_NONE);
+ 	if (ret)
+-		goto err;
++		return ERR_PTR(ret);
+ 
+ 	/*
+ 	 * As the user may map the buffer once pinned in the display plane
+@@ -411,33 +406,20 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 	vma = ERR_PTR(-ENOSPC);
+ 	if ((flags & PIN_MAPPABLE) == 0 &&
+ 	    (!view || view->type == I915_GGTT_VIEW_NORMAL))
+-		vma = i915_gem_object_ggtt_pin_ww(obj, &ww, view, 0, alignment,
++		vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment,
+ 						  flags | PIN_MAPPABLE |
+ 						  PIN_NONBLOCK);
+ 	if (IS_ERR(vma) && vma != ERR_PTR(-EDEADLK))
+-		vma = i915_gem_object_ggtt_pin_ww(obj, &ww, view, 0,
++		vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0,
+ 						  alignment, flags);
+-	if (IS_ERR(vma)) {
+-		ret = PTR_ERR(vma);
+-		goto err;
+-	}
++	if (IS_ERR(vma))
++		return vma;
+ 
+ 	vma->display_alignment = max_t(u64, vma->display_alignment, alignment);
+ 	i915_vma_mark_scanout(vma);
+ 
+ 	i915_gem_object_flush_if_display_locked(obj);
+ 
+-err:
+-	if (ret == -EDEADLK) {
+-		ret = i915_gem_ww_ctx_backoff(&ww);
+-		if (!ret)
+-			goto retry;
+-	}
+-	i915_gem_ww_ctx_fini(&ww);
+-
+-	if (ret)
+-		return ERR_PTR(ret);
+-
+ 	return vma;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index 7f4b3062d0db..0a238af5601b 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -484,6 +484,7 @@ int __must_check
+ i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write);
+ struct i915_vma * __must_check
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
++				     struct i915_gem_ww_ctx *ww,
+ 				     u32 alignment,
+ 				     const struct i915_ggtt_view *view,
+ 				     unsigned int flags);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_phys.c b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+index 44329c435cf1..92297362fad8 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_phys.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_phys.c
+@@ -219,6 +219,8 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ {
+ 	int err;
+ 
++	assert_object_held(obj);
++
+ 	if (align > obj->base.size)
+ 		return -EINVAL;
+ 
+@@ -232,13 +234,9 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ 	if (err)
+ 		return err;
+ 
+-	err = i915_gem_object_lock_interruptible(obj, NULL);
+-	if (err)
+-		return err;
+-
+ 	err = mutex_lock_interruptible(&obj->mm.lock);
+ 	if (err)
+-		goto err_unlock;
++		return err;
+ 
+ 	if (unlikely(!i915_gem_object_has_struct_page(obj)))
+ 		goto out;
+@@ -269,8 +267,6 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
+ 
+ out:
+ 	mutex_unlock(&obj->mm.lock);
+-err_unlock:
+-	i915_gem_object_unlock(obj);
+ 	return err;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c b/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
+index 0cfa082047fe..3a6ce87f8b52 100644
+--- a/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
++++ b/drivers/gpu/drm/i915/gem/selftests/i915_gem_phys.c
+@@ -31,7 +31,9 @@ static int mock_phys_object(void *arg)
+ 		goto out_obj;
+ 	}
+ 
++	i915_gem_object_lock(obj, NULL);
+ 	err = i915_gem_object_attach_phys(obj, PAGE_SIZE);
++	i915_gem_object_unlock(obj);
+ 	if (err) {
+ 		pr_err("i915_gem_object_attach_phys failed, err=%d\n", err);
+ 		goto out_obj;
+-- 
+2.25.1
+

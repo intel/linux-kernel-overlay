@@ -1,0 +1,195 @@
+From e1368d562b0e402b9f7738d1e17eb827dc5130e8 Mon Sep 17 00:00:00 2001
+From: Emil Renner Berthing <kernel@esmil.dk>
+Date: Tue, 26 Jan 2021 16:01:55 +0100
+Subject: [PATCH 1002/2740] drm/i915/gt: use new tasklet API for execution list
+
+This converts the driver to use the new tasklet API introduced in
+commit 12cc923f1ccc ("tasklet: Introduce new initialization API")
+
+v2: Fix up selftests/execlists.
+
+Signed-off-by: Emil Renner Berthing <kernel@esmil.dk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210126150155.1617-1-kernel@esmil.dk
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c     |  4 +--
+ .../drm/i915/gt/intel_execlists_submission.c  | 28 +++++++++----------
+ drivers/gpu/drm/i915/gt/selftest_execlists.c  |  4 +--
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c | 10 +++----
+ 4 files changed, 23 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index 7528d4910fca..d99390fc7b80 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -1232,14 +1232,14 @@ void __intel_engine_flush_submission(struct intel_engine_cs *engine, bool sync)
+ {
+ 	struct tasklet_struct *t = &engine->execlists.tasklet;
+ 
+-	if (!t->func)
++	if (!t->callback)
+ 		return;
+ 
+ 	local_bh_disable();
+ 	if (tasklet_trylock(t)) {
+ 		/* Must wait for any GPU reset in progress. */
+ 		if (__tasklet_is_enabled(t))
+-			t->func(t->data);
++			t->callback(t);
+ 		tasklet_unlock(t);
+ 	}
+ 	local_bh_enable();
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index c27a58392c31..9a80f9484a77 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -2343,9 +2343,10 @@ static bool preempt_timeout(const struct intel_engine_cs *const engine)
+  * Check the unread Context Status Buffers and manage the submission of new
+  * contexts to the ELSP accordingly.
+  */
+-static void execlists_submission_tasklet(unsigned long data)
++static void execlists_submission_tasklet(struct tasklet_struct *t)
+ {
+-	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
++	struct intel_engine_cs * const engine =
++		from_tasklet(engine, t, execlists.tasklet);
+ 	struct i915_request *post[2 * EXECLIST_MAX_PORTS];
+ 	struct i915_request **inactive;
+ 
+@@ -2943,9 +2944,10 @@ static void execlists_reset_rewind(struct intel_engine_cs *engine, bool stalled)
+ 	rcu_read_unlock();
+ }
+ 
+-static void nop_submission_tasklet(unsigned long data)
++static void nop_submission_tasklet(struct tasklet_struct *t)
+ {
+-	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
++	struct intel_engine_cs * const engine =
++		from_tasklet(engine, t, execlists.tasklet);
+ 
+ 	/* The driver is wedged; don't process any more events. */
+ 	WRITE_ONCE(engine->execlists.queue_priority_hint, INT_MIN);
+@@ -3029,7 +3031,7 @@ static void execlists_reset_cancel(struct intel_engine_cs *engine)
+ 	execlists->queue = RB_ROOT_CACHED;
+ 
+ 	GEM_BUG_ON(__tasklet_is_enabled(&execlists->tasklet));
+-	execlists->tasklet.func = nop_submission_tasklet;
++	execlists->tasklet.callback = nop_submission_tasklet;
+ 
+ 	spin_unlock_irqrestore(&engine->active.lock, flags);
+ 	rcu_read_unlock();
+@@ -3090,7 +3092,7 @@ static void execlists_set_default_submission(struct intel_engine_cs *engine)
+ {
+ 	engine->submit_request = execlists_submit_request;
+ 	engine->schedule = i915_schedule;
+-	engine->execlists.tasklet.func = execlists_submission_tasklet;
++	engine->execlists.tasklet.callback = execlists_submission_tasklet;
+ 
+ 	engine->reset.prepare = execlists_reset_prepare;
+ 	engine->reset.rewind = execlists_reset_rewind;
+@@ -3213,8 +3215,7 @@ int intel_execlists_submission_setup(struct intel_engine_cs *engine)
+ 	struct intel_uncore *uncore = engine->uncore;
+ 	u32 base = engine->mmio_base;
+ 
+-	tasklet_init(&engine->execlists.tasklet,
+-		     execlists_submission_tasklet, (unsigned long)engine);
++	tasklet_setup(&engine->execlists.tasklet, execlists_submission_tasklet);
+ 	timer_setup(&engine->execlists.timer, execlists_timeslice, 0);
+ 	timer_setup(&engine->execlists.preempt, execlists_preempt, 0);
+ 
+@@ -3456,9 +3457,10 @@ static intel_engine_mask_t virtual_submission_mask(struct virtual_engine *ve)
+ 	return mask;
+ }
+ 
+-static void virtual_submission_tasklet(unsigned long data)
++static void virtual_submission_tasklet(struct tasklet_struct *t)
+ {
+-	struct virtual_engine * const ve = (struct virtual_engine *)data;
++	struct virtual_engine * const ve =
++		from_tasklet(ve, t, base.execlists.tasklet);
+ 	const int prio = READ_ONCE(ve->base.execlists.queue_priority_hint);
+ 	intel_engine_mask_t mask;
+ 	unsigned int n;
+@@ -3668,9 +3670,7 @@ intel_execlists_create_virtual(struct intel_engine_cs **siblings,
+ 
+ 	INIT_LIST_HEAD(virtual_queue(ve));
+ 	ve->base.execlists.queue_priority_hint = INT_MIN;
+-	tasklet_init(&ve->base.execlists.tasklet,
+-		     virtual_submission_tasklet,
+-		     (unsigned long)ve);
++	tasklet_setup(&ve->base.execlists.tasklet, virtual_submission_tasklet);
+ 
+ 	intel_context_init(&ve->context, &ve->base);
+ 
+@@ -3698,7 +3698,7 @@ intel_execlists_create_virtual(struct intel_engine_cs **siblings,
+ 		 * layering if we handle cloning of the requests and
+ 		 * submitting a copy into each backend.
+ 		 */
+-		if (sibling->execlists.tasklet.func !=
++		if (sibling->execlists.tasklet.callback !=
+ 		    execlists_submission_tasklet) {
+ 			err = -ENODEV;
+ 			goto err_put;
+diff --git a/drivers/gpu/drm/i915/gt/selftest_execlists.c b/drivers/gpu/drm/i915/gt/selftest_execlists.c
+index 0f49f38e1187..1081cd36a2bd 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_execlists.c
++++ b/drivers/gpu/drm/i915/gt/selftest_execlists.c
+@@ -608,7 +608,7 @@ static int live_hold_reset(void *arg)
+ 		}
+ 		tasklet_disable(&engine->execlists.tasklet);
+ 
+-		engine->execlists.tasklet.func(engine->execlists.tasklet.data);
++		engine->execlists.tasklet.callback(&engine->execlists.tasklet);
+ 		GEM_BUG_ON(execlists_active(&engine->execlists) != rq);
+ 
+ 		i915_request_get(rq);
+@@ -4595,7 +4595,7 @@ static int reset_virtual_engine(struct intel_gt *gt,
+ 	}
+ 	tasklet_disable(&engine->execlists.tasklet);
+ 
+-	engine->execlists.tasklet.func(engine->execlists.tasklet.data);
++	engine->execlists.tasklet.callback(&engine->execlists.tasklet);
+ 	GEM_BUG_ON(execlists_active(&engine->execlists) != rq);
+ 
+ 	/* Fake a preemption event; failed of course */
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 3124d8794d87..92688a9b6717 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -237,9 +237,10 @@ static void __guc_dequeue(struct intel_engine_cs *engine)
+ 	execlists->active = execlists->inflight;
+ }
+ 
+-static void guc_submission_tasklet(unsigned long data)
++static void guc_submission_tasklet(struct tasklet_struct *t)
+ {
+-	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
++	struct intel_engine_cs * const engine =
++		from_tasklet(engine, t, execlists.tasklet);
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	struct i915_request **port, *rq;
+ 	unsigned long flags;
+@@ -608,7 +609,7 @@ static void guc_set_default_submission(struct intel_engine_cs *engine)
+ {
+ 	engine->submit_request = guc_submit_request;
+ 	engine->schedule = i915_schedule;
+-	engine->execlists.tasklet.func = guc_submission_tasklet;
++	engine->execlists.tasklet.callback = guc_submission_tasklet;
+ 
+ 	engine->reset.prepare = guc_reset_prepare;
+ 	engine->reset.rewind = guc_reset_rewind;
+@@ -700,8 +701,7 @@ int intel_guc_submission_setup(struct intel_engine_cs *engine)
+ 	 */
+ 	GEM_BUG_ON(INTEL_GEN(i915) < 11);
+ 
+-	tasklet_init(&engine->execlists.tasklet,
+-		     guc_submission_tasklet, (unsigned long)engine);
++	tasklet_setup(&engine->execlists.tasklet, guc_submission_tasklet);
+ 
+ 	guc_default_vfuncs(engine);
+ 	guc_default_irqs(engine);
+-- 
+2.25.1
+

@@ -1,0 +1,118 @@
+From fc453fca1601fc15ee52dbf2cd393d05d19f0e76 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:50:02 +0100
+Subject: [PATCH 0775/2740] drm/i915: Reject more ioctls for userptr, v2.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There are a couple of ioctl's related to tiling and cache placement,
+that make no sense for userptr, reject those:
+- i915_gem_set_tiling_ioctl()
+    Tiling should always be linear for userptr. Changing placement will
+    fail with -ENXIO.
+- i915_gem_set_caching_ioctl()
+    Userptr memory should always be cached. Changing caching mode will
+    fail with -ENXIO.
+- i915_gem_set_domain_ioctl()
+    Still temporarily allowed to work as intended, it's used to check
+    userptr validity. With the reworked userptr code, it will keep
+    working for this usecase.
+
+This plus the previous changes have been tested against beignet
+by using its own unit tests, and intel-video-compute by using
+piglit's opencl tests.
+
+Changes since v1:
+- set_domain was apparently used in iris for checking userptr validity,
+  keep it working as intended.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Acked-by: Jason Ekstrand <jason@jlekstrand.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-14-maarten.lankhorst@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c |  2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_domain.c   | 12 ++++++++++--
+ drivers/gpu/drm/i915/gem/i915_gem_object.h   |  6 ++++++
+ drivers/gpu/drm/i915/gem/i915_gem_userptr.c  |  3 ++-
+ 4 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index e3f8d0034fcf..111d7a7a95da 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -11905,7 +11905,7 @@ static int intel_user_framebuffer_create_handle(struct drm_framebuffer *fb,
+ 	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+ 
+-	if (obj->userptr.mm) {
++	if (i915_gem_object_is_userptr(obj)) {
+ 		drm_dbg(&i915->drm,
+ 			"attempting to use a userptr for a framebuffer, denied\n");
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_domain.c b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+index 36f54cedaaeb..84f0232e9245 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_domain.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+@@ -335,7 +335,14 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
+ 	 * not allowed to be changed by userspace.
+ 	 */
+ 	if (i915_gem_object_is_proxy(obj)) {
+-		ret = -ENXIO;
++		/*
++		 * Silently allow cached for userptr; the vulkan driver
++		 * sets all objects to cached
++		 */
++		if (!i915_gem_object_is_userptr(obj) ||
++		    args->caching != I915_CACHING_CACHED)
++			ret = -ENXIO;
++
+ 		goto out;
+ 	}
+ 
+@@ -532,7 +539,8 @@ i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 	 * tracking for that backing storage. The proxy object is always
+ 	 * considered to be outside of any cache domain.
+ 	 */
+-	if (i915_gem_object_is_proxy(obj)) {
++	if (i915_gem_object_is_proxy(obj) &&
++	    !i915_gem_object_is_userptr(obj)) {
+ 		err = -ENXIO;
+ 		goto out;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index 2c7ca527f4ad..d0e525389845 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -548,6 +548,12 @@ void __i915_gem_object_flush_frontbuffer(struct drm_i915_gem_object *obj,
+ void __i915_gem_object_invalidate_frontbuffer(struct drm_i915_gem_object *obj,
+ 					      enum fb_op_origin origin);
+ 
++static inline bool
++i915_gem_object_is_userptr(struct drm_i915_gem_object *obj)
++{
++	return obj->userptr.mm;
++}
++
+ static inline void
+ i915_gem_object_flush_frontbuffer(struct drm_i915_gem_object *obj,
+ 				  enum fb_op_origin origin)
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_userptr.c b/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+index 44af6265948d..64a946d5f753 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+@@ -721,7 +721,8 @@ static const struct drm_i915_gem_object_ops i915_gem_userptr_ops = {
+ 	.name = "i915_gem_object_userptr",
+ 	.flags = I915_GEM_OBJECT_IS_SHRINKABLE |
+ 		 I915_GEM_OBJECT_NO_MMAP |
+-		 I915_GEM_OBJECT_ASYNC_CANCEL,
++		 I915_GEM_OBJECT_ASYNC_CANCEL |
++		 I915_GEM_OBJECT_IS_PROXY,
+ 	.get_pages = i915_gem_userptr_get_pages,
+ 	.put_pages = i915_gem_userptr_put_pages,
+ 	.dmabuf_export = i915_gem_userptr_dmabuf_export,
+-- 
+2.25.1
+

@@ -1,0 +1,568 @@
+From f63887d8a29ceb39f0575d6a2e74c805e71dea83 Mon Sep 17 00:00:00 2001
+From: Tamar Mashiah <tamar.mashiah@intel.com>
+Date: Thu, 25 Feb 2021 22:17:32 +0200
+Subject: [PATCH] mtd: spi-nor: intel-spi: add is_protected and is_bios_locked
+ knobs
+
+The manufacturing access to the PCH/SoC SPI device is traditionally
+performed via user space driver accessing registers via /dev/mem
+but due to security concerns /dev/mem access is being much restricted,
+hence the reason for utilizing dedicated Intel PCH/SoC SPI controller
+driver, which is already implemented in the Linux kernel.
+
+Intel PCH/SoC SPI controller protects the flash storage via two
+mechanisms one is the via region protection registers and second
+via BIOS lock. The BIOS locks only the BIOS regions usually 0 and/or 6.
+
+The device always boots with BIOS lock set, but during manufacturing
+the BIOS lock has to be lifted in order to enable the write access.
+So we add sysfs file (spi_bios_lock) to be able to do it on demand.
+The BIOS lock was automatically attempted to be lifted by the driver
+during initialization, this part is dropped.
+
+Second, also the region protection status is exposed via sysfs file
+as the manufacturing will need the both files in order to validate
+that the device is properly sealed.
+In case device was not properly sealed one should disable write access
+via writeable module parameter.
+
+Signed-off-by: Tamar Mashiah <tamar.mashiah@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Reviewed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+---
+ .../ABI/testing/sysfs-devices-intel-spi       |  16 +++
+ MAINTAINERS                                   |   1 +
+ drivers/mfd/lpc_ich.c                         |  37 ++++-
+ .../mtd/spi-nor/controllers/intel-spi-pci.c   |  83 +++++++++--
+ .../spi-nor/controllers/intel-spi-platform.c  |  40 ++++++
+ drivers/mtd/spi-nor/controllers/intel-spi.c   | 133 +++++++++++++-----
+ drivers/mtd/spi-nor/controllers/intel-spi.h   |   3 +
+ include/linux/platform_data/intel-spi.h       |   6 +-
+ 8 files changed, 266 insertions(+), 53 deletions(-)
+ create mode 100644 Documentation/ABI/testing/sysfs-devices-intel-spi
+
+diff --git a/Documentation/ABI/testing/sysfs-devices-intel-spi b/Documentation/ABI/testing/sysfs-devices-intel-spi
+new file mode 100644
+index 000000000000..d5bf1ac53e56
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-devices-intel-spi
+@@ -0,0 +1,16 @@
++What:		/sys/devices/.../is_protected
++Date:		Jun 2021
++Contact:	Tomas Winkler <tomas.winkler@intel.com>
++Description:
++		The /sys/devices/.../is_protected attribute allows the user
++		space to check if the intel-spi controller is write protected
++		from the host.
++
++What:		/sys/devices/.../bios_lock
++Date:		Jun 2021
++Contact:	Tomas Winkler <tomas.winkler@intel.com>
++Description:
++		The /sys/devices/.../bios_lock attribute allows the user
++		space to check if the intel-spi controller is locked by bios
++		for writes. It is possible to unlock the bios lock by writing
++		"unlock" to the file.
+diff --git a/MAINTAINERS b/MAINTAINERS
+index d549a0097bb5..b2651b9b3266 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -11397,6 +11397,7 @@ Q:	http://patchwork.ozlabs.org/project/linux-mtd/list/
+ C:	irc://irc.oftc.net/mtd
+ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/mtd/linux.git mtd/fixes
+ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/mtd/linux.git mtd/next
++F:	Documentation/ABI/testing/sysfs-devices-intel-spi
+ F:	Documentation/devicetree/bindings/mtd/
+ F:	drivers/mtd/
+ F:	include/linux/mtd/
+diff --git a/drivers/mfd/lpc_ich.c b/drivers/mfd/lpc_ich.c
+index 3bbb29a7e7a5..eceaf11bec93 100644
+--- a/drivers/mfd/lpc_ich.c
++++ b/drivers/mfd/lpc_ich.c
+@@ -1083,12 +1083,39 @@ static int lpc_ich_init_wdt(struct pci_dev *dev)
+ 	return ret;
+ }
+ 
++static int lcp_ich_bios_unlock(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u32 bcr = 0;
++
++	pci_read_config_dword(pdev, BCR, &bcr);
++	if (!(bcr & BCR_WPD)) {
++		bcr |= BCR_WPD;
++		pci_write_config_dword(pdev, BCR, bcr);
++		pci_read_config_dword(pdev, BCR, &bcr);
++	}
++
++	if (!(bcr & BCR_WPD))
++		return -EIO;
++
++	return 0;
++}
++
++static bool lcp_ich_is_bios_locked(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u32 bcr = 0;
++
++	pci_read_config_dword(pdev, BCR, &bcr);
++	return !(bcr & BCR_WPD);
++}
++
+ static int lpc_ich_init_spi(struct pci_dev *dev)
+ {
+ 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+ 	struct resource *res = &intel_spi_res[0];
+ 	struct intel_spi_boardinfo *info;
+-	u32 spi_base, rcba, bcr;
++	u32 spi_base, rcba;
+ 
+ 	info = devm_kzalloc(&dev->dev, sizeof(*info), GFP_KERNEL);
+ 	if (!info)
+@@ -1112,8 +1139,8 @@ static int lpc_ich_init_spi(struct pci_dev *dev)
+ 			res->start = spi_base + SPIBASE_LPT;
+ 			res->end = res->start + SPIBASE_LPT_SZ - 1;
+ 
+-			pci_read_config_dword(dev, BCR, &bcr);
+-			info->writeable = !!(bcr & BCR_WPD);
++			info->is_bios_locked = lcp_ich_is_bios_locked;
++			info->bios_unlock = lcp_ich_bios_unlock;
+ 		}
+ 		break;
+ 
+@@ -1134,8 +1161,8 @@ static int lpc_ich_init_spi(struct pci_dev *dev)
+ 			res->start = spi_base & 0xfffffff0;
+ 			res->end = res->start + SPIBASE_APL_SZ - 1;
+ 
+-			pci_bus_read_config_dword(bus, spi, BCR, &bcr);
+-			info->writeable = !!(bcr & BCR_WPD);
++			info->is_bios_locked = lcp_ich_is_bios_locked;
++			info->bios_unlock = lcp_ich_bios_unlock;
+ 		}
+ 
+ 		pci_bus_write_config_byte(bus, p2sb, 0xe1, 0x1);
+diff --git a/drivers/mtd/spi-nor/controllers/intel-spi-pci.c b/drivers/mtd/spi-nor/controllers/intel-spi-pci.c
+index 825610a2e9dc..bd55bd8078b4 100644
+--- a/drivers/mtd/spi-nor/controllers/intel-spi-pci.c
++++ b/drivers/mtd/spi-nor/controllers/intel-spi-pci.c
+@@ -16,12 +16,43 @@
+ #define BCR		0xdc
+ #define BCR_WPD		BIT(0)
+ 
++static int intel_spi_pci_bios_unlock(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u32 bcr = 0;
++
++	pci_read_config_dword(pdev, BCR, &bcr);
++	if (!(bcr & BCR_WPD)) {
++		bcr |= BCR_WPD;
++		pci_write_config_dword(pdev, BCR, bcr);
++		pci_read_config_dword(pdev, BCR, &bcr);
++	}
++
++	if (!(bcr & BCR_WPD))
++		return -EIO;
++
++	return 0;
++}
++
++static bool intel_spi_pci_is_bios_locked(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u32 bcr = 0;
++
++	pci_read_config_dword(pdev, BCR, &bcr);
++	return !(bcr & BCR_WPD);
++}
++
+ static const struct intel_spi_boardinfo bxt_info = {
+ 	.type = INTEL_SPI_BXT,
++	.is_bios_locked = intel_spi_pci_is_bios_locked,
++	.bios_unlock = intel_spi_pci_bios_unlock,
+ };
+ 
+ static const struct intel_spi_boardinfo cnl_info = {
+ 	.type = INTEL_SPI_CNL,
++	.is_bios_locked = intel_spi_pci_is_bios_locked,
++	.bios_unlock = intel_spi_pci_bios_unlock,
+ };
+ 
+ static int intel_spi_pci_probe(struct pci_dev *pdev,
+@@ -29,7 +60,6 @@ static int intel_spi_pci_probe(struct pci_dev *pdev,
+ {
+ 	struct intel_spi_boardinfo *info;
+ 	struct intel_spi *ispi;
+-	u32 bcr;
+ 	int ret;
+ 
+ 	ret = pcim_enable_device(pdev);
+@@ -41,15 +71,6 @@ static int intel_spi_pci_probe(struct pci_dev *pdev,
+ 	if (!info)
+ 		return -ENOMEM;
+ 
+-	/* Try to make the chip read/write */
+-	pci_read_config_dword(pdev, BCR, &bcr);
+-	if (!(bcr & BCR_WPD)) {
+-		bcr |= BCR_WPD;
+-		pci_write_config_dword(pdev, BCR, bcr);
+-		pci_read_config_dword(pdev, BCR, &bcr);
+-	}
+-	info->writeable = !!(bcr & BCR_WPD);
+-
+ 	ispi = intel_spi_probe(&pdev->dev, &pdev->resource[0], info);
+ 	if (IS_ERR(ispi))
+ 		return PTR_ERR(ispi);
+@@ -84,11 +105,53 @@ static const struct pci_device_id intel_spi_pci_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(pci, intel_spi_pci_ids);
+ 
++static ssize_t intel_spi_is_protected_show(struct device *dev,
++					   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", intel_spi_is_protected(dev));
++}
++static DEVICE_ATTR_ADMIN_RO(intel_spi_is_protected);
++
++static ssize_t intel_spi_bios_lock_show(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", intel_spi_is_bios_lock(dev));
++}
++
++static ssize_t intel_spi_bios_lock_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t len)
++{
++	if (!sysfs_streq(buf, "unlock"))
++		return -EINVAL;
++
++	return intel_spi_bios_unlock(dev, len);
++}
++static DEVICE_ATTR_ADMIN_RW(intel_spi_bios_lock);
++
++static struct attribute *intel_spi_pci_attrs[] = {
++	 &dev_attr_intel_spi_is_protected.attr,
++	 &dev_attr_intel_spi_bios_lock.attr,
++	 NULL
++};
++
++static const struct attribute_group intel_spi_pci_attr_group = {
++	.attrs = intel_spi_pci_attrs,
++};
++
++static const struct attribute_group *intel_spi_pci_dev_groups[] = {
++	&intel_spi_pci_attr_group,
++	NULL
++};
++
+ static struct pci_driver intel_spi_pci_driver = {
+ 	.name = "intel-spi",
+ 	.id_table = intel_spi_pci_ids,
+ 	.probe = intel_spi_pci_probe,
+ 	.remove = intel_spi_pci_remove,
++	.driver = {
++		.dev_groups = intel_spi_pci_dev_groups,
++	},
+ };
+ 
+ module_pci_driver(intel_spi_pci_driver);
+diff --git a/drivers/mtd/spi-nor/controllers/intel-spi-platform.c b/drivers/mtd/spi-nor/controllers/intel-spi-platform.c
+index f80f1086f928..931c55361236 100644
+--- a/drivers/mtd/spi-nor/controllers/intel-spi-platform.c
++++ b/drivers/mtd/spi-nor/controllers/intel-spi-platform.c
+@@ -38,11 +38,51 @@ static int intel_spi_platform_remove(struct platform_device *pdev)
+ 	return intel_spi_remove(ispi);
+ }
+ 
++static ssize_t intel_spi_is_protected_show(struct device *dev,
++					   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", intel_spi_is_protected(dev));
++}
++static DEVICE_ATTR_ADMIN_RO(intel_spi_is_protected);
++
++static ssize_t intel_spi_bios_lock_show(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", intel_spi_is_bios_lock(dev));
++}
++
++static ssize_t intel_spi_bios_lock_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t len)
++{
++	if (!sysfs_streq(buf, "unlock"))
++		return -EINVAL;
++
++	return intel_spi_bios_unlock(dev, len);
++}
++static DEVICE_ATTR_ADMIN_RW(intel_spi_bios_lock);
++
++static struct attribute *intel_spi_platform_attrs[] = {
++	&dev_attr_intel_spi_is_protected.attr,
++	&dev_attr_intel_spi_bios_lock.attr,
++	NULL
++};
++
++static const struct attribute_group intel_spi_platform_attr_group = {
++	.attrs = intel_spi_platform_attrs,
++};
++
++static const struct attribute_group *intel_spi_platform_dev_groups[] = {
++	&intel_spi_platform_attr_group,
++	NULL
++};
++
+ static struct platform_driver intel_spi_platform_driver = {
+ 	.probe = intel_spi_platform_probe,
+ 	.remove = intel_spi_platform_remove,
+ 	.driver = {
+ 		.name = "intel-spi",
++		.dev_groups = intel_spi_platform_dev_groups,
+ 	},
+ };
+ 
+diff --git a/drivers/mtd/spi-nor/controllers/intel-spi.c b/drivers/mtd/spi-nor/controllers/intel-spi.c
+index b54a56a68100..269e2dd51fcc 100644
+--- a/drivers/mtd/spi-nor/controllers/intel-spi.c
++++ b/drivers/mtd/spi-nor/controllers/intel-spi.c
+@@ -132,7 +132,8 @@
+  * @sregs: Start of software sequencer registers
+  * @nregions: Maximum number of regions
+  * @pr_num: Maximum number of protected range registers
+- * @writeable: Is the chip writeable
++ * @is_protected: Whether the regions are write protected
++ * @is_bios_locked: Whether the spi is locked by BIOS
+  * @locked: Is SPI setting locked
+  * @swseq_reg: Use SW sequencer in register reads/writes
+  * @swseq_erase: Use SW sequencer in erase operation
+@@ -150,7 +151,8 @@ struct intel_spi {
+ 	void __iomem *sregs;
+ 	size_t nregions;
+ 	size_t pr_num;
+-	bool writeable;
++	bool is_protected;
++	bool is_bios_locked;
+ 	bool locked;
+ 	bool swseq_reg;
+ 	bool swseq_erase;
+@@ -246,6 +248,38 @@ static void intel_spi_dump_regs(struct intel_spi *ispi)
+ 		ispi->swseq_erase ? 'S' : 'H');
+ }
+ 
++static int intel_spi_byt_bios_unlock(struct device *dev)
++{
++	struct intel_spi *ispi = dev_get_drvdata(dev);
++	u32 bcr;
++
++	bcr = readl(ispi->base + BYT_BCR);
++	if (!(bcr & BYT_BCR_WPD)) {
++		bcr |= BYT_BCR_WPD;
++		writel(bcr, ispi->base + BYT_BCR);
++		bcr = readl(ispi->base + BYT_BCR);
++	}
++
++	if (!(bcr & BYT_BCR_WPD))
++		return -EIO;
++
++	return 0;
++}
++
++static bool intel_spi_byt_is_bios_locked(struct device *dev)
++{
++	struct intel_spi *ispi = dev_get_drvdata(dev);
++	u32 bcr = readl(ispi->base + BYT_BCR);
++
++	return !(bcr & BYT_BCR_WPD);
++}
++
++static const struct intel_spi_boardinfo byt_info = {
++	.type = INTEL_SPI_BYT,
++	.is_bios_locked = intel_spi_byt_is_bios_locked,
++	.bios_unlock = intel_spi_byt_bios_unlock,
++};
++
+ /* Reads max INTEL_SPI_FIFO_SZ bytes from the device fifo */
+ static int intel_spi_read_block(struct intel_spi *ispi, void *buf, size_t size)
+ {
+@@ -317,19 +351,6 @@ static int intel_spi_init(struct intel_spi *ispi)
+ 		ispi->nregions = BYT_FREG_NUM;
+ 		ispi->pr_num = BYT_PR_NUM;
+ 		ispi->swseq_reg = true;
+-
+-		if (writeable) {
+-			/* Disable write protection */
+-			val = readl(ispi->base + BYT_BCR);
+-			if (!(val & BYT_BCR_WPD)) {
+-				val |= BYT_BCR_WPD;
+-				writel(val, ispi->base + BYT_BCR);
+-				val = readl(ispi->base + BYT_BCR);
+-			}
+-
+-			ispi->writeable = !!(val & BYT_BCR_WPD);
+-		}
+-
+ 		break;
+ 
+ 	case INTEL_SPI_LPT:
+@@ -830,22 +851,15 @@ static int intel_spi_erase(struct spi_nor *nor, loff_t offs)
+ 	return 0;
+ }
+ 
+-static bool intel_spi_is_protected(const struct intel_spi *ispi,
+-				   unsigned int base, unsigned int limit)
++static bool intel_spi_is_pr_protected(const struct intel_spi *ispi)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < ispi->pr_num; i++) {
+-		u32 pr_base, pr_limit, pr_value;
++		u32 pr_value;
+ 
+ 		pr_value = readl(ispi->pregs + PR(i));
+-		if (!(pr_value & (PR_WPE | PR_RPE)))
+-			continue;
+-
+-		pr_limit = (pr_value & PR_LIMIT_MASK) >> PR_LIMIT_SHIFT;
+-		pr_base = pr_value & PR_BASE_MASK;
+-
+-		if (pr_base >= base && pr_limit <= limit)
++		if (pr_value == 0)
+ 			return true;
+ 	}
+ 
+@@ -882,19 +896,60 @@ static void intel_spi_fill_partition(struct intel_spi *ispi,
+ 		if (base >= limit || limit == 0)
+ 			continue;
+ 
+-		/*
+-		 * If any of the regions have protection bits set, make the
+-		 * whole partition read-only to be on the safe side.
+-		 */
+-		if (intel_spi_is_protected(ispi, base, limit))
+-			ispi->writeable = false;
+-
+ 		end = (limit << 12) + 4096;
+ 		if (end > part->size)
+ 			part->size = end;
+ 	}
+ }
+ 
++bool intel_spi_is_protected(struct device *dev)
++{
++	struct intel_spi *ispi = dev_get_drvdata(dev);
++
++	return ispi->is_protected;
++}
++EXPORT_SYMBOL_GPL(intel_spi_is_protected);
++
++bool intel_spi_is_bios_lock(struct device *dev)
++{
++	struct intel_spi *ispi = dev_get_drvdata(dev);
++
++	return ispi->is_bios_locked;
++}
++EXPORT_SYMBOL_GPL(intel_spi_is_bios_lock);
++
++ssize_t intel_spi_bios_unlock(struct device *dev, size_t len)
++{
++	struct intel_spi *ispi = dev_get_drvdata(dev);
++	struct mtd_info *child, *master = mtd_get_master(&ispi->nor.mtd);
++	int err;
++
++	if (!ispi->info->is_bios_locked)
++		return -EOPNOTSUPP;
++
++	if (ispi->is_protected || !writeable)
++		return -EPERM;
++
++	if (ispi->info->is_bios_locked(dev)) {
++		err = ispi->info->bios_unlock(dev);
++		if (err)
++			return err;
++	}
++
++	ispi->is_bios_locked = false;
++
++	/* Device is now writable */
++	ispi->nor.mtd.flags |= MTD_WRITEABLE;
++
++	mutex_lock(&master->master.partitions_lock);
++	list_for_each_entry(child, &ispi->nor.mtd.partitions, part.node)
++		child->flags |= MTD_WRITEABLE;
++	mutex_unlock(&master->master.partitions_lock);
++
++	return len;
++}
++EXPORT_SYMBOL_GPL(intel_spi_bios_unlock);
++
+ static const struct spi_nor_controller_ops intel_spi_controller_ops = {
+ 	.read_reg = intel_spi_read_reg,
+ 	.write_reg = intel_spi_write_reg,
+@@ -927,8 +982,15 @@ struct intel_spi *intel_spi_probe(struct device *dev,
+ 		return ERR_CAST(ispi->base);
+ 
+ 	ispi->dev = dev;
+-	ispi->info = info;
+-	ispi->writeable = info->writeable;
++
++	/* byt requires access to MMIO has to be implemented here */
++	if (info->type == INTEL_SPI_BYT)
++		ispi->info = &byt_info;
++	else
++		ispi->info = info;
++
++	ispi->is_bios_locked = info->is_bios_locked(dev);
++	ispi->is_protected = intel_spi_is_pr_protected(ispi);
+ 
+ 	ret = intel_spi_init(ispi);
+ 	if (ret)
+@@ -946,8 +1008,7 @@ struct intel_spi *intel_spi_probe(struct device *dev,
+ 
+ 	intel_spi_fill_partition(ispi, &part);
+ 
+-	/* Prevent writes if not explicitly enabled */
+-	if (!ispi->writeable || !writeable)
++	if (ispi->is_protected && !writeable)
+ 		ispi->nor.mtd.flags &= ~MTD_WRITEABLE;
+ 
+ 	ret = mtd_device_register(&ispi->nor.mtd, &part, 1);
+diff --git a/drivers/mtd/spi-nor/controllers/intel-spi.h b/drivers/mtd/spi-nor/controllers/intel-spi.h
+index e2f41b8827bf..744d4bf1977f 100644
+--- a/drivers/mtd/spi-nor/controllers/intel-spi.h
++++ b/drivers/mtd/spi-nor/controllers/intel-spi.h
+@@ -17,5 +17,8 @@ struct resource;
+ struct intel_spi *intel_spi_probe(struct device *dev,
+ 	struct resource *mem, const struct intel_spi_boardinfo *info);
+ int intel_spi_remove(struct intel_spi *ispi);
++bool intel_spi_is_protected(struct device *dev);
++bool intel_spi_is_bios_lock(struct device *dev);
++ssize_t intel_spi_bios_unlock(struct device *dev, size_t len);
+ 
+ #endif /* INTEL_SPI_H */
+diff --git a/include/linux/platform_data/intel-spi.h b/include/linux/platform_data/intel-spi.h
+index 7f53a5c6f35e..335dbb40620f 100644
+--- a/include/linux/platform_data/intel-spi.h
++++ b/include/linux/platform_data/intel-spi.h
+@@ -19,11 +19,13 @@ enum intel_spi_type {
+ /**
+  * struct intel_spi_boardinfo - Board specific data for Intel SPI driver
+  * @type: Type which this controller is compatible with
+- * @writeable: The chip is writeable
++ * @is_bios_locked: report if the device is locked by BIOS
++ * @bios_unlock: handler to unlock the bios
+  */
+ struct intel_spi_boardinfo {
+ 	enum intel_spi_type type;
+-	bool writeable;
++	bool (*is_bios_locked)(struct device *dev);
++	int (*bios_unlock)(struct device *dev);
+ };
+ 
+ #endif /* INTEL_SPI_PDATA_H */
+-- 
+2.25.1
+

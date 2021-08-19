@@ -1,0 +1,137 @@
+From dbd3f3acbaeac622ea3cf897ce0c262d8e9f83b5 Mon Sep 17 00:00:00 2001
+From: Roman Stratiienko <r.stratiienko@gmail.com>
+Date: Thu, 28 Jan 2021 13:39:40 +0200
+Subject: [PATCH 0166/2740] drm/sun4i: Add alpha property for sun8i and sun50i
+ VI layer
+
+DE3.0 VI layers supports plane-global alpha channel.
+DE2.0 FCC block have GLOBAL_ALPHA register that can be used as alpha source
+for blender.
+
+Add alpha property to the DRM plane and connect it to the
+corresponding registers in the mixer.
+
+Do not add alpha property for V3s SOC that have DE2.0 and 2 VI planes.
+
+Signed-off-by: Roman Stratiienko <r.stratiienko@gmail.com>
+Reviewed-by: Jernej Skrabec <jernej.skrabec@siol.net>
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210128113940.347013-3-r.stratiienko@gmail.com
+---
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c | 48 +++++++++++++++++++++-----
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.h | 11 ++++++
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 8cc294a9969d..8abb59e2f0c0 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -66,6 +66,36 @@ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
+ 	}
+ }
+ 
++static void sun8i_vi_layer_update_alpha(struct sun8i_mixer *mixer, int channel,
++					int overlay, struct drm_plane *plane)
++{
++	u32 mask, val, ch_base;
++
++	ch_base = sun8i_channel_base(mixer, channel);
++
++	if (mixer->cfg->is_de3) {
++		mask = SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MASK |
++		       SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_MASK;
++		val = SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA
++			(plane->state->alpha >> 8);
++
++		val |= (plane->state->alpha == DRM_BLEND_ALPHA_OPAQUE) ?
++			SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL :
++			SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
++
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base,
++								  overlay),
++				   mask, val);
++	} else if (mixer->cfg->vi_num == 1) {
++		regmap_update_bits(mixer->engine.regs,
++				   SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG,
++				   SUN8I_MIXER_FCC_GLOBAL_ALPHA_MASK,
++				   SUN8I_MIXER_FCC_GLOBAL_ALPHA
++					(plane->state->alpha >> 8));
++	}
++}
++
+ static int sun8i_vi_layer_update_coord(struct sun8i_mixer *mixer, int channel,
+ 				       int overlay, struct drm_plane *plane,
+ 				       unsigned int zpos)
+@@ -268,14 +298,6 @@ static int sun8i_vi_layer_update_formats(struct sun8i_mixer *mixer, int channel,
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, overlay),
+ 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR_RGB_MODE, val);
+ 
+-	/* It seems that YUV formats use global alpha setting. */
+-	if (mixer->cfg->is_de3)
+-		regmap_update_bits(mixer->engine.regs,
+-				   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base,
+-								  overlay),
+-				   SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MASK,
+-				   SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA(0xff));
+-
+ 	return 0;
+ }
+ 
+@@ -393,6 +415,8 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 
+ 	sun8i_vi_layer_update_coord(mixer, layer->channel,
+ 				    layer->overlay, plane, zpos);
++	sun8i_vi_layer_update_alpha(mixer, layer->channel,
++				    layer->overlay, plane);
+ 	sun8i_vi_layer_update_formats(mixer, layer->channel,
+ 				      layer->overlay, plane);
+ 	sun8i_vi_layer_update_buffer(mixer, layer->channel,
+@@ -534,6 +558,14 @@ struct sun8i_vi_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 
+ 	plane_cnt = mixer->cfg->ui_num + mixer->cfg->vi_num;
+ 
++	if (mixer->cfg->vi_num == 1 || mixer->cfg->is_de3) {
++		ret = drm_plane_create_alpha_property(&layer->plane);
++		if (ret) {
++			dev_err(drm->dev, "Couldn't add alpha property\n");
++			return ERR_PTR(ret);
++		}
++	}
++
+ 	ret = drm_plane_create_zpos_property(&layer->plane, index,
+ 					     0, plane_cnt - 1);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.h b/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
+index eaa6076f5dbc..48c399e1c86d 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
+@@ -29,14 +29,25 @@
+ #define SUN8I_MIXER_CHAN_VI_VDS_UV(base) \
+ 		((base) + 0xfc)
+ 
++#define SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG \
++		(0xAA000 + 0x90)
++
++#define SUN8I_MIXER_FCC_GLOBAL_ALPHA(x)			((x) << 24)
++#define SUN8I_MIXER_FCC_GLOBAL_ALPHA_MASK		GENMASK(31, 24)
++
+ #define SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN		BIT(0)
+ /* RGB mode should be set for RGB formats and cleared for YCbCr */
+ #define SUN8I_MIXER_CHAN_VI_LAYER_ATTR_RGB_MODE		BIT(15)
+ #define SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_OFFSET	8
+ #define SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_MASK	GENMASK(12, 8)
++#define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_MASK	GENMASK(2, 1)
+ #define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MASK	GENMASK(31, 24)
+ #define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA(x)	((x) << 24)
+ 
++#define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL	((0) << 1)
++#define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_LAYER	((1) << 1)
++#define SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED	((2) << 1)
++
+ #define SUN8I_MIXER_CHAN_VI_DS_N(x)			((x) << 16)
+ #define SUN8I_MIXER_CHAN_VI_DS_M(x)			((x) << 0)
+ 
+-- 
+2.25.1
+
