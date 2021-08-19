@@ -1,0 +1,210 @@
+From 73d5beea4734930a8c3f33a793d41dc25125645d Mon Sep 17 00:00:00 2001
+From: Voon Weifeng <weifeng.voon@intel.com>
+Date: Thu, 18 Mar 2021 08:50:52 +0800
+Subject: [PATCH 15/60] net: stmmac: EST interrupts handling and error
+ reporting
+
+Enabled EST related interrupts as below:
+1) Constant Gate Control Error (CGCE)
+2) Head-of-Line Blocking due to Scheduling (HLBS)
+3) Head-of-Line Blocking due to Frame Size (HLBF).
+4) Base Time Register error (BTRE)
+5) Switch to S/W owned list Complete (SWLC)
+
+For HLBS, the user will get the info of all the queues that shows this
+error. For HLBF, the user will get the info of all the queue with the
+latest frame size which causes the error. Frame size 0 indicates no
+error.
+
+The ISR handling takes place when EST feature is enabled by user.
+
+Signed-off-by: Voon Weifeng <weifeng.voon@intel.com>
+Signed-off-by: Ong Boon Leong <boon.leong.ong@intel.com>
+Co-developed-by: Mohammad Athari Bin Ismail <mohammad.athari.ismail@intel.com>
+Signed-off-by: Mohammad Athari Bin Ismail <mohammad.athari.ismail@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac5.c  | 75 +++++++++++++++++++
+ drivers/net/ethernet/stmicro/stmmac/dwmac5.h  | 32 ++++++++
+ drivers/net/ethernet/stmicro/stmmac/hwif.h    |  4 +
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c |  3 +
+ 4 files changed, 114 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac5.c b/drivers/net/ethernet/stmicro/stmmac/dwmac5.c
+index de5255b951e1..0dc2f4a9818c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac5.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac5.c
+@@ -599,9 +599,84 @@ int dwmac5_est_configure(void __iomem *ioaddr, struct stmmac_est *cfg,
+ 		ctrl &= ~EEST;
+ 
+ 	writel(ctrl, ioaddr + MTL_EST_CONTROL);
++
++	/* Configure EST interrupt */
++	if (cfg->enable)
++		ctrl = (IECGCE | IEHS | IEHF | IEBE | IECC);
++	else
++		ctrl = 0;
++
++	writel(ctrl, ioaddr + MTL_EST_INT_EN);
++
+ 	return 0;
+ }
+ 
++void dwmac5_est_irq_status(void __iomem *ioaddr, struct net_device *dev,
++			  u32 txqcnt)
++{
++	u32 status, value, feqn, hbfq, hbfs, btrl;
++	u32 txqcnt_mask = (1 << txqcnt) - 1;
++
++	status = readl(ioaddr + MTL_EST_STATUS);
++
++	value = (CGCE | HLBS | HLBF | BTRE | SWLC);
++
++	/* Return if there is no error */
++	if (!(status & value))
++		return;
++
++	if (status & CGCE) {
++		/* Clear Interrupt */
++		writel(CGCE, ioaddr + MTL_EST_STATUS);
++	}
++
++	if (status & HLBS) {
++		value = readl(ioaddr + MTL_EST_SCH_ERR);
++		value &= txqcnt_mask;
++
++		/* Clear Interrupt */
++		writel(value, ioaddr + MTL_EST_SCH_ERR);
++
++		/* Collecting info to shows all the queues that has HLBS
++		 * issue. The only way to clear this is to clear the
++		 * statistic
++		 */
++		if (net_ratelimit())
++			netdev_err(dev, "EST: HLB(sched) Queue 0x%x\n", value);
++	}
++
++	if (status & HLBF) {
++		value = readl(ioaddr + MTL_EST_FRM_SZ_ERR);
++		feqn = value & txqcnt_mask;
++
++		value = readl(ioaddr + MTL_EST_FRM_SZ_CAP);
++		hbfq = (value & SZ_CAP_HBFQ_MASK(txqcnt)) >> SZ_CAP_HBFQ_SHIFT;
++		hbfs = value & SZ_CAP_HBFS_MASK;
++
++		/* Clear Interrupt */
++		writel(feqn, ioaddr + MTL_EST_FRM_SZ_ERR);
++
++		if (net_ratelimit())
++			netdev_err(dev, "EST: HLB(size) Queue %u Size %u\n",
++				   hbfq, hbfs);
++	}
++
++	if (status & BTRE) {
++		btrl = (status & BTRL) >> BTRL_SHIFT;
++
++		if (net_ratelimit())
++			netdev_info(dev, "EST: BTR Error Loop Count %u\n",
++				    btrl);
++
++		writel(BTRE, ioaddr + MTL_EST_STATUS);
++	}
++
++	if (status & SWLC) {
++		writel(SWLC, ioaddr + MTL_EST_STATUS);
++		netdev_info(dev, "EST: SWOL has been switched\n");
++	}
++}
++
+ void dwmac5_fpe_configure(void __iomem *ioaddr, u32 num_txq, u32 num_rxq,
+ 			  bool enable)
+ {
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac5.h b/drivers/net/ethernet/stmicro/stmmac/dwmac5.h
+index 56b0762c1276..7174f5e1501b 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac5.h
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac5.h
+@@ -38,6 +38,36 @@
+ #define PTOV_SHIFT			24
+ #define SSWL				BIT(1)
+ #define EEST				BIT(0)
++
++#define MTL_EST_STATUS			0x00000c58
++#define BTRL				GENMASK(11, 8)
++#define BTRL_SHIFT			8
++#define BTRL_MAX			(0xF << BTRL_SHIFT)
++#define SWOL				BIT(7)
++#define SWOL_SHIFT			7
++#define CGCE				BIT(4)
++#define HLBS				BIT(3)
++#define HLBF				BIT(2)
++#define BTRE				BIT(1)
++#define SWLC				BIT(0)
++
++#define MTL_EST_SCH_ERR			0x00000c60
++#define MTL_EST_FRM_SZ_ERR		0x00000c64
++#define MTL_EST_FRM_SZ_CAP		0x00000c68
++#define SZ_CAP_HBFS_MASK		GENMASK(14, 0)
++#define SZ_CAP_HBFQ_SHIFT		16
++#define SZ_CAP_HBFQ_MASK(_val)		({ typeof(_val) (val) = (_val);	\
++					((val) > 4 ? GENMASK(18, 16) :	\
++					 (val) > 2 ? GENMASK(17, 16) :	\
++					 BIT(16)); })
++
++#define MTL_EST_INT_EN			0x00000c70
++#define IECGCE				CGCE
++#define IEHS				HLBS
++#define IEHF				HLBF
++#define IEBE				BTRE
++#define IECC				SWLC
++
+ #define MTL_EST_GCL_CONTROL		0x00000c80
+ #define BTR_LOW				0x0
+ #define BTR_HIGH			0x1
+@@ -111,6 +141,8 @@ int dwmac5_flex_pps_config(void __iomem *ioaddr, int index,
+ 			   u32 sub_second_inc, u32 systime_flags);
+ int dwmac5_est_configure(void __iomem *ioaddr, struct stmmac_est *cfg,
+ 			 unsigned int ptp_rate);
++void dwmac5_est_irq_status(void __iomem *ioaddr, struct net_device *dev,
++			   u32 txqcnt);
+ void dwmac5_fpe_configure(void __iomem *ioaddr, u32 num_txq, u32 num_rxq,
+ 			  bool enable);
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index da9996a985f6..4bcdedf291a5 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -393,6 +393,8 @@ struct stmmac_ops {
+ 	void (*set_arp_offload)(struct mac_device_info *hw, bool en, u32 addr);
+ 	int (*est_configure)(void __iomem *ioaddr, struct stmmac_est *cfg,
+ 			     unsigned int ptp_rate);
++	void (*est_irq_status)(void __iomem *ioaddr, struct net_device *dev,
++			       u32 txqcnt);
+ 	void (*fpe_configure)(void __iomem *ioaddr, u32 num_txq, u32 num_rxq,
+ 			      bool enable);
+ };
+@@ -491,6 +493,8 @@ struct stmmac_ops {
+ 	stmmac_do_void_callback(__priv, mac, set_arp_offload, __args)
+ #define stmmac_est_configure(__priv, __args...) \
+ 	stmmac_do_callback(__priv, mac, est_configure, __args)
++#define stmmac_est_irq_status(__priv, __args...) \
++	stmmac_do_void_callback(__priv, mac, est_irq_status, __args)
+ #define stmmac_fpe_configure(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, mac, fpe_configure, __args)
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 1b34373a1918..0d74d1102aba 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4314,6 +4314,9 @@ static irqreturn_t stmmac_interrupt(int irq, void *dev_id)
+ 	if (stmmac_safety_feat_interrupt(priv))
+ 		return IRQ_HANDLED;
+ 
++	if (priv->dma_cap.estsel)
++		stmmac_est_irq_status(priv, priv->ioaddr, priv->dev, tx_cnt);
++
+ 	/* To handle GMAC own interrupts */
+ 	if ((priv->plat->has_gmac) || xmac) {
+ 		int status = stmmac_host_irq_status(priv, priv->hw, &priv->xstats);
+-- 
+2.25.1
+
