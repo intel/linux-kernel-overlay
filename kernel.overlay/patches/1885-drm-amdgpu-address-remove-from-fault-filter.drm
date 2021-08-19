@@ -1,0 +1,137 @@
+From e01dfa9a84d17e513e191bf09037674f4c0b04b8 Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Tue, 20 Apr 2021 10:05:44 -0400
+Subject: [PATCH 1885/2740] drm/amdgpu: address remove from fault filter
+
+Add interface to remove address from fault filter ring by resetting
+fault ring entry key, then future vm fault on the address will be
+processed to recover.
+
+Define fault key as atomic64_t type to use atomic read/set/cmpxchg key
+to protect fault ring access by interrupt handler and interrupt deferred
+work for vg20. Change fault->timestamp to 48-bit to share same uint64_t
+with 8-bit fault->next, it is enough for 48bit IH timestamp.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 48 ++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |  6 ++--
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index c39ed9eb0987..dfa67c2255f2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -332,6 +332,17 @@ void amdgpu_gmc_agp_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc)
+ 			mc->agp_size >> 20, mc->agp_start, mc->agp_end);
+ }
+ 
++/**
++ * amdgpu_gmc_fault_key - get hask key from vm fault address and pasid
++ *
++ * @addr: 48 bit physical address, page aligned (36 significant bits)
++ * @pasid: 16 bit process address space identifier
++ */
++static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid)
++{
++	return addr << 4 | pasid;
++}
++
+ /**
+  * amdgpu_gmc_filter_faults - filter VM faults
+  *
+@@ -348,8 +359,7 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev, uint64_t addr,
+ 			      uint16_t pasid, uint64_t timestamp)
+ {
+ 	struct amdgpu_gmc *gmc = &adev->gmc;
+-
+-	uint64_t stamp, key = addr << 4 | pasid;
++	uint64_t stamp, key = amdgpu_gmc_fault_key(addr, pasid);
+ 	struct amdgpu_gmc_fault *fault;
+ 	uint32_t hash;
+ 
+@@ -365,7 +375,7 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev, uint64_t addr,
+ 	while (fault->timestamp >= stamp) {
+ 		uint64_t tmp;
+ 
+-		if (fault->key == key)
++		if (atomic64_read(&fault->key) == key)
+ 			return true;
+ 
+ 		tmp = fault->timestamp;
+@@ -378,7 +388,7 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev, uint64_t addr,
+ 
+ 	/* Add the fault to the ring */
+ 	fault = &gmc->fault_ring[gmc->last_fault];
+-	fault->key = key;
++	atomic64_set(&fault->key, key);
+ 	fault->timestamp = timestamp;
+ 
+ 	/* And update the hash */
+@@ -387,6 +397,36 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev, uint64_t addr,
+ 	return false;
+ }
+ 
++/**
++ * amdgpu_gmc_filter_faults_remove - remove address from VM faults filter
++ *
++ * @adev: amdgpu device structure
++ * @addr: address of the VM fault
++ * @pasid: PASID of the process causing the fault
++ *
++ * Remove the address from fault filter, then future vm fault on this address
++ * will pass to retry fault handler to recover.
++ */
++void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
++				     uint16_t pasid)
++{
++	struct amdgpu_gmc *gmc = &adev->gmc;
++	uint64_t key = amdgpu_gmc_fault_key(addr, pasid);
++	struct amdgpu_gmc_fault *fault;
++	uint32_t hash;
++	uint64_t tmp;
++
++	hash = hash_64(key, AMDGPU_GMC_FAULT_HASH_ORDER);
++	fault = &gmc->fault_ring[gmc->fault_hash[hash].idx];
++	do {
++		if (atomic64_cmpxchg(&fault->key, key, 0) == key)
++			break;
++
++		tmp = fault->timestamp;
++		fault = &gmc->fault_ring[fault->next];
++	} while (fault->timestamp < tmp);
++}
++
+ int amdgpu_gmc_ras_late_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 9d11c02a3938..6aa1d52d3aee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -66,9 +66,9 @@ struct firmware;
+  * GMC page fault information
+  */
+ struct amdgpu_gmc_fault {
+-	uint64_t	timestamp;
++	uint64_t	timestamp:48;
+ 	uint64_t	next:AMDGPU_GMC_FAULT_RING_ORDER;
+-	uint64_t	key:52;
++	atomic64_t	key;
+ };
+ 
+ /*
+@@ -318,6 +318,8 @@ void amdgpu_gmc_agp_location(struct amdgpu_device *adev,
+ 			     struct amdgpu_gmc *mc);
+ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev, uint64_t addr,
+ 			      uint16_t pasid, uint64_t timestamp);
++void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
++				     uint16_t pasid);
+ int amdgpu_gmc_ras_late_init(struct amdgpu_device *adev);
+ void amdgpu_gmc_ras_fini(struct amdgpu_device *adev);
+ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev);
+-- 
+2.25.1
+

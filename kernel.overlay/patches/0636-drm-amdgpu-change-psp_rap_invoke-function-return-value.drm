@@ -1,0 +1,150 @@
+From d5f92d25b89caa8e6b8b347c33dfbb3de16e8ec1 Mon Sep 17 00:00:00 2001
+From: Kevin Wang <kevin1.wang@amd.com>
+Date: Sun, 7 Feb 2021 21:09:59 +0800
+Subject: [PATCH 0636/2740] drm/amdgpu: change psp_rap_invoke() function return
+ value
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RAP TA is an optional firmware. if it doesn’t exist,
+the driver should bypass psp_rap_invoke() function.
+
+1. bypass psp_rap_invoke() when RAP TA is not loaded.
+2. add new parameter (status) to query RAP TA status.
+   (the status value is different with psp_ta_invoke(),
+3. fix the 'rap_status' MThread critical problem.
+   (used without lock)
+
+Signed-off-by: Kevin Wang <kevin1.wang@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c | 29 +++++++++++++++----------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c |  7 +++---
+ 3 files changed, 22 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index a4f96d931573..3510be551cdd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -1597,6 +1597,7 @@ static int psp_rap_unload(struct psp_context *psp)
+ static int psp_rap_initialize(struct psp_context *psp)
+ {
+ 	int ret;
++	enum ta_rap_status status = TA_RAP_STATUS__SUCCESS;
+ 
+ 	/*
+ 	 * TODO: bypass the initialize in sriov for now
+@@ -1620,8 +1621,8 @@ static int psp_rap_initialize(struct psp_context *psp)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = psp_rap_invoke(psp, TA_CMD_RAP__INITIALIZE);
+-	if (ret != TA_RAP_STATUS__SUCCESS) {
++	ret = psp_rap_invoke(psp, TA_CMD_RAP__INITIALIZE, &status);
++	if (ret || status != TA_RAP_STATUS__SUCCESS) {
+ 		psp_rap_unload(psp);
+ 
+ 		amdgpu_bo_free_kernel(&psp->rap_context.rap_shared_bo,
+@@ -1630,8 +1631,10 @@ static int psp_rap_initialize(struct psp_context *psp)
+ 
+ 		psp->rap_context.rap_initialized = false;
+ 
+-		dev_warn(psp->adev->dev, "RAP TA initialize fail.\n");
+-		return -EINVAL;
++		dev_warn(psp->adev->dev, "RAP TA initialize fail (%d) status %d.\n",
++			 ret, status);
++
++		return ret;
+ 	}
+ 
+ 	return 0;
+@@ -1656,13 +1659,13 @@ static int psp_rap_terminate(struct psp_context *psp)
+ 	return ret;
+ }
+ 
+-int psp_rap_invoke(struct psp_context *psp, uint32_t ta_cmd_id)
++int psp_rap_invoke(struct psp_context *psp, uint32_t ta_cmd_id, enum ta_rap_status *status)
+ {
+ 	struct ta_rap_shared_memory *rap_cmd;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (!psp->rap_context.rap_initialized)
+-		return -EINVAL;
++		return 0;
+ 
+ 	if (ta_cmd_id != TA_CMD_RAP__INITIALIZE &&
+ 	    ta_cmd_id != TA_CMD_RAP__VALIDATE_L0)
+@@ -1678,14 +1681,16 @@ int psp_rap_invoke(struct psp_context *psp, uint32_t ta_cmd_id)
+ 	rap_cmd->validation_method_id = METHOD_A;
+ 
+ 	ret = psp_ta_invoke(psp, rap_cmd->cmd_id, psp->rap_context.session_id);
+-	if (ret) {
+-		mutex_unlock(&psp->rap_context.mutex);
+-		return ret;
+-	}
++	if (ret)
++		goto out_unlock;
++
++	if (status)
++		*status = rap_cmd->rap_status;
+ 
++out_unlock:
+ 	mutex_unlock(&psp->rap_context.mutex);
+ 
+-	return rap_cmd->rap_status;
++	return ret;
+ }
+ // RAP end
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index b19717b2e110..9c9a13f2a121 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -399,7 +399,7 @@ int psp_ras_trigger_error(struct psp_context *psp,
+ 
+ int psp_hdcp_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
+ int psp_dtm_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
+-int psp_rap_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
++int psp_rap_invoke(struct psp_context *psp, uint32_t ta_cmd_id, enum ta_rap_status *status);
+ int psp_securedisplay_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
+ 
+ int psp_rlc_autoload_start(struct psp_context *psp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c
+index 8da5356c36f1..51909bf8798c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c
+@@ -48,6 +48,7 @@ static ssize_t amdgpu_rap_debugfs_write(struct file *f, const char __user *buf,
+ 	struct ta_rap_cmd_output_data *rap_cmd_output;
+ 	struct drm_device *dev = adev_to_drm(adev);
+ 	uint32_t op;
++	enum ta_rap_status status;
+ 	int ret;
+ 
+ 	if (*pos || size != 2)
+@@ -70,9 +71,8 @@ static ssize_t amdgpu_rap_debugfs_write(struct file *f, const char __user *buf,
+ 
+ 	switch (op) {
+ 	case 2:
+-		ret = psp_rap_invoke(&adev->psp, op);
+-
+-		if (ret == TA_RAP_STATUS__SUCCESS) {
++		ret = psp_rap_invoke(&adev->psp, op, &status);
++		if (!ret && status == TA_RAP_STATUS__SUCCESS) {
+ 			dev_info(adev->dev, "RAP L0 validate test success.\n");
+ 		} else {
+ 			rap_shared_mem = (struct ta_rap_shared_memory *)
+@@ -97,6 +97,7 @@ static ssize_t amdgpu_rap_debugfs_write(struct file *f, const char __user *buf,
+ 	default:
+ 		dev_info(adev->dev, "Unsupported op id: %d, ", op);
+ 		dev_info(adev->dev, "Only support op 2(L0 validate test).\n");
++		break;
+ 	}
+ 
+ 	amdgpu_gfx_off_ctrl(adev, true);
+-- 
+2.25.1
+

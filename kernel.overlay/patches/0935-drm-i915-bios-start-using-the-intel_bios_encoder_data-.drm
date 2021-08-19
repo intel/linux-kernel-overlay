@@ -1,0 +1,246 @@
+From b54e5b4fd2a3be47890880d90d8765dad4a0e21e Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Wed, 17 Mar 2021 18:36:51 +0200
+Subject: [PATCH 0935/2740] drm/i915/bios: start using the
+ intel_bios_encoder_data directly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Start using struct intel_bios_encoder_data directly. We'll start
+sanitizing the child device data directly as well, instead of the cached
+data in ddi_port_info[]. The one downside here is having to store a
+non-const pointer back to intel_bios_encoder_data.
+
+Eventually we'll be able to have a direct pointer from encoder to
+intel_bios_encoder_data, removing the need to go through the
+ddi_port_info[] array altogether. And we'll be able to remove all the
+cached data in ddi_port_info[].
+
+v2:
+- Remove supports_dp and supports_edp from ddi_port_info too
+- Add devdata != NULL check in intel_bios_is_port_edp()
+
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com> # v1
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/061df32a012ff640060920fcd730fb23f8717ee8.1615998927.git.jani.nikula@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_bios.c | 52 +++++++++++------------
+ drivers/gpu/drm/i915/display/intel_bios.h | 10 +++--
+ drivers/gpu/drm/i915/display/intel_ddi.c  | 15 +++++--
+ drivers/gpu/drm/i915/i915_drv.h           |  6 +--
+ 4 files changed, 44 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_bios.c b/drivers/gpu/drm/i915/display/intel_bios.c
+index 441274dab95c..f5be953dda22 100644
+--- a/drivers/gpu/drm/i915/display/intel_bios.c
++++ b/drivers/gpu/drm/i915/display/intel_bios.c
+@@ -1524,6 +1524,7 @@ static void sanitize_ddc_pin(struct drm_i915_private *i915,
+ 			     enum port port)
+ {
+ 	struct ddi_vbt_port_info *info = &i915->vbt.ddi_port_info[port];
++	struct child_device_config *child;
+ 	enum port p;
+ 
+ 	p = get_port_by_ddc_pin(i915, info->alternate_ddc_pin);
+@@ -1546,9 +1547,11 @@ static void sanitize_ddc_pin(struct drm_i915_private *i915,
+ 	 * port A and port E with the same AUX ch and we must pick port E :(
+ 	 */
+ 	info = &i915->vbt.ddi_port_info[p];
++	child = &info->devdata->child;
++
++	child->device_type &= ~DEVICE_TYPE_TMDS_DVI_SIGNALING;
++	child->device_type |= DEVICE_TYPE_NOT_HDMI_OUTPUT;
+ 
+-	info->supports_dvi = false;
+-	info->supports_hdmi = false;
+ 	info->alternate_ddc_pin = 0;
+ }
+ 
+@@ -1574,6 +1577,7 @@ static void sanitize_aux_ch(struct drm_i915_private *i915,
+ 			    enum port port)
+ {
+ 	struct ddi_vbt_port_info *info = &i915->vbt.ddi_port_info[port];
++	struct child_device_config *child;
+ 	enum port p;
+ 
+ 	p = get_port_by_aux_ch(i915, info->alternate_aux_channel);
+@@ -1596,8 +1600,9 @@ static void sanitize_aux_ch(struct drm_i915_private *i915,
+ 	 * port A and port E with the same AUX ch and we must pick port E :(
+ 	 */
+ 	info = &i915->vbt.ddi_port_info[p];
++	child = &info->devdata->child;
+ 
+-	info->supports_dp = false;
++	child->device_type &= ~DEVICE_TYPE_DISPLAYPORT_OUTPUT;
+ 	info->alternate_aux_channel = 0;
+ }
+ 
+@@ -1822,20 +1827,20 @@ intel_bios_encoder_supports_crt(const struct intel_bios_encoder_data *devdata)
+ 	return devdata->child.device_type & DEVICE_TYPE_ANALOG_OUTPUT;
+ }
+ 
+-static bool
++bool
+ intel_bios_encoder_supports_dvi(const struct intel_bios_encoder_data *devdata)
+ {
+ 	return devdata->child.device_type & DEVICE_TYPE_TMDS_DVI_SIGNALING;
+ }
+ 
+-static bool
++bool
+ intel_bios_encoder_supports_hdmi(const struct intel_bios_encoder_data *devdata)
+ {
+ 	return intel_bios_encoder_supports_dvi(devdata) &&
+ 		(devdata->child.device_type & DEVICE_TYPE_NOT_HDMI_OUTPUT) == 0;
+ }
+ 
+-static bool
++bool
+ intel_bios_encoder_supports_dp(const struct intel_bios_encoder_data *devdata)
+ {
+ 	return devdata->child.device_type & DEVICE_TYPE_DISPLAYPORT_OUTPUT;
+@@ -1877,11 +1882,6 @@ static void parse_ddi_port(struct drm_i915_private *i915,
+ 	is_hdmi = intel_bios_encoder_supports_hdmi(devdata);
+ 	is_edp = intel_bios_encoder_supports_edp(devdata);
+ 
+-	info->supports_dvi = is_dvi;
+-	info->supports_hdmi = is_hdmi;
+-	info->supports_dp = is_dp;
+-	info->supports_edp = is_edp;
+-
+ 	if (i915->vbt.version >= 195)
+ 		info->supports_typec_usb = child->dp_usb_type_c;
+ 
+@@ -2557,8 +2557,13 @@ bool intel_bios_is_port_edp(struct drm_i915_private *i915, enum port port)
+ 		[PORT_F] = DVO_PORT_DPF,
+ 	};
+ 
+-	if (HAS_DDI(i915))
+-		return i915->vbt.ddi_port_info[port].supports_edp;
++	if (HAS_DDI(i915)) {
++		const struct intel_bios_encoder_data *devdata;
++
++		devdata = intel_bios_encoder_data_lookup(i915, port);
++
++		return devdata && intel_bios_encoder_supports_edp(devdata);
++	}
+ 
+ 	list_for_each_entry(devdata, &i915->vbt.display_devices, node) {
+ 		child = &devdata->child;
+@@ -2930,21 +2935,6 @@ int intel_bios_alternate_ddc_pin(struct intel_encoder *encoder)
+ 	return i915->vbt.ddi_port_info[encoder->port].alternate_ddc_pin;
+ }
+ 
+-bool intel_bios_port_supports_dvi(struct drm_i915_private *i915, enum port port)
+-{
+-	return i915->vbt.ddi_port_info[port].supports_dvi;
+-}
+-
+-bool intel_bios_port_supports_hdmi(struct drm_i915_private *i915, enum port port)
+-{
+-	return i915->vbt.ddi_port_info[port].supports_hdmi;
+-}
+-
+-bool intel_bios_port_supports_dp(struct drm_i915_private *i915, enum port port)
+-{
+-	return i915->vbt.ddi_port_info[port].supports_dp;
+-}
+-
+ bool intel_bios_port_supports_typec_usb(struct drm_i915_private *i915,
+ 					enum port port)
+ {
+@@ -2955,3 +2945,9 @@ bool intel_bios_port_supports_tbt(struct drm_i915_private *i915, enum port port)
+ {
+ 	return i915->vbt.ddi_port_info[port].supports_tbt;
+ }
++
++const struct intel_bios_encoder_data *
++intel_bios_encoder_data_lookup(struct drm_i915_private *i915, enum port port)
++{
++	return i915->vbt.ddi_port_info[port].devdata;
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_bios.h b/drivers/gpu/drm/i915/display/intel_bios.h
+index 6591cf7758f2..18b5c2976bd4 100644
+--- a/drivers/gpu/drm/i915/display/intel_bios.h
++++ b/drivers/gpu/drm/i915/display/intel_bios.h
+@@ -254,10 +254,14 @@ int intel_bios_dp_boost_level(struct intel_encoder *encoder);
+ int intel_bios_hdmi_boost_level(struct intel_encoder *encoder);
+ int intel_bios_dp_max_link_rate(struct intel_encoder *encoder);
+ int intel_bios_alternate_ddc_pin(struct intel_encoder *encoder);
+-bool intel_bios_port_supports_dvi(struct drm_i915_private *i915, enum port port);
+-bool intel_bios_port_supports_hdmi(struct drm_i915_private *i915, enum port port);
+-bool intel_bios_port_supports_dp(struct drm_i915_private *i915, enum port port);
+ bool intel_bios_port_supports_typec_usb(struct drm_i915_private *i915, enum port port);
+ bool intel_bios_port_supports_tbt(struct drm_i915_private *i915, enum port port);
+ 
++const struct intel_bios_encoder_data *
++intel_bios_encoder_data_lookup(struct drm_i915_private *i915, enum port port);
++
++bool intel_bios_encoder_supports_dvi(const struct intel_bios_encoder_data *devdata);
++bool intel_bios_encoder_supports_hdmi(const struct intel_bios_encoder_data *devdata);
++bool intel_bios_encoder_supports_dp(const struct intel_bios_encoder_data *devdata);
++
+ #endif /* _INTEL_BIOS_H_ */
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 64a952db8528..d74cfdcabca5 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -4426,6 +4426,7 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ {
+ 	struct intel_digital_port *dig_port;
+ 	struct intel_encoder *encoder;
++	const struct intel_bios_encoder_data *devdata;
+ 	bool init_hdmi, init_dp;
+ 	enum phy phy = intel_port_to_phy(dev_priv, port);
+ 
+@@ -4441,9 +4442,17 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ 		return;
+ 	}
+ 
+-	init_hdmi = intel_bios_port_supports_dvi(dev_priv, port) ||
+-		intel_bios_port_supports_hdmi(dev_priv, port);
+-	init_dp = intel_bios_port_supports_dp(dev_priv, port);
++	devdata = intel_bios_encoder_data_lookup(dev_priv, port);
++	if (!devdata) {
++		drm_dbg_kms(&dev_priv->drm,
++			    "VBT says port %c is not present\n",
++			    port_name(port));
++		return;
++	}
++
++	init_hdmi = intel_bios_encoder_supports_dvi(devdata) ||
++		intel_bios_encoder_supports_hdmi(devdata);
++	init_dp = intel_bios_encoder_supports_dp(devdata);
+ 
+ 	if (intel_bios_is_lspcon_present(dev_priv, port)) {
+ 		/*
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index b80580cc3897..aaf3a87c6f04 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -583,7 +583,7 @@ i915_fence_timeout(const struct drm_i915_private *i915)
+ 
+ struct ddi_vbt_port_info {
+ 	/* Non-NULL if port present. */
+-	const struct intel_bios_encoder_data *devdata;
++	struct intel_bios_encoder_data *devdata;
+ 
+ 	int max_tmds_clock;
+ 
+@@ -591,10 +591,6 @@ struct ddi_vbt_port_info {
+ 	u8 hdmi_level_shift;
+ 	u8 hdmi_level_shift_set:1;
+ 
+-	u8 supports_dvi:1;
+-	u8 supports_hdmi:1;
+-	u8 supports_dp:1;
+-	u8 supports_edp:1;
+ 	u8 supports_typec_usb:1;
+ 	u8 supports_tbt:1;
+ 
+-- 
+2.25.1
+

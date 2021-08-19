@@ -1,0 +1,135 @@
+From 24865035617175a446072e1966b866d0951cecc6 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Wed, 31 Mar 2021 18:27:21 -0700
+Subject: [PATCH 1098/2740] drm/msm: Improved debugfs gem stats
+
+The last patch lost the breakdown of active vs inactive GEM objects in
+$debugfs/gem.  But we can add some better stats to summarize not just
+active vs inactive, but also purgable/purged to make up for that.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Tested-by: Douglas Anderson <dianders@chromium.org>
+Reviewed-by: Douglas Anderson <dianders@chromium.org>
+Link: https://lore.kernel.org/r/20210401012722.527712-5-robdclark@gmail.com
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/msm_fb.c  |  3 ++-
+ drivers/gpu/drm/msm/msm_gem.c | 31 ++++++++++++++++++++++++-------
+ drivers/gpu/drm/msm/msm_gem.h | 11 ++++++++++-
+ 3 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_fb.c b/drivers/gpu/drm/msm/msm_fb.c
+index d42f0665359a..91c0e493aed5 100644
+--- a/drivers/gpu/drm/msm/msm_fb.c
++++ b/drivers/gpu/drm/msm/msm_fb.c
+@@ -33,6 +33,7 @@ static const struct drm_framebuffer_funcs msm_framebuffer_funcs = {
+ #ifdef CONFIG_DEBUG_FS
+ void msm_framebuffer_describe(struct drm_framebuffer *fb, struct seq_file *m)
+ {
++	struct msm_gem_stats stats = {};
+ 	int i, n = fb->format->num_planes;
+ 
+ 	seq_printf(m, "fb: %dx%d@%4.4s (%2d, ID:%d)\n",
+@@ -42,7 +43,7 @@ void msm_framebuffer_describe(struct drm_framebuffer *fb, struct seq_file *m)
+ 	for (i = 0; i < n; i++) {
+ 		seq_printf(m, "   %d: offset=%d pitch=%d, obj: ",
+ 				i, fb->offsets[i], fb->pitches[i]);
+-		msm_gem_describe(fb->obj[i], m);
++		msm_gem_describe(fb->obj[i], m, &stats);
+ 	}
+ }
+ #endif
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index b8dde5332750..f146d9c5ba9c 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -873,7 +873,8 @@ static void describe_fence(struct dma_fence *fence, const char *type,
+ 				fence->seqno);
+ }
+ 
+-void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m)
++void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m,
++		struct msm_gem_stats *stats)
+ {
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+ 	struct dma_resv *robj = obj->resv;
+@@ -885,11 +886,23 @@ void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m)
+ 
+ 	msm_gem_lock(obj);
+ 
++	stats->all.count++;
++	stats->all.size += obj->size;
++
++	if (is_active(msm_obj)) {
++		stats->active.count++;
++		stats->active.size += obj->size;
++	}
++
+ 	switch (msm_obj->madv) {
+ 	case __MSM_MADV_PURGED:
++		stats->purged.count++;
++		stats->purged.size += obj->size;
+ 		madv = " purged";
+ 		break;
+ 	case MSM_MADV_DONTNEED:
++		stats->purgable.count++;
++		stats->purgable.size += obj->size;
+ 		madv = " purgeable";
+ 		break;
+ 	case MSM_MADV_WILLNEED:
+@@ -956,20 +969,24 @@ void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m)
+ 
+ void msm_gem_describe_objects(struct list_head *list, struct seq_file *m)
+ {
++	struct msm_gem_stats stats = {};
+ 	struct msm_gem_object *msm_obj;
+-	int count = 0;
+-	size_t size = 0;
+ 
+ 	seq_puts(m, "   flags       id ref  offset   kaddr            size     madv      name\n");
+ 	list_for_each_entry(msm_obj, list, node) {
+ 		struct drm_gem_object *obj = &msm_obj->base;
+ 		seq_puts(m, "   ");
+-		msm_gem_describe(obj, m);
+-		count++;
+-		size += obj->size;
++		msm_gem_describe(obj, m, &stats);
+ 	}
+ 
+-	seq_printf(m, "Total %d objects, %zu bytes\n", count, size);
++	seq_printf(m, "Total:    %4d objects, %9zu bytes\n",
++			stats.all.count, stats.all.size);
++	seq_printf(m, "Active:   %4d objects, %9zu bytes\n",
++			stats.active.count, stats.active.size);
++	seq_printf(m, "Purgable: %4d objects, %9zu bytes\n",
++			stats.purgable.count, stats.purgable.size);
++	seq_printf(m, "Purged:   %4d objects, %9zu bytes\n",
++			stats.purged.count, stats.purged.size);
+ }
+ #endif
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index e6b28edb1db9..7c7d54bad189 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -158,7 +158,16 @@ struct drm_gem_object *msm_gem_import(struct drm_device *dev,
+ __printf(2, 3)
+ void msm_gem_object_set_name(struct drm_gem_object *bo, const char *fmt, ...);
+ #ifdef CONFIG_DEBUG_FS
+-void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m);
++
++struct msm_gem_stats {
++	struct {
++		unsigned count;
++		size_t size;
++	} all, active, purgable, purged;
++};
++
++void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m,
++		struct msm_gem_stats *stats);
+ void msm_gem_describe_objects(struct list_head *list, struct seq_file *m);
+ #endif
+ 
+-- 
+2.25.1
+

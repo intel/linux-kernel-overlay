@@ -1,0 +1,125 @@
+From b8cb108d2bbf6bd29d9cc185c56b0e9b8d707235 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Tue, 23 Mar 2021 16:50:14 +0100
+Subject: [PATCH 0787/2740] drm/i915: Take reservation lock around
+ i915_vma_pin.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We previously complained when ww == NULL.
+
+This function is now only used in selftests to pin an object,
+and ww locking is now fixed.
+
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+[danvet: Resolve conflict because we don't have a set-domain refactor,
+see
+https://lore.kernel.org/intel-gfx/20210203090205.25818-8-chris@chris-wilson.co.uk/
+
+The really worrying thing here is that the above patch had a change in
+arguments for i915_gem_object_set_to_gtt_domain(), without any
+explanation. I decided to just faithfully apply Maarten's change but
+not the argument change which was in Maarten's context diff.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210323155059.628690-26-maarten.lankhorst@linux.intel.com
+---
+ .../i915/gem/selftests/i915_gem_coherency.c   | 10 ++++------
+ drivers/gpu/drm/i915/i915_gem.c               |  6 +++++-
+ drivers/gpu/drm/i915/i915_vma.c               |  4 +---
+ drivers/gpu/drm/i915/i915_vma.h               | 20 +++++++++++++++----
+ 4 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/selftests/i915_gem_coherency.c b/drivers/gpu/drm/i915/gem/selftests/i915_gem_coherency.c
+index 1117d2a44518..6fe08e7ef25f 100644
+--- a/drivers/gpu/drm/i915/gem/selftests/i915_gem_coherency.c
++++ b/drivers/gpu/drm/i915/gem/selftests/i915_gem_coherency.c
+@@ -200,17 +200,15 @@ static int gpu_set(struct context *ctx, unsigned long offset, u32 v)
+ 	u32 *cs;
+ 	int err;
+ 
++	vma = i915_gem_object_ggtt_pin(ctx->obj, NULL, 0, 0, 0);
++	if (IS_ERR(vma))
++		return PTR_ERR(vma);
++
+ 	i915_gem_object_lock(ctx->obj, NULL);
+ 	err = i915_gem_object_set_to_gtt_domain(ctx->obj, true);
+ 	if (err)
+ 		goto out_unlock;
+ 
+-	vma = i915_gem_object_ggtt_pin(ctx->obj, NULL, 0, 0, 0);
+-	if (IS_ERR(vma)) {
+-		err = PTR_ERR(vma);
+-		goto out_unlock;
+-	}
+-
+ 	rq = intel_engine_create_kernel_request(ctx->engine);
+ 	if (IS_ERR(rq)) {
+ 		err = PTR_ERR(rq);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 1e266c3bf039..caa7bedb564f 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -928,7 +928,11 @@ i915_gem_object_ggtt_pin_ww(struct drm_i915_gem_object *obj,
+ 			return ERR_PTR(ret);
+ 	}
+ 
+-	ret = i915_vma_pin_ww(vma, ww, size, alignment, flags | PIN_GLOBAL);
++	if (ww)
++		ret = i915_vma_pin_ww(vma, ww, size, alignment, flags | PIN_GLOBAL);
++	else
++		ret = i915_vma_pin(vma, size, alignment, flags | PIN_GLOBAL);
++
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 4215714ae19c..6401299d421a 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -863,9 +863,7 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 	int err;
+ 
+ #ifdef CONFIG_PROVE_LOCKING
+-	if (debug_locks && lockdep_is_held(&vma->vm->i915->drm.struct_mutex))
+-		WARN_ON(!ww);
+-	if (debug_locks && ww && vma->resv)
++	if (debug_locks && !WARN_ON(!ww) && vma->resv)
+ 		assert_vma_held(vma);
+ #endif
+ 
+diff --git a/drivers/gpu/drm/i915/i915_vma.h b/drivers/gpu/drm/i915/i915_vma.h
+index 6b48f5c42488..8df784a026d2 100644
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -246,10 +246,22 @@ i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ static inline int __must_check
+ i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
+ {
+-#ifdef CONFIG_LOCKDEP
+-	WARN_ON_ONCE(vma->resv && dma_resv_held(vma->resv));
+-#endif
+-	return i915_vma_pin_ww(vma, NULL, size, alignment, flags);
++	struct i915_gem_ww_ctx ww;
++	int err;
++
++	i915_gem_ww_ctx_init(&ww, true);
++retry:
++	err = i915_gem_object_lock(vma->obj, &ww);
++	if (!err)
++		err = i915_vma_pin_ww(vma, &ww, size, alignment, flags);
++	if (err == -EDEADLK) {
++		err = i915_gem_ww_ctx_backoff(&ww);
++		if (!err)
++			goto retry;
++	}
++	i915_gem_ww_ctx_fini(&ww);
++
++	return err;
+ }
+ 
+ int i915_ggtt_pin(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+-- 
+2.25.1
+

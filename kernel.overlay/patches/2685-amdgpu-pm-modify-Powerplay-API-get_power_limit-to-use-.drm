@@ -1,0 +1,195 @@
+From b04148a50a9167f00bdcdc26bca769b3df26c3b6 Mon Sep 17 00:00:00 2001
+From: Darren Powell <darren.powell@amd.com>
+Date: Sat, 22 May 2021 00:13:53 -0400
+Subject: [PATCH 2685/2740] amdgpu/pm: modify Powerplay API get_power_limit to
+ use new pp_power enums
+
+ updated {amd_pm_funcs}->get_power_limit() signature
+ rewrote pp_get_power_limit to use new enums
+ pp_get_power_limit now returns -EOPNOTSUPP for unknown power limit
+ update calls to {amd_pm_funcs}->get_power_limit()
+
+* Test Notes
+* testing hardware was NAVI10 (tests SMU path)
+** needs testing on VANGOGH
+** needs testing on SMU < 11
+** ie, one of
+ TOPAZ, FIJI, TONGA, POLARIS10, POLARIS11, POLARIS12, VEGAM, CARRIZO,
+ STONEY, VEGA10, VEGA12,VEGA20, RAVEN, BONAIRE, HAWAII
+
+* Test
+ AMDGPU_PCI_ADDR=`lspci -nn | grep "VGA\|Display" | cut -d " " -f 1`
+ AMDGPU_HWMON=`ls -la /sys/class/hwmon | grep $AMDGPU_PCI_ADDR | cut -d " " -f 11`
+ HWMON_DIR=/sys/class/hwmon/${AMDGPU_HWMON}
+
+ lspci -nn | grep "VGA\|Display" ; \
+ echo "=== power1 cap ===" ; cat $HWMON_DIR/power1_cap ;           \
+ echo "=== power1 cap max ===" ; cat $HWMON_DIR/power1_cap_max ;   \
+ echo "=== power1 cap def ===" ; cat $HWMON_DIR/power1_cap_default
+
+Signed-off-by: Darren Powell <darren.powell@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |  5 +--
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            | 27 ++++++++-------
+ .../gpu/drm/amd/pm/powerplay/amd_powerplay.c  | 33 ++++++++++++-------
+ 3 files changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 6689164e62f2..62559723bcb9 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -307,8 +307,9 @@ struct amd_pm_funcs {
+ 				uint32_t block_type, bool gate);
+ 	int (*set_clockgating_by_smu)(void *handle, uint32_t msg_id);
+ 	int (*set_power_limit)(void *handle, uint32_t n);
+-	int (*get_power_limit)(void *handle, uint32_t *limit, uint32_t *max_limit,
+-			bool default_limit);
++	int (*get_power_limit)(void *handle, uint32_t *limit,
++			enum pp_power_limit_level pp_limit_level,
++			enum pp_power_type power_type);
+ 	int (*get_power_profile_mode)(void *handle, char *buf);
+ 	int (*set_power_profile_mode)(void *handle, long *input, uint32_t size);
+ 	int (*set_fine_grain_clk_vol)(void *handle, uint32_t type, long *input, uint32_t size);
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index c827f0ae5afa..e34ca352294f 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -2908,8 +2908,8 @@ static ssize_t amdgpu_hwmon_show_power_cap_max(struct device *dev,
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
+ 	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
+ 	enum pp_power_type power_type = to_sensor_dev_attr(attr)->index;
++	enum pp_power_limit_level pp_limit_level = PP_PWR_LIMIT_MAX;
+ 	uint32_t limit;
+-	uint32_t max_limit = 0;
+ 	ssize_t size;
+ 	int r;
+ 
+@@ -2925,12 +2925,13 @@ static ssize_t amdgpu_hwmon_show_power_cap_max(struct device *dev,
+ 	}
+ 
+ 	if (is_support_sw_smu(adev)) {
+-		smu_get_power_limit(&adev->smu, &limit, PP_PWR_LIMIT_MAX, power_type);
++		smu_get_power_limit(&adev->smu, &limit,
++				    pp_limit_level, power_type);
+ 		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else if (pp_funcs && pp_funcs->get_power_limit) {
+-		pp_funcs->get_power_limit(adev->powerplay.pp_handle,
+-				&limit, &max_limit, true);
+-		size = snprintf(buf, PAGE_SIZE, "%u\n", max_limit * 1000000);
++		pp_funcs->get_power_limit(adev->powerplay.pp_handle, &limit,
++					  pp_limit_level, power_type);
++		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else {
+ 		size = snprintf(buf, PAGE_SIZE, "\n");
+ 	}
+@@ -2948,6 +2949,7 @@ static ssize_t amdgpu_hwmon_show_power_cap(struct device *dev,
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
+ 	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
+ 	enum pp_power_type power_type = to_sensor_dev_attr(attr)->index;
++	enum pp_power_limit_level pp_limit_level = PP_PWR_LIMIT_CURRENT;
+ 	uint32_t limit;
+ 	ssize_t size;
+ 	int r;
+@@ -2964,11 +2966,12 @@ static ssize_t amdgpu_hwmon_show_power_cap(struct device *dev,
+ 	}
+ 
+ 	if (is_support_sw_smu(adev)) {
+-		smu_get_power_limit(&adev->smu, &limit, PP_PWR_LIMIT_CURRENT, power_type);
++		smu_get_power_limit(&adev->smu, &limit,
++				    pp_limit_level, power_type);
+ 		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else if (pp_funcs && pp_funcs->get_power_limit) {
+-		pp_funcs->get_power_limit(adev->powerplay.pp_handle,
+-				&limit, NULL, false);
++		pp_funcs->get_power_limit(adev->powerplay.pp_handle, &limit,
++					  pp_limit_level, power_type);
+ 		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else {
+ 		size = snprintf(buf, PAGE_SIZE, "\n");
+@@ -2987,6 +2990,7 @@ static ssize_t amdgpu_hwmon_show_power_cap_default(struct device *dev,
+ 	struct amdgpu_device *adev = dev_get_drvdata(dev);
+ 	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
+ 	enum pp_power_type power_type = to_sensor_dev_attr(attr)->index;
++	enum pp_power_limit_level pp_limit_level = PP_PWR_LIMIT_DEFAULT;
+ 	uint32_t limit;
+ 	ssize_t size;
+ 	int r;
+@@ -3003,11 +3007,12 @@ static ssize_t amdgpu_hwmon_show_power_cap_default(struct device *dev,
+ 	}
+ 
+ 	if (is_support_sw_smu(adev)) {
+-		smu_get_power_limit(&adev->smu, &limit, PP_PWR_LIMIT_DEFAULT, power_type);
++		smu_get_power_limit(&adev->smu, &limit,
++				    pp_limit_level, power_type);
+ 		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else if (pp_funcs && pp_funcs->get_power_limit) {
+-		pp_funcs->get_power_limit(adev->powerplay.pp_handle,
+-				&limit, NULL, true);
++		pp_funcs->get_power_limit(adev->powerplay.pp_handle, &limit,
++					  pp_limit_level, power_type);
+ 		size = snprintf(buf, PAGE_SIZE, "%u\n", limit * 1000000);
+ 	} else {
+ 		size = snprintf(buf, PAGE_SIZE, "\n");
+diff --git a/drivers/gpu/drm/amd/pm/powerplay/amd_powerplay.c b/drivers/gpu/drm/amd/pm/powerplay/amd_powerplay.c
+index c73504e998e5..d2a38246a78a 100644
+--- a/drivers/gpu/drm/amd/pm/powerplay/amd_powerplay.c
++++ b/drivers/gpu/drm/amd/pm/powerplay/amd_powerplay.c
+@@ -1035,31 +1035,42 @@ static int pp_set_power_limit(void *handle, uint32_t limit)
+ }
+ 
+ static int pp_get_power_limit(void *handle, uint32_t *limit,
+-		uint32_t *max_limit, bool default_limit)
++			      enum pp_power_limit_level pp_limit_level,
++			      enum pp_power_type power_type)
+ {
+ 	struct pp_hwmgr *hwmgr = handle;
++	int ret = 0;
+ 
+ 	if (!hwmgr || !hwmgr->pm_en ||!limit)
+ 		return -EINVAL;
+ 
++	if (power_type != PP_PWR_TYPE_SUSTAINED)
++		return -EOPNOTSUPP;
++
+ 	mutex_lock(&hwmgr->smu_lock);
+ 
+-	if (default_limit) {
+-		*limit = hwmgr->default_power_limit;
+-		if (max_limit) {
+-			*max_limit = *limit;
++	switch (pp_limit_level) {
++		case PP_PWR_LIMIT_CURRENT:
++			*limit = hwmgr->power_limit;
++			break;
++		case PP_PWR_LIMIT_DEFAULT:
++			*limit = hwmgr->default_power_limit;
++			break;
++		case PP_PWR_LIMIT_MAX:
++			*limit = hwmgr->default_power_limit;
+ 			if (hwmgr->od_enabled) {
+-				*max_limit *= (100 + hwmgr->platform_descriptor.TDPODLimit);
+-				*max_limit /= 100;
++				*limit *= (100 + hwmgr->platform_descriptor.TDPODLimit);
++				*limit /= 100;
+ 			}
+-		}
++			break;
++		default:
++			ret = -EOPNOTSUPP;
++			break;
+ 	}
+-	else
+-		*limit = hwmgr->power_limit;
+ 
+ 	mutex_unlock(&hwmgr->smu_lock);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int pp_display_configuration_change(void *handle,
+-- 
+2.25.1
+

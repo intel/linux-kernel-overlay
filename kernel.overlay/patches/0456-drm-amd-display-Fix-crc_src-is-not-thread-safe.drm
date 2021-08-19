@@ -1,0 +1,190 @@
+From 4e29d12c648de6002426c95ca17576ed00784e58 Mon Sep 17 00:00:00 2001
+From: Wayne Lin <Wayne.Lin@amd.com>
+Date: Tue, 9 Feb 2021 16:52:22 +0800
+Subject: [PATCH 0456/2740] drm/amd/display: Fix crc_src is not thread safe
+
+[Why & How]
+Find out that referring to crtc_state->crc_src is not thread safe.
+Move crc_src from dm_crtc_state to dm_irq_params to fix this.
+
+Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+Acked-by: Eryk Brol <eryk.brol@amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 11 ++++++--
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  1 -
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c | 28 +++++++++++++++----
+ .../display/amdgpu_dm/amdgpu_dm_irq_params.h  |  6 ++++
+ 4 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 5780e4ed191e..d73ef50089c3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -5519,7 +5519,6 @@ dm_crtc_duplicate_state(struct drm_crtc *crtc)
+ 	state->abm_level = cur->abm_level;
+ 	state->vrr_supported = cur->vrr_supported;
+ 	state->freesync_config = cur->freesync_config;
+-	state->crc_src = cur->crc_src;
+ 	state->cm_has_degamma = cur->cm_has_degamma;
+ 	state->cm_is_degamma_srgb = cur->cm_is_degamma_srgb;
+ 
+@@ -8664,6 +8663,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 	 */
+ 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+ 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
++#ifdef CONFIG_DEBUG_FS
++		enum amdgpu_dm_pipe_crc_source cur_crc_src;
++#endif
+ 
+ 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+ 
+@@ -8680,11 +8682,14 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 			 * settings for the stream.
+ 			 */
+ 			dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
++			spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
++			cur_crc_src = acrtc->dm_irq_params.crc_src;
++			spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
+ 
+-			if (amdgpu_dm_is_valid_crc_source(dm_new_crtc_state->crc_src)) {
++			if (amdgpu_dm_is_valid_crc_source(cur_crc_src)) {
+ 				amdgpu_dm_crtc_configure_crc_source(
+ 					crtc, dm_new_crtc_state,
+-					dm_new_crtc_state->crc_src);
++					cur_crc_src);
+ 			}
+ #endif
+ 		}
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 4fbea832f002..b713d041a215 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -452,7 +452,6 @@ struct dm_crtc_state {
+ 	int active_planes;
+ 
+ 	int crc_skip_count;
+-	enum amdgpu_dm_pipe_crc_source crc_src;
+ 
+ 	bool freesync_timing_changed;
+ 	bool freesync_vrr_info_changed;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index 66cb8730586b..a96770621f5a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -142,8 +142,11 @@ int amdgpu_dm_crtc_configure_crc_source(struct drm_crtc *crtc,
+ int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name)
+ {
+ 	enum amdgpu_dm_pipe_crc_source source = dm_parse_crc_source(src_name);
++	enum amdgpu_dm_pipe_crc_source cur_crc_src;
+ 	struct drm_crtc_commit *commit;
+ 	struct dm_crtc_state *crtc_state;
++	struct drm_device *drm_dev = crtc->dev;
++	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 	struct drm_dp_aux *aux = NULL;
+ 	bool enable = false;
+ 	bool enabled = false;
+@@ -182,6 +185,9 @@ int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name)
+ 
+ 	enable = amdgpu_dm_is_valid_crc_source(source);
+ 	crtc_state = to_dm_crtc_state(crtc->state);
++	spin_lock_irq(&drm_dev->event_lock);
++	cur_crc_src = acrtc->dm_irq_params.crc_src;
++	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	/*
+ 	 * USER REQ SRC | CURRENT SRC | BEHAVIOR
+@@ -198,7 +204,7 @@ int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name)
+ 	 */
+ 	if (dm_is_crc_source_dprx(source) ||
+ 	    (source == AMDGPU_DM_PIPE_CRC_SOURCE_NONE &&
+-	     dm_is_crc_source_dprx(crtc_state->crc_src))) {
++	     dm_is_crc_source_dprx(cur_crc_src))) {
+ 		struct amdgpu_dm_connector *aconn = NULL;
+ 		struct drm_connector *connector;
+ 		struct drm_connector_list_iter conn_iter;
+@@ -237,7 +243,7 @@ int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name)
+ 	 * Reading the CRC requires the vblank interrupt handler to be
+ 	 * enabled. Keep a reference until CRC capture stops.
+ 	 */
+-	enabled = amdgpu_dm_is_valid_crc_source(crtc_state->crc_src);
++	enabled = amdgpu_dm_is_valid_crc_source(cur_crc_src);
+ 	if (!enabled && enable) {
+ 		ret = drm_crtc_vblank_get(crtc);
+ 		if (ret)
+@@ -261,7 +267,9 @@ int amdgpu_dm_crtc_set_crc_source(struct drm_crtc *crtc, const char *src_name)
+ 		}
+ 	}
+ 
+-	crtc_state->crc_src = source;
++	spin_lock_irq(&drm_dev->event_lock);
++	acrtc->dm_irq_params.crc_src = source;
++	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	/* Reset crc_skipped on dm state */
+ 	crtc_state->crc_skip_count = 0;
+@@ -286,16 +294,26 @@ void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc)
+ {
+ 	struct dm_crtc_state *crtc_state;
+ 	struct dc_stream_state *stream_state;
++	struct drm_device *drm_dev = NULL;
++	enum amdgpu_dm_pipe_crc_source cur_crc_src;
++	struct amdgpu_crtc *acrtc = NULL;
+ 	uint32_t crcs[3];
++	unsigned long flags;
+ 
+ 	if (crtc == NULL)
+ 		return;
+ 
+ 	crtc_state = to_dm_crtc_state(crtc->state);
+ 	stream_state = crtc_state->stream;
++	acrtc = to_amdgpu_crtc(crtc);
++	drm_dev = crtc->dev;
++
++	spin_lock_irqsave(&drm_dev->event_lock, flags);
++	cur_crc_src = acrtc->dm_irq_params.crc_src;
++	spin_unlock_irqrestore(&drm_dev->event_lock, flags);
+ 
+ 	/* Early return if CRC capture is not enabled. */
+-	if (!amdgpu_dm_is_valid_crc_source(crtc_state->crc_src))
++	if (!amdgpu_dm_is_valid_crc_source(cur_crc_src))
+ 		return;
+ 
+ 	/*
+@@ -309,7 +327,7 @@ void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc)
+ 		return;
+ 	}
+ 
+-	if (dm_is_crc_source_crtc(crtc_state->crc_src)) {
++	if (dm_is_crc_source_crtc(cur_crc_src)) {
+ 		if (!dc_stream_get_crc(stream_state->ctx->dc, stream_state,
+ 				       &crcs[0], &crcs[1], &crcs[2]))
+ 			return;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
+index 45825a34f8eb..db2e7703a79f 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
+@@ -26,12 +26,18 @@
+ #ifndef __AMDGPU_DM_IRQ_PARAMS_H__
+ #define __AMDGPU_DM_IRQ_PARAMS_H__
+ 
++#include "amdgpu_dm_crc.h"
++
+ struct dm_irq_params {
+ 	u32 last_flip_vblank;
+ 	struct mod_vrr_params vrr_params;
+ 	struct dc_stream_state *stream;
+ 	int active_planes;
+ 	struct mod_freesync_config freesync_config;
++
++#ifdef CONFIG_DEBUG_FS
++	enum amdgpu_dm_pipe_crc_source crc_src;
++#endif
+ };
+ 
+ #endif /* __AMDGPU_DM_IRQ_PARAMS_H__ */
+-- 
+2.25.1
+

@@ -1,0 +1,377 @@
+From a1cd8a28fc8aa54fa97305d235efd8d7c7f18af0 Mon Sep 17 00:00:00 2001
+From: Peng Ju Zhou <PengJu.Zhou@amd.com>
+Date: Fri, 14 May 2021 14:26:46 +0800
+Subject: [PATCH 2238/2740] drm/amdgpu: Indirect register access for Navi12
+ sriov
+
+This patch series are used for GC/MMHUB(part)/IH_RB_CNTL
+indirect access in the SRIOV environment.
+
+There are 4 bits, controlled by host, to control
+if GC/MMHUB(part)/IH_RB_CNTL indirect access enabled.
+(one bit is master bit controls other 3 bits)
+
+For GC registers, changing all the register access from MMIO to
+RLC and use RLC as the default access method in the full access time.
+
+For partial MMHUB registers, changing their access from MMIO to
+RLC in the full access time, the remaining registers
+keep the original access method.
+
+For IH_RB_CNTL register, changing it's access from MMIO to PSP.
+
+Signed-off-by: Peng Ju Zhou <PengJu.Zhou@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.h    |  4 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c     | 78 +++++++++----------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c      |  9 ++-
+ drivers/gpu/drm/amd/amdgpu/soc15_common.h  | 87 +++++++++++++---------
+ 6 files changed, 97 insertions(+), 84 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 45a780ebc368..7dbbd1ba15a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1146,6 +1146,7 @@ int emu_soc_asic_init(struct amdgpu_device *adev);
+  * Registers read & write functions.
+  */
+ #define AMDGPU_REGS_NO_KIQ    (1<<1)
++#define AMDGPU_REGS_RLC	(1<<2)
+ 
+ #define RREG32_NO_KIQ(reg) amdgpu_device_rreg(adev, (reg), AMDGPU_REGS_NO_KIQ)
+ #define WREG32_NO_KIQ(reg, v) amdgpu_device_wreg(adev, (reg), (v), AMDGPU_REGS_NO_KIQ)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index ef50b7d75b77..276cf532341c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -499,7 +499,7 @@ void amdgpu_mm_wreg_mmio_rlc(struct amdgpu_device *adev,
+ 	    adev->gfx.rlc.funcs &&
+ 	    adev->gfx.rlc.funcs->is_rlcg_access_range) {
+ 		if (adev->gfx.rlc.funcs->is_rlcg_access_range(adev, reg))
+-			return adev->gfx.rlc.funcs->rlcg_wreg(adev, reg, v, 0);
++			return adev->gfx.rlc.funcs->rlcg_wreg(adev, reg, v, 0, 0);
+ 	} else {
+ 		writel(v, ((void __iomem *)adev->rmmio) + (reg * 4));
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.h
+index 4fc2ce8ce8ab..7a4775ab6804 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.h
+@@ -127,8 +127,8 @@ struct amdgpu_rlc_funcs {
+ 	void (*reset)(struct amdgpu_device *adev);
+ 	void (*start)(struct amdgpu_device *adev);
+ 	void (*update_spm_vmid)(struct amdgpu_device *adev, unsigned vmid);
+-	void (*rlcg_wreg)(struct amdgpu_device *adev, u32 offset, u32 v, u32 flag);
+-	u32 (*rlcg_rreg)(struct amdgpu_device *adev, u32 offset, u32 flag);
++	void (*rlcg_wreg)(struct amdgpu_device *adev, u32 offset, u32 v, u32 acc_flags, u32 hwip);
++	u32 (*rlcg_rreg)(struct amdgpu_device *adev, u32 offset, u32 acc_flags, u32 hwip);
+ 	bool (*is_rlcg_access_range)(struct amdgpu_device *adev, uint32_t reg);
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+index fc12e3c3e9ca..d3af9bdb6cc2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -1432,38 +1432,36 @@ static const struct soc15_reg_golden golden_settings_gc_10_1_2[] =
+ 	SOC15_REG_GOLDEN_VALUE(GC, 0, mmUTCL1_CTRL, 0xffffffff, 0x00c00000)
+ };
+ 
+-static bool gfx_v10_is_rlcg_rw(struct amdgpu_device *adev, u32 offset, uint32_t *flag, bool write)
+-{
+-	/* always programed by rlcg, only for gc */
+-	if (offset == SOC15_REG_OFFSET(GC, 0, mmRLC_CSIB_ADDR_HI) ||
+-	    offset == SOC15_REG_OFFSET(GC, 0, mmRLC_CSIB_ADDR_LO) ||
+-	    offset == SOC15_REG_OFFSET(GC, 0, mmRLC_CSIB_LENGTH) ||
+-	    offset == SOC15_REG_OFFSET(GC, 0, mmGRBM_GFX_CNTL) ||
+-	    offset == SOC15_REG_OFFSET(GC, 0, mmGRBM_GFX_INDEX) ||
+-	    offset == SOC15_REG_OFFSET(GC, 0, mmCP_ME_CNTL)) {
+-		if (!amdgpu_sriov_reg_indirect_gc(adev))
+-			*flag = GFX_RLCG_GC_WRITE_OLD;
+-		else
+-			*flag = write ? GFX_RLCG_GC_WRITE : GFX_RLCG_GC_READ;
++static bool gfx_v10_get_rlcg_flag(struct amdgpu_device *adev, u32 acc_flags, u32 hwip,
++				 int write, u32 *rlcg_flag)
++{
++	switch (hwip) {
++	case GC_HWIP:
++		if (amdgpu_sriov_reg_indirect_gc(adev)) {
++			*rlcg_flag = write ? GFX_RLCG_GC_WRITE : GFX_RLCG_GC_READ;
+ 
+-		return true;
+-	}
++			return true;
++		/* only in new version, AMDGPU_REGS_NO_KIQ and AMDGPU_REGS_RLC enabled simultaneously */
++		} else if ((acc_flags & AMDGPU_REGS_RLC) && !(acc_flags & AMDGPU_REGS_NO_KIQ)) {
++			*rlcg_flag = GFX_RLCG_GC_WRITE_OLD;
+ 
+-	/* currently support gc read/write, mmhub write */
+-	if (offset >= SOC15_REG_OFFSET(GC, 0, mmSDMA0_DEC_START) &&
+-	    offset <= SOC15_REG_OFFSET(GC, 0, mmRLC_GTS_OFFSET_MSB)) {
+-		if (amdgpu_sriov_reg_indirect_gc(adev))
+-			*flag = write ? GFX_RLCG_GC_WRITE : GFX_RLCG_GC_READ;
+-		else
+-			return false;
+-	} else {
+-		if (amdgpu_sriov_reg_indirect_mmhub(adev))
+-			*flag = GFX_RLCG_MMHUB_WRITE;
+-		else
+-			return false;
++			return true;
++		}
++
++		break;
++	case MMHUB_HWIP:
++		if (amdgpu_sriov_reg_indirect_mmhub(adev) &&
++		    (acc_flags & AMDGPU_REGS_RLC) && write) {
++			*rlcg_flag = GFX_RLCG_MMHUB_WRITE;
++			return true;
++		}
++
++		break;
++	default:
++		DRM_DEBUG("Not program register by RLCG\n");
+ 	}
+ 
+-	return true;
++	return false;
+ }
+ 
+ static u32 gfx_v10_rlcg_rw(struct amdgpu_device *adev, u32 offset, u32 v, uint32_t flag)
+@@ -1523,36 +1521,34 @@ static u32 gfx_v10_rlcg_rw(struct amdgpu_device *adev, u32 offset, u32 v, uint32
+ 	return ret;
+ }
+ 
+-static void gfx_v10_rlcg_wreg(struct amdgpu_device *adev, u32 offset, u32 value, u32 flag)
++static void gfx_v10_rlcg_wreg(struct amdgpu_device *adev, u32 offset, u32 value, u32 acc_flags, u32 hwip)
+ {
+-	uint32_t rlcg_flag;
++	u32 rlcg_flag;
+ 
+-	if (amdgpu_sriov_fullaccess(adev) &&
+-	    gfx_v10_is_rlcg_rw(adev, offset, &rlcg_flag, 1)) {
++	if (!amdgpu_sriov_runtime(adev) &&
++	    gfx_v10_get_rlcg_flag(adev, acc_flags, hwip, 1, &rlcg_flag)) {
+ 		gfx_v10_rlcg_rw(adev, offset, value, rlcg_flag);
+-
+ 		return;
+ 	}
+-	if (flag & AMDGPU_REGS_NO_KIQ)
++
++	if (acc_flags & AMDGPU_REGS_NO_KIQ)
+ 		WREG32_NO_KIQ(offset, value);
+ 	else
+ 		WREG32(offset, value);
+ }
+ 
+-static u32 gfx_v10_rlcg_rreg(struct amdgpu_device *adev, u32 offset, u32 flag)
++static u32 gfx_v10_rlcg_rreg(struct amdgpu_device *adev, u32 offset, u32 acc_flags, u32 hwip)
+ {
+-	uint32_t rlcg_flag;
++	u32 rlcg_flag;
+ 
+-	if (amdgpu_sriov_fullaccess(adev) &&
+-	    gfx_v10_is_rlcg_rw(adev, offset, &rlcg_flag, 0))
++	if (!amdgpu_sriov_runtime(adev) &&
++	    gfx_v10_get_rlcg_flag(adev, acc_flags, hwip, 0, &rlcg_flag))
+ 		return gfx_v10_rlcg_rw(adev, offset, 0, rlcg_flag);
+ 
+-	if (flag & AMDGPU_REGS_NO_KIQ)
++	if (acc_flags & AMDGPU_REGS_NO_KIQ)
+ 		return RREG32_NO_KIQ(offset);
+ 	else
+ 		return RREG32(offset);
+-
+-	return 0;
+ }
+ 
+ static const struct soc15_reg_golden golden_settings_gc_10_1_nv14[] =
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index feaa5e4a5538..fe5908f708cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -734,7 +734,7 @@ static const u32 GFX_RLC_SRM_INDEX_CNTL_DATA_OFFSETS[] =
+ 	mmRLC_SRM_INDEX_CNTL_DATA_7 - mmRLC_SRM_INDEX_CNTL_DATA_0,
+ };
+ 
+-static void gfx_v9_0_rlcg_rw(struct amdgpu_device *adev, u32 offset, u32 v, u32 flag)
++static void gfx_v9_0_rlcg_w(struct amdgpu_device *adev, u32 offset, u32 v, u32 flag)
+ {
+ 	static void *scratch_reg0;
+ 	static void *scratch_reg1;
+@@ -787,15 +787,16 @@ static void gfx_v9_0_rlcg_rw(struct amdgpu_device *adev, u32 offset, u32 v, u32
+ 
+ }
+ 
+-static void gfx_v9_0_rlcg_wreg(struct amdgpu_device *adev, u32 offset, u32 v, u32 flag)
++static void gfx_v9_0_rlcg_wreg(struct amdgpu_device *adev, u32 offset,
++			       u32 v, u32 acc_flags, u32 hwip)
+ {
+ 	if (amdgpu_sriov_fullaccess(adev)) {
+-		gfx_v9_0_rlcg_rw(adev, offset, v, flag);
++		gfx_v9_0_rlcg_w(adev, offset, v, acc_flags);
+ 
+ 		return;
+ 	}
+ 
+-	if (flag & AMDGPU_REGS_NO_KIQ)
++	if (acc_flags & AMDGPU_REGS_NO_KIQ)
+ 		WREG32_NO_KIQ(offset, v);
+ 	else
+ 		WREG32(offset, v);
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15_common.h b/drivers/gpu/drm/amd/amdgpu/soc15_common.h
+index 14bd794bbea6..c781808e4dc3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15_common.h
++++ b/drivers/gpu/drm/amd/amdgpu/soc15_common.h
+@@ -27,28 +27,51 @@
+ /* Register Access Macros */
+ #define SOC15_REG_OFFSET(ip, inst, reg)	(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg)
+ 
++#define __WREG32_SOC15_RLC__(reg, value, flag, hwip) \
++	((amdgpu_sriov_vf(adev) && adev->gfx.rlc.funcs->rlcg_wreg) ? \
++	 adev->gfx.rlc.funcs->rlcg_wreg(adev, reg, value, flag, hwip) : \
++	 WREG32(reg, value))
++
++#define __RREG32_SOC15_RLC__(reg, flag, hwip) \
++	((amdgpu_sriov_vf(adev) && adev->gfx.rlc.funcs->rlcg_rreg) ? \
++	 adev->gfx.rlc.funcs->rlcg_rreg(adev, reg, flag, hwip) : \
++	 RREG32(reg))
++
+ #define WREG32_FIELD15(ip, idx, reg, field, val)	\
+-	WREG32(adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg,	\
+-	(RREG32(adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg)	\
+-	& ~REG_FIELD_MASK(reg, field)) | (val) << REG_FIELD_SHIFT(reg, field))
++	 __WREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg,	\
++				(__RREG32_SOC15_RLC__( \
++					adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg, \
++					0, ip##_HWIP) & \
++				~REG_FIELD_MASK(reg, field)) | (val) << REG_FIELD_SHIFT(reg, field), \
++			      0, ip##_HWIP)
+ 
+ #define RREG32_SOC15(ip, inst, reg) \
+-	RREG32(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg)
++	__RREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, \
++			 0, ip##_HWIP)
++
++#define RREG32_SOC15_IP(ip, reg) __RREG32_SOC15_RLC__(reg, 0, ip##_HWIP)
+ 
+ #define RREG32_SOC15_NO_KIQ(ip, inst, reg) \
+-	RREG32_NO_KIQ(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg)
++	__RREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, \
++			 AMDGPU_REGS_NO_KIQ, ip##_HWIP)
+ 
+ #define RREG32_SOC15_OFFSET(ip, inst, reg, offset) \
+-	RREG32((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset)
++	 __RREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, 0, ip##_HWIP)
+ 
+ #define WREG32_SOC15(ip, inst, reg, value) \
+-	WREG32((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg), value)
++	 __WREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg), \
++			  value, 0, ip##_HWIP)
++
++#define WREG32_SOC15_IP(ip, reg, value) \
++	 __WREG32_SOC15_RLC__(reg, value, 0, ip##_HWIP)
+ 
+ #define WREG32_SOC15_NO_KIQ(ip, inst, reg, value) \
+-	WREG32_NO_KIQ((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg), value)
++	__WREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, \
++			     value, AMDGPU_REGS_NO_KIQ, ip##_HWIP)
+ 
+ #define WREG32_SOC15_OFFSET(ip, inst, reg, offset, value) \
+-	WREG32((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, value)
++	 __WREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, \
++			  value, 0, ip##_HWIP)
+ 
+ #define SOC15_WAIT_ON_RREG(ip, inst, reg, expected_value, mask) \
+ ({	int ret = 0;						\
+@@ -77,12 +100,7 @@
+ })
+ 
+ #define WREG32_RLC(reg, value) \
+-	do { \
+-		if (adev->gfx.rlc.funcs->rlcg_wreg) \
+-			adev->gfx.rlc.funcs->rlcg_wreg(adev, reg, value, 0); \
+-		else \
+-			WREG32(reg, value);	\
+-	} while (0)
++	__WREG32_SOC15_RLC__(reg, value, AMDGPU_REGS_RLC, GC_HWIP)
+ 
+ #define WREG32_RLC_EX(prefix, reg, value) \
+ 	do {							\
+@@ -108,24 +126,19 @@
+ 		}	\
+ 	} while (0)
+ 
++/* shadow the registers in the callback function */
+ #define WREG32_SOC15_RLC_SHADOW(ip, inst, reg, value) \
+-	WREG32_RLC((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg), value)
++	__WREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg), value, AMDGPU_REGS_RLC, GC_HWIP)
+ 
++/* for GC only */
+ #define RREG32_RLC(reg) \
+-	(adev->gfx.rlc.funcs->rlcg_rreg ? \
+-		adev->gfx.rlc.funcs->rlcg_rreg(adev, reg, 0) : RREG32(reg))
+-
+-#define WREG32_RLC_NO_KIQ(reg, value) \
+-	do { \
+-		if (adev->gfx.rlc.funcs->rlcg_wreg) \
+-			adev->gfx.rlc.funcs->rlcg_wreg(adev, reg, value, AMDGPU_REGS_NO_KIQ); \
+-		else \
+-			WREG32_NO_KIQ(reg, value);	\
+-	} while (0)
++	__RREG32_SOC15_RLC__(reg, AMDGPU_REGS_RLC, GC_HWIP)
++
++#define WREG32_RLC_NO_KIQ(reg, value, hwip) \
++	__WREG32_SOC15_RLC__(reg, value, AMDGPU_REGS_NO_KIQ | AMDGPU_REGS_RLC, hwip)
+ 
+-#define RREG32_RLC_NO_KIQ(reg) \
+-	(adev->gfx.rlc.funcs->rlcg_rreg ? \
+-		adev->gfx.rlc.funcs->rlcg_rreg(adev, reg, AMDGPU_REGS_NO_KIQ) : RREG32_NO_KIQ(reg))
++#define RREG32_RLC_NO_KIQ(reg, hwip) \
++	__RREG32_SOC15_RLC__(reg, AMDGPU_REGS_NO_KIQ | AMDGPU_REGS_RLC, hwip)
+ 
+ #define WREG32_SOC15_RLC_SHADOW_EX(prefix, ip, inst, reg, value) \
+ 	do {							\
+@@ -146,12 +159,12 @@
+ 	} while (0)
+ 
+ #define RREG32_SOC15_RLC(ip, inst, reg) \
+-	RREG32_RLC(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg)
++	__RREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, AMDGPU_REGS_RLC, ip##_HWIP)
+ 
+ #define WREG32_SOC15_RLC(ip, inst, reg, value) \
+ 	do {							\
+ 		uint32_t target_reg = adev->reg_offset[ip##_HWIP][0][reg##_BASE_IDX] + reg;\
+-		WREG32_RLC(target_reg, value); \
++		__WREG32_SOC15_RLC__(target_reg, value, AMDGPU_REGS_RLC, ip##_HWIP); \
+ 	} while (0)
+ 
+ #define WREG32_SOC15_RLC_EX(prefix, ip, inst, reg, value) \
+@@ -161,14 +174,16 @@
+ 	} while (0)
+ 
+ #define WREG32_FIELD15_RLC(ip, idx, reg, field, val)   \
+-	WREG32_RLC((adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg), \
+-	(RREG32_RLC(adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg) \
+-	& ~REG_FIELD_MASK(reg, field)) | (val) << REG_FIELD_SHIFT(reg, field))
++	__WREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg), \
++			     (__RREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][idx][mm##reg##_BASE_IDX] + mm##reg, \
++						   AMDGPU_REGS_RLC, ip##_HWIP) & \
++			      ~REG_FIELD_MASK(reg, field)) | (val) << REG_FIELD_SHIFT(reg, field), \
++			     AMDGPU_REGS_RLC, ip##_HWIP)
+ 
+ #define WREG32_SOC15_OFFSET_RLC(ip, inst, reg, offset, value) \
+-	WREG32_RLC(((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset), value)
++	__WREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, value, AMDGPU_REGS_RLC, ip##_HWIP)
+ 
+ #define RREG32_SOC15_OFFSET_RLC(ip, inst, reg, offset) \
+-	RREG32_RLC(((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset))
++	__RREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, AMDGPU_REGS_RLC, ip##_HWIP)
+ 
+ #endif
+-- 
+2.25.1
+

@@ -1,0 +1,1047 @@
+From ab5dcf7b1152925c629211f71683e77c884db146 Mon Sep 17 00:00:00 2001
+From: Zack Rusin <zackr@vmware.com>
+Date: Tue, 4 May 2021 23:57:38 -0400
+Subject: [PATCH 1728/2740] drm/vmwgfx: Remove the reservation semaphore
+
+Now since Christian reworked TTM to always keep objects on the LRU
+list unless they are pinned we shouldn't need the reservation
+semaphore. It makes the driver code a lot cleaner, especially
+because it was a little hard to reason when and where the
+reservation semaphore needed to be held.
+
+Signed-off-by: Zack Rusin <zackr@vmware.com>
+Reviewed-by: Roland Scheidegger <sroland@vmware.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210505035740.286923-5-zackr@vmware.com
+---
+ drivers/gpu/drm/vmwgfx/Makefile               |   2 +-
+ drivers/gpu/drm/vmwgfx/ttm_lock.c             | 194 ----------------
+ drivers/gpu/drm/vmwgfx/ttm_lock.h             | 218 ------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_bo.c            |  31 ---
+ drivers/gpu/drm/vmwgfx/vmwgfx_context.c       |  13 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c           |  14 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h           |   6 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c       |   5 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c            |   8 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c         |  11 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c           |   7 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c      |   4 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_shader.c        |   6 -
+ .../gpu/drm/vmwgfx/vmwgfx_simple_resource.c   |   5 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_surface.c       |  17 --
+ 15 files changed, 6 insertions(+), 535 deletions(-)
+ delete mode 100644 drivers/gpu/drm/vmwgfx/ttm_lock.c
+ delete mode 100644 drivers/gpu/drm/vmwgfx/ttm_lock.h
+
+diff --git a/drivers/gpu/drm/vmwgfx/Makefile b/drivers/gpu/drm/vmwgfx/Makefile
+index 9f5743013cbb..09f6dcac768b 100644
+--- a/drivers/gpu/drm/vmwgfx/Makefile
++++ b/drivers/gpu/drm/vmwgfx/Makefile
+@@ -9,7 +9,7 @@ vmwgfx-y := vmwgfx_execbuf.o vmwgfx_gmr.o vmwgfx_kms.o vmwgfx_drv.o \
+ 	    vmwgfx_cotable.o vmwgfx_so.o vmwgfx_binding.o vmwgfx_msg.o \
+ 	    vmwgfx_simple_resource.o vmwgfx_va.o vmwgfx_blit.o \
+ 	    vmwgfx_validation.o vmwgfx_page_dirty.o vmwgfx_streamoutput.o \
+-	    ttm_object.o ttm_lock.o ttm_memory.o
++	    ttm_object.o ttm_memory.o
+ 
+ vmwgfx-$(CONFIG_DRM_FBDEV_EMULATION) += vmwgfx_fb.o
+ vmwgfx-$(CONFIG_TRANSPARENT_HUGEPAGE) += vmwgfx_thp.o
+diff --git a/drivers/gpu/drm/vmwgfx/ttm_lock.c b/drivers/gpu/drm/vmwgfx/ttm_lock.c
+deleted file mode 100644
+index 5971c72e6d10..000000000000
+--- a/drivers/gpu/drm/vmwgfx/ttm_lock.c
++++ /dev/null
+@@ -1,194 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 OR MIT */
+-/**************************************************************************
+- *
+- * Copyright (c) 2007-2009 VMware, Inc., Palo Alto, CA., USA
+- * All Rights Reserved.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the
+- * "Software"), to deal in the Software without restriction, including
+- * without limitation the rights to use, copy, modify, merge, publish,
+- * distribute, sub license, and/or sell copies of the Software, and to
+- * permit persons to whom the Software is furnished to do so, subject to
+- * the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the
+- * next paragraph) shall be included in all copies or substantial portions
+- * of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
+- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+- *
+- **************************************************************************/
+-/*
+- * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
+- */
+-
+-#include <linux/atomic.h>
+-#include <linux/errno.h>
+-#include <linux/wait.h>
+-#include <linux/sched/signal.h>
+-#include "ttm_lock.h"
+-#include "ttm_object.h"
+-
+-#define TTM_WRITE_LOCK_PENDING    (1 << 0)
+-#define TTM_VT_LOCK_PENDING       (1 << 1)
+-#define TTM_SUSPEND_LOCK_PENDING  (1 << 2)
+-#define TTM_VT_LOCK               (1 << 3)
+-#define TTM_SUSPEND_LOCK          (1 << 4)
+-
+-void ttm_lock_init(struct ttm_lock *lock)
+-{
+-	spin_lock_init(&lock->lock);
+-	init_waitqueue_head(&lock->queue);
+-	lock->rw = 0;
+-	lock->flags = 0;
+-}
+-
+-void ttm_read_unlock(struct ttm_lock *lock)
+-{
+-	spin_lock(&lock->lock);
+-	if (--lock->rw == 0)
+-		wake_up_all(&lock->queue);
+-	spin_unlock(&lock->lock);
+-}
+-
+-static bool __ttm_read_lock(struct ttm_lock *lock)
+-{
+-	bool locked = false;
+-
+-	spin_lock(&lock->lock);
+-	if (lock->rw >= 0 && lock->flags == 0) {
+-		++lock->rw;
+-		locked = true;
+-	}
+-	spin_unlock(&lock->lock);
+-	return locked;
+-}
+-
+-int ttm_read_lock(struct ttm_lock *lock, bool interruptible)
+-{
+-	int ret = 0;
+-
+-	if (interruptible)
+-		ret = wait_event_interruptible(lock->queue,
+-					       __ttm_read_lock(lock));
+-	else
+-		wait_event(lock->queue, __ttm_read_lock(lock));
+-	return ret;
+-}
+-
+-static bool __ttm_read_trylock(struct ttm_lock *lock, bool *locked)
+-{
+-	bool block = true;
+-
+-	*locked = false;
+-
+-	spin_lock(&lock->lock);
+-	if (lock->rw >= 0 && lock->flags == 0) {
+-		++lock->rw;
+-		block = false;
+-		*locked = true;
+-	} else if (lock->flags == 0) {
+-		block = false;
+-	}
+-	spin_unlock(&lock->lock);
+-
+-	return !block;
+-}
+-
+-int ttm_read_trylock(struct ttm_lock *lock, bool interruptible)
+-{
+-	int ret = 0;
+-	bool locked;
+-
+-	if (interruptible)
+-		ret = wait_event_interruptible
+-			(lock->queue, __ttm_read_trylock(lock, &locked));
+-	else
+-		wait_event(lock->queue, __ttm_read_trylock(lock, &locked));
+-
+-	if (unlikely(ret != 0)) {
+-		BUG_ON(locked);
+-		return ret;
+-	}
+-
+-	return (locked) ? 0 : -EBUSY;
+-}
+-
+-void ttm_write_unlock(struct ttm_lock *lock)
+-{
+-	spin_lock(&lock->lock);
+-	lock->rw = 0;
+-	wake_up_all(&lock->queue);
+-	spin_unlock(&lock->lock);
+-}
+-
+-static bool __ttm_write_lock(struct ttm_lock *lock)
+-{
+-	bool locked = false;
+-
+-	spin_lock(&lock->lock);
+-	if (lock->rw == 0 && ((lock->flags & ~TTM_WRITE_LOCK_PENDING) == 0)) {
+-		lock->rw = -1;
+-		lock->flags &= ~TTM_WRITE_LOCK_PENDING;
+-		locked = true;
+-	} else {
+-		lock->flags |= TTM_WRITE_LOCK_PENDING;
+-	}
+-	spin_unlock(&lock->lock);
+-	return locked;
+-}
+-
+-int ttm_write_lock(struct ttm_lock *lock, bool interruptible)
+-{
+-	int ret = 0;
+-
+-	if (interruptible) {
+-		ret = wait_event_interruptible(lock->queue,
+-					       __ttm_write_lock(lock));
+-		if (unlikely(ret != 0)) {
+-			spin_lock(&lock->lock);
+-			lock->flags &= ~TTM_WRITE_LOCK_PENDING;
+-			wake_up_all(&lock->queue);
+-			spin_unlock(&lock->lock);
+-		}
+-	} else
+-		wait_event(lock->queue, __ttm_write_lock(lock));
+-
+-	return ret;
+-}
+-
+-void ttm_suspend_unlock(struct ttm_lock *lock)
+-{
+-	spin_lock(&lock->lock);
+-	lock->flags &= ~TTM_SUSPEND_LOCK;
+-	wake_up_all(&lock->queue);
+-	spin_unlock(&lock->lock);
+-}
+-
+-static bool __ttm_suspend_lock(struct ttm_lock *lock)
+-{
+-	bool locked = false;
+-
+-	spin_lock(&lock->lock);
+-	if (lock->rw == 0) {
+-		lock->flags &= ~TTM_SUSPEND_LOCK_PENDING;
+-		lock->flags |= TTM_SUSPEND_LOCK;
+-		locked = true;
+-	} else {
+-		lock->flags |= TTM_SUSPEND_LOCK_PENDING;
+-	}
+-	spin_unlock(&lock->lock);
+-	return locked;
+-}
+-
+-void ttm_suspend_lock(struct ttm_lock *lock)
+-{
+-	wait_event(lock->queue, __ttm_suspend_lock(lock));
+-}
+diff --git a/drivers/gpu/drm/vmwgfx/ttm_lock.h b/drivers/gpu/drm/vmwgfx/ttm_lock.h
+deleted file mode 100644
+index af8b28ca546f..000000000000
+--- a/drivers/gpu/drm/vmwgfx/ttm_lock.h
++++ /dev/null
+@@ -1,218 +0,0 @@
+-/**************************************************************************
+- *
+- * Copyright (c) 2007-2009 VMware, Inc., Palo Alto, CA., USA
+- * All Rights Reserved.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the
+- * "Software"), to deal in the Software without restriction, including
+- * without limitation the rights to use, copy, modify, merge, publish,
+- * distribute, sub license, and/or sell copies of the Software, and to
+- * permit persons to whom the Software is furnished to do so, subject to
+- * the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the
+- * next paragraph) shall be included in all copies or substantial portions
+- * of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
+- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+- *
+- **************************************************************************/
+-/*
+- * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
+- */
+-
+-/** @file ttm_lock.h
+- * This file implements a simple replacement for the buffer manager use
+- * of the DRM heavyweight hardware lock.
+- * The lock is a read-write lock. Taking it in read mode and write mode
+- * is relatively fast, and intended for in-kernel use only.
+- *
+- * The vt mode is used only when there is a need to block all
+- * user-space processes from validating buffers.
+- * It's allowed to leave kernel space with the vt lock held.
+- * If a user-space process dies while having the vt-lock,
+- * it will be released during the file descriptor release. The vt lock
+- * excludes write lock and read lock.
+- *
+- * The suspend mode is used to lock out all TTM users when preparing for
+- * and executing suspend operations.
+- *
+- */
+-
+-#ifndef _TTM_LOCK_H_
+-#define _TTM_LOCK_H_
+-
+-#include <linux/atomic.h>
+-#include <linux/wait.h>
+-
+-#include "ttm_object.h"
+-
+-/**
+- * struct ttm_lock
+- *
+- * @base: ttm base object used solely to release the lock if the client
+- * holding the lock dies.
+- * @queue: Queue for processes waiting for lock change-of-status.
+- * @lock: Spinlock protecting some lock members.
+- * @rw: Read-write lock counter. Protected by @lock.
+- * @flags: Lock state. Protected by @lock.
+- */
+-
+-struct ttm_lock {
+-	struct ttm_base_object base;
+-	wait_queue_head_t queue;
+-	spinlock_t lock;
+-	int32_t rw;
+-	uint32_t flags;
+-};
+-
+-
+-/**
+- * ttm_lock_init
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * Initializes the lock.
+- */
+-extern void ttm_lock_init(struct ttm_lock *lock);
+-
+-/**
+- * ttm_read_unlock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Releases a read lock.
+- */
+-extern void ttm_read_unlock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_read_lock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * @interruptible: Interruptible sleeping while waiting for a lock.
+- *
+- * Takes the lock in read mode.
+- * Returns:
+- * -ERESTARTSYS If interrupted by a signal and interruptible is true.
+- */
+-extern int ttm_read_lock(struct ttm_lock *lock, bool interruptible);
+-
+-/**
+- * ttm_read_trylock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * @interruptible: Interruptible sleeping while waiting for a lock.
+- *
+- * Tries to take the lock in read mode. If the lock is already held
+- * in write mode, the function will return -EBUSY. If the lock is held
+- * in vt or suspend mode, the function will sleep until these modes
+- * are unlocked.
+- *
+- * Returns:
+- * -EBUSY The lock was already held in write mode.
+- * -ERESTARTSYS If interrupted by a signal and interruptible is true.
+- */
+-extern int ttm_read_trylock(struct ttm_lock *lock, bool interruptible);
+-
+-/**
+- * ttm_write_unlock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Releases a write lock.
+- */
+-extern void ttm_write_unlock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_write_lock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * @interruptible: Interruptible sleeping while waiting for a lock.
+- *
+- * Takes the lock in write mode.
+- * Returns:
+- * -ERESTARTSYS If interrupted by a signal and interruptible is true.
+- */
+-extern int ttm_write_lock(struct ttm_lock *lock, bool interruptible);
+-
+-/**
+- * ttm_lock_downgrade
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Downgrades a write lock to a read lock.
+- */
+-extern void ttm_lock_downgrade(struct ttm_lock *lock);
+-
+-/**
+- * ttm_suspend_lock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Takes the lock in suspend mode. Excludes read and write mode.
+- */
+-extern void ttm_suspend_lock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_suspend_unlock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Releases a suspend lock
+- */
+-extern void ttm_suspend_unlock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_vt_lock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * @interruptible: Interruptible sleeping while waiting for a lock.
+- * @tfile: Pointer to a struct ttm_object_file to register the lock with.
+- *
+- * Takes the lock in vt mode.
+- * Returns:
+- * -ERESTARTSYS If interrupted by a signal and interruptible is true.
+- * -ENOMEM: Out of memory when locking.
+- */
+-extern int ttm_vt_lock(struct ttm_lock *lock, bool interruptible,
+-		       struct ttm_object_file *tfile);
+-
+-/**
+- * ttm_vt_unlock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Releases a vt lock.
+- * Returns:
+- * -EINVAL If the lock was not held.
+- */
+-extern int ttm_vt_unlock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_write_unlock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- *
+- * Releases a write lock.
+- */
+-extern void ttm_write_unlock(struct ttm_lock *lock);
+-
+-/**
+- * ttm_write_lock
+- *
+- * @lock: Pointer to a struct ttm_lock
+- * @interruptible: Interruptible sleeping while waiting for a lock.
+- *
+- * Takes the lock in write mode.
+- * Returns:
+- * -ERESTARTSYS If interrupted by a signal and interruptible is true.
+- */
+-extern int ttm_write_lock(struct ttm_lock *lock, bool interruptible);
+-
+-#endif
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index 587314d57991..4aa97387d27d 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -96,10 +96,6 @@ int vmw_bo_pin_in_placement(struct vmw_private *dev_priv,
+ 	int ret;
+ 	uint32_t new_flags;
+ 
+-	ret = ttm_write_lock(&dev_priv->reservation_sem, interruptible);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	vmw_execbuf_release_pinned_bo(dev_priv);
+ 
+ 	ret = ttm_bo_reserve(bo, interruptible, false, NULL);
+@@ -116,9 +112,7 @@ int vmw_bo_pin_in_placement(struct vmw_private *dev_priv,
+ 		vmw_bo_pin_reserved(buf, true);
+ 
+ 	ttm_bo_unreserve(bo);
+-
+ err:
+-	ttm_write_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+@@ -144,10 +138,6 @@ int vmw_bo_pin_in_vram_or_gmr(struct vmw_private *dev_priv,
+ 	int ret;
+ 	uint32_t new_flags;
+ 
+-	ret = ttm_write_lock(&dev_priv->reservation_sem, interruptible);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	vmw_execbuf_release_pinned_bo(dev_priv);
+ 
+ 	ret = ttm_bo_reserve(bo, interruptible, false, NULL);
+@@ -172,7 +162,6 @@ int vmw_bo_pin_in_vram_or_gmr(struct vmw_private *dev_priv,
+ 
+ 	ttm_bo_unreserve(bo);
+ err:
+-	ttm_write_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+@@ -228,10 +217,6 @@ int vmw_bo_pin_in_start_of_vram(struct vmw_private *dev_priv,
+ 	placement.num_busy_placement = 1;
+ 	placement.busy_placement = &place;
+ 
+-	ret = ttm_write_lock(&dev_priv->reservation_sem, interruptible);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	vmw_execbuf_release_pinned_bo(dev_priv);
+ 	ret = ttm_bo_reserve(bo, interruptible, false, NULL);
+ 	if (unlikely(ret != 0))
+@@ -263,7 +248,6 @@ int vmw_bo_pin_in_start_of_vram(struct vmw_private *dev_priv,
+ 
+ 	ttm_bo_unreserve(bo);
+ err_unlock:
+-	ttm_write_unlock(&dev_priv->reservation_sem);
+ 
+ 	return ret;
+ }
+@@ -287,10 +271,6 @@ int vmw_bo_unpin(struct vmw_private *dev_priv,
+ 	struct ttm_buffer_object *bo = &buf->base;
+ 	int ret;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, interruptible);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = ttm_bo_reserve(bo, interruptible, false, NULL);
+ 	if (unlikely(ret != 0))
+ 		goto err;
+@@ -300,7 +280,6 @@ int vmw_bo_unpin(struct vmw_private *dev_priv,
+ 	ttm_bo_unreserve(bo);
+ 
+ err:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+@@ -906,10 +885,6 @@ int vmw_bo_alloc_ioctl(struct drm_device *dev, void *data,
+ 	uint32_t handle;
+ 	int ret;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = vmw_user_bo_alloc(dev_priv, vmw_fpriv(file_priv)->tfile,
+ 				req->size, false, &handle, &vbo,
+ 				NULL);
+@@ -924,7 +899,6 @@ int vmw_bo_alloc_ioctl(struct drm_device *dev, void *data,
+ 	vmw_bo_unreference(&vbo);
+ 
+ out_no_bo:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 
+ 	return ret;
+ }
+@@ -1119,10 +1093,6 @@ int vmw_dumb_create(struct drm_file *file_priv,
+ 	args->pitch = args->width * ((args->bpp + 7) / 8);
+ 	args->size = args->pitch * args->height;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = vmw_user_bo_alloc(dev_priv, vmw_fpriv(file_priv)->tfile,
+ 				    args->size, false, &args->handle,
+ 				    &vbo, NULL);
+@@ -1131,7 +1101,6 @@ int vmw_dumb_create(struct drm_file *file_priv,
+ 
+ 	vmw_bo_unreference(&vbo);
+ out_no_bo:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_context.c b/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
+index 4a5a3e246216..3ed9914cb994 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_context.c
+@@ -748,10 +748,6 @@ static int vmw_context_define(struct drm_device *dev, void *data,
+ 		  ((dev_priv->has_mob) ? vmw_cmdbuf_res_man_size() : 0) +
+ 		  + VMW_IDA_ACC_SIZE + TTM_OBJ_EXTRA_SIZE;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = ttm_mem_global_alloc(vmw_mem_glob(dev_priv),
+ 				   vmw_user_context_size,
+ 				   &ttm_opt_ctx);
+@@ -759,7 +755,7 @@ static int vmw_context_define(struct drm_device *dev, void *data,
+ 		if (ret != -ERESTARTSYS)
+ 			DRM_ERROR("Out of graphics memory for context"
+ 				  " creation.\n");
+-		goto out_unlock;
++		goto out_ret;
+ 	}
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+@@ -767,7 +763,7 @@ static int vmw_context_define(struct drm_device *dev, void *data,
+ 		ttm_mem_global_free(vmw_mem_glob(dev_priv),
+ 				    vmw_user_context_size);
+ 		ret = -ENOMEM;
+-		goto out_unlock;
++		goto out_ret;
+ 	}
+ 
+ 	res = &ctx->res;
+@@ -780,7 +776,7 @@ static int vmw_context_define(struct drm_device *dev, void *data,
+ 
+ 	ret = vmw_context_init(dev_priv, res, vmw_user_context_free, dx);
+ 	if (unlikely(ret != 0))
+-		goto out_unlock;
++		goto out_ret;
+ 
+ 	tmp = vmw_resource_reference(&ctx->res);
+ 	ret = ttm_base_object_init(tfile, &ctx->base, false, VMW_RES_CONTEXT,
+@@ -794,8 +790,7 @@ static int vmw_context_define(struct drm_device *dev, void *data,
+ 	arg->cid = ctx->base.handle;
+ out_err:
+ 	vmw_resource_unreference(&res);
+-out_unlock:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
++out_ret:
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 1b27d7f7fcfa..22a2874116c9 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -708,7 +708,6 @@ static int vmw_driver_load(struct vmw_private *dev_priv, u32 pci_id)
+ 
+ 	mutex_init(&dev_priv->cmdbuf_mutex);
+ 	mutex_init(&dev_priv->binding_mutex);
+-	ttm_lock_init(&dev_priv->reservation_sem);
+ 	spin_lock_init(&dev_priv->resource_lock);
+ 	spin_lock_init(&dev_priv->hw_lock);
+ 	spin_lock_init(&dev_priv->waiter_lock);
+@@ -966,6 +965,7 @@ static int vmw_driver_load(struct vmw_private *dev_priv, u32 pci_id)
+ 		DRM_INFO("SM4_1 support available.\n");
+ 	if (dev_priv->sm_type == VMW_SM_4)
+ 		DRM_INFO("SM4 support available.\n");
++	DRM_INFO("Running without reservation semaphore\n");
+ 
+ 	snprintf(host_log, sizeof(host_log), "vmwgfx: Module Version: %d.%d.%d",
+ 		VMWGFX_DRIVER_MAJOR, VMWGFX_DRIVER_MINOR,
+@@ -1191,9 +1191,7 @@ static void __vmw_svga_enable(struct vmw_private *dev_priv)
+  */
+ void vmw_svga_enable(struct vmw_private *dev_priv)
+ {
+-	(void) ttm_read_lock(&dev_priv->reservation_sem, false);
+ 	__vmw_svga_enable(dev_priv);
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ }
+ 
+ /**
+@@ -1238,7 +1236,6 @@ void vmw_svga_disable(struct vmw_private *dev_priv)
+ 	 *
+ 	 */
+ 	vmw_kms_lost_device(&dev_priv->drm);
+-	ttm_write_lock(&dev_priv->reservation_sem, false);
+ 	if (ttm_resource_manager_used(man)) {
+ 		if (ttm_resource_manager_evict_all(&dev_priv->bdev, man))
+ 			DRM_ERROR("Failed evicting VRAM buffers.\n");
+@@ -1247,7 +1244,6 @@ void vmw_svga_disable(struct vmw_private *dev_priv)
+ 			  SVGA_REG_ENABLE_HIDE |
+ 			  SVGA_REG_ENABLE_ENABLE);
+ 	}
+-	ttm_write_unlock(&dev_priv->reservation_sem);
+ }
+ 
+ static void vmw_remove(struct pci_dev *pdev)
+@@ -1287,14 +1283,12 @@ static int vmwgfx_pm_notifier(struct notifier_block *nb, unsigned long val,
+ 		 * Once user-space processes have been frozen, we can release
+ 		 * the lock again.
+ 		 */
+-		ttm_suspend_lock(&dev_priv->reservation_sem);
+ 		dev_priv->suspend_locked = true;
+ 		break;
+ 	case PM_POST_HIBERNATION:
+ 	case PM_POST_RESTORE:
+ 		if (READ_ONCE(dev_priv->suspend_locked)) {
+ 			dev_priv->suspend_locked = false;
+-			ttm_suspend_unlock(&dev_priv->reservation_sem);
+ 		}
+ 		break;
+ 	default:
+@@ -1353,20 +1347,16 @@ static int vmw_pm_freeze(struct device *kdev)
+ 	int ret;
+ 
+ 	/*
+-	 * Unlock for vmw_kms_suspend.
+ 	 * No user-space processes should be running now.
+ 	 */
+-	ttm_suspend_unlock(&dev_priv->reservation_sem);
+ 	ret = vmw_kms_suspend(&dev_priv->drm);
+ 	if (ret) {
+-		ttm_suspend_lock(&dev_priv->reservation_sem);
+ 		DRM_ERROR("Failed to freeze modesetting.\n");
+ 		return ret;
+ 	}
+ 	if (dev_priv->enable_fb)
+ 		vmw_fb_off(dev_priv);
+ 
+-	ttm_suspend_lock(&dev_priv->reservation_sem);
+ 	vmw_execbuf_release_pinned_bo(dev_priv);
+ 	vmw_resource_evict_all(dev_priv);
+ 	vmw_release_device_early(dev_priv);
+@@ -1379,7 +1369,6 @@ static int vmw_pm_freeze(struct device *kdev)
+ 			vmw_fifo_resource_inc(dev_priv);
+ 		WARN_ON(vmw_request_device_late(dev_priv));
+ 		dev_priv->suspend_locked = false;
+-		ttm_suspend_unlock(&dev_priv->reservation_sem);
+ 		if (dev_priv->suspend_state)
+ 			vmw_kms_resume(dev);
+ 		if (dev_priv->enable_fb)
+@@ -1416,7 +1405,6 @@ static int vmw_pm_restore(struct device *kdev)
+ 
+ 	vmw_fence_fifo_up(dev_priv->fman);
+ 	dev_priv->suspend_locked = false;
+-	ttm_suspend_unlock(&dev_priv->reservation_sem);
+ 	if (dev_priv->suspend_state)
+ 		vmw_kms_resume(&dev_priv->drm);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index ffddccff867b..2fb6898ceca9 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -40,7 +40,6 @@
+ #include <drm/ttm/ttm_bo_driver.h>
+ #include <drm/ttm/ttm_execbuf_util.h>
+ 
+-#include "ttm_lock.h"
+ #include "ttm_object.h"
+ 
+ #include "vmwgfx_fence.h"
+@@ -593,11 +592,6 @@ struct vmw_private {
+ 
+ 	atomic_t num_fifo_resources;
+ 
+-	/*
+-	 * Replace this with an rwsem as soon as we have down_xx_interruptible()
+-	 */
+-	struct ttm_lock reservation_sem;
+-
+ 	/*
+ 	 * Query processing. These members
+ 	 * are protected by the cmdbuf mutex.
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+index ca5360efa172..3ad07657b7d2 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -4443,10 +4443,6 @@ int vmw_execbuf_ioctl(struct drm_device *dev, void *data,
+ 			goto out;
+ 	}
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = vmw_execbuf_process(file_priv, dev_priv,
+ 				  (void __user *)(unsigned long)arg->commands,
+ 				  NULL, arg->command_size, arg->throttle_us,
+@@ -4454,7 +4450,6 @@ int vmw_execbuf_ioctl(struct drm_device *dev, void *data,
+ 				  (void __user *)(unsigned long)arg->fence_rep,
+ 				  NULL, arg->flags);
+ 
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	if (unlikely(ret != 0))
+ 		goto out;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+index 33f07abfc3ae..d18c6a56e3dc 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -195,7 +195,6 @@ static void vmw_fb_dirty_flush(struct work_struct *work)
+ 	if (!cur_fb)
+ 		goto out_unlock;
+ 
+-	(void) ttm_read_lock(&vmw_priv->reservation_sem, false);
+ 	(void) ttm_bo_reserve(&vbo->base, false, false, NULL);
+ 	virtual = vmw_bo_map_and_cache(vbo);
+ 	if (!virtual)
+@@ -254,7 +253,6 @@ static void vmw_fb_dirty_flush(struct work_struct *work)
+ 
+ out_unreserve:
+ 	ttm_bo_unreserve(&vbo->base);
+-	ttm_read_unlock(&vmw_priv->reservation_sem);
+ 	if (w && h) {
+ 		WARN_ON_ONCE(par->set_fb->funcs->dirty(cur_fb, NULL, 0, 0,
+ 						       &clip, 1));
+@@ -396,8 +394,6 @@ static int vmw_fb_create_bo(struct vmw_private *vmw_priv,
+ 	struct vmw_buffer_object *vmw_bo;
+ 	int ret;
+ 
+-	(void) ttm_write_lock(&vmw_priv->reservation_sem, false);
+-
+ 	vmw_bo = kmalloc(sizeof(*vmw_bo), GFP_KERNEL);
+ 	if (!vmw_bo) {
+ 		ret = -ENOMEM;
+@@ -412,12 +408,8 @@ static int vmw_fb_create_bo(struct vmw_private *vmw_priv,
+ 		goto err_unlock; /* init frees the buffer on failure */
+ 
+ 	*out = vmw_bo;
+-	ttm_write_unlock(&vmw_priv->reservation_sem);
+-
+-	return 0;
+ 
+ err_unlock:
+-	ttm_write_unlock(&vmw_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+index b36032964b2f..6763d0638450 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+@@ -302,10 +302,6 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 	vfb = vmw_framebuffer_to_vfb(fb);
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		goto out_no_ttm_lock;
+-
+ 	ret = vmw_user_resource_lookup_handle(dev_priv, tfile, arg->sid,
+ 					      user_surface_converter,
+ 					      &res);
+@@ -322,8 +318,6 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
+ 	vmw_surface_unreference(&surface);
+ 
+ out_no_surface:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+-out_no_ttm_lock:
+ 	drm_framebuffer_put(fb);
+ out_no_fb:
+ 	drm_modeset_unlock_all(dev);
+@@ -391,15 +385,10 @@ int vmw_present_readback_ioctl(struct drm_device *dev, void *data,
+ 		goto out_no_ttm_lock;
+ 	}
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		goto out_no_ttm_lock;
+-
+ 	ret = vmw_kms_readback(dev_priv, file_priv,
+ 			       vfb, user_fence_rep,
+ 			       clips, num_clips);
+ 
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ out_no_ttm_lock:
+ 	drm_framebuffer_put(fb);
+ out_no_fb:
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index abbca8b0b3c5..67f693acea5f 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1008,12 +1008,6 @@ static int vmw_framebuffer_bo_dirty(struct drm_framebuffer *framebuffer,
+ 
+ 	drm_modeset_lock_all(&dev_priv->drm);
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0)) {
+-		drm_modeset_unlock_all(&dev_priv->drm);
+-		return ret;
+-	}
+-
+ 	if (!num_clips) {
+ 		num_clips = 1;
+ 		clips = &norect;
+@@ -1037,7 +1031,6 @@ static int vmw_framebuffer_bo_dirty(struct drm_framebuffer *framebuffer,
+ 	}
+ 
+ 	vmw_cmd_flush(dev_priv, false);
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 
+ 	drm_modeset_unlock_all(&dev_priv->drm);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index 35f02958ee2c..d5da28be938a 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -990,7 +990,6 @@ int vmw_resource_pin(struct vmw_resource *res, bool interruptible)
+ 	struct vmw_private *dev_priv = res->dev_priv;
+ 	int ret;
+ 
+-	ttm_write_lock(&dev_priv->reservation_sem, interruptible);
+ 	mutex_lock(&dev_priv->cmdbuf_mutex);
+ 	ret = vmw_resource_reserve(res, interruptible, false);
+ 	if (ret)
+@@ -1029,7 +1028,6 @@ int vmw_resource_pin(struct vmw_resource *res, bool interruptible)
+ 	vmw_resource_unreserve(res, false, false, false, NULL, 0UL);
+ out_no_reserve:
+ 	mutex_unlock(&dev_priv->cmdbuf_mutex);
+-	ttm_write_unlock(&dev_priv->reservation_sem);
+ 
+ 	return ret;
+ }
+@@ -1047,7 +1045,6 @@ void vmw_resource_unpin(struct vmw_resource *res)
+ 	struct vmw_private *dev_priv = res->dev_priv;
+ 	int ret;
+ 
+-	(void) ttm_read_lock(&dev_priv->reservation_sem, false);
+ 	mutex_lock(&dev_priv->cmdbuf_mutex);
+ 
+ 	ret = vmw_resource_reserve(res, false, true);
+@@ -1065,7 +1062,6 @@ void vmw_resource_unpin(struct vmw_resource *res)
+ 	vmw_resource_unreserve(res, false, false, false, NULL, 0UL);
+ 
+ 	mutex_unlock(&dev_priv->cmdbuf_mutex);
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+index a0db06564013..b391975871a5 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+@@ -876,15 +876,9 @@ static int vmw_shader_define(struct drm_device *dev, struct drm_file *file_priv,
+ 		goto out_bad_arg;
+ 	}
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		goto out_bad_arg;
+-
+ 	ret = vmw_user_shader_alloc(dev_priv, buffer, size, offset,
+ 				    shader_type, num_input_sig,
+ 				    num_output_sig, tfile, shader_handle);
+-
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ out_bad_arg:
+ 	vmw_bo_unreference(&buffer);
+ 	return ret;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_simple_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_simple_resource.c
+index 73e9a487e659..33b69a70cfe3 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_simple_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_simple_resource.c
+@@ -162,13 +162,8 @@ vmw_simple_resource_create_ioctl(struct drm_device *dev, void *data,
+ 	account_size = ttm_round_pot(alloc_size) + VMW_IDA_ACC_SIZE +
+ 		TTM_OBJ_EXTRA_SIZE;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (ret)
+-		return ret;
+-
+ 	ret = ttm_mem_global_alloc(vmw_mem_glob(dev_priv), account_size,
+ 				   &ctx);
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	if (ret) {
+ 		if (ret != -ERESTARTSYS)
+ 			DRM_ERROR("Out of graphics memory for %s"
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index beab3e19d8e2..4e08cd7855e3 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -779,10 +779,6 @@ int vmw_surface_define_ioctl(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = ttm_mem_global_alloc(vmw_mem_glob(dev_priv),
+ 				   size, &ctx);
+ 	if (unlikely(ret != 0)) {
+@@ -913,7 +909,6 @@ int vmw_surface_define_ioctl(struct drm_device *dev, void *data,
+ 	rep->sid = user_srf->prime.base.handle;
+ 	vmw_resource_unreference(&res);
+ 
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return 0;
+ out_no_copy:
+ 	kfree(srf->offsets);
+@@ -924,7 +919,6 @@ int vmw_surface_define_ioctl(struct drm_device *dev, void *data,
+ out_no_user_srf:
+ 	ttm_mem_global_free(vmw_mem_glob(dev_priv), size);
+ out_unlock:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+@@ -1542,10 +1536,6 @@ vmw_gb_surface_define_internal(struct drm_device *dev,
+ 	if (drm_is_primary_client(file_priv))
+ 		user_srf->master = drm_master_get(file_priv->master);
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	res = &user_srf->srf.res;
+ 
+ 	if (req->base.buffer_handle != SVGA3D_INVALID_ID) {
+@@ -1627,7 +1617,6 @@ vmw_gb_surface_define_internal(struct drm_device *dev,
+ 	vmw_resource_unreference(&res);
+ 
+ out_unlock:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+ 
+@@ -2125,10 +2114,6 @@ int vmw_gb_surface_define(struct vmw_private *dev_priv,
+ 	if (req->sizes != NULL)
+ 		return -EINVAL;
+ 
+-	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+ 	ret = ttm_mem_global_alloc(vmw_mem_glob(dev_priv),
+ 				   user_accounting_size, &ctx);
+ 	if (ret != 0) {
+@@ -2192,13 +2177,11 @@ int vmw_gb_surface_define(struct vmw_private *dev_priv,
+ 	 */
+ 	ret = vmw_surface_init(dev_priv, srf, vmw_user_surface_free);
+ 
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ 
+ out_no_user_srf:
+ 	ttm_mem_global_free(vmw_mem_glob(dev_priv), user_accounting_size);
+ 
+ out_unlock:
+-	ttm_read_unlock(&dev_priv->reservation_sem);
+ 	return ret;
+ }
+-- 
+2.25.1
+

@@ -1,0 +1,189 @@
+From d9294ef57fdc3996e97991ad192e5c1eda2764c8 Mon Sep 17 00:00:00 2001
+From: Mark Yacoub <markyacoub@google.com>
+Date: Mon, 8 Mar 2021 16:36:22 -0500
+Subject: [PATCH 0667/2740] drm/amdgpu: Verify bo size can fit framebuffer size
+ on init.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To initialize the framebuffer, call drm_gem_fb_init_with_funcs which
+verifies that the BO size can fit the FB size by calculating the minimum
+expected size of each plane.
+
+The bug was caught using igt-gpu-tools test: kms_addfb_basic.too-high
+and kms_addfb_basic.bo-too-small
+
+Tested on ChromeOS Zork by turning on the display and running a YT
+video.
+
+=== Changes from v1 ===
+1. Added new line under declarations.
+2. Use C style comment.
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Mark Yacoub <markyacoub@chromium.org>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c | 68 +++++++++++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c      |  4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h    |  8 +++
+ 3 files changed, 65 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index 48cb33e5b382..afa5f8ad0f56 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -870,17 +870,62 @@ static int amdgpu_display_get_fb_info(const struct amdgpu_framebuffer *amdgpu_fb
+ 	return r;
+ }
+ 
++int amdgpu_display_gem_fb_init(struct drm_device *dev,
++			       struct amdgpu_framebuffer *rfb,
++			       const struct drm_mode_fb_cmd2 *mode_cmd,
++			       struct drm_gem_object *obj)
++{
++	int ret;
++
++	rfb->base.obj[0] = obj;
++	drm_helper_mode_fill_fb_struct(dev, &rfb->base, mode_cmd);
++	ret = drm_framebuffer_init(dev, &rfb->base, &amdgpu_fb_funcs);
++	if (ret)
++		goto err;
++
++	ret = amdgpu_display_framebuffer_init(dev, rfb, mode_cmd, obj);
++	if (ret)
++		goto err;
++
++	return 0;
++err:
++	drm_err(dev, "Failed to init gem fb: %d\n", ret);
++	rfb->base.obj[0] = NULL;
++	return ret;
++}
++
++int amdgpu_display_gem_fb_verify_and_init(
++	struct drm_device *dev, struct amdgpu_framebuffer *rfb,
++	struct drm_file *file_priv, const struct drm_mode_fb_cmd2 *mode_cmd,
++	struct drm_gem_object *obj)
++{
++	int ret;
++
++	rfb->base.obj[0] = obj;
++
++	/* Verify that bo size can fit the fb size. */
++	ret = drm_gem_fb_init_with_funcs(dev, &rfb->base, file_priv, mode_cmd,
++					 &amdgpu_fb_funcs);
++	if (ret)
++		goto err;
++
++	ret = amdgpu_display_framebuffer_init(dev, rfb, mode_cmd, obj);
++	if (ret)
++		goto err;
++
++	return 0;
++err:
++	drm_err(dev, "Failed to verify and init gem fb: %d\n", ret);
++	rfb->base.obj[0] = NULL;
++	return ret;
++}
++
+ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 				    struct amdgpu_framebuffer *rfb,
+ 				    const struct drm_mode_fb_cmd2 *mode_cmd,
+ 				    struct drm_gem_object *obj)
+ {
+ 	int ret, i;
+-	rfb->base.obj[0] = obj;
+-	drm_helper_mode_fill_fb_struct(dev, &rfb->base, mode_cmd);
+-	ret = drm_framebuffer_init(dev, &rfb->base, &amdgpu_fb_funcs);
+-	if (ret)
+-		goto fail;
+ 
+ 	/*
+ 	 * This needs to happen before modifier conversion as that might change
+@@ -891,13 +936,13 @@ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 			drm_dbg_kms(dev, "Plane 0 and %d have different BOs: %u vs. %u\n",
+ 				    i, mode_cmd->handles[0], mode_cmd->handles[i]);
+ 			ret = -EINVAL;
+-			goto fail;
++			return ret;
+ 		}
+ 	}
+ 
+ 	ret = amdgpu_display_get_fb_info(rfb, &rfb->tiling_flags, &rfb->tmz_surface);
+ 	if (ret)
+-		goto fail;
++		return ret;
+ 
+ 	if (dev->mode_config.allow_fb_modifiers &&
+ 	    !(rfb->base.flags & DRM_MODE_FB_MODIFIERS)) {
+@@ -905,7 +950,7 @@ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 		if (ret) {
+ 			drm_dbg_kms(dev, "Failed to convert tiling flags 0x%llX to a modifier",
+ 				    rfb->tiling_flags);
+-			goto fail;
++			return ret;
+ 		}
+ 	}
+ 
+@@ -915,10 +960,6 @@ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 	}
+ 
+ 	return 0;
+-
+-fail:
+-	rfb->base.obj[0] = NULL;
+-	return ret;
+ }
+ 
+ struct drm_framebuffer *
+@@ -953,7 +994,8 @@ amdgpu_display_user_framebuffer_create(struct drm_device *dev,
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	ret = amdgpu_display_framebuffer_init(dev, amdgpu_fb, mode_cmd, obj);
++	ret = amdgpu_display_gem_fb_verify_and_init(dev, amdgpu_fb, file_priv,
++						    mode_cmd, obj);
+ 	if (ret) {
+ 		kfree(amdgpu_fb);
+ 		drm_gem_object_put(obj);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+index 24010cacf7d0..4c5c19820d37 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fb.c
+@@ -232,8 +232,8 @@ static int amdgpufb_create(struct drm_fb_helper *helper,
+ 		goto out;
+ 	}
+ 
+-	ret = amdgpu_display_framebuffer_init(adev_to_drm(adev), &rfbdev->rfb,
+-					      &mode_cmd, gobj);
++	ret = amdgpu_display_gem_fb_init(adev_to_drm(adev), &rfbdev->rfb,
++					 &mode_cmd, gobj);
+ 	if (ret) {
+ 		DRM_ERROR("failed to initialize framebuffer %d\n", ret);
+ 		goto out;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 319cb19e1b99..cb0b581bbce7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -602,6 +602,14 @@ int amdgpu_display_get_crtc_scanoutpos(struct drm_device *dev,
+ 			int *hpos, ktime_t *stime, ktime_t *etime,
+ 			const struct drm_display_mode *mode);
+ 
++int amdgpu_display_gem_fb_init(struct drm_device *dev,
++			       struct amdgpu_framebuffer *rfb,
++			       const struct drm_mode_fb_cmd2 *mode_cmd,
++			       struct drm_gem_object *obj);
++int amdgpu_display_gem_fb_verify_and_init(
++	struct drm_device *dev, struct amdgpu_framebuffer *rfb,
++	struct drm_file *file_priv, const struct drm_mode_fb_cmd2 *mode_cmd,
++	struct drm_gem_object *obj);
+ int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 				    struct amdgpu_framebuffer *rfb,
+ 				    const struct drm_mode_fb_cmd2 *mode_cmd,
+-- 
+2.25.1
+

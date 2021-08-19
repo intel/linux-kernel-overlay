@@ -1,0 +1,168 @@
+From c203990667629245a56607177bdbc04560f5c8e4 Mon Sep 17 00:00:00 2001
+From: Oak Zeng <Oak.Zeng@amd.com>
+Date: Thu, 17 Sep 2020 22:53:54 -0500
+Subject: [PATCH 0611/2740] drm/amdgpu: Add function to allocate and fill PDB0
+
+Add functions to allocate PDB0, map it for CPU access,
+and fill it.
+
+Those functions are only used for 2-level vmid0 page
+table construction
+
+Signed-off-by: Oak Zeng <Oak.Zeng@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 103 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |   5 ++
+ 2 files changed, 108 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 2c3477627679..3ab85a445d6f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -31,6 +31,57 @@
+ #include "amdgpu_ras.h"
+ #include "amdgpu_xgmi.h"
+ 
++/**
++ * amdgpu_gmc_pdb0_alloc - allocate vram for pdb0
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * Allocate video memory for pdb0 and map it for CPU access
++ * Returns 0 for success, error for failure.
++ */
++int amdgpu_gmc_pdb0_alloc(struct amdgpu_device *adev)
++{
++	int r;
++	struct amdgpu_bo_param bp;
++	u64 vram_size = adev->gmc.xgmi.node_segment_size * adev->gmc.xgmi.num_physical_nodes;
++	uint32_t pde0_page_shift = adev->gmc.vmid0_page_table_block_size + 21;
++	uint32_t npdes = (vram_size + (1ULL << pde0_page_shift) -1) >> pde0_page_shift;
++
++	memset(&bp, 0, sizeof(bp));
++	bp.size = PAGE_ALIGN((npdes + 1) * 8);
++	bp.byte_align = PAGE_SIZE;
++	bp.domain = AMDGPU_GEM_DOMAIN_VRAM;
++	bp.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
++		AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
++	bp.type = ttm_bo_type_kernel;
++	bp.resv = NULL;
++	r = amdgpu_bo_create(adev, &bp, &adev->gmc.pdb0_bo);
++	if (r)
++		return r;
++
++	r = amdgpu_bo_reserve(adev->gmc.pdb0_bo, false);
++	if (unlikely(r != 0))
++		goto bo_reserve_failure;
++
++	r = amdgpu_bo_pin(adev->gmc.pdb0_bo, AMDGPU_GEM_DOMAIN_VRAM);
++	if (r)
++		goto bo_pin_failure;
++	r = amdgpu_bo_kmap(adev->gmc.pdb0_bo, &adev->gmc.ptr_pdb0);
++	if (r)
++		goto bo_kmap_failure;
++
++	amdgpu_bo_unreserve(adev->gmc.pdb0_bo);
++	return 0;
++
++bo_kmap_failure:
++	amdgpu_bo_unpin(adev->gmc.pdb0_bo);
++bo_pin_failure:
++	amdgpu_bo_unreserve(adev->gmc.pdb0_bo);
++bo_reserve_failure:
++	amdgpu_bo_unref(&adev->gmc.pdb0_bo);
++	return r;
++}
++
+ /**
+  * amdgpu_gmc_get_pde_for_bo - get the PDE for a BO
+  *
+@@ -558,3 +609,55 @@ void amdgpu_gmc_get_vbios_allocations(struct amdgpu_device *adev)
+ 		adev->mman.stolen_extended_size = 0;
+ 	}
+ }
++
++/**
++ * amdgpu_gmc_init_pdb0 - initialize PDB0
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * This function is only used when GART page table is used
++ * for FB address translatioin. In such a case, we construct
++ * a 2-level system VM page table: PDB0->PTB, to cover both
++ * VRAM of the hive and system memory.
++ *
++ * PDB0 is static, initialized once on driver initialization.
++ * The first n entries of PDB0 are used as PTE by setting
++ * P bit to 1, pointing to VRAM. The n+1'th entry points
++ * to a big PTB covering system memory.
++ *
++ */
++void amdgpu_gmc_init_pdb0(struct amdgpu_device *adev)
++{
++	int i;
++	uint64_t flags = adev->gart.gart_pte_flags; //TODO it is UC. explore NC/RW?
++	/* Each PDE0 (used as PTE) covers (2^vmid0_page_table_block_size)*2M
++	 */
++	u64 vram_size = adev->gmc.xgmi.node_segment_size * adev->gmc.xgmi.num_physical_nodes;
++	u64 pde0_page_size = (1ULL<<adev->gmc.vmid0_page_table_block_size)<<21;
++	u64 vram_addr = adev->vm_manager.vram_base_offset -
++		adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
++	u64 vram_end = vram_addr + vram_size;
++	u64 gart_ptb_gpu_pa = amdgpu_bo_gpu_offset(adev->gart.bo) +
++		adev->vm_manager.vram_base_offset - adev->gmc.vram_start;
++
++	flags |= AMDGPU_PTE_VALID | AMDGPU_PTE_READABLE;
++	flags |= AMDGPU_PTE_WRITEABLE;
++	flags |= AMDGPU_PTE_SNOOPED;
++	flags |= AMDGPU_PTE_FRAG((adev->gmc.vmid0_page_table_block_size + 9*1));
++	flags |= AMDGPU_PDE_PTE;
++
++	/* The first n PDE0 entries are used as PTE,
++	 * pointing to vram
++	 */
++	for (i = 0; vram_addr < vram_end; i++, vram_addr += pde0_page_size)
++		amdgpu_gmc_set_pte_pde(adev, adev->gmc.ptr_pdb0, i, vram_addr, flags);
++
++	/* The n+1'th PDE0 entry points to a huge
++	 * PTB who has more than 512 entries each
++	 * pointing to a 4K system page
++	 */
++	flags = AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM;
++	flags |= AMDGPU_PDE_BFS(0) | AMDGPU_PTE_SNOOPED;
++	/* Requires gart_ptb_gpu_pa to be 4K aligned */
++	amdgpu_gmc_set_pte_pde(adev, adev->gmc.ptr_pdb0, i, gart_ptb_gpu_pa, flags);
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index d5312b8e6abf..d5f3825cd479 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -247,6 +247,9 @@ struct amdgpu_gmc {
+ 
+ 	uint32_t	vmid0_page_table_block_size;
+ 	uint32_t	vmid0_page_table_depth;
++	struct amdgpu_bo		*pdb0_bo;
++	/* CPU kmapped address of pdb0*/
++	void				*ptr_pdb0;
+ };
+ 
+ #define amdgpu_gmc_flush_gpu_tlb(adev, vmid, vmhub, type) ((adev)->gmc.gmc_funcs->flush_gpu_tlb((adev), (vmid), (vmhub), (type)))
+@@ -288,6 +291,7 @@ static inline uint64_t amdgpu_gmc_sign_extend(uint64_t addr)
+ 	return addr;
+ }
+ 
++int amdgpu_gmc_pdb0_alloc(struct amdgpu_device *adev);
+ void amdgpu_gmc_get_pde_for_bo(struct amdgpu_bo *bo, int level,
+ 			       uint64_t *addr, uint64_t *flags);
+ int amdgpu_gmc_set_pte_pde(struct amdgpu_device *adev, void *cpu_pt_addr,
+@@ -317,4 +321,5 @@ amdgpu_gmc_set_vm_fault_masks(struct amdgpu_device *adev, int hub_type,
+ 
+ void amdgpu_gmc_get_vbios_allocations(struct amdgpu_device *adev);
+ 
++void amdgpu_gmc_init_pdb0(struct amdgpu_device *adev);
+ #endif
+-- 
+2.25.1
+
