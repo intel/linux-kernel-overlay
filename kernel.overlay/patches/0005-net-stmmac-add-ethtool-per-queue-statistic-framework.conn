@@ -1,0 +1,230 @@
+From 178eb857269b96fb6fbc72f377a4c69645aad77c Mon Sep 17 00:00:00 2001
+From: Vijayakannan Ayyathurai <vijayakannan.ayyathurai@intel.com>
+Date: Mon, 16 Aug 2021 14:15:59 +0800
+Subject: [PATCH 5/6] net: stmmac: add ethtool per-queue statistic framework
+
+Adding generic ethtool per-queue statistic framework to display the
+statistics for each rx/tx queue. In future, users can avail it to add
+more per-queue specific counters. Number of rx/tx queues displayed is
+depending on the available rx/tx queues in that particular MAC config
+and this number is limited up to the MTL_MAX_{RX|TX}_QUEUES defined
+in the driver.
+
+Ethtool per-queue statistic display will look like below, when users
+start adding more counters.
+
+Example:
+ q0_tx_statA:
+ q0_tx_statB:
+ q0_tx_statC:
+ |
+ q0_tx_statX:
+ .
+ .
+ .
+ qMAX_tx_statA:
+ qMAX_tx_statB:
+ qMAX_tx_statC:
+ |
+ qMAX_tx_statX:
+
+ q0_rx_statA:
+ q0_rx_statB:
+ q0_rx_statC:
+ |
+ q0_rx_statX:
+ .
+ .
+ .
+ qMAX_rx_statA:
+ qMAX_rx_statB:
+ qMAX_rx_statC:
+ |
+ qMAX_rx_statX:
+
+In addition, this patch has the support on displaying the number of
+packets received and transmitted per queue.
+
+Signed-off-by: Vijayakannan Ayyathurai <vijayakannan.ayyathurai@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/stmicro/stmmac/common.h  | 11 ++++
+ .../ethernet/stmicro/stmmac/stmmac_ethtool.c  | 65 ++++++++++++++++++-
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c |  5 ++
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 5fecc83f175b..79333deef2e2 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -58,6 +58,14 @@
+ #undef FRAME_FILTER_DEBUG
+ /* #define FRAME_FILTER_DEBUG */
+ 
++struct stmmac_txq_stats {
++	unsigned long tx_pkt_n;
++};
++
++struct stmmac_rxq_stats {
++	unsigned long rx_pkt_n;
++};
++
+ /* Extra statistic and debug information exposed by ethtool */
+ struct stmmac_extra_stats {
+ 	/* Transmit errors */
+@@ -189,6 +197,9 @@ struct stmmac_extra_stats {
+ 	unsigned long mtl_est_hlbf;
+ 	unsigned long mtl_est_btre;
+ 	unsigned long mtl_est_btrlm;
++	/* per queue statistics */
++	struct stmmac_txq_stats txq_stats[MTL_MAX_TX_QUEUES];
++	struct stmmac_rxq_stats rxq_stats[MTL_MAX_RX_QUEUES];
+ };
+ 
+ /* Safety Feature statistics exposed by ethtool */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index d0ce608b81c3..10c0895d0b43 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -261,6 +261,16 @@ static const struct stmmac_stats stmmac_mmc[] = {
+ };
+ #define STMMAC_MMC_STATS_LEN ARRAY_SIZE(stmmac_mmc)
+ 
++static const char stmmac_qstats_tx_string[][ETH_GSTRING_LEN] = {
++	"tx_pkt_n",
++#define STMMAC_TXQ_STATS ARRAY_SIZE(stmmac_qstats_tx_string)
++};
++
++static const char stmmac_qstats_rx_string[][ETH_GSTRING_LEN] = {
++	"rx_pkt_n",
++#define STMMAC_RXQ_STATS ARRAY_SIZE(stmmac_qstats_rx_string)
++};
++
+ static void stmmac_ethtool_getdrvinfo(struct net_device *dev,
+ 				      struct ethtool_drvinfo *info)
+ {
+@@ -510,6 +520,31 @@ stmmac_set_pauseparam(struct net_device *netdev,
+ 	}
+ }
+ 
++static void stmmac_get_per_qstats(struct stmmac_priv *priv, u64 *data)
++{
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
++	int q, stat;
++	char *p;
++
++	for (q = 0; q < tx_cnt; q++) {
++		p = (char *)priv + offsetof(struct stmmac_priv,
++					    xstats.txq_stats[q].tx_pkt_n);
++		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
++			*data++ = (*(u64 *)p);
++			p += sizeof(u64 *);
++		}
++	}
++	for (q = 0; q < rx_cnt; q++) {
++		p = (char *)priv + offsetof(struct stmmac_priv,
++					    xstats.rxq_stats[q].rx_pkt_n);
++		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
++			*data++ = (*(u64 *)p);
++			p += sizeof(u64 *);
++		}
++	}
++}
++
+ static void stmmac_get_ethtool_stats(struct net_device *dev,
+ 				 struct ethtool_stats *dummy, u64 *data)
+ {
+@@ -560,16 +595,21 @@ static void stmmac_get_ethtool_stats(struct net_device *dev,
+ 		data[j++] = (stmmac_gstrings_stats[i].sizeof_stat ==
+ 			     sizeof(u64)) ? (*(u64 *)p) : (*(u32 *)p);
+ 	}
++	stmmac_get_per_qstats(priv, &data[j]);
+ }
+ 
+ static int stmmac_get_sset_count(struct net_device *netdev, int sset)
+ {
+ 	struct stmmac_priv *priv = netdev_priv(netdev);
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
+ 	int i, len, safety_len = 0;
+ 
+ 	switch (sset) {
+ 	case ETH_SS_STATS:
+-		len = STMMAC_STATS_LEN;
++		len = STMMAC_STATS_LEN +
++		      STMMAC_TXQ_STATS * tx_cnt +
++		      STMMAC_RXQ_STATS * rx_cnt;
+ 
+ 		if (priv->dma_cap.rmon)
+ 			len += STMMAC_MMC_STATS_LEN;
+@@ -592,6 +632,28 @@ static int stmmac_get_sset_count(struct net_device *netdev, int sset)
+ 	}
+ }
+ 
++static void stmmac_get_qstats_string(struct stmmac_priv *priv, u8 *data)
++{
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
++	int q, stat;
++
++	for (q = 0; q < tx_cnt; q++) {
++		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
++			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
++				 stmmac_qstats_tx_string[stat]);
++			data += ETH_GSTRING_LEN;
++		}
++	}
++	for (q = 0; q < rx_cnt; q++) {
++		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
++			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
++				 stmmac_qstats_rx_string[stat]);
++			data += ETH_GSTRING_LEN;
++		}
++	}
++}
++
+ static void stmmac_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ {
+ 	int i;
+@@ -622,6 +684,7 @@ static void stmmac_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ 				ETH_GSTRING_LEN);
+ 			p += ETH_GSTRING_LEN;
+ 		}
++		stmmac_get_qstats_string(priv, p);
+ 		break;
+ 	case ETH_SS_TEST:
+ 		stmmac_selftest_get_strings(priv, p);
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index cef67c87656f..dc926a534535 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -2566,6 +2566,7 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue)
+ 			} else {
+ 				priv->dev->stats.tx_packets++;
+ 				priv->xstats.tx_pkt_n++;
++				priv->xstats.txq_stats[queue].tx_pkt_n++;
+ 			}
+ 			if (skb)
+ 				stmmac_get_tx_hwtstamp(priv, p, skb);
+@@ -5074,6 +5075,9 @@ static int stmmac_rx_zc(struct stmmac_priv *priv, int limit, u32 queue)
+ 
+ 	stmmac_finalize_xdp_rx(priv, xdp_status);
+ 
++	priv->xstats.rx_pkt_n += count;
++	priv->xstats.rxq_stats[queue].rx_pkt_n += count;
++
+ 	if (xsk_uses_need_wakeup(rx_q->xsk_pool)) {
+ 		if (failure || stmmac_rx_dirty(priv, queue) > 0)
+ 			xsk_set_rx_need_wakeup(rx_q->xsk_pool);
+@@ -5364,6 +5368,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 	stmmac_rx_refill(priv, queue);
+ 
+ 	priv->xstats.rx_pkt_n += count;
++	priv->xstats.rxq_stats[queue].rx_pkt_n += count;
+ 
+ 	return count;
+ }
+-- 
+2.27.0
+
