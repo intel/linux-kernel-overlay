@@ -57,6 +57,7 @@ make olddefconfig
 
 echo "Building the .deb package"
 nice make -j`nproc` bindeb-pkg
+cp .config $CUR_DIR/kernel.config
 popd
 
 ls -lah *.deb
