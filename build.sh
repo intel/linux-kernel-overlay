@@ -28,7 +28,7 @@ fi
 if [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
         kernel_p='lts'
 elif [[ $kernel_tag =~ .*?mainline-tracking-.*?Z$ ]]; then
-        kernel_p='mainline-tracking'
+        kernel_p='mainline'
 elif [[ $kernel_tag =~ .*?iotg-next-v.*?Z$ ]]; then
         kernel_p='iotg-next'
 else
