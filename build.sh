@@ -18,6 +18,29 @@ DEBIAN_DIR=$CUR_DIR/debian
 KSRC_DIR=$CUR_DIR/kernel
 KSRC_OVERLAY_DIR=$CUR_DIR/kernel.overlay/
 
+kernel_tag=$1
+build_id=$2
+
+if [ -z $build_id ]; then
+	build_id=0
+fi
+
+if [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
+        kernel_p='lts'
+elif [[ $kernel_tag =~ .*?mainline-tracking-.*?Z$ ]]; then
+        kernel_p='mainline'
+elif [[ $kernel_tag =~ .*?iotg-next-v.*?Z$ ]]; then
+        kernel_p='iotg-next'
+else
+        kernel_p='none'
+fi
+
+timestamp=`echo $kernel_tag|awk -F'-' '{print $NF}'`
+if [ -z $timestamp ]; then
+	timestamp='no_timestamp'
+fi
+
+echo "kenrle_p=${kernel_p}, timestamp=${timestamp}"
 # Clone and apply the debian repository.
 echo "Clone the Linux kernel repository to $KSRC_DIR, tag: $KSRC_TAG"
 if [ -z "${KSRC_MIRROR}" ] ; then
@@ -56,7 +79,7 @@ cp $CUR_DIR/overlay.config $KSRC_DIR/.config
 make olddefconfig
 
 echo "Building the .deb package"
-nice make -j`nproc` bindeb-pkg
+nice make -j`nproc` bindeb-pkg  LOCALVERSION= KDEB_PKGVERSION=$build_id KERNELRELEASE=${kernel_p}-`make kernelversion`-${timestamp}
 cp .config $CUR_DIR/kernel.config
 popd
 
