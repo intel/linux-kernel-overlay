@@ -79,7 +79,7 @@ cp $CUR_DIR/overlay.config $KSRC_DIR/.config
 make olddefconfig
 
 echo "Building the .deb package"
-nice make -j`nproc` bindeb-pkg  LOCALVERSION= KDEB_PKGVERSION=$build_id KERNELRELEASE=${kernel_p}-`make kernelversion`-${timestamp}
+nice make -j`nproc` bindeb-pkg  LOCALVERSION= KDEB_PKGVERSION=$build_id KERNELRELEASE=${kernel_p}-`make kernelversion`-${timestamp,,}
 cp .config $CUR_DIR/kernel.config
 popd
 
