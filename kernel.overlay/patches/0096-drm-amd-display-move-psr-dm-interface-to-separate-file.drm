@@ -1,0 +1,420 @@
+From 375d69238f7c60c7d3c685ee410da6244ae530ec Mon Sep 17 00:00:00 2001
+From: Roman Li <roman.li@amd.com>
+Date: Fri, 4 Jun 2021 14:34:24 -0400
+Subject: [PATCH 0096/1423] drm/amd/display: move psr dm interface to separate
+ files
+
+[Why]
+Improve the maintain/read abilities of dm code.
+
+[How]
+Create amdgpu_dm_psr.c/h files.
+Move psr function from amdgpu_dm.c
+
+Signed-off-by: Roman Li <roman.li@amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+Acked-by: Anson Jacob <Anson.Jacob@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/Makefile    |   2 +-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 137 +--------------
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c | 166 ++++++++++++++++++
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_psr.h |  37 ++++
+ 4 files changed, 205 insertions(+), 137 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.h
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+index 9a3b7bf8ab0b..91fb72c96545 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+@@ -28,7 +28,7 @@
+ AMDGPUDM = amdgpu_dm.o amdgpu_dm_irq.o amdgpu_dm_mst_types.o amdgpu_dm_color.o
+ 
+ ifneq ($(CONFIG_DRM_AMD_DC),)
+-AMDGPUDM += amdgpu_dm_services.o amdgpu_dm_helpers.o amdgpu_dm_pp_smu.o
++AMDGPUDM += amdgpu_dm_services.o amdgpu_dm_helpers.o amdgpu_dm_pp_smu.o amdgpu_dm_psr.o
+ endif
+ 
+ ifdef CONFIG_DRM_AMD_DC_HDCP
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 6c985a37ab44..0d70a92219af 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -58,6 +58,7 @@
+ #if defined(CONFIG_DEBUG_FS)
+ #include "amdgpu_dm_debugfs.h"
+ #endif
++#include "amdgpu_dm_psr.h"
+ 
+ #include "ivsrcid/ivsrcid_vislands30.h"
+ 
+@@ -213,12 +214,6 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ static void handle_cursor_update(struct drm_plane *plane,
+ 				 struct drm_plane_state *old_plane_state);
+ 
+-static void amdgpu_dm_set_psr_caps(struct dc_link *link);
+-static bool amdgpu_dm_psr_enable(struct dc_stream_state *stream);
+-static bool amdgpu_dm_link_setup_psr(struct dc_stream_state *stream);
+-static bool amdgpu_dm_psr_disable(struct dc_stream_state *stream);
+-static bool amdgpu_dm_psr_disable_all(struct amdgpu_display_manager *dm);
+-
+ static const struct drm_format_info *
+ amd_get_format_info(const struct drm_mode_fb_cmd2 *cmd);
+ 
+@@ -10730,136 +10725,6 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 						       freesync_capable);
+ }
+ 
+-static void amdgpu_dm_set_psr_caps(struct dc_link *link)
+-{
+-	uint8_t dpcd_data[EDP_PSR_RECEIVER_CAP_SIZE];
+-
+-	if (!(link->connector_signal & SIGNAL_TYPE_EDP))
+-		return;
+-	if (link->type == dc_connection_none)
+-		return;
+-	if (dm_helpers_dp_read_dpcd(NULL, link, DP_PSR_SUPPORT,
+-					dpcd_data, sizeof(dpcd_data))) {
+-		link->dpcd_caps.psr_caps.psr_version = dpcd_data[0];
+-
+-		if (dpcd_data[0] == 0) {
+-			link->psr_settings.psr_version = DC_PSR_VERSION_UNSUPPORTED;
+-			link->psr_settings.psr_feature_enabled = false;
+-		} else {
+-			link->psr_settings.psr_version = DC_PSR_VERSION_1;
+-			link->psr_settings.psr_feature_enabled = true;
+-		}
+-
+-		DRM_INFO("PSR support:%d\n", link->psr_settings.psr_feature_enabled);
+-	}
+-}
+-
+-/*
+- * amdgpu_dm_link_setup_psr() - configure psr link
+- * @stream: stream state
+- *
+- * Return: true if success
+- */
+-static bool amdgpu_dm_link_setup_psr(struct dc_stream_state *stream)
+-{
+-	struct dc_link *link = NULL;
+-	struct psr_config psr_config = {0};
+-	struct psr_context psr_context = {0};
+-	bool ret = false;
+-
+-	if (stream == NULL)
+-		return false;
+-
+-	link = stream->link;
+-
+-	psr_config.psr_version = link->dpcd_caps.psr_caps.psr_version;
+-
+-	if (psr_config.psr_version > 0) {
+-		psr_config.psr_exit_link_training_required = 0x1;
+-		psr_config.psr_frame_capture_indication_req = 0;
+-		psr_config.psr_rfb_setup_time = 0x37;
+-		psr_config.psr_sdp_transmit_line_num_deadline = 0x20;
+-		psr_config.allow_smu_optimizations = 0x0;
+-
+-		ret = dc_link_setup_psr(link, stream, &psr_config, &psr_context);
+-
+-	}
+-	DRM_DEBUG_DRIVER("PSR link: %d\n",	link->psr_settings.psr_feature_enabled);
+-
+-	return ret;
+-}
+-
+-/*
+- * amdgpu_dm_psr_enable() - enable psr f/w
+- * @stream: stream state
+- *
+- * Return: true if success
+- */
+-bool amdgpu_dm_psr_enable(struct dc_stream_state *stream)
+-{
+-	struct dc_link *link = stream->link;
+-	unsigned int vsync_rate_hz = 0;
+-	struct dc_static_screen_params params = {0};
+-	/* Calculate number of static frames before generating interrupt to
+-	 * enter PSR.
+-	 */
+-	// Init fail safe of 2 frames static
+-	unsigned int num_frames_static = 2;
+-
+-	DRM_DEBUG_DRIVER("Enabling psr...\n");
+-
+-	vsync_rate_hz = div64_u64(div64_u64((
+-			stream->timing.pix_clk_100hz * 100),
+-			stream->timing.v_total),
+-			stream->timing.h_total);
+-
+-	/* Round up
+-	 * Calculate number of frames such that at least 30 ms of time has
+-	 * passed.
+-	 */
+-	if (vsync_rate_hz != 0) {
+-		unsigned int frame_time_microsec = 1000000 / vsync_rate_hz;
+-		num_frames_static = (30000 / frame_time_microsec) + 1;
+-	}
+-
+-	params.triggers.cursor_update = true;
+-	params.triggers.overlay_update = true;
+-	params.triggers.surface_update = true;
+-	params.num_frames = num_frames_static;
+-
+-	dc_stream_set_static_screen_params(link->ctx->dc,
+-					   &stream, 1,
+-					   &params);
+-
+-	return dc_link_set_psr_allow_active(link, true, false, false);
+-}
+-
+-/*
+- * amdgpu_dm_psr_disable() - disable psr f/w
+- * @stream:  stream state
+- *
+- * Return: true if success
+- */
+-static bool amdgpu_dm_psr_disable(struct dc_stream_state *stream)
+-{
+-
+-	DRM_DEBUG_DRIVER("Disabling psr...\n");
+-
+-	return dc_link_set_psr_allow_active(stream->link, false, true, false);
+-}
+-
+-/*
+- * amdgpu_dm_psr_disable() - disable psr f/w
+- * if psr is enabled on any stream
+- *
+- * Return: true if success
+- */
+-static bool amdgpu_dm_psr_disable_all(struct amdgpu_display_manager *dm)
+-{
+-	DRM_DEBUG_DRIVER("Disabling psr if psr is enabled on any stream\n");
+-	return dc_set_psr_allow_active(dm->dc, false);
+-}
+-
+ void amdgpu_dm_trigger_timing_sync(struct drm_device *dev)
+ {
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c
+new file mode 100644
+index 000000000000..f7c77ae0d965
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c
+@@ -0,0 +1,166 @@
++/*
++ * Copyright 2021 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#include "amdgpu_dm_psr.h"
++#include "dc.h"
++#include "dm_helpers.h"
++
++/*
++ * amdgpu_dm_set_psr_caps() - set link psr capabilities
++ * @link: link
++ *
++ */
++void amdgpu_dm_set_psr_caps(struct dc_link *link)
++{
++	uint8_t dpcd_data[EDP_PSR_RECEIVER_CAP_SIZE];
++
++	if (!(link->connector_signal & SIGNAL_TYPE_EDP))
++		return;
++	if (link->type == dc_connection_none)
++		return;
++	if (dm_helpers_dp_read_dpcd(NULL, link, DP_PSR_SUPPORT,
++					dpcd_data, sizeof(dpcd_data))) {
++		link->dpcd_caps.psr_caps.psr_version = dpcd_data[0];
++
++		if (dpcd_data[0] == 0) {
++			link->psr_settings.psr_version = DC_PSR_VERSION_UNSUPPORTED;
++			link->psr_settings.psr_feature_enabled = false;
++		} else {
++			link->psr_settings.psr_version = DC_PSR_VERSION_1;
++			link->psr_settings.psr_feature_enabled = true;
++		}
++
++		DRM_INFO("PSR support:%d\n", link->psr_settings.psr_feature_enabled);
++	}
++}
++
++/*
++ * amdgpu_dm_link_setup_psr() - configure psr link
++ * @stream: stream state
++ *
++ * Return: true if success
++ */
++bool amdgpu_dm_link_setup_psr(struct dc_stream_state *stream)
++{
++	struct dc_link *link = NULL;
++	struct psr_config psr_config = {0};
++	struct psr_context psr_context = {0};
++	struct dc *dc = NULL;
++	bool ret = false;
++
++	if (stream == NULL)
++		return false;
++
++	link = stream->link;
++	dc = link->ctx->dc;
++
++	psr_config.psr_version = link->dpcd_caps.psr_caps.psr_version;
++
++	if (psr_config.psr_version > 0) {
++		psr_config.psr_exit_link_training_required = 0x1;
++		psr_config.psr_frame_capture_indication_req = 0;
++		psr_config.psr_rfb_setup_time = 0x37;
++		psr_config.psr_sdp_transmit_line_num_deadline = 0x20;
++		psr_config.allow_smu_optimizations = 0x0;
++
++		ret = dc_link_setup_psr(link, stream, &psr_config, &psr_context);
++
++	}
++	DRM_DEBUG_DRIVER("PSR link: %d\n",	link->psr_settings.psr_feature_enabled);
++
++	return ret;
++}
++
++/*
++ * amdgpu_dm_psr_enable() - enable psr f/w
++ * @stream: stream state
++ *
++ * Return: true if success
++ */
++bool amdgpu_dm_psr_enable(struct dc_stream_state *stream)
++{
++	struct dc_link *link = stream->link;
++	unsigned int vsync_rate_hz = 0;
++	struct dc_static_screen_params params = {0};
++	/* Calculate number of static frames before generating interrupt to
++	 * enter PSR.
++	 */
++	// Init fail safe of 2 frames static
++	unsigned int num_frames_static = 2;
++
++	DRM_DEBUG_DRIVER("Enabling psr...\n");
++
++	vsync_rate_hz = div64_u64(div64_u64((
++			stream->timing.pix_clk_100hz * 100),
++			stream->timing.v_total),
++			stream->timing.h_total);
++
++	/* Round up
++	 * Calculate number of frames such that at least 30 ms of time has
++	 * passed.
++	 */
++	if (vsync_rate_hz != 0) {
++		unsigned int frame_time_microsec = 1000000 / vsync_rate_hz;
++		num_frames_static = (30000 / frame_time_microsec) + 1;
++	}
++
++	params.triggers.cursor_update = true;
++	params.triggers.overlay_update = true;
++	params.triggers.surface_update = true;
++	params.num_frames = num_frames_static;
++
++	dc_stream_set_static_screen_params(link->ctx->dc,
++					   &stream, 1,
++					   &params);
++
++	return dc_link_set_psr_allow_active(link, true, false, false);
++}
++
++/*
++ * amdgpu_dm_psr_disable() - disable psr f/w
++ * @stream:  stream state
++ *
++ * Return: true if success
++ */
++bool amdgpu_dm_psr_disable(struct dc_stream_state *stream)
++{
++
++	DRM_DEBUG_DRIVER("Disabling psr...\n");
++
++	return dc_link_set_psr_allow_active(stream->link, false, true, false);
++}
++
++/*
++ * amdgpu_dm_psr_disable() - disable psr f/w
++ * if psr is enabled on any stream
++ *
++ * Return: true if success
++ */
++bool amdgpu_dm_psr_disable_all(struct amdgpu_display_manager *dm)
++{
++	DRM_DEBUG_DRIVER("Disabling psr if psr is enabled on any stream\n");
++	return dc_set_psr_allow_active(dm->dc, false);
++}
++
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.h
+new file mode 100644
+index 000000000000..57bbb80421e8
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright 2021 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: AMD
++ *
++ */
++
++#ifndef AMDGPU_DM_AMDGPU_DM_PSR_H_
++#define AMDGPU_DM_AMDGPU_DM_PSR_H_
++
++#include "amdgpu.h"
++
++void amdgpu_dm_set_psr_caps(struct dc_link *link);
++bool amdgpu_dm_psr_enable(struct dc_stream_state *stream);
++bool amdgpu_dm_link_setup_psr(struct dc_stream_state *stream);
++bool amdgpu_dm_psr_disable(struct dc_stream_state *stream);
++bool amdgpu_dm_psr_disable_all(struct amdgpu_display_manager *dm);
++
++#endif /* AMDGPU_DM_AMDGPU_DM_PSR_H_ */
+-- 
+2.27.0
+

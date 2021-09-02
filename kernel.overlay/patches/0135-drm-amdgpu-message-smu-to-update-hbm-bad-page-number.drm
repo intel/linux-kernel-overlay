@@ -1,0 +1,108 @@
+From 83de2fa01eb7910d1871d9a5eefb71565d5254d7 Mon Sep 17 00:00:00 2001
+From: "Stanley.Yang" <Stanley.Yang@amd.com>
+Date: Fri, 11 Jun 2021 15:38:50 +0800
+Subject: [PATCH 0135/1423] drm/amdgpu: message smu to update hbm bad page
+ number
+
+Use SMU to update the bad pages rather than directly
+accessing the EEPROM from the driver.
+
+Signed-off-by: Stanley.Yang <Stanley.Yang@amd.com>
+Reviewed-by: John Clements <john.clements@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c           |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c           |  4 ++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h           |  6 ++++++
+ .../gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c    | 15 +++++++++++++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 6d1e6005bd87..c13b02caf8c3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -1984,6 +1984,9 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev)
+ 		ret = amdgpu_ras_load_bad_pages(adev);
+ 		if (ret)
+ 			goto free;
++
++		if (adev->smu.ppt_funcs && adev->smu.ppt_funcs->send_hbm_bad_pages_num)
++			adev->smu.ppt_funcs->send_hbm_bad_pages_num(&adev->smu, con->eeprom_control.num_recs);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+index ea6f99be070b..f4489773715e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+@@ -94,6 +94,7 @@ int amdgpu_umc_process_ras_data_cb(struct amdgpu_device *adev,
+ 		struct amdgpu_iv_entry *entry)
+ {
+ 	struct ras_err_data *err_data = (struct ras_err_data *)ras_error_status;
++	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
+ 
+ 	kgd2kfd_set_sram_ecc_flag(adev->kfd.dev);
+ 	if (adev->umc.ras_funcs &&
+@@ -131,6 +132,9 @@ int amdgpu_umc_process_ras_data_cb(struct amdgpu_device *adev,
+ 			amdgpu_ras_add_bad_pages(adev, err_data->err_addr,
+ 						err_data->err_addr_cnt);
+ 			amdgpu_ras_save_bad_pages(adev);
++
++			if (adev->smu.ppt_funcs && adev->smu.ppt_funcs->send_hbm_bad_pages_num)
++				adev->smu.ppt_funcs->send_hbm_bad_pages_num(&adev->smu, con->eeprom_control.num_recs);
+ 		}
+ 
+ 		amdgpu_ras_reset_gpu(adev);
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+index 6559912ba229..3e89852e4820 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_smu.h
+@@ -1232,6 +1232,12 @@ struct pptable_funcs {
+ 	 */
+ 	int (*wait_for_event)(struct smu_context *smu,
+ 			      enum smu_event_type event, uint64_t event_arg);
++
++	/**
++	 * @sned_hbm_bad_pages_num:  message SMU to update bad page number
++	 *										of SMUBUS table.
++	 */
++	int (*send_hbm_bad_pages_num)(struct smu_context *smu, uint32_t size);
+ };
+ 
+ typedef enum {
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+index 82099c528ccb..9316a726195c 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+@@ -1923,6 +1923,20 @@ static int aldebaran_set_mp1_state(struct smu_context *smu,
+ 	}
+ }
+ 
++static int aldebaran_smu_send_hbm_bad_page_num(struct smu_context *smu,
++		uint32_t size)
++{
++	int ret = 0;
++
++	/* message SMU to update the bad page number on SMUBUS */
++	ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetNumBadHbmPagesRetired, size, NULL);
++	if (ret)
++		dev_err(smu->adev->dev, "[%s] failed to message SMU to update HBM bad pages number\n",
++				__func__);
++
++	return ret;
++}
++
+ static const struct pptable_funcs aldebaran_ppt_funcs = {
+ 	/* init dpm */
+ 	.get_allowed_feature_mask = aldebaran_get_allowed_feature_mask,
+@@ -1985,6 +1999,7 @@ static const struct pptable_funcs aldebaran_ppt_funcs = {
+ 	.wait_for_event = smu_v13_0_wait_for_event,
+ 	.i2c_init = aldebaran_i2c_control_init,
+ 	.i2c_fini = aldebaran_i2c_control_fini,
++	.send_hbm_bad_pages_num = aldebaran_smu_send_hbm_bad_page_num,
+ };
+ 
+ void aldebaran_set_ppt_funcs(struct smu_context *smu)
+-- 
+2.27.0
+

@@ -1,0 +1,114 @@
+From 7c3263a9dbb560e8d89d5a42d96f524db6336cad Mon Sep 17 00:00:00 2001
+From: Alex Sierra <alex.sierra@amd.com>
+Date: Wed, 23 Jun 2021 17:06:22 -0500
+Subject: [PATCH 0323/1423] drm/amdkfd: use hmm range fault to get both domain
+ pfns
+
+Now that prange could have mixed domains (VRAM or SYSRAM),
+actual_loc nor svm_bo can not be used to check its current
+domain and eventually get its pfns to map them in GPU.
+Instead, pfns from both domains, are now obtained from
+hmm_range_fault through amdgpu_hmm_range_get_pages
+call. This is done everytime a GPU map occur.
+
+Signed-off-by: Alex Sierra <alex.sierra@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c | 68 +++++++++++-----------------
+ 1 file changed, 27 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index a782af09b9b9..3e782572073f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -1426,42 +1426,38 @@ static int svm_range_validate_and_map(struct mm_struct *mm,
+ 
+ 	svm_range_reserve_bos(&ctx);
+ 
+-	if (!prange->actual_loc) {
+-		p = container_of(prange->svms, struct kfd_process, svms);
+-		owner = kfd_svm_page_owner(p, find_first_bit(ctx.bitmap,
+-							MAX_GPU_INSTANCE));
+-		for_each_set_bit(idx, ctx.bitmap, MAX_GPU_INSTANCE) {
+-			if (kfd_svm_page_owner(p, idx) != owner) {
+-				owner = NULL;
+-				break;
+-			}
+-		}
+-		r = amdgpu_hmm_range_get_pages(&prange->notifier, mm, NULL,
+-					       prange->start << PAGE_SHIFT,
+-					       prange->npages, &hmm_range,
+-					       false, true, owner);
+-		if (r) {
+-			pr_debug("failed %d to get svm range pages\n", r);
+-			goto unreserve_out;
+-		}
+-
+-		r = svm_range_dma_map(prange, ctx.bitmap,
+-				      hmm_range->hmm_pfns);
+-		if (r) {
+-			pr_debug("failed %d to dma map range\n", r);
+-			goto unreserve_out;
++	p = container_of(prange->svms, struct kfd_process, svms);
++	owner = kfd_svm_page_owner(p, find_first_bit(ctx.bitmap,
++						MAX_GPU_INSTANCE));
++	for_each_set_bit(idx, ctx.bitmap, MAX_GPU_INSTANCE) {
++		if (kfd_svm_page_owner(p, idx) != owner) {
++			owner = NULL;
++			break;
+ 		}
++	}
++	r = amdgpu_hmm_range_get_pages(&prange->notifier, mm, NULL,
++				       prange->start << PAGE_SHIFT,
++				       prange->npages, &hmm_range,
++				       false, true, owner);
++	if (r) {
++		pr_debug("failed %d to get svm range pages\n", r);
++		goto unreserve_out;
++	}
+ 
+-		prange->validated_once = true;
++	r = svm_range_dma_map(prange, ctx.bitmap,
++			      hmm_range->hmm_pfns);
++	if (r) {
++		pr_debug("failed %d to dma map range\n", r);
++		goto unreserve_out;
+ 	}
+ 
++	prange->validated_once = true;
++
+ 	svm_range_lock(prange);
+-	if (!prange->actual_loc) {
+-		if (amdgpu_hmm_range_get_pages_done(hmm_range)) {
+-			pr_debug("hmm update the range, need validate again\n");
+-			r = -EAGAIN;
+-			goto unlock_out;
+-		}
++	if (amdgpu_hmm_range_get_pages_done(hmm_range)) {
++		pr_debug("hmm update the range, need validate again\n");
++		r = -EAGAIN;
++		goto unlock_out;
+ 	}
+ 	if (!list_empty(&prange->child_list)) {
+ 		pr_debug("range split by unmap in parallel, validate again\n");
+@@ -2797,16 +2793,6 @@ svm_range_trigger_migration(struct mm_struct *mm, struct svm_range *prange,
+ 	    best_loc == prange->actual_loc)
+ 		return 0;
+ 
+-	/*
+-	 * Prefetch to GPU without host access flag, set actual_loc to gpu, then
+-	 * validate on gpu and map to gpus will be handled afterwards.
+-	 */
+-	if (best_loc && !prange->actual_loc &&
+-	    !(prange->flags & KFD_IOCTL_SVM_FLAG_HOST_ACCESS)) {
+-		prange->actual_loc = best_loc;
+-		return 0;
+-	}
+-
+ 	if (!best_loc) {
+ 		r = svm_migrate_vram_to_ram(prange, mm);
+ 		*migrated = !r;
+-- 
+2.27.0
+

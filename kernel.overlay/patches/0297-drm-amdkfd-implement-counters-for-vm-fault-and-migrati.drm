@@ -1,0 +1,160 @@
+From 117be2c4829666dfa90de240b79aaa23ec7409fa Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Tue, 22 Jun 2021 00:12:32 -0400
+Subject: [PATCH 0297/1423] drm/amdkfd: implement counters for vm fault and
+ migration
+
+Add helper function to get process device data structure from adev to
+update counters.
+
+Update vm faults, page_in, page_out counters will no be executed in
+parallel, use WRITE_ONCE to avoid any form of compiler optimizations.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_migrate.c | 14 ++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c     | 45 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.h     |  2 ++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+index 2660f03e63a7..d8092a84e0a4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+@@ -365,6 +365,7 @@ svm_migrate_vma_to_vram(struct amdgpu_device *adev, struct svm_range *prange,
+ 			uint64_t end)
+ {
+ 	uint64_t npages = (end - start) >> PAGE_SHIFT;
++	struct kfd_process_device *pdd;
+ 	struct dma_fence *mfence = NULL;
+ 	struct migrate_vma migrate;
+ 	dma_addr_t *scratch;
+@@ -425,6 +426,12 @@ svm_migrate_vma_to_vram(struct amdgpu_device *adev, struct svm_range *prange,
+ out_free:
+ 	kvfree(buf);
+ out:
++	if (!r) {
++		pdd = svm_range_get_pdd_by_adev(prange, adev);
++		if (pdd)
++			WRITE_ONCE(pdd->page_in, pdd->page_in + migrate.cpages);
++	}
++
+ 	return r;
+ }
+ 
+@@ -581,6 +588,7 @@ svm_migrate_vma_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
+ 		       struct vm_area_struct *vma, uint64_t start, uint64_t end)
+ {
+ 	uint64_t npages = (end - start) >> PAGE_SHIFT;
++	struct kfd_process_device *pdd;
+ 	struct dma_fence *mfence = NULL;
+ 	struct migrate_vma migrate;
+ 	dma_addr_t *scratch;
+@@ -630,6 +638,12 @@ svm_migrate_vma_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
+ out_free:
+ 	kvfree(buf);
+ out:
++	if (!r) {
++		pdd = svm_range_get_pdd_by_adev(prange, adev);
++		if (pdd)
++			WRITE_ONCE(pdd->page_out,
++				   pdd->page_out + migrate.cpages);
++	}
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index dff1011dd7ee..90e2eacb8ba0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -564,6 +564,24 @@ svm_range_get_adev_by_id(struct svm_range *prange, uint32_t gpu_id)
+ 	return (struct amdgpu_device *)pdd->dev->kgd;
+ }
+ 
++struct kfd_process_device *
++svm_range_get_pdd_by_adev(struct svm_range *prange, struct amdgpu_device *adev)
++{
++	struct kfd_process *p;
++	int32_t gpu_idx, gpuid;
++	int r;
++
++	p = container_of(prange->svms, struct kfd_process, svms);
++
++	r = kfd_process_gpuid_from_kgd(p, adev, &gpuid, &gpu_idx);
++	if (r) {
++		pr_debug("failed to get device id by adev %p\n", adev);
++		return NULL;
++	}
++
++	return kfd_process_device_from_gpuidx(p, gpu_idx);
++}
++
+ static int svm_range_bo_validate(void *param, struct amdgpu_bo *bo)
+ {
+ 	struct ttm_operation_ctx ctx = { false, false };
+@@ -2311,6 +2329,27 @@ static bool svm_range_skip_recover(struct svm_range *prange)
+ 	return false;
+ }
+ 
++static void
++svm_range_count_fault(struct amdgpu_device *adev, struct kfd_process *p,
++		      struct svm_range *prange, int32_t gpuidx)
++{
++	struct kfd_process_device *pdd;
++
++	if (gpuidx == MAX_GPU_INSTANCE)
++		/* fault is on different page of same range
++		 * or fault is skipped to recover later
++		 */
++		pdd = svm_range_get_pdd_by_adev(prange, adev);
++	else
++		/* fault recovered
++		 * or fault cannot recover because GPU no access on the range
++		 */
++		pdd = kfd_process_device_from_gpuidx(p, gpuidx);
++
++	if (pdd)
++		WRITE_ONCE(pdd->faults, pdd->faults + 1);
++}
++
+ int
+ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 			uint64_t addr)
+@@ -2320,7 +2359,8 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 	struct svm_range *prange;
+ 	struct kfd_process *p;
+ 	uint64_t timestamp;
+-	int32_t best_loc, gpuidx;
++	int32_t best_loc;
++	int32_t gpuidx = MAX_GPU_INSTANCE;
+ 	bool write_locked = false;
+ 	int r = 0;
+ 
+@@ -2440,6 +2480,9 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ out_unlock_svms:
+ 	mutex_unlock(&svms->lock);
+ 	mmap_read_unlock(mm);
++
++	svm_range_count_fault(adev, p, prange, gpuidx);
++
+ 	mmput(mm);
+ out:
+ 	kfd_unref_process(p);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+index 0c0fc399395e..a9af03994d1a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+@@ -174,6 +174,8 @@ void svm_range_dma_unmap(struct device *dev, dma_addr_t *dma_addr,
+ 			 unsigned long offset, unsigned long npages);
+ void svm_range_free_dma_mappings(struct svm_range *prange);
+ void svm_range_prefault(struct svm_range *prange, struct mm_struct *mm);
++struct kfd_process_device *
++svm_range_get_pdd_by_adev(struct svm_range *prange, struct amdgpu_device *adev);
+ 
+ /* SVM API and HMM page migration work together, device memory type
+  * is initialized to not 0 when page migration register device memory.
+-- 
+2.27.0
+

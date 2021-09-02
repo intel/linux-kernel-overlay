@@ -1,0 +1,279 @@
+From f85466dbd0293f7b88ed495195fd2ca37e22f60f Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 10 Jun 2021 18:39:56 -0400
+Subject: [PATCH 0111/1423] drm/amdkfd: Disable SVM per GPU, not per process
+
+When some GPUs don't support SVM, don't disabe it for the entire process.
+That would be inconsistent with the information the process got from the
+topology, which indicates SVM support per GPU.
+
+Instead disable SVM support only for the unsupported GPUs. This is done
+by checking any per-device attributes against the bitmap of supported
+GPUs. Also use the supported GPU bitmap to initialize access bitmaps for
+new SVM address ranges.
+
+Don't handle recoverable page faults from unsupported GPUs. (I don't
+think there will be unsupported GPUs that can generate recoverable page
+faults. But better safe than sorry.)
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Philip Yang <philip.yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c     |  3 -
+ drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c |  4 --
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h        |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c     |  1 -
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.c         | 60 ++++++++++++--------
+ drivers/gpu/drm/amd/amdkfd/kfd_svm.h         |  7 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.c    |  6 +-
+ 7 files changed, 45 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 5788a4656fa1..67541c30327a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1797,9 +1797,6 @@ static int kfd_ioctl_svm(struct file *filep, struct kfd_process *p, void *data)
+ 	struct kfd_ioctl_svm_args *args = data;
+ 	int r = 0;
+ 
+-	if (p->svm_disabled)
+-		return -EPERM;
+-
+ 	pr_debug("start 0x%llx size 0x%llx op 0x%x nattr 0x%x\n",
+ 		 args->start_addr, args->size, args->op, args->nattr);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+index 91c50739b756..a9b329f0f862 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
+@@ -405,10 +405,6 @@ int kfd_init_apertures(struct kfd_process *process)
+ 			case CHIP_POLARIS12:
+ 			case CHIP_VEGAM:
+ 				kfd_init_apertures_vi(pdd, id);
+-				/* VI GPUs cannot support SVM with only
+-				 * 40 bits of virtual address space.
+-				 */
+-				process->svm_disabled = true;
+ 				break;
+ 			case CHIP_VEGA10:
+ 			case CHIP_VEGA12:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 329684ee5d6e..6dc22fa1e555 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -743,6 +743,7 @@ struct svm_range_list {
+ 	spinlock_t			deferred_list_lock;
+ 	atomic_t			evicted_ranges;
+ 	struct delayed_work		restore_work;
++	DECLARE_BITMAP(bitmap_supported, MAX_GPU_INSTANCE);
+ };
+ 
+ /* Process data */
+@@ -826,7 +827,6 @@ struct kfd_process {
+ 
+ 	/* shared virtual memory registered by this process */
+ 	struct svm_range_list svms;
+-	bool svm_disabled;
+ 
+ 	bool xnack_enabled;
+ };
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index f1f40bba5c60..09b98a83f670 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1260,7 +1260,6 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	process->mm = thread->mm;
+ 	process->lead_thread = thread->group_leader;
+ 	process->n_pdds = 0;
+-	process->svm_disabled = false;
+ 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
+ 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
+ 	process->last_restore_timestamp = get_jiffies_64();
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index da569d417d1d..451e2ff5c062 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -281,7 +281,8 @@ svm_range *svm_range_new(struct svm_range_list *svms, uint64_t start,
+ 
+ 	p = container_of(svms, struct kfd_process, svms);
+ 	if (p->xnack_enabled)
+-		bitmap_fill(prange->bitmap_access, MAX_GPU_INSTANCE);
++		bitmap_copy(prange->bitmap_access, svms->bitmap_supported,
++			    MAX_GPU_INSTANCE);
+ 
+ 	svm_range_set_default_attributes(&prange->preferred_loc,
+ 					 &prange->prefetch_loc,
+@@ -577,36 +578,25 @@ svm_range_check_attr(struct kfd_process *p,
+ 		     uint32_t nattr, struct kfd_ioctl_svm_attribute *attrs)
+ {
+ 	uint32_t i;
+-	int gpuidx;
+ 
+ 	for (i = 0; i < nattr; i++) {
++		uint32_t val = attrs[i].value;
++		int gpuidx = MAX_GPU_INSTANCE;
++
+ 		switch (attrs[i].type) {
+ 		case KFD_IOCTL_SVM_ATTR_PREFERRED_LOC:
+-			if (attrs[i].value != KFD_IOCTL_SVM_LOCATION_SYSMEM &&
+-			    attrs[i].value != KFD_IOCTL_SVM_LOCATION_UNDEFINED &&
+-			    kfd_process_gpuidx_from_gpuid(p,
+-							  attrs[i].value) < 0) {
+-				pr_debug("no GPU 0x%x found\n", attrs[i].value);
+-				return -EINVAL;
+-			}
++			if (val != KFD_IOCTL_SVM_LOCATION_SYSMEM &&
++			    val != KFD_IOCTL_SVM_LOCATION_UNDEFINED)
++				gpuidx = kfd_process_gpuidx_from_gpuid(p, val);
+ 			break;
+ 		case KFD_IOCTL_SVM_ATTR_PREFETCH_LOC:
+-			if (attrs[i].value != KFD_IOCTL_SVM_LOCATION_SYSMEM &&
+-			    kfd_process_gpuidx_from_gpuid(p,
+-							  attrs[i].value) < 0) {
+-				pr_debug("no GPU 0x%x found\n", attrs[i].value);
+-				return -EINVAL;
+-			}
++			if (val != KFD_IOCTL_SVM_LOCATION_SYSMEM)
++				gpuidx = kfd_process_gpuidx_from_gpuid(p, val);
+ 			break;
+ 		case KFD_IOCTL_SVM_ATTR_ACCESS:
+ 		case KFD_IOCTL_SVM_ATTR_ACCESS_IN_PLACE:
+ 		case KFD_IOCTL_SVM_ATTR_NO_ACCESS:
+-			gpuidx = kfd_process_gpuidx_from_gpuid(p,
+-							       attrs[i].value);
+-			if (gpuidx < 0) {
+-				pr_debug("no GPU 0x%x found\n", attrs[i].value);
+-				return -EINVAL;
+-			}
++			gpuidx = kfd_process_gpuidx_from_gpuid(p, val);
+ 			break;
+ 		case KFD_IOCTL_SVM_ATTR_SET_FLAGS:
+ 			break;
+@@ -618,6 +608,15 @@ svm_range_check_attr(struct kfd_process *p,
+ 			pr_debug("unknown attr type 0x%x\n", attrs[i].type);
+ 			return -EINVAL;
+ 		}
++
++		if (gpuidx < 0) {
++			pr_debug("no GPU 0x%x found\n", val);
++			return -EINVAL;
++		} else if (gpuidx < MAX_GPU_INSTANCE &&
++			   !test_bit(gpuidx, p->svms.bitmap_supported)) {
++			pr_debug("GPU 0x%x not supported\n", val);
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1855,7 +1854,7 @@ static void svm_range_drain_retry_fault(struct svm_range_list *svms)
+ 
+ 	p = container_of(svms, struct kfd_process, svms);
+ 
+-	for (i = 0; i < p->n_pdds; i++) {
++	for_each_set_bit(i, svms->bitmap_supported, p->n_pdds) {
+ 		pdd = p->pdds[i];
+ 		if (!pdd)
+ 			continue;
+@@ -2325,6 +2324,11 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 	bool write_locked = false;
+ 	int r = 0;
+ 
++	if (!KFD_IS_SVM_API_SUPPORTED(adev->kfd.dev)) {
++		pr_debug("device does not support SVM\n");
++		return -EFAULT;
++	}
++
+ 	p = kfd_lookup_process_by_pasid(pasid);
+ 	if (!p) {
+ 		pr_debug("kfd process not founded pasid 0x%x\n", pasid);
+@@ -2472,6 +2476,7 @@ void svm_range_list_fini(struct kfd_process *p)
+ int svm_range_list_init(struct kfd_process *p)
+ {
+ 	struct svm_range_list *svms = &p->svms;
++	int i;
+ 
+ 	svms->objects = RB_ROOT_CACHED;
+ 	mutex_init(&svms->lock);
+@@ -2482,6 +2487,10 @@ int svm_range_list_init(struct kfd_process *p)
+ 	INIT_LIST_HEAD(&svms->deferred_range_list);
+ 	spin_lock_init(&svms->deferred_list_lock);
+ 
++	for (i = 0; i < p->n_pdds; i++)
++		if (KFD_IS_SVM_API_SUPPORTED(p->pdds[i]->dev))
++			bitmap_set(svms->bitmap_supported, i, 1);
++
+ 	return 0;
+ }
+ 
+@@ -2978,14 +2987,15 @@ svm_range_get_attr(struct kfd_process *p, uint64_t start, uint64_t size,
+ 		svm_range_set_default_attributes(&location, &prefetch_loc,
+ 						 &granularity, &flags);
+ 		if (p->xnack_enabled)
+-			bitmap_fill(bitmap_access, MAX_GPU_INSTANCE);
++			bitmap_copy(bitmap_access, svms->bitmap_supported,
++				    MAX_GPU_INSTANCE);
+ 		else
+ 			bitmap_zero(bitmap_access, MAX_GPU_INSTANCE);
+ 		bitmap_zero(bitmap_aip, MAX_GPU_INSTANCE);
+ 		goto fill_values;
+ 	}
+-	bitmap_fill(bitmap_access, MAX_GPU_INSTANCE);
+-	bitmap_fill(bitmap_aip, MAX_GPU_INSTANCE);
++	bitmap_copy(bitmap_access, svms->bitmap_supported, MAX_GPU_INSTANCE);
++	bitmap_copy(bitmap_aip, svms->bitmap_supported, MAX_GPU_INSTANCE);
+ 
+ 	while (node) {
+ 		struct interval_tree_node *next;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+index 573f984b81fe..0c0fc399395e 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.h
+@@ -175,6 +175,11 @@ void svm_range_dma_unmap(struct device *dev, dma_addr_t *dma_addr,
+ void svm_range_free_dma_mappings(struct svm_range *prange);
+ void svm_range_prefault(struct svm_range *prange, struct mm_struct *mm);
+ 
++/* SVM API and HMM page migration work together, device memory type
++ * is initialized to not 0 when page migration register device memory.
++ */
++#define KFD_IS_SVM_API_SUPPORTED(dev) ((dev)->pgmap.type != 0)
++
+ #else
+ 
+ struct kfd_process;
+@@ -201,6 +206,8 @@ static inline int svm_range_schedule_evict_svm_bo(
+ 	return -EINVAL;
+ }
+ 
++#define KFD_IS_SVM_API_SUPPORTED(dev) false
++
+ #endif /* IS_ENABLED(CONFIG_HSA_AMD_SVM) */
+ 
+ #endif /* KFD_SVM_H_ */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+index f668b8cc2b57..ff4e296c1c58 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.c
+@@ -36,6 +36,7 @@
+ #include "kfd_topology.h"
+ #include "kfd_device_queue_manager.h"
+ #include "kfd_iommu.h"
++#include "kfd_svm.h"
+ #include "amdgpu_amdkfd.h"
+ #include "amdgpu_ras.h"
+ 
+@@ -1441,10 +1442,7 @@ int kfd_topology_add_device(struct kfd_dev *gpu)
+ 		dev->node_props.capability |= (adev->ras_enabled != 0) ?
+ 			HSA_CAP_RASEVENTNOTIFY : 0;
+ 
+-	/* SVM API and HMM page migration work together, device memory type
+-	 * is initialized to not 0 when page migration register device memory.
+-	 */
+-	if (adev->kfd.dev->pgmap.type != 0)
++	if (KFD_IS_SVM_API_SUPPORTED(adev->kfd.dev))
+ 		dev->node_props.capability |= HSA_CAP_SVMAPI_SUPPORTED;
+ 
+ 	kfd_debug_print_topology();
+-- 
+2.27.0
+
