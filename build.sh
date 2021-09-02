@@ -4,7 +4,7 @@
 KVERSION=5
 KPATCHLEVEL=14
 KSUBLEVEL=0
-KEXTRAVERSION=-rc6
+KEXTRAVERSION=
 
 KSRC_REPO=https://github.com/torvalds/linux.git
 

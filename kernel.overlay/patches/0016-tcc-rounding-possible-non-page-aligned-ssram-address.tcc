@@ -1,4 +1,4 @@
-From fe7545d85e2d3b13f93fd2f8bd902a3748d114ac Mon Sep 17 00:00:00 2001
+From d40403715b720f027879925548969fb1b60c5d04 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Sun, 8 Aug 2021 03:13:01 +0800
 Subject: [PATCH 16/16] tcc: rounding possible non page-aligned ssram address
