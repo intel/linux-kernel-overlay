@@ -5,10 +5,11 @@ KVERSION=5
 KPATCHLEVEL=10
 KSUBLEVEL=59
 KEXTRAVERSION=
+KRTV=52
 
-KSRC_REPO=https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/linux.git
+KSRC_REPO=https://kernel.googlesource.com/pub/scm/linux/kernel/git/rt/linux-stable-rt.git
 
-KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL
+KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL-rt$KRTV
 
 KSRC_MIRROR=
 
