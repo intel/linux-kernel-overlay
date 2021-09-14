@@ -1,0 +1,120 @@
+From 572d3675cffbb5d8503f93d2b30900c9db88212b Mon Sep 17 00:00:00 2001
+From: Kurt Kanzenbach <kurt@linutronix.de>
+Date: Mon, 28 Jun 2021 21:43:31 -0700
+Subject: [PATCH 117/122] igc: Make flex filter more flexible
+
+Currently flex filters are only used for filters containing user data.
+However, it makes sense to utilize them also for filters having
+multiple conditions, because that's not supported by the driver at the
+moment. Add it.
+
+Signed-off-by: Kurt Kanzenbach <kurt@linutronix.de>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Signed-off-by: Muhammad Husaini Zulkifli <muhammad.husaini.zulkifli@intel.com>
+---
+ drivers/net/ethernet/intel/igc/igc.h         |  1 +
+ drivers/net/ethernet/intel/igc/igc_ethtool.c | 27 ++++++++++++--------
+ drivers/net/ethernet/intel/igc/igc_main.c    | 14 ++++------
+ 3 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc.h b/drivers/net/ethernet/intel/igc/igc.h
+index c5a823c355ad..65c105a63ced 100644
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@ -529,6 +529,7 @@ struct igc_nfc_rule {
+ 	struct igc_nfc_filter filter;
+ 	u32 location;
+ 	u16 action;
++	bool flex;
+ };
+ 
+ /* IGC supports a total of 32 NFC rules: 16 MAC address based, 8 VLAN priority
+diff --git a/drivers/net/ethernet/intel/igc/igc_ethtool.c b/drivers/net/ethernet/intel/igc/igc_ethtool.c
+index cbcefef09d59..97c20d3d4c50 100644
+--- a/drivers/net/ethernet/intel/igc/igc_ethtool.c
++++ b/drivers/net/ethernet/intel/igc/igc_ethtool.c
+@@ -1236,19 +1236,29 @@ static void igc_ethtool_init_nfc_rule(struct igc_nfc_rule *rule,
+ 				fsp->h_u.ether_spec.h_dest);
+ 	}
+ 
++	/* VLAN etype matching */
++	if ((fsp->flow_type & FLOW_EXT) && fsp->h_ext.vlan_etype) {
++		rule->filter.vlan_etype = fsp->h_ext.vlan_etype;
++		rule->filter.match_flags |= IGC_FILTER_FLAG_VLAN_ETYPE;
++	}
++
+ 	/* Check for user defined data */
+ 	if ((fsp->flow_type & FLOW_EXT) &&
+ 	    (fsp->h_ext.data[0] || fsp->h_ext.data[1])) {
+ 		rule->filter.match_flags |= IGC_FILTER_FLAG_USER_DATA;
+ 		memcpy(rule->filter.user_data, fsp->h_ext.data, sizeof(fsp->h_ext.data));
+ 		memcpy(rule->filter.user_mask, fsp->m_ext.data, sizeof(fsp->m_ext.data));
+-
+-		/* VLAN etype matching is only valid using flex filter */
+-		if ((fsp->flow_type & FLOW_EXT) && fsp->h_ext.vlan_etype) {
+-			rule->filter.vlan_etype = fsp->h_ext.vlan_etype;
+-			rule->filter.match_flags |= IGC_FILTER_FLAG_VLAN_ETYPE;
+-		}
+ 	}
++
++	/* When multiple filter options or user data or vlan etype is set, use a
++	 * flex filter.
++	 */
++	if ((rule->filter.match_flags & IGC_FILTER_FLAG_USER_DATA) ||
++	    (rule->filter.match_flags & IGC_FILTER_FLAG_VLAN_ETYPE) ||
++	    (rule->filter.match_flags & (rule->filter.match_flags - 1)))
++		rule->flex = true;
++	else
++		rule->flex = false;
+ }
+ 
+ /**
+@@ -1278,11 +1288,6 @@ static int igc_ethtool_check_nfc_rule(struct igc_adapter *adapter,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (flags & (flags - 1)) {
+-		netdev_dbg(dev, "Rule with multiple matches not supported\n");
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	list_for_each_entry(tmp, &adapter->nfc_rule_list, list) {
+ 		if (!memcmp(&rule->filter, &tmp->filter,
+ 			    sizeof(rule->filter)) &&
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index 939edc566fcf..f2dab4a6d376 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -3416,14 +3416,8 @@ static int igc_enable_nfc_rule(struct igc_adapter *adapter,
+ {
+ 	int err;
+ 
+-	/* Check for user data first: When user data is set, the only option is
+-	 * to use a flex filter. When more options are set (ethertype, vlan tci,
+-	 * ...) construct a flex filter matching all of that.
+-	 */
+-	if (rule->filter.match_flags & IGC_FILTER_FLAG_USER_DATA) {
+-		err = igc_add_flex_filter(adapter, rule);
+-		if (err)
+-			return err;
++	if (rule->flex) {
++		return igc_add_flex_filter(adapter, rule);
+ 	}
+ 
+ 	if (rule->filter.match_flags & IGC_FILTER_FLAG_ETHER_TYPE) {
+@@ -3462,8 +3456,10 @@ static int igc_enable_nfc_rule(struct igc_adapter *adapter,
+ static void igc_disable_nfc_rule(struct igc_adapter *adapter,
+ 				 const struct igc_nfc_rule *rule)
+ {
+-	if (rule->filter.match_flags & IGC_FILTER_FLAG_USER_DATA)
++	if (rule->flex) {
+ 		igc_del_flex_filter(adapter, rule->filter.flex_index);
++		return;
++	}
+ 
+ 	if (rule->filter.match_flags & IGC_FILTER_FLAG_ETHER_TYPE)
+ 		igc_del_etype_filter(adapter, rule->filter.etype);
+-- 
+2.17.1
+

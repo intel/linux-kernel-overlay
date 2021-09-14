@@ -1,0 +1,287 @@
+From cc5c6b0db35084266f89737b8ad23debab46a20b Mon Sep 17 00:00:00 2001
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Wed, 2 Jun 2021 19:20:18 +0300
+Subject: [PATCH 044/122] net: pcs: xpcs: convert to mdio_device
+
+Unify the 2 existing PCS drivers (lynx and xpcs) by doing a similar
+thing on probe, which is to have a *_create function that takes a
+struct mdio_device * given by the caller, and builds a private PCS
+structure around that.
+
+This changes stmmac to hold only a pointer to the xpcs, as opposed to
+the full structure. This will be used in the next patch when struct
+mdio_xpcs_ops is removed. Currently a pointer to struct mdio_xpcs_ops
+is used as a shorthand to determine whether the port has an XPCS or not.
+We can do the same now with the mdio_xpcs_args pointer.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/stmicro/stmmac/common.h  |  2 +-
+ .../ethernet/stmicro/stmmac/stmmac_ethtool.c  |  2 +-
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 10 ++--
+ .../net/ethernet/stmicro/stmmac/stmmac_mdio.c | 39 ++++++++------
+ drivers/net/pcs/pcs-xpcs.c                    | 53 +++++++++++++++----
+ include/linux/pcs/pcs-xpcs.h                  |  7 +--
+ 6 files changed, 76 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 619e3c0760d6..4bcd1d340766 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -504,7 +504,7 @@ struct mac_device_info {
+ 	const struct stmmac_tc_ops *tc;
+ 	const struct stmmac_mmc_ops *mmc;
+ 	const struct mdio_xpcs_ops *xpcs;
+-	struct mdio_xpcs_args xpcs_args;
++	struct mdio_xpcs_args *xpcs_args;
+ 	struct mii_regs mii;	/* MII register Addresses */
+ 	struct mac_link link;
+ 	void __iomem *pcsr;     /* vpointer to device CSRs */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index ba7d0f40723a..050576ee704d 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -721,7 +721,7 @@ static int stmmac_ethtool_op_set_eee(struct net_device *dev,
+ 			    "Setting EEE tx-lpi is not supported\n");
+ 
+ 	if (priv->hw->xpcs) {
+-		ret = xpcs_config_eee(&priv->hw->xpcs_args,
++		ret = xpcs_config_eee(priv->hw->xpcs_args,
+ 				      priv->plat->mult_fact_100ns,
+ 				      edata->eee_enabled);
+ 		if (ret)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index de2e43dce729..b4b0fa59addb 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -997,7 +997,7 @@ static void stmmac_validate(struct phylink_config *config,
+ 
+ 	/* If PCS is supported, check which modes it supports. */
+ 	if (priv->hw->xpcs)
+-		xpcs_validate(&priv->hw->xpcs_args, supported, state);
++		xpcs_validate(priv->hw->xpcs_args, supported, state);
+ }
+ 
+ static void stmmac_mac_pcs_get_state(struct phylink_config *config,
+@@ -1006,7 +1006,7 @@ static void stmmac_mac_pcs_get_state(struct phylink_config *config,
+ 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
+ 
+ 	state->link = 0;
+-	stmmac_xpcs_get_state(priv, &priv->hw->xpcs_args, state);
++	stmmac_xpcs_get_state(priv, priv->hw->xpcs_args, state);
+ }
+ 
+ static void stmmac_mac_config(struct phylink_config *config, unsigned int mode,
+@@ -1014,7 +1014,7 @@ static void stmmac_mac_config(struct phylink_config *config, unsigned int mode,
+ {
+ 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
+ 
+-	stmmac_xpcs_config(priv, &priv->hw->xpcs_args, state);
++	stmmac_xpcs_config(priv, priv->hw->xpcs_args, state);
+ }
+ 
+ static void stmmac_mac_an_restart(struct phylink_config *config)
+@@ -1061,7 +1061,7 @@ static void stmmac_mac_link_up(struct phylink_config *config,
+ 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
+ 	u32 ctrl;
+ 
+-	stmmac_xpcs_link_up(priv, &priv->hw->xpcs_args, speed, interface);
++	stmmac_xpcs_link_up(priv, priv->hw->xpcs_args, speed, interface);
+ 
+ 	ctrl = readl(priv->ioaddr + MAC_CTRL_REG);
+ 	ctrl &= ~priv->hw->link.speed_mask;
+@@ -3654,7 +3654,7 @@ int stmmac_open(struct net_device *dev)
+ 	if (priv->hw->pcs != STMMAC_PCS_TBI &&
+ 	    priv->hw->pcs != STMMAC_PCS_RTBI &&
+ 	    (!priv->hw->xpcs ||
+-	     xpcs_get_an_mode(&priv->hw->xpcs_args, mode) != DW_AN_C73)) {
++	     xpcs_get_an_mode(priv->hw->xpcs_args, mode) != DW_AN_C73)) {
+ 		ret = stmmac_init_phy(dev);
+ 		if (ret) {
+ 			netdev_err(priv->dev,
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+index 331d85776237..cc7a29d93394 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+@@ -546,25 +546,27 @@ int stmmac_mdio_register(struct net_device *ndev)
+ 	}
+ 
+ 	/* Try to probe the XPCS by scanning all addresses. */
+-	if (priv->hw->xpcs) {
+-		struct mdio_xpcs_args *xpcs = &priv->hw->xpcs_args;
+-		int ret, mode = priv->plat->phy_interface;
+-		max_addr = PHY_MAX_ADDR;
+-
+-		xpcs->bus = new_bus;
+-
+-		found = 0;
+-		for (addr = 0; addr < max_addr; addr++) {
+-			xpcs->addr = addr;
+-
+-			ret = xpcs_probe(xpcs, mode);
+-			if (!ret) {
+-				found = 1;
+-				break;
++	if (mdio_bus_data->has_xpcs) {
++		int mode = priv->plat->phy_interface;
++		struct mdio_device *mdiodev;
++		struct mdio_xpcs_args *xpcs;
++
++		for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
++			mdiodev = mdio_device_create(new_bus, addr);
++			if (IS_ERR(mdiodev))
++				continue;
++
++			xpcs = xpcs_create(mdiodev, mode);
++			if (IS_ERR_OR_NULL(xpcs)) {
++				mdio_device_free(mdiodev);
++				continue;
+ 			}
++
++			priv->hw->xpcs_args = xpcs;
++			break;
+ 		}
+ 
+-		if (!found && !mdio_node) {
++		if (!priv->hw->xpcs_args) {
+ 			dev_warn(dev, "No XPCS found\n");
+ 			err = -ENODEV;
+ 			goto no_xpcs_found;
+@@ -596,6 +598,11 @@ int stmmac_mdio_unregister(struct net_device *ndev)
+ 	if (!priv->mii)
+ 		return 0;
+ 
++	if (priv->hw->xpcs) {
++		mdio_device_free(priv->hw->xpcs_args->mdiodev);
++		xpcs_destroy(priv->hw->xpcs_args);
++	}
++
+ 	mdiobus_unregister(priv->mii);
+ 	priv->mii->priv = NULL;
+ 	mdiobus_free(priv->mii);
+diff --git a/drivers/net/pcs/pcs-xpcs.c b/drivers/net/pcs/pcs-xpcs.c
+index afabb9209c52..e17e72175ebb 100644
+--- a/drivers/net/pcs/pcs-xpcs.c
++++ b/drivers/net/pcs/pcs-xpcs.c
+@@ -241,15 +241,19 @@ static bool __xpcs_linkmode_supported(const struct xpcs_compat *compat,
+ static int xpcs_read(struct mdio_xpcs_args *xpcs, int dev, u32 reg)
+ {
+ 	u32 reg_addr = mdiobus_c45_addr(dev, reg);
++	struct mii_bus *bus = xpcs->mdiodev->bus;
++	int addr = xpcs->mdiodev->addr;
+ 
+-	return mdiobus_read(xpcs->bus, xpcs->addr, reg_addr);
++	return mdiobus_read(bus, addr, reg_addr);
+ }
+ 
+ static int xpcs_write(struct mdio_xpcs_args *xpcs, int dev, u32 reg, u16 val)
+ {
+ 	u32 reg_addr = mdiobus_c45_addr(dev, reg);
++	struct mii_bus *bus = xpcs->mdiodev->bus;
++	int addr = xpcs->mdiodev->addr;
+ 
+-	return mdiobus_write(xpcs->bus, xpcs->addr, reg_addr, val);
++	return mdiobus_write(bus, addr, reg_addr, val);
+ }
+ 
+ static int xpcs_read_vendor(struct mdio_xpcs_args *xpcs, int dev, u32 reg)
+@@ -315,7 +319,7 @@ static int xpcs_soft_reset(struct mdio_xpcs_args *xpcs,
+ #define xpcs_warn(__xpcs, __state, __args...) \
+ ({ \
+ 	if ((__state)->link) \
+-		dev_warn(&(__xpcs)->bus->dev, ##__args); \
++		dev_warn(&(__xpcs)->mdiodev->dev, ##__args); \
+ })
+ 
+ static int xpcs_read_fault_c73(struct mdio_xpcs_args *xpcs,
+@@ -1005,10 +1009,20 @@ static const struct xpcs_id xpcs_id_list[] = {
+ 	},
+ };
+ 
+-int xpcs_probe(struct mdio_xpcs_args *xpcs, phy_interface_t interface)
++struct mdio_xpcs_args *xpcs_create(struct mdio_device *mdiodev,
++				   phy_interface_t interface)
+ {
+-	u32 xpcs_id = xpcs_get_id(xpcs);
+-	int i;
++	struct mdio_xpcs_args *xpcs;
++	u32 xpcs_id;
++	int i, ret;
++
++	xpcs = kzalloc(sizeof(*xpcs), GFP_KERNEL);
++	if (!xpcs)
++		return NULL;
++
++	xpcs->mdiodev = mdiodev;
++
++	xpcs_id = xpcs_get_id(xpcs);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(xpcs_id_list); i++) {
+ 		const struct xpcs_id *entry = &xpcs_id_list[i];
+@@ -1020,15 +1034,32 @@ int xpcs_probe(struct mdio_xpcs_args *xpcs, phy_interface_t interface)
+ 		xpcs->id = entry;
+ 
+ 		compat = xpcs_find_compat(entry, interface);
+-		if (!compat)
+-			return -ENODEV;
++		if (!compat) {
++			ret = -ENODEV;
++			goto out;
++		}
+ 
+-		return xpcs_soft_reset(xpcs, compat);
++		ret = xpcs_soft_reset(xpcs, compat);
++		if (ret)
++			goto out;
++
++		return xpcs;
+ 	}
+ 
+-	return -ENODEV;
++	ret = -ENODEV;
++
++out:
++	kfree(xpcs);
++
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(xpcs_create);
++
++void xpcs_destroy(struct mdio_xpcs_args *xpcs)
++{
++	kfree(xpcs);
+ }
+-EXPORT_SYMBOL_GPL(xpcs_probe);
++EXPORT_SYMBOL_GPL(xpcs_destroy);
+ 
+ static struct mdio_xpcs_ops xpcs_ops = {
+ 	.config = xpcs_config,
+diff --git a/include/linux/pcs/pcs-xpcs.h b/include/linux/pcs/pcs-xpcs.h
+index 1d8581b74d81..57a199393d63 100644
+--- a/include/linux/pcs/pcs-xpcs.h
++++ b/include/linux/pcs/pcs-xpcs.h
+@@ -17,9 +17,8 @@
+ struct xpcs_id;
+ 
+ struct mdio_xpcs_args {
+-	struct mii_bus *bus;
++	struct mdio_device *mdiodev;
+ 	const struct xpcs_id *id;
+-	int addr;
+ };
+ 
+ struct mdio_xpcs_ops {
+@@ -37,6 +36,8 @@ void xpcs_validate(struct mdio_xpcs_args *xpcs, unsigned long *supported,
+ 		   struct phylink_link_state *state);
+ int xpcs_config_eee(struct mdio_xpcs_args *xpcs, int mult_fact_100ns,
+ 		    int enable);
+-int xpcs_probe(struct mdio_xpcs_args *xpcs, phy_interface_t interface);
++struct mdio_xpcs_args *xpcs_create(struct mdio_device *mdiodev,
++				   phy_interface_t interface);
++void xpcs_destroy(struct mdio_xpcs_args *xpcs);
+ 
+ #endif /* __LINUX_PCS_XPCS_H */
+-- 
+2.17.1
+
