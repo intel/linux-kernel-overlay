@@ -1,0 +1,171 @@
+From 74ae9517ffc0f9d7c3725cf3b472486a211f42e4 Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Tue, 25 May 2021 16:57:39 -0700
+Subject: [PATCH 54/88] x86/process/64: Clean up uintr task fork and exit paths
+
+The user interrupt MSRs and the user interrupt state is task specific.
+During task fork and exit clear the task state, clear the MSRs and
+dereference the shared resources.
+
+Some of the memory resources like the UPID are referenced in the file
+descriptor and could be in use while the uintr_fd is still valid.
+Instead of freeing up  the UPID just dereference it.  Eventually when
+every user releases the reference the memory resource will be freed up.
+
+Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+ arch/x86/include/asm/uintr.h |  3 ++
+ arch/x86/kernel/fpu/core.c   |  9 ++++++
+ arch/x86/kernel/process.c    | 10 +++++++
+ arch/x86/kernel/uintr_core.c | 55 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 77 insertions(+)
+
+diff --git a/arch/x86/include/asm/uintr.h b/arch/x86/include/asm/uintr.h
+index f7ccb67014b8..cef4dd81d40e 100644
+--- a/arch/x86/include/asm/uintr.h
++++ b/arch/x86/include/asm/uintr.h
+@@ -8,12 +8,15 @@ bool uintr_arch_enabled(void);
+ int do_uintr_register_handler(u64 handler);
+ int do_uintr_unregister_handler(void);
+ 
++void uintr_free(struct task_struct *task);
++
+ /* TODO: Inline the context switch related functions */
+ void switch_uintr_prepare(struct task_struct *prev);
+ void switch_uintr_return(void);
+ 
+ #else /* !CONFIG_X86_USER_INTERRUPTS */
+ 
++static inline void uintr_free(struct task_struct *task) {}
+ static inline void switch_uintr_prepare(struct task_struct *prev) {}
+ static inline void switch_uintr_return(void) {}
+ 
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index e30588bf7ce9..c0a54f7aaa2a 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -260,6 +260,7 @@ int fpu_clone(struct task_struct *dst)
+ {
+ 	struct fpu *src_fpu = &current->thread.fpu;
+ 	struct fpu *dst_fpu = &dst->thread.fpu;
++	struct uintr_state *uintr_state;
+ 
+ 	/* The new task's FPU state cannot be valid in the hardware. */
+ 	dst_fpu->last_cpu = -1;
+@@ -284,6 +285,14 @@ int fpu_clone(struct task_struct *dst)
+ 
+ 	else
+ 		save_fpregs_to_fpstate(dst_fpu);
++
++	/* UINTR state is not expected to be inherited (in the current design). */
++	if (static_cpu_has(X86_FEATURE_UINTR)) {
++		uintr_state = get_xsave_addr(&dst_fpu->state.xsave, XFEATURE_UINTR);
++		if (uintr_state)
++			memset(uintr_state, 0, sizeof(*uintr_state));
++	}
++
+ 	fpregs_unlock();
+ 
+ 	set_tsk_thread_flag(dst, TIF_NEED_FPU_LOAD);
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 7d8ccebdcab1..9454c3df8fc4 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -26,6 +26,7 @@
+ #include <linux/elf-randomize.h>
+ #include <trace/events/power.h>
+ #include <linux/hw_breakpoint.h>
++#include <asm/uintr.h>
+ #include <asm/cpu.h>
+ #include <asm/apic.h>
+ #include <linux/uaccess.h>
+@@ -88,6 +89,12 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ #ifdef CONFIG_VM86
+ 	dst->thread.vm86 = NULL;
+ #endif
++
++#ifdef CONFIG_X86_USER_INTERRUPTS
++	/* User Interrupt state is unique for each task */
++	dst->thread.ui_recv = NULL;
++#endif
++
+ 	return fpu_clone(dst);
+ }
+ 
+@@ -105,6 +112,9 @@ void exit_thread(struct task_struct *tsk)
+ 	free_vm86(t);
+ 
+ 	shstk_free(tsk);
++
++	uintr_free(tsk);
++
+ 	fpu__drop(fpu);
+ }
+ 
+diff --git a/arch/x86/kernel/uintr_core.c b/arch/x86/kernel/uintr_core.c
+index 7a29888050ad..a2a13f890139 100644
+--- a/arch/x86/kernel/uintr_core.c
++++ b/arch/x86/kernel/uintr_core.c
+@@ -313,3 +313,58 @@ void switch_uintr_return(void)
+ 			apic->send_IPI_self(UINTR_NOTIFICATION_VECTOR);
+ 	}
+ }
++
++/*
++ * This should only be called from exit_thread().
++ * exit_thread() can happen in current context when the current thread is
++ * exiting or it can happen for a new thread that is being created.
++ * For new threads is_uintr_receiver() should fail.
++ */
++void uintr_free(struct task_struct *t)
++{
++	struct uintr_receiver *ui_recv;
++	struct fpu *fpu;
++
++	if (!static_cpu_has(X86_FEATURE_UINTR) || !is_uintr_receiver(t))
++		return;
++
++	if (WARN_ON_ONCE(t != current))
++		return;
++
++	fpu = &t->thread.fpu;
++
++	fpregs_lock();
++
++	if (fpregs_state_valid(fpu, smp_processor_id())) {
++		wrmsrl(MSR_IA32_UINTR_MISC, 0ULL);
++		wrmsrl(MSR_IA32_UINTR_PD, 0ULL);
++		wrmsrl(MSR_IA32_UINTR_RR, 0ULL);
++		wrmsrl(MSR_IA32_UINTR_STACKADJUST, 0ULL);
++		wrmsrl(MSR_IA32_UINTR_HANDLER, 0ULL);
++	} else {
++		struct uintr_state *p;
++
++		p = get_xsave_addr(&fpu->state.xsave, XFEATURE_UINTR);
++		if (p) {
++			p->handler = 0;
++			p->uirr = 0;
++			p->upid_addr = 0;
++			p->stack_adjust = 0;
++			p->uinv = 0;
++		}
++	}
++
++	/* Check: Can a thread be context switched while it is exiting? */
++	ui_recv = t->thread.ui_recv;
++
++	/*
++	 * Suppress notifications so that no further interrupts are
++	 * generated based on this UPID.
++	 */
++	set_bit(UPID_SN, (unsigned long *)&ui_recv->upid_ctx->upid->nc.status);
++	put_upid_ref(ui_recv->upid_ctx);
++	kfree(ui_recv);
++	t->thread.ui_recv = NULL;
++
++	fpregs_unlock();
++}
+-- 
+2.32.0
+

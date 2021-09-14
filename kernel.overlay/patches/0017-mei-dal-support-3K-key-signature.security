@@ -1,0 +1,249 @@
+From 3359eeaa29fc6031774116c7401170b8d3152fb9 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Tue, 24 Mar 2020 13:30:12 +0200
+Subject: [PATCH 17/22] mei: dal: support 3K key signature.
+
+Support for 3K key for applets authentication,
+while preserving backward compatibility with 2K keys.
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+---
+ drivers/misc/mei/dal/acp_format.h | 22 +++++---
+ drivers/misc/mei/dal/acp_parser.c | 84 +++++++++++++++++++++++++++----
+ 2 files changed, 87 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/misc/mei/dal/acp_format.h b/drivers/misc/mei/dal/acp_format.h
+index 28a8b678bdb9..640a3f6d79d9 100644
+--- a/drivers/misc/mei/dal/acp_format.h
++++ b/drivers/misc/mei/dal/acp_format.h
+@@ -11,7 +11,10 @@
+ #define AC_MAX_INS_REASONS_LENGTH 1024
+ #define AC_MAX_USED_SERVICES 20
+ #define AC_MAX_PROPS_LENGTH 2048
+-#define AC_MAX_PACK_HASH_LEN 32
++#define AC_PACK_HASH_LEN_V1 32
++#define AC_PACK_HASH_LEN_V2 48
++#define AC_MAX_PACK_HASH_LEN AC_PACK_HASH_LEN_V2
++#define AC_PACK_SIG_VER_OFFSET 44
+ 
+ /**
+  * enum ac_cmd_id - acp file command (acp type)
+@@ -41,13 +44,16 @@ enum ac_cmd_id {
+ };
+ 
+ /**
+- * struct ac_pack_hash - ta pack hash
++ * enum ac_sig_version - bh signature version
+  *
+- * @data: ta hash
++ * @ac_SIG_VERSION_1: signature version 1 (2K)
++ * @ac_SIG_VERSION_2: signature version 2 (3K)
+  */
+-struct ac_pack_hash {
+-	u8 data[AC_MAX_PACK_HASH_LEN];
+-} __packed;
++enum ac_sig_version {
++	AC_SIG_VERSION_NONE = 0,
++	AC_SIG_VERSION_1 = 1,
++	AC_SIG_VERSION_2 = 2,
++};
+ 
+ /**
+  * struct ac_pack_header - admin comman pack header
+@@ -136,14 +142,14 @@ struct ac_pack {
+  * @ta_svn: ta security version number
+  * @hash_alg_type: ta hash algorithm type
+  * @ta_reserved: reserved bytes
+- * @hash: ta pack hash
++ * @ta_pack_hash: ta pack hash length can be 32 or 48 bytes.
+  */
+ struct ac_ins_ta_header {
+ 	uuid_t ta_id;
+ 	u32 ta_svn;
+ 	u8 hash_alg_type;
+ 	u8 ta_reserved[3];
+-	struct ac_pack_hash hash;
++	u8 ta_pack_hash[];
+ } __packed;
+ 
+ /**
+diff --git a/drivers/misc/mei/dal/acp_parser.c b/drivers/misc/mei/dal/acp_parser.c
+index 3898444dbbe1..f7f10e8749c5 100644
+--- a/drivers/misc/mei/dal/acp_parser.c
++++ b/drivers/misc/mei/dal/acp_parser.c
+@@ -12,7 +12,8 @@
+ /* CSS Header + CSS Crypto Block
+  * Prefixes each signed ACP package
+  */
+-#define AC_CSS_HEADER_LENGTH    (128 + 520)
++#define AC_CSS_HEADER_LENGTH_V1 (128 + 520)
++#define AC_CSS_HEADER_LENGTH_V2 (128 + 776)
+ 
+ /**
+  * struct ac_pr_state - admin command pack reader state
+@@ -174,6 +175,46 @@ static bool ac_pr_is_end(const struct ac_pr_state *pr)
+ 	return (pr->cur == pr->head + pr->total);
+ }
+ 
++static unsigned int acp_get_sig_version(const char *data, size_t size)
++{
++	u32 sig_ver;
++
++	if (size < AC_PACK_SIG_VER_OFFSET + sizeof(sig_ver))
++		return AC_SIG_VERSION_NONE;
++
++	sig_ver = *(u32 *)(data + AC_PACK_SIG_VER_OFFSET);
++
++	if (sig_ver == AC_SIG_VERSION_1 || sig_ver == AC_SIG_VERSION_2)
++		return sig_ver;
++
++	return AC_SIG_VERSION_NONE;
++}
++
++static size_t acp_get_hash_pack_len(unsigned int sig_ver)
++{
++	switch (sig_ver) {
++	case AC_SIG_VERSION_1:
++		return AC_PACK_HASH_LEN_V1;
++	case AC_SIG_VERSION_2:
++		return AC_PACK_HASH_LEN_V2;
++	}
++
++	return 0;
++}
++
++/* Intel CSS Header + CSS Cypto Block which prefixes each signed ACP pkg */
++static int acp_get_css_hdr_len(unsigned int sig_ver)
++{
++	switch (sig_ver) {
++	case AC_SIG_VERSION_1:
++		return AC_CSS_HEADER_LENGTH_V1;
++	case AC_SIG_VERSION_2:
++		return AC_CSS_HEADER_LENGTH_V2;
++	}
++
++	return 0;
++}
++
+ /**
+  * acp_load_reasons - load list of event codes that can be
+  *                    received or posted by ta
+@@ -362,18 +403,23 @@ static int acp_load_ins_jta_prop(struct ac_pr_state *pr,
+  *
+  * @pr: pack reader
+  * @head: out param to hold the installation header
++ * @hash_size: ta hash size
+  *
+  * Return: 0 on success
+  *         -EINVAL on invalid parameters
+  */
+ static int acp_load_ins_jta_head(struct ac_pr_state *pr,
+-				 struct ac_ins_ta_header **head)
++				 struct ac_ins_ta_header **head,
++				 unsigned int hash_size)
+ {
++	size_t hdr_size;
++
+ 	if (!ac_pr_is_safe_to_read(pr, sizeof(**head)))
+ 		return -EINVAL;
+ 
+ 	*head = (struct ac_ins_ta_header *)pr->cur;
+-	return ac_pr_align_move(pr, sizeof(**head));
++	hdr_size = sizeof(**head) + hash_size;
++	return ac_pr_align_move(pr, hdr_size);
+ }
+ 
+ /**
+@@ -381,12 +427,14 @@ static int acp_load_ins_jta_head(struct ac_pr_state *pr,
+  *
+  * @pr: pack reader
+  * @pack: out param to hold install information
++ * @hash_size: ta hash size
+  *
+  * Return: 0 on success
+  *         -EINVAL on invalid parameters
+  */
+ static int acp_load_ins_jta(struct ac_pr_state *pr,
+-			    struct ac_ins_jta_pack *pack)
++			    struct ac_ins_jta_pack *pack,
++			    unsigned int hash_size)
+ {
+ 	int ret;
+ 
+@@ -394,7 +442,7 @@ static int acp_load_ins_jta(struct ac_pr_state *pr,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = acp_load_ins_jta_head(pr, &pack->head);
++	ret = acp_load_ins_jta_head(pr, &pack->head, hash_size);
+ 
+ 	return ret;
+ }
+@@ -423,6 +471,7 @@ static int acp_load_pack_head(struct ac_pr_state *pr,
+  *
+  * @raw_pack: acp file content, without the acp CSS header
+  * @size: acp file size (without CSS header)
++ * @sig_ver: version of pack signature
+  * @cmd_id: command id
+  * @pack: out param to hold the loaded pack
+  *
+@@ -430,12 +479,14 @@ static int acp_load_pack_head(struct ac_pr_state *pr,
+  *         -EINVAL on invalid parameters
+  */
+ static int acp_load_pack(const char *raw_pack, unsigned int size,
+-			 unsigned int cmd_id, struct ac_pack *pack)
++			 unsigned int sig_ver, unsigned int cmd_id,
++			 struct ac_pack *pack)
+ {
+ 	int ret;
+ 	struct ac_pr_state pr;
+ 	struct ac_ins_jta_pack_ext *pack_ext;
+ 	struct ac_ins_jta_prop_ext *prop_ext;
++	unsigned int hash_size;
+ 
+ 	ret = ac_pr_init(&pr, raw_pack, size);
+ 	if (ret)
+@@ -450,10 +501,12 @@ static int acp_load_pack(const char *raw_pack, unsigned int size,
+ 	if (cmd_id != AC_INSTALL_JTA_PROP && cmd_id != pack->head->cmd_id)
+ 		return -EINVAL;
+ 
++	hash_size = acp_get_hash_pack_len(sig_ver);
++
+ 	switch (cmd_id) {
+ 	case AC_INSTALL_JTA:
+ 		pack_ext = (struct ac_ins_jta_pack_ext *)pack;
+-		ret = acp_load_ins_jta(&pr, &pack_ext->cmd_pack);
++		ret = acp_load_ins_jta(&pr, &pack_ext->cmd_pack, hash_size);
+ 		if (ret)
+ 			break;
+ 		ret = acp_load_ta_pack(&pr, &pack_ext->ta_pack);
+@@ -495,13 +548,22 @@ int acp_pload_ins_jta(const void *raw_data, unsigned int size,
+ 		      struct ac_ins_jta_pack_ext *pack)
+ {
+ 	int ret;
++	unsigned int sig_ver;
++	unsigned int css_hdr_len;
++
++	if (!raw_data || !pack)
++		return -EINVAL;
++
++	sig_ver = acp_get_sig_version(raw_data, size);
++	if (sig_ver == AC_SIG_VERSION_NONE)
++		return -EINVAL;
+ 
+-	if (!raw_data || size <= AC_CSS_HEADER_LENGTH || !pack)
++	css_hdr_len = acp_get_css_hdr_len(sig_ver);
++	if (size < css_hdr_len)
+ 		return -EINVAL;
+ 
+-	ret = acp_load_pack((const char *)raw_data + AC_CSS_HEADER_LENGTH,
+-			    size - AC_CSS_HEADER_LENGTH,
+-			    AC_INSTALL_JTA, (struct ac_pack *)pack);
++	ret = acp_load_pack(raw_data + css_hdr_len, size - css_hdr_len,
++			    sig_ver, AC_INSTALL_JTA, (struct ac_pack *)pack);
+ 
+ 	return ret;
+ }
+-- 
+2.32.0
+

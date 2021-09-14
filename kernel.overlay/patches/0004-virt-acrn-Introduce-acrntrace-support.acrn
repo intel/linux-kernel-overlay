@@ -1,0 +1,777 @@
+From b22590dff35192e34ceeaefd09e3d2eda700869e Mon Sep 17 00:00:00 2001
+From: Shuo Liu <shuo.a.liu@intel.com>
+Date: Tue, 15 Jun 2021 15:49:00 +0800
+Subject: [PATCH 4/4] virt: acrn: Introduce acrntrace support
+
+!! Don't upstream this patch directly !!
+Need refine to upstream quality.
+
+Signed-off-by: Shuo Liu <shuo.a.liu@intel.com>
+---
+ drivers/virt/acrn/Makefile    |   2 +-
+ drivers/virt/acrn/acrn_drv.h  |   2 +
+ drivers/virt/acrn/hsm.c       |   2 +
+ drivers/virt/acrn/hvtrace.c   | 281 ++++++++++++++++++++++++++++++++++
+ drivers/virt/acrn/hypercall.h |   8 +
+ drivers/virt/acrn/sbuf.c      | 240 +++++++++++++++++++++++++++++
+ drivers/virt/acrn/sbuf.h      | 131 ++++++++++++++++
+ include/uapi/linux/acrn.h     |   6 +
+ 8 files changed, 671 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/virt/acrn/hvtrace.c
+ create mode 100644 drivers/virt/acrn/sbuf.c
+ create mode 100644 drivers/virt/acrn/sbuf.h
+
+diff --git a/drivers/virt/acrn/Makefile b/drivers/virt/acrn/Makefile
+index 08ce641dcfa1..84cdcefb6d54 100644
+--- a/drivers/virt/acrn/Makefile
++++ b/drivers/virt/acrn/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_ACRN_HSM)	:= acrn.o
+-acrn-y := hsm.o vm.o mm.o ioreq.o ioeventfd.o irqfd.o
++acrn-y := hsm.o vm.o mm.o ioreq.o ioeventfd.o irqfd.o sbuf.o hvtrace.o
+diff --git a/drivers/virt/acrn/acrn_drv.h b/drivers/virt/acrn/acrn_drv.h
+index 1be54efa666c..8830adcfaf63 100644
+--- a/drivers/virt/acrn/acrn_drv.h
++++ b/drivers/virt/acrn/acrn_drv.h
+@@ -224,4 +224,6 @@ int acrn_irqfd_init(struct acrn_vm *vm);
+ int acrn_irqfd_config(struct acrn_vm *vm, struct acrn_irqfd *args);
+ void acrn_irqfd_deinit(struct acrn_vm *vm);
+ 
++int acrn_trace_init(void);
++void acrn_trace_exit(void);
+ #endif /* __ACRN_HSM_DRV_H */
+diff --git a/drivers/virt/acrn/hsm.c b/drivers/virt/acrn/hsm.c
+index eb824a1a86a0..a695b25edd25 100644
+--- a/drivers/virt/acrn/hsm.c
++++ b/drivers/virt/acrn/hsm.c
+@@ -565,6 +565,7 @@ static int __init hsm_init(void)
+ 		misc_deregister(&acrn_dev);
+ 		return ret;
+ 	}
++	acrn_trace_init();
+ 	return 0;
+ }
+ 
+@@ -572,6 +573,7 @@ static void __exit hsm_exit(void)
+ {
+ 	acrn_ioreq_intr_remove();
+ 	misc_deregister(&acrn_dev);
++	acrn_trace_exit();
+ }
+ module_init(hsm_init);
+ module_exit(hsm_exit);
+diff --git a/drivers/virt/acrn/hvtrace.c b/drivers/virt/acrn/hvtrace.c
+new file mode 100644
+index 000000000000..f5a81670ff89
+--- /dev/null
++++ b/drivers/virt/acrn/hvtrace.c
+@@ -0,0 +1,281 @@
++/*
++*
++* ACRN Trace module
++*
++* This file is provided under a dual BSD/GPLv2 license.  When using or
++* redistributing this file, you may do so under either license.
++*
++* GPL LICENSE SUMMARY
++*
++* Copyright (c) 2017 Intel Corporation. All rights reserved.
++*
++* This program is free software; you can redistribute it and/or modify
++* it under the terms of version 2 of the GNU General Public License as
++* published by the Free Software Foundation.
++*
++* This program is distributed in the hope that it will be useful, but
++* WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++* General Public License for more details.
++*
++* Contact Information: Yan, Like <like.yan@intel.com>
++*
++* BSD LICENSE
++*
++* Copyright (c) 2017 Intel Corporation. All rights reserved.
++*
++* Redistribution and use in source and binary forms, with or without
++* modification, are permitted provided that the following conditions
++* are met:
++*
++*   * Redistributions of source code must retain the above copyright
++*     notice, this list of conditions and the following disclaimer.
++*   * Redistributions in binary form must reproduce the above copyright
++*     notice, this list of conditions and the following disclaimer in
++*     the documentation and/or other materials provided with the
++*     distribution.
++*   * Neither the name of Intel Corporation nor the names of its
++*     contributors may be used to endorse or promote products derived
++*     from this software without specific prior written permission.
++*
++* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++* "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++* LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++* A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++* OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++* SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++* LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++* THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*
++* Like Yan <like.yan@intel.com>
++*
++*/
++
++#define pr_fmt(fmt) "ACRNTrace: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/major.h>
++#include <linux/slab.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++
++#include <asm/acrn.h>
++#include <asm/hypervisor.h>
++
++#include "acrn_drv.h"
++#include "sbuf.h"
++
++
++#define TRACE_SBUF_SIZE		(4 * 1024 * 1024)
++#define TRACE_ELEMENT_SIZE	32 /* byte */
++#define TRACE_ELEMENT_NUM	((TRACE_SBUF_SIZE - SBUF_HEAD_SIZE) /	\
++				TRACE_ELEMENT_SIZE)
++
++#define foreach_cpu(cpu, cpu_num)					\
++	for ((cpu) = 0; (cpu) < (cpu_num); (cpu)++)
++
++#define DEFAULT_NR_CPUS	4
++/* actual physical cpu number, initialized by module init */
++static int pcpu_num = DEFAULT_NR_CPUS;
++
++struct acrn_trace {
++	struct miscdevice miscdev;
++	char name[24];
++	shared_buf_t *sbuf;
++	atomic_t open_cnt;
++	uint16_t pcpu_id;
++};
++
++static struct acrn_trace *acrn_trace_devs;
++
++/************************************************************************
++ *
++ * file_operations functions
++ *
++ ***********************************************************************/
++static int acrn_trace_open(struct inode *inode, struct file *filep)
++{
++	struct acrn_trace *dev;
++
++	dev = container_of(filep->private_data, struct acrn_trace, miscdev);
++	if (!dev) {
++		pr_err("No such dev\n");
++		return -ENODEV;
++	}
++	pr_debug("%s, cpu %d\n", __func__, dev->pcpu_id);
++
++	/* More than one reader at the same time could get data messed up */
++	if (atomic_read(&dev->open_cnt))
++		return -EBUSY;
++
++	atomic_inc(&dev->open_cnt);
++
++	return 0;
++}
++
++static int acrn_trace_release(struct inode *inode, struct file *filep)
++{
++	struct acrn_trace *dev;
++
++	dev = container_of(filep->private_data, struct acrn_trace, miscdev);
++	if (!dev) {
++		pr_err("No such dev\n");
++		return -ENODEV;
++	}
++
++	pr_debug("%s, cpu %d\n", __func__, dev->pcpu_id);
++
++	atomic_dec(&dev->open_cnt);
++
++	return 0;
++}
++
++static int acrn_trace_mmap(struct file *filep, struct vm_area_struct *vma)
++{
++	phys_addr_t paddr;
++	struct acrn_trace *dev;
++
++	dev = container_of(filep->private_data, struct acrn_trace, miscdev);
++	if (!dev) {
++		pr_err("No such dev\n");
++		return -ENODEV;
++	}
++
++	pr_debug("%s, cpu %d\n", __func__, dev->pcpu_id);
++
++	WARN_ON(!virt_addr_valid(dev->sbuf));
++	paddr = virt_to_phys(dev->sbuf);
++
++	if (remap_pfn_range(vma, vma->vm_start,
++				paddr >> PAGE_SHIFT,
++				vma->vm_end - vma->vm_start,
++				vma->vm_page_prot)) {
++		pr_err("Failed to mmap sbuf for cpu%d\n", dev->pcpu_id);
++		return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static const struct file_operations acrn_trace_fops = {
++	.owner  = THIS_MODULE,
++	.open   = acrn_trace_open,
++	.release = acrn_trace_release,
++	.mmap   = acrn_trace_mmap,
++};
++
++/*
++ * acrn_trace_init()
++ */
++int acrn_trace_init(void)
++{
++	int ret = 0;
++	int i, cpu;
++	shared_buf_t *sbuf;
++	struct miscdevice *miscdev;
++	struct acrn_platform_info *plat_info;
++
++	if (x86_hyper_type != X86_HYPER_ACRN) {
++		pr_err("acrn_trace: not support acrn hypervisor!\n");
++		return -EINVAL;
++	}
++
++	plat_info = kzalloc(sizeof(*plat_info), GFP_KERNEL);
++	ret = hcall_get_platform_info(virt_to_phys(plat_info));
++	if (!ret)
++		pcpu_num = plat_info->hw.cpu_num;
++
++	acrn_trace_devs = kcalloc(pcpu_num, sizeof(struct acrn_trace),
++				GFP_KERNEL);
++	if (!acrn_trace_devs)
++		return -ENOMEM;
++
++	foreach_cpu(cpu, pcpu_num) {
++		/* allocate shared_buf */
++		sbuf = sbuf_allocate(TRACE_ELEMENT_NUM, TRACE_ELEMENT_SIZE);
++		if (!sbuf) {
++			ret = -ENOMEM;
++			goto out_free;
++		}
++		acrn_trace_devs[cpu].sbuf = sbuf;
++	}
++
++	foreach_cpu(cpu, pcpu_num) {
++		sbuf = acrn_trace_devs[cpu].sbuf;
++		BUG_ON(!virt_addr_valid(sbuf));
++		ret = sbuf_share_setup(cpu, ACRN_TRACE, virt_to_phys(sbuf));
++		if (ret < 0) {
++			pr_err("Failed to setup SBuf, cpuid %d\n", cpu);
++			goto out_sbuf;
++		}
++	}
++
++	foreach_cpu(cpu, pcpu_num) {
++		acrn_trace_devs[cpu].pcpu_id = cpu;
++
++		miscdev = &acrn_trace_devs[cpu].miscdev;
++		snprintf(acrn_trace_devs[cpu].name,
++				sizeof(acrn_trace_devs[cpu].name),
++				"acrn_trace_%d", cpu);
++		miscdev->name = acrn_trace_devs[cpu].name;
++		miscdev->minor = MISC_DYNAMIC_MINOR;
++		miscdev->fops = &acrn_trace_fops;
++
++		ret = misc_register(&acrn_trace_devs[cpu].miscdev);
++		if (ret < 0) {
++			pr_err("Failed to register acrn_trace_%d, errno %d\n",
++				cpu, ret);
++			goto out_dereg;
++		}
++	}
++
++	pr_info("Initialized acrn trace module with %u cpu\n", pcpu_num);
++	kfree(plat_info);
++	return ret;
++
++out_dereg:
++	for (i = --cpu; i >= 0; i--)
++		misc_deregister(&acrn_trace_devs[i].miscdev);
++	cpu = pcpu_num;
++
++out_sbuf:
++	for (i = --cpu; i >= 0; i--)
++		sbuf_share_setup(i, ACRN_TRACE, 0);
++	cpu = pcpu_num;
++
++out_free:
++	for (i = --cpu; i >= 0; i--)
++		sbuf_free(acrn_trace_devs[i].sbuf);
++	kfree(acrn_trace_devs);
++
++	return ret;
++}
++
++/*
++ * acrn_trace_exit()
++ */
++void acrn_trace_exit(void)
++{
++	int cpu;
++
++	pr_info("%s, cpu_num %d\n", __func__, pcpu_num);
++
++	foreach_cpu(cpu, pcpu_num) {
++		/* deregister devices */
++		misc_deregister(&acrn_trace_devs[cpu].miscdev);
++
++		/* set sbuf pointer to NULL in HV */
++		sbuf_share_setup(cpu, ACRN_TRACE, 0);
++
++		/* free sbuf, per-cpu sbuf should be set NULL */
++		sbuf_free(acrn_trace_devs[cpu].sbuf);
++	}
++
++	kfree(acrn_trace_devs);
++}
+diff --git a/drivers/virt/acrn/hypercall.h b/drivers/virt/acrn/hypercall.h
+index 440e204d731a..e2c09452b815 100644
+--- a/drivers/virt/acrn/hypercall.h
++++ b/drivers/virt/acrn/hypercall.h
+@@ -47,6 +47,9 @@
+ #define HC_CREATE_VDEV			_HC_ID(HC_ID, HC_ID_PCI_BASE + 0x09)
+ #define HC_DESTROY_VDEV			_HC_ID(HC_ID, HC_ID_PCI_BASE + 0x0A)
+ 
++#define HC_ID_DBG_BASE              0x60UL
++#define HC_SETUP_SBUF               _HC_ID(HC_ID, HC_ID_DBG_BASE + 0x00)
++
+ #define HC_ID_PM_BASE			0x80UL
+ #define HC_PM_GET_CPU_STATE		_HC_ID(HC_ID, HC_ID_PM_BASE + 0x00)
+ 
+@@ -315,4 +318,9 @@ static inline long hcall_get_cpu_state(u64 cmd, u64 state)
+ 	return acrn_hypercall2(HC_PM_GET_CPU_STATE, cmd, state);
+ }
+ 
++static inline long hcall_setup_sbuf(unsigned long sbuf_head)
++{
++	return acrn_hypercall1(HC_SETUP_SBUF, sbuf_head);
++}
++
+ #endif /* __ACRN_HSM_HYPERCALL_H */
+diff --git a/drivers/virt/acrn/sbuf.c b/drivers/virt/acrn/sbuf.c
+new file mode 100644
+index 000000000000..59cab94897b2
+--- /dev/null
++++ b/drivers/virt/acrn/sbuf.c
+@@ -0,0 +1,240 @@
++/*
++ * shared buffer
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * Copyright (c) 2017 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * Contact Information: Li Fei <fei1.li@intel.com>
++ *
++ * BSD LICENSE
++ *
++ * Copyright (C) 2017 Intel Corporation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *   * Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *   * Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in
++ *     the documentation and/or other materials provided with the
++ *     distribution.
++ *   * Neither the name of Intel Corporation nor the names of its
++ *     contributors may be used to endorse or promote products derived
++ *     from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Li Fei <fei1.li@intel.com>
++ *
++ */
++
++#define pr_fmt(fmt) "SBuf: " fmt
++
++#include <linux/gfp.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <asm/pgtable.h>
++#include <asm/hypervisor.h>
++
++#include "acrn_drv.h"
++#include "sbuf.h"
++
++static inline bool sbuf_is_empty(shared_buf_t *sbuf)
++{
++	return (sbuf->head == sbuf->tail);
++}
++
++static inline uint32_t sbuf_next_ptr(uint32_t pos,
++		uint32_t span, uint32_t scope)
++{
++	pos += span;
++	pos = (pos >= scope) ? (pos - scope) : pos;
++	return pos;
++}
++
++static inline uint32_t sbuf_calculate_allocate_size(uint32_t ele_num,
++						uint32_t ele_size)
++{
++	uint64_t sbuf_allocate_size;
++
++	sbuf_allocate_size = ele_num * ele_size;
++	sbuf_allocate_size +=  SBUF_HEAD_SIZE;
++	if (sbuf_allocate_size > SBUF_MAX_SIZE) {
++		pr_err("num=0x%x, size=0x%x exceed 0x%llx!\n",
++			ele_num, ele_size, SBUF_MAX_SIZE);
++		return 0;
++	}
++
++	/* align to PAGE_SIZE */
++	return (sbuf_allocate_size + PAGE_SIZE - 1) & PAGE_MASK;
++}
++
++shared_buf_t *sbuf_allocate(uint32_t ele_num, uint32_t ele_size)
++{
++	shared_buf_t *sbuf;
++	struct page *page;
++	uint32_t sbuf_allocate_size;
++
++	if (!ele_num || !ele_size) {
++		pr_err("invalid parameter %s!\n", __func__);
++		return NULL;
++	}
++
++	sbuf_allocate_size = sbuf_calculate_allocate_size(ele_num, ele_size);
++	if (!sbuf_allocate_size)
++		return NULL;
++
++	page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
++					get_order(sbuf_allocate_size));
++	if (page == NULL) {
++		pr_err("failed to alloc pages!\n");
++		return NULL;
++	}
++
++	sbuf = phys_to_virt(page_to_phys(page));
++	sbuf->ele_num = ele_num;
++	sbuf->ele_size = ele_size;
++	sbuf->size = ele_num * ele_size;
++	sbuf->magic = SBUF_MAGIC;
++	pr_info("ele_num=0x%x, ele_size=0x%x allocated!\n",
++		ele_num, ele_size);
++	return sbuf;
++}
++EXPORT_SYMBOL(sbuf_allocate);
++
++void sbuf_free(shared_buf_t *sbuf)
++{
++	uint32_t sbuf_allocate_size;
++
++	if ((sbuf == NULL) || sbuf->magic != SBUF_MAGIC) {
++		pr_err("invalid parameter %s\n", __func__);
++		return;
++	}
++
++	sbuf_allocate_size = sbuf_calculate_allocate_size(sbuf->ele_num,
++						sbuf->ele_size);
++	if (!sbuf_allocate_size)
++		return;
++
++	sbuf->magic = 0;
++	__free_pages((struct page *)virt_to_page(sbuf),
++			get_order(sbuf_allocate_size));
++}
++EXPORT_SYMBOL(sbuf_free);
++
++int sbuf_get(shared_buf_t *sbuf, uint8_t *data)
++{
++	const void *from;
++
++	if ((sbuf == NULL) || (data == NULL))
++		return -EINVAL;
++
++	if (sbuf_is_empty(sbuf)) {
++		/* no data available */
++		return 0;
++	}
++
++	from = (void *)sbuf + SBUF_HEAD_SIZE + sbuf->head;
++
++	memcpy(data, from, sbuf->ele_size);
++
++	sbuf->head = sbuf_next_ptr(sbuf->head, sbuf->ele_size, sbuf->size);
++
++	return sbuf->ele_size;
++}
++EXPORT_SYMBOL(sbuf_get);
++
++int sbuf_share_setup(uint32_t pcpu_id, uint32_t sbuf_id, uint64_t gpa)
++{
++	struct sbuf_setup_param *ssp;
++	int ret;
++
++	if (x86_hyper_type != X86_HYPER_ACRN)
++		return -ENODEV;
++
++	ssp = kzalloc(sizeof(*ssp), GFP_KERNEL);
++	ssp->pcpu_id = pcpu_id;
++	ssp->sbuf_id = sbuf_id;
++	ssp->gpa = gpa;
++	pr_info("setup phys add = 0x%llx\n", ssp->gpa);
++
++	ret = hcall_setup_sbuf(virt_to_phys(ssp));
++	kfree(ssp);
++	return ret;
++}
++EXPORT_SYMBOL(sbuf_share_setup);
++
++shared_buf_t *sbuf_check_valid(uint32_t ele_num, uint32_t ele_size,
++				void *vaddr)
++{
++	shared_buf_t *sbuf;
++
++	if (!ele_num || !ele_size || !vaddr)
++		return NULL;
++
++	sbuf = (shared_buf_t *)vaddr;
++
++	if ((sbuf->magic == SBUF_MAGIC) &&
++		(sbuf->ele_num == ele_num) &&
++		(sbuf->ele_size == ele_size)) {
++		return sbuf;
++	}
++
++	return NULL;
++}
++EXPORT_SYMBOL(sbuf_check_valid);
++
++shared_buf_t *sbuf_construct(uint32_t ele_num, uint32_t ele_size,
++				void *vaddr)
++{
++	shared_buf_t *sbuf;
++
++	if (!ele_num || !ele_size || !vaddr)
++		return NULL;
++
++	sbuf = (shared_buf_t *)vaddr;
++
++	memset(sbuf, 0, SBUF_HEAD_SIZE);
++	sbuf->magic = SBUF_MAGIC;
++	sbuf->ele_num = ele_num;
++	sbuf->ele_size = ele_size;
++	sbuf->size = ele_num * ele_size;
++	pr_info("construct sbuf at 0x%llx.\n", (unsigned long long)sbuf);
++	return sbuf;
++}
++EXPORT_SYMBOL(sbuf_construct);
++
++void sbuf_deconstruct(shared_buf_t *sbuf)
++{
++	if (sbuf == NULL)
++		return;
++
++	sbuf->magic = 0;
++}
++EXPORT_SYMBOL(sbuf_deconstruct);
+diff --git a/drivers/virt/acrn/sbuf.h b/drivers/virt/acrn/sbuf.h
+new file mode 100644
+index 000000000000..f8bed41bbb58
+--- /dev/null
++++ b/drivers/virt/acrn/sbuf.h
+@@ -0,0 +1,131 @@
++/*
++ * shared buffer
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * Copyright (c) 2017 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * Contact Information: Li Fei <fei1.li@intel.com>
++ *
++ * BSD LICENSE
++ *
++ * Copyright (C) 2017 Intel Corporation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *   * Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *   * Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in
++ *     the documentation and/or other materials provided with the
++ *     distribution.
++ *   * Neither the name of Intel Corporation nor the names of its
++ *     contributors may be used to endorse or promote products derived
++ *     from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Li Fei <fei1.li@intel.com>
++ *
++ */
++
++#ifndef SHARED_BUF_H
++#define SHARED_BUF_H
++
++#include <linux/types.h>
++
++
++#define SBUF_MAGIC	0x5aa57aa71aa13aa3
++#define SBUF_MAX_SIZE	(1ULL << 22)
++#define SBUF_HEAD_SIZE	64
++
++/* sbuf flags */
++#define OVERRUN_CNT_EN	(1ULL << 0) /* whether overrun counting is enabled */
++#define OVERWRITE_EN	(1ULL << 1) /* whether overwrite is enabled */
++
++enum sbuf_type {
++	ACRN_TRACE,
++	ACRN_HVLOG,
++	ACRN_SEP,
++	ACRN_SOCWATCH,
++	ACRN_SBUF_TYPE_MAX,
++};
++/**
++ * (sbuf) head + buf (store (ele_num - 1) elements at most)
++ * buffer empty: tail == head
++ * buffer full:  (tail + ele_size) % size == head
++ *
++ *             Base of memory for elements
++ *                |
++ *                |
++ * ---------------------------------------------------------------------------------------
++ * | shared_buf_t | raw data (ele_size)| raw date (ele_size) | ... | raw data (ele_size) |
++ * ---------------------------------------------------------------------------------------
++ * |
++ * |
++ * shared_buf_t *buf
++ */
++
++/* Make sure sizeof(shared_buf_t) == SBUF_HEAD_SIZE */
++typedef struct shared_buf {
++	uint64_t magic;
++	uint32_t ele_num;	/* number of elements */
++	uint32_t ele_size;	/* sizeof of elements */
++	uint32_t head;		/* offset from base, to read */
++	uint32_t tail;		/* offset from base, to write */
++	uint64_t flags;
++	uint32_t overrun_cnt;	/* count of overrun */
++	uint32_t size;		/* ele_num * ele_size */
++	uint32_t padding[6];
++} ____cacheline_aligned shared_buf_t;
++
++static inline void sbuf_clear_flags(shared_buf_t *sbuf, uint64_t flags)
++{
++	sbuf->flags &= ~flags;
++}
++
++static inline void sbuf_set_flags(shared_buf_t *sbuf, uint64_t flags)
++{
++	sbuf->flags = flags;
++}
++
++static inline void sbuf_add_flags(shared_buf_t *sbuf, uint64_t flags)
++{
++	sbuf->flags |= flags;
++}
++
++shared_buf_t *sbuf_allocate(uint32_t ele_num, uint32_t ele_size);
++void sbuf_free(shared_buf_t *sbuf);
++int sbuf_get(shared_buf_t *sbuf, uint8_t *data);
++int sbuf_share_setup(uint32_t pcpu_id, uint32_t sbuf_id, uint64_t gpa);
++shared_buf_t *sbuf_check_valid(uint32_t ele_num, uint32_t ele_size,
++				void *vaddr);
++shared_buf_t *sbuf_construct(uint32_t ele_num, uint32_t ele_size,
++				void *vaddr);
++void sbuf_deconstruct(shared_buf_t *sbuf);
++
++#endif /* SHARED_BUF_H */
+diff --git a/include/uapi/linux/acrn.h b/include/uapi/linux/acrn.h
+index 303c420619d8..f8dc1ae59086 100644
+--- a/include/uapi/linux/acrn.h
++++ b/include/uapi/linux/acrn.h
+@@ -611,6 +611,12 @@ struct acrn_platform_info {
+ 	} sw;
+ };
+ 
++struct sbuf_setup_param {
++	__u32	pcpu_id;
++	__u32	sbuf_id;
++	__u64	gpa;
++};
++
+ /* The ioctl type, documented in ioctl-number.rst */
+ #define ACRN_IOCTL_TYPE			0xA2
+ 
+-- 
+2.32.0
+

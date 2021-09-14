@@ -1,0 +1,166 @@
+From 235fbbf3a9d9531276de4adb90c643dd8a816078 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Wed, 30 Sep 2020 09:21:55 -0700
+Subject: [PATCH 88/88] !UPSTREAM: x86/fpu/xstate: Introduce boot-parameters to
+ control AMX
+
+amx=disable:   for admin to be able to permanently disable AMX on a booted
+               kernel.
+amx=on:        the deafult -- a debug option to allow all processes to
+               access AMX state without invoking the system call.
+amx=off:       an experimental option -- AMX is enabled for a process
+               that successfully invokes the system call.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+---
+ .../admin-guide/kernel-parameters.txt         | 11 ++++
+ arch/x86/include/asm/fpu/xstate.h             |  1 +
+ arch/x86/kernel/fpu/init.c                    | 50 +++++++++++++++++++
+ arch/x86/kernel/fpu/regset.c                  |  2 +-
+ arch/x86/kernel/traps.c                       |  2 +-
+ 5 files changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index d1c3b8c73585..e3dc65e64fa0 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -325,6 +325,17 @@
+ 			Format: <a>,<b>
+ 			See also Documentation/input/joydev/joystick.rst
+ 
++	amx=		[X86-64]
++			disable     - for admin to be able to permanently
++			              diable AMX on a booted kernel.
++			on          - a debug option to allow all processes
++			              to access AMX state without invoking
++			              the system call.
++			off         - the default -- AMX is enabled, but it
++			              is of by default for all processes,
++			              until they successfully invoke the
++			              system call.
++
+ 	analog.map=	[HW,JOY] Analog joystick and gamepad support
+ 			Specifies type or capabilities of an analog joystick
+ 			connected to one of 16 gameports
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 9c6e62188cb4..1182cbb45174 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -163,6 +163,7 @@ void free_xstate_buffer(struct fpu *fpu);
+ long set_process_xstate_perm(struct task_struct *tsk, u64 state_perm);
+ void reset_task_xstate_perm(struct task_struct *tsk);
+ long get_task_state_perm(struct task_struct *tsk);
++bool check_task_state_perm(struct task_struct *tsk, u64 state_mask);
+ 
+ int xfeature_size(int xfeature_nr);
+ int copy_uabi_from_kernel_to_xstate(struct fpu *fpu, const void *kbuf);
+diff --git a/arch/x86/kernel/fpu/init.c b/arch/x86/kernel/fpu/init.c
+index acbd3da0e022..062660fe9944 100644
+--- a/arch/x86/kernel/fpu/init.c
++++ b/arch/x86/kernel/fpu/init.c
+@@ -5,6 +5,7 @@
+ #include <asm/fpu/internal.h>
+ #include <asm/tlbflush.h>
+ #include <asm/setup.h>
++#include <asm/cmdline.h>
+ 
+ #include <linux/sched.h>
+ #include <linux/sched/task.h>
+@@ -213,6 +214,40 @@ static void __init fpu__init_system_xstate_size_legacy(void)
+ 	set_xstate_config(XSTATE_USER_MINSIG_SIZE, xstate_size);
+ }
+ 
++/*
++ * Find supported xfeatures based on cpu features and command-line input.
++ * This must be called after fpu__init_parse_early_param() is called and
++ * xfeatures_mask_all is enumerated.
++ */
++
++bool amx_enable = true;
++bool amx_abi = false;
++
++bool check_task_state_perm(struct task_struct *tsk, u64 state_mask)
++{
++	bool perm;
++
++	perm = ((state_mask & tsk->thread.fpu.dynamic_state_perm) == state_mask);
++	if (!amx_abi) {
++		if (!perm)
++			WARN(1, "x86/fpu:[%d] ARCH_SET_STATE_ENABLE was missing.\n",
++			     task_pid_nr(tsk));
++		perm = true;
++	}
++	return perm;
++}
++
++u64 __init fpu__get_supported_xfeatures_mask(void)
++{
++	u64 mask = XFEATURE_MASK_USER_SUPPORTED | XFEATURE_MASK_SUPERVISOR_SUPPORTED;
++
++	if (!IS_ENABLED(CONFIG_X86_64) || !amx_enable) {
++		mask  &= ~(XFEATURE_MASK_XTILE);
++	}
++
++	return mask;
++}
++
+ /* Legacy code to initialize eager fpu mode. */
+ static void __init fpu__init_system_ctx_switch(void)
+ {
+@@ -222,12 +257,27 @@ static void __init fpu__init_system_ctx_switch(void)
+ 	on_boot_cpu = 0;
+ }
+ 
++static void __init fpu__init_parse_early_param(void)
++{
++	char arg[20];
++
++	if (cmdline_find_option(boot_command_line, "amx", arg, sizeof(arg))) {
++		if (!strcmp(arg, "off"))
++			amx_abi = true;
++		else if (!strcmp(arg, "on"))
++			amx_abi = false;
++		else if (!strcmp(arg, "disable"))
++			amx_enable = false;
++	}
++}
++
+ /*
+  * Called on the boot CPU once per system bootup, to set up the initial
+  * FPU state that is later cloned into all processes:
+  */
+ void __init fpu__init_system(struct cpuinfo_x86 *c)
+ {
++	fpu__init_parse_early_param();
+ 	fpu__init_system_early_generic(c);
+ 
+ 	/*
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 02be5b6b4a1e..9ca78d7eb588 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -181,7 +181,7 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 		/* Check the permission and expand the xstate buffer. */
+ 		dynstate_mask = state_mask & xfeatures_mask_user_dynamic;
+ 		if (dynstate_mask) {
+-			if ((dynstate_mask & fpu->dynamic_state_perm) != dynstate_mask) {
++			if (!check_task_state_perm(target, dynstate_mask)) {
+ 				ret = -EFAULT;
+ 				goto out;
+ 			}
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index b67c78e530c4..ef81dd69ae76 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -1199,7 +1199,7 @@ DEFINE_IDTENTRY(exc_device_not_available)
+ 				 * and not in interrupt context as handling a trap from
+ 				 * userspace.
+ 				 */
+-				if (((xfd_event & fpu->dynamic_state_perm) == xfd_event) &&
++				if (check_task_state_perm(current, xfd_event) &&
+ 				    !WARN_ON(in_interrupt())) {
+ 					err = alloc_xstate_buffer(fpu, xfd_event);
+ 					if (!err)
+-- 
+2.32.0
+
