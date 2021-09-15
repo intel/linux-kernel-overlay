@@ -37,7 +37,7 @@ fi
 
 timestamp=`echo $kernel_tag|awk -F'-' '{print $NF}'`
 if [ -z $timestamp ]; then
-	timestamp='no_timestamp'
+	timestamp='000'
 fi
 
 echo "kenrle_p=${kernel_p}, timestamp=${timestamp}"
