@@ -1,0 +1,123 @@
+From e5c6f90c89c59e307b5b45f10db7a89d2df6648a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 26 Apr 2021 10:06:13 +0200
+Subject: [PATCH 0396/1423] drm/amdgpu: restructure amdgpu_vram_mgr_new
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Merge the two loops, loosen the restriction for big allocations.
+This reduces the CPU overhead in the good case, but increases
+it a bit under memory pressure.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-and-Tested-by: Nirmoy Das <nirmoy.das@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c | 61 +++++++++-----------
+ 1 file changed, 28 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+index 7695dee6016a..0bf9243b66f4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+@@ -363,13 +363,13 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
+ 			       const struct ttm_place *place,
+ 			       struct ttm_resource *mem)
+ {
++	unsigned long lpfn, num_nodes, pages_per_node, pages_left, pages;
+ 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
+ 	struct amdgpu_device *adev = to_amdgpu_device(mgr);
++	uint64_t vis_usage = 0, mem_bytes, max_bytes;
+ 	struct drm_mm *mm = &mgr->mm;
+-	struct drm_mm_node *nodes;
+ 	enum drm_mm_insert_mode mode;
+-	unsigned long lpfn, num_nodes, pages_per_node, pages_left;
+-	uint64_t vis_usage = 0, mem_bytes, max_bytes;
++	struct drm_mm_node *nodes;
+ 	unsigned i;
+ 	int r;
+ 
+@@ -396,10 +396,10 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
+ 		pages_per_node = HPAGE_PMD_NR;
+ #else
+ 		/* default to 2MB */
+-		pages_per_node = (2UL << (20UL - PAGE_SHIFT));
++		pages_per_node = 2UL << (20UL - PAGE_SHIFT);
+ #endif
+-		pages_per_node = max((uint32_t)pages_per_node,
+-				     tbo->page_alignment);
++		pages_per_node = max_t(uint32_t, pages_per_node,
++				       tbo->page_alignment);
+ 		num_nodes = DIV_ROUND_UP(mem->num_pages, pages_per_node);
+ 	}
+ 
+@@ -417,42 +417,37 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
+ 	mem->start = 0;
+ 	pages_left = mem->num_pages;
+ 
+-	spin_lock(&mgr->lock);
+-	for (i = 0; pages_left >= pages_per_node; ++i) {
+-		unsigned long pages = rounddown_pow_of_two(pages_left);
+-
+-		/* Limit maximum size to 2GB due to SG table limitations */
+-		pages = min(pages, (2UL << (30 - PAGE_SHIFT)));
++	/* Limit maximum size to 2GB due to SG table limitations */
++	pages = min(pages_left, 2UL << (30 - PAGE_SHIFT));
+ 
+-		r = drm_mm_insert_node_in_range(mm, &nodes[i], pages,
+-						pages_per_node, 0,
+-						place->fpfn, lpfn,
+-						mode);
+-		if (unlikely(r))
+-			break;
+-
+-		vis_usage += amdgpu_vram_mgr_vis_size(adev, &nodes[i]);
+-		amdgpu_vram_mgr_virt_start(mem, &nodes[i]);
+-		pages_left -= pages;
+-	}
+-
+-	for (; pages_left; ++i) {
+-		unsigned long pages = min(pages_left, pages_per_node);
+-		uint32_t alignment = tbo->page_alignment;
++	i = 0;
++	spin_lock(&mgr->lock);
++	while (pages_left) {
++		uint32_t alignment = mem->page_alignment;
+ 
+-		if (pages == pages_per_node)
++		if (pages >= pages_per_node)
+ 			alignment = pages_per_node;
+ 
+-		r = drm_mm_insert_node_in_range(mm, &nodes[i],
+-						pages, alignment, 0,
+-						place->fpfn, lpfn,
+-						mode);
+-		if (unlikely(r))
++		r = drm_mm_insert_node_in_range(mm, &nodes[i], pages, alignment,
++						0, place->fpfn, lpfn, mode);
++		if (unlikely(r)) {
++			if (pages > pages_per_node) {
++				if (is_power_of_2(pages))
++					pages = pages / 2;
++				else
++					pages = rounddown_pow_of_two(pages);
++				continue;
++			}
+ 			goto error;
++		}
+ 
+ 		vis_usage += amdgpu_vram_mgr_vis_size(adev, &nodes[i]);
+ 		amdgpu_vram_mgr_virt_start(mem, &nodes[i]);
+ 		pages_left -= pages;
++		++i;
++
++		if (pages > pages_left)
++			pages = pages_left;
+ 	}
+ 	spin_unlock(&mgr->lock);
+ 
+-- 
+2.27.0
+

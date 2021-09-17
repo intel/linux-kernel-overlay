@@ -1,0 +1,152 @@
+From 12c87798efeb7bbac1872a48304b8bd413bf5b69 Mon Sep 17 00:00:00 2001
+From: Peter Xu <peterx@redhat.com>
+Date: Fri, 12 Mar 2021 21:07:26 -0800
+Subject: [PATCH 0002/1423] mm: introduce page_needs_cow_for_dma() for deciding
+ whether cow
+
+We've got quite a few places (pte, pmd, pud) that explicitly checked
+against whether we should break the cow right now during fork().  It's
+easier to provide a helper, especially before we work the same thing on
+hugetlbfs.
+
+Since we'll reference is_cow_mapping() in mm.h, move it there too.
+Actually it suites mm.h more since internal.h is mm/ only, but mm.h is
+exported to the whole kernel.  With that we should expect another patch to
+use is_cow_mapping() whenever we can across the kernel since we do use it
+quite a lot but it's always done with raw code against VM_* flags.
+
+Link: https://lkml.kernel.org/r/20210217233547.93892-4-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Reviewed-by: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: David Airlie <airlied@linux.ie>
+Cc: David Gibson <david@gibson.dropbear.id.au>
+Cc: Gal Pressman <galpress@amazon.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kirill Shutemov <kirill@shutemov.name>
+Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+Cc: Roland Scheidegger <sroland@vmware.com>
+Cc: VMware Graphics <linux-graphics-maintainer@vmware.com>
+Cc: Wei Zhang <wzam@amazon.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ include/linux/mm.h | 21 +++++++++++++++++++++
+ mm/huge_memory.c   |  8 ++------
+ mm/internal.h      |  5 -----
+ mm/memory.c        |  8 +-------
+ 4 files changed, 24 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 37da66a9818b..a05b357a4579 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1275,6 +1275,27 @@ static inline bool page_maybe_dma_pinned(struct page *page)
+ 		GUP_PIN_COUNTING_BIAS;
+ }
+ 
++static inline bool is_cow_mapping(vm_flags_t flags)
++{
++	return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
++}
++
++/*
++ * This should most likely only be called during fork() to see whether we
++ * should break the cow immediately for a page on the src mm.
++ */
++static inline bool page_needs_cow_for_dma(struct vm_area_struct *vma,
++					  struct page *page)
++{
++	if (!is_cow_mapping(vma->vm_flags))
++		return false;
++
++	if (!atomic_read(&vma->vm_mm->has_pinned))
++		return false;
++
++	return page_maybe_dma_pinned(page);
++}
++
+ #if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
+ #define SECTION_IN_PAGE_FLAGS
+ #endif
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 594368f6134f..67be026e00e0 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1089,9 +1089,7 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 	 * best effort that the pinned pages won't be replaced by another
+ 	 * random page during the coming copy-on-write.
+ 	 */
+-	if (unlikely(is_cow_mapping(src_vma->vm_flags) &&
+-		     atomic_read(&src_mm->has_pinned) &&
+-		     page_maybe_dma_pinned(src_page))) {
++	if (unlikely(page_needs_cow_for_dma(src_vma, src_page))) {
+ 		pte_free(dst_mm, pgtable);
+ 		spin_unlock(src_ptl);
+ 		spin_unlock(dst_ptl);
+@@ -1205,9 +1203,7 @@ int copy_huge_pud(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 	}
+ 
+ 	/* Please refer to comments in copy_huge_pmd() */
+-	if (unlikely(is_cow_mapping(vma->vm_flags) &&
+-		     atomic_read(&src_mm->has_pinned) &&
+-		     page_maybe_dma_pinned(pud_page(pud)))) {
++	if (unlikely(page_needs_cow_for_dma(vma, pud_page(pud)))) {
+ 		spin_unlock(src_ptl);
+ 		spin_unlock(dst_ptl);
+ 		__split_huge_pud(vma, src_pud, addr);
+diff --git a/mm/internal.h b/mm/internal.h
+index 840b8a330b9a..290e8f45d76e 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -291,11 +291,6 @@ static inline unsigned int buddy_order(struct page *page)
+  */
+ #define buddy_order_unsafe(page)	READ_ONCE(page_private(page))
+ 
+-static inline bool is_cow_mapping(vm_flags_t flags)
+-{
+-	return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+-}
+-
+ /*
+  * These three helpers classifies VMAs for virtual memory accounting.
+  */
+diff --git a/mm/memory.c b/mm/memory.c
+index fabe173b2af2..7169a40f7a8f 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -799,12 +799,8 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 		  pte_t *dst_pte, pte_t *src_pte, unsigned long addr, int *rss,
+ 		  struct page **prealloc, pte_t pte, struct page *page)
+ {
+-	struct mm_struct *src_mm = src_vma->vm_mm;
+ 	struct page *new_page;
+ 
+-	if (!is_cow_mapping(src_vma->vm_flags))
+-		return 1;
+-
+ 	/*
+ 	 * What we want to do is to check whether this page may
+ 	 * have been pinned by the parent process.  If so,
+@@ -818,9 +814,7 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 	 * the page count. That might give false positives for
+ 	 * for pinning, but it will work correctly.
+ 	 */
+-	if (likely(!atomic_read(&src_mm->has_pinned)))
+-		return 1;
+-	if (likely(!page_maybe_dma_pinned(page)))
++	if (likely(!page_needs_cow_for_dma(src_vma, page)))
+ 		return 1;
+ 
+ 	new_page = *prealloc;
+-- 
+2.27.0
+
