@@ -26,8 +26,10 @@ if [ -z $build_id ]; then
 	build_id=0
 fi
 
-if [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
-        kernel_p='lts'
+if [[ $kernel_tag =~ .*?preempt-rt.*?Z$ ]]; then
+        kernel_p='rt'
+elif [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
+	kernel_p='lts'
 elif [[ $kernel_tag =~ .*?mainline-tracking-.*?Z$ ]]; then
         kernel_p='mainline'
 elif [[ $kernel_tag =~ .*?iotg-next-v.*?Z$ ]]; then
@@ -38,10 +40,10 @@ fi
 
 timestamp=`echo $kernel_tag|awk -F'-' '{print $NF}'`
 if [ -z $timestamp ]; then
-	timestamp='no_timestamp'
+	timestamp='000'
 fi
 
-echo "kenrle_p=${kernel_p}, timestamp=${timestamp}"
+echo "kernel_p=${kernel_p}, timestamp=${timestamp}"
 # Clone and apply the debian repository.
 echo "Clone the Linux kernel repository to $KSRC_DIR, tag: $KSRC_TAG"
 if [ -z "${KSRC_MIRROR}" ] ; then
