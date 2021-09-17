@@ -25,8 +25,10 @@ if [ -z $build_id ]; then
 	build_id=0
 fi
 
-if [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
-        kernel_p='lts'
+if [[ $kernel_tag =~ .*?preempt-rt.*?Z$ ]]; then
+        kernel_p='rt'
+elif [[ $kernel_tag =~ .*?lts-v.*?Z$ ]]; then
+	kernel_p='lts'
 elif [[ $kernel_tag =~ .*?mainline-tracking-.*?Z$ ]]; then
         kernel_p='mainline'
 elif [[ $kernel_tag =~ .*?iotg-next-v.*?Z$ ]]; then
