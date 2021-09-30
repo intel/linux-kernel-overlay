@@ -1,4 +1,4 @@
-From 91949e47ecfcd8bd5ffb0e79f94c64dec8988df2 Mon Sep 17 00:00:00 2001
+From 2a0320949e31e13eebd86583bcfd497bdeb359ad Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 16:02:33 +0800
 Subject: [PATCH 01/16] tcc: parse PTCT table and record pesudo sram ranges
@@ -16,7 +16,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index e55e0c1fad8c..bc0df2e1d396 100644
+index 14bcd59bcdee..802e7a5b4dc6 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1218,6 +1218,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -129,7 +129,7 @@ index e55e0c1fad8c..bc0df2e1d396 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index 2069ac38a4e2..76f6657252ff 100644
+index a47b32a5cbde..44e7d7baa72f 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
 @@ -41,6 +41,7 @@
@@ -140,7 +140,7 @@ index 2069ac38a4e2..76f6657252ff 100644
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
-@@ -1753,6 +1754,59 @@ struct acpi_prmt_handler_info {
+@@ -1923,6 +1924,59 @@ struct acpi_prmt_handler_info {
  	u64 acpi_param_buffer_address;
  };
  

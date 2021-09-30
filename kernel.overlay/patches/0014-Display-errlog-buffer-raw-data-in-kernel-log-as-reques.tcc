@@ -1,4 +1,4 @@
-From 7c07d28867f96ee181718a585b89c79bd6d546ba Mon Sep 17 00:00:00 2001
+From 0347744a0d9270c90d643a795944c866ae629267 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Tue, 8 Jun 2021 17:59:33 +0800
 Subject: [PATCH 14/16] Display errlog buffer raw data in kernel log as

@@ -1,4 +1,4 @@
-From 82d6479ec03fc061e367c30cf281ac8ff3694c25 Mon Sep 17 00:00:00 2001
+From f86783cbf22e630dd1df6d51b017598c7c9be2db Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
 Subject: [PATCH 02/16] tcc: this is kernel driver to interface to TCC PTCM
@@ -21,10 +21,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  create mode 100644 drivers/tcc/tcc_buffer.c
 
 diff --git a/drivers/Kconfig b/drivers/Kconfig
-index 8bad63417a50..5687898f4075 100644
+index 30d2db37cc87..1e7ee6266fc8 100644
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -236,4 +236,6 @@ source "drivers/interconnect/Kconfig"
+@@ -234,4 +234,6 @@ source "drivers/interconnect/Kconfig"
  source "drivers/counter/Kconfig"
  
  source "drivers/most/Kconfig"
@@ -32,10 +32,10 @@ index 8bad63417a50..5687898f4075 100644
 +source "drivers/tcc/Kconfig"
  endmenu
 diff --git a/drivers/Makefile b/drivers/Makefile
-index 27c018bdf4de..c3d4b56b9040 100644
+index be5d40ae1488..9e4fd41c5073 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+@@ -188,3 +188,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
  obj-$(CONFIG_INTERCONNECT)	+= interconnect/
  obj-$(CONFIG_COUNTER)		+= counter/
  obj-$(CONFIG_MOST)		+= most/

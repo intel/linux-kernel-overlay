@@ -1,4 +1,4 @@
-From 74821d6d511d817958a06233078a08ea050ae235 Mon Sep 17 00:00:00 2001
+From 87a8e5a347cee56c45cab2a1050c0386c47212af Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 8 Jun 2020 00:40:45 +0800
 Subject: [PATCH 03/16] tcc: update license header
@@ -14,7 +14,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 62 insertions(+), 17 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index bc0df2e1d396..5951c7bf2c24 100644
+index 802e7a5b4dc6..e7419ee4b2b2 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1229,9 +1229,6 @@ static inline bool is_TCC_range(u64 start, u64 end)

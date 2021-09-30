@@ -1,4 +1,4 @@
-From 02aa738611d7dc4807600a831a93adc66bfd3950 Mon Sep 17 00:00:00 2001
+From 473a71ca01d06e99a2ccbadb79fd799223f648dc Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 18:48:46 +0800
 Subject: [PATCH 10/16] tcc: update RTCT table parser to support two versions
@@ -15,7 +15,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  3 files changed, 546 insertions(+), 88 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 648574d48ff1..e4617138ec51 100644
+index 9376b1692b83..406bcacb0c7c 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1225,6 +1225,10 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -960,7 +960,7 @@ index a9f83c1d0722..fbdab419a241 100644
  
  module_init(tcc_buffer_init);
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index 76f6657252ff..0ff9532b8d80 100644
+index 44e7d7baa72f..1f14170981f2 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
 @@ -41,7 +41,8 @@
@@ -973,7 +973,7 @@ index 76f6657252ff..0ff9532b8d80 100644
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
-@@ -1805,7 +1806,48 @@ struct ptct_psram_region {
+@@ -1975,7 +1976,48 @@ struct ptct_psram_region {
  #define PTCT_ENTRY_PSRAM_SIZE	sizeof(struct acpi_ptct_psram)
  #define PTCT_ACPI_HEADER_SIZE	sizeof(struct acpi_table_header)
  #define PSRAM_REGION_INFO_SIZE	sizeof(struct ptct_psram_region)
