@@ -1,0 +1,302 @@
+From 2bea6fd9edd46332ff87204e34c3c1c95eec0e1d Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Wed, 30 Sep 2020 09:02:54 -0700
+Subject: [PATCH 26/47] x86/fpu/xstate: Introduce helpers to manage the XSTATE
+ buffer dynamically
+
+The static XSTATE per-task buffer contains the extended register states --
+but it is not expandable at runtime. Introduce runtime methods and a new
+fpu struct field to support the expansion.
+
+fpu->state_mask indicates which state components are to be saved in the
+XSTATE buffer.
+
+realloc_xstate_buffer() uses vzalloc(). If use of this mechanism grows to
+re-allocate buffers larger than 64KB, a more sophisticated allocation
+scheme that includes purpose-built reclaim capability might be justified.
+
+Introduce a new helper -- calculate_xstate_buf_size_from_mask() to
+calculate the buffer size.
+
+Also, use the new field and helper to initialize the buffer.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Reviewed-by: Len Brown <len.brown@intel.com>
+Cc: x86@kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ arch/x86/include/asm/fpu/types.h  |   7 ++
+ arch/x86/include/asm/fpu/xstate.h |   3 +
+ arch/x86/kernel/fpu/core.c        |  19 +++--
+ arch/x86/kernel/fpu/xstate.c      | 125 ++++++++++++++++++++++++++++++
+ 4 files changed, 147 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/types.h b/arch/x86/include/asm/fpu/types.h
+index 6bde210026eb..9fa10f638b48 100644
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@ -354,6 +354,13 @@ struct fpu {
+ 	 */
+ 	unsigned long			avx512_timestamp;
+ 
++	/*
++	 * @state_mask:
++	 *
++	 * The bitmap represents state components to be saved in ->state.
++	 */
++	u64				state_mask;
++
+ 	/*
+ 	 * @state:
+ 	 *
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index f47a00e241ae..eba6fd57b2aa 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -154,7 +154,10 @@ struct fpu_xstate_buffer_config {
+ 
+ extern struct fpu_xstate_buffer_config fpu_buf_cfg;
+ 
++unsigned int calculate_xstate_buf_size_from_mask(u64 mask);
+ void *get_xsave_addr(struct fpu *fpu, int xfeature_nr);
++int realloc_xstate_buffer(struct fpu *fpu, u64 mask);
++void free_xstate_buffer(struct fpu *fpu);
+ int xfeature_size(int xfeature_nr);
+ int copy_uabi_from_kernel_to_xstate(struct fpu *fpu, const void *kbuf);
+ int copy_sigframe_from_user_to_xstate(struct fpu *fpu, const void __user *ubuf);
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 0f947248ddb5..d3cdfe0ab8a8 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -244,9 +244,8 @@ void fpstate_init(struct fpu *fpu)
+ 
+ 	if (likely(fpu)) {
+ 		state = fpu->state;
+-		/* The dynamic user states are not prepared yet. */
+-		mask = xfeatures_mask_all & ~xfeatures_mask_user_dynamic;
+-		size = fpu_buf_cfg.min_size;
++		mask = fpu->state_mask;
++		size = calculate_xstate_buf_size_from_mask(fpu->state_mask);
+ 	} else {
+ 		state = &init_fpstate;
+ 		mask = xfeatures_mask_all;
+@@ -283,14 +282,16 @@ int fpu_clone(struct task_struct *dst)
+ 	if (!cpu_feature_enabled(X86_FEATURE_FPU))
+ 		return 0;
+ 
++	/*
++	 * The child does not inherit the dynamic states. Thus, use the
++	 * buffer embedded in struct task_struct, which has the minimum
++	 * size.
++	 */
++	dst_fpu->state_mask = (xfeatures_mask_all & ~xfeatures_mask_user_dynamic);
+ 	dst_fpu->state = &dst_fpu->__default_state;
+-
+ 	/*
+ 	 * Don't let 'init optimized' areas of the XSAVE area
+ 	 * leak into the child task:
+-	 *
+-	 * The child does not inherit the dynamic states. So,
+-	 * the xstate buffer has the minimum size.
+ 	 */
+ 	memset(&dst_fpu->state->xsave, 0, fpu_buf_cfg.min_size);
+ 
+@@ -397,6 +398,10 @@ static void fpu_reset_fpstate(void)
+ 	 * flush_thread().
+ 	 */
+ 	memcpy(fpu->state, &init_fpstate, init_fpstate_copy_size());
++	/* Adjust the xstate buffer format for current. */
++	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
++		fpstate_init_xstate(&fpu->state->xsave, fpu->state_mask);
++
+ 	set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	fpregs_unlock();
+ }
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 79190eac010a..d26b801354b1 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -10,6 +10,7 @@
+ #include <linux/pkeys.h>
+ #include <linux/seq_file.h>
+ #include <linux/proc_fs.h>
++#include <linux/vmalloc.h>
+ 
+ #include <asm/fpu/api.h>
+ #include <asm/fpu/internal.h>
+@@ -19,6 +20,7 @@
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/cpufeature.h>
++#include <asm/trace/fpu.h>
+ 
+ /*
+  * Although we spell it out in here, the Processor Trace
+@@ -84,6 +86,12 @@ static unsigned int xstate_comp_offsets[XFEATURE_MAX] __ro_after_init =
+ 	{ [ 0 ... XFEATURE_MAX - 1] = -1};
+ static unsigned int xstate_supervisor_only_offsets[XFEATURE_MAX] __ro_after_init =
+ 	{ [ 0 ... XFEATURE_MAX - 1] = -1};
++/*
++ * True if the buffer of the corresponding XFEATURE is located on the next 64
++ * byte boundary. Otherwise, it follows the preceding component immediately.
++ */
++static bool xstate_64byte_aligned[XFEATURE_MAX] __ro_after_init =
++	{ [ 0 ... XFEATURE_MAX - 1] = false};
+ 
+ struct fpu_xstate_buffer_config fpu_buf_cfg __ro_after_init;
+ EXPORT_SYMBOL_GPL(fpu_buf_cfg);
+@@ -139,6 +147,60 @@ static bool xfeature_is_supervisor(int xfeature_nr)
+ 	return ecx & 1;
+ }
+ 
++/**
++ * calculate_xstate_buf_size_from_mask - Calculate the amount of space
++ *					 needed to store an xstate buffer
++ *					 with the given features
++ * @mask:	The set of components for which the space is needed.
++ *
++ * Consults values populated in setup_xstate_features(). Must be called
++ * after that setup.
++ *
++ * Returns:	The buffer size
++ */
++unsigned int calculate_xstate_buf_size_from_mask(u64 mask)
++{
++	unsigned int size = FXSAVE_SIZE + XSAVE_HDR_SIZE;
++	int i, last_feature_nr;
++
++	if (!mask)
++		return 0;
++
++	/*
++	 * The minimum buffer size excludes the dynamic user state. When a
++	 * task uses the state, the buffer can grow up to the max size.
++	 */
++	if (mask == (xfeatures_mask_all & ~xfeatures_mask_user_dynamic))
++		return fpu_buf_cfg.min_size;
++	else if (mask == xfeatures_mask_all)
++		return fpu_buf_cfg.max_size;
++
++	last_feature_nr = fls64(mask) - 1;
++	if (last_feature_nr < FIRST_EXTENDED_XFEATURE)
++		return size;
++
++	/*
++	 * Each state offset in the non-compacted format is fixed. Take the
++	 * size from the last feature 'nr'.
++	 */
++	if (!cpu_feature_enabled(X86_FEATURE_XSAVES))
++		return xstate_offsets[last_feature_nr] + xstate_sizes[last_feature_nr];
++
++	/*
++	 * With the given mask, no relevant size is found so far. So,
++	 * calculate it by summing up each state size.
++	 */
++	for (i = FIRST_EXTENDED_XFEATURE; i <= last_feature_nr; i++) {
++		if (!(mask & BIT_ULL(i)))
++			continue;
++
++		if (xstate_64byte_aligned[i])
++			size = ALIGN(size, 64);
++		size += xstate_sizes[i];
++	}
++	return size;
++}
++
+ /*
+  * Enable the extended processor state save/restore feature.
+  * Called once per CPU onlining.
+@@ -210,6 +272,7 @@ static void __init setup_xstate_features(void)
+ 			continue;
+ 
+ 		xstate_offsets[i] = ebx;
++		xstate_64byte_aligned[i] = (ecx & 2) ? true : false;
+ 
+ 		/*
+ 		 * In our xstate size checks, we assume that the highest-numbered
+@@ -819,6 +882,12 @@ void __init fpu__init_system_xstate(void)
+ 	if (err)
+ 		goto out_disable;
+ 
++	/*
++	 * Initially, the FPU buffer used is the static one, without
++	 * dynamic states.
++	 */
++	current->thread.fpu.state_mask = (xfeatures_mask_all & ~xfeatures_mask_user_dynamic);
++
+ 	/*
+ 	 * Update info used for ptrace frames; use standard-format size and no
+ 	 * supervisor xstates:
+@@ -1009,6 +1078,60 @@ int arch_set_user_pkey_access(struct task_struct *tsk, int pkey,
+ }
+ #endif /* ! CONFIG_ARCH_HAS_PKEYS */
+ 
++void free_xstate_buffer(struct fpu *fpu)
++{
++	vfree(fpu->state);
++}
++
++/**
++ * realloc_xstate_buffer - Re-alloc a buffer with the size calculated from
++ *			   @mask.
++ *
++ * @fpu:	A struct fpu * pointer
++ * @mask:	The bitmap tells which components to be reserved in the new
++ *		buffer.
++ *
++ * It deals with enlarging the xstate buffer with dynamic states.
++ *
++ * Use vzalloc() simply here. If the task with a vzalloc()-allocated buffer
++ * tends to terminate quickly, vfree()-induced IPIs may be a concern.
++ * Caching may be helpful for this. But the task with large state is likely
++ * to live longer.
++ *
++ * Also, this method does not shrink or reclaim the buffer.
++ *
++ * Returns 0 on success, -ENOMEM on allocation error.
++ */
++int realloc_xstate_buffer(struct fpu *fpu, u64 mask)
++{
++	union fpregs_state *state;
++	u64 state_mask;
++
++	state_mask = fpu->state_mask | mask;
++	if ((state_mask & fpu->state_mask) == state_mask)
++		return 0;
++
++	state = vzalloc(calculate_xstate_buf_size_from_mask(state_mask));
++	if (!state)
++		return -ENOMEM;
++
++	/*
++	 * As long as the register state is intact, save the xstate in the
++	 * new buffer at the next context switch or ptrace's context
++	 * injection.
++	 */
++	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
++		fpstate_init_xstate(&state->xsave, state_mask);
++
++	/* Free the old buffer */
++	if (fpu->state != &fpu->__default_state)
++		free_xstate_buffer(fpu);
++
++	fpu->state = state;
++	fpu->state_mask = state_mask;
++	return 0;
++}
++
+ static void copy_feature(bool from_xstate, struct membuf *to, void *xstate,
+ 			 void *init_xstate, unsigned int size)
+ {
+@@ -1161,6 +1284,8 @@ static int copy_uabi_to_xstate(struct fpu *fpu, const void *kbuf,
+ 	if (validate_user_xstate_header(&hdr))
+ 		return -EINVAL;
+ 
++	hdr.xfeatures &= fpu->state_mask;
++
+ 	/* Validate MXCSR when any of the related features is in use */
+ 	mask = XFEATURE_MASK_FP | XFEATURE_MASK_SSE | XFEATURE_MASK_YMM;
+ 	if (hdr.xfeatures & mask) {
+-- 
+2.32.0
+

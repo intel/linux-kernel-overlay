@@ -1,4 +1,4 @@
-From d40403715b720f027879925548969fb1b60c5d04 Mon Sep 17 00:00:00 2001
+From ae9fbaf68095f469995cc1e5615a1b8eed34fa2b Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Sun, 8 Aug 2021 03:13:01 +0800
 Subject: [PATCH 16/16] tcc: rounding possible non page-aligned ssram address
@@ -11,7 +11,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  1 file changed, 8 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index e4617138ec51..0c364f4501ed 100644
+index 406bcacb0c7c..898f37577a9f 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1315,6 +1315,10 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
