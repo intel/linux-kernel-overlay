@@ -59,15 +59,15 @@
 # flag used to know if is a RC
 %global isrc 0
 
-%define pkgrelease  29
-%define rpmversion  5.10.59
+%define pkgrelease  22
+%define rpmversion  5.10.65
 %if %{?isrc}
 %define rcversion   .
 %endif
-%define embargoname 0916.lts2020
+%define embargoname 1007.lts2020
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210916T090200Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}211007T223057Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -462,7 +462,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo 'https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/linux.git'
-%global kernel_src_tag v5.10.59
+%global kernel_src_tag v5.10.65
 # END OF PROJECT SPECIFIC MACROS
 
 
