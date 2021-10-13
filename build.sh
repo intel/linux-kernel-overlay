@@ -9,7 +9,7 @@ KRTV=52
 
 KSRC_REPO=https://kernel.googlesource.com/pub/scm/linux/kernel/git/rt/linux-stable-rt.git
 
-KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL-rt$KRTV
+KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL$KRTV
 
 KSRC_MIRROR=
 
