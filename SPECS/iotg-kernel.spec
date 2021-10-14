@@ -61,15 +61,15 @@
 # name in the kernel version
 %global isrc 1
 
-%define pkgrelease  29
-%define rpmversion  5.10.59
+%define pkgrelease  25
+%define rpmversion  5.10.65
 %if %{?isrc}
-%define rcversion   rt52.
+%define rcversion   rt53.
 %endif
-%define embargoname 0916.lts2020_rt
+%define embargoname 1011.lts2020_rt
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210916T182324Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}211011T224241Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -464,7 +464,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo 'https://kernel.googlesource.com/pub/scm/linux/kernel/git/rt/linux-stable-rt.git'
-%global kernel_src_tag v5.10.59-rt52
+%global kernel_src_tag v5.10.65-rt53
 # END OF PROJECT SPECIFIC MACROS
 
 
