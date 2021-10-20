@@ -61,15 +61,15 @@
 # name in the kernel version
 %global isrc 1
 
-%define pkgrelease  25
+%define pkgrelease  29
 %define rpmversion  5.10.65
 %if %{?isrc}
 %define rcversion   rt53.
 %endif
-%define embargoname 1011.lts2020_rt
+%define embargoname 1019.lts2020_rt
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}211011T224241Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}211019T014742Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
