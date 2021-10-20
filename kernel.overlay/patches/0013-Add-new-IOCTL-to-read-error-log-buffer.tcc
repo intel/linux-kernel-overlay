@@ -1,4 +1,4 @@
-From 4cbad828a0fc702a0d4a6f612fb1c806395913b3 Mon Sep 17 00:00:00 2001
+From 5c6a30792184ec2c3fa95313b4e39f5ab6f73dfc Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 20 May 2021 17:57:47 +0800
 Subject: [PATCH 13/16] Add new IOCTL to read error log buffer.

@@ -1,0 +1,161 @@
+From 34a02a7c9f2c0087fd9b2e847bf3828996fc79e0 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Mon, 28 Jun 2021 13:34:16 -0700
+Subject: [PATCH 43/43] x86/fpu/xstate: Add a sanity check for XFD state when
+ saving XSTATE
+
+Add a DEBUG sanity check that XFD state matches with XINUSE state.
+
+Instead of reading MSR IA32_XFD directly, read a per-cpu value that is
+recorded at every MSR write.
+
+Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Reviewed-by: Len Brown <len.brown@intel.com>
+Cc: x86@kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ arch/x86/include/asm/fpu/internal.h | 22 +++++++++++++++++++++-
+ arch/x86/kernel/fpu/core.c          | 13 +++++++++++++
+ arch/x86/kernel/fpu/xstate.c        | 12 +++++-------
+ arch/x86/kernel/traps.c             |  9 ++++-----
+ 4 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 0225ab63e5d1..8b1833243d4a 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -568,6 +568,26 @@ static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+  * Misc helper functions:
+  */
+ 
++#ifdef CONFIG_X86_DEBUG_FPU
++DECLARE_PER_CPU(u64, xfd_shadow);
++static inline u64 xfd_debug_shadow(void)
++{
++	return this_cpu_read(xfd_shadow);
++}
++
++static inline void xfd_write(u64 value)
++{
++	wrmsrl_safe(MSR_IA32_XFD, value);
++	this_cpu_write(xfd_shadow, value);
++}
++#else
++#define xfd_debug_shadow()	0
++static inline void xfd_write(u64 value)
++{
++	wrmsrl_safe(MSR_IA32_XFD, value);
++}
++#endif
++
+ /**
+  * xfd_switch - Switches the MSR IA32_XFD context if needed.
+  * @prev:	The previous task's struct fpu pointer
+@@ -584,7 +604,7 @@ static inline void xfd_switch(struct fpu *prev, struct fpu *next)
+ 	next_xfd_mask = next->state_mask & xfeatures_mask_user_dynamic;
+ 
+ 	if (unlikely(prev_xfd_mask != next_xfd_mask))
+-		wrmsrl_safe(MSR_IA32_XFD, xfeatures_mask_user_dynamic ^ next_xfd_mask);
++		xfd_write(xfeatures_mask_user_dynamic ^ next_xfd_mask);
+ }
+ 
+ /*
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 99ec49185658..64667d6264cd 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -82,6 +82,10 @@ bool irq_fpu_usable(void)
+ }
+ EXPORT_SYMBOL(irq_fpu_usable);
+ 
++#ifdef CONFIG_X86_DEBUG_FPU
++DEFINE_PER_CPU(u64, xfd_shadow);
++#endif
++
+ /*
+  * Save the FPU register state in fpu->state. The register state is
+  * preserved.
+@@ -107,6 +111,15 @@ EXPORT_SYMBOL(irq_fpu_usable);
+ void save_fpregs_to_fpstate(struct fpu *fpu)
+ {
+ 	if (likely(use_xsave())) {
++		/*
++		 * If XFD is armed for an xfeature, XSAVE* will not save
++		 * its state. Verify XFD is clear for all features that
++		 * are in use before XSAVE*.
++		 */
++		if (IS_ENABLED(CONFIG_X86_DEBUG_FPU) && cpu_feature_enabled(X86_FEATURE_XFD) &&
++		    cpu_feature_enabled(X86_FEATURE_XGETBV1))
++			WARN_ON_FPU(xgetbv(1) & xfd_debug_shadow());
++
+ 		os_xsave(&fpu->state->xsave, fpu->state_mask);
+ 
+ 		/*
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index c295a824c98e..9079470267ec 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -270,7 +270,7 @@ void fpu__init_cpu_xstate(void)
+ 	}
+ 
+ 	if (boot_cpu_has(X86_FEATURE_XFD))
+-		wrmsrl(MSR_IA32_XFD, xfeatures_mask_user_dynamic);
++		xfd_write(xfeatures_mask_user_dynamic);
+ }
+ 
+ static bool xfeature_enabled(enum xfeature xfeature)
+@@ -1102,9 +1102,8 @@ void fpu__resume_cpu(void)
+ 	}
+ 
+ 	if (cpu_feature_enabled(X86_FEATURE_XFD))
+-		wrmsrl_safe(MSR_IA32_XFD, (current->thread.fpu.state_mask &
+-					   xfeatures_mask_user_dynamic) ^
+-					  xfeatures_mask_user_dynamic);
++		xfd_write((current->thread.fpu.state_mask & xfeatures_mask_user_dynamic) ^
++			  xfeatures_mask_user_dynamic);
+ }
+ 
+ /**
+@@ -1349,9 +1348,8 @@ void reset_dynamic_state_perm(struct task_struct *tsk)
+ 	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
+ 		fpstate_init_xstate(&fpu->state->xsave, fpu->state_mask);
+ 
+-	wrmsrl_safe(MSR_IA32_XFD,
+-		    (fpu->state_mask & xfeatures_mask_user_dynamic) ^
+-		    xfeatures_mask_user_dynamic);
++	xfd_write((fpu->state_mask & xfeatures_mask_user_dynamic) ^
++		  xfeatures_mask_user_dynamic);
+ 
+ 	fpu->dynamic_state_perm = 0;
+ }
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 4fcb6a9617cd..b107ffdfead4 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -1129,7 +1129,7 @@ static __always_inline bool handle_xfd_event(struct fpu *fpu, struct pt_regs *re
+ 			 * unblock the task.
+ 			 */
+ 			rdmsrl_safe(MSR_IA32_XFD, &value);
+-			wrmsrl_safe(MSR_IA32_XFD, value & ~xfd_err);
++			xfd_write(value & ~xfd_err);
+ 		} else {
+ 			struct fpu *fpu = &current->thread.fpu;
+ 			int err = -1;
+@@ -1148,10 +1148,9 @@ static __always_inline bool handle_xfd_event(struct fpu *fpu, struct pt_regs *re
+ 				if (!WARN_ON(in_interrupt())) {
+ 					err = realloc_xstate_buffer(fpu, xfd_event);
+ 					if (!err)
+-						wrmsrl_safe(MSR_IA32_XFD,
+-							    (fpu->state_mask &
+-							     xfeatures_mask_user_dynamic) ^
+-							    xfeatures_mask_user_dynamic);
++						xfd_write((fpu->state_mask &
++							  xfeatures_mask_user_dynamic) ^
++							  xfeatures_mask_user_dynamic);
+ 				}
+ 
+ 				if (err)
+-- 
+2.32.0
+
