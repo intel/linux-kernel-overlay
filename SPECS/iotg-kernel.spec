@@ -59,15 +59,15 @@
 # flag used to know if is a RC
 %global isrc 0
 
-%define pkgrelease  27
+%define pkgrelease  31
 %define rpmversion  5.10.65
 %if %{?isrc}
 %define rcversion   .
 %endif
-%define embargoname 1018.lts2020
+%define embargoname 1025.lts2020
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}211018T221343Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}211025T073137Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
