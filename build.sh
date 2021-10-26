@@ -5,10 +5,11 @@ KVERSION=5
 KPATCHLEVEL=13
 KSUBLEVEL=0
 KEXTRAVERSION=-rc3
+KRTV=
 
 KSRC_REPO=https://github.com/torvalds/linux.git
 
-KSRC_TAG=v$KVERSION.$KPATCHLEVEL$KEXTRAVERSION
+KSRC_TAG=v$KVERSION.$KPATCHLEVEL.$KSUBLEVEL$KRTV
 
 KSRC_MIRROR=
 
@@ -82,8 +83,6 @@ cp $CUR_DIR/overlay.config $KSRC_DIR/.config
 make olddefconfig
 
 echo "Building the .deb package"
-#nice make -j`nproc` bindeb-pkg  LOCALVERSION= KDEB_PKGVERSION=$build_id KERNELRELEASE=`make kernelversion`-${kernel_p}-${timestamp,,}
-KERNELRELEASE=`make kernelversion`-${kernel_p}-${timestamp,,}
 nice make -j`nproc` bindeb-pkg  LOCALVERSION= KDEB_PKGVERSION=$build_id KERNELRELEASE=`make kernelversion`-${kernel_p}-${timestamp,,} KDEB_SOURCENAME=linux-${KERNELRELEASE}
 cp .config $CUR_DIR/kernel.config
 popd
