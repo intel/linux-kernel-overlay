@@ -1,4 +1,4 @@
-WRNING
+WARNING
 -------------------------------------------------------------------------------
 This repository includes the intel embargoed Linux kernel source code and confidential
 information, Pls. following related intel policy when you distribute it.
