@@ -1,4 +1,4 @@
-From 9231d1f86881c183c0eaabe25a9ebc455e0221ea Mon Sep 17 00:00:00 2001
+From 5df74174fd54a36913f8b7c0346fa17787426b7b Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 9 Apr 2021 16:22:34 +0800
 Subject: [PATCH 12/16] Remove Clock_Cycles_VT from MHL entry.

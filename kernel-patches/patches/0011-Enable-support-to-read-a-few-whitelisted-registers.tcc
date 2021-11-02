@@ -1,4 +1,4 @@
-From 82fd680be62770587245db014a05f7a7303c9279 Mon Sep 17 00:00:00 2001
+From 3ee1a49e70553956a059ac2e936e85026b850465 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 19:57:18 +0800
 Subject: [PATCH 11/16] Enable support to read a few whitelisted registers.
