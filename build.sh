@@ -5,6 +5,7 @@ source config.sh
 
 iotg_kernel_tag=$1
 build_id=$2
+customized_kver_string=$3
 
 if [ -z $build_id ]; then
 	build_id=0
@@ -30,25 +31,12 @@ BINARY_DIR=$CUR_DIR/binary
 
 echo "IoTG Kernel tag: $iotg_kernel_tag, build ID: $build_id,  Upstream kernel: $KSRC_UPSTREAM_TAG, out-of-tree patches: $KSRC_OOT_PATCHES"
 
-if [[ $iotg_kernel_tag =~ .*?preempt-rt.*?Z$ ]]; then
-        kernel_p='rt'
-elif [[ $iotg_kernel_tag =~ .*?lts-v.*?Z$ ]]; then
-        kernel_p='lts'
-elif [[ $iotg_kernel_tag =~ .*?mainline-tracking-.*?Z$ ]]; then
-        kernel_p='mainline-tracking'
-elif [[ $iotg_kernel_tag =~ .*?iotg-next-v.*?Z$ ]]; then
-        kernel_p='iotg-next'
-else
-        kernel_p='none'
-fi
-
 timestamp=`echo $iotg_kernel_tag|awk -F'-' '{print $NF}'`
 if [ -z $timestamp ]; then
 	timestamp='000'
 fi
 
-echo "kernel_p=${kernel_p}, timestamp=${timestamp}"
-
+echo "customized_kver_string=${customized_kver_string}, timestamp=${timestamp}"
 
 # Setup the kernel source code that need be built.
 if [ -d "${BUILD_DIR}" ] && [ -f "$BUILD_DIR/.git/config" ] ; then
@@ -114,9 +102,9 @@ done
 # Build the Debian packages.
 echo "Building the .deb package"
 make olddefconfig
-KERNELRELEASE=`make kernelversion`-${kernel_p}-${timestamp,,}
+KERNELRELEASE=`make kernelversion`-${customized_kver_string}-${timestamp,,}
 # KDEB_PKTVERSION has to start with digit, then we removed the first character (v) from KSRC_UPSTREAM_TAG
-nice make -j`nproc` bindeb-pkg LOCALVERSION= KDEB_PKGVERSION=${KSRC_UPSTREAM_TAG:1}-$build_id KERNELRELEASE=`make kernelversion`-${kernel_p}-${timestamp,,} KDEB_SOURCENAME=linux-${KERNELRELEASE}
+nice make -j`nproc` bindeb-pkg LOCALVERSION= KDEB_PKGVERSION=${KSRC_UPSTREAM_TAG:1}-$build_id KERNELRELEASE=`make kernelversion`-${customized_kver_string}-${timestamp,,} KDEB_SOURCENAME=linux-${KERNELRELEASE}
 
 # Post-build action: move the config and deb package to CUR_DIR
 cp .config $CUR_DIR/kernel.config
