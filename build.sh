@@ -111,6 +111,26 @@ for cfg_file in $KCFG_FEATURES_DIR/*.cfg; do
 done
 ./scripts/kconfig/merge_config.sh -m .config $KCFG_OVERLAY
 
+# *** For RT kernel, we need to add some cmdlines to the boot options
+# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
+# *** After the kernel deb package is installed. cmd-params in /boot/;
+if [ $KRTV ] ; then
+	cp $CUR_DIR/cmd-params $BUILD_DIR
+	cat <<- EOF > insert_script_code
+	cp cmd-params "\$tmpdir/boot/cmd-params-\$version"
+EOF
+	builddeb_path='scripts/package/builddeb'
+	insert_line_num=$(grep -n 'cp System.map "$tmpdir/boot/System.map' $builddeb_path| cut -f1 -d:)
+	if [ -n "$insert_line_num" ];then
+		sed -i "${insert_line_num}r insert_script_code" $builddeb_path
+	else
+		echo "$0 Error: Not sure that the insertion point of the code segment"
+		exit 1
+	fi
+	rm insert_script_code
+fi
+# *** For RT kernel --end
+
 # Build the Debian packages.
 echo "Building the .deb package"
 make olddefconfig
