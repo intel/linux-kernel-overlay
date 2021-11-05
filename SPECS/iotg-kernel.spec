@@ -66,6 +66,10 @@
 %endif
 %define embargoname 0616.iotg_next
 
+%define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
+%define features_cfg_dir features
+%define overlay_cfg_file overlay/overlay.cfg
+
 # allow pkg_release to have configurable %%{?dist} tag
 %define specrelease %{?rcversion}210616T015924Z_%{pkgrelease}%{?dist}
 
@@ -497,7 +501,6 @@ Source400: mod-kvm.list
 # Sources for kernel-tools
 Source2000: cpupower.service
 Source2001: cpupower.config
-Source2002: overlay.config
 Source2003: patches.tar
 
 ## Patches needed for building this package
@@ -1025,7 +1028,7 @@ cd configs
 # Copy config files
 pwd
 
-cp $RPM_SOURCE_DIR/overlay.config overlay.config
+cp $RPM_SOURCE_DIR/kernel-config . -r
 
 # Note we need to disable these flags for cross builds because the flags
 # from redhat-rpm-config assume that host == target so target arch
@@ -1108,7 +1111,15 @@ BuildKernel() {
     %{make} -s %{?_smp_mflags} mrproper
     # Merge Enbargo Overlay Kernel config
     # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-    cp configs/overlay.config .config
+    # cp configs/kernel-config/base-os/centos.config-4.18.0-348.el8.x86_64 .config
+    cp configs/kernel-config/%{base_os_cfg_file} .config
+    ls -lah configs/kernel-config/%{features_cfg_dir}/*.cfg
+    for cfg_file in configs/kernel-config/%{features_cfg_dir}/*.cfg; do
+        echo $cfg_file
+        ./scripts/kconfig/merge_config.sh -m .config $cfg_file
+    done
+    ./scripts/kconfig/merge_config.sh -m .config configs/kernel-config/%{overlay_cfg_file}
+
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif

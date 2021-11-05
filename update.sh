@@ -33,6 +33,7 @@ KDATE=
 KDATE_MMDD=
 KERNEL_FULL_VERSION=
 SPEC_FILE="SPECS/iotg-kernel.spec"
+BASE_OS_CFG_FILE="base-os/centos.config-4.18.0-348.el8.x86_64"
 WORKDIR=$(dirname $(realpath $0))
 
 usage() {
@@ -54,11 +55,12 @@ if [[ $# == 0 ]]; then
   exit 1
 fi
 
-while getopts k:t:b:nh opt
+while getopts k:t:c:nh opt
 do
     case "$opt" in
       k)  KSRC_REPO=$OPTARG;;
       t)  KSRC_TAG=$OPTARG;;
+      c)  BASE_OS_CFG_FILE=$OPTARG;;
       n)  NOT_COMMIT=true;;
       h)  usage
           exit 0
@@ -125,6 +127,9 @@ sed -i "/define specrelease/c %define specrelease %{?rcversion}${KDATE}_%{pkgrel
 # Set the kernel src
 sed -i "/global kernel_src_repo/c %global kernel_src_repo ${KSRC_REPO}" ${SPEC_FILE}
 sed -i "/global kernel_src_tag/c %global kernel_src_tag ${KSRC_TAG}" ${SPEC_FILE}
+
+# Set the kernel configurations of the base operating system.
+sed -i "/define base_os_cfg_file/c %define base_os_cfg_file ${BASE_OS_CFG_FILE}" ${SPEC_FILE}
 
 if [ "$NOT_COMMIT" = true ] ; then
     exit 0
