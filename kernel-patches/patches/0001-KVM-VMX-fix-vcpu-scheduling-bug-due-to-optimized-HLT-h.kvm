@@ -1,0 +1,59 @@
+From 173c94c91165d4811016517f0721b554ceef243e Mon Sep 17 00:00:00 2001
+From: pixiange <xiange.pi@intel.com>
+Date: Tue, 2 Nov 2021 03:14:53 -0400
+Subject: [PATCH] KVM: VMX: fix vcpu scheduling bug due to optimized HLT
+ handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch fixes a KVM scheduling bug that occurs in the following scenario:
+- VCPU issues HLT that causes VM exit
+- Before the KVM HLT handler is completed, an interrupt arrives targeting the same VCPU
+- KVM posts the interrupt to the VCPU
+- KVM checks to see if it’s necessary to perform a kvm_vcpu_kick(), which essentially
+wakes up the VCPU thread if required. Commit 379a3c added an optimization to avoid the
+kvm_vcpu_kick() call if the VCPU is in running state. Since we are still in the middle
+of HLT processing, the VCPU’s state is still running. This will lead to the skip of the
+kvm_vcpu_kick() call and eventually the HLT processing is done and VCPU is (wrongly) put
+to sleep.
+
+The bug can remain unnoticeable due to two reasons:
+- To be hit by the bug, the interrupt needs to arrive in a short window during the HLT
+processing
+- Even if the bug is hit, the VCPU scheduling is recovered as long as there is another
+interrupt arrival
+
+Signed-off-by: Sun Jian <jian.sun@intel.com>
+---
+ arch/x86/kvm/vmx/vmx.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index fcd8bcb7e0ea..d8be282740d2 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -3947,8 +3947,8 @@ static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+ 		 * interrupts in PIR, and sending a notification event
+ 		 * which has no effect is safe here.
+ 		 */
+-
+-		apic->send_IPI_mask(get_cpu_mask(vcpu->cpu), pi_vec);
++		if (vcpu != kvm_get_running_vcpu())
++			apic->send_IPI_mask(get_cpu_mask(vcpu->cpu), pi_vec);
+ 		return true;
+ 	}
+ #endif
+@@ -4001,8 +4001,7 @@ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ 	if (pi_test_and_set_on(&vmx->pi_desc))
+ 		return 0;
+ 
+-	if (vcpu != kvm_get_running_vcpu() &&
+-	    !kvm_vcpu_trigger_posted_interrupt(vcpu, false))
++	if (!kvm_vcpu_trigger_posted_interrupt(vcpu, false))
+ 		kvm_vcpu_kick(vcpu);
+ 
+ 	return 0;
+-- 
+2.25.1
+
