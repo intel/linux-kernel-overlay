@@ -60,18 +60,18 @@
 %global isrc 1
 
 %define pkgrelease  14
-%define rpmversion  5.13.0
+%define rpmversion  5.15.2
 %if %{?isrc}
-%define rcversion   rc6.
+%define rcversion   rt19.
 %endif
-%define embargoname 0616.iotg_next
+%define embargoname 1117.lts2021_rt
 
 %define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210616T015924Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}211117T171214Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -358,7 +358,7 @@
 %define initrd_prereq  dracut >= 027
 
 
-Name: iotg-next%{?variant}
+Name: lts2021_rt%{?variant}
 Group: System Environment/Kernel
 License: GPL-2.0 Distributable
 URL: http://www.kernel.org/
@@ -465,8 +465,8 @@ BuildRequires: asciidoc
 %endif
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global kernel_src_repo 'https://github.com/torvalds/linux.git'
-%global kernel_src_tag v5.13-rc6
+%global kernel_src_repo https://kernel.googlesource.com/pub/scm/linux/kernel/git/rt/linux-rt-devel
+%global kernel_src_tag v5.15.2-rt19
 # END OF PROJECT SPECIFIC MACROS
 
 
