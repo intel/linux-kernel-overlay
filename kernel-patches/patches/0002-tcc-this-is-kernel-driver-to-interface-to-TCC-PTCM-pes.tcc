@@ -1,7 +1,7 @@
-From 6381448f342accf6beba1c3ff2486a7a8da31c09 Mon Sep 17 00:00:00 2001
+From e6e3afcab094fabb49668158a16a8452b07552c2 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
-Subject: [PATCH 2/9] tcc: this is kernel driver to interface to TCC PTCM
+Subject: [PATCH 02/16] tcc: this is kernel driver to interface to TCC PTCM
  pesudo SRAM
 
 ACPI may include PTCT table. It PTCT is included, then there will
@@ -21,10 +21,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  create mode 100644 drivers/tcc/tcc_buffer.c
 
 diff --git a/drivers/Kconfig b/drivers/Kconfig
-index 47980c6b1945..fc073bccb034 100644
+index 0d399ddaa185..253f498284ee 100644
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -238,4 +238,6 @@ source "drivers/interconnect/Kconfig"
+@@ -236,4 +236,6 @@ source "drivers/interconnect/Kconfig"
  source "drivers/counter/Kconfig"
  
  source "drivers/most/Kconfig"
@@ -32,10 +32,10 @@ index 47980c6b1945..fc073bccb034 100644
 +source "drivers/tcc/Kconfig"
  endmenu
 diff --git a/drivers/Makefile b/drivers/Makefile
-index 5a6d613e868d..35e59104daa9 100644
+index be5d40ae1488..9e4fd41c5073 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -190,3 +190,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+@@ -188,3 +188,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
  obj-$(CONFIG_INTERCONNECT)	+= interconnect/
  obj-$(CONFIG_COUNTER)		+= counter/
  obj-$(CONFIG_MOST)		+= most/
@@ -769,5 +769,5 @@ index 000000000000..4d4e0557dddc
 +
 +MODULE_LICENSE("GPL v2");
 -- 
-2.27.0
+2.32.0
 
