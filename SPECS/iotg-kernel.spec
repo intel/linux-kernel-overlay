@@ -981,6 +981,10 @@ if [ -f localversion-rt ]; then
 fi
 %endif
 
+if [ -f localversion-rt ]; then
+   rm -f localversion-rt
+fi
+
 # remove the localversion-intel file since it screws around with
 # the uname output
 rm -f localversion-intel
