@@ -1,0 +1,188 @@
+From 372cf352dc1b9eba82eec32e392264a859773f68 Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Tue, 13 Oct 2020 17:07:42 -0700
+Subject: [PATCH 8/8] x86/cpu: Add hardware randomization option for Key
+ Locker's internal key
+
+Hardware can load Key Locker's internal key with its randomization. Add a
+new boot parameter option -- 'keylocker.use_hwrand' to use the mechanism.
+
+The option requires the backup mechanism to distribute the key. If a key is
+loaded with hardware randomization, it is (currently) the only way to copy
+the (unknown) key value to other CPUs.
+
+The hardware randomization is skipped when hardware does not provide the
+key backup.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Cc: x86@kernel.org
+Cc: linux-doc@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ .../admin-guide/kernel-parameters.txt         |  4 ++
+ arch/x86/include/asm/keylocker.h              |  2 +-
+ arch/x86/kernel/cpu/common.c                  | 16 +++++++-
+ arch/x86/kernel/keylocker.c                   | 39 ++++++++++++++++---
+ 4 files changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index c7b868ceec94..04806aada4d7 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2128,6 +2128,10 @@
+ 			parameter KASAN will print report only for the first
+ 			invalid access.
+ 
++	keylocker.use_hwrand
++			[x86] Use on-chip hardware random number generator for
++			the CPU internal key.
++
+ 	keepinitrd	[HW,ARM]
+ 
+ 	kernelcore=	[KNL,X86,IA-64,PPC]
+diff --git a/arch/x86/include/asm/keylocker.h b/arch/x86/include/asm/keylocker.h
+index 0f83fcddf9b7..77df64fb0dd6 100644
+--- a/arch/x86/include/asm/keylocker.h
++++ b/arch/x86/include/asm/keylocker.h
+@@ -30,7 +30,7 @@ void backup_iwkey(void);
+ bool load_iwkey(void);
+ bool copy_iwkey(void);
+ 
+-void make_iwkeydata(void);
++void make_iwkeydata(bool use_hwrandom);
+ #ifdef CONFIG_X86_KL
+ void invalidate_iwkeydata(void);
+ #else
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 2a358755674e..034ffb5a5d6b 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -479,6 +479,19 @@ static __init int x86_nofsgsbase_setup(char *arg)
+ }
+ __setup("nofsgsbase", x86_nofsgsbase_setup);
+ 
++static bool use_hwrand_iwkey;
++
++static __init int setup_hwrand_iwkey(char *arg)
++{
++	/* Require an exact match without trailing characters. */
++	if (strlen(arg))
++		return 0;
++
++	use_hwrand_iwkey = true;
++	return 1;
++}
++__setup("keylocker.use_hwrand", setup_hwrand_iwkey);
++
+ static __always_inline void setup_keylocker(struct cpuinfo_x86 *c)
+ {
+ 	if (!cpu_feature_enabled(X86_FEATURE_KL) ||
+@@ -493,8 +506,7 @@ static __always_inline void setup_keylocker(struct cpuinfo_x86 *c)
+ 		if (!check_keylocker_readiness())
+ 			goto disable_keylocker;
+ 
+-		make_iwkeydata();
+-
++		make_iwkeydata(use_hwrand_iwkey);
+ 		iwkeyloaded = load_iwkey();
+ 		if (!iwkeyloaded) {
+ 			pr_err("x86/keylocker: Fail to load internal key\n");
+diff --git a/arch/x86/kernel/keylocker.c b/arch/x86/kernel/keylocker.c
+index 07b07d66dfcf..7adb3d5efc94 100644
+--- a/arch/x86/kernel/keylocker.c
++++ b/arch/x86/kernel/keylocker.c
+@@ -13,6 +13,7 @@
+ #include <asm/fpu/types.h>
+ 
+ static bool iwkeybackup_available;
++static bool iwkey_hwrand_available;
+ 
+ bool check_keylocker_readiness(void)
+ {
+@@ -33,6 +34,8 @@ bool check_keylocker_readiness(void)
+ 		pr_debug("x86/keylocker: no key backup support with possible S3/4\n");
+ 		return false;
+ 	}
++
++	iwkey_hwrand_available = (ecx & KL_CPUID_ECX_RAND);
+ 	return true;
+ }
+ 
+@@ -41,16 +44,24 @@ bool check_keylocker_readiness(void)
+ 
+ static struct iwkey {
+ 	bool valid;
++	bool hwrand;
+ 	struct reg_128_bit value[LOADIWKEY_NUM_OPERANDS];
+ } iwkeydata;
+ 
+-void make_iwkeydata(void)
++void make_iwkeydata(bool use_hwrand)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < LOADIWKEY_NUM_OPERANDS; i++)
+ 		get_random_bytes(&iwkeydata.value[i], sizeof(struct reg_128_bit));
+ 
++	if (use_hwrand && iwkey_hwrand_available && iwkeybackup_available) {
++		iwkeydata.hwrand = true;
++	} else {
++		if (use_hwrand)
++			pr_warn("x86/keylocker: hardware random key not fully supported\n");
++		iwkeydata.hwrand = false;
++	}
+ 	iwkeydata.valid = true;
+ }
+ 
+@@ -63,12 +74,16 @@ void invalidate_iwkeydata(void)
+ }
+ 
+ #define IWKEY_SW_PROVIDED	0
++#define IWKEY_HW_RANDOM		BIT(1)
++
++#define LOADIWKEY_HWRANDOM_RETRY	10
+ 
+ bool load_iwkey(void)
+ {
+-	u32 keysource = IWKEY_SW_PROVIDED;
+ 	struct reg_128_bit zeros = { 0 };
++	unsigned int retry;
+ 	bool err = true;
++	u32 keysource;
+ 
+ 	if (!iwkeydata.valid)
+ 		return false;
+@@ -76,13 +91,27 @@ bool load_iwkey(void)
+ 	asm ("movdqu %0, %%xmm0; movdqu %1, %%xmm1; movdqu %2, %%xmm2;"
+ 	     :: "m"(iwkeydata.value[0]), "m"(iwkeydata.value[1]), "m"(iwkeydata.value[2]));
+ 
+-	asm volatile (LOADIWKEY CC_SET(z)
+-		      : CC_OUT(z) (err)
+-		      : "a"(keysource));
++	if (iwkeydata.hwrand) {
++		keysource = IWKEY_HW_RANDOM;
++		retry = LOADIWKEY_HWRANDOM_RETRY;
++	} else {
++		keysource = IWKEY_SW_PROVIDED;
++		retry = 0;
++	}
++
++	do {
++		asm volatile (LOADIWKEY CC_SET(z)
++			      : CC_OUT(z) (err)
++			      : "a"(keysource));
++		retry--;
++	} while (err && retry > 0);
+ 
+ 	asm ("movdqu %0, %%xmm0; movdqu %0, %%xmm1; movdqu %0, %%xmm2;"
+ 	     :: "m"(zeros));
+ 
++	if (iwkeydata.hwrand)
++		invalidate_iwkeydata();
++
+ 	return err ? false : true;
+ }
+ 
+-- 
+2.17.1
+

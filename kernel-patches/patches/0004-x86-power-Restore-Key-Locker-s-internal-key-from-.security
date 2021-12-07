@@ -1,0 +1,248 @@
+From f8928662d77653e9fdbd10c84f4be00641cba84f Mon Sep 17 00:00:00 2001
+From: "Chang S. Bae" <chang.seok.bae@intel.com>
+Date: Wed, 23 Oct 2019 13:38:23 -0700
+Subject: [PATCH 4/8] x86/power: Restore Key Locker's internal key from Sleep
+ or Hibernate state
+
+When system state switches to S3/4 states, the internal key gets reset. The
+key needs to be stored in a safe place ahead of those power state changes
+so that restored back later.
+
+Key Locker provides a mechanism to backup the internal key in non-volatile
+memory. The kernel requests a backup at boot-time and copy it later when
+the system wakes up.
+
+The kernel needs to check CPUID if hardware supports the backup, before
+enabling Key Locker on a system with S3/4 states.
+
+When the key cannot be restored, disable the feature. Other options, such
+as a new IWKey or system shutdown, are considered improper.
+
+Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+Cc: x86@kernel.org
+Cc: linux-kernel@vger.kernel.org
+Cc: linux-pm@vger.kernel.org
+---
+ arch/x86/include/asm/keylocker.h | 11 ++++++++
+ arch/x86/kernel/cpu/common.c     | 24 ++++++++++++-----
+ arch/x86/kernel/keylocker.c      | 46 ++++++++++++++++++++++++++++++++
+ arch/x86/power/cpu.c             | 35 ++++++++++++++++++++++++
+ 4 files changed, 109 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/include/asm/keylocker.h b/arch/x86/include/asm/keylocker.h
+index b1d185982467..0f83fcddf9b7 100644
+--- a/arch/x86/include/asm/keylocker.h
++++ b/arch/x86/include/asm/keylocker.h
+@@ -6,6 +6,7 @@
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/bits.h>
++
+ #include <asm/msr.h>
+ 
+ #define KL_CPUID                0x019
+@@ -17,7 +18,17 @@
+ 
+ bool check_keylocker_readiness(void);
+ 
++static inline u64 read_iwkeybackup_status(void)
++{
++	u64 status;
++
++	rdmsrl(MSR_IA32_IWKEYBACKUP_STATUS, status);
++	return status;
++}
++
++void backup_iwkey(void);
+ bool load_iwkey(void);
++bool copy_iwkey(void);
+ 
+ void make_iwkeydata(void);
+ #ifdef CONFIG_X86_KL
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 1804f21dc2c8..38e72620e241 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -464,30 +464,40 @@ __setup("nofsgsbase", x86_nofsgsbase_setup);
+ 
+ static __always_inline void setup_keylocker(struct cpuinfo_x86 *c)
+ {
+-	bool iwkeyloaded;
+-
+ 	if (!cpu_feature_enabled(X86_FEATURE_KL) ||
+ 	    !cpu_has(c, X86_FEATURE_KL))
+ 		goto out;
+ 
+ 	if (c == &boot_cpu_data) {
++		bool iwkeyloaded;
++
+ 		cr4_set_bits(X86_CR4_KL);
+ 
+ 		if (!check_keylocker_readiness())
+ 			goto disable_keylocker;
+ 
+ 		make_iwkeydata();
++
++		iwkeyloaded = load_iwkey();
++		if (!iwkeyloaded) {
++			pr_err("x86/keylocker: Fail to load internal key\n");
++			goto disable_keylocker;
++		}
++		backup_iwkey();
+ 	} else {
++		bool iwkeycopied;
++
+ 		if (!boot_cpu_has(X86_FEATURE_KL))
+ 			goto disable_keylocker;
+ 
+ 		cr4_set_bits(X86_CR4_KL);
+-	}
+ 
+-	iwkeyloaded = load_iwkey();
+-	if (!iwkeyloaded) {
+-		pr_err_once("x86/keylocker: Fail to load internal key\n");
+-		goto disable_keylocker;
++		/* NB: When system wakes up, this path recovers the internal key. */
++		iwkeycopied = copy_iwkey();
++		if (!iwkeycopied) {
++			pr_err_once("x86/keylocker: Fail to copy internal key\n");
++			goto disable_keylocker;
++		}
+ 	}
+ 
+ 	pr_info_once("x86/keylocker: Activated\n");
+diff --git a/arch/x86/kernel/keylocker.c b/arch/x86/kernel/keylocker.c
+index 1513fd488ccb..07b07d66dfcf 100644
+--- a/arch/x86/kernel/keylocker.c
++++ b/arch/x86/kernel/keylocker.c
+@@ -6,10 +6,14 @@
+ 
+ #include <linux/random.h>
+ #include <linux/bits.h>
++#include <linux/acpi.h>
++#include <linux/delay.h>
+ 
+ #include <asm/keylocker.h>
+ #include <asm/fpu/types.h>
+ 
++static bool iwkeybackup_available;
++
+ bool check_keylocker_readiness(void)
+ {
+ 	u32 eax, ebx, ecx, edx;
+@@ -21,6 +25,14 @@ bool check_keylocker_readiness(void)
+ 		return false;
+ 	}
+ 
++	iwkeybackup_available = (ebx & KL_CPUID_EBX_BACKUP);
++	/* IWKey backup is essential with S3/4 states */
++	if (!iwkeybackup_available &&
++	    (acpi_sleep_state_supported(ACPI_STATE_S3) ||
++	     acpi_sleep_state_supported(ACPI_STATE_S4))) {
++		pr_debug("x86/keylocker: no key backup support with possible S3/4\n");
++		return false;
++	}
+ 	return true;
+ }
+ 
+@@ -73,3 +85,37 @@ bool load_iwkey(void)
+ 
+ 	return err ? false : true;
+ }
++
++void backup_iwkey(void)
++{
++	if (iwkeybackup_available)
++		wrmsrl(MSR_IA32_COPY_LOCAL_TO_PLATFORM, 1);
++}
++
++#define IWKEY_RESTORE_RETRY	1
++
++bool copy_iwkey(void)
++{
++	bool copied = false;
++	int i;
++
++	/* Use valid key data when available */
++	if (iwkeydata.valid)
++		return load_iwkey();
++
++	if (!iwkeybackup_available)
++		return copied;
++
++	wrmsrl(MSR_IA32_COPY_PLATFORM_TO_LOCAL, 1);
++
++	for (i = 0; (i <= IWKEY_RESTORE_RETRY) && !copied; i++) {
++		u64 status;
++
++		if (i)
++			udelay(1);
++		rdmsrl(MSR_IA32_COPY_STATUS, status);
++		copied = status & BIT(0) ? true : false;
++	}
++
++	return copied;
++}
+diff --git a/arch/x86/power/cpu.c b/arch/x86/power/cpu.c
+index db1378c6ff26..ca86c82ab61a 100644
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@ -25,6 +25,7 @@
+ #include <asm/cpu.h>
+ #include <asm/mmu_context.h>
+ #include <asm/cpu_device_id.h>
++#include <asm/keylocker.h>
+ 
+ #ifdef CONFIG_X86_32
+ __visible unsigned long saved_context_ebx;
+@@ -57,6 +58,39 @@ static void msr_restore_context(struct saved_context *ctxt)
+ 	}
+ }
+ 
++/*
++ * The boot CPU executes this function, while other CPUs restore the key
++ * through the setup path in setup_keylocker().
++ */
++static void restore_keylocker(void)
++{
++	u64 iwkeybackup_status;
++	bool iwkeycopied;
++
++	if (!cpu_feature_enabled(X86_FEATURE_KL) ||
++	    !boot_cpu_has(X86_FEATURE_KL))
++		return;
++
++	iwkeybackup_status = read_iwkeybackup_status();
++	if (!(iwkeybackup_status & BIT(0))) {
++		pr_err("x86/keylocker: internal key restoration failed with %s\n",
++		       (iwkeybackup_status & BIT(2)) ? "read error" : "invalid status");
++		WARN_ON(1);
++		goto disable_keylocker;
++	}
++
++	iwkeycopied = copy_iwkey();
++	if (iwkeycopied)
++		return;
++
++	pr_err("x86/keylocker: internal key copy failure\n");
++
++disable_keylocker:
++	pr_info_once("x86/keylocker: Disabled with internal key restoration failure\n");
++	setup_clear_cpu_cap(X86_FEATURE_KL);
++	cr4_clear_bits(X86_CR4_KL);
++}
++
+ /**
+  *	__save_processor_state - save CPU registers before creating a
+  *		hibernation image and before restoring the memory state from it
+@@ -265,6 +299,7 @@ static void notrace __restore_processor_state(struct saved_context *ctxt)
+ 	mtrr_bp_restore();
+ 	perf_restore_debug_store();
+ 	msr_restore_context(ctxt);
++	restore_keylocker();
+ 
+ 	c = &cpu_data(smp_processor_id());
+ 	if (cpu_has(c, X86_FEATURE_MSR_IA32_FEAT_CTL))
+-- 
+2.17.1
+
