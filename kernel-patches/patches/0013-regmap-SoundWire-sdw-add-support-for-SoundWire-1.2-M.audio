@@ -1,0 +1,266 @@
+From a97641c22ab69d6a55f4795a164796877ba17bca Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Wed, 4 Nov 2020 01:22:23 +0800
+Subject: [PATCH 13/16] regmap/SoundWire: sdw: add support for SoundWire 1.2
+ MBQ
+
+The SoundWire 1.1 specification only allowed for reads and writes of
+bytes. The SoundWire 1.2 specification adds a new capability to
+transfer "Multi-Byte Quantities" (MBQ) across the bus. The transfers
+still happens one-byte-at-a-time, but the update is atomic.
+
+For example when writing a 16-bit volume, the first byte transferred
+is only taken into account when the second byte is successfully
+transferred.
+
+The mechanism is symmetrical for read and writes:
+- On a read, the address of the last byte to be read is modified by
+setting the MBQ bit
+- On a write, the address of all but the last byte to be written are
+modified by setting the MBQ bit. The address for the last byte relies
+on the MBQ bit being cleared.
+
+The current definitions for MBQ-based controls in the SDCA draft
+standard are limited to 16 bits for volumes, so for now this is the
+only supported format. An update will be provided if and when support
+for 24-bit and 32-bit values is specified by the SDCA standard.
+
+One possible objection is that this code could have been handled with
+regmap-sdw.c. However this is a new spec addition not handled by every
+SoundWire 1.1 and non-SDCA device, so there's no reason to load code
+that will never be used.
+
+Also in practice it's extremely unlikely that CONFIG_REGMAP would not
+be selected with CONFIG_REGMAP_MBQ selected. However there's no
+functional dependency between the two modules so they can be selected
+separately.
+
+Reviewed-by: Rander Wang <rander.wang@linux.intel.com>
+Reviewed-by: Guennadi Liakhovetski <guennadi.liakhovetski@linux.intel.com>
+Reviewed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Signed-off-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Reviewed-by: Vinod Koul <vkoul@kernel.org>
+Link: https://lore.kernel.org/r/20201103172226.4278-3-yung-chuan.liao@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ drivers/base/regmap/Kconfig          |   6 +-
+ drivers/base/regmap/Makefile         |   1 +
+ drivers/base/regmap/regmap-sdw-mbq.c | 101 +++++++++++++++++++++++++++
+ include/linux/regmap.h               |  35 ++++++++++
+ 4 files changed, 142 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/base/regmap/regmap-sdw-mbq.c
+
+diff --git a/drivers/base/regmap/Kconfig b/drivers/base/regmap/Kconfig
+index bcb90d8c3960..50b1e2d06a25 100644
+--- a/drivers/base/regmap/Kconfig
++++ b/drivers/base/regmap/Kconfig
+@@ -4,7 +4,7 @@
+ # subsystems should select the appropriate symbols.
+ 
+ config REGMAP
+-	default y if (REGMAP_I2C || REGMAP_SPI || REGMAP_SPMI || REGMAP_W1 || REGMAP_AC97 || REGMAP_MMIO || REGMAP_IRQ || REGMAP_SOUNDWIRE || REGMAP_SCCB || REGMAP_I3C || REGMAP_SPI_AVMM)
++	default y if (REGMAP_I2C || REGMAP_SPI || REGMAP_SPMI || REGMAP_W1 || REGMAP_AC97 || REGMAP_MMIO || REGMAP_IRQ || REGMAP_SOUNDWIRE || REGMAP_SOUNDWIRE_MBQ || REGMAP_SCCB || REGMAP_I3C || REGMAP_SPI_AVMM)
+ 	select IRQ_DOMAIN if REGMAP_IRQ
+ 	bool
+ 
+@@ -46,6 +46,10 @@ config REGMAP_SOUNDWIRE
+ 	tristate
+ 	depends on SOUNDWIRE
+ 
++config REGMAP_SOUNDWIRE_MBQ
++	tristate
++	depends on SOUNDWIRE
++
+ config REGMAP_SCCB
+ 	tristate
+ 	depends on I2C
+diff --git a/drivers/base/regmap/Makefile b/drivers/base/regmap/Makefile
+index ac1b69ee4051..33f63adb5b3d 100644
+--- a/drivers/base/regmap/Makefile
++++ b/drivers/base/regmap/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_REGMAP_MMIO) += regmap-mmio.o
+ obj-$(CONFIG_REGMAP_IRQ) += regmap-irq.o
+ obj-$(CONFIG_REGMAP_W1) += regmap-w1.o
+ obj-$(CONFIG_REGMAP_SOUNDWIRE) += regmap-sdw.o
++obj-$(CONFIG_REGMAP_SOUNDWIRE_MBQ) += regmap-sdw-mbq.o
+ obj-$(CONFIG_REGMAP_SCCB) += regmap-sccb.o
+ obj-$(CONFIG_REGMAP_I3C) += regmap-i3c.o
+ obj-$(CONFIG_REGMAP_SPI_AVMM) += regmap-spi-avmm.o
+diff --git a/drivers/base/regmap/regmap-sdw-mbq.c b/drivers/base/regmap/regmap-sdw-mbq.c
+new file mode 100644
+index 000000000000..8ce30650b97c
+--- /dev/null
++++ b/drivers/base/regmap/regmap-sdw-mbq.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright(c) 2020 Intel Corporation.
++
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/soundwire/sdw.h>
++#include <linux/soundwire/sdw_registers.h>
++#include "internal.h"
++
++static int regmap_sdw_mbq_write(void *context, unsigned int reg, unsigned int val)
++{
++	struct device *dev = context;
++	struct sdw_slave *slave = dev_to_sdw_dev(dev);
++	int ret;
++
++	ret = sdw_write(slave, SDW_SDCA_MBQ_CTL(reg), (val >> 8) & 0xff);
++	if (ret < 0)
++		return ret;
++
++	return sdw_write(slave, reg, val & 0xff);
++}
++
++static int regmap_sdw_mbq_read(void *context, unsigned int reg, unsigned int *val)
++{
++	struct device *dev = context;
++	struct sdw_slave *slave = dev_to_sdw_dev(dev);
++	int read0;
++	int read1;
++
++	read0 = sdw_read(slave, reg);
++	if (read0 < 0)
++		return read0;
++
++	read1 = sdw_read(slave, SDW_SDCA_MBQ_CTL(reg));
++	if (read1 < 0)
++		return read1;
++
++	*val = (read1 << 8) | read0;
++
++	return 0;
++}
++
++static struct regmap_bus regmap_sdw_mbq = {
++	.reg_read = regmap_sdw_mbq_read,
++	.reg_write = regmap_sdw_mbq_write,
++	.reg_format_endian_default = REGMAP_ENDIAN_LITTLE,
++	.val_format_endian_default = REGMAP_ENDIAN_LITTLE,
++};
++
++static int regmap_sdw_mbq_config_check(const struct regmap_config *config)
++{
++	/* MBQ-based controls are only 16-bits for now */
++	if (config->val_bits != 16)
++		return -ENOTSUPP;
++
++	/* Registers are 32 bits wide */
++	if (config->reg_bits != 32)
++		return -ENOTSUPP;
++
++	if (config->pad_bits != 0)
++		return -ENOTSUPP;
++
++	return 0;
++}
++
++struct regmap *__regmap_init_sdw_mbq(struct sdw_slave *sdw,
++				     const struct regmap_config *config,
++				     struct lock_class_key *lock_key,
++				     const char *lock_name)
++{
++	int ret;
++
++	ret = regmap_sdw_mbq_config_check(config);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return __regmap_init(&sdw->dev, &regmap_sdw_mbq,
++			&sdw->dev, config, lock_key, lock_name);
++}
++EXPORT_SYMBOL_GPL(__regmap_init_sdw_mbq);
++
++struct regmap *__devm_regmap_init_sdw_mbq(struct sdw_slave *sdw,
++					  const struct regmap_config *config,
++					  struct lock_class_key *lock_key,
++					  const char *lock_name)
++{
++	int ret;
++
++	ret = regmap_sdw_mbq_config_check(config);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return __devm_regmap_init(&sdw->dev, &regmap_sdw_mbq,
++			&sdw->dev, config, lock_key, lock_name);
++}
++EXPORT_SYMBOL_GPL(__devm_regmap_init_sdw_mbq);
++
++MODULE_DESCRIPTION("Regmap SoundWire MBQ Module");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/linux/regmap.h b/include/linux/regmap.h
+index e7834d98207f..a652d1474d6a 100644
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@ -570,6 +570,10 @@ struct regmap *__regmap_init_sdw(struct sdw_slave *sdw,
+ 				 const struct regmap_config *config,
+ 				 struct lock_class_key *lock_key,
+ 				 const char *lock_name);
++struct regmap *__regmap_init_sdw_mbq(struct sdw_slave *sdw,
++				     const struct regmap_config *config,
++				     struct lock_class_key *lock_key,
++				     const char *lock_name);
+ struct regmap *__regmap_init_spi_avmm(struct spi_device *spi,
+ 				      const struct regmap_config *config,
+ 				      struct lock_class_key *lock_key,
+@@ -619,6 +623,10 @@ struct regmap *__devm_regmap_init_sdw(struct sdw_slave *sdw,
+ 				 const struct regmap_config *config,
+ 				 struct lock_class_key *lock_key,
+ 				 const char *lock_name);
++struct regmap *__devm_regmap_init_sdw_mbq(struct sdw_slave *sdw,
++					  const struct regmap_config *config,
++					  struct lock_class_key *lock_key,
++					  const char *lock_name);
+ struct regmap *__devm_regmap_init_slimbus(struct slim_device *slimbus,
+ 				 const struct regmap_config *config,
+ 				 struct lock_class_key *lock_key,
+@@ -817,6 +825,19 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
+ 	__regmap_lockdep_wrapper(__regmap_init_sdw, #config,		\
+ 				sdw, config)
+ 
++/**
++ * regmap_init_sdw_mbq() - Initialise register map
++ *
++ * @sdw: Device that will be interacted with
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer to
++ * a struct regmap.
++ */
++#define regmap_init_sdw_mbq(sdw, config)					\
++	__regmap_lockdep_wrapper(__regmap_init_sdw_mbq, #config,		\
++				sdw, config)
++
+ /**
+  * regmap_init_spi_avmm() - Initialize register map for Intel SPI Slave
+  * to AVMM Bus Bridge
+@@ -989,6 +1010,20 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
+ 	__regmap_lockdep_wrapper(__devm_regmap_init_sdw, #config,	\
+ 				sdw, config)
+ 
++/**
++ * devm_regmap_init_sdw_mbq() - Initialise managed register map
++ *
++ * @sdw: Device that will be interacted with
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer
++ * to a struct regmap. The regmap will be automatically freed by the
++ * device management code.
++ */
++#define devm_regmap_init_sdw_mbq(sdw, config)			\
++	__regmap_lockdep_wrapper(__devm_regmap_init_sdw_mbq, #config,   \
++				sdw, config)
++
+ /**
+  * devm_regmap_init_slimbus() - Initialise managed register map
+  *
+-- 
+2.17.1
+
