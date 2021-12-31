@@ -1,0 +1,179 @@
+From d8ccc9e51c106ca54632d57bf89424c28585d804 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 30 Sep 2020 17:41:52 -0700
+Subject: [PATCH 29/41] DEBUG: thermal: intel: hfi: Count the number of HFI
+ events
+
+Add a per-CPU variable to count the number of thermal interrupts due to
+HFI updates. Also, count the number of processed HFI updates a result of
+HFI interrupts.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ drivers/thermal/intel/intel_hfi.c | 83 ++++++++++++++++++++++++++++---
+ 1 file changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index c82b76089441..13d61633710d 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -172,6 +172,23 @@ static DEFINE_MUTEX(hfi_lock);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 
++/* Received package-level interrupts that are not HFI events. */
++static DEFINE_PER_CPU(u64, hfi_intr_not_hfi);
++/* Received package-level interrupts when per-CPU data is not initialized. */
++static DEFINE_PER_CPU(u64, hfi_intr_not_initialized);
++/* Received package-level interrupts that are HFI events. */
++static DEFINE_PER_CPU(u64, hfi_intr_received);
++/* HFI events for which new delayed work was scheduled */
++static DEFINE_PER_CPU(u64, hfi_intr_processed);
++/* HFI events which delayed work was scheduled while there was previous work pending. */
++static DEFINE_PER_CPU(u64, hfi_intr_skipped);
++/* HFI events during which the event_lock was held by another CPU. */
++static DEFINE_PER_CPU(u64, hfi_intr_ignored);
++/* HFI events that did not have a newer timestamp */
++static DEFINE_PER_CPU(u64, hfi_intr_bad_ts);
++
++static u64 hfi_updates, hfi_updates_recovered;
++
+ static int hfi_features_show(struct seq_file *s, void *unused)
+ {
+ 	union cpuid6_edx edx;
+@@ -240,9 +257,18 @@ static int hfi_state_show(struct seq_file *s, void *unused)
+ 	seq_printf(s, "CPUs:\t\t%*pbl\n", cpumask_pr_args(hfi_instance->cpus));
+ 	seq_printf(s, "Timestamp:\t%lld\n", *hfi_instance->timestamp);
+ 	seq_printf(s, "\nPer-CPU data:\n");
+-	seq_printf(s, "CPU\tAddress\n");
++	seq_printf(s, "CPU\tInstance data at:\t\t\t\t\tHFI interrupts:\n");
++	seq_printf(s, "\t\t\t    received | not hfi | not initialized | processed | skipped | ignored | bad timestamp\n");
+ 	for_each_cpu(i, hfi_instance->cpus) {
+-		seq_printf(s, "%4d\t%p\n", i, per_cpu(hfi_cpu_info, i).hfi_instance);
++		seq_printf(s, "%4d\t%p", i, per_cpu(hfi_cpu_info, i).hfi_instance);
++		seq_printf(s, "%12llu%10llu%18llu%12llu%10llu\t%8llu\t%8llu\n",
++			   per_cpu(hfi_intr_received, i),
++			   per_cpu(hfi_intr_not_hfi, i),
++			   per_cpu(hfi_intr_not_initialized, i),
++			   per_cpu(hfi_intr_processed, i),
++			   per_cpu(hfi_intr_skipped, i),
++			   per_cpu(hfi_intr_ignored, i),
++			   per_cpu(hfi_intr_bad_ts, i));
+ 	}
+ 
+ 	/* Dump the performance capability change indication */
+@@ -266,6 +292,11 @@ static int hfi_state_show(struct seq_file *s, void *unused)
+ 		hfi_hdr++;
+ 	}
+ 
++	/* Overall HFI updates in the system */
++	seq_printf(s, "\n\nHFI table updates:\n");
++	seq_printf(s, "\tscheduled: %llu\t recovered: %llu\n",
++		   hfi_updates, hfi_updates_recovered);
++
+ 	/* Dump the HFI table */
+ 	seq_printf(s, "\nHFI table:\n");
+ 	seq_printf(s, "CPU\tIndex");
+@@ -399,6 +430,12 @@ static void hfi_update_work_fn(struct work_struct *work)
+ 	if (!hfi_instance)
+ 		return;
+ 
++#ifdef CONFIG_DEBUG_FS
++	mutex_lock(&hfi_lock);
++	hfi_updates++;
++	mutex_unlock(&hfi_lock);
++#endif
++
+ 	update_capabilities(hfi_instance);
+ }
+ 
+@@ -409,12 +446,24 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
+ 	struct hfi_cpu_info *info;
+ 	u64 new_timestamp;
+ 
+-	if (!pkg_therm_status_msr_val)
++#ifdef CONFIG_DEBUG_FS
++	per_cpu(hfi_intr_received, cpu)++;
++#endif
++
++	if (!pkg_therm_status_msr_val) {
++#ifdef CONFIG_DEBUG_FS
++		per_cpu(hfi_intr_not_hfi, cpu)++;
++#endif
+ 		return;
++	}
+ 
+ 	info = &per_cpu(hfi_cpu_info, cpu);
+-	if (!info)
++	if (!info) {
++#ifdef CONFIG_DEBUG_FS
++		per_cpu(hfi_intr_not_initialized, cpu)++;
++#endif
+ 		return;
++	}
+ 
+ 	/*
+ 	 * It is possible that we get an HFI thermal interrupt on this CPU
+@@ -423,21 +472,31 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
+ 	 * interrupt and is fully initialized.
+ 	 */
+ 	hfi_instance = info->hfi_instance;
+-	if (!hfi_instance)
++	if (!hfi_instance) {
++#ifdef CONFIG_DEBUG_FS
++		per_cpu(hfi_intr_not_initialized, cpu)++;
++#endif
+ 		return;
+-
++	}
+ 	/*
+ 	 * On most systems, all CPUs in the package receive a package-level
+ 	 * thermal interrupt when there is an HFI update. It is sufficient to
+ 	 * let a single CPU to acknowledge the update and schedule work to
+ 	 * process it. The remaining CPUs can resume their work.
+ 	 */
+-	if (!raw_spin_trylock(&hfi_instance->event_lock))
++	if (!raw_spin_trylock(&hfi_instance->event_lock)) {
++#ifdef CONFIG_DEBUG_FS
++		per_cpu(hfi_intr_ignored, cpu)++;
++#endif
+ 		return;
++	}
+ 
+ 	/* Skip duplicated updates. */
+ 	new_timestamp = *(u64 *)hfi_instance->hw_table;
+ 	if (*hfi_instance->timestamp == new_timestamp) {
++#ifdef CONFIG_DEBUG_FS
++		per_cpu(hfi_intr_bad_ts, cpu)++;
++#endif
+ 		raw_spin_unlock(&hfi_instance->event_lock);
+ 		return;
+ 	}
+@@ -462,7 +521,14 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
+ 				    ~PACKAGE_THERM_STATUS_HFI_UPDATED;
+ 	wrmsrl(MSR_IA32_PACKAGE_THERM_STATUS, pkg_therm_status_msr_val);
+ 
++#ifdef CONFIG_DEBUG_FS
++	if (schedule_delayed_work(&hfi_instance->update_work, HFI_UPDATE_INTERVAL))
++		per_cpu(hfi_intr_processed, cpu)++;
++	else
++		per_cpu(hfi_intr_skipped, cpu)++;
++#else
+ 	schedule_delayed_work(&hfi_instance->update_work, HFI_UPDATE_INTERVAL);
++#endif
+ }
+ 
+ static void init_hfi_cpu_index(struct hfi_cpu_info *info)
+@@ -575,6 +641,9 @@ void intel_hfi_online(unsigned int cpu)
+ 
+ 			schedule_delayed_work(&hfi_instance->update_work,
+ 					      HFI_UPDATE_INTERVAL);
++#ifdef CONFIG_DEBUG_FS
++			hfi_updates_recovered++;
++#endif
+ 
+ 			mutex_unlock(&hfi_lock);
+ 			return;
+-- 
+2.32.0
+

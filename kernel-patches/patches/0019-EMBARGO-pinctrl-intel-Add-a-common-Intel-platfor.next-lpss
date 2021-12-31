@@ -1,0 +1,225 @@
+From 70d90bc9a4d33ab3287bbdafc718fad9b09b6601 Mon Sep 17 00:00:00 2001
+From: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Date: Thu, 19 Aug 2021 20:00:45 +0300
+Subject: [PATCH 19/20] EMBARGO: pinctrl: intel: Add a common Intel platform
+ pinctrl driver
+
+New generations of Intel platforms will provide better description
+of the pin control devices in the ACPI tables. Hence, we may provide
+a common platform pinctrl driver for all of them.
+
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+---
+ drivers/pinctrl/intel/Kconfig                 |   8 +
+ drivers/pinctrl/intel/Makefile                |   1 +
+ .../pinctrl/intel/pinctrl-intel-platform.c    | 167 ++++++++++++++++++
+ 3 files changed, 176 insertions(+)
+ create mode 100644 drivers/pinctrl/intel/pinctrl-intel-platform.c
+
+diff --git a/drivers/pinctrl/intel/Kconfig b/drivers/pinctrl/intel/Kconfig
+index 4ea61dd3c37a..ac650d3c9463 100644
+--- a/drivers/pinctrl/intel/Kconfig
++++ b/drivers/pinctrl/intel/Kconfig
+@@ -55,6 +55,14 @@ config PINCTRL_INTEL_CORE
+ 	select GPIOLIB
+ 	select GPIOLIB_IRQCHIP
+ 
++config PINCTRL_INTEL_PLATFORM
++	tristate "Intel pinctrl and GPIO platform driver"
++	depends on ACPI
++	select PINCTRL_INTEL_CORE
++	help
++	  This pinctrl driver provides an interface that allows configuring
++	  of Intel PCH pins and using them as GPIOs.
++
+ config PINCTRL_ALDERLAKE
+ 	tristate "Intel Alder Lake pinctrl and GPIO driver"
+ 	depends on ACPI
+diff --git a/drivers/pinctrl/intel/Makefile b/drivers/pinctrl/intel/Makefile
+index 972264f26423..4f1795752eec 100644
+--- a/drivers/pinctrl/intel/Makefile
++++ b/drivers/pinctrl/intel/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_PINCTRL_CHERRYVIEW)	+= pinctrl-cherryview.o
+ obj-$(CONFIG_PINCTRL_LYNXPOINT)		+= pinctrl-lynxpoint.o
+ obj-$(CONFIG_PINCTRL_MERRIFIELD)	+= pinctrl-merrifield.o
+ obj-$(CONFIG_PINCTRL_INTEL_CORE)	+= pinctrl-intel-core.o
++obj-$(CONFIG_PINCTRL_INTEL_PLATFORM)	+= pinctrl-intel-platform.o
+ obj-$(CONFIG_PINCTRL_ALDERLAKE)		+= pinctrl-alderlake.o
+ obj-$(CONFIG_PINCTRL_ALDERLAKE)		+= pinctrl-alderlake-s.o
+ obj-$(CONFIG_PINCTRL_BROXTON)		+= pinctrl-broxton.o
+diff --git a/drivers/pinctrl/intel/pinctrl-intel-platform.c b/drivers/pinctrl/intel/pinctrl-intel-platform.c
+new file mode 100644
+index 000000000000..d228ec1e3ba4
+--- /dev/null
++++ b/drivers/pinctrl/intel/pinctrl-intel-platform.c
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel PCH pinctrl/GPIO driver
++ *
++ * Copyright (C) 2021, Intel Corporation
++ * Author: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
++ */
++
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++
++#include <linux/pinctrl/pinctrl.h>
++
++#include "pinctrl-intel.h"
++
++struct intel_platform_pins {
++	struct pinctrl_pin_desc *pins;
++	size_t npins;
++};
++
++static int intel_platform_pinctrl_get_community(struct platform_device *pdev,
++						struct intel_community *community,
++						struct intel_platform_pins *pins)
++{
++	struct device *dev = &pdev->dev;
++	struct fwnode_handle *child;
++	struct intel_padgroup *gpps;
++	unsigned int group;
++	size_t ngpps;
++	u32 value;
++	int ret;
++
++	ret = device_property_read_u32(dev, "intc-gpio-pad-ownership-offset", &value);
++	if (ret)
++		return ret;
++	community->padown_offset = value;
++
++	ret = device_property_read_u32(dev, "intc-gpio-pad-configuration-lock-offset", &value);
++	if (ret)
++		return ret;
++	community->padcfglock_offset = value;
++
++	ret = device_property_read_u32(dev, "intc-gpio-host-software-pad-ownership-offset", &value);
++	if (ret)
++		return ret;
++	community->hostown_offset = value;
++
++	ret = device_property_read_u32(dev, "intc-gpio-interrupt-status-offset", &value);
++	if (ret)
++		return ret;
++	community->is_offset = value;
++
++	ret = device_property_read_u32(dev, "intc-gpio-interrupt-enable-offset", &value);
++	if (ret)
++		return ret;
++	community->ie_offset = value;
++
++	ngpps = device_get_child_node_count(dev);
++	if (ngpps == 0)
++		return -ENODEV;
++
++	gpps = devm_kcalloc(dev, ngpps, sizeof(*gpps), GFP_KERNEL);
++	if (!gpps)
++		return -ENOMEM;
++
++	community->ngpps = ngpps;
++	community->gpps = gpps;
++
++	group = 0;
++	device_for_each_child_node(dev, child) {
++		struct intel_padgroup *gpp = &gpps[group];
++		struct pinctrl_pin_desc *new;
++		const char *group_name;
++		char **pin_names;
++		unsigned int pin;
++
++		ret = fwnode_property_read_string(child, "intc-gpio-group-name", &group_name);
++		if (ret)
++			return ret;
++
++		ret = fwnode_property_read_u32(child, "intc-gpio-pad-count", &value);
++		if (ret)
++			return ret;
++
++		gpp->reg_num = group;
++		gpp->base = community->npins;
++		gpp->size = value;
++
++		pin_names = devm_kasprintf_strarray(dev, group_name, gpp->size);
++		if (IS_ERR(pin_names))
++			return PTR_ERR(pin_names);
++
++		new = devm_krealloc(dev, pins->pins, pins->npins + gpp->size, GFP_KERNEL);
++		if (!new)
++			return -ENOMEM;
++
++		for (pin = 0; pin < gpp->size; pin++) {
++			new->number = pins->npins + pin;
++			new->name = pin_names[pin];
++		}
++
++		pins->pins = new;
++		pins->npins += gpp->size;
++
++		community->npins += gpp->size;
++
++		group++;
++	}
++
++	return 0;
++}
++
++static int intel_platform_pinctrl_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct intel_platform_pins pins = {};
++	struct intel_pinctrl_soc_data *data;
++	struct intel_community *communities;
++	size_t ncommunities;
++	unsigned int i;
++	int ret;
++
++	ncommunities = 1,
++	communities = devm_kcalloc(dev, ncommunities, sizeof(*communities), GFP_KERNEL);
++	if (!communities)
++		return -ENOMEM;
++
++	for (i = 0; i < ncommunities; i++) {
++		struct intel_community *community = &communities[i];
++
++		ret = intel_platform_pinctrl_get_community(pdev, community, &pins);
++		if (ret)
++			return ret;
++	}
++
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->ncommunities = ncommunities;
++	data->communities = communities;
++
++	return intel_pinctrl_probe(pdev, data);
++}
++
++static const struct acpi_device_id intel_platform_pinctrl_acpi_match[] = {
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, intel_platform_pinctrl_acpi_match);
++
++static INTEL_PINCTRL_PM_OPS(intel_platform_pinctrl_pm_ops);
++
++static struct platform_driver intel_platform_pinctrl_driver = {
++	.probe = intel_platform_pinctrl_probe,
++	.driver = {
++		.name = "intel-pinctrl",
++		.acpi_match_table = intel_platform_pinctrl_acpi_match,
++		.pm = &intel_platform_pinctrl_pm_ops,
++	},
++};
++module_platform_driver(intel_platform_pinctrl_driver);
++
++MODULE_AUTHOR("Andy Shevchenko <andriy.shevchenko@linux.intel.com>");
++MODULE_DESCRIPTION("Intel PCH pinctrl/GPIO driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.32.0
+
