@@ -64,14 +64,14 @@
 %if %{?isrc}
 %define rcversion   rt23.
 %endif
-%define embargoname 1230.lts2021_rt
+%define embargoname 0106.lts2021_rt
 
 %define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}211230T190637Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}220106T064845Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
