@@ -1,0 +1,68 @@
+From 9e16d1fe598c9329ff6e35f9f438d79d06a8643f Mon Sep 17 00:00:00 2001
+From: Reinette Chatre <reinette.chatre@intel.com>
+Date: Thu, 13 Jan 2022 11:51:48 -0800
+Subject: [PATCH 02/38] x86/sgx: Add poison handling to reclaimer
+
+The SGX reclaimer code lacks page poison handling in its main
+free path. This can lead to avoidable machine checks if a
+poisoned page is freed and reallocated instead of being
+isolated.
+
+A troublesome scenario is:
+ 1. Machine check (#MC) occurs (asynchronous, !MF_ACTION_REQUIRED)
+ 2. arch_memory_failure() is eventually called
+ 3. (SGX) page->poison set to 1
+ 4. Page is reclaimed
+ 5. Page added to normal free lists by sgx_reclaim_pages()
+    ^ This is the bug (poison pages should be isolated on the
+    sgx_poison_page_list instead)
+ 6. Page is reallocated by some innocent enclave, a second (synchronous)
+    in-kernel #MC is induced, probably during EADD instruction.
+    ^ This is the fallout from the bug
+
+(6) is unfortunate and can be avoided by replacing the open coded
+enclave page freeing code in the reclaimer with sgx_free_epc_page()
+to obtain support for poison page handling that includes placing the
+poisoned page on the correct list.
+
+Fixes: d6d261bded8a ("x86/sgx: Add new sgx_epc_page flag bit to mark free pages")
+Fixes: 992801ae9243 ("x86/sgx: Initial poison handling for dirty and free pages")
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+---
+ arch/x86/kernel/cpu/sgx/main.c | 10 +---------
+ 1 file changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/sgx/main.c b/arch/x86/kernel/cpu/sgx/main.c
+index 4b41efc9e367..8e4bc6453d26 100644
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -344,10 +344,8 @@ static void sgx_reclaim_pages(void)
+ {
+ 	struct sgx_epc_page *chunk[SGX_NR_TO_SCAN];
+ 	struct sgx_backing backing[SGX_NR_TO_SCAN];
+-	struct sgx_epc_section *section;
+ 	struct sgx_encl_page *encl_page;
+ 	struct sgx_epc_page *epc_page;
+-	struct sgx_numa_node *node;
+ 	pgoff_t page_index;
+ 	int cnt = 0;
+ 	int ret;
+@@ -418,13 +416,7 @@ static void sgx_reclaim_pages(void)
+ 		kref_put(&encl_page->encl->refcount, sgx_encl_release);
+ 		epc_page->flags &= ~SGX_EPC_PAGE_RECLAIMER_TRACKED;
+ 
+-		section = &sgx_epc_sections[epc_page->section];
+-		node = section->node;
+-
+-		spin_lock(&node->lock);
+-		list_add_tail(&epc_page->list, &node->free_page_list);
+-		spin_unlock(&node->lock);
+-		atomic_long_inc(&sgx_nr_free_pages);
++		sgx_free_epc_page(epc_page);
+ 	}
+ }
+ 
+-- 
+2.32.0
+

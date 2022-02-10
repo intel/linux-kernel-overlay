@@ -1,0 +1,184 @@
+From 5823db69a3be12cd2f359988fbf71959d19a1f28 Mon Sep 17 00:00:00 2001
+From: Zhengjun Xing <zhengjun.xing@linux.intel.com>
+Date: Thu, 15 Jul 2021 09:57:30 +0800
+Subject: [PATCH 16/20] perf stat: Support hybrid --topdown option
+
+Since for big core or atom core, they have different topdown
+events groups.
+
+For big core, --topdown equals to
+"{slots,cpu_core/topdown-retiring/,cpu_core/topdown-bad-spec/,
+  cpu_core/topdown-fe-bound/,cpu_core/topdown-be-bound/,
+  cpu_core/topdown-heavy-ops/,cpu_core/topdown-br-mispredict/,
+  cpu_core/topdown-fetch-lat/,cpu_core/topdown-mem-bound/}"
+
+For atom core, --topdown equals to
+"{cpu_atom/topdown-retiring/,cpu_atom/topdown-bad-spec/,
+ cpu_atom/topdown-fe-bound/,cpu_atom/topdown-be-bound/}"
+
+To simplify the implementation, on hybrid, --topdown is used
+together with --cputype. If without --cputype, it uses big core
+topdown events by default.
+
+  # ./perf stat --topdown -a  sleep 1
+  WARNING: default to use big core topdown events
+
+   Performance counter stats for 'system wide':
+
+              retiring      bad speculation       frontend bound        backend bound     heavy operations     light operations    branch mispredict       machine clears        fetch latency      fetch bandwidth         memory bound           Core bound
+                  4.1%                 0.0%                 5.1%                90.8%                 2.3%                 1.8%                 0.0%                 0.0%                 4.2%                 0.9%                 9.9%                81.0%
+
+         1.002624229 seconds time elapsed
+
+  # ./perf stat --topdown -a --cputype atom  sleep 1
+
+   Performance counter stats for 'system wide':
+
+              retiring      bad speculation       frontend bound        backend bound
+                 13.5%                 0.1%                31.2%                55.2%
+
+         1.002366987 seconds time elapsed
+
+Signed-off-by: Zhengjun Xing <zhengjun.xing@linux.intel.com>
+---
+ tools/perf/builtin-stat.c | 21 ++++++++++++++++++---
+ tools/perf/util/stat.c    |  3 ++-
+ tools/perf/util/topdown.c | 20 +++++++++++++++-----
+ tools/perf/util/topdown.h |  3 ++-
+ 4 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index c47e76771450..fd5fb7b92b84 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -1841,11 +1841,23 @@ static int add_default_attributes(void)
+ 		unsigned int max_level = 1;
+ 		char *str = NULL;
+ 		bool warn = false;
++		const char *pmu_name = "cpu";
+ 
+ 		if (!force_metric_only)
+ 			stat_config.metric_only = true;
+ 
+-		if (pmu_have_event("cpu", topdown_metric_L2_attrs[5])) {
++		if (perf_pmu__has_hybrid()) {
++			if (!evsel_list->hybrid_pmu_name) {
++				pr_warning("WARNING: default to use big core topdown events\n");
++				evsel_list->hybrid_pmu_name = perf_pmu__hybrid_type_to_pmu("core");
++			}
++
++			pmu_name = evsel_list->hybrid_pmu_name;
++			if (!pmu_name)
++				return -1;
++		}
++
++		if (pmu_have_event(pmu_name, topdown_metric_L2_attrs[5])) {
+ 			metric_attrs = topdown_metric_L2_attrs;
+ 			max_level = 2;
+ 		}
+@@ -1856,10 +1868,11 @@ static int add_default_attributes(void)
+ 		} else if (!stat_config.topdown_level)
+ 			stat_config.topdown_level = max_level;
+ 
+-		if (topdown_filter_events(metric_attrs, &str, 1) < 0) {
++		if (topdown_filter_events(metric_attrs, &str, 1, pmu_name) < 0) {
+ 			pr_err("Out of memory\n");
+ 			return -1;
+ 		}
++
+ 		if (metric_attrs[0] && str) {
+ 			if (!stat_config.interval && !stat_config.metric_only) {
+ 				fprintf(stat_config.output,
+@@ -1883,10 +1896,12 @@ static int add_default_attributes(void)
+ 		}
+ 
+ 		if (topdown_filter_events(topdown_attrs, &str,
+-				arch_topdown_check_group(&warn)) < 0) {
++				arch_topdown_check_group(&warn),
++				pmu_name) < 0) {
+ 			pr_err("Out of memory\n");
+ 			return -1;
+ 		}
++
+ 		if (topdown_attrs[0] && str) {
+ 			struct parse_events_error errinfo;
+ 			if (warn)
+diff --git a/tools/perf/util/stat.c b/tools/perf/util/stat.c
+index ee6f03481215..45b33d5115b5 100644
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@ -116,7 +116,8 @@ static void perf_stat_evsel_id_init(struct evsel *evsel)
+ 	/* ps->id is 0 hence PERF_STAT_EVSEL_ID__NONE by default */
+ 
+ 	for (i = 0; i < PERF_STAT_EVSEL_ID__MAX; i++) {
+-		if (!strcmp(evsel__name(evsel), id_str[i])) {
++		if (!strcmp(evsel__name(evsel), id_str[i]) ||
++		    (strstr(evsel->name, id_str[i]) && strstr(evsel->name, evsel->pmu_name))) {
+ 			ps->id = i;
+ 			break;
+ 		}
+diff --git a/tools/perf/util/topdown.c b/tools/perf/util/topdown.c
+index 1081b20f9891..9fe456aaac48 100644
+--- a/tools/perf/util/topdown.c
++++ b/tools/perf/util/topdown.c
+@@ -1,21 +1,28 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <stdio.h>
+ #include "pmu.h"
++#include "pmu-hybrid.h"
+ #include "topdown.h"
+ 
+-int topdown_filter_events(const char **attr, char **str, bool use_group)
++int topdown_filter_events(const char **attr, char **str, bool use_group,
++			  const char *pmu_name)
+ {
+ 	int off = 0;
+ 	int i;
+ 	int len = 0;
+ 	char *s;
++	bool is_hybrid = perf_pmu__is_hybrid(pmu_name);
+ 
+ 	for (i = 0; attr[i]; i++) {
+-		if (pmu_have_event("cpu", attr[i])) {
+-			len += strlen(attr[i]) + 1;
++		if (pmu_have_event(pmu_name, attr[i])) {
++			if (is_hybrid)
++				len += strlen(attr[i]) + strlen(pmu_name) + 3;
++			else
++				len += strlen(attr[i]) + 1;
+ 			attr[i - off] = attr[i];
+-		} else
++		} else {
+ 			off++;
++		}
+ 	}
+ 	attr[i - off] = NULL;
+ 
+@@ -30,7 +37,10 @@ int topdown_filter_events(const char **attr, char **str, bool use_group)
+ 	if (use_group)
+ 		*s++ = '{';
+ 	for (i = 0; attr[i]; i++) {
+-		strcpy(s, attr[i]);
++		if (!is_hybrid || !strcmp(attr[i], "slots"))
++			strcpy(s, attr[i]);
++		else
++			sprintf(s, "%s/%s/", pmu_name, attr[i]);
+ 		s += strlen(s);
+ 		*s++ = ',';
+ 	}
+diff --git a/tools/perf/util/topdown.h b/tools/perf/util/topdown.h
+index 2f0d0b887639..118e75281f93 100644
+--- a/tools/perf/util/topdown.h
++++ b/tools/perf/util/topdown.h
+@@ -7,6 +7,7 @@ bool arch_topdown_check_group(bool *warn);
+ void arch_topdown_group_warn(void);
+ bool arch_topdown_sample_read(struct evsel *leader);
+ 
+-int topdown_filter_events(const char **attr, char **str, bool use_group);
++int topdown_filter_events(const char **attr, char **str, bool use_group,
++			  const char *pmu_name);
+ 
+ #endif
+-- 
+2.32.0
+
