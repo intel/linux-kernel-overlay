@@ -1,0 +1,1876 @@
+From c7a7b89a6547d3eae4121f4ce2274468adab086e Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Wed, 16 Jun 2021 17:09:54 -0700
+Subject: [PATCH 16/16] !REVIEW: selftests/x86/uintr: Add a test suite for
+ UINTR
+
+The test suite currently covers:
+
+1. SENDUIPI base IPC tests
+2. UINTR Syscall unit tests
+3. SENDUIPI instruction fault tests
+4. A configurable IPC test to stress context switching
+
+Planning to add the following in the future:
+1. More context switching tests
+2. UIF related tests
+3. uintr_wait() syscall tests
+4. Kernel to user notification tests
+5. Stack adjust tests
+
+Signed-off-by: Gayatri Kammela <gayatri.kammela@intel.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+ tools/testing/selftests/uintr/Makefile        |  20 +
+ .../selftests/uintr/context_switch_ipc.c      | 223 +++++++++++
+ tools/testing/selftests/uintr/ipc_base.c      | 355 ++++++++++++++++++
+ .../testing/selftests/uintr/senduipi_instr.c  | 289 ++++++++++++++
+ tools/testing/selftests/uintr/syscall_flags.c | 219 +++++++++++
+ .../testing/selftests/uintr/syscall_handler.c | 156 ++++++++
+ .../testing/selftests/uintr/syscall_sender.c  | 210 +++++++++++
+ .../testing/selftests/uintr/syscall_vector.c  | 155 ++++++++
+ tools/testing/selftests/uintr/uintr_common.h  | 149 ++++++++
+ 9 files changed, 1776 insertions(+)
+ create mode 100644 tools/testing/selftests/uintr/Makefile
+ create mode 100644 tools/testing/selftests/uintr/context_switch_ipc.c
+ create mode 100644 tools/testing/selftests/uintr/ipc_base.c
+ create mode 100644 tools/testing/selftests/uintr/senduipi_instr.c
+ create mode 100644 tools/testing/selftests/uintr/syscall_flags.c
+ create mode 100644 tools/testing/selftests/uintr/syscall_handler.c
+ create mode 100644 tools/testing/selftests/uintr/syscall_sender.c
+ create mode 100644 tools/testing/selftests/uintr/syscall_vector.c
+ create mode 100644 tools/testing/selftests/uintr/uintr_common.h
+
+diff --git a/tools/testing/selftests/uintr/Makefile b/tools/testing/selftests/uintr/Makefile
+new file mode 100644
+index 000000000000..f8bcb1476f1c
+--- /dev/null
++++ b/tools/testing/selftests/uintr/Makefile
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: GPL-2.0
++
++CAN_BUILD_UINTR := $(shell ./../x86/check_cc.sh $(CC) ../x86/trivial_64bit_program.c -muintr)
++
++ifeq ($(CAN_BUILD_UINTR),1)
++CFLAGS += -g -muintr -mgeneral-regs-only
++LDLIBS += -lpthread
++
++TEST_GEN_PROGS = ipc_base \
++	syscall_handler \
++	syscall_vector \
++	syscall_sender \
++	syscall_flags \
++	senduipi_instr
++
++TEST_GEN_PROGS_EXTENDED = context_switch_ipc
++
++endif
++
++include ../lib.mk
+diff --git a/tools/testing/selftests/uintr/context_switch_ipc.c b/tools/testing/selftests/uintr/context_switch_ipc.c
+new file mode 100644
+index 000000000000..54bc3212cdff
+--- /dev/null
++++ b/tools/testing/selftests/uintr/context_switch_ipc.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/sysinfo.h>
++#include <sys/wait.h>
++
++#include "uintr_common.h"
++
++unsigned int client_received;
++unsigned int server_received;
++unsigned int count = 100000;
++unsigned int nprocs;
++unsigned int start_cpu;
++
++static void __attribute__((interrupt)) client_handler(struct __uintr_frame *ui_frame,
++						      unsigned long long vector)
++{
++	client_received = 1;
++}
++
++static void __attribute__((interrupt)) server_handler(struct __uintr_frame *ui_frame,
++						      unsigned long long vector)
++{
++	server_received = 1;
++}
++
++static void wait_for_interrupt(unsigned int *interrupt_received_flag)
++{
++	/* TODO: Add alternate to test with usleep() */
++
++	while (!(*interrupt_received_flag))
++		cpu_relax();
++}
++
++static void client_process_bi(int server_fd, int sock)
++{
++	int uipi_index;
++	int client_fd;
++	ssize_t size;
++
++	uipi_index = uintr_register_sender(server_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		exit(EXIT_FAILURE);
++	}
++
++	if (uintr_register_handler(client_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd with vector 1 */
++	client_fd = uintr_create_fd(1, 0);
++	if (client_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++	_stui();
++
++	/* Share client_fd */
++	if (sock_fd_write(sock, "1", 1, client_fd) != 1) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	do {
++		wait_for_interrupt(&client_received);
++		client_received = 0;
++		_senduipi(uipi_index);
++	} while (1);
++}
++
++static void test_process_ipi_bidirectional(int i)
++{
++	int server_fd, client_fd, uipi_index, pid;
++	char buf[16];
++	ssize_t size;
++	int sv[2];
++
++	cpu_set_t cpuset;
++
++	CPU_ZERO(&cpuset);
++	CPU_SET((start_cpu + (i % nprocs)) % get_nprocs(), &cpuset);
++	if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sv) < 0)  {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (uintr_register_handler(server_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd with vector 0 */
++	server_fd = uintr_create_fd(0, 0);
++	if (server_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	_stui();
++
++	printf("\tStarting Server-Client pair: %d\n", i);
++
++	pid = fork();
++	if (pid == 0) {
++		/* Child client process */
++		close(sv[0]);
++
++		CPU_ZERO(&cpuset);
++		CPU_SET((start_cpu + ((i + 1) % nprocs)) % get_nprocs(), &cpuset);
++		if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
++			printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++			return;
++		}
++
++		client_process_bi(server_fd, sv[1]);
++		exit(EXIT_SUCCESS);
++	}
++
++	close(sv[1]);
++	if (sock_fd_read(sv[0], buf, sizeof(buf), &client_fd) != 1) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	//Register server as sender
++	uipi_index = uintr_register_sender(client_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	do {
++		server_received = 0;
++		_senduipi(uipi_index);
++		wait_for_interrupt(&server_received);
++	} while (count--);
++
++	uintr_unregister_handler(0);
++
++	kill(pid, SIGKILL);
++
++	if (server_received)
++		printf("[OK]\tAll interrupts received: pair: %d\n", i);
++	else
++		printf("[FAIL]\tInterrupt not received: pair: %d\n", i);
++
++	exit(EXIT_SUCCESS);
++}
++
++int main(int argc, char *argv[])
++{
++	int num_forks, i, c, pairs;
++	int *pid = NULL;
++
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	nprocs = get_nprocs();
++	pairs = nprocs * 2;
++
++	srand(time(NULL));
++	start_cpu = rand() % get_nprocs();
++
++	while ((c = getopt(argc, argv, "c:i:p:")) != EOF) {
++		switch (c) {
++		case 'c':
++			nprocs = atoi(optarg);
++			if (nprocs > get_nprocs())
++				nprocs = get_nprocs();
++			break;
++
++		case 'i':
++			count = atoi(optarg);
++			break;
++
++		case 'p':
++			pairs = atoi(optarg);
++			break;
++
++		default:
++			break;
++		}
++	}
++
++	printf("[RUN]\tContext switch IPC test\n");
++
++	pid = malloc(sizeof(int) * pairs);
++	if (!pid) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return EXIT_SUCCESS;
++	}
++
++	printf("\tServer-Client pairs:%d Number of cpus:%d Iterations per pair:%d\n",
++	       pairs, nprocs, count);
++
++	for (i = 0; i < pairs; i++) {
++		pid[i] = fork();
++		if (pid[i] == 0) {
++			test_process_ipi_bidirectional(i);
++			break;
++		}
++	}
++
++	for (i = 0; i < pairs; i++)
++		waitpid(pid[i], NULL, 0);
++
++	return EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/ipc_base.c b/tools/testing/selftests/uintr/ipc_base.c
+new file mode 100644
+index 000000000000..2d795f70b48a
+--- /dev/null
++++ b/tools/testing/selftests/uintr/ipc_base.c
+@@ -0,0 +1,355 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++#include <pthread.h>
++#include <signal.h>
++
++#include "uintr_common.h"
++
++unsigned int uintr_received;
++unsigned int client_received;
++unsigned int server_received;
++unsigned int nerrs;
++
++static void __attribute__((interrupt)) uintr_handler(struct __uintr_frame *ui_frame,
++						     unsigned long long vector)
++{
++	uintr_received = 1;
++}
++
++static void __attribute__((interrupt)) client_handler(struct __uintr_frame *ui_frame,
++						      unsigned long long vector)
++{
++	client_received = 1;
++}
++
++static void __attribute__((interrupt)) server_handler(struct __uintr_frame *ui_frame,
++						      unsigned long long vector)
++{
++	server_received = 1;
++}
++
++/* This check doesn't fail. */
++static void print_uintr_support(void)
++{
++	printf("[RUN]\tCheck if User Interrupts (UINTR) is supported\n");
++	if (uintr_supported())
++		printf("[OK]\tUser Interrupts (UINTR) is supported\n");
++	else
++		printf("[OK]\tUser Interrupts (UINTR) is not supported. Skipping rest of the tests silently\n");
++}
++
++static void *sender_thread(void *arg)
++{
++	int  uintr_fd = *(int *)arg;
++	int uipi_index;
++
++	uipi_index = uintr_register_sender(uintr_fd, 0);
++	if (uipi_index < 0) {
++		printf("[FAIL]\tSender register error\n");
++		return NULL;
++	}
++
++	/* Sleep before sending IPI to allow the receiver to start waiting */
++	usleep(100);
++
++	printf("\tother thread: sending IPI\n");
++	_senduipi(uipi_index);
++
++	uintr_unregister_sender(uintr_fd, 0);
++
++	return NULL;
++}
++
++static inline void cpu_delay(void)
++{
++	long long dl = 1000;
++	volatile long long cnt = dl << 10;
++
++	while (cnt--)
++		dl++;
++}
++
++static void test_thread_ipi(void)
++{
++	int wait_for_delay = 1000;
++	int vector = 0;
++	int uintr_fd;
++	pthread_t pt;
++
++	/* Register interrupt handler */
++	if (uintr_register_handler(uintr_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd */
++	uintr_fd = uintr_create_fd(vector, 0);
++	if (uintr_fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Enable interrupts */
++	_stui();
++
++	uintr_received = 0;
++	if (pthread_create(&pt, NULL, &sender_thread, (void *)&uintr_fd)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tBase UIPI test: pthreads\n");
++	printf("\tSpin in userspace (waiting for interrupts)\n");
++	// Keep spinning until interrupt received
++	while (wait_for_delay-- && !uintr_received)
++		cpu_delay();
++
++	if (uintr_received) {
++		printf("[OK]\tUser interrupt received\n");
++	} else {
++		printf("[FAIL]\tUser interrupt not received\n");
++		nerrs++;
++	}
++
++	pthread_join(pt, NULL);
++	close(uintr_fd);
++	uintr_unregister_handler(0);
++}
++
++static void test_blocking_ipi(void)
++{
++	int ret, uintr_fd;
++	int vector = 0;
++	pthread_t pt;
++
++	/* Register interrupt handler */
++	if (uintr_register_handler(uintr_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd */
++	uintr_fd = uintr_create_fd(vector, 0);
++	if (uintr_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Enable interrupts */
++	_stui();
++
++	uintr_received = 0;
++	if (pthread_create(&pt, NULL, &sender_thread, (void *)&uintr_fd)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tBase UIPI test: pthreads\n");
++	printf("\tBlock in the kernel (waiting for interrupts)\n");
++	uintr_wait(0);
++	if (uintr_received) {
++		printf("[OK]\tUser interrupt received\n");
++	} else {
++		printf("[FAIL]\tUser interrupt not received\n");
++		nerrs++;
++	}
++
++	pthread_join(pt, NULL);
++	close(uintr_fd);
++	uintr_unregister_handler(0);
++}
++
++static void sender_process_uni(int uintr_fd)
++{
++	int uipi_index;
++
++	uipi_index = uintr_register_sender(uintr_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		exit(EXIT_FAILURE);
++	}
++
++	_senduipi(uipi_index);
++
++	uintr_unregister_sender(uintr_fd, 0);
++	/* Close sender copy of uintr_fd */
++	close(uintr_fd);
++
++	pause();
++}
++
++static void test_process_ipi_unidirectional(void)
++{
++	int wait_for_usec = 100;
++	int uintr_fd, pid;
++
++	if (uintr_register_handler(uintr_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uintr_fd = uintr_create_fd(0, 0);
++	if (uintr_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uintr_received = 0;
++	_stui();
++
++	printf("[RUN]\tBase User IPI test: Process uni-directional\n");
++
++	pid = fork();
++	if (pid == 0) {
++		/* Child sender process */
++		sender_process_uni(uintr_fd);
++		exit(EXIT_SUCCESS);
++	}
++
++	while (wait_for_usec-- && !uintr_received)
++		usleep(1);
++
++	close(uintr_fd);
++	uintr_unregister_handler(0);
++	kill(pid, SIGKILL);
++
++	if (!uintr_received) {
++		printf("[FAIL]\tUser interrupt not received\n");
++		nerrs++;
++	} else {
++		printf("[OK]\tUser interrupt received\n");
++	}
++}
++
++static void client_process_bi(int server_fd, int sock)
++{
++	int uipi_index;
++	int client_fd;
++	ssize_t size;
++
++	uipi_index = uintr_register_sender(server_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		exit(EXIT_FAILURE);
++	}
++
++	if (uintr_register_handler(client_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd with vector 1 */
++	client_fd = uintr_create_fd(1, 0);
++	if (client_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++	_stui();
++
++	// Share client_fd
++	if (sock_fd_write(sock, "1", 1, client_fd) != 1) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	while (!client_received)
++		usleep(1);
++
++	_senduipi(uipi_index);
++
++	pause();
++}
++
++static void test_process_ipi_bidirectional(void)
++{
++	int server_fd, client_fd, pid;
++	int sv[2];
++	ssize_t size;
++	char buf[16];
++	int uipi_index;
++
++	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sv) < 0)  {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (uintr_register_handler(server_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Create uintr_fd with vector 0 */
++	server_fd = uintr_create_fd(0, 0);
++	if (server_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	_stui();
++
++	printf("[RUN]\tBase User IPI test: Process bi-directional\n");
++
++	pid = fork();
++	if (pid == 0) {
++		/* Child client process */
++		close(sv[0]);
++		client_process_bi(server_fd, sv[1]);
++		exit(EXIT_SUCCESS);
++	}
++
++	close(sv[1]);
++	if (sock_fd_read(sv[0], buf, sizeof(buf), &client_fd) != 1) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	//Register server as sender
++	uipi_index = uintr_register_sender(client_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	_senduipi(uipi_index);
++
++	while (!server_received)
++		usleep(1);
++
++	//close(uintr_fd);
++	uintr_unregister_handler(0);
++	kill(pid, SIGKILL);
++
++	if (!server_received) {
++		printf("[FAIL]\tUser interrupt not received\n");
++		nerrs++;
++	} else {
++		printf("[OK]\tUser interrupt received\n");
++	}
++}
++
++/* TODO: Use some better method for failure rather than the 45sec KSFT timeout */
++int main(int argc, char *argv[])
++{
++	print_uintr_support();
++
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_thread_ipi();
++
++	test_blocking_ipi();
++
++	test_process_ipi_unidirectional();
++
++	test_process_ipi_bidirectional();
++
++	return nerrs ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/senduipi_instr.c b/tools/testing/selftests/uintr/senduipi_instr.c
+new file mode 100644
+index 000000000000..19bc9ff23086
+--- /dev/null
++++ b/tools/testing/selftests/uintr/senduipi_instr.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++#include <signal.h>
++#include <sys/ucontext.h>
++#include <string.h>
++#include <err.h>
++#include <stdbool.h>
++#include <pthread.h>
++
++#include "uintr_common.h"
++
++static volatile sig_atomic_t expect_sigill;
++static volatile sig_atomic_t expect_sigsegv;
++
++static void set_handler(int sig, void (*handler)(int, siginfo_t *, void *), int flags)
++{
++	struct sigaction sa;
++
++	memset(&sa, 0, sizeof(sa));
++	sa.sa_sigaction = handler;
++	sa.sa_flags = SA_SIGINFO | flags;
++	sigemptyset(&sa.sa_mask);
++	if (sigaction(sig, &sa, 0))
++		err(1, "sigaction");
++}
++
++static void clear_handler(int sig)
++{
++	struct sigaction sa;
++
++	memset(&sa, 0, sizeof(sa));
++	sa.sa_handler = SIG_DFL;
++	sigemptyset(&sa.sa_mask);
++	if (sigaction(sig, &sa, 0))
++		err(1, "sigaction");
++}
++
++static void sigsegv(int sig, siginfo_t *si, void *ctx_void)
++{
++	ucontext_t *ctx = (ucontext_t *)ctx_void;
++
++	if (!expect_sigsegv) {
++		clear_handler(SIGSEGV);
++		return;
++	}
++
++	expect_sigsegv = false;
++
++	/* skip senduipi */
++	ctx->uc_mcontext.gregs[REG_RIP] += 4;
++}
++
++static void sigill(int sig, siginfo_t *si, void *ctx_void)
++{
++	ucontext_t *ctx = (ucontext_t *)ctx_void;
++
++	if (!expect_sigill) {
++		clear_handler(SIGILL);
++		return;
++	}
++
++	expect_sigill = false;
++
++	/* skip senduipi */
++	ctx->uc_mcontext.gregs[REG_RIP] += 4;
++}
++
++static void test_no_registration(void)
++{
++	set_handler(SIGILL, sigill, 0);
++	expect_sigill = true;
++
++	printf("[RUN]\tSENDUIPI without registration\n");
++	_senduipi(0);
++	clear_handler(SIGILL);
++
++	if (expect_sigill)
++		printf("[FAIL]\tDidn't receive SIGILL as expected\n");
++	else
++		printf("[OK]\tSIGILL generated\n");
++}
++
++static void test_invalid_handle(void)
++{
++	int fd, uipi_handle;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uipi_handle = uintr_register_sender(fd, 0);
++	if (uipi_handle < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	set_handler(SIGSEGV, sigsegv, 0);
++	expect_sigsegv = true;
++
++	printf("[RUN]\tSENDUIPI with invalid handle\n");
++	_senduipi(uipi_handle + 1);
++	clear_handler(SIGSEGV);
++
++	if (expect_sigsegv)
++		printf("[FAIL]\tDidn't receive SIGSEGV as expected\n");
++	else
++		printf("[OK]\tSIGSEGV generated\n");
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++static void test_after_unregister(void)
++{
++	int fd, uipi_handle;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uipi_handle = uintr_register_sender(fd, 0);
++	if (uipi_handle < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	set_handler(SIGILL, sigill, 0);
++	expect_sigill = true;
++
++	printf("[RUN]\tSENDUIPI after unregister sender\n");
++
++	uintr_unregister_sender(fd, 0);
++	_senduipi(uipi_handle);
++	clear_handler(SIGILL);
++
++	if (expect_sigill)
++		printf("[FAIL]\tDidn't receive SIGILL as expected\n");
++	else
++		printf("[OK]\tSIGILL generated\n");
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++static void test_after_closefd(void)
++{
++	int fd, uipi_handle;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uipi_handle = uintr_register_sender(fd, 0);
++	if (uipi_handle < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	set_handler(SIGILL, sigill, 0);
++	expect_sigill = true;
++
++	printf("[RUN]\tSENDUIPI after close fd\n");
++
++	close(fd);
++	_senduipi(uipi_handle);
++	clear_handler(SIGILL);
++
++	if (expect_sigill)
++		printf("[FAIL]\tDidn't receive SIGILL as expected\n");
++	else
++		printf("[OK]\tSIGILL generated\n");
++
++	uintr_unregister_handler(0);
++}
++
++static void *sender_thread(void *arg)
++{
++	int uipi_handle = *(int *)arg;
++
++	set_handler(SIGILL, sigill, 0);
++	expect_sigill = true;
++
++	printf("[RUN]\tSENDUIPI on another thread\n");
++
++	_senduipi(uipi_handle);
++	clear_handler(SIGILL);
++
++	if (expect_sigill)
++		printf("[FAIL]\tDidn't receive SIGILL as expected\n");
++	else
++		printf("[OK]\tSIGILL generated\n");
++
++	return NULL;
++}
++
++static void test_separate_thread(void)
++{
++	int fd, uipi_handle;
++	pthread_t pt;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uipi_handle = uintr_register_sender(fd, 0);
++	if (uipi_handle < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (pthread_create(&pt, NULL, &sender_thread, (void *)&uipi_handle)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	pthread_join(pt, NULL);
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++int main(int argc, char *argv[])
++{
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_no_registration();
++
++	test_invalid_handle();
++
++	test_after_unregister();
++
++	test_after_closefd();
++
++	test_separate_thread();
++
++	exit(EXIT_SUCCESS);
++}
+diff --git a/tools/testing/selftests/uintr/syscall_flags.c b/tools/testing/selftests/uintr/syscall_flags.c
+new file mode 100644
+index 000000000000..40a5ff53bbcf
+--- /dev/null
++++ b/tools/testing/selftests/uintr/syscall_flags.c
+@@ -0,0 +1,219 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++
++#include "uintr_common.h"
++
++unsigned int total_nerrs;
++
++static void test_register_handler_flags(void)
++{
++	unsigned int invalid_flag_mask, nerrs, flag, bit;
++
++	/* Test valid flags first and remove them from the mask */
++	/* None at this point */
++	invalid_flag_mask = 0xFFFFFFFF;
++	nerrs = 0;
++
++	printf("[RUN]\tTest uintr_register_handler invalid flags\n");
++	for (bit = 0; bit < sizeof(unsigned int); bit++) {
++		flag = invalid_flag_mask & (1 << bit);
++		if (flag && !uintr_register_handler(uintr_empty_handler, flag)) {
++			nerrs++;
++			uintr_unregister_handler(0);
++		}
++	}
++
++	if (nerrs) {
++		printf("[FAIL]\tuintr_register_handler accepted an invalid flag\n");
++		total_nerrs += nerrs;
++	} else {
++		printf("[OK]\tuintr_register_handler returned errors on all invalid flags\n");
++	}
++}
++
++static void test_unregister_handler_flags(void)
++{
++	unsigned int invalid_flag_mask, nerrs, flag, bit;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Test valid flags first and remove them from the mask */
++	/* None at this point */
++	invalid_flag_mask = 0xFFFFFFFF;
++	nerrs = 0;
++
++	printf("[RUN]\tTest uintr_unregister_handler invalid flags\n");
++	for (bit = 0; bit < sizeof(unsigned int); bit++) {
++		flag = invalid_flag_mask & (1 << bit);
++		if (flag && !uintr_unregister_handler(flag)) {
++			nerrs++;
++			uintr_register_handler(uintr_empty_handler, flag);
++		}
++	}
++
++	if (nerrs) {
++		printf("[FAIL]\tuintr_unregister_handler accepted an invalid flag\n");
++		total_nerrs += nerrs;
++	} else {
++		printf("[OK]\tuintr_unregister_handler returned errors on all invalid flags\n");
++	}
++
++	uintr_unregister_handler(0);
++}
++
++static void test_create_fd_flags(void)
++{
++	unsigned int invalid_flag_mask, nerrs, flag, bit;
++	int fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Test valid flags first and remove them from the mask */
++	/* None at this point */
++	invalid_flag_mask = 0xFFFFFFFF;
++	nerrs = 0;
++
++	printf("[RUN]\tTest uintr_create_fd invalid flags\n");
++	for (bit = 0; bit < sizeof(unsigned int); bit++) {
++		flag = invalid_flag_mask & (1 << bit);
++		fd = uintr_create_fd(0, flag);
++		if (fd >= 0) {
++			nerrs++;
++			close(fd);
++		}
++	}
++
++	if (nerrs) {
++		printf("[FAIL]\tuintr_create_fd accepted an invalid flag\n");
++		total_nerrs += nerrs;
++	} else {
++		printf("[OK]\tuintr_create_fd returned errors on all invalid flags\n");
++	}
++
++	uintr_unregister_handler(0);
++}
++
++static void test_register_sender_flags(void)
++{
++	unsigned int invalid_flag_mask, nerrs, flag, bit;
++	int fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Test valid flags first and remove them from the mask */
++	/* None at this point */
++	invalid_flag_mask = 0xFFFFFFFF;
++	nerrs = 0;
++
++	printf("[RUN]\tTest uintr_register_sender invalid flags\n");
++	for (bit = 0; bit < sizeof(unsigned int); bit++) {
++		flag = invalid_flag_mask & (1 << bit);
++		if (uintr_register_sender(fd, flag) >= 0) {
++			nerrs++;
++			uintr_unregister_sender(fd, 0);
++		}
++	}
++
++	if (nerrs) {
++		printf("[FAIL]\tuintr_register_sender accepted an invalid flag\n");
++		total_nerrs += nerrs;
++	} else {
++		printf("[OK]\tuintr_register_sender returned errors on all invalid flags\n");
++	}
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++static void test_unregister_sender_flags(void)
++{
++	unsigned int invalid_flag_mask, nerrs, flag, bit;
++	int fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (uintr_register_sender(fd, 0) < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Test valid flags first and remove them from the mask */
++	/* None at this point */
++	invalid_flag_mask = 0xFFFFFFFF;
++	nerrs = 0;
++
++	printf("[RUN]\tTest uintr_unregister_sender invalid flags\n");
++	for (bit = 0; bit < sizeof(unsigned int); bit++) {
++		flag = invalid_flag_mask & (1 << bit);
++		if (!uintr_unregister_sender(fd, flag)) {
++			nerrs++;
++			uintr_register_sender(fd, 0);
++		}
++	}
++
++	if (nerrs) {
++		printf("[FAIL]\tuintr_register_sender accepted an invalid flag\n");
++		total_nerrs += nerrs;
++	} else {
++		printf("[OK]\tuintr_register_sender returned errors on all invalid flags\n");
++	}
++
++	uintr_unregister_sender(fd, 0);
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++int main(void)
++{
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_register_handler_flags();
++
++	test_unregister_handler_flags();
++
++	test_create_fd_flags();
++
++	test_register_sender_flags();
++
++	test_unregister_sender_flags();
++
++	return total_nerrs ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/syscall_handler.c b/tools/testing/selftests/uintr/syscall_handler.c
+new file mode 100644
+index 000000000000..2e595c63a02c
+--- /dev/null
++++ b/tools/testing/selftests/uintr/syscall_handler.c
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <sched.h>
++#include <signal.h>
++#include <stdio.h>
++#include <sys/random.h>
++#include <sys/wait.h>
++#include <x86gprintrin.h>
++
++#include "uintr_common.h"
++
++int uintr_received;
++int nerrs;
++
++static void test_handler_unregister(void)
++{
++	printf("[RUN]\tUnregister Handler: Unregister without any registration\n");
++	if (uintr_unregister_handler(0))
++		printf("[OK]\tUnregister Handler: Error no handler present\n");
++	else
++		printf("[FAIL]\tUnregister Handler: Didn't throw the expected error\n");
++}
++
++static void test_handler_already_registered(void)
++{
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tRegister Handler: Try registering twice\n");
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[OK]\tRegister Handler: Error on second registration\n");
++	} else {
++		printf("[FAIL]\tRegister Handler: Didn't fail on second registration\n");
++		nerrs++;
++	}
++
++	uintr_unregister_handler(0);
++}
++
++static void test_incorrect_handler(void)
++{
++	unsigned long long addr;
++
++	printf("[RUN]\tRegister Handler: Invalid address\n");
++	if (uintr_register_handler(0xabcd, 0)) {
++		printf("[OK]\tRegister Handler: error\n");
++	} else {
++		printf("[FAIL]\tRegister Handler: Didn't throw the expected error\n");
++		nerrs++;
++	}
++	uintr_unregister_handler(0);
++
++	printf("[RUN]\tRegister Handler: non-canonical address\n");
++	if (uintr_register_handler(0x0f0000000000abcd, 0)) {
++		printf("[OK]\tRegister Handler: error\n");
++	} else {
++		printf("[FAIL]\tRegister Handler: Didn't throw the expected error\n");
++		nerrs++;
++	}
++	uintr_unregister_handler(0);
++
++	printf("[RUN]\tRegister Handler: kernel address\n");
++	if (uintr_register_handler(0xffffffff00000000, 0)) {
++		printf("[OK]\tHandler register error\n");
++	} else {
++		printf("[FAIL]\tRegister Handler: Didn't throw the expected error\n");
++		nerrs++;
++	}
++	uintr_unregister_handler(0);
++
++	getrandom(&addr, sizeof(addr), 0);
++	printf("[RUN]\tRegister Handler: Random address\n");
++	if (uintr_register_handler(addr, 0)) {
++		printf("[OK]\tHandler register error\n");
++	} else {
++		printf("[FAIL]\tRegister Handler: Didn't throw the expected error\n");
++		nerrs++;
++	}
++	uintr_unregister_handler(0);
++}
++
++static void usual_function(struct __uintr_frame *ui_frame, unsigned long long vector)
++{
++	uintr_received++;
++}
++
++static void sigsegv(int sig)
++{
++	printf("[OK]\tRegister Handler: SIGSEGV received\n");
++	exit(EXIT_SUCCESS);
++}
++
++static void test_regular_function_as_handler(void)
++{
++	int uintr_fd, uipi_index;
++
++	if (uintr_register_handler(usual_function, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	uintr_fd = uintr_create_fd(0, 0);
++	if (uintr_fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	_stui();
++
++	uipi_index = uintr_register_sender(uintr_fd, 0);
++	if (uipi_index < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tRegister Handler: Regular function as handler\n");
++
++	signal(SIGSEGV, sigsegv);
++
++	_senduipi(uipi_index);
++
++	while (!uintr_received)
++		usleep(1);
++
++	printf("[FAIL]\tRegister Handler: Error signal not generated\n");
++	exit(EXIT_FAILURE);
++}
++
++int main(void)
++{
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_handler_unregister();
++
++	test_handler_already_registered();
++
++	/* Expected to fail as kernel checks are not implemented yet */
++	//test_incorrect_handler();
++
++	/* Run this test in a separate process to avoid state corruption */
++	if (fork() == 0)
++		test_regular_function_as_handler();
++
++	wait(NULL);
++
++	return nerrs ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/syscall_sender.c b/tools/testing/selftests/uintr/syscall_sender.c
+new file mode 100644
+index 000000000000..a6a9e34d510b
+--- /dev/null
++++ b/tools/testing/selftests/uintr/syscall_sender.c
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++#include <sys/eventfd.h>
++#include <pthread.h>
++#include <sys/wait.h>
++
++#include "uintr_common.h"
++
++unsigned int nerrs;
++int uintr_fd[256];
++
++static void test_no_uintr_fd(void)
++{
++	int fd = -1;
++
++	printf("[RUN]\tRegister without uintr_fd\n");
++	if (uintr_register_sender(fd, 0) < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_register_sender didn't throw any error\n");
++		nerrs++;
++	}
++}
++
++static void test_invalid_uintr_fd(void)
++{
++	int fd = eventfd(0, 0);
++
++	if (fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tRegister with invalid uintr_fd\n");
++	if (uintr_register_sender(fd, 0) < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_register_sender didn't throw any error\n");
++		nerrs++;
++	}
++}
++
++/*
++ * This test case would need to change if we decide to return the same
++ * uipi_index back when the same uintr_fd is registered for multi-threaded
++ * usages.
++ */
++static void test_registering_uintrfd_again(void)
++{
++	int fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tRegister with the same uintr_fd again\n");
++	if (uintr_register_sender(fd, 0) < 0) {
++		close(fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	if (uintr_register_sender(fd, 0) < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_register_sender didn't throw any error\n");
++		nerrs++;
++	}
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++/* Threads needed to max out UITT size with 64 vectors per thread */
++#define NUM_THREADS 4
++
++pthread_cond_t test_done = PTHREAD_COND_INITIALIZER;
++pthread_mutex_t test_done_mtx = PTHREAD_MUTEX_INITIALIZER;
++pthread_barrier_t init_barrier;
++
++static void *sender_thread(void *arg)
++{
++	int voffset = (*(int *)arg) * 64;
++	int i, fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0))
++		pthread_exit(NULL);
++
++	for (i = 0; i < 64; i++) {
++		fd = uintr_create_fd(i, 0);
++		if (fd < 0) {
++			uintr_unregister_handler(0);
++			pthread_exit(NULL);
++		}
++
++		uintr_fd[voffset + i] = fd;
++	}
++
++	pthread_barrier_wait(&init_barrier);
++
++	pthread_mutex_lock(&test_done_mtx);
++	pthread_cond_wait(&test_done, &test_done_mtx);
++	pthread_mutex_unlock(&test_done_mtx);
++}
++
++/*
++ * Currently, the UITT size is hardcoded as 256. This test would need to change
++ * when the UITT is made dynamic in size.
++ */
++static void test_out_of_uitte(void)
++{
++	pthread_t pt[NUM_THREADS];
++	int thread[NUM_THREADS];
++	int fd, i;
++
++	pthread_barrier_init(&init_barrier, NULL, NUM_THREADS + 1);
++
++	for (i = 0; i < 4; i++) {
++		thread[i] = i;
++		if (pthread_create(&pt[i], NULL, &sender_thread, (void *)&thread[i]))
++			goto skip;
++	}
++
++	/* Wait for all threads to finish their initialization */
++	/* TODO: Avoid infinite waiting when one of the thread exits before reaching the barrier */
++	pthread_barrier_wait(&init_barrier);
++
++	for (i = 0; i < 256; i++) {
++		if (uintr_register_sender(uintr_fd[i], 0) < 0)
++			goto skip;
++	}
++
++	/*
++	 * Register this thread itself as a sender for the 257th entry in the
++	 * UITT table that is expected to fail.
++	 */
++	if (uintr_register_handler(uintr_empty_handler, 0))
++		goto skip;
++
++	fd = uintr_create_fd(0, 0);
++
++	if (fd < 0)
++		goto skip;
++
++	printf("[RUN]\tMax UITT entries exceeded\n");
++	if (uintr_register_sender(fd, 0) < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_register_sender didn't throw any error\n");
++		nerrs++;
++	}
++
++	goto exit;
++
++skip:
++	printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++exit:
++
++	/*
++	 * All FDs and UINTR state will be automatically cleared by the kernel
++	 * upon process exit.
++	 */
++	pthread_mutex_lock(&test_done_mtx);
++	pthread_cond_broadcast(&test_done);
++	pthread_mutex_unlock(&test_done_mtx);
++
++	if (nerrs)
++		exit(EXIT_FAILURE);
++	else
++		exit(EXIT_SUCCESS);
++}
++
++int main(void)
++{
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_no_uintr_fd();
++
++	test_invalid_uintr_fd();
++
++	test_registering_uintrfd_again();
++
++	//test_receiver_has_exited();
++
++	/* Run this test in a separate process to ease state cleanup */
++	if (fork() == 0)
++		test_out_of_uitte();
++
++	wait(NULL);
++
++	return nerrs ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/syscall_vector.c b/tools/testing/selftests/uintr/syscall_vector.c
+new file mode 100644
+index 000000000000..45fe1e2624f3
+--- /dev/null
++++ b/tools/testing/selftests/uintr/syscall_vector.c
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <x86gprintrin.h>
++
++#include "uintr_common.h"
++
++unsigned int nerrs;
++
++static void test_no_handler(void)
++{
++	int fd;
++
++	/* Make sure no handler is registered */
++	uintr_unregister_handler(0);
++
++	printf("[RUN]\tTest uintr_create_fd without any handler registered\n");
++
++	fd = uintr_create_fd(0, 0);
++	if (fd < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_create_fd didn't throw any error\n");
++		close(fd);
++		nerrs++;
++	}
++}
++
++static void test_register_same_vector(void)
++{
++	int fd, fd2;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	/* Register vector 0 */
++	fd = uintr_create_fd(0, 0);
++	if (fd < 0) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tTest uintr_create_fd with same vector\n");
++	/* Register vector 0 again */
++	fd2 = uintr_create_fd(0, 0);
++	if (fd2 < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_create_fd didn't throw any error\n");
++		close(fd2);
++		nerrs++;
++	}
++
++	close(fd);
++	uintr_unregister_handler(0);
++}
++
++static void test_vector(int vector)
++{
++	int fd;
++
++	fd = uintr_create_fd(vector, 0);
++	if (fd < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_create_fd didn't throw any error for vector %d\n", vector);
++		close(fd);
++		nerrs++;
++	}
++}
++
++static void test_vectors_beyond_range(void)
++{
++	int vector, fd;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tTest uintr_create_fd with invalid vector -1\n");
++	test_vector(-1);
++
++	printf("[RUN]\tTest uintr_create_fd with invalid vector 64\n");
++	test_vector(64);
++
++	printf("[RUN]\tTest uintr_create_fd with invalid vector 100\n");
++	test_vector(100);
++
++	uintr_unregister_handler(0);
++}
++
++static void test_fd_dup(void)
++{
++	int orig_fd, dup_fd, fd, vector;
++
++	if (uintr_register_handler(uintr_empty_handler, 0)) {
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	vector = 0;
++	orig_fd = uintr_create_fd(vector, 0);
++	if (orig_fd < 0) {
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	dup_fd = dup(orig_fd);
++	if (dup_fd < 0) {
++		close(orig_fd);
++		uintr_unregister_handler(0);
++		printf("[SKIP]\t%s:%d\n", __func__, __LINE__);
++		return;
++	}
++
++	printf("[RUN]\tDuplicate and close one of the FDs and try re-registering\n");
++
++	close(orig_fd);
++	fd = uintr_create_fd(vector, 0);
++	if (fd < 0) {
++		printf("[OK]\tError returned\n");
++	} else {
++		printf("[FAIL]\tuintr_create_fd didn't throw any error during re-registeration\n");
++		close(fd);
++		nerrs++;
++	}
++
++	close(dup_fd);
++	uintr_unregister_handler(0);
++}
++
++int main(void)
++{
++	if (!uintr_supported())
++		return EXIT_SUCCESS;
++
++	test_no_handler();
++
++	test_register_same_vector();
++
++	test_vectors_beyond_range();
++
++	test_fd_dup();
++
++	return nerrs ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/tools/testing/selftests/uintr/uintr_common.h b/tools/testing/selftests/uintr/uintr_common.h
+new file mode 100644
+index 000000000000..9e465c423058
+--- /dev/null
++++ b/tools/testing/selftests/uintr/uintr_common.h
+@@ -0,0 +1,149 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2021, Intel Corporation.
++ *
++ * Sohil Mehta <sohil.mehta@intel.com>
++ */
++#define _GNU_SOURCE
++#include <syscall.h>
++#include <errno.h>
++#include <x86gprintrin.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sched.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/ioctl.h>
++#include "../kselftest.h"
++
++#ifndef __NR_uintr_register_handler
++#define __NR_uintr_register_handler	471
++#define __NR_uintr_unregister_handler	472
++#define __NR_uintr_create_fd		473
++#define __NR_uintr_register_sender	474
++#define __NR_uintr_unregister_sender	475
++#define __NR_uintr_wait			476
++#endif
++
++#define uintr_register_handler(handler, flags)	syscall(__NR_uintr_register_handler, handler, flags)
++#define uintr_unregister_handler(flags)		syscall(__NR_uintr_unregister_handler, flags)
++#define uintr_create_fd(vector, flags)		syscall(__NR_uintr_create_fd, vector, flags)
++#define uintr_register_sender(fd, flags)	syscall(__NR_uintr_register_sender, fd, flags)
++#define uintr_unregister_sender(fd, flags)	syscall(__NR_uintr_unregister_sender, fd, flags)
++#define uintr_wait(flags)			syscall(__NR_uintr_wait, flags)
++
++void __attribute__((interrupt)) uintr_empty_handler(struct __uintr_frame *ui_frame,
++						    unsigned long long vector)
++{
++}
++
++static inline int uintr_supported(void)
++{
++	if (!uintr_register_handler(uintr_empty_handler, 0)) {
++		uintr_unregister_handler(0);
++		return 1;
++	}
++
++	if (errno == EBUSY)
++		return 1;
++
++	return 0;
++}
++
++static inline void cpu_relax(void)
++{
++	asm volatile("rep; nop" ::: "memory");
++}
++
++void cpu_sets(int cpu, cpu_set_t *set)
++{
++	CPU_ZERO(set);
++	CPU_SET(cpu, set);
++	sched_setaffinity(cpu, sizeof(cpu_set_t), set);
++}
++
++ssize_t sock_fd_write(int sock, void *buf, ssize_t buflen, int fd)
++{
++	ssize_t size;
++	struct msghdr msg;
++	struct iovec iov;
++	union {
++		struct cmsghdr cmsghdr;
++		char control[CMSG_SPACE(sizeof(int))];
++	} cmsgu;
++	struct cmsghdr *cmsg;
++
++	iov.iov_base = buf;
++	iov.iov_len = buflen;
++	msg.msg_name = NULL;
++	msg.msg_namelen = 0;
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	if (fd != -1) {
++		msg.msg_control = cmsgu.control;
++		msg.msg_controllen = sizeof(cmsgu.control);
++
++		cmsg = CMSG_FIRSTHDR(&msg);
++		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++		cmsg->cmsg_level = SOL_SOCKET;
++		cmsg->cmsg_type = SCM_RIGHTS;
++
++		*((int *)CMSG_DATA(cmsg)) = fd;
++	} else {
++		msg.msg_control = NULL;
++		msg.msg_controllen = 0;
++	}
++	size = sendmsg(sock, &msg, 0);
++	if (size < 0)
++		exit(0);
++
++	return size;
++}
++
++ssize_t sock_fd_read(int sock, void *buf, ssize_t bufsize, int *fd)
++{
++	ssize_t size;
++
++	if (fd) {
++		struct msghdr msg;
++		struct iovec iov;
++		union {
++			struct cmsghdr cmsghdr;
++			char control[CMSG_SPACE(sizeof(int))];
++		} cmsgu;
++		struct cmsghdr *cmsg;
++
++		iov.iov_base = buf;
++		iov.iov_len = bufsize;
++		msg.msg_name = NULL;
++		msg.msg_namelen = 0;
++		msg.msg_iov = &iov;
++		msg.msg_iovlen = 1;
++		msg.msg_control = cmsgu.control;
++		msg.msg_controllen = sizeof(cmsgu.control);
++		size = recvmsg(sock, &msg, 0);
++		if (size < 0)
++			exit(0);
++
++		cmsg = CMSG_FIRSTHDR(&msg);
++		if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
++			if (cmsg->cmsg_level != SOL_SOCKET)
++				exit(0);
++			if (cmsg->cmsg_type != SCM_RIGHTS)
++				exit(0);
++
++			*fd = *((int *)CMSG_DATA(cmsg));
++		} else {
++			*fd = -1;
++		}
++	} else {
++		size = read(sock, buf, bufsize);
++		if (size < 0)
++			exit(0);
++	}
++
++	return size;
++}
+-- 
+2.32.0
+
