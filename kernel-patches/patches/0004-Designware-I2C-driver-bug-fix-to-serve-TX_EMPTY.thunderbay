@@ -1,0 +1,106 @@
+From 42b45abce7bb934e89c744982fb58e583d25a5cc Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tamal.saha@intel.com>
+Date: Fri, 30 Jul 2021 17:07:13 +0530
+Subject: [PATCH 04/29] Designware I2C driver bug fix to "serve TX_EMPTY,
+ RX_FULL and STOP_DET routine in sequence although RX_FULL interrupt is raised
+ after STOP_DET by hardware".
+
+Intel bay platform supports multimaster operations over same I2C bus
+using Synopsis I2C designware IP. It is observed that, when multi
+masters initiate i2c operation simultaneously in a loop, SCL line
+is stcucked low forever after few i2c operations. Following interrupt
+sequences are observed in:
+	working case: TX_EMPTY, RX_FULL and STOP_DET
+	non working case: TX_EMPTY, STOP_DET, RX_FULL
+
+Linux kernel I2C designware software does not handle above non working
+sequence. This patch is introduced to "serve TX_EMPTY, RX_FULL and
+STOP_DET routine in sequence although RX_FULL interrupt is raised
+after STOP_DET by hardware".
+
+------                      -------
+ I2C |----------------------| I2C
+ M1  |     |         |      | M2
+     |-----|---------|------|
+-----    | |       | |      -------
+         | |       | |
+        ------    -----
+          S1       S2
+        ------    -----
+
+Signed-off-by: Tamal Saha <tamal.saha@intel.com>
+---
+ drivers/i2c/busses/i2c-designware-core.h   |  2 ++
+ drivers/i2c/busses/i2c-designware-master.c | 11 ++++++++---
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-designware-core.h b/drivers/i2c/busses/i2c-designware-core.h
+index 60a2e750cee9..f0ce3713e2e1 100644
+--- a/drivers/i2c/busses/i2c-designware-core.h
++++ b/drivers/i2c/busses/i2c-designware-core.h
+@@ -212,6 +212,7 @@ struct reset_control;
+  * @tx_fifo_depth: depth of the hardware tx fifo
+  * @rx_fifo_depth: depth of the hardware rx fifo
+  * @rx_outstanding: current master-rx elements in tx fifo
++ * @rx_fifo_interrupt_serviced: to service RX_FULL interrupt before STOP_DET
+  * @timings: bus clock frequency, SDA hold and other timings
+  * @sda_hold_time: SDA hold value
+  * @ss_hcnt: standard speed HCNT value
+@@ -268,6 +269,7 @@ struct dw_i2c_dev {
+ 	unsigned int		tx_fifo_depth;
+ 	unsigned int		rx_fifo_depth;
+ 	int			rx_outstanding;
++	bool			rx_fifo_interrupt_serviced;
+ 	struct i2c_timings	timings;
+ 	u32			sda_hold_time;
+ 	u16			ss_hcnt;
+diff --git a/drivers/i2c/busses/i2c-designware-master.c b/drivers/i2c/busses/i2c-designware-master.c
+index 9b08bb5df38d..bdcf47ce5f4c 100644
+--- a/drivers/i2c/busses/i2c-designware-master.c
++++ b/drivers/i2c/busses/i2c-designware-master.c
+@@ -439,7 +439,7 @@ i2c_dw_xfer_msg(struct dw_i2c_dev *dev)
+ 				/* Avoid rx buffer overrun */
+ 				if (dev->rx_outstanding >= dev->rx_fifo_depth)
+ 					break;
+-
++				dev->rx_fifo_interrupt_serviced = FALSE;
+ 				regmap_write(dev->map, DW_IC_DATA_CMD,
+ 					     cmd | 0x100);
+ 				rx_limit--;
+@@ -582,6 +582,7 @@ i2c_dw_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+ 	dev->status = STATUS_IDLE;
+ 	dev->abort_source = 0;
+ 	dev->rx_outstanding = 0;
++	dev->rx_fifo_interrupt_serviced = TRUE;
+ 
+ 	ret = i2c_dw_acquire_lock(dev);
+ 	if (ret)
+@@ -729,11 +730,14 @@ static int i2c_dw_irq_handler_master(struct dw_i2c_dev *dev)
+ 		 * buffers are flushed. Make sure to skip them.
+ 		 */
+ 		regmap_write(dev->map, DW_IC_INTR_MASK, 0);
++		dev->rx_fifo_interrupt_serviced = TRUE;
+ 		goto tx_aborted;
+ 	}
+ 
+-	if (stat & DW_IC_INTR_RX_FULL)
++	if (stat & DW_IC_INTR_RX_FULL) {
++		dev->rx_fifo_interrupt_serviced = TRUE;
+ 		i2c_dw_read(dev);
++	}
+ 
+ 	if (stat & DW_IC_INTR_TX_EMPTY)
+ 		i2c_dw_xfer_msg(dev);
+@@ -745,7 +749,8 @@ static int i2c_dw_irq_handler_master(struct dw_i2c_dev *dev)
+ 	 */
+ 
+ tx_aborted:
+-	if ((stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || dev->msg_err)
++	if (((stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || dev->msg_err) &&
++			(dev->rx_fifo_interrupt_serviced))
+ 		complete(&dev->cmd_complete);
+ 	else if (unlikely(dev->flags & ACCESS_INTR_MASK)) {
+ 		/* Workaround to trigger pending interrupt */
+-- 
+2.25.1
+
