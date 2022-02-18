@@ -5,7 +5,7 @@ KVERSION=5
 KPATCHLEVEL=17
 KSUBLEVEL=0
 KEXTRAVERSION=-rc3
-KRTV=
+KRTV=-rt6
 
 KSRC_MIRROR=
 
@@ -14,4 +14,4 @@ KCFG_BASE_OS="base-os/hirsute.config-5.11.0-16-generic"
 KCFG_FEATURES_DIR="features/"
 KCFG_OVERLAY="overlay/overlay.cfg"
 
-KSRC_REPO=https://github.com/torvalds/linux.git
+KSRC_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-rt-devel.git
