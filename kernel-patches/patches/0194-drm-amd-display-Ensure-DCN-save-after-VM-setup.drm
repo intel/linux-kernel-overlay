@@ -1,0 +1,152 @@
+From 79142a71673ee64dcc4c9bcec4725ff28ae84859 Mon Sep 17 00:00:00 2001
+From: Jake Wang <haonan.wang2@amd.com>
+Date: Thu, 5 Aug 2021 14:43:41 -0400
+Subject: [PATCH 194/888] drm/amd/display: Ensure DCN save after VM setup
+
+[Why]
+DM initializes VM context after DMCUB initialization.
+This results in loss of DCN_VM_CONTEXT registers after z10.
+
+[How]
+Notify DMCUB when VM setup is complete, and have DMCUB
+save init registers.
+
+v2: squash in CONFIG_DRM_AMD_DC_DCN3_1 fix
+
+Reviewed-by: Nicholas Kazlauskas <nicholas.kazlauskas@amd.com>
+Acked-by: Wayne Lin <wayne.lin@amd.com>
+Signed-off-by: Jake Wang <haonan.wang2@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c           |  6 ++++++
+ drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c |  3 +++
+ drivers/gpu/drm/amd/display/dc/dc.h                |  1 +
+ drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c | 12 ++++++++++++
+ drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.h |  1 +
+ drivers/gpu/drm/amd/display/dc/dcn31/dcn31_init.c  |  1 +
+ drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h  |  1 +
+ drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h    |  5 +++++
+ 8 files changed, 30 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 7a442fcfa6ac..c798c65d4276 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1549,6 +1549,12 @@ void dc_z10_restore(struct dc *dc)
+ 	if (dc->hwss.z10_restore)
+ 		dc->hwss.z10_restore(dc);
+ }
++
++void dc_z10_save_init(struct dc *dc)
++{
++	if (dc->hwss.z10_save_init)
++		dc->hwss.z10_save_init(dc);
++}
+ #endif
+ /*
+  * Applies given context to HW and copy it into current context.
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c b/drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c
+index f2b39ec35c89..cde8ed2560b3 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c
+@@ -47,6 +47,9 @@ int dc_setup_system_context(struct dc *dc, struct dc_phy_addr_space_config *pa_c
+ 		 */
+ 		memcpy(&dc->vm_pa_config, pa_config, sizeof(struct dc_phy_addr_space_config));
+ 		dc->vm_pa_config.valid = true;
++#if defined(CONFIG_DRM_AMD_DC_DCN)
++		dc_z10_save_init(dc);
++#endif
+ 	}
+ 
+ 	return num_vmids;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 03b81e5c5d67..0494e6dcf4dc 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -1338,6 +1338,7 @@ void dc_hardware_release(struct dc *dc);
+ bool dc_set_psr_allow_active(struct dc *dc, bool enable);
+ #if defined(CONFIG_DRM_AMD_DC_DCN)
+ void dc_z10_restore(struct dc *dc);
++void dc_z10_save_init(struct dc *dc);
+ #endif
+ 
+ bool dc_enable_dmub_notifications(struct dc *dc);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c
+index 6399e8acd093..3f2333ec67e2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c
+@@ -407,6 +407,18 @@ void dcn31_update_info_frame(struct pipe_ctx *pipe_ctx)
+ 			&pipe_ctx->stream_res.encoder_info_frame);
+ 	}
+ }
++void dcn31_z10_save_init(struct dc *dc)
++{
++	union dmub_rb_cmd cmd;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.dcn_restore.header.type = DMUB_CMD__IDLE_OPT;
++	cmd.dcn_restore.header.sub_type = DMUB_CMD__IDLE_OPT_DCN_SAVE_INIT;
++
++	dc_dmub_srv_cmd_queue(dc->ctx->dmub_srv, &cmd);
++	dc_dmub_srv_cmd_execute(dc->ctx->dmub_srv);
++	dc_dmub_srv_wait_idle(dc->ctx->dmub_srv);
++}
+ 
+ void dcn31_z10_restore(struct dc *dc)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.h
+index 40dfebe78fdd..140435e4f7ff 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.h
+@@ -44,6 +44,7 @@ void dcn31_enable_power_gating_plane(
+ void dcn31_update_info_frame(struct pipe_ctx *pipe_ctx);
+ 
+ void dcn31_z10_restore(struct dc *dc);
++void dcn31_z10_save_init(struct dc *dc);
+ 
+ void dcn31_hubp_pg_control(struct dce_hwseq *hws, unsigned int hubp_inst, bool power_on);
+ int dcn31_init_sys_ctx(struct dce_hwseq *hws, struct dc *dc, struct dc_phy_addr_space_config *pa_config);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_init.c b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_init.c
+index 05954045c332..40011cd3c8ef 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_init.c
+@@ -97,6 +97,7 @@ static const struct hw_sequencer_funcs dcn31_funcs = {
+ 	.set_abm_immediate_disable = dcn21_set_abm_immediate_disable,
+ 	.set_pipe = dcn21_set_pipe,
+ 	.z10_restore = dcn31_z10_restore,
++	.z10_save_init = dcn31_z10_save_init,
+ 	.is_abm_supported = dcn31_is_abm_supported,
+ 	.set_disp_pattern_generator = dcn30_set_disp_pattern_generator,
+ 	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 5ab008e62b82..ad5f2adcc40d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -237,6 +237,7 @@ struct hw_sequencer_funcs {
+ 			int width, int height, int offset);
+ 
+ 	void (*z10_restore)(struct dc *dc);
++	void (*z10_save_init)(struct dc *dc);
+ 
+ 	void (*update_visual_confirm_color)(struct dc *dc,
+ 			struct pipe_ctx *pipe_ctx,
+diff --git a/drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h b/drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h
+index 5950da7bf252..a6f3d58f82c6 100644
+--- a/drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h
++++ b/drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h
+@@ -860,6 +860,11 @@ enum dmub_cmd_idle_opt_type {
+ 	 * DCN hardware restore.
+ 	 */
+ 	DMUB_CMD__IDLE_OPT_DCN_RESTORE = 0,
++
++	/**
++	 * DCN hardware save.
++	 */
++	DMUB_CMD__IDLE_OPT_DCN_SAVE_INIT = 1
+ };
+ 
+ /**
+-- 
+2.25.1
+

@@ -1,0 +1,286 @@
+From 74f318fd60440388365afda3a54dfb0d4c3a21a4 Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Wed, 24 Nov 2021 13:16:42 +0800
+Subject: [PATCH 062/888] Revert "drm/i915/selftests: Add initial GuC selftest
+ for scrubbing lost G2H"
+
+This reverts commit a9c2f1b0bf281789cd86ab796b4b10975229f7ec.
+---
+ drivers/gpu/drm/i915/gt/intel_context_types.h |  18 ---
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c |  25 ----
+ drivers/gpu/drm/i915/gt/uc/selftest_guc.c     | 126 ------------------
+ .../drm/i915/selftests/i915_live_selftests.h  |   1 -
+ .../i915/selftests/intel_scheduler_helpers.c  |  12 --
+ .../i915/selftests/intel_scheduler_helpers.h  |   2 -
+ 6 files changed, 184 deletions(-)
+ delete mode 100644 drivers/gpu/drm/i915/gt/uc/selftest_guc.c
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_context_types.h b/drivers/gpu/drm/i915/gt/intel_context_types.h
+index 3a73f3117873..e54351a170e2 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_context_types.h
+@@ -198,24 +198,6 @@ struct intel_context {
+ 	 */
+ 	u8 guc_prio;
+ 	u32 guc_prio_count[GUC_CLIENT_PRIORITY_NUM];
+-
+-#ifdef CONFIG_DRM_I915_SELFTEST
+-	/**
+-	 * @drop_schedule_enable: Force drop of schedule enable G2H for selftest
+-	 */
+-	bool drop_schedule_enable;
+-
+-	/**
+-	 * @drop_schedule_disable: Force drop of schedule disable G2H for
+-	 * selftest
+-	 */
+-	bool drop_schedule_disable;
+-
+-	/**
+-	 * @drop_deregister: Force drop of deregister G2H for selftest
+-	 */
+-	bool drop_deregister;
+-#endif
+ };
+ 
+ #endif /* __INTEL_CONTEXT_TYPES__ */
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index e0e85e4ad512..e53a4ef7d442 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -2635,13 +2635,6 @@ int intel_guc_deregister_done_process_msg(struct intel_guc *guc,
+ 
+ 	trace_intel_context_deregister_done(ce);
+ 
+-#ifdef CONFIG_DRM_I915_SELFTEST
+-	if (unlikely(ce->drop_deregister)) {
+-		ce->drop_deregister = false;
+-		return 0;
+-	}
+-#endif
+-
+ 	if (context_wait_for_deregister_to_register(ce)) {
+ 		struct intel_runtime_pm *runtime_pm =
+ 			&ce->engine->gt->i915->runtime_pm;
+@@ -2696,24 +2689,10 @@ int intel_guc_sched_done_process_msg(struct intel_guc *guc,
+ 	trace_intel_context_sched_done(ce);
+ 
+ 	if (context_pending_enable(ce)) {
+-#ifdef CONFIG_DRM_I915_SELFTEST
+-		if (unlikely(ce->drop_schedule_enable)) {
+-			ce->drop_schedule_enable = false;
+-			return 0;
+-		}
+-#endif
+-
+ 		clr_context_pending_enable(ce);
+ 	} else if (context_pending_disable(ce)) {
+ 		bool banned;
+ 
+-#ifdef CONFIG_DRM_I915_SELFTEST
+-		if (unlikely(ce->drop_schedule_disable)) {
+-			ce->drop_schedule_disable = false;
+-			return 0;
+-		}
+-#endif
+-
+ 		/*
+ 		 * Unpin must be done before __guc_signal_context_fence,
+ 		 * otherwise a race exists between the requests getting
+@@ -3090,7 +3069,3 @@ bool intel_guc_virtual_engine_has_heartbeat(const struct intel_engine_cs *ve)
+ 
+ 	return false;
+ }
+-
+-#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+-#include "selftest_guc.c"
+-#endif
+diff --git a/drivers/gpu/drm/i915/gt/uc/selftest_guc.c b/drivers/gpu/drm/i915/gt/uc/selftest_guc.c
+deleted file mode 100644
+index 264e2f705c17..000000000000
+--- a/drivers/gpu/drm/i915/gt/uc/selftest_guc.c
++++ /dev/null
+@@ -1,126 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-/*
+- * Copyright �� 2021 Intel Corporation
+- */
+-
+-#include "selftests/intel_scheduler_helpers.h"
+-
+-static struct i915_request *nop_user_request(struct intel_context *ce,
+-					     struct i915_request *from)
+-{
+-	struct i915_request *rq;
+-	int ret;
+-
+-	rq = intel_context_create_request(ce);
+-	if (IS_ERR(rq))
+-		return rq;
+-
+-	if (from) {
+-		ret = i915_sw_fence_await_dma_fence(&rq->submit,
+-						    &from->fence, 0,
+-						    I915_FENCE_GFP);
+-		if (ret < 0) {
+-			i915_request_put(rq);
+-			return ERR_PTR(ret);
+-		}
+-	}
+-
+-	i915_request_get(rq);
+-	i915_request_add(rq);
+-
+-	return rq;
+-}
+-
+-static int intel_guc_scrub_ctbs(void *arg)
+-{
+-	struct intel_gt *gt = arg;
+-	int ret = 0;
+-	int i;
+-	struct i915_request *last[3] = {NULL, NULL, NULL}, *rq;
+-	intel_wakeref_t wakeref;
+-	struct intel_engine_cs *engine;
+-	struct intel_context *ce;
+-
+-	wakeref = intel_runtime_pm_get(gt->uncore->rpm);
+-	engine = intel_selftest_find_any_engine(gt);
+-
+-	/* Submit requests and inject errors forcing G2H to be dropped */
+-	for (i = 0; i < 3; ++i) {
+-		ce = intel_context_create(engine);
+-		if (IS_ERR(ce)) {
+-			ret = PTR_ERR(ce);
+-			pr_err("Failed to create context, %d: %d\n", i, ret);
+-			goto err;
+-		}
+-
+-		switch (i) {
+-		case 0:
+-			ce->drop_schedule_enable = true;
+-			break;
+-		case 1:
+-			ce->drop_schedule_disable = true;
+-			break;
+-		case 2:
+-			ce->drop_deregister = true;
+-			break;
+-		}
+-
+-		rq = nop_user_request(ce, NULL);
+-		intel_context_put(ce);
+-
+-		if (IS_ERR(rq)) {
+-			ret = PTR_ERR(rq);
+-			pr_err("Failed to create request, %d: %d\n", i, ret);
+-			goto err;
+-		}
+-
+-		last[i] = rq;
+-	}
+-
+-	for (i = 0; i < 3; ++i) {
+-		ret = i915_request_wait(last[i], 0, HZ);
+-		if (ret < 0) {
+-			pr_err("Last request failed to complete: %d\n", ret);
+-			goto err;
+-		}
+-		i915_request_put(last[i]);
+-		last[i] = NULL;
+-	}
+-
+-	/* Force all H2G / G2H to be submitted / processed */
+-	intel_gt_retire_requests(gt);
+-	msleep(500);
+-
+-	/* Scrub missing G2H */
+-	intel_gt_handle_error(engine->gt, -1, 0, "selftest reset");
+-
+-	ret = intel_gt_wait_for_idle(gt, HZ);
+-	if (ret < 0) {
+-		pr_err("GT failed to idle: %d\n", ret);
+-		goto err;
+-	}
+-
+-err:
+-	for (i = 0; i < 3; ++i)
+-		if (last[i])
+-			i915_request_put(last[i]);
+-	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+-
+-	return ret;
+-}
+-
+-int intel_guc_live_selftests(struct drm_i915_private *i915)
+-{
+-	static const struct i915_subtest tests[] = {
+-		SUBTEST(intel_guc_scrub_ctbs),
+-	};
+-	struct intel_gt *gt = &i915->gt;
+-
+-	if (intel_gt_is_wedged(gt))
+-		return 0;
+-
+-	if (!intel_uc_uses_guc_submission(&gt->uc))
+-		return 0;
+-
+-	return intel_gt_live_subtests(tests, gt);
+-}
+diff --git a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+index 3cf6758931f9..cfa5c4165a4f 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+@@ -47,6 +47,5 @@ selftest(execlists, intel_execlists_live_selftests)
+ selftest(ring_submission, intel_ring_submission_live_selftests)
+ selftest(perf, i915_perf_live_selftests)
+ selftest(slpc, intel_slpc_live_selftests)
+-selftest(guc, intel_guc_live_selftests)
+ /* Here be dragons: keep last to run last! */
+ selftest(late_gt_pm, intel_gt_pm_late_selftests)
+diff --git a/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.c b/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.c
+index 310fb83c527e..4b328346b48a 100644
+--- a/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.c
++++ b/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.c
+@@ -14,18 +14,6 @@
+ #define REDUCED_PREEMPT		10
+ #define WAIT_FOR_RESET_TIME	10000
+ 
+-struct intel_engine_cs *intel_selftest_find_any_engine(struct intel_gt *gt)
+-{
+-	struct intel_engine_cs *engine;
+-	enum intel_engine_id id;
+-
+-	for_each_engine(engine, gt, id)
+-		return engine;
+-
+-	pr_err("No valid engine found!\n");
+-	return NULL;
+-}
+-
+ int intel_selftest_modify_policy(struct intel_engine_cs *engine,
+ 				 struct intel_selftest_saved_policy *saved,
+ 				 u32 modify_type)
+diff --git a/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.h b/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.h
+index ae60bb507f45..35c098601ac0 100644
+--- a/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.h
++++ b/drivers/gpu/drm/i915/selftests/intel_scheduler_helpers.h
+@@ -10,7 +10,6 @@
+ 
+ struct i915_request;
+ struct intel_engine_cs;
+-struct intel_gt;
+ 
+ struct intel_selftest_saved_policy {
+ 	u32 flags;
+@@ -24,7 +23,6 @@ enum selftest_scheduler_modify {
+ 	SELFTEST_SCHEDULER_MODIFY_FAST_RESET,
+ };
+ 
+-struct intel_engine_cs *intel_selftest_find_any_engine(struct intel_gt *gt);
+ int intel_selftest_modify_policy(struct intel_engine_cs *engine,
+ 				 struct intel_selftest_saved_policy *saved,
+ 				 enum selftest_scheduler_modify modify_type);
+-- 
+2.25.1
+

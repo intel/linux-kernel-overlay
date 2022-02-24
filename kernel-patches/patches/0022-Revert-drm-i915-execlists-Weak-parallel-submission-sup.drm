@@ -1,0 +1,175 @@
+From e8943ca552eb3bb400dcbf9b89392dc118bc5d94 Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Wed, 24 Nov 2021 13:16:36 +0800
+Subject: [PATCH 022/888] Revert "drm/i915/execlists: Weak parallel submission
+ support for execlists"
+
+This reverts commit c3e9ca0d2a36200f9484904001637e9d4dc795ab.
+---
+ drivers/gpu/drm/i915/gem/i915_gem_context.c   |  9 +--
+ drivers/gpu/drm/i915/gt/intel_context.c       |  4 +-
+ .../drm/i915/gt/intel_execlists_submission.c  | 57 +------------------
+ drivers/gpu/drm/i915/gt/intel_lrc.c           |  2 -
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c |  2 +
+ 5 files changed, 9 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_context.c b/drivers/gpu/drm/i915/gem/i915_gem_context.c
+index 817e66625642..8e4c5a5918d0 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_context.c
+@@ -529,6 +529,9 @@ set_proto_ctx_engines_parallel_submit(struct i915_user_extension __user *base,
+ 	struct intel_engine_cs **siblings = NULL;
+ 	intel_engine_mask_t prev_mask;
+ 
++	if (!(intel_uc_uses_guc_submission(&i915->gt.uc)))
++		return -ENODEV;
++
+ 	if (get_user(slot, &ext->engine_index))
+ 		return -EFAULT;
+ 
+@@ -538,12 +541,6 @@ set_proto_ctx_engines_parallel_submit(struct i915_user_extension __user *base,
+ 	if (get_user(num_siblings, &ext->num_siblings))
+ 		return -EFAULT;
+ 
+-	if (!intel_uc_uses_guc_submission(&i915->gt.uc) && num_siblings != 1) {
+-		drm_dbg(&i915->drm, "Only 1 sibling (%d) supported in non-GuC mode\n",
+-			num_siblings);
+-		return -EINVAL;
+-	}
+-
+ 	if (slot >= set->num_engines) {
+ 		drm_dbg(&i915->drm, "Invalid placement value, %d >= %d\n",
+ 			slot, set->num_engines);
+diff --git a/drivers/gpu/drm/i915/gt/intel_context.c b/drivers/gpu/drm/i915/gt/intel_context.c
+index b0f0cac6a151..2de62649e275 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context.c
++++ b/drivers/gpu/drm/i915/gt/intel_context.c
+@@ -79,8 +79,7 @@ static int intel_context_active_acquire(struct intel_context *ce)
+ 
+ 	__i915_active_acquire(&ce->active);
+ 
+-	if (intel_context_is_barrier(ce) || intel_engine_uses_guc(ce->engine) ||
+-	    intel_context_is_parallel(ce))
++	if (intel_context_is_barrier(ce) || intel_engine_uses_guc(ce->engine))
+ 		return 0;
+ 
+ 	/* Preallocate tracking nodes */
+@@ -555,6 +554,7 @@ void intel_context_bind_parent_child(struct intel_context *parent,
+ 	 * Callers responsibility to validate that this function is used
+ 	 * correctly but we use GEM_BUG_ON here ensure that they do.
+ 	 */
++	GEM_BUG_ON(!intel_engine_uses_guc(parent->engine));
+ 	GEM_BUG_ON(intel_context_is_pinned(parent));
+ 	GEM_BUG_ON(intel_context_is_child(parent));
+ 	GEM_BUG_ON(intel_context_is_pinned(child));
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index 8875d85a1677..d1e2d6f8ff81 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -927,7 +927,8 @@ static void execlists_submit_ports(struct intel_engine_cs *engine)
+ 
+ static bool ctx_single_port_submission(const struct intel_context *ce)
+ {
+-	return intel_context_force_single_submission(ce);
++	return (IS_ENABLED(CONFIG_DRM_I915_GVT) &&
++		intel_context_force_single_submission(ce));
+ }
+ 
+ static bool can_merge_ctx(const struct intel_context *prev,
+@@ -2597,59 +2598,6 @@ static void execlists_context_cancel_request(struct intel_context *ce,
+ 				      current->comm);
+ }
+ 
+-static struct intel_context *
+-execlists_create_parallel(struct intel_engine_cs **engines,
+-			  unsigned int num_siblings,
+-			  unsigned int width)
+-{
+-	struct intel_engine_cs **siblings = NULL;
+-	struct intel_context *parent = NULL, *ce, *err;
+-	int i, j;
+-
+-	GEM_BUG_ON(num_siblings != 1);
+-
+-	siblings = kmalloc_array(num_siblings,
+-				 sizeof(*siblings),
+-				 GFP_KERNEL);
+-	if (!siblings)
+-		return ERR_PTR(-ENOMEM);
+-
+-	for (i = 0; i < width; ++i) {
+-		for (j = 0; j < num_siblings; ++j)
+-			siblings[j] = engines[i * num_siblings + j];
+-
+-		ce = intel_context_create(siblings[0]);
+-		if (!ce) {
+-			err = ERR_PTR(-ENOMEM);
+-			goto unwind;
+-		}
+-
+-		if (i == 0) {
+-			parent = ce;
+-		} else {
+-			intel_context_bind_parent_child(parent, ce);
+-		}
+-	}
+-
+-	parent->fence_context = dma_fence_context_alloc(1);
+-
+-	intel_context_set_nopreempt(parent);
+-	intel_context_set_single_submission(parent);
+-	for_each_child(parent, ce) {
+-		intel_context_set_nopreempt(ce);
+-		intel_context_set_single_submission(ce);
+-	}
+-
+-	kfree(siblings);
+-	return parent;
+-
+-unwind:
+-	if (parent)
+-		intel_context_put(parent);
+-	kfree(siblings);
+-	return err;
+-}
+-
+ static const struct intel_context_ops execlists_context_ops = {
+ 	.flags = COPS_HAS_INFLIGHT,
+ 
+@@ -2668,7 +2616,6 @@ static const struct intel_context_ops execlists_context_ops = {
+ 	.reset = lrc_reset,
+ 	.destroy = lrc_destroy,
+ 
+-	.create_parallel = execlists_create_parallel,
+ 	.create_virtual = execlists_create_virtual,
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.c b/drivers/gpu/drm/i915/gt/intel_lrc.c
+index 7e1153f84cca..0ddbad4e062a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -983,8 +983,6 @@ lrc_pin(struct intel_context *ce,
+ 
+ void lrc_unpin(struct intel_context *ce)
+ {
+-	if (unlikely(ce->last_rq))
+-		i915_request_put(ce->last_rq);
+ 	check_redzone((void *)ce->lrc_reg_state - LRC_STATE_OFFSET,
+ 		      ce->engine);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index a70a4e2f5bde..c857ce920942 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -2904,6 +2904,8 @@ static void guc_parent_context_unpin(struct intel_context *ce)
+ 	GEM_BUG_ON(!intel_context_is_parent(ce));
+ 	GEM_BUG_ON(!intel_engine_is_virtual(ce->engine));
+ 
++	if (ce->last_rq)
++		i915_request_put(ce->last_rq);
+ 	unpin_guc_id(guc, ce);
+ 	lrc_unpin(ce);
+ }
+-- 
+2.25.1
+
