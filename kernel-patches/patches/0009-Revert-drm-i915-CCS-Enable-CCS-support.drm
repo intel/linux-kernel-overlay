@@ -1,0 +1,789 @@
+From 82ca1bd25aedd7a389d87e8e66f1947a3a079358 Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Wed, 24 Nov 2021 13:16:34 +0800
+Subject: [PATCH 009/888] Revert "drm/i915/CCS: Enable CCS support"
+
+This reverts commit 6b36d7f522def74c2a04a5527ad99ec2ec979090.
+---
+ .../drm/i915/gem/selftests/i915_gem_context.c |  7 ++--
+ drivers/gpu/drm/i915/gt/gen8_engine_cs.c      | 31 +++++-----------
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c     | 37 -------------------
+ drivers/gpu/drm/i915/gt/intel_engine_types.h  | 12 +-----
+ drivers/gpu/drm/i915/gt/intel_engine_user.c   |  5 +--
+ .../drm/i915/gt/intel_execlists_submission.c  | 35 +-----------------
+ drivers/gpu/drm/i915/gt/intel_gpu_commands.h  | 15 --------
+ drivers/gpu/drm/i915/gt/intel_gt_irq.c        | 15 +-------
+ drivers/gpu/drm/i915/gt/intel_lrc.c           |  5 +--
+ drivers/gpu/drm/i915/gt/intel_lrc.h           | 10 -----
+ drivers/gpu/drm/i915/gt/intel_ppgtt.c         | 11 ------
+ .../gpu/drm/i915/gt/iov/intel_iov_service.c   |  5 ++-
+ drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c    |  5 ---
+ drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h   | 13 +++----
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c | 29 +--------------
+ drivers/gpu/drm/i915/i915_drv.c               | 15 --------
+ drivers/gpu/drm/i915/i915_drv.h               |  2 -
+ drivers/gpu/drm/i915/i915_perf.c              |  4 +-
+ drivers/gpu/drm/i915/i915_reg.h               | 24 +-----------
+ include/uapi/drm/i915_drm.h                   |  1 -
+ 20 files changed, 32 insertions(+), 249 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/selftests/i915_gem_context.c b/drivers/gpu/drm/i915/gem/selftests/i915_gem_context.c
+index 531db002c379..8eb5050f8cb3 100644
+--- a/drivers/gpu/drm/i915/gem/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/gem/selftests/i915_gem_context.c
+@@ -889,8 +889,7 @@ static int igt_shared_ctx_exec(void *arg)
+ 	return err;
+ }
+ 
+-static int rpcs_query_batch(struct drm_i915_gem_object *rpcs,
+-			    struct i915_vma *vma, struct intel_engine_cs *engine)
++static int rpcs_query_batch(struct drm_i915_gem_object *rpcs, struct i915_vma *vma)
+ {
+ 	u32 *cmd;
+ 
+@@ -901,7 +900,7 @@ static int rpcs_query_batch(struct drm_i915_gem_object *rpcs,
+ 		return PTR_ERR(cmd);
+ 
+ 	*cmd++ = MI_STORE_REGISTER_MEM_GEN8;
+-	*cmd++ = i915_mmio_reg_offset(GEN8_R_PWR_CLK_STATE(RENDER_RING_BASE));
++	*cmd++ = i915_mmio_reg_offset(GEN8_R_PWR_CLK_STATE);
+ 	*cmd++ = lower_32_bits(vma->node.start);
+ 	*cmd++ = upper_32_bits(vma->node.start);
+ 	*cmd = MI_BATCH_BUFFER_END;
+@@ -962,7 +961,7 @@ emit_rpcs_query(struct drm_i915_gem_object *obj,
+ 	if (err)
+ 		goto err_vma;
+ 
+-	err = rpcs_query_batch(rpcs, vma, ce->engine);
++	err = rpcs_query_batch(rpcs, vma);
+ 	if (err)
+ 		goto err_batch;
+ 
+diff --git a/drivers/gpu/drm/i915/gt/gen8_engine_cs.c b/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
+index 11195401f747..461844dffd7e 100644
+--- a/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
+@@ -200,8 +200,6 @@ static u32 *gen12_emit_aux_table_inv(const i915_reg_t inv_reg, u32 *cs)
+ 
+ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
+ {
+-	struct intel_engine_cs *engine = rq->engine;
+-
+ 	if (mode & EMIT_FLUSH) {
+ 		u32 flags = 0;
+ 		u32 *cs;
+@@ -220,9 +218,6 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
+ 
+ 		flags |= PIPE_CONTROL_CS_STALL;
+ 
+-		if (engine->class == COMPUTE_CLASS)
+-			flags &= ~PIPE_CONTROL_RENDER_ONLY_FLAGS;
+-
+ 		cs = intel_ring_begin(rq, 6);
+ 		if (IS_ERR(cs))
+ 			return PTR_ERR(cs);
+@@ -250,9 +245,6 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
+ 
+ 		flags |= PIPE_CONTROL_CS_STALL;
+ 
+-		if (engine->class == COMPUTE_CLASS)
+-			flags &= ~PIPE_CONTROL_RENDER_ONLY_FLAGS;
+-
+ 		cs = intel_ring_begin(rq, 8 + 4);
+ 		if (IS_ERR(cs))
+ 			return PTR_ERR(cs);
+@@ -625,24 +617,19 @@ u32 *gen12_emit_fini_breadcrumb_xcs(struct i915_request *rq, u32 *cs)
+ 
+ u32 *gen12_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
+ {
+-	u32 flags = (PIPE_CONTROL_CS_STALL |
+-		     PIPE_CONTROL_TILE_CACHE_FLUSH |
+-		     PIPE_CONTROL_FLUSH_L3 |
+-		     PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH |
+-		     PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+-		     /* Wa_1409600907:tgl,adl-p */
+-		     PIPE_CONTROL_DEPTH_STALL |
+-		     PIPE_CONTROL_DC_FLUSH_ENABLE |
+-		     PIPE_CONTROL_FLUSH_ENABLE);
+-
+-	if (rq->engine->class == COMPUTE_CLASS)
+-		flags &= ~PIPE_CONTROL_RENDER_ONLY_FLAGS;
+-
+ 	cs = gen12_emit_ggtt_write_rcs(cs,
+ 				       rq->fence.seqno,
+ 				       hwsp_offset(rq),
+ 				       PIPE_CONTROL0_HDC_PIPELINE_FLUSH,
+-				       flags);
++				       PIPE_CONTROL_CS_STALL |
++				       PIPE_CONTROL_TILE_CACHE_FLUSH |
++				       PIPE_CONTROL_FLUSH_L3 |
++				       PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH |
++				       PIPE_CONTROL_DEPTH_CACHE_FLUSH |
++				       /* Wa_1409600907:tgl */
++				       PIPE_CONTROL_DEPTH_STALL |
++				       PIPE_CONTROL_DC_FLUSH_ENABLE |
++				       PIPE_CONTROL_FLUSH_ENABLE);
+ 
+ 	return gen12_emit_fini_breadcrumb_tail(rq, cs);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index d1111c7fc96d..324db532b0fa 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -153,34 +153,6 @@ static const struct engine_info intel_engines[] = {
+ 			{ .graphics_ver = 12, .base = XEHP_VEBOX4_RING_BASE }
+ 		},
+ 	},
+-	[CCS0] = {
+-		.class = COMPUTE_CLASS,
+-		.instance = 0,
+-		.mmio_bases = {
+-			{ .graphics_ver = 12, .base = GEN12_COMPUTE0_RING_BASE }
+-		}
+-	},
+-	[CCS1] = {
+-		.class = COMPUTE_CLASS,
+-		.instance = 1,
+-		.mmio_bases = {
+-			{ .graphics_ver = 12, .base = GEN12_COMPUTE1_RING_BASE }
+-		}
+-	},
+-	[CCS2] = {
+-		.class = COMPUTE_CLASS,
+-		.instance = 2,
+-		.mmio_bases = {
+-			{ .graphics_ver = 12, .base = GEN12_COMPUTE2_RING_BASE }
+-		}
+-	},
+-	[CCS3] = {
+-		.class = COMPUTE_CLASS,
+-		.instance = 3,
+-		.mmio_bases = {
+-			{ .graphics_ver = 12, .base = GEN12_COMPUTE3_RING_BASE }
+-		}
+-	},
+ };
+ 
+ /**
+@@ -205,9 +177,6 @@ u32 intel_engine_context_size(struct intel_gt *gt, u8 class)
+ 	BUILD_BUG_ON(I915_GTT_PAGE_SIZE != PAGE_SIZE);
+ 
+ 	switch (class) {
+-	case COMPUTE_CLASS: /* TODO: same as render, for now... */
+-		GEM_BUG_ON(!CCS_MASK(gt));
+-		/* fall through */
+ 	case RENDER_CLASS:
+ 		switch (GRAPHICS_VER(gt->i915)) {
+ 		default:
+@@ -387,12 +356,6 @@ static int intel_engine_setup(struct intel_gt *gt, enum intel_engine_id id,
+ 	if (GRAPHICS_VER(i915) == 12 && engine->class == RENDER_CLASS)
+ 		engine->props.preempt_timeout_ms = 0;
+ 
+-	/* features common between engines sharing EUs */
+-	if (engine->class == RENDER_CLASS || engine->class == COMPUTE_CLASS) {
+-		engine->flags |= I915_ENGINE_HAS_RCS_REG_STATE;
+-		engine->flags |= I915_ENGINE_HAS_EU_PRIORITY;
+-	}
+-
+ 	engine->defaults = engine->props; /* never to change again */
+ 
+ 	engine->context_size = intel_engine_context_size(gt, engine->class);
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_types.h b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+index efb40aa91c0f..fddf35546b58 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+@@ -33,8 +33,7 @@
+ #define VIDEO_ENHANCEMENT_CLASS	2
+ #define COPY_ENGINE_CLASS	3
+ #define OTHER_CLASS		4
+-#define COMPUTE_CLASS		5
+-#define MAX_ENGINE_CLASS	5
++#define MAX_ENGINE_CLASS	4
+ #define MAX_ENGINE_INSTANCE	7
+ 
+ #define I915_MAX_SLICES	3
+@@ -93,7 +92,7 @@ struct i915_ctx_workarounds {
+ 
+ #define I915_MAX_VCS	8
+ #define I915_MAX_VECS	4
+-#define I915_MAX_CCS	4
++
+ /*
+  * Engine IDs definitions.
+  * Keep instances of the same type engine together.
+@@ -115,11 +114,6 @@ enum intel_engine_id {
+ 	VECS2,
+ 	VECS3,
+ #define _VECS(n) (VECS0 + (n))
+-	CCS0,
+-	CCS1,
+-	CCS2,
+-	CCS3,
+-#define _CCS(n) (CCS0 + (n))
+ 	I915_NUM_ENGINES
+ #define INVALID_ENGINE ((enum intel_engine_id)-1)
+ };
+@@ -455,8 +449,6 @@ struct intel_engine_cs {
+ #define I915_ENGINE_HAS_RELATIVE_MMIO BIT(6)
+ #define I915_ENGINE_REQUIRES_CMD_PARSER BIT(7)
+ #define I915_ENGINE_WANT_FORCED_PREEMPTION BIT(8)
+-#define I915_ENGINE_HAS_RCS_REG_STATE  BIT(9)
+-#define I915_ENGINE_HAS_EU_PRIORITY    BIT(10)
+ 	unsigned int flags;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_user.c b/drivers/gpu/drm/i915/gt/intel_engine_user.c
+index 2e9351189c05..7cb16b6cf2ef 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_user.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_user.c
+@@ -47,7 +47,6 @@ static const u8 uabi_classes[] = {
+ 	[COPY_ENGINE_CLASS] = I915_ENGINE_CLASS_COPY,
+ 	[VIDEO_DECODE_CLASS] = I915_ENGINE_CLASS_VIDEO,
+ 	[VIDEO_ENHANCEMENT_CLASS] = I915_ENGINE_CLASS_VIDEO_ENHANCE,
+-	[COMPUTE_CLASS] = I915_ENGINE_CLASS_COMPUTE,
+ };
+ 
+ static int engine_cmp(void *priv, struct list_head *A, struct list_head *B)
+@@ -139,7 +138,6 @@ const char *intel_engine_class_repr(u8 class)
+ 		[COPY_ENGINE_CLASS] = "bcs",
+ 		[VIDEO_DECODE_CLASS] = "vcs",
+ 		[VIDEO_ENHANCEMENT_CLASS] = "vecs",
+-		[COMPUTE_CLASS] = "ccs",
+ 	};
+ 
+ 	if (class >= ARRAY_SIZE(uabi_names) || !uabi_names[class])
+@@ -163,7 +161,6 @@ static int legacy_ring_idx(const struct legacy_ring *ring)
+ 		[COPY_ENGINE_CLASS] = { BCS0, 1 },
+ 		[VIDEO_DECODE_CLASS] = { VCS0, I915_MAX_VCS },
+ 		[VIDEO_ENHANCEMENT_CLASS] = { VECS0, I915_MAX_VECS },
+-		[COMPUTE_CLASS] = { CCS0, I915_MAX_CCS },
+ 	};
+ 
+ 	if (GEM_DEBUG_WARN_ON(ring->class >= ARRAY_SIZE(map)))
+@@ -192,7 +189,7 @@ static void add_legacy_ring(struct legacy_ring *ring,
+ void intel_engines_driver_register(struct drm_i915_private *i915)
+ {
+ 	struct legacy_ring ring = {};
+-	u8 uabi_instances[5] = {};
++	u8 uabi_instances[4] = {};
+ 	struct list_head *it, *next;
+ 	struct rb_node **p, *prev;
+ 	LIST_HEAD(engines);
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index c2327b3aeecc..8875d85a1677 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -663,13 +663,9 @@ static inline void execlists_schedule_out(struct i915_request *rq)
+ static u64 execlists_update_context(struct i915_request *rq)
+ {
+ 	struct intel_context *ce = rq->context;
+-	u64 desc;
++	u64 desc = ce->lrc.desc;
+ 	u32 tail, prev;
+ 
+-	desc = ce->lrc.desc;
+-	if (rq->engine->flags & I915_ENGINE_HAS_EU_PRIORITY)
+-		desc |= lrc_desc_priority(rq_prio(rq));
+-
+ 	/*
+ 	 * WaIdleLiteRestore:bdw,skl
+ 	 *
+@@ -2924,29 +2920,6 @@ static int execlists_resume(struct intel_engine_cs *engine)
+ 	return 0;
+ }
+ 
+-static int gen12_rcs_resume(struct intel_engine_cs *engine)
+-{
+-	int ret;
+-
+-	ret = execlists_resume(engine);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * Multi Context programming.
+-	 * just need to program this register once no matter how many CCS
+-	 * engines there are. Since some of the CCS engines might be fused off,
+-	 * we can't do this as part of the init of a specific CCS and we do
+-	 * it during RCS init instead. RCS and all CCS engines are reset
+-	 * together, so post-reset re-init is covered as well.
+-	 */
+-	if (CCS_MASK(engine->gt))
+-		intel_uncore_write(engine->uncore, GEN12_RCU_MODE,
+-			   _MASKED_BIT_ENABLE(GEN12_RCU_MODE_CCS_ENABLE));
+-
+-	return 0;
+-}
+-
+ static void execlists_reset_prepare(struct intel_engine_cs *engine)
+ {
+ 	ENGINE_TRACE(engine, "depth<-%d\n",
+@@ -3467,9 +3440,6 @@ static void rcs_submission_override(struct intel_engine_cs *engine)
+ 		engine->emit_fini_breadcrumb = gen8_emit_fini_breadcrumb_rcs;
+ 		break;
+ 	}
+-
+-	if (engine->class == RENDER_CLASS)
+-		engine->resume = gen12_rcs_resume;
+ }
+ 
+ int intel_execlists_submission_setup(struct intel_engine_cs *engine)
+@@ -3486,8 +3456,7 @@ int intel_execlists_submission_setup(struct intel_engine_cs *engine)
+ 	logical_ring_default_vfuncs(engine);
+ 	logical_ring_default_irqs(engine);
+ 
+-	if (engine->class == RENDER_CLASS ||
+-	    engine->class == COMPUTE_CLASS)
++	if (engine->class == RENDER_CLASS)
+ 		rcs_submission_override(engine);
+ 
+ 	lrc_init_wa_ctx(engine);
+diff --git a/drivers/gpu/drm/i915/gt/intel_gpu_commands.h b/drivers/gpu/drm/i915/gt/intel_gpu_commands.h
+index a3c1047a2c71..1c3af0fc0456 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gpu_commands.h
++++ b/drivers/gpu/drm/i915/gt/intel_gpu_commands.h
+@@ -223,14 +223,11 @@
+ #define   PIPE_CONTROL_COMMAND_CACHE_INVALIDATE		(1<<29) /* gen11+ */
+ #define   PIPE_CONTROL_TILE_CACHE_FLUSH			(1<<28) /* gen11+ */
+ #define   PIPE_CONTROL_FLUSH_L3				(1<<27)
+-#define   PIPE_CONTROL_AMFS_FLUSH			(1<<25) /* gen12+ */
+ #define   PIPE_CONTROL_GLOBAL_GTT_IVB			(1<<24) /* gen7+ */
+ #define   PIPE_CONTROL_MMIO_WRITE			(1<<23)
+ #define   PIPE_CONTROL_STORE_DATA_INDEX			(1<<21)
+ #define   PIPE_CONTROL_CS_STALL				(1<<20)
+-#define   PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET		(1<<19)
+ #define   PIPE_CONTROL_TLB_INVALIDATE			(1<<18)
+-#define   PIPE_CONTROL_PSD_SYNC				(1<<17) /* gen11+ */
+ #define   PIPE_CONTROL_MEDIA_STATE_CLEAR		(1<<16)
+ #define   PIPE_CONTROL_WRITE_TIMESTAMP			(3<<14)
+ #define   PIPE_CONTROL_QW_WRITE				(1<<14)
+@@ -252,18 +249,6 @@
+ #define   PIPE_CONTROL_DEPTH_CACHE_FLUSH		(1<<0)
+ #define   PIPE_CONTROL_GLOBAL_GTT (1<<2) /* in addr dword */
+ 
+-/* 3D-related flags can't be set on compute engine */
+-#define PIPE_CONTROL_RENDER_ONLY_FLAGS (\
+-		PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH | \
+-		PIPE_CONTROL_DEPTH_CACHE_FLUSH | \
+-		PIPE_CONTROL_TILE_CACHE_FLUSH | \
+-		PIPE_CONTROL_DEPTH_STALL | \
+-		PIPE_CONTROL_STALL_AT_SCOREBOARD | \
+-		PIPE_CONTROL_PSD_SYNC | \
+-		PIPE_CONTROL_AMFS_FLUSH | \
+-		PIPE_CONTROL_VF_CACHE_INVALIDATE | \
+-		PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET)
+-
+ #define MI_MATH(x)			MI_INSTR(0x1a, (x) - 1)
+ #define MI_MATH_INSTR(opcode, op1, op2) ((opcode) << 20 | (op1) << 10 | (op2))
+ /* Opcodes for MI_MATH_INSTR */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_irq.c b/drivers/gpu/drm/i915/gt/intel_gt_irq.c
+index 612281d47513..b2de83be4d97 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_irq.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_irq.c
+@@ -96,7 +96,7 @@ gen11_gt_identity_handler(struct intel_gt *gt, const u32 identity)
+ 	if (unlikely(!intr))
+ 		return;
+ 
+-	if (class <= COPY_ENGINE_CLASS || class == COMPUTE_CLASS)
++	if (class <= COPY_ENGINE_CLASS)
+ 		return gen11_engine_irq_handler(gt, class, instance, intr);
+ 
+ 	if (class == OTHER_CLASS)
+@@ -178,8 +178,6 @@ void gen11_gt_irq_reset(struct intel_gt *gt)
+ 	/* Disable RCS, BCS, VCS and VECS class engines. */
+ 	intel_uncore_write(uncore, GEN11_RENDER_COPY_INTR_ENABLE, 0);
+ 	intel_uncore_write(uncore, GEN11_VCS_VECS_INTR_ENABLE,	  0);
+-	if (CCS_MASK(gt))
+-		intel_uncore_write(uncore, GEN12_CCS_RSVD_INTR_ENABLE, 0);
+ 
+ 	/* Restore masks irqs on RCS, BCS, VCS and VECS engines. */
+ 	intel_uncore_write(uncore, GEN11_RCS0_RSVD_INTR_MASK,	~0);
+@@ -193,10 +191,6 @@ void gen11_gt_irq_reset(struct intel_gt *gt)
+ 	intel_uncore_write(uncore, GEN11_VECS0_VECS1_INTR_MASK,	~0);
+ 	if (HAS_ENGINE(gt, VECS2) || HAS_ENGINE(gt, VECS3))
+ 		intel_uncore_write(uncore, GEN12_VECS2_VECS3_INTR_MASK, ~0);
+-	if (HAS_ENGINE(gt, CCS0) || HAS_ENGINE(gt, CCS1))
+-		intel_uncore_write(uncore, GEN12_CCS0_CCS1_INTR_MASK, ~0);
+-	if (HAS_ENGINE(gt, CCS2) || HAS_ENGINE(gt, CCS3))
+-		intel_uncore_write(uncore, GEN12_CCS2_CCS3_INTR_MASK, ~0);
+ 
+ 	intel_uncore_write(uncore, GEN11_GPM_WGBOXPERF_INTR_ENABLE, 0);
+ 	intel_uncore_write(uncore, GEN11_GPM_WGBOXPERF_INTR_MASK,  ~0);
+@@ -224,8 +218,6 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 	/* Enable RCS, BCS, VCS and VECS class interrupts. */
+ 	intel_uncore_write(uncore, GEN11_RENDER_COPY_INTR_ENABLE, dmask);
+ 	intel_uncore_write(uncore, GEN11_VCS_VECS_INTR_ENABLE, dmask);
+-	if (CCS_MASK(gt))
+-		intel_uncore_write(uncore, GEN12_CCS_RSVD_INTR_ENABLE, smask);
+ 
+ 	/* Unmask irqs on RCS, BCS, VCS and VECS engines. */
+ 	intel_uncore_write(uncore, GEN11_RCS0_RSVD_INTR_MASK, ~smask);
+@@ -239,11 +231,6 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 	intel_uncore_write(uncore, GEN11_VECS0_VECS1_INTR_MASK, ~dmask);
+ 	if (HAS_ENGINE(gt, VECS2) || HAS_ENGINE(gt, VECS3))
+ 		intel_uncore_write(uncore, GEN12_VECS2_VECS3_INTR_MASK, ~dmask);
+-	if (HAS_ENGINE(gt, CCS0) || HAS_ENGINE(gt, CCS1))
+-		intel_uncore_write(uncore, GEN12_CCS0_CCS1_INTR_MASK, ~dmask);
+-	if (HAS_ENGINE(gt, CCS2) || HAS_ENGINE(gt, CCS3))
+-		intel_uncore_write(uncore, GEN12_CCS2_CCS3_INTR_MASK, ~dmask);
+-
+ 	/*
+ 	 * RPS interrupts will get enabled/disabled on demand when RPS itself
+ 	 * is enabled/disabled.
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.c b/drivers/gpu/drm/i915/gt/intel_lrc.c
+index 646e83815d37..7e1153f84cca 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -632,8 +632,7 @@ static int lrc_ring_cmd_buf_cctl(const struct intel_engine_cs *engine)
+ 		 * simply to match the RCS context image layout.
+ 		 */
+ 		return 0xc6;
+-	else if (engine->class != RENDER_CLASS &&
+-		 engine->class != COMPUTE_CLASS)
++	else if (engine->class != RENDER_CLASS)
+ 		return -1;
+ 	else if (GRAPHICS_VER(engine->i915) >= 12)
+ 		return 0xb6;
+@@ -1499,7 +1498,7 @@ void lrc_init_wa_ctx(struct intel_engine_cs *engine)
+ 	unsigned int i;
+ 	int err;
+ 
+-	if (engine->class != RENDER_CLASS && engine->class != COMPUTE_CLASS)
++	if (engine->class != RENDER_CLASS)
+ 		return;
+ 
+ 	switch (GRAPHICS_VER(engine->i915)) {
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.h b/drivers/gpu/drm/i915/gt/intel_lrc.h
+index d3f2096b3d51..7f697845c4cf 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.h
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.h
+@@ -79,14 +79,4 @@ static inline u32 lrc_get_runtime(const struct intel_context *ce)
+ 	return READ_ONCE(ce->lrc_reg_state[CTX_TIMESTAMP]);
+ }
+ 
+-static inline u32 lrc_desc_priority(int prio)
+-{
+-	if (prio > I915_PRIORITY_NORMAL)
+-		return GEN12_CTX_PRIORITY_HIGH;
+-	else if (prio < I915_PRIORITY_NORMAL)
+-		return GEN12_CTX_PRIORITY_LOW;
+-	else
+-		return GEN12_CTX_PRIORITY_NORMAL;
+-}
+-
+ #endif /* __INTEL_LRC_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_ppgtt.c b/drivers/gpu/drm/i915/gt/intel_ppgtt.c
+index 317330fe20c4..886060f7e6fc 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ppgtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ppgtt.c
+@@ -151,17 +151,6 @@ int i915_ppgtt_init_hw(struct intel_gt *gt)
+ 	else if (GRAPHICS_VER(i915) == 7)
+ 		gen7_ppgtt_enable(gt);
+ 
+-	/*
+-	 * Tell GAM that we want to use dual-ctx. The same address space will be
+-	 * shared by RCS and CCS and the HW to use bit 47 as an indication of
+-	 * the source unit, so the PPGTT size needs to be limited to 47b.
+-	 * This restriction does not apply in multi-ctx mode.
+-	 */
+-	if (IS_TIGERLAKE(i915) || IS_DG1(i915) || IS_ALDERLAKE_S(i915) || IS_ALDERLAKE_P(i915))
+-		if (HAS_ENGINE(gt, CCS0) && INTEL_INFO(i915)->ppgtt_size < 48)
+-			intel_uncore_write(gt->uncore, GEN12_GAM_MULT_CTXT_CTL,
+-					   _MASKED_BIT_ENABLE
+-					   (GEN12_GAM_MULT_CTXT_ENABLE));
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c b/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
+index 21c4727b43fb..70bd23c3cd98 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
+@@ -31,8 +31,9 @@ static const i915_reg_t tgl_runtime_regs[] = {
+ 	GEN10_MIRROR_FUSE3,             /* _MMIO(0x9118) */
+ 	GEN11_EU_DISABLE,		/* _MMIO(0x9134) */
+ 	GEN11_GT_SLICE_ENABLE,		/* _MMIO(0x9138) */
+-	GEN12_GT_DSS_ENABLE,		/* _MMIO(0x913C) */
++	GEN12_GT_DSS_ENABLE,	/* _MMIO(0x913C) */
+ 	GEN11_GT_VEBOX_VDBOX_DISABLE,	/* _MMIO(0x9140) */
++	GEN12_GT_COMPUTE_DSS_ENABLE,    /* _MMIO(0x9144) */
+ 	CTC_MODE,			/* _MMIO(0xA26C) */
+ 	GEN9_TIMESTAMP_OVERRIDE,	/* _MMIO(0x44074) */
+ };
+@@ -42,7 +43,7 @@ static const i915_reg_t *get_runtime_regs(struct drm_i915_private *i915,
+ {
+ 	const i915_reg_t *regs;
+ 
+-	if (IS_TIGERLAKE(i915) || IS_ALDERLAKE_S(i915) || IS_ALDERLAKE_P(i915)) {
++	if (IS_TIGERLAKE(i915) || IS_ALDERLAKE_S(i915) || IS_ALDERLAKE_P(i915))  {
+ 		regs = tgl_runtime_regs;
+ 		*size = ARRAY_SIZE(tgl_runtime_regs);
+ 	} else {
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c
+index 3d4357d1473d..823aed4eeeec 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c
+@@ -275,10 +275,6 @@ static void guc_mmio_regset_init(struct temp_regset *regset,
+ 	GUC_MMIO_REG_ADD(regset, RING_HWS_PGA(base), false);
+ 	GUC_MMIO_REG_ADD(regset, RING_IMR(base), false);
+ 
+-	if ((engine->class == RENDER_CLASS) &&
+-	    CCS_MASK(engine->gt))
+-		GUC_MMIO_REG_ADD(regset, GEN12_RCU_MODE, true);
+-
+ 	for (i = 0, wa = wal->list; i < wal->count; i++, wa++)
+ 		GUC_MMIO_REG_ADD(regset, wa->reg, wa->masked_reg);
+ 
+@@ -368,7 +364,6 @@ static void fill_engine_enable_masks(struct intel_gt *gt,
+ 				     struct guc_gt_system_info *info)
+ {
+ 	info->engine_enabled_masks[GUC_RENDER_CLASS] = 1;
+-	info->engine_enabled_masks[GUC_COMPUTE_CLASS] = CCS_MASK(gt);
+ 	info->engine_enabled_masks[GUC_BLITTER_CLASS] = 1;
+ 	info->engine_enabled_masks[GUC_VIDEO_CLASS] = VDBOX_MASK(gt);
+ 	info->engine_enabled_masks[GUC_VIDEOENHANCE_CLASS] = VEBOX_MASK(gt);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h b/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
+index 5576281253c8..9bea80c4def2 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
+@@ -69,8 +69,8 @@ static inline const char *hxg_type_to_string(u32 type)
+ #define GUC_VIDEO_CLASS			1
+ #define GUC_VIDEOENHANCE_CLASS		2
+ #define GUC_BLITTER_CLASS		3
+-#define GUC_COMPUTE_CLASS		4
+-#define GUC_LAST_ENGINE_CLASS		GUC_COMPUTE_CLASS
++#define GUC_RESERVED_CLASS		4
++#define GUC_LAST_ENGINE_CLASS		GUC_RESERVED_CLASS
+ #define GUC_MAX_ENGINE_CLASSES		16
+ #define GUC_MAX_INSTANCES_PER_CLASS	32
+ 
+@@ -187,20 +187,17 @@ static inline u8 engine_class_to_guc_class(u8 class)
+ 	BUILD_BUG_ON(GUC_BLITTER_CLASS != COPY_ENGINE_CLASS);
+ 	BUILD_BUG_ON(GUC_VIDEO_CLASS != VIDEO_DECODE_CLASS);
+ 	BUILD_BUG_ON(GUC_VIDEOENHANCE_CLASS != VIDEO_ENHANCEMENT_CLASS);
+-	BUILD_BUG_ON(GUC_COMPUTE_CLASS != (COMPUTE_CLASS - 1));
+ 	GEM_BUG_ON(class > MAX_ENGINE_CLASS || class == OTHER_CLASS);
+ 
+-	/* the GuC arrays don't include OTHER_CLASS */
+-	return class < OTHER_CLASS ? class : class - 1;
++	return class;
+ }
+ 
+ static inline u8 guc_class_to_engine_class(u8 guc_class)
+ {
+-	BUILD_BUG_ON(GUC_COMPUTE_CLASS != OTHER_CLASS);
+-	BUILD_BUG_ON(GUC_LAST_ENGINE_CLASS != (MAX_ENGINE_CLASS - 1));
+ 	GEM_BUG_ON(guc_class > GUC_LAST_ENGINE_CLASS);
++	GEM_BUG_ON(guc_class == GUC_RESERVED_CLASS);
+ 
+-	return guc_class < GUC_COMPUTE_CLASS ? guc_class : guc_class + 1;
++	return guc_class;
+ }
+ 
+ /* Work item for submitting workloads into work queue of GuC. */
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 3247b2b7ef15..23b7a859195d 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -3237,29 +3237,6 @@ static int vf_guc_resume(struct intel_engine_cs *engine)
+ 	return 0;
+ }
+ 
+-static int gen12_rcs_resume(struct intel_engine_cs *engine)
+-{
+-	int ret;
+-
+-	ret = guc_resume(engine);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * Multi Context programming.
+-	 * just need to program this register once no matter how many CCS
+-	 * engines there are. Since some of the CCS engines might be fused off,
+-	 * we can't do this as part of the init of a specific CCS and we do
+-	 * it during RCS init instead. RCS and all CCS engines are reset
+-	 * together, so post-reset re-init is covered as well.
+-	 */
+-	if (CCS_MASK(engine->gt))
+-		intel_uncore_write(engine->uncore, GEN12_RCU_MODE,
+-			   _MASKED_BIT_ENABLE(GEN12_RCU_MODE_CCS_ENABLE));
+-
+-       return 0;
+-}
+-
+ static bool guc_sched_engine_disabled(struct i915_sched_engine *sched_engine)
+ {
+ 	return !sched_engine->tasklet.callback;
+@@ -3379,9 +3356,6 @@ static void rcs_submission_override(struct intel_engine_cs *engine)
+ 		engine->emit_fini_breadcrumb = gen8_emit_fini_breadcrumb_rcs;
+ 		break;
+ 	}
+-
+-	if (engine->class == RENDER_CLASS)
+-		engine->resume = gen12_rcs_resume;
+ }
+ 
+ static void guc_default_irqs(struct intel_engine_cs *engine)
+@@ -3435,8 +3409,7 @@ int intel_guc_submission_setup(struct intel_engine_cs *engine)
+ 	guc_default_irqs(engine);
+ 	guc_init_breadcrumbs(engine);
+ 
+-	if (engine->class == RENDER_CLASS ||
+-	    engine->class == COMPUTE_CLASS)
++	if (engine->class == RENDER_CLASS)
+ 		rcs_submission_override(engine);
+ 
+ 	if (IS_SRIOV_VF(engine->i915))
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index b5e29b9c6c57..4d09812c44ff 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -835,21 +835,6 @@ int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (IS_ERR(i915))
+ 		return PTR_ERR(i915);
+ 
+-	/*
+-	 * Hack to enable CCS and set ppgtt_size to 47
+-	 * on TGL and DG1 for testing purpose
+-	 *
+-	 */
+-	if ((match_info->platform == INTEL_DG1 ||
+-	    match_info->platform == INTEL_TIGERLAKE ||
+-	    match_info->platform == INTEL_ALDERLAKE_S ||
+-	    match_info->platform == INTEL_ALDERLAKE_P) &&
+-	    (i915->params.enable_guc & ENABLE_GUC_SUBMISSION)
+-	    && i915->params.enable_guc != -1) {
+-		mkwrite_device_info(i915)->ppgtt_size = 47;
+-		mkwrite_device_info(i915)->platform_engine_mask |= BIT(CCS0);
+-	}
+-
+ 	/* Disable nuclear pageflip by default on pre-ILK */
+ 	if (!i915->params.nuclear_pageflip && match_info->graphics_ver < 5)
+ 		i915->drm.driver_features &= ~DRIVER_ATOMIC;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index cdb17d0a3a90..14640df405e5 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1617,8 +1617,6 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
+ 	ENGINE_INSTANCES_MASK(gt, VCS0, I915_MAX_VCS)
+ #define VEBOX_MASK(gt) \
+ 	ENGINE_INSTANCES_MASK(gt, VECS0, I915_MAX_VECS)
+-#define CCS_MASK(gt) \
+-	ENGINE_INSTANCES_MASK(gt, CCS0, I915_MAX_CCS)
+ 
+ /*
+  * The Gen7 cmdparser copies the scanned buffer to the ggtt for execution
+diff --git a/drivers/gpu/drm/i915/i915_perf.c b/drivers/gpu/drm/i915/i915_perf.c
+index 1e9cccf91a56..0e4cc7b93b86 100644
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -2418,7 +2418,7 @@ gen12_configure_all_contexts(struct i915_perf_stream *stream,
+ {
+ 	struct flex regs[] = {
+ 		{
+-			GEN8_R_PWR_CLK_STATE(RENDER_RING_BASE),
++			GEN8_R_PWR_CLK_STATE,
+ 			CTX_R_PWR_CLK_STATE,
+ 		},
+ 	};
+@@ -2438,7 +2438,7 @@ lrc_configure_all_contexts(struct i915_perf_stream *stream,
+ #define ctx_flexeuN(N) (ctx_flexeu0 + 2 * (N) + 1)
+ 	struct flex regs[] = {
+ 		{
+-			GEN8_R_PWR_CLK_STATE(RENDER_RING_BASE),
++			GEN8_R_PWR_CLK_STATE,
+ 			CTX_R_PWR_CLK_STATE,
+ 		},
+ 		{
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index cfbccef66ef0..4e31256765d4 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -441,7 +441,7 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define GEN8_RING_PDP_UDW(base, n)	_MMIO((base) + 0x270 + (n) * 8 + 4)
+ #define GEN8_RING_PDP_LDW(base, n)	_MMIO((base) + 0x270 + (n) * 8)
+ 
+-#define GEN8_R_PWR_CLK_STATE(base)	_MMIO((base)+0xc8)
++#define GEN8_R_PWR_CLK_STATE		_MMIO(0x20C8)
+ #define   GEN8_RPCS_ENABLE		(1 << 31)
+ #define   GEN8_RPCS_S_CNT_ENABLE	(1 << 18)
+ #define   GEN8_RPCS_S_CNT_SHIFT		15
+@@ -498,12 +498,6 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   ECOBITS_PPGTT_CACHE64B	(3 << 8)
+ #define   ECOBITS_PPGTT_CACHE4B		(0 << 8)
+ 
+-#define GEN12_RCU_MODE			_MMIO(0x14800)
+-#define   GEN12_RCU_MODE_CCS_ENABLE	(1<<0)
+-
+-#define GEN12_GAM_MULT_CTXT_CTL		_MMIO(0xce90)
+-#define   GEN12_GAM_MULT_CTXT_ENABLE	(1<<0)
+-
+ #define GAB_CTL				_MMIO(0x24000)
+ #define   GAB_CTL_CONT_AFTER_PAGEFAULT	(1 << 8)
+ 
+@@ -2530,10 +2524,6 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define GEN11_VEBOX2_RING_BASE		0x1d8000
+ #define XEHP_VEBOX3_RING_BASE		0x1e8000
+ #define XEHP_VEBOX4_RING_BASE		0x1f8000
+-#define GEN12_COMPUTE0_RING_BASE       0x1a000
+-#define GEN12_COMPUTE1_RING_BASE       0x1c000
+-#define GEN12_COMPUTE2_RING_BASE       0x1e000
+-#define GEN12_COMPUTE3_RING_BASE       0x26000
+ #define BLT_RING_BASE		0x22000
+ #define RING_TAIL(base)		_MMIO((base) + 0x30)
+ #define RING_HEAD(base)		_MMIO((base) + 0x34)
+@@ -4184,11 +4174,6 @@ enum {
+ #define GEN8_CTX_L3LLC_COHERENT (1 << 5)
+ #define GEN8_CTX_PRIVILEGE (1 << 8)
+ #define GEN8_CTX_ADDRESSING_MODE_SHIFT 3
+-#define GEN12_CTX_PRIORITY_SHIFT 9
+-#define GEN12_CTX_PRIORITY_MASK (3<<GEN12_CTX_PRIORITY_SHIFT)
+-#define GEN12_CTX_PRIORITY_HIGH (2<<GEN12_CTX_PRIORITY_SHIFT)
+-#define GEN12_CTX_PRIORITY_NORMAL (1<<GEN12_CTX_PRIORITY_SHIFT)
+-#define GEN12_CTX_PRIORITY_LOW (0<<GEN12_CTX_PRIORITY_SHIFT)
+ 
+ #define GEN8_CTX_ID_SHIFT 32
+ #define GEN8_CTX_ID_WIDTH 21
+@@ -8086,10 +8071,6 @@ enum {
+ #define  GEN11_KCR			(19)
+ #define  GEN11_GTPM			(16)
+ #define  GEN11_BCS			(15)
+-#define  GEN12_CCS3			(7)
+-#define  GEN12_CCS2			(6)
+-#define  GEN12_CCS1			(5)
+-#define  GEN12_CCS0			(4)
+ #define  GEN11_RCS0			(0)
+ 
+ #define GEN11_GT_INTR_DW1		_MMIO(0x19001c)
+@@ -8121,7 +8102,6 @@ enum {
+ #define GEN11_GPM_WGBOXPERF_INTR_ENABLE	_MMIO(0x19003c)
+ #define GEN11_CRYPTO_RSVD_INTR_ENABLE	_MMIO(0x190040)
+ #define GEN11_GUNIT_CSME_INTR_ENABLE	_MMIO(0x190044)
+-#define GEN12_CCS_RSVD_INTR_ENABLE	_MMIO(0x190048)
+ 
+ #define GEN11_RCS0_RSVD_INTR_MASK	_MMIO(0x190090)
+ #define GEN11_BCS_RSVD_INTR_MASK	_MMIO(0x1900a0)
+@@ -8135,8 +8115,6 @@ enum {
+ #define GEN11_GPM_WGBOXPERF_INTR_MASK	_MMIO(0x1900ec)
+ #define GEN11_CRYPTO_RSVD_INTR_MASK	_MMIO(0x1900f0)
+ #define GEN11_GUNIT_CSME_INTR_MASK	_MMIO(0x1900f4)
+-#define GEN12_CCS0_CCS1_INTR_MASK	_MMIO(0x190100)
+-#define GEN12_CCS2_CCS3_INTR_MASK	_MMIO(0x190104)
+ 
+ #define   ENGINE1_MASK			REG_GENMASK(31, 16)
+ #define   ENGINE0_MASK			REG_GENMASK(15, 0)
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 2e734ff00be3..c3781eb66ea9 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -166,7 +166,6 @@ enum drm_i915_gem_engine_class {
+ 	I915_ENGINE_CLASS_COPY		= 1,
+ 	I915_ENGINE_CLASS_VIDEO		= 2,
+ 	I915_ENGINE_CLASS_VIDEO_ENHANCE	= 3,
+-	I915_ENGINE_CLASS_COMPUTE       = 4,
+ 
+ 	/* should be kept compact */
+ 
+-- 
+2.25.1
+

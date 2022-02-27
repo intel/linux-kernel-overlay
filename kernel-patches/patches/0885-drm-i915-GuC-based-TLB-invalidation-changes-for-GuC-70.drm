@@ -1,0 +1,314 @@
+From 912ab930ae4005ba378f61a1e892c896fbec712f Mon Sep 17 00:00:00 2001
+From: "Zawawi, Muhammad Zul Husni" <muhammad.zul.husni.zawawi@intel.com>
+Date: Thu, 17 Feb 2022 14:26:36 +0800
+Subject: [PATCH 885/888] drm/i915: GuC based TLB invalidation changes for GuC
+ 70
+
+Signed-off-by: Zawawi, Muhammad Zul Husni <muhammad.zul.husni.zawawi@intel.com>
+---
+ .../gpu/drm/i915/gt/uc/abi/guc_actions_abi.h  |  11 +-
+ .../gpu/drm/i915/gt/uc/abi/guc_version_abi.h  |   7 +-
+ drivers/gpu/drm/i915/gt/uc/intel_guc.c        | 107 +++++++++++++++++-
+ drivers/gpu/drm/i915/gt/uc/intel_guc.h        |  10 ++
+ drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h   |   8 ++
+ drivers/gpu/drm/i915/gt/uc/intel_uc.c         |   6 +
+ drivers/gpu/drm/i915/i915_drv.h               |   3 +
+ drivers/gpu/drm/i915/i915_pci.c               |   1 +
+ drivers/gpu/drm/i915/intel_device_info.h      |   1 +
+ 9 files changed, 146 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h
+index e0606b60cde4..dd6db08c8c6f 100644
+--- a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h
++++ b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h
+@@ -138,6 +138,7 @@ enum intel_guc_action {
+ 	INTEL_GUC_ACTION_PAGE_FAULT_NOTIFICATION = 0x6001,
+ 	INTEL_GUC_ACTION_TLB_INVALIDATION = 0x7000,
+ 	INTEL_GUC_ACTION_TLB_INVALIDATION_DONE = 0x7001,
++	INTEL_GUC_ACTION_TLB_INVALIDATION_ALL = 0x7002,
+ 	INTEL_GUC_ACTION_STATE_CAPTURE_NOTIFICATION = 0x8002,
+ 	INTEL_GUC_ACTION_NOTIFY_FLUSH_LOG_BUFFER_TO_FILE = 0x8003,
+ 	INTEL_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED = 0x8004,
+@@ -174,8 +175,16 @@ enum intel_guc_sleep_state_status {
+ #define GUC_LOG_CONTROL_VERBOSITY_MASK	(0xF << GUC_LOG_CONTROL_VERBOSITY_SHIFT)
+ #define GUC_LOG_CONTROL_DEFAULT_LOGGING	(1 << 8)
+ 
++#define INTEL_GUC_TLB_INVAL_TYPE_SHIFT 0
++#define INTEL_GUC_TLB_INVAL_MODE_SHIFT 8
++/* Flush PPC or SMRO caches along with TLB invalidation request */
++#define INTEL_GUC_TLB_INVAL_FLUSH_CACHE (1 << 31)
++
+ enum intel_guc_tlb_invalidation_type {
+-	INTEL_GUC_TLB_INVAL_GUC = 0x6,
++	INTEL_GUC_TLB_INVAL_FULL = 0x0,
++	INTEL_GUC_TLB_INVAL_PAGE_SELECTIVE = 0x1,
++	INTEL_GUC_TLB_INVAL_PAGE_SELECTIVE_CTX = 0x2,
++	INTEL_GUC_TLB_INVAL_GUC = 0x3,
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/i915/gt/uc/abi/guc_version_abi.h b/drivers/gpu/drm/i915/gt/uc/abi/guc_version_abi.h
+index 351f8a943f63..17272f76f20d 100644
+--- a/drivers/gpu/drm/i915/gt/uc/abi/guc_version_abi.h
++++ b/drivers/gpu/drm/i915/gt/uc/abi/guc_version_abi.h
+@@ -1,13 +1,12 @@
+ /* SPDX-License-Identifier: MIT */
+ /*
+- * Copyright © 2021 Intel Corporation
++ * Copyright © 2022 Intel Corporation
+  */
+ 
+ #ifndef _ABI_GUC_VERSION_ABI_H
+ #define _ABI_GUC_VERSION_ABI_H
+ 
+-/* XXX: preliminary VF version is 0.10 */
+-#define GUC_VF_VERSION_LATEST_MAJOR	0
+-#define GUC_VF_VERSION_LATEST_MINOR	10
++#define GUC_VF_VERSION_LATEST_MAJOR	1
++#define GUC_VF_VERSION_LATEST_MINOR	0
+ 
+ #endif /* _ABI_GUC_VERSION_ABI_H */
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc.c b/drivers/gpu/drm/i915/gt/uc/intel_guc.c
+index 4495ac6ceab9..607f26a94e2a 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc.c
+@@ -906,7 +906,7 @@ static int guc_send_invalidate_tlb(struct intel_guc *guc, u32 *action, u32 size)
+ 	if (GEM_WARN_ON(err))
+ 		return err;
+ 
+-	action[2] = seqno;
++	action[1] = seqno;
+ 
+ 	err = intel_guc_send_busy_loop(guc, action, size, G2H_LEN_DW_INVALIDATE_TLB, true);
+ 	if (err) {
+@@ -941,6 +941,103 @@ static int guc_send_invalidate_tlb(struct intel_guc *guc, u32 *action, u32 size)
+ 	return (timeout < 0) ? timeout : 0;
+ }
+ 
++/*
++ * Full TLB invalidation:
++ * If invoked by PF, will invalidate the TLB's across all VFs and all engines.
++ * If invoked by VF, will invalidate the TLB's across all engines, given the
++ * VF is active.
++ */
++int intel_guc_invalidate_tlb_full(struct intel_guc *guc,
++				  enum intel_guc_tlb_inval_mode mode)
++{
++	u32 action[] = {
++		IS_SRIOV_PF(guc_to_gt(guc)->i915) ?
++			INTEL_GUC_ACTION_TLB_INVALIDATION_ALL :
++			INTEL_GUC_ACTION_TLB_INVALIDATION,
++		0,
++		INTEL_GUC_TLB_INVAL_FULL << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
++			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
++			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
++	};
++
++	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION_FULL(guc)) {
++		DRM_ERROR("Tlb invalidation: Operation not supported in this platform!\n");
++		return 0;
++	}
++
++	return guc_send_invalidate_tlb(guc, action, ARRAY_SIZE(action));
++}
++
++/*
++ * Selective TLB Invalidation for Address Range:
++ * TLB's in the Address Range is Invalidated across all engines.
++ */
++int intel_guc_invalidate_tlb_page_selective(struct intel_guc *guc,
++					    enum intel_guc_tlb_inval_mode mode,
++					    u64 start, u64 length, u32 asid)
++{
++	u64 vm_total = BIT_ULL(INTEL_INFO(guc_to_gt(guc)->i915)->ppgtt_size);
++	u32 address_mask = (ilog2(length) - ilog2(I915_GTT_PAGE_SIZE_4K));
++	u32 full_range = vm_total == length;
++	u32 action[] = {
++		INTEL_GUC_ACTION_TLB_INVALIDATION,
++		0,
++		INTEL_GUC_TLB_INVAL_PAGE_SELECTIVE << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
++			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
++			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
++		asid,
++		full_range ? full_range : lower_32_bits(start),
++		full_range ? 0 : upper_32_bits(start),
++		full_range ? 0 : address_mask,
++	};
++
++	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION_SELECTIVE(guc)) {
++		DRM_ERROR("Tlb invalidation: Operation not supported in this platform!\n");
++		return 0;
++	}
++
++	GEM_BUG_ON(!IS_ALIGNED(start, I915_GTT_PAGE_SIZE_4K));
++	GEM_BUG_ON(!IS_ALIGNED(length, I915_GTT_PAGE_SIZE_4K));
++	GEM_BUG_ON(range_overflows(start, length, vm_total));
++
++	return guc_send_invalidate_tlb(guc, action, ARRAY_SIZE(action));
++}
++
++/*
++ * Selective TLB Invalidation for Context:
++ * Invalidates all TLB's for a specific context across all engines.
++ */
++int intel_guc_invalidate_tlb_page_selective_ctx(struct intel_guc *guc,
++						enum intel_guc_tlb_inval_mode mode,
++						u64 start, u64 length, u32 ctxid)
++{
++	u64 vm_total = BIT_ULL(INTEL_INFO(guc_to_gt(guc)->i915)->ppgtt_size);
++	u32 address_mask = (ilog2(length) - ilog2(I915_GTT_PAGE_SIZE_4K));
++	u32 full_range = vm_total == length;
++	u32 action[] = {
++		INTEL_GUC_ACTION_TLB_INVALIDATION,
++		0,
++		INTEL_GUC_TLB_INVAL_PAGE_SELECTIVE_CTX << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
++			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
++			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
++		ctxid,
++		full_range ? full_range : lower_32_bits(start),
++		full_range ? 0 : upper_32_bits(start),
++		full_range ? 0 : address_mask,
++	};
++
++	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION_SELECTIVE(guc)) {
++		DRM_ERROR("Tlb invalidation: Operation not supported in this platform!\n");
++		return 0;
++	}
++
++	GEM_BUG_ON(!IS_ALIGNED(start, I915_GTT_PAGE_SIZE_4K));
++	GEM_BUG_ON(!IS_ALIGNED(length, I915_GTT_PAGE_SIZE_4K));
++	GEM_BUG_ON(range_overflows(start, length, vm_total));
++
++	return guc_send_invalidate_tlb(guc, action, ARRAY_SIZE(action));
++}
++
+ /*
+  * Guc TLB Invalidation: Invalidate the TLB's of GuC itself.
+  */
+@@ -949,9 +1046,10 @@ int intel_guc_invalidate_tlb_guc(struct intel_guc *guc,
+ {
+ 	u32 action[] = {
+ 		INTEL_GUC_ACTION_TLB_INVALIDATION,
+-		INTEL_GUC_TLB_INVAL_GUC,
+ 		0,
+-		mode,
++		INTEL_GUC_TLB_INVAL_GUC << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
++			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
++			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
+ 	};
+ 
+ 	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc)) {
+@@ -987,6 +1085,9 @@ void intel_guc_load_status(struct intel_guc *guc, struct drm_printer *p)
+ 
+ 	intel_uc_fw_dump(&guc->fw, p);
+ 
++	if (IS_SRIOV_VF(guc_to_gt(guc)->i915))
++		return;
++
+ 	with_intel_runtime_pm(uncore->rpm, wakeref) {
+ 		u32 status = intel_uncore_read(uncore, GUC_STATUS);
+ 		u32 i;
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc.h b/drivers/gpu/drm/i915/gt/uc/intel_guc.h
+index d25fc1877efc..ed34acadfca8 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc.h
+@@ -360,6 +360,16 @@ int intel_guc_allocate_and_map_vma(struct intel_guc *guc, u32 size,
+ int intel_guc_self_cfg32(struct intel_guc *guc, u16 key, u32 value);
+ int intel_guc_self_cfg64(struct intel_guc *guc, u16 key, u64 value);
+ 
++int intel_guc_invalidate_tlb_full(struct intel_guc *guc,
++				  enum intel_guc_tlb_inval_mode mode);
++int intel_guc_invalidate_tlb_full_engine(struct intel_guc *guc,
++					    u32 engine_class);
++int intel_guc_invalidate_tlb_page_selective(struct intel_guc *guc,
++					    enum intel_guc_tlb_inval_mode mode,
++					    u64 start, u64 length, u32 asid);
++int intel_guc_invalidate_tlb_page_selective_ctxid(struct intel_guc *guc,
++						  enum intel_guc_tlb_inval_mode mode,
++						  u64 start, u64 length, u32 ctxid);
+ int intel_guc_invalidate_tlb_guc(struct intel_guc *guc,
+ 				 enum intel_guc_tlb_inval_mode mode);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h b/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
+index 4903362e8608..445925600805 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h
+@@ -439,5 +439,13 @@ enum intel_guc_recv_message {
+ 	((intel_guc_ct_enabled(&(guc)->ct)) && \
+ 	 (intel_guc_submission_is_used(guc)) && \
+ 	 (GRAPHICS_VER(guc_to_gt((guc))->i915) >= 12))
++#define INTEL_GUC_SUPPORTS_TLB_INVALIDATION_ENGINE(guc) \
++	INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc)
++#define INTEL_GUC_SUPPORTS_TLB_INVALIDATION_FULL(guc) \
++	(INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc) && \
++	HAS_SELECTIVE_TLB_INVALIDATION(guc_to_gt(guc)->i915))
++#define INTEL_GUC_SUPPORTS_TLB_INVALIDATION_SELECTIVE(guc) \
++	(INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc) && \
++	HAS_SELECTIVE_TLB_INVALIDATION(guc_to_gt(guc)->i915))
+ 
+ #endif
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_uc.c
+index da47cb2b479c..a02515904143 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc.c
+@@ -186,6 +186,9 @@ void intel_uc_driver_remove(struct intel_uc *uc)
+  */
+ static void guc_clear_mmio_msg(struct intel_guc *guc)
+ {
++	if (IS_SRIOV_VF(guc_to_gt(guc)->i915))
++		return;
++
+ 	intel_uncore_write(guc_to_gt(guc)->uncore, SOFT_SCRATCH(15), 0);
+ }
+ 
+@@ -193,6 +196,9 @@ static void guc_get_mmio_msg(struct intel_guc *guc)
+ {
+ 	u32 val;
+ 
++	if (IS_SRIOV_VF(guc_to_gt(guc)->i915))
++		return;
++
+ 	spin_lock_irq(&guc->irq_lock);
+ 
+ 	val = intel_uncore_read(guc_to_gt(guc)->uncore, SOFT_SCRATCH(15));
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index bec8dffa7f5a..c1bb6fca2ad1 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1744,6 +1744,9 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
+ 
+ #define HAS_SRIOV(dev_priv)	(INTEL_INFO(dev_priv)->has_sriov)
+ 
++#define HAS_SELECTIVE_TLB_INVALIDATION(dev_priv) \
++	(INTEL_INFO(dev_priv)->has_selective_tlb_invalidation)
++
+ #define HAS_POOLED_EU(dev_priv)	(INTEL_INFO(dev_priv)->has_pooled_eu)
+ 
+ #define HAS_GLOBAL_MOCS_REGISTERS(dev_priv)	(INTEL_INFO(dev_priv)->has_global_mocs)
+diff --git a/drivers/gpu/drm/i915/i915_pci.c b/drivers/gpu/drm/i915/i915_pci.c
+index a386bdb25818..dd428ca6d568 100644
+--- a/drivers/gpu/drm/i915/i915_pci.c
++++ b/drivers/gpu/drm/i915/i915_pci.c
+@@ -974,6 +974,7 @@ static const struct intel_device_info adl_p_info = {
+ 	.display.has_cdclk_crawl = 1,
+ 	.display.has_modular_fia = 1,
+ 	.display.has_psr_hw_tracking = 0,
++	.has_selective_tlb_invalidation = 1,
+ 	.platform_engine_mask =
+ 		BIT(RCS0) | BIT(BCS0) | BIT(VECS0) | BIT(VCS0) | BIT(VCS2),
+ 	.ppgtt_size = 48,
+diff --git a/drivers/gpu/drm/i915/intel_device_info.h b/drivers/gpu/drm/i915/intel_device_info.h
+index d720e982e072..0f3b5dd939d9 100644
+--- a/drivers/gpu/drm/i915/intel_device_info.h
++++ b/drivers/gpu/drm/i915/intel_device_info.h
+@@ -138,6 +138,7 @@ enum intel_ppgtt_type {
+ 	func(has_rc6p); \
+ 	func(has_rps); \
+ 	func(has_runtime_pm); \
++	func(has_selective_tlb_invalidation); \
+ 	func(has_snoop); \
+ 	func(has_sriov); \
+ 	func(has_coherent_ggtt); \
+-- 
+2.25.1
+

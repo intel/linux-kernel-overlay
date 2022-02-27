@@ -1,0 +1,124 @@
+From 1dbf5c08cf33cdc26f8f2010853bf088cd552572 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <mdaenzer@redhat.com>
+Date: Tue, 17 Aug 2021 10:23:25 +0200
+Subject: [PATCH 220/888] drm/amdgpu: Cancel delayed work when GFXOFF is
+ disabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+schedule_delayed_work does not push back the work if it was already
+scheduled before, so amdgpu_device_delay_enable_gfx_off ran ~100 ms
+after the first time GFXOFF was disabled and re-enabled, even if GFXOFF
+was disabled and re-enabled again during those 100 ms.
+
+This resulted in frame drops / stutter with the upcoming mutter 41
+release on Navi 14, due to constantly enabling GFXOFF in the HW and
+disabling it again (for getting the GPU clock counter).
+
+To fix this, call cancel_delayed_work_sync when the disable count
+transitions from 0 to 1, and only schedule the delayed work on the
+reverse transition, not if the disable count was already 0. This makes
+sure the delayed work doesn't run at unexpected times, and allows it to
+be lock-free.
+
+v2:
+* Use cancel_delayed_work_sync & mutex_trylock instead of
+  mod_delayed_work.
+v3:
+* Make amdgpu_device_delay_enable_gfx_off lock-free (Christian König)
+v4:
+* Fix race condition between amdgpu_gfx_off_ctrl incrementing
+  adev->gfx.gfx_off_req_count and amdgpu_device_delay_enable_gfx_off
+  checking for it to be 0 (Evan Quan)
+
+Cc: stable@vger.kernel.org
+Reviewed-by: Evan Quan <evan.quan@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com> # v3
+Acked-by: Christian König <christian.koenig@amd.com> # v3
+Signed-off-by: Michel Dänzer <mdaenzer@redhat.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 11 +++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    | 36 +++++++++++++++-------
+ 2 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index df98144e2554..0b5764aa98a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2828,12 +2828,11 @@ static void amdgpu_device_delay_enable_gfx_off(struct work_struct *work)
+ 	struct amdgpu_device *adev =
+ 		container_of(work, struct amdgpu_device, gfx.gfx_off_delay_work.work);
+ 
+-	mutex_lock(&adev->gfx.gfx_off_mutex);
+-	if (!adev->gfx.gfx_off_state && !adev->gfx.gfx_off_req_count) {
+-		if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, true))
+-			adev->gfx.gfx_off_state = true;
+-	}
+-	mutex_unlock(&adev->gfx.gfx_off_mutex);
++	WARN_ON_ONCE(adev->gfx.gfx_off_state);
++	WARN_ON_ONCE(adev->gfx.gfx_off_req_count);
++
++	if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, true))
++		adev->gfx.gfx_off_state = true;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index e7e9655c5623..e7f06bd0f0cd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -563,24 +563,38 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
+ 
+ 	mutex_lock(&adev->gfx.gfx_off_mutex);
+ 
+-	if (!enable)
+-		adev->gfx.gfx_off_req_count++;
+-	else if (adev->gfx.gfx_off_req_count > 0)
++	if (enable) {
++		/* If the count is already 0, it means there's an imbalance bug somewhere.
++		 * Note that the bug may be in a different caller than the one which triggers the
++		 * WARN_ON_ONCE.
++		 */
++		if (WARN_ON_ONCE(adev->gfx.gfx_off_req_count == 0))
++			goto unlock;
++
+ 		adev->gfx.gfx_off_req_count--;
+ 
+-	if (enable && !adev->gfx.gfx_off_state && !adev->gfx.gfx_off_req_count) {
+-		schedule_delayed_work(&adev->gfx.gfx_off_delay_work, GFX_OFF_DELAY_ENABLE);
+-	} else if (!enable && adev->gfx.gfx_off_state) {
+-		if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, false)) {
+-			adev->gfx.gfx_off_state = false;
++		if (adev->gfx.gfx_off_req_count == 0 && !adev->gfx.gfx_off_state)
++			schedule_delayed_work(&adev->gfx.gfx_off_delay_work, GFX_OFF_DELAY_ENABLE);
++	} else {
++		if (adev->gfx.gfx_off_req_count == 0) {
++			cancel_delayed_work_sync(&adev->gfx.gfx_off_delay_work);
++
++			if (adev->gfx.gfx_off_state &&
++			    !amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, false)) {
++				adev->gfx.gfx_off_state = false;
+ 
+-			if (adev->gfx.funcs->init_spm_golden) {
+-				dev_dbg(adev->dev, "GFXOFF is disabled, re-init SPM golden settings\n");
+-				amdgpu_gfx_init_spm_golden(adev);
++				if (adev->gfx.funcs->init_spm_golden) {
++					dev_dbg(adev->dev,
++						"GFXOFF is disabled, re-init SPM golden settings\n");
++					amdgpu_gfx_init_spm_golden(adev);
++				}
+ 			}
+ 		}
++
++		adev->gfx.gfx_off_req_count++;
+ 	}
+ 
++unlock:
+ 	mutex_unlock(&adev->gfx.gfx_off_mutex);
+ }
+ 
+-- 
+2.25.1
+
