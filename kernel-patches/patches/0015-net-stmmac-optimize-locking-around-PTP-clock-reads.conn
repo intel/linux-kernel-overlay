@@ -1,0 +1,183 @@
+From f85b2aa08d126cf47bd8a2ff86b94359414cf8d8 Mon Sep 17 00:00:00 2001
+From: Yannick Vignon <yannick.vignon@nxp.com>
+Date: Fri, 4 Feb 2022 14:55:44 +0100
+Subject: [PATCH 15/17] net: stmmac: optimize locking around PTP clock reads
+
+Reading the PTP clock is a simple operation requiring only 3 register
+reads. Under a PREEMPT_RT kernel, protecting those reads by a spin_lock is
+counter-productive: if the 2nd task preempting the 1st has a higher prio
+but needs to read time as well, it will require 2 context switches, which
+will pretty much always be more costly than just disabling preemption for
+the duration of the reads. Moreover, with the code logic recently added
+to get_systime(), disabling preemption is not even required anymore:
+reads and writes just need to be protected from each other, to prevent a
+clock read while the clock is being updated.
+
+Improve the above situation by replacing the PTP spinlock by a rwlock, and
+using read_lock for PTP clock reads so simultaneous reads do not block
+each other.
+
+Signed-off-by: Yannick Vignon <yannick.vignon@nxp.com>
+Link: https://lore.kernel.org/r/20220204135545.2770625-1-yannick.vignon@oss.nxp.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ .../net/ethernet/stmicro/stmmac/dwmac-intel.c |  4 ++--
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  2 +-
+ .../ethernet/stmicro/stmmac/stmmac_hwtstamp.c |  4 ++--
+ .../net/ethernet/stmicro/stmmac/stmmac_ptp.c  | 22 +++++++++----------
+ .../stmicro/stmmac/stmmac_selftests.c         |  8 +++----
+ 5 files changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+index 2c719984e8bf..527911e1c8ff 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+@@ -384,10 +384,10 @@ static int intel_crosststamp(ktime_t *device,
+ 
+ 	/* Repeat until the timestamps are from the FIFO last segment */
+ 	for (i = 0; i < num_snapshot; i++) {
+-		spin_lock_irqsave(&priv->ptp_lock, flags);
++		read_lock_irqsave(&priv->ptp_lock, flags);
+ 		stmmac_get_ptptime(priv, ptpaddr, &ptp_time);
+ 		*device = ns_to_ktime(ptp_time);
+-		spin_unlock_irqrestore(&priv->ptp_lock, flags);
++		read_unlock_irqrestore(&priv->ptp_lock, flags);
+ 		get_arttime(priv->mii, intel_priv->mdio_adhoc_addr, &art_time);
+ 		*system = convert_art_to_tsc(art_time);
+ 	}
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index c02834f2a780..27935aeca8c2 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -265,7 +265,7 @@ struct stmmac_priv {
+ 	u32 adv_ts;
+ 	int use_riwt;
+ 	int irq_wake;
+-	spinlock_t ptp_lock;
++	rwlock_t ptp_lock;
+ 	/* Protects auxiliary snapshot registers from concurrent access. */
+ 	struct mutex aux_ts_lock;
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+index a7ec9f4d46ce..22fea0f67245 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+@@ -196,9 +196,9 @@ static void timestamp_interrupt(struct stmmac_priv *priv)
+ 		       GMAC_TIMESTAMP_ATSNS_SHIFT;
+ 
+ 	for (i = 0; i < num_snapshot; i++) {
+-		spin_lock_irqsave(&priv->ptp_lock, flags);
++		read_lock_irqsave(&priv->ptp_lock, flags);
+ 		get_ptptime(priv->ptpaddr, &ptp_time);
+-		spin_unlock_irqrestore(&priv->ptp_lock, flags);
++		read_unlock_irqrestore(&priv->ptp_lock, flags);
+ 		event.type = PTP_CLOCK_EXTTS;
+ 		event.index = 0;
+ 		event.timestamp = ptp_time;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+index 1c9f02f9c317..e45fb191d8e6 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+@@ -39,9 +39,9 @@ static int stmmac_adjust_freq(struct ptp_clock_info *ptp, s32 ppb)
+ 	diff = div_u64(adj, 1000000000ULL);
+ 	addend = neg_adj ? (addend - diff) : (addend + diff);
+ 
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	write_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_config_addend(priv, priv->ptpaddr, addend);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	write_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	return 0;
+ }
+@@ -86,9 +86,9 @@ static int stmmac_adjust_time(struct ptp_clock_info *ptp, s64 delta)
+ 		mutex_unlock(&priv->plat->est->lock);
+ 	}
+ 
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	write_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_adjust_systime(priv, priv->ptpaddr, sec, nsec, neg_adj, xmac);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	write_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	/* Caculate new basetime and re-configured EST after PTP time adjust. */
+ 	if (est_rst) {
+@@ -137,9 +137,9 @@ static int stmmac_get_time(struct ptp_clock_info *ptp, struct timespec64 *ts)
+ 	unsigned long flags;
+ 	u64 ns = 0;
+ 
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	read_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_get_systime(priv, priv->ptpaddr, &ns);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	read_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	*ts = ns_to_timespec64(ns);
+ 
+@@ -162,9 +162,9 @@ static int stmmac_set_time(struct ptp_clock_info *ptp,
+ 	    container_of(ptp, struct stmmac_priv, ptp_clock_ops);
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	write_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_init_systime(priv, priv->ptpaddr, ts->tv_sec, ts->tv_nsec);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	write_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	return 0;
+ }
+@@ -194,12 +194,12 @@ static int stmmac_enable(struct ptp_clock_info *ptp,
+ 		cfg->period.tv_sec = rq->perout.period.sec;
+ 		cfg->period.tv_nsec = rq->perout.period.nsec;
+ 
+-		spin_lock_irqsave(&priv->ptp_lock, flags);
++		write_lock_irqsave(&priv->ptp_lock, flags);
+ 		ret = stmmac_flex_pps_config(priv, priv->ioaddr,
+ 					     rq->perout.index, cfg, on,
+ 					     priv->sub_second_inc,
+ 					     priv->systime_flags);
+-		spin_unlock_irqrestore(&priv->ptp_lock, flags);
++		write_unlock_irqrestore(&priv->ptp_lock, flags);
+ 		break;
+ 	case PTP_CLK_REQ_EXTTS:
+ 		priv->plat->ext_snapshot_en = on;
+@@ -314,7 +314,7 @@ void stmmac_ptp_register(struct stmmac_priv *priv)
+ 	stmmac_ptp_clock_ops.n_per_out = priv->dma_cap.pps_out_num;
+ 	stmmac_ptp_clock_ops.n_ext_ts = priv->dma_cap.aux_snapshot_n;
+ 
+-	spin_lock_init(&priv->ptp_lock);
++	rwlock_init(&priv->ptp_lock);
+ 	mutex_init(&priv->aux_ts_lock);
+ 	priv->ptp_clock_ops = stmmac_ptp_clock_ops;
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_selftests.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_selftests.c
+index 0462dcc93e53..ae1fc4c18bb9 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_selftests.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_selftests.c
+@@ -1777,9 +1777,9 @@ static int stmmac_test_tbs(struct stmmac_priv *priv)
+ 	if (ret)
+ 		return ret;
+ 
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	read_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_get_systime(priv, priv->ptpaddr, &curr_time);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	read_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	if (!curr_time) {
+ 		ret = -EOPNOTSUPP;
+@@ -1799,9 +1799,9 @@ static int stmmac_test_tbs(struct stmmac_priv *priv)
+ 		goto fail_disable;
+ 
+ 	/* Check if expected time has elapsed */
+-	spin_lock_irqsave(&priv->ptp_lock, flags);
++	read_lock_irqsave(&priv->ptp_lock, flags);
+ 	stmmac_get_systime(priv, priv->ptpaddr, &curr_time);
+-	spin_unlock_irqrestore(&priv->ptp_lock, flags);
++	read_unlock_irqrestore(&priv->ptp_lock, flags);
+ 
+ 	if ((curr_time - start_time) < STMMAC_TBS_LT_OFFSET)
+ 		ret = -EINVAL;
+-- 
+2.25.1
+
