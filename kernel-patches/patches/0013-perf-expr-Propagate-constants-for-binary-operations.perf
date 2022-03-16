@@ -1,0 +1,153 @@
+From 98b9119a07aafb2a310dd6ec8f28af3e18f1255f Mon Sep 17 00:00:00 2001
+From: Ian Rogers <irogers@google.com>
+Date: Thu, 23 Sep 2021 00:46:14 -0700
+Subject: [PATCH 13/45] perf expr: Propagate constants for binary operations
+
+When we're computing ID values, if we have constant values then compute
+the constant result. For example:
+
+  1 + 2
+
+Previously .val would be set to BOTTOM by union_expr, meaning that
+all values are possible. With this change .val is set to 3.
+
+Later changes will use the constant values to hopefully eliminate ID
+values that don't need to be computed.
+
+Signed-off-by: Ian Rogers <irogers@google.com>
+Tested-by: John Garry <john.garry@huawei.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Kajol Jain <kjain@linux.ibm.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Paul Clarke <pc@us.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sandeep Dasgupta <sdasgup@google.com>
+Cc: Stephane Eranian <eranian@google.com>
+Link: https://lore.kernel.org/r/20210923074616.674826-12-irogers@google.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/expr.y | 63 ++++++++++++++++++++++++++++++------------
+ 1 file changed, 45 insertions(+), 18 deletions(-)
+
+diff --git a/tools/perf/util/expr.y b/tools/perf/util/expr.y
+index 6aeead54760a..5a295e385914 100644
+--- a/tools/perf/util/expr.y
++++ b/tools/perf/util/expr.y
+@@ -68,6 +68,12 @@ static void expr_error(double *final_val __maybe_unused,
+  */
+ #define BOTTOM NAN
+ 
++/* During computing ids, does val represent a constant (non-BOTTOM) value? */
++static bool is_const(double val)
++{
++	return isfinite(val);
++}
++
+ static struct ids union_expr(struct ids ids1, struct ids ids2)
+ {
+ 	struct ids result = {
+@@ -77,8 +83,15 @@ static struct ids union_expr(struct ids ids1, struct ids ids2)
+ 	return result;
+ }
+ 
++/*
++ * If we're not computing ids or $1 and $3 are constants, compute the new
++ * constant value using OP. Its invariant that there are no ids.  If computing
++ * ids for non-constants union the set of IDs that must be computed.
++ */
+ #define BINARY_LONG_OP(RESULT, OP, LHS, RHS)				\
+-	if (!compute_ids) {						\
++	if (!compute_ids || (is_const(LHS.val) && is_const(RHS.val))) { \
++		assert(LHS.ids == NULL);				\
++		assert(RHS.ids == NULL);				\
+ 		RESULT.val = (long)LHS.val OP (long)RHS.val;		\
+ 		RESULT.ids = NULL;					\
+ 	} else {							\
+@@ -86,7 +99,9 @@ static struct ids union_expr(struct ids ids1, struct ids ids2)
+ 	}
+ 
+ #define BINARY_OP(RESULT, OP, LHS, RHS)					\
+-	if (!compute_ids) {						\
++	if (!compute_ids || (is_const(LHS.val) && is_const(RHS.val))) { \
++		assert(LHS.ids == NULL);				\
++		assert(RHS.ids == NULL);				\
+ 		RESULT.val = LHS.val OP RHS.val;			\
+ 		RESULT.ids = NULL;					\
+ 	} else {							\
+@@ -163,40 +178,52 @@ expr: NUMBER
+ | expr '*' expr { BINARY_OP($$, *, $1, $3); }
+ | expr '/' expr
+ {
+-	if (!compute_ids) {
+-		if (fpclassify($3.val) == FP_ZERO) {
+-			pr_debug("division by zero\n");
+-			YYABORT;
+-		}
++	if (fpclassify($3.val) == FP_ZERO) {
++		pr_debug("division by zero\n");
++		YYABORT;
++	} else if (!compute_ids || (is_const($1.val) && is_const($3.val))) {
++		assert($1.ids == NULL);
++		assert($3.ids == NULL);
+ 		$$.val = $1.val / $3.val;
+ 		$$.ids = NULL;
+ 	} else {
++		/* LHS and/or RHS need computing from event IDs so union. */
+ 		$$ = union_expr($1, $3);
+ 	}
+ }
+ | expr '%' expr
+ {
+-	if (!compute_ids) {
+-		if (fpclassify($3.val) == FP_ZERO) {
+-			pr_debug("division by zero\n");
+-			YYABORT;
+-		}
++	if (fpclassify($3.val) == FP_ZERO) {
++		pr_debug("division by zero\n");
++		YYABORT;
++	} else if (!compute_ids || (is_const($1.val) && is_const($3.val))) {
++		assert($1.ids == NULL);
++		assert($3.ids == NULL);
+ 		$$.val = (long)$1.val % (long)$3.val;
+ 		$$.ids = NULL;
+ 	} else {
++		/* LHS and/or RHS need computing from event IDs so union. */
+ 		$$ = union_expr($1, $3);
+ 	}
+ }
+ | D_RATIO '(' expr ',' expr ')'
+ {
+-	if (!compute_ids) {
++	if (fpclassify($5.val) == FP_ZERO) {
++		/*
++		 * Division by constant zero always yields zero and no events
++		 * are necessary.
++		 */
++		assert($5.ids == NULL);
++		$$.val = 0.0;
++		$$.ids = NULL;
++		ids__free($3.ids);
++	} else if (!compute_ids || (is_const($3.val) && is_const($5.val))) {
++		assert($3.ids == NULL);
++		assert($5.ids == NULL);
++		$$.val = $3.val / $5.val;
+ 		$$.ids = NULL;
+-		if (fpclassify($5.val) == FP_ZERO) {
+-			$$.val = 0.0;
+-		} else {
+-			$$.val = $3.val / $5.val;
+-		}
+ 	} else {
++		/* LHS and/or RHS need computing from event IDs so union. */
+ 		$$ = union_expr($3, $5);
+ 	}
+ }
+-- 
+2.25.1
+
