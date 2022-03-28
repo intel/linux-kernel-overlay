@@ -1,10 +1,6 @@
-WARNING
--------------------------------------------------------------------------------
-This repository includes the intel Linux kernel source code.
-
 Overview
 -------------------------------------------------------------------------------
-This is the IoTG Linux kernel overlay repository (Ubuntu). It includes the Out-Of-Tree(OOT) IoTG
+This is the Intel Linux kernel overlay repository (Ubuntu). It includes the Out-Of-Tree(OOT)
 Linux kernel patches, kernel config and other files. With them, user can build the Linux
 kernel .deb packages.
 
