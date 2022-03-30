@@ -1,0 +1,210 @@
+From 21fc757b395320be30c751563e712eb730ee1bcf Mon Sep 17 00:00:00 2001
+From: Ian Rogers <irogers@google.com>
+Date: Wed, 26 Aug 2020 08:30:55 -0700
+Subject: [PATCH 17/60] perf expr: Force encapsulation on expr_id_data
+
+This patch resolves some undefined behavior where variables in
+expr_id_data were accessed (for debugging) without being defined. To
+better enforce the tagged union behavior, the struct is moved into
+expr.c and accessors provided. Tag values (kinds) are explicitly
+identified.
+
+Signed-off-by: Ian Rogers <irogers@google.com>
+Reviewed-By: Kajol Jain<kjain@linux.ibm.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Link: https://lore.kernel.org/r/20200826153055.2067780-1-irogers@google.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/expr.c        | 68 ++++++++++++++++++++++++++++++-----
+ tools/perf/util/expr.h        | 17 +++------
+ tools/perf/util/expr.y        |  2 +-
+ tools/perf/util/metricgroup.c |  4 +--
+ 4 files changed, 66 insertions(+), 25 deletions(-)
+
+diff --git a/tools/perf/util/expr.c b/tools/perf/util/expr.c
+index 50ccde43ace5..adf16bb7571a 100644
+--- a/tools/perf/util/expr.c
++++ b/tools/perf/util/expr.c
+@@ -17,6 +17,29 @@
+ extern int expr_debug;
+ #endif
+ 
++struct expr_id_data {
++	union {
++		double val;
++		struct {
++			double val;
++			const char *metric_name;
++			const char *metric_expr;
++		} ref;
++		struct expr_id	*parent;
++	};
++
++	enum {
++		/* Holding a double value. */
++		EXPR_ID_DATA__VALUE,
++		/* Reference to another metric. */
++		EXPR_ID_DATA__REF,
++		/* A reference but the value has been computed. */
++		EXPR_ID_DATA__REF_VALUE,
++		/* A parent is remembered for the recursion check. */
++		EXPR_ID_DATA__PARENT,
++	} kind;
++};
++
+ static size_t key_hash(const void *key, void *ctx __maybe_unused)
+ {
+ 	const char *str = (const char *)key;
+@@ -48,6 +71,7 @@ int expr__add_id(struct expr_parse_ctx *ctx, const char *id)
+ 		return -ENOMEM;
+ 
+ 	data_ptr->parent = ctx->parent;
++	data_ptr->kind = EXPR_ID_DATA__PARENT;
+ 
+ 	ret = hashmap__set(ctx->ids, id, data_ptr,
+ 			   (const void **)&old_key, (void **)&old_data);
+@@ -69,7 +93,7 @@ int expr__add_id_val(struct expr_parse_ctx *ctx, const char *id, double val)
+ 	if (!data_ptr)
+ 		return -ENOMEM;
+ 	data_ptr->val = val;
+-	data_ptr->is_ref = false;
++	data_ptr->kind = EXPR_ID_DATA__VALUE;
+ 
+ 	ret = hashmap__set(ctx->ids, id, data_ptr,
+ 			   (const void **)&old_key, (void **)&old_data);
+@@ -114,8 +138,7 @@ int expr__add_ref(struct expr_parse_ctx *ctx, struct metric_ref *ref)
+ 	 */
+ 	data_ptr->ref.metric_name = ref->metric_name;
+ 	data_ptr->ref.metric_expr = ref->metric_expr;
+-	data_ptr->ref.counted = false;
+-	data_ptr->is_ref = true;
++	data_ptr->kind = EXPR_ID_DATA__REF;
+ 
+ 	ret = hashmap__set(ctx->ids, name, data_ptr,
+ 			   (const void **)&old_key, (void **)&old_data);
+@@ -148,17 +171,30 @@ int expr__resolve_id(struct expr_parse_ctx *ctx, const char *id,
+ 
+ 	data = *datap;
+ 
+-	pr_debug2("lookup: is_ref %d, counted %d, val %f: %s\n",
+-		  data->is_ref, data->ref.counted, data->val, id);
+-
+-	if (data->is_ref && !data->ref.counted) {
+-		data->ref.counted = true;
++	switch (data->kind) {
++	case EXPR_ID_DATA__VALUE:
++		pr_debug2("lookup(%s): val %f\n", id, data->val);
++		break;
++	case EXPR_ID_DATA__PARENT:
++		pr_debug2("lookup(%s): parent %s\n", id, data->parent->id);
++		break;
++	case EXPR_ID_DATA__REF:
++		pr_debug2("lookup(%s): ref metric name %s\n", id,
++			data->ref.metric_name);
+ 		pr_debug("processing metric: %s ENTRY\n", id);
+-		if (expr__parse(&data->val, ctx, data->ref.metric_expr, 1)) {
++		data->kind = EXPR_ID_DATA__REF_VALUE;
++		if (expr__parse(&data->ref.val, ctx, data->ref.metric_expr, 1)) {
+ 			pr_debug("%s failed to count\n", id);
+ 			return -1;
+ 		}
+ 		pr_debug("processing metric: %s EXIT: %f\n", id, data->val);
++		break;
++	case EXPR_ID_DATA__REF_VALUE:
++		pr_debug2("lookup(%s): ref val %f metric name %s\n", id,
++			data->ref.val, data->ref.metric_name);
++		break;
++	default:
++		assert(0);  /* Unreachable. */
+ 	}
+ 
+ 	return 0;
+@@ -262,3 +298,17 @@ int expr__find_ids(const char *expr, const char *one,
+ 
+ 	return ret;
+ }
++
++double expr_id_data__value(const struct expr_id_data *data)
++{
++	if (data->kind == EXPR_ID_DATA__VALUE)
++		return data->val;
++	assert(data->kind == EXPR_ID_DATA__REF_VALUE);
++	return data->ref.val;
++}
++
++struct expr_id *expr_id_data__parent(struct expr_id_data *data)
++{
++	assert(data->kind == EXPR_ID_DATA__PARENT);
++	return data->parent;
++}
+diff --git a/tools/perf/util/expr.h b/tools/perf/util/expr.h
+index 8a6ce628511d..955d5adb7ca4 100644
+--- a/tools/perf/util/expr.h
++++ b/tools/perf/util/expr.h
+@@ -23,19 +23,7 @@ struct expr_parse_ctx {
+ 	struct expr_id	*parent;
+ };
+ 
+-struct expr_id_data {
+-	union {
+-		double val;
+-		struct {
+-			const char *metric_name;
+-			const char *metric_expr;
+-			bool counted;
+-		} ref;
+-		struct expr_id	*parent;
+-	};
+-
+-	bool is_ref;
+-};
++struct expr_id_data;
+ 
+ struct expr_scanner_ctx {
+ 	int start_token;
+@@ -58,4 +46,7 @@ int expr__parse(double *final_val, struct expr_parse_ctx *ctx,
+ int expr__find_ids(const char *expr, const char *one,
+ 		struct expr_parse_ctx *ids, int runtime);
+ 
++double expr_id_data__value(const struct expr_id_data *data);
++struct expr_id *expr_id_data__parent(struct expr_id_data *data);
++
+ #endif
+diff --git a/tools/perf/util/expr.y b/tools/perf/util/expr.y
+index d34b370391c6..b2ada8f8309a 100644
+--- a/tools/perf/util/expr.y
++++ b/tools/perf/util/expr.y
+@@ -93,7 +93,7 @@ expr:	  NUMBER
+ 						YYABORT;
+ 					}
+ 
+-					$$ = data->val;
++					$$ = expr_id_data__value(data);
+ 					free($1);
+ 				}
+ 	| expr '|' expr		{ $$ = (long)$1 | (long)$3; }
+diff --git a/tools/perf/util/metricgroup.c b/tools/perf/util/metricgroup.c
+index 6c7abc1ecf52..e7a11fd5a671 100644
+--- a/tools/perf/util/metricgroup.c
++++ b/tools/perf/util/metricgroup.c
+@@ -946,7 +946,7 @@ static int recursion_check(struct metric *m, const char *id, struct expr_id **pa
+ 	if (ret)
+ 		return ret;
+ 
+-	p = data->parent;
++	p = expr_id_data__parent(data);
+ 
+ 	while (p->parent) {
+ 		if (!strcmp(p->id, id)) {
+@@ -967,7 +967,7 @@ static int recursion_check(struct metric *m, const char *id, struct expr_id **pa
+ 	}
+ 
+ 	p->id     = strdup(id);
+-	p->parent = data->parent;
++	p->parent = expr_id_data__parent(data);
+ 	*parent   = p;
+ 
+ 	return p->id ? 0 : -ENOMEM;
+-- 
+2.25.1
+
