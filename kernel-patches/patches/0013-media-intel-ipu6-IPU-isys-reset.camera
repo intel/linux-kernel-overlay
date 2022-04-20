@@ -1,0 +1,498 @@
+From c1d5b335126351e8a7cdae7263c1db61455941ff Mon Sep 17 00:00:00 2001
+From: zouxiaoh <xiaohong.zou@intel.com>
+Date: Tue, 12 Apr 2022 14:33:34 +0800
+Subject: [PATCH 13/40] media: intel-ipu6: IPU isys reset
+
+IPU reset at the end of stop_streaming, if reset_needed is true.
+
+Signed-off-by: Chen Meng J <meng.j.chen@intel.com>
+Signed-off-by: zouxiaoh <xiaohong.zou@intel.com>
+---
+ drivers/media/pci/intel/ipu-isys-queue.c | 246 ++++++++++++++++++++++-
+ drivers/media/pci/intel/ipu-isys-video.c |  34 +++-
+ drivers/media/pci/intel/ipu-isys-video.h |   1 +
+ drivers/media/pci/intel/ipu-isys.c       |   6 +
+ drivers/media/pci/intel/ipu-isys.h       |   2 +
+ drivers/media/pci/intel/ipu6/Makefile    |   1 +
+ 6 files changed, 281 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-isys-queue.c b/drivers/media/pci/intel/ipu-isys-queue.c
+index 467ba55050c9..c8b07e463f85 100644
+--- a/drivers/media/pci/intel/ipu-isys-queue.c
++++ b/drivers/media/pci/intel/ipu-isys-queue.c
+@@ -5,6 +5,7 @@
+ #include <linux/device.h>
+ #include <linux/module.h>
+ #include <linux/string.h>
++#include <linux/delay.h>
+ 
+ #include <media/media-entity.h>
+ #include <media/videobuf2-dma-contig.h>
+@@ -12,6 +13,7 @@
+ 
+ #include "ipu.h"
+ #include "ipu-bus.h"
++#include "ipu-cpd.h"
+ #include "ipu-buttress.h"
+ #include "ipu-isys.h"
+ #include "ipu-isys-csi2.h"
+@@ -514,6 +516,22 @@ static void __buf_queue(struct vb2_buffer *vb, bool force)
+ 	list_add(&ib->head, &aq->incoming);
+ 	spin_unlock_irqrestore(&aq->lock, flags);
+ 
++	mutex_unlock(&av->mutex);
++	mutex_lock(&av->isys->reset_mutex);
++	while (av->isys->in_reset) {
++		mutex_unlock(&av->isys->reset_mutex);
++		dev_dbg(&av->isys->adev->dev, "buffer: %s: wait for reset\n",
++			av->vdev.name
++		);
++		usleep_range(10000, 11000);
++		mutex_lock(&av->isys->reset_mutex);
++	}
++	mutex_unlock(&av->isys->reset_mutex);
++	mutex_lock(&av->mutex);
++
++	/* ip may be cleared in ipu reset */
++	ip = to_ipu_isys_pipeline(av->vdev.entity.pipe);
++	pipe_av = container_of(ip, struct ipu_isys_video, ip);
+ 	if (ib->req)
+ 		return;
+ 
+@@ -750,9 +768,10 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	ip = to_ipu_isys_pipeline(av->vdev.entity.pipe);
+ 	pipe_av = container_of(ip, struct ipu_isys_video, ip);
+-	mutex_unlock(&av->mutex);
+-
+-	mutex_lock(&pipe_av->mutex);
++	if (pipe_av != av) {
++		mutex_unlock(&av->mutex);
++		mutex_lock(&pipe_av->mutex);
++	}
+ 	ip->nr_streaming++;
+ 	dev_dbg(&av->isys->adev->dev, "queue %u of %u\n", ip->nr_streaming,
+ 		ip->nr_queues);
+@@ -777,16 +796,20 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
+ 		goto out_stream_start;
+ 
+ out:
+-	mutex_unlock(&pipe_av->mutex);
+-	mutex_lock(&av->mutex);
++	if (pipe_av != av) {
++		mutex_unlock(&pipe_av->mutex);
++		mutex_lock(&av->mutex);
++	}
+ 
+ 	return 0;
+ 
+ out_stream_start:
+ 	list_del(&aq->node);
+ 	ip->nr_streaming--;
+-	mutex_unlock(&pipe_av->mutex);
+-	mutex_lock(&av->mutex);
++	if (pipe_av != av) {
++		mutex_unlock(&pipe_av->mutex);
++		mutex_lock(&av->mutex);
++	}
+ 
+ out_unprepare_streaming:
+ 	mutex_lock(&av->isys->stream_mutex);
+@@ -800,6 +823,207 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
+ 	return rval;
+ }
+ 
++static void reset_stop_streaming(struct ipu_isys_video *av)
++{
++	struct ipu_isys_pipeline *ip = &av->ip;
++	struct ipu_isys_queue *aq = &av->aq;
++
++	dev_info(&av->isys->adev->dev, "%s: stop streaming\n", av->vdev.name);
++
++	mutex_lock(&av->isys->stream_mutex);
++	if (ip->nr_streaming == ip->nr_queues && ip->streaming)
++		ipu_isys_video_set_streaming(av, 0, NULL);
++	if (ip->nr_streaming == 1)
++		ipu_isys_video_prepare_streaming(av, 0);
++	mutex_unlock(&av->isys->stream_mutex);
++
++	ip->nr_streaming--;
++	list_del(&aq->node);
++	ip->streaming = 0;
++}
++
++static int reset_start_streaming(struct ipu_isys_video *av)
++{
++	struct ipu_isys_pipeline *ip = &av->ip;
++	struct ipu_isys_queue *aq = &av->aq;
++	unsigned long flags;
++	int rval;
++
++	dev_info(&av->isys->adev->dev, "%s: start streaming\n", av->vdev.name);
++
++	spin_lock_irqsave(&aq->lock, flags);
++	while (!list_empty(&aq->active)) {
++		struct ipu_isys_buffer *ib = list_first_entry(&aq->active,
++				struct
++				ipu_isys_buffer,
++				head);
++		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
++
++		list_del(&ib->head);
++		list_add_tail(&ib->head, &aq->incoming);
++	}
++	spin_unlock_irqrestore(&aq->lock, flags);
++
++	rval = start_streaming(&aq->vbq, 0);
++
++	return rval;
++}
++
++static int ipu_isys_reset(struct ipu_isys_video *self_av)
++{
++	struct ipu_isys *isys = self_av->isys;
++	struct ipu_bus_device *adev = isys->adev;
++	struct ipu_bus_driver *adrv = adev->adrv;
++	struct ipu_device *isp = isys->adev->isp;
++	struct ipu_isys_video *av = NULL;
++	struct ipu_isys_pipeline *ip = NULL;
++	struct ipu_isys_queue *aq = NULL;
++	struct ipu_isys_csi2_be_soc *csi2_be_soc = NULL;
++	int rval, i, j;
++	int has_streaming = 0;
++
++	dev_info(&isys->adev->dev, "%s\n", __func__);
++
++	mutex_lock(&isys->reset_mutex);
++	if (isys->in_reset) {
++		mutex_unlock(&isys->reset_mutex);
++		return 0;
++	}
++	isys->in_reset = true;
++	mutex_unlock(&isys->reset_mutex);
++
++	for (i = 0; i < NR_OF_CSI2_SOURCE_PADS; i++) {
++		av = &isys->csi2->av[i];
++
++		if (av == self_av)
++			continue;
++
++		ip = &av->ip;
++		mutex_lock(&av->mutex);
++		if (!ip->streaming) {
++			mutex_unlock(&av->mutex);
++			continue;
++		}
++
++		av->reset = true;
++		has_streaming = true;
++		reset_stop_streaming(av);
++		mutex_unlock(&av->mutex);
++	}
++
++	av = &isys->csi2_be.av;
++
++	if (av != self_av) {
++		ip = &av->ip;
++		mutex_lock(&av->mutex);
++		if (ip->streaming) {
++			av->reset = true;
++			has_streaming = true;
++			reset_stop_streaming(av);
++		}
++		mutex_unlock(&av->mutex);
++	}
++
++	csi2_be_soc = &isys->csi2_be_soc;
++	for (j = 0; j < NR_OF_CSI2_BE_SOC_SOURCE_PADS; j++) {
++		av = &csi2_be_soc->av[j];
++		if (av == self_av)
++			continue;
++
++		ip = &av->ip;
++		mutex_lock(&av->mutex);
++		if (!ip->streaming) {
++			mutex_unlock(&av->mutex);
++			continue;
++		}
++		av->reset = true;
++		has_streaming = true;
++		reset_stop_streaming(av);
++		mutex_unlock(&av->mutex);
++	}
++
++	if (!has_streaming)
++		goto end_of_reset;
++
++	dev_info(&isys->adev->dev, "ipu reset, close fw\n");
++	ipu_fw_isys_close(isys);
++
++	dev_dbg(&isys->adev->dev, "ipu reset, power cycle\n");
++
++	/* bus_pm_runtime_suspend() */
++	/* isys_runtime_pm_suspend() */
++	adev->dev.bus->pm->runtime_suspend(&adev->dev);
++
++	/* ipu_suspend */
++	isp->pdev->driver->driver.pm->runtime_suspend(&isp->pdev->dev);
++
++	/* ipu_runtime_resume */
++	isp->pdev->driver->driver.pm->runtime_resume(&isp->pdev->dev);
++
++	/* bus_pm_runtime_resume() */
++	/* isys_runtime_pm_resume() */
++	adev->dev.bus->pm->runtime_resume(&adev->dev);
++
++	ipu_configure_spc(isys->adev->isp,
++			  &isys->pdata->ipdata->hw_variant,
++			  IPU_CPD_PKG_DIR_ISYS_SERVER_IDX,
++			  isys->pdata->base, isys->pkg_dir,
++			  isys->pkg_dir_dma_addr);
++
++	ipu_cleanup_fw_msg_bufs(isys);
++	if (isys->fwcom) {
++		dev_err(&isys->adev->dev, "Clearing old context\n");
++		ipu_fw_isys_cleanup(isys);
++	}
++
++	rval = ipu_fw_isys_init(av->isys,
++			  isys->pdata->ipdata->num_parallel_streams);
++	if (rval < 0)
++		dev_err(&isys->adev->dev, "ipu fw isys init failed\n");
++
++	dev_dbg(&isys->adev->dev, "restart streams\n");
++
++	for (i = 0; i < NR_OF_CSI2_SOURCE_PADS; i++) {
++		av = &isys->csi2->av[i];
++
++		if (!av->reset)
++			continue;
++
++		av->reset = false;
++		mutex_lock(&av->mutex);
++		reset_start_streaming(av);
++		mutex_unlock(&av->mutex);
++	}
++
++	av = &isys->csi2_be.av;
++	if (av->reset) {
++		av->reset = false;
++		mutex_lock(&av->mutex);
++		reset_start_streaming(av);
++		mutex_unlock(&av->mutex);
++	}
++
++	csi2_be_soc = &isys->csi2_be_soc;
++	for (j = 0; j < NR_OF_CSI2_BE_SOC_SOURCE_PADS; j++) {
++		av = &csi2_be_soc->av[j];
++		if (!av->reset)
++			continue;
++
++		av->reset = false;
++		mutex_lock(&av->mutex);
++		reset_start_streaming(av);
++		mutex_unlock(&av->mutex);
++	}
++
++end_of_reset:
++	mutex_lock(&isys->reset_mutex);
++	isys->in_reset = false;
++	mutex_unlock(&isys->reset_mutex);
++	dev_info(&isys->adev->dev, "reset done\n");
++
++	return 0;
++}
++
+ static void stop_streaming(struct vb2_queue *q)
+ {
+ 	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+@@ -809,6 +1033,9 @@ static void stop_streaming(struct vb2_queue *q)
+ 	struct ipu_isys_video *pipe_av =
+ 	    container_of(ip, struct ipu_isys_video, ip);
+ 
++	dev_info(&av->isys->adev->dev, "stop: %s: enter\n",
++		av->vdev.name);
++
+ 	if (pipe_av != av) {
+ 		mutex_unlock(&av->mutex);
+ 		mutex_lock(&pipe_av->mutex);
+@@ -831,6 +1058,11 @@ static void stop_streaming(struct vb2_queue *q)
+ 	}
+ 
+ 	return_buffers(aq, VB2_BUF_STATE_ERROR);
++	if (av->isys->reset_needed)
++		ipu_isys_reset(av);
++
++	dev_info(&av->isys->adev->dev, "stop: %s: exit\n",
++		av->vdev.name);
+ }
+ 
+ static unsigned int
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index d10727c6b9be..71497341d7e0 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -243,14 +243,29 @@ static int video_release(struct file *file)
+ 	struct ipu_isys_video *av = video_drvdata(file);
+ 	int ret = 0;
+ 
++	dev_info(&av->isys->adev->dev, "release: %s: enter\n",
++		av->vdev.name);
+ 	vb2_fop_release(file);
+ 
++	mutex_lock(&av->isys->reset_mutex);
++	while (av->isys->in_reset) {
++		mutex_unlock(&av->isys->reset_mutex);
++		dev_dbg(&av->isys->adev->dev, "release: %s: wait for reset\n",
++			av->vdev.name
++		);
++		usleep_range(10000, 11000);
++		mutex_lock(&av->isys->reset_mutex);
++	}
++	mutex_unlock(&av->isys->reset_mutex);
++
+ 	mutex_lock(&av->isys->mutex);
+ 
+ 	if (!--av->isys->video_opened) {
+ #ifdef IPU_IRQ_POLL
+ 		kthread_stop(av->isys->isr_thread);
+ #endif
++	dev_info(&av->isys->adev->dev, "release: %s: close fw\n",
++		av->vdev.name);
+ 		ipu_fw_isys_close(av->isys);
+ 		if (av->isys->fwcom) {
+ 			av->isys->reset_needed = true;
+@@ -267,6 +282,8 @@ static int video_release(struct file *file)
+ 	else
+ 		pm_runtime_put(&av->isys->adev->dev);
+ 
++	dev_info(&av->isys->adev->dev, "release: %s: exit\n",
++		av->vdev.name);
+ 	return ret;
+ }
+ 
+@@ -1263,6 +1280,7 @@ static void stop_streaming_firmware(struct ipu_isys_video *av)
+ 	int rval, tout;
+ 	enum ipu_fw_isys_send_type send_type =
+ 		IPU_FW_ISYS_SEND_TYPE_STREAM_FLUSH;
++	unsigned long timeout = IPU_LIB_CALL_TIMEOUT_JIFFIES;
+ 
+ 	reinit_completion(&ip->stream_stop_completion);
+ 
+@@ -1274,8 +1292,13 @@ static void stop_streaming_firmware(struct ipu_isys_video *av)
+ 		return;
+ 	}
+ 
++	mutex_lock(&av->isys->reset_mutex);
++	if (av->isys->in_reset)
++		timeout = msecs_to_jiffies(30);
++	mutex_unlock(&av->isys->reset_mutex);
++
+ 	tout = wait_for_completion_timeout(&ip->stream_stop_completion,
+-					   IPU_LIB_CALL_TIMEOUT_JIFFIES);
++					   timeout);
+ 	if (!tout)
+ 		dev_err(dev, "stream stop time out\n");
+ 	else if (ip->error)
+@@ -1290,6 +1313,7 @@ static void close_streaming_firmware(struct ipu_isys_video *av)
+ 	    to_ipu_isys_pipeline(av->vdev.entity.pipe);
+ 	struct device *dev = &av->isys->adev->dev;
+ 	int rval, tout;
++	unsigned long timeout = IPU_LIB_CALL_TIMEOUT_JIFFIES;
+ 
+ 	reinit_completion(&ip->stream_close_completion);
+ 
+@@ -1300,8 +1324,13 @@ static void close_streaming_firmware(struct ipu_isys_video *av)
+ 		return;
+ 	}
+ 
++	mutex_lock(&av->isys->reset_mutex);
++	if (av->isys->in_reset)
++		timeout = msecs_to_jiffies(30);
++	mutex_unlock(&av->isys->reset_mutex);
++
+ 	tout = wait_for_completion_timeout(&ip->stream_close_completion,
+-					   IPU_LIB_CALL_TIMEOUT_JIFFIES);
++					   timeout);
+ 	if (!tout)
+ 		dev_err(dev, "stream close time out\n");
+ 	else if (ip->error)
+@@ -1776,6 +1805,7 @@ int ipu_isys_video_init(struct ipu_isys_video *av,
+ 	av->ip.isys = av->isys;
+ 	av->ip.stream_id = 0;
+ 	av->ip.vc = 0;
++	av->reset = false;
+ 
+ #if defined(IPU_IWAKE_ENABLE)
+ 	if (!av->watermark) {
+diff --git a/drivers/media/pci/intel/ipu-isys-video.h b/drivers/media/pci/intel/ipu-isys-video.h
+index c8737b3a68e8..46b812e3399e 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.h
++++ b/drivers/media/pci/intel/ipu-isys-video.h
+@@ -124,6 +124,7 @@ struct ipu_isys_video {
+ 	struct ipu_isys *isys;
+ 	struct ipu_isys_pipeline ip;
+ 	unsigned int streaming;
++	unsigned int reset;
+ 	bool packed;
+ #if defined(IPU_ISYS_COMPRESSION)
+ 	bool compression;
+diff --git a/drivers/media/pci/intel/ipu-isys.c b/drivers/media/pci/intel/ipu-isys.c
+index ba3b7fbc5987..98e498ddbf08 100644
+--- a/drivers/media/pci/intel/ipu-isys.c
++++ b/drivers/media/pci/intel/ipu-isys.c
+@@ -895,6 +895,7 @@ static void isys_remove(struct ipu_bus_device *adev)
+ 	mutex_destroy(&isys->stream_mutex);
+ 	mutex_destroy(&isys->mutex);
+ 
++	mutex_destroy(&isys->reset_mutex);
+ 	if (isys->short_packet_source == IPU_ISYS_SHORT_PACKET_FROM_TUNIT) {
+ 		u32 trace_size = IPU_ISYS_SHORT_PACKET_TRACE_BUFFER_SIZE;
+ 
+@@ -1222,6 +1223,9 @@ static int isys_probe(struct ipu_bus_device *adev)
+ 	mutex_init(&isys->stream_mutex);
+ 	mutex_init(&isys->lib_mutex);
+ 
++	mutex_init(&isys->reset_mutex);
++	isys->in_reset = false;
++
+ 	spin_lock_init(&isys->listlock);
+ 	INIT_LIST_HEAD(&isys->framebuflist);
+ 	INIT_LIST_HEAD(&isys->framebuflist_fw);
+@@ -1305,6 +1309,8 @@ static int isys_probe(struct ipu_bus_device *adev)
+ 	mutex_destroy(&isys->mutex);
+ 	mutex_destroy(&isys->stream_mutex);
+ 
++	mutex_destroy(&isys->reset_mutex);
++
+ 	if (isys->short_packet_source == IPU_ISYS_SHORT_PACKET_FROM_TUNIT)
+ 		mutex_destroy(&isys->short_packet_tracing_mutex);
+ 
+diff --git a/drivers/media/pci/intel/ipu-isys.h b/drivers/media/pci/intel/ipu-isys.h
+index fb907a297c34..04a0e64c42ee 100644
+--- a/drivers/media/pci/intel/ipu-isys.h
++++ b/drivers/media/pci/intel/ipu-isys.h
+@@ -212,6 +212,8 @@ struct ipu_isys {
+ 	struct isys_iwake_watermark *iwake_watermark;
+ #endif
+ 
++	struct mutex reset_mutex;
++	bool in_reset;
+ };
+ 
+ #if defined(IPU_IWAKE_ENABLE)
+diff --git a/drivers/media/pci/intel/ipu6/Makefile b/drivers/media/pci/intel/ipu6/Makefile
+index 901e2f3826ba..49f19439f4f3 100644
+--- a/drivers/media/pci/intel/ipu6/Makefile
++++ b/drivers/media/pci/intel/ipu6/Makefile
+@@ -8,6 +8,7 @@ endif
+ ccflags-y += -DIPU_VC_SUPPORT -DIPU_HAS_S2M -DIPU_TPG_FRAME_SYNC -DIPU_PSYS_GPC \
+ 		-DIPU_ISYS_GPC -DIPU_TRACE_EVENT
+ ccflags-y += -DIPU_META_DATA_SUPPORT -DI2C_DYNAMIC
++ccflags-y += -DIPU_ISYS_RESET
+ 
+ intel-ipu6-objs				+= ../ipu.o \
+ 					   ../ipu-bus.o \
+-- 
+2.25.1
+
