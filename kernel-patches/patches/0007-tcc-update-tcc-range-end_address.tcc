@@ -1,7 +1,7 @@
-From fbfc9b97479ab180124b09a9e378059efdeec96d Mon Sep 17 00:00:00 2001
+From 8844bf12efa2135665a7f4fe91be163060cc7590 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 16:56:12 +0800
-Subject: [PATCH 07/19] tcc: update tcc range end_address.
+Subject: [PATCH 07/23] tcc: update tcc range end_address.
 
 To report tcc range, start_address is inclusive; but end_address is not.
 
@@ -11,7 +11,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 46330302796a..551743255dc8 100644
+index 204c0610bf6b..f09c433d1210 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1295,7 +1295,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
@@ -24,5 +24,5 @@ index 46330302796a..551743255dc8 100644
  		}
  		ptr += entry->size;
 -- 
-2.32.0
+2.25.1
 
