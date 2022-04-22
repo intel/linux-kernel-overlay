@@ -1,0 +1,115 @@
+From 2ab51d9143fb92090cd6aed5568714417212246e Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Mon, 21 Mar 2022 15:16:54 +0800
+Subject: [PATCH] Revert "drm/i915/gt: Restore ce->signal flush before
+ releasing virtual engine"
+
+This reverts commit 6413203cd4418a71650c922c078cf6ebe251d1f0.
+---
+ drivers/gpu/drm/i915/gt/intel_breadcrumbs.c   | 33 -------------------
+ drivers/gpu/drm/i915/gt/intel_breadcrumbs.h   |  1 -
+ .../drm/i915/gt/intel_execlists_submission.c  | 25 ++++++++------
+ 3 files changed, 15 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+index 14a5386bcfb9..e5a3a5fbee95 100644
+--- a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+@@ -454,39 +454,6 @@ void i915_request_cancel_breadcrumb(struct i915_request *rq)
+ 	i915_request_put(rq);
+ }
+ 
+-void intel_context_remove_breadcrumbs(struct intel_context *ce,
+-				      struct intel_breadcrumbs *b)
+-{
+-	struct i915_request *rq, *rn;
+-	bool release = false;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&ce->signal_lock, flags);
+-
+-	if (list_empty(&ce->signals))
+-		goto unlock;
+-
+-	list_for_each_entry_safe(rq, rn, &ce->signals, signal_link) {
+-		GEM_BUG_ON(!__i915_request_is_complete(rq));
+-		if (!test_and_clear_bit(I915_FENCE_FLAG_SIGNAL,
+-					&rq->fence.flags))
+-			continue;
+-
+-		list_del_rcu(&rq->signal_link);
+-		irq_signal_request(rq, b);
+-		i915_request_put(rq);
+-	}
+-	release = remove_signaling_context(b, ce);
+-
+-unlock:
+-	spin_unlock_irqrestore(&ce->signal_lock, flags);
+-	if (release)
+-		intel_context_put(ce);
+-
+-	while (atomic_read(&b->signaler_active))
+-		cpu_relax();
+-}
+-
+ static void print_signals(struct intel_breadcrumbs *b, struct drm_printer *p)
+ {
+ 	struct intel_context *ce;
+diff --git a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.h b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.h
+index be0d4f379a85..40010e336f40 100644
+--- a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.h
++++ b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.h
+@@ -6,7 +6,6 @@
+ #ifndef __INTEL_BREADCRUMBS__
+ #define __INTEL_BREADCRUMBS__
+ 
+-#include <linux/atomic.h>
+ #include <linux/irq_work.h>
+ 
+ #include "intel_breadcrumbs_types.h"
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index afee57a9bd66..4128b2223aa7 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -544,6 +544,21 @@ resubmit_virtual_request(struct i915_request *rq, struct virtual_engine *ve)
+ {
+ 	struct intel_engine_cs *engine = rq->engine;
+ 
++	/* Flush concurrent rcu iterators in signal_irq_work */
++	if (test_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &rq->fence.flags)) {
++		/*
++		 * After this point, the rq may be transferred to a new
++		 * sibling, so before we clear ce->inflight make sure that
++		 * the context has been removed from the b->signalers and
++		 * furthermore we need to make sure that the concurrent
++		 * iterator in signal_irq_work is no longer following
++		 * ce->signal_link.
++		 */
++		i915_request_cancel_breadcrumb(rq);
++		while (atomic_read(&engine->breadcrumbs->signaler_active))
++			cpu_relax();
++	}
++
+ 	spin_lock_irq(&engine->sched_engine->lock);
+ 
+ 	clear_bit(I915_FENCE_FLAG_PQUEUE, &rq->fence.flags);
+@@ -558,16 +573,6 @@ static void kick_siblings(struct i915_request *rq, struct intel_context *ce)
+ 	struct virtual_engine *ve = container_of(ce, typeof(*ve), context);
+ 	struct intel_engine_cs *engine = rq->engine;
+ 
+-	/*
+-	 * After this point, the rq may be transferred to a new sibling, so
+-	 * before we clear ce->inflight make sure that the context has been
+-	 * removed from the b->signalers and furthermore we need to make sure
+-	 * that the concurrent iterator in signal_irq_work is no longer
+-	 * following ce->signal_link.
+-	 */
+-	if (!list_empty(&ce->signals))
+-		intel_context_remove_breadcrumbs(ce, engine->breadcrumbs);
+-
+ 	/*
+ 	 * This engine is now too busy to run this virtual request, so
+ 	 * see if we can find an alternative engine for it to execute on.
+-- 
+2.27.0
+
