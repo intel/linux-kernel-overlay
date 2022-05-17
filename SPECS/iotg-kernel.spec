@@ -62,18 +62,18 @@
 %global isrc 1
 
 %define pkgrelease  36
-%define rpmversion  5.10.109
+%define rpmversion  5.10.115
 %if %{?isrc}
-%define rcversion   rt65.
+%define rcversion   rt67.
 %endif
-%define embargoname 0512.lts2020_rt
+%define embargoname 0516.lts2020_rt
 
 %define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}220512T091439Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}220516T230154Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -468,7 +468,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo https://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git/
-%global kernel_src_tag v5.10.109-rt65
+%global kernel_src_tag v5.10.115-rt67
 # END OF PROJECT SPECIFIC MACROS
 
 
