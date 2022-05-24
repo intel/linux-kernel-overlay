@@ -1,7 +1,7 @@
-From d4fb800f1c87dfa397827fbc3a2a1a64504ce3bd Mon Sep 17 00:00:00 2001
+From 938857216642dd7a821c2fea3d1e0086a01c7283 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 10 Jul 2020 17:48:35 +0800
-Subject: [PATCH 06/19] tcc: tcc drvier should not exit even if no psram entry.
+Subject: [PATCH 06/23] tcc: tcc drvier should not exit even if no psram entry.
 
 Driver should work even no pSRAM regions are created, because it is used
 by tcc_cache_configurator to read RTCT and configure pSRAM.
@@ -13,7 +13,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 1 insertion(+), 6 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index e500613c6bce..46330302796a 100644
+index d9e7fadf33be..204c0610bf6b 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1280,7 +1280,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
@@ -42,5 +42,5 @@ index 544ab59b3a94..ce5d565b68ee 100644
  	l2_end = 0;
  
 -- 
-2.32.0
+2.25.1
 

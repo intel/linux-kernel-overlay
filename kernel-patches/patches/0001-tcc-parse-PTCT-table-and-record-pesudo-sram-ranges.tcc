@@ -1,7 +1,7 @@
-From db1c34582d6d22e03264c9eadcbf8ae9e24710a3 Mon Sep 17 00:00:00 2001
+From 76c8e63effe00bd2331c3651284001ef88913965 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 16:02:33 +0800
-Subject: [PATCH 01/19] tcc: parse PTCT table and record pesudo sram ranges
+Subject: [PATCH 01/23] tcc: parse PTCT table and record pesudo sram ranges
 
 ACPI may include PTCT table. If PTCT is included, this table need to be parsed
 and records all pesudo SRAM ranges indicated in the table. These pesudo SRAM
@@ -16,7 +16,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 5b6d1a95776f..941c8f942d8c 100644
+index 0d01e7f5078c..7efbaf88e705 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1227,6 +1227,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -116,7 +116,7 @@ index 5b6d1a95776f..941c8f942d8c 100644
  static void __init early_acpi_process_madt(void)
  {
  #ifdef CONFIG_X86_LOCAL_APIC
-@@ -1609,6 +1699,11 @@ int __init acpi_boot_init(void)
+@@ -1633,6 +1723,11 @@ int __init acpi_boot_init(void)
  	if (IS_ENABLED(CONFIG_ACPI_BGRT) && !acpi_nobgrt)
  		acpi_table_parse(ACPI_SIG_BGRT, acpi_parse_bgrt);
  
@@ -201,5 +201,5 @@ index 16847c8d9d5f..ea80534b4603 100644
   *
   * RASF - RAS Feature Table (ACPI 5.0)
 -- 
-2.32.0
+2.25.1
 
