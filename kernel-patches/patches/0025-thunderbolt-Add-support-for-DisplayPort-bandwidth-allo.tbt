@@ -1,0 +1,1128 @@
+From 5cedcb4897a9b3f82dfd7402317e8bf9b4a2a5cf Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Wed, 23 Mar 2022 16:45:39 +0200
+Subject: [PATCH 25/25] thunderbolt: Add support for DisplayPort bandwidth
+ allocation mode
+
+The USB4 spec defines an optional feature that allows the connection
+manager to negotiate with the graphics through DPCD registers changes in
+the bandwidth allocation dynamically. This is referred as "bandwidth
+allocation mode" in the spec. The connection manager uses DP IN adapters
+registers to communicate with the graphics, and also gets notifications
+from these adapters when the graphics wants to change the bandwidth
+allocation. Both the connection manager and the graphics driver needs to
+support this.
+
+We check if the DP IN adapter supports this and if it does enable it
+before establishing a DP tunnel. Then we react on DP_BW notifications
+coming from the DP IN adapter and update the bandwidth allocation
+accordingly (within the maximum commong capabilities the DP IN/OUT
+support).
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/ctl.c     |  27 ++-
+ drivers/thunderbolt/ctl.h     |   1 +
+ drivers/thunderbolt/tb.c      | 403 +++++++++++++++++++++++++++++++++-
+ drivers/thunderbolt/tb.h      |  23 ++
+ drivers/thunderbolt/tb_msgs.h |  11 +-
+ drivers/thunderbolt/tunnel.c  | 325 +++++++++++++++++++++++++--
+ drivers/thunderbolt/tunnel.h  |  10 +
+ 7 files changed, 756 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/thunderbolt/ctl.c b/drivers/thunderbolt/ctl.c
+index 4986edfbdf67..a823fb707187 100644
+--- a/drivers/thunderbolt/ctl.c
++++ b/drivers/thunderbolt/ctl.c
+@@ -231,7 +231,6 @@ static int check_config_address(struct tb_cfg_address addr,
+ static struct tb_cfg_result decode_error(const struct ctl_pkg *response)
+ {
+ 	struct cfg_error_pkg *pkg = response->buffer;
+-	struct tb_ctl *ctl = response->ctl;
+ 	struct tb_cfg_result res = { 0 };
+ 	res.response_route = tb_cfg_get_route(&pkg->header);
+ 	res.response_port = 0;
+@@ -240,13 +239,6 @@ static struct tb_cfg_result decode_error(const struct ctl_pkg *response)
+ 	if (res.err)
+ 		return res;
+ 
+-	if (pkg->zero1)
+-		tb_ctl_warn(ctl, "pkg->zero1 is %#x\n", pkg->zero1);
+-	if (pkg->zero2)
+-		tb_ctl_warn(ctl, "pkg->zero2 is %#x\n", pkg->zero2);
+-	if (pkg->zero3)
+-		tb_ctl_warn(ctl, "pkg->zero3 is %#x\n", pkg->zero3);
+-
+ 	res.err = 1;
+ 	res.tb_error = pkg->error;
+ 	res.response_port = pkg->port;
+@@ -417,6 +409,7 @@ static int tb_async_error(const struct ctl_pkg *pkg)
+ 	case TB_CFG_ERROR_LINK_ERROR:
+ 	case TB_CFG_ERROR_HEC_ERROR_DETECTED:
+ 	case TB_CFG_ERROR_FLOW_CONTROL_ERROR:
++	case TB_CFG_ERROR_DP_BW:
+ 		return true;
+ 
+ 	default:
+@@ -736,6 +729,24 @@ void tb_ctl_stop(struct tb_ctl *ctl)
+ 
+ /* public interface, commands */
+ 
++/**
++ * tb_cfg_ack_notification() - Ack notification
++ * @ctl: Control channel to use
++ * @route: Router that originated the event
++ *
++ * Call this as response for non-plug notification to ack it. Returns
++ * %0 on success or an error code on failure.
++ */
++int tb_cfg_ack_notification(struct tb_ctl *ctl, u64 route)
++{
++	struct cfg_ack_pkg pkg = {
++		.header = tb_cfg_make_header(route),
++	};
++
++	tb_ctl_dbg(ctl, "acking notification on %llx\n", route);
++	return tb_ctl_tx(ctl, &pkg, sizeof(pkg), TB_CFG_PKG_ERROR);
++}
++
+ /**
+  * tb_cfg_ack_plug() - Ack hot plug/unplug event
+  * @ctl: Control channel to use
+diff --git a/drivers/thunderbolt/ctl.h b/drivers/thunderbolt/ctl.h
+index e8c64898dfce..5db69623ac58 100644
+--- a/drivers/thunderbolt/ctl.h
++++ b/drivers/thunderbolt/ctl.h
+@@ -122,6 +122,7 @@ static inline struct tb_cfg_header tb_cfg_make_header(u64 route)
+ 	return header;
+ }
+ 
++int tb_cfg_ack_notification(struct tb_ctl *ctl, u64 route);
+ int tb_cfg_ack_plug(struct tb_ctl *ctl, u64 route, u32 port, bool unplug);
+ struct tb_cfg_result tb_cfg_reset(struct tb_ctl *ctl, u64 route);
+ struct tb_cfg_result tb_cfg_read_raw(struct tb_ctl *ctl, void *buffer,
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index d0758193ea98..8c20a50cc9d9 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -16,7 +16,8 @@
+ #include "tb_regs.h"
+ #include "tunnel.h"
+ 
+-#define TB_TIMEOUT	100 /* ms */
++#define TB_TIMEOUT	100	/* ms */
++#define MAX_GROUPS	7	/* max Group_ID is 7 */
+ 
+ /**
+  * struct tb_cm - Simple Thunderbolt connection manager
+@@ -28,12 +29,14 @@
+  *		    after cfg has been paused.
+  * @remove_work: Work used to remove any unplugged routers after
+  *		 runtime resume
++ * @groups: Bandwidth groups used in this domain.
+  */
+ struct tb_cm {
+ 	struct list_head tunnel_list;
+ 	struct list_head dp_resources;
+ 	bool hotplug_active;
+ 	struct delayed_work remove_work;
++	struct tb_bandwidth_group groups[MAX_GROUPS];
+ };
+ 
+ static inline struct tb *tcm_to_tb(struct tb_cm *tcm)
+@@ -49,6 +52,123 @@ struct tb_hotplug_event {
+ 	bool unplug;
+ };
+ 
++static void tb_init_bandwidth_groups(struct tb_cm *tcm)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(tcm->groups); i++) {
++		struct tb_bandwidth_group *group = &tcm->groups[i];
++
++		group->tb = tcm_to_tb(tcm);
++		group->index = i + 1;
++		INIT_LIST_HEAD(&group->ports);
++	}
++}
++
++static void tb_bandwidth_group_attach_port(struct tb_bandwidth_group *group,
++					   struct tb_port *in)
++{
++	if (!group || WARN_ON(in->group))
++		return;
++
++	in->group = group;
++	list_add_tail(&in->group_list, &group->ports);
++
++	tb_port_dbg(in, "attached to bandwidth group %d\n", group->index);
++}
++
++static struct tb_bandwidth_group *tb_find_free_bandwidth_group(struct tb_cm *tcm)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(tcm->groups); i++) {
++		struct tb_bandwidth_group *group = &tcm->groups[i];
++
++		if (list_empty(&group->ports))
++			return group;
++	}
++
++	return NULL;
++}
++
++static void tb_attach_bandwidth_group(struct tb_cm *tcm, struct tb_port *in,
++				      struct tb_port *out)
++{
++	struct tb_bandwidth_group *group;
++	struct tb_port *port;
++
++	/* Only use groups if the adapter supports them */
++	if (!usb4_dp_port_bw_mode_supported(in))
++		return;
++
++	tb_for_each_port_on_path(in, out, port) {
++		struct tb_tunnel *tunnel;
++
++		/* Skip non-lane adapters */
++		if (!tb_port_is_null(port))
++			continue;
++
++		/*
++		 * Find all DP tunnels that cross the same USB4 port and
++		 * attach the @in to the same bandwidth group as they
++		 * share the same bandwidth.
++		 */
++		list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
++			if (!tb_tunnel_is_dp(tunnel))
++				continue;
++
++			if (!tb_tunnel_port_on_path(tunnel, port))
++				continue;
++
++			if (tunnel->src_port->group) {
++				tb_bandwidth_group_attach_port(
++					tunnel->src_port->group, in);
++				return;
++			}
++		}
++	}
++
++	/* Pick up next available group then */
++	group = tb_find_free_bandwidth_group(tcm);
++	if (!group) {
++		tb_port_warn(in, "no available bandwidth groups, not adding\n");
++		return;
++	}
++
++	tb_bandwidth_group_attach_port(group, in);
++}
++
++static void tb_discover_bandwidth_group(struct tb_cm *tcm, struct tb_port *in,
++					struct tb_port *out)
++{
++	if (usb4_dp_port_bw_mode_enabled(in)) {
++		int index, i;
++
++		index = usb4_dp_port_group_id(in);
++		for (i = 0; i < ARRAY_SIZE(tcm->groups); i++) {
++			if (tcm->groups[i].index == index) {
++				tb_bandwidth_group_attach_port(
++					&tcm->groups[i], in);
++				return;
++			}
++		}
++	}
++
++	tb_attach_bandwidth_group(tcm, in, out);
++}
++
++static void tb_detach_bandwidth_group(struct tb_port *in)
++{
++	struct tb_bandwidth_group *group = in->group;
++
++	if (group) {
++		in->group = NULL;
++		list_del_init(&in->group_list);
++
++		tb_port_dbg(in, "detached from bandwidth group %d\n", group->index);
++	}
++}
++
+ static void tb_handle_hotplug(struct work_struct *work);
+ 
+ static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
+@@ -160,9 +280,14 @@ static void tb_discover_tunnels(struct tb *tb)
+ 				parent = tb_switch_parent(parent);
+ 			}
+ 		} else if (tb_tunnel_is_dp(tunnel)) {
++			struct tb_port *in = tunnel->src_port;
++			struct tb_port *out = tunnel->dst_port;
++
+ 			/* Keep the domain from powering down */
+-			pm_runtime_get_sync(&tunnel->src_port->sw->dev);
+-			pm_runtime_get_sync(&tunnel->dst_port->sw->dev);
++			pm_runtime_get_sync(&in->sw->dev);
++			pm_runtime_get_sync(&out->sw->dev);
++
++			tb_discover_bandwidth_group(tcm, in, out);
+ 		}
+ 	}
+ }
+@@ -363,12 +488,24 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 		list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+ 			int dp_consumed_up, dp_consumed_down;
+ 
++			if (tb_tunnel_is_invalid(tunnel))
++				continue;
++
+ 			if (!tb_tunnel_is_dp(tunnel))
+ 				continue;
+ 
+ 			if (!tb_tunnel_port_on_path(tunnel, port))
+ 				continue;
+ 
++			/*
++			 * Ignore the DP tunnel between src_port and
++			 * dst_port because it is the same tunnel and we
++			 * may be re-calculating estimated bandwidth.
++			 */
++			if (tunnel->src_port == src_port &&
++			    tunnel->dst_port == dst_port)
++				continue;
++
+ 			ret = tb_tunnel_consumed_bandwidth(tunnel,
+ 							   &dp_consumed_up,
+ 							   &dp_consumed_down);
+@@ -705,6 +842,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
+ 
+ 	switch (tunnel->type) {
+ 	case TB_TUNNEL_DP:
++		tb_detach_bandwidth_group(src_port);
+ 		/*
+ 		 * In case of DP tunnel make sure the DP IN resource is
+ 		 * deallocated properly.
+@@ -859,6 +997,72 @@ static struct tb_port *tb_find_dp_out(struct tb *tb, struct tb_port *in)
+ 	return NULL;
+ }
+ 
++static void tb_update_estimated_bandwidth(struct tb_tunnel *tunnel,
++					  int estimated_up, int estimated_down)
++{
++	struct tb_port *in = tunnel->src_port;
++	struct tb_port *out = tunnel->dst_port;
++	int bw;
++
++	if (in->sw->config.depth < out->sw->config.depth)
++		bw = estimated_down;
++	else
++		bw = estimated_up;
++
++	if (usb4_dp_port_set_estimated_bw(in, bw))
++		tb_port_warn(in, "failed to update estimated bandwidth\n");
++}
++
++static void tb_recalc_estimated_bandwidth(struct tb *tb)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++	struct tb_tunnel *tunnel;
++
++	tb_dbg(tb, "bandwidth consumption changed, re-calculating estimated bandwidth\n");
++
++	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
++		int estimated_up, estimated_down, ret;
++		struct tb_port *in, *out;
++
++		if (!tb_tunnel_is_dp(tunnel))
++			continue;
++
++		in = tunnel->src_port;
++		/* Only needed if the bandwidth allocation mode is enabled */
++		if (!in->group)
++			continue;
++
++		out = tunnel->dst_port;
++
++		ret = tb_release_unused_usb3_bandwidth(tb, in, out);
++		if (ret) {
++			tb_port_warn(in, "failed to release unused bandwidth\n");
++			return;
++		}
++
++		ret = tb_available_bandwidth(tb, in, out, &estimated_up,
++					     &estimated_down);
++		if (ret) {
++			tb_port_warn(in, "failed to re-calculate estimated bandwidth\n");
++			tb_reclaim_usb3_bandwidth(tb, in, out);
++			return;
++		}
++
++		/*
++		 * Estimated bandwidth includes:
++		 *  * already allocated bandwidth for the DP tunnel
++		 *  * available bandwidth along the path
++		 *  * bandwidth allocated for USB 3.x but not used.
++		 */
++		tb_port_dbg(in, "estimated bandwidth %u/%u Mb/s\n", estimated_up,
++			    estimated_down);
++
++		tb_update_estimated_bandwidth(tunnel, estimated_up, estimated_down);
++
++		tb_reclaim_usb3_bandwidth(tb, in, out);
++	}
++}
++
+ static void tb_tunnel_dp(struct tb *tb)
+ {
+ 	int available_up, available_down, ret;
+@@ -929,18 +1133,19 @@ static void tb_tunnel_dp(struct tb *tb)
+ 		goto err_dealloc_dp;
+ 	}
+ 
+-	ret = tb_available_bandwidth(tb, in, out, &available_up,
+-				     &available_down);
++	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down);
+ 	if (ret)
+-		goto err_reclaim;
++		goto err_dealloc_dp;
+ 
+ 	tb_dbg(tb, "available bandwidth for new DP tunnel %u/%u Mb/s\n",
+ 	       available_up, available_down);
+ 
++	tb_attach_bandwidth_group(tcm, in, out);
++
+ 	tunnel = tb_tunnel_alloc_dp(tb, in, out, available_up, available_down);
+ 	if (!tunnel) {
+ 		tb_port_dbg(out, "could not allocate DP tunnel\n");
+-		goto err_reclaim;
++		goto err_detach_group;
+ 	}
+ 
+ 	if (tb_tunnel_activate(tunnel)) {
+@@ -954,7 +1159,8 @@ static void tb_tunnel_dp(struct tb *tb)
+ 
+ err_free:
+ 	tb_tunnel_free(tunnel);
+-err_reclaim:
++err_detach_group:
++	tb_detach_bandwidth_group(in);
+ 	tb_reclaim_usb3_bandwidth(tb, in, out);
+ err_dealloc_dp:
+ 	tb_switch_dealloc_dp_resource(in->sw, in);
+@@ -988,6 +1194,7 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port)
+ 	 * See if there is another DP OUT port that can be used for
+ 	 * to create another tunnel.
+ 	 */
++	tb_recalc_estimated_bandwidth(tb);
+ 	tb_tunnel_dp(tb);
+ }
+ 
+@@ -1235,6 +1442,7 @@ static void tb_handle_hotplug(struct work_struct *work)
+ 			if (port->dual_link_port)
+ 				port->dual_link_port->remote = NULL;
+ 			/* Maybe we can create another DP tunnel */
++			tb_recalc_estimated_bandwidth(tb);
+ 			tb_tunnel_dp(tb);
+ 		} else if (port->xdomain) {
+ 			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
+@@ -1292,6 +1500,172 @@ static void tb_handle_hotplug(struct work_struct *work)
+ 	kfree(ev);
+ }
+ 
++static int tb_alloc_dp_bandwidth(struct tb_tunnel *tunnel, int *requested_up,
++				 int *requested_down)
++{
++	int allocated_up, allocated_down, available_up, available_down, ret;
++	struct tb *tb = tunnel->tb;
++	struct tb_port *in, *out;
++
++	ret = tb_tunnel_allocated_bandwidth(tunnel, &allocated_up, &allocated_down);
++	if (ret)
++		return ret;
++
++	/* Already allocated what was requested */
++	if ((*requested_up && *requested_up == allocated_up) ||
++	    (*requested_down && *requested_down == allocated_down))
++		return 0;
++
++	if ((*requested_up && *requested_up < allocated_up) ||
++	    (*requested_down && *requested_down < allocated_down)) {
++		/*
++		 * If requested bandwidth is less than what is currently
++		 * allocated to that tunnel we simply change the
++		 * reservation of the tunnel. Since all the tunnels
++		 * going out from the same USB4 port are in the same
++		 * group the released bandwidth will be taken into
++		 * account for the other tunnels automatically below.
++		 */
++		 return tb_tunnel_alloc_bandwidth(tunnel, requested_up,
++						  requested_down);
++	}
++
++	in = tunnel->src_port;
++	out = tunnel->dst_port;
++
++	/*
++	 * More bandwidth is requested. Release all the potential
++	 * bandwidth from USB3 and also if any of the existing tunnels
++	 * that are in the same group released their bandwidth.
++	 */
++	ret = tb_release_unused_usb3_bandwidth(tb, in, out);
++	if (ret)
++		return ret;
++
++	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down);
++	if (ret)
++		goto reclaim;
++
++	tb_port_dbg(in, "available bandwidth %u/%u Mb/s\n", available_up,
++		    available_down);
++
++	if ((*requested_up && available_up >= *requested_up) ||
++	    (*requested_down && available_down >= *requested_down)) {
++		ret = tb_tunnel_alloc_bandwidth(tunnel, requested_up,
++						requested_down);
++	} else {
++		ret = -ENOBUFS;
++	}
++
++reclaim:
++	tb_reclaim_usb3_bandwidth(tb, in, out);
++
++	return ret;
++}
++
++static void tb_handle_dp_bandwidth_request(struct work_struct *work)
++{
++	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work);
++	int requested_bw, requested_up, requested_down;
++	struct tb_port *in, *out;
++	struct tb_tunnel *tunnel;
++	struct tb *tb = ev->tb;
++	struct tb_cm *tcm = tb_priv(tb);
++	struct tb_switch *sw;
++
++	pm_runtime_get_sync(&tb->dev);
++
++	mutex_lock(&tb->lock);
++	if (!tcm->hotplug_active)
++		goto unlock;
++
++	sw = tb_switch_find_by_route(tb, ev->route);
++	if (!sw) {
++		tb_warn(tb, "bandwidth request from non-existent router %llx\n",
++			ev->route);
++		goto unlock;
++	}
++
++	in = &sw->ports[ev->port];
++	if (!tb_port_is_dpin(in)) {
++		tb_port_warn(in, "bandwidth request to non-DP IN adapter\n");
++		goto unlock;
++	}
++
++	if (!usb4_dp_port_bw_mode_enabled(in)) {
++		tb_port_warn(in, "bandwidth allocation mode not enabled\n");
++		goto unlock;
++	}
++
++	requested_bw = usb4_dp_port_requested_bw(in);
++	if (requested_bw <= 0) {
++		tb_port_dbg(in, "no bandwidth request active\n");
++		goto unlock;
++	}
++
++	tunnel = tb_find_tunnel(tb, TB_TUNNEL_DP, in, NULL);
++	if (!tunnel) {
++		tb_port_warn(in, "failed to find tunnel\n");
++		goto unlock;
++	}
++
++	out = tunnel->dst_port;
++
++	if (in->sw->config.depth < out->sw->config.depth) {
++		requested_up = 0;
++		requested_down = requested_bw;
++	} else {
++		requested_up = requested_bw;
++		requested_down = 0;
++	}
++
++	if (tb_alloc_dp_bandwidth(tunnel, &requested_up, &requested_down)) {
++		tb_port_warn(in, "failed to change bandwidth allocation\n");
++	} else {
++		tb_port_dbg(in, "bandwidth allocation changed to %u/%u Mb/s\n",
++			    requested_up, requested_down);
++		tb_recalc_estimated_bandwidth(tb);
++	}
++
++unlock:
++	mutex_unlock(&tb->lock);
++
++	pm_runtime_mark_last_busy(&tb->dev);
++	pm_runtime_put_autosuspend(&tb->dev);
++}
++
++static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port)
++{
++	struct tb_hotplug_event *ev;
++
++	ev = kmalloc(sizeof(*ev), GFP_KERNEL);
++	if (!ev)
++		return;
++
++	ev->tb = tb;
++	ev->route = route;
++	ev->port = port;
++	INIT_WORK(&ev->work, tb_handle_dp_bandwidth_request);
++	queue_work(tb->wq, &ev->work);
++}
++
++static void tb_handle_notification(struct tb *tb, u64 route,
++				   const struct cfg_error_pkg *pkg)
++{
++	if (tb_cfg_ack_notification(tb->ctl, route))
++		tb_warn(tb, "could not ack notification on %llx\n", route);
++
++	switch (pkg->error) {
++	case TB_CFG_ERROR_DP_BW:
++		tb_queue_dp_bandwidth_request(tb, route, pkg->port);
++		break;
++
++	default:
++		/* Ack is enough */
++		return;
++	}
++}
++
+ /*
+  * tb_schedule_hotplug_handler() - callback function for the control channel
+  *
+@@ -1301,15 +1675,19 @@ static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
+ 			    const void *buf, size_t size)
+ {
+ 	const struct cfg_event_pkg *pkg = buf;
+-	u64 route;
++	u64 route = tb_cfg_get_route(&pkg->header);
+ 
+-	if (type != TB_CFG_PKG_EVENT) {
++	switch (type) {
++	case TB_CFG_PKG_ERROR:
++		tb_handle_notification(tb, route, (const struct cfg_error_pkg *)buf);
++		return;
++	case TB_CFG_PKG_EVENT:
++		break;
++	default:
+ 		tb_warn(tb, "unexpected event %#x, ignoring\n", type);
+ 		return;
+ 	}
+ 
+-	route = tb_cfg_get_route(&pkg->header);
+-
+ 	if (tb_cfg_ack_plug(tb->ctl, route, pkg->port, pkg->unplug)) {
+ 		tb_warn(tb, "could not ack plug event on %llx:%x\n", route,
+ 			pkg->port);
+@@ -1717,6 +2095,7 @@ struct tb *tb_probe(struct tb_nhi *nhi)
+ 	INIT_LIST_HEAD(&tcm->tunnel_list);
+ 	INIT_LIST_HEAD(&tcm->dp_resources);
+ 	INIT_DELAYED_WORK(&tcm->remove_work, tb_remove_work);
++	tb_init_bandwidth_groups(tcm);
+ 
+ 	tb_dbg(tb, "using software connection manager\n");
+ 
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 9e4eb827d1df..38d7f463f3a8 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -220,6 +220,23 @@ struct tb_switch {
+ 	enum tb_clx clx;
+ };
+ 
++/**
++ * struct tb_bandwidth_group - Bandwidth management group
++ * @tb: Pointer to the domain the group belongs to
++ * @index: Index of the group (aka Group_ID). Valid values %1-%7
++ * @ports: DP IN adapters belonging to this group are linked here
++ *
++ * Any tunnel that requires isochronous bandwidth (that's DP for now) is
++ * attached to a bandwidth group. All tunnels going through the same
++ * USB4 links share the same group and can dynamically distribute the
++ * bandwidth within the group.
++ */
++struct tb_bandwidth_group {
++	struct tb *tb;
++	int index;
++	struct list_head ports;
++};
++
+ /**
+  * struct tb_port - a thunderbolt port, part of a tb_switch
+  * @config: Cached port configuration read from registers
+@@ -244,6 +261,10 @@ struct tb_switch {
+  * @ctl_credits: Buffers reserved for control path
+  * @dma_credits: Number of credits allocated for DMA tunneling for all
+  *		 DMA paths through this port.
++ * @group: If set the adapter is assigned with bandwidth group and
++ *	   supports DP bandwidth allocation mode. Only used for DP
++ *	   IN adapters for now.
++ * @group_list: The port is linked to the group's list of ports through this
+  *
+  * In USB4 terminology this structure represents an adapter (protocol or
+  * lane adapter).
+@@ -269,6 +290,8 @@ struct tb_port {
+ 	unsigned int total_credits;
+ 	unsigned int ctl_credits;
+ 	unsigned int dma_credits;
++	struct tb_bandwidth_group *group;
++	struct list_head group_list;
+ };
+ 
+ /**
+diff --git a/drivers/thunderbolt/tb_msgs.h b/drivers/thunderbolt/tb_msgs.h
+index 33c4c7aed56d..3234bff07899 100644
+--- a/drivers/thunderbolt/tb_msgs.h
++++ b/drivers/thunderbolt/tb_msgs.h
+@@ -29,6 +29,7 @@ enum tb_cfg_error {
+ 	TB_CFG_ERROR_HEC_ERROR_DETECTED = 12,
+ 	TB_CFG_ERROR_FLOW_CONTROL_ERROR = 13,
+ 	TB_CFG_ERROR_LOCK = 15,
++	TB_CFG_ERROR_DP_BW = 32,
+ };
+ 
+ /* common header */
+@@ -64,14 +65,16 @@ struct cfg_write_pkg {
+ /* TB_CFG_PKG_ERROR */
+ struct cfg_error_pkg {
+ 	struct tb_cfg_header header;
+-	enum tb_cfg_error error:4;
+-	u32 zero1:4;
++	enum tb_cfg_error error:8;
+ 	u32 port:6;
+-	u32 zero2:2; /* Both should be zero, still they are different fields. */
+-	u32 zero3:14;
++	u32 reserved:16;
+ 	u32 pg:2;
+ } __packed;
+ 
++struct cfg_ack_pkg {
++	struct tb_cfg_header header;
++};
++
+ #define TB_CFG_ERROR_PG_HOT_PLUG	0x2
+ #define TB_CFG_ERROR_PG_HOT_UNPLUG	0x3
+ 
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index 118742ec93ed..d08441f36e7a 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -594,6 +594,103 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
+ 			     in->cap_adap + DP_REMOTE_CAP, 1);
+ }
+ 
++static int tb_dp_bw_alloc_mode_enable(struct tb_tunnel *tunnel)
++{
++	struct tb_port *out = tunnel->dst_port;
++	struct tb_port *in = tunnel->src_port;
++	u32 out_dp_cap, out_rate, out_lanes;
++	u32 in_dp_cap, in_rate, in_lanes;
++	int ret, estimated_bw;
++	u32 rate, lanes;
++
++	ret = usb4_dp_port_set_cm_bw_mode_supported(in, true);
++	if (ret)
++		return ret;
++
++	ret = usb4_dp_port_set_group_id(in, in->group->index);
++	if (ret)
++		return ret;
++
++	/*
++	 * Get the non-reduced rate and lanes based on the lowest
++	 * capability of both adapters.
++	 */
++	ret = tb_port_read(in, &in_dp_cap, TB_CFG_PORT,
++			   in->cap_adap + DP_LOCAL_CAP, 1);
++	if (ret)
++		return ret;
++
++	ret = tb_port_read(out, &out_dp_cap, TB_CFG_PORT,
++			   out->cap_adap + DP_LOCAL_CAP, 1);
++	if (ret)
++		return ret;
++
++	in_rate = tb_dp_cap_get_rate(in_dp_cap);
++	in_lanes = tb_dp_cap_get_lanes(in_dp_cap);
++	out_rate = tb_dp_cap_get_rate(out_dp_cap);
++	out_lanes = tb_dp_cap_get_lanes(out_dp_cap);
++
++	rate = min(in_rate, out_rate);
++	lanes = min(in_lanes, out_lanes);
++
++	tb_port_dbg(in, "non-reduced bandwidth %u Mb/s x%u = %u Mb/s\n", rate,
++		    lanes, tb_dp_bandwidth(rate, lanes));
++
++	ret = usb4_dp_port_set_nrd(in, rate, lanes);
++	if (ret)
++		return ret;
++
++	/* Use 1G granularty with the bandwidth fields */
++	ret = usb4_dp_port_set_granularity(in, 1000);
++	if (ret)
++		return ret;
++
++	/*
++	 * Bandwidth estimation is pretty much what we have in
++	 * max_up/down fields. For discovery we just read what the
++	 * estimation was set to.
++	 */
++	if (in->sw->config.depth < out->sw->config.depth)
++		estimated_bw = tunnel->max_down;
++	else
++		estimated_bw = tunnel->max_up;
++
++	ret = usb4_dp_port_set_estimated_bw(in, estimated_bw);
++	if (ret)
++		return ret;
++
++	ret = usb4_dp_port_allocate_bw(in, 0);
++	if (ret)
++		return ret;
++
++	tb_port_dbg(in, "bandwidth allocation mode enabled\n");
++	return 0;
++}
++
++static int tb_dp_init(struct tb_tunnel *tunnel)
++{
++	struct tb_port *in = tunnel->src_port;
++	struct tb_switch *sw = in->sw;
++	struct tb *tb = in->sw->tb;
++	int ret;
++
++	ret = tb_dp_xchg_caps(tunnel);
++	if (ret)
++		return ret;
++
++	if (!tb_switch_is_usb4(sw))
++		return 0;
++
++	ret = usb4_dp_port_set_cm_id(in, tb->index);
++	if (ret)
++		return ret;
++
++	if (!in->group)
++		return 0;
++
++	return tb_dp_bw_alloc_mode_enable(tunnel);
++}
++
+ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
+ {
+ 	int ret;
+@@ -631,6 +728,141 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
+ 	return 0;
+ }
+ 
++static int tb_dp_bw_mode_consumed_bandwidth(struct tb_tunnel *tunnel,
++					    int *consumed_up, int *consumed_down)
++{
++	struct tb_port *out = tunnel->dst_port;
++	struct tb_port *in = tunnel->src_port;
++	int ret;
++
++	if (!usb4_dp_port_bw_mode_enabled(in))
++		return -EOPNOTSUPP;
++
++	/*
++	 * Read what was allocated previously if any. Otherwise use DPRX
++	 * to figure out the consumed bandwidth.
++	 */
++	ret = usb4_dp_port_allocated_bw(in);
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		return -ENODATA;
++
++	if (in->sw->config.depth < out->sw->config.depth) {
++		*consumed_up = 0;
++		*consumed_down = ret;
++	} else {
++		*consumed_up = ret;
++		*consumed_down = 0;
++	}
++
++	return 0;
++}
++
++static int tb_dp_allocated_bandwidth(struct tb_tunnel *tunnel, int *allocated_up,
++				     int *allocated_down)
++{
++	struct tb_port *out = tunnel->dst_port;
++	struct tb_port *in = tunnel->src_port;
++	int ret, bw = 0;
++
++	/*
++	 * If we have already set the allocated bandwidth then use that.
++	 * Otherwise we read it from the DP IN adapter remote
++	 * capabilities (that might be reduced).
++	 */
++	if (usb4_dp_port_bw_mode_enabled(in)) {
++		ret = usb4_dp_port_allocated_bw(in);
++		if (ret < 0)
++			return ret;
++		bw = ret;
++	}
++
++	if (!bw) {
++		u32 dp_cap, lanes, rate;
++
++		ret = tb_port_read(in, &dp_cap, TB_CFG_PORT,
++				   in->cap_adap + DP_REMOTE_CAP, 1);
++		if (ret)
++			return ret;
++
++		rate = tb_dp_cap_get_rate(dp_cap);
++		lanes = tb_dp_cap_get_lanes(dp_cap);
++		bw = tb_dp_bandwidth(rate, lanes);
++	}
++
++	if (in->sw->config.depth < out->sw->config.depth) {
++		*allocated_up = 0;
++		*allocated_down = bw;
++	} else {
++		*allocated_up = bw;
++		*allocated_down = 0;
++	}
++
++	return 0;
++}
++
++static int tb_dp_alloc_bandwidth(struct tb_tunnel *tunnel, int *alloc_up,
++				 int *alloc_down)
++{
++	int max_rate, max_lanes, max_bw, ret, tmp;
++	struct tb_port *in = tunnel->src_port;
++
++	if (!usb4_dp_port_bw_mode_enabled(in))
++		return -EOPNOTSUPP;
++
++	ret = usb4_dp_port_nrd(in, &max_rate, &max_lanes);
++	if (ret)
++		return ret;
++
++	/* Don't allow go higher than what the hardware is capable of */
++	max_bw = tb_dp_bandwidth(max_rate, max_lanes);
++
++	if (*alloc_down) {
++		tmp = min(*alloc_down, max_bw);
++		ret = usb4_dp_port_allocate_bw(in, tmp);
++		if (ret)
++			return ret;
++		*alloc_down = tmp;
++	} else {
++		tmp = min(*alloc_up, max_bw);
++		ret = usb4_dp_port_allocate_bw(in, tmp);
++		if (ret)
++			return ret;
++		*alloc_up = tmp;
++	}
++
++	return 0;
++}
++
++static int tb_dp_read_dprx(struct tb_port *in, u32 *rate, u32 *lanes)
++{
++	int timeout = 20;
++
++	/*
++	 * Wait for DPRX done. Normally it should be already set for
++	 * active tunnel.
++	 */
++	do {
++		u32 val;
++		int ret;
++
++		ret = tb_port_read(in, &val, TB_CFG_PORT,
++				   in->cap_adap + DP_COMMON_CAP, 1);
++		if (ret)
++			return ret;
++
++		if (val & DP_COMMON_CAP_DPRX_DONE) {
++			*rate = tb_dp_cap_get_rate(val);
++			*lanes = tb_dp_cap_get_lanes(val);
++			return 0;
++		}
++		msleep(250);
++	} while (timeout--);
++
++	return -ETIMEDOUT;
++}
++
+ static int tb_dp_consumed_bandwidth(struct tb_tunnel *tunnel, int *consumed_up,
+ 				    int *consumed_down)
+ {
+@@ -640,28 +872,22 @@ static int tb_dp_consumed_bandwidth(struct tb_tunnel *tunnel, int *consumed_up,
+ 	int ret;
+ 
+ 	if (tb_dp_is_usb4(sw)) {
+-		int timeout = 20;
+-
+ 		/*
+-		 * Wait for DPRX done. Normally it should be already set
+-		 * for active tunnel.
++		 * On USB4 routers check if the bandwidth allocation
++		 * mode is enabled first and then read the bandwidth
++		 * through those registers. Otherwise fall back to DPRX.
+ 		 */
+-		do {
+-			ret = tb_port_read(in, &val, TB_CFG_PORT,
+-					   in->cap_adap + DP_COMMON_CAP, 1);
+-			if (ret)
++		ret = tb_dp_bw_mode_consumed_bandwidth(tunnel, consumed_up,
++						       consumed_down);
++		if (ret < 0) {
++			if (ret != -EOPNOTSUPP && ret != -ENODATA)
+ 				return ret;
+-
+-			if (val & DP_COMMON_CAP_DPRX_DONE) {
+-				rate = tb_dp_cap_get_rate(val);
+-				lanes = tb_dp_cap_get_lanes(val);
+-				break;
+-			}
+-			msleep(250);
+-		} while (timeout--);
+-
+-		if (!timeout)
+-			return -ETIMEDOUT;
++		} else if (!ret) {
++			return 0;
++		}
++		ret = tb_dp_read_dprx(in, &rate, &lanes);
++		if (ret)
++			return ret;
+ 	} else if (sw->generation >= 2) {
+ 		/*
+ 		 * Read from the copied remote cap so that we take into
+@@ -795,8 +1021,10 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+ 	if (!tunnel)
+ 		return NULL;
+ 
+-	tunnel->init = tb_dp_xchg_caps;
++	tunnel->init = tb_dp_init;
+ 	tunnel->activate = tb_dp_activate;
++	tunnel->allocated_bandwidth = tb_dp_allocated_bandwidth;
++	tunnel->alloc_bandwidth = tb_dp_alloc_bandwidth;
+ 	tunnel->consumed_bandwidth = tb_dp_consumed_bandwidth;
+ 	tunnel->src_port = in;
+ 
+@@ -885,6 +1113,8 @@ struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
+ 
+ 	tunnel->init = tb_dp_xchg_caps;
+ 	tunnel->activate = tb_dp_activate;
++	tunnel->allocated_bandwidth = tb_dp_allocated_bandwidth;
++	tunnel->alloc_bandwidth = tb_dp_alloc_bandwidth;
+ 	tunnel->consumed_bandwidth = tb_dp_consumed_bandwidth;
+ 	tunnel->src_port = in;
+ 	tunnel->dst_port = out;
+@@ -1709,6 +1939,61 @@ static bool tb_tunnel_is_active(const struct tb_tunnel *tunnel)
+ 	return true;
+ }
+ 
++/**
++ * tb_tunnel_allocated_bandwidth() - Return bandwidth allocated for the tunnel
++ * @tunnel: Tunnel to check
++ * @allocated_up: Currently allocated upstream bandwidth in Mb/s is stored here
++ * @allocated_down: Currently allocated downstream bandwidth in Mb/s is
++ *		    stored here
++ *
++ * Returns the bandwidth allocated for the tunnel. This may be higher
++ * than what the tunnel actually consumes.
++ */
++int tb_tunnel_allocated_bandwidth(struct tb_tunnel *tunnel, int *allocated_up,
++				  int *allocated_down)
++{
++	if (!tb_tunnel_is_active(tunnel)) {
++		*allocated_up = 0;
++		*allocated_down = 0;
++		return 0;
++	}
++
++	if (tunnel->allocated_bandwidth) {
++		int ret;
++
++		ret = tunnel->allocated_bandwidth(tunnel, allocated_up,
++						  allocated_down);
++		if (ret)
++			return ret;
++
++	}
++
++	return 0;
++}
++
++/**
++ * tb_tunnel_alloc_bandwidth() - Change tunnel bandwidth allocation
++ * @tunnel: Tunnel whose bandwidth allocation to change
++ * @alloc_up: New upstream bandwidth in Mb/s
++ * @alloc_down: New downstream bandwidth in Mb/s
++ *
++ * Tries to change tunnel bandwidth allocation. If succeeds returns %0
++ * and updates @alloc_up and @alloc_down to that was actually allocated
++ * (it may not be the same as passed originally). Returns negative errno
++ * in case of failure.
++ */
++int tb_tunnel_alloc_bandwidth(struct tb_tunnel *tunnel, int *alloc_up,
++			      int *alloc_down)
++{
++	if (!tb_tunnel_is_active(tunnel))
++		return -EINVAL;
++
++	if (tunnel->alloc_bandwidth)
++		return tunnel->alloc_bandwidth(tunnel, alloc_up, alloc_down);
++
++	return -EOPNOTSUPP;
++}
++
+ /**
+  * tb_tunnel_consumed_bandwidth() - Return bandwidth consumed by the tunnel
+  * @tunnel: Tunnel to check
+diff --git a/drivers/thunderbolt/tunnel.h b/drivers/thunderbolt/tunnel.h
+index 03e56076b5bc..ea605046d41f 100644
+--- a/drivers/thunderbolt/tunnel.h
++++ b/drivers/thunderbolt/tunnel.h
+@@ -29,6 +29,8 @@ enum tb_tunnel_type {
+  * @init: Optional tunnel specific initialization
+  * @deinit: Optional tunnel specific de-initialization
+  * @activate: Optional tunnel specific activation/deactivation
++ * @allocated_bandwidth: Return how much bandwidth is allocated for the tunnel
++ * @alloc_bandwidth: Change tunnel bandwidth allocation
+  * @consumed_bandwidth: Return how much bandwidth the tunnel consumes
+  * @release_unused_bandwidth: Release all unused bandwidth
+  * @reclaim_available_bandwidth: Reclaim back available bandwidth
+@@ -50,6 +52,10 @@ struct tb_tunnel {
+ 	int (*init)(struct tb_tunnel *tunnel);
+ 	void (*deinit)(struct tb_tunnel *tunnel);
+ 	int (*activate)(struct tb_tunnel *tunnel, bool activate);
++	int (*allocated_bandwidth)(struct tb_tunnel *tunnel, int *allocated_up,
++				   int *allocated_down);
++	int (*alloc_bandwidth)(struct tb_tunnel *tunnel, int *alloc_up,
++			       int *alloc_down);
+ 	int (*consumed_bandwidth)(struct tb_tunnel *tunnel, int *consumed_up,
+ 				  int *consumed_down);
+ 	int (*release_unused_bandwidth)(struct tb_tunnel *tunnel);
+@@ -92,6 +98,10 @@ void tb_tunnel_deactivate(struct tb_tunnel *tunnel);
+ bool tb_tunnel_is_invalid(struct tb_tunnel *tunnel);
+ bool tb_tunnel_port_on_path(const struct tb_tunnel *tunnel,
+ 			    const struct tb_port *port);
++int tb_tunnel_allocated_bandwidth(struct tb_tunnel *tunnel, int *allocated_up,
++				  int *allocated_down);
++int tb_tunnel_alloc_bandwidth(struct tb_tunnel *tunnel, int *alloc_up,
++			      int *alloc_down);
+ int tb_tunnel_consumed_bandwidth(struct tb_tunnel *tunnel, int *consumed_up,
+ 				 int *consumed_down);
+ int tb_tunnel_release_unused_bandwidth(struct tb_tunnel *tunnel);
+-- 
+2.25.1
+
