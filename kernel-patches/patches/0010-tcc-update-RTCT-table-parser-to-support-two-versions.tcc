@@ -1,7 +1,7 @@
-From 82de2efb790d0dcc3006a6c4e0aa9d9322ff86a4 Mon Sep 17 00:00:00 2001
+From 673508a7ae283325b208efbbc6f9bb283b2be043 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 18:48:46 +0800
-Subject: [PATCH 10/19] tcc: update RTCT table parser to support two versions
+Subject: [PATCH 10/23] tcc: update RTCT table parser to support two versions
 
 Reject request if size is not kernel page size aligned;
 Clear memory by affinity cpu;
@@ -15,7 +15,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  3 files changed, 546 insertions(+), 88 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 551743255dc8..18136605a00d 100644
+index f09c433d1210..c640a76a255f 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1234,6 +1234,10 @@ static inline int acpi_parse_madt_ioapic_entries(void)
@@ -1024,5 +1024,5 @@ index ea80534b4603..b89377231558 100644
  /*******************************************************************************
   *
 -- 
-2.32.0
+2.25.1
 

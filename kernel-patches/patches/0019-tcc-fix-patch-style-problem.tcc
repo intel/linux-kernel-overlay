@@ -1,7 +1,7 @@
-From 94c7e4158b8f047e4c7902c6fc624ffb453ec6fb Mon Sep 17 00:00:00 2001
+From ce6f29ac45abb497386eeda15bd22172ecf0d264 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 10 Feb 2022 18:08:20 +0800
-Subject: [PATCH 19/19] tcc: fix patch style problem
+Subject: [PATCH 19/23] tcc: fix patch style problem
 
 Unnecessary blank lines are removed, sort local varibles.
 
@@ -12,7 +12,7 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 17 insertions(+), 30 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 38adb0a158e4..7a0285786f69 100644
+index 01defcbc8cfb..c536ee4d126c 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1257,21 +1257,19 @@ static bool tcc_is_untracked_pat_range(u64 start, u64 end)
@@ -128,5 +128,5 @@ index b89377231558..f8f3c5b02151 100644
  };
  
 -- 
-2.32.0
+2.25.1
 
