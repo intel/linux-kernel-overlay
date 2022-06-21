@@ -1,0 +1,161 @@
+From 8d30c2f79d57e57cf692121675b510358bfee8d5 Mon Sep 17 00:00:00 2001
+From: Ian Rogers <irogers@google.com>
+Date: Tue, 30 Nov 2021 09:49:45 -0800
+Subject: [PATCH 06/22] perf parse-events: Architecture specific leader
+ override
+
+Currently topdown events must appear after a slots event:
+
+  $ perf stat -e '{slots,topdown-fe-bound}' /bin/true
+
+   Performance counter stats for '/bin/true':
+
+         3,183,090      slots
+           986,133      topdown-fe-bound
+
+Reversing the events yields:
+
+  $ perf stat -e '{topdown-fe-bound,slots}' /bin/true
+  Error:
+  The sys_perf_event_open() syscall returned with 22 (Invalid argument) for event (topdown-fe-bound).
+
+For metrics the order of events is determined by iterating over a
+hashmap, and so slots isn't guaranteed to be first which can yield this
+error.
+
+Change the set_leader in parse-events, called when a group is closed, so
+that rather than always making the first event the leader, if the slots
+event exists then it is made the leader. It is then moved to the head of
+the evlist otherwise it won't be opened in the correct order.
+
+The result is:
+
+  $ perf stat -e '{topdown-fe-bound,slots}' /bin/true
+
+   Performance counter stats for '/bin/true':
+
+         3,274,795      slots
+         1,001,702      topdown-fe-bound
+
+A problem with this approach is the slots event is identified by name,
+names can be overwritten like 'cpu/slots,name=foo/' and this causes the
+leader change to fail.
+
+The change also modifies and fixes mixed groups like, with the change:
+
+  $ perf stat -e '{instructions,slots,topdown-fe-bound}' -a -- sleep 2
+
+   Performance counter stats for 'system wide':
+
+        5574985410      slots
+         971981616      instructions
+        1348461887      topdown-fe-bound
+
+       2.001263120 seconds time elapsed
+
+Without the change:
+
+  $ perf stat -e '{instructions,slots,topdown-fe-bound}' -a -- sleep 2
+
+   Performance counter stats for 'system wide':
+
+     <not counted>      instructions
+     <not counted>      slots
+   <not supported>      topdown-fe-bound
+
+       2.006247990 seconds time elapsed
+
+Something that may be undesirable here is that the events are reordered
+in the output.
+
+Reviewed-by: Kajol Jain <kjain@linux.ibm.com>
+Signed-off-by: Ian Rogers <irogers@google.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: John Garry <john.garry@huawei.com>
+Cc: Kajol Jain <kjain@linux.ibm.com>
+Cc: Kan Liang <kan.liang@linux.intel.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Paul Clarke <pc@us.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Riccardo Mancini <rickyman7@gmail.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Vineet Singh <vineet.singh@intel.com>
+Link: http://lore.kernel.org/lkml/20211130174945.247604-2-irogers@google.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/arch/x86/util/evlist.c | 17 +++++++++++++++++
+ tools/perf/util/evlist.h          |  1 +
+ tools/perf/util/parse-events.c    |  8 +++++++-
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/arch/x86/util/evlist.c b/tools/perf/arch/x86/util/evlist.c
+index 0b0951030a2f..f924246eff78 100644
+--- a/tools/perf/arch/x86/util/evlist.c
++++ b/tools/perf/arch/x86/util/evlist.c
+@@ -17,3 +17,20 @@ int arch_evlist__add_default_attrs(struct evlist *evlist)
+ 	else
+ 		return parse_events(evlist, TOPDOWN_L1_EVENTS, NULL);
+ }
++
++struct evsel *arch_evlist__leader(struct list_head *list)
++{
++	struct evsel *evsel, *first;
++
++	first = list_first_entry(list, struct evsel, core.node);
++
++	if (!pmu_have_event("cpu", "slots"))
++		return first;
++
++	__evlist__for_each_entry(list, evsel) {
++		if (evsel->pmu_name && !strcmp(evsel->pmu_name, "cpu") &&
++			evsel->name && strstr(evsel->name, "slots"))
++			return evsel;
++	}
++	return first;
++}
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 7af5b247e319..27594900a052 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -111,6 +111,7 @@ int __evlist__add_default_attrs(struct evlist *evlist,
+ 	__evlist__add_default_attrs(evlist, array, ARRAY_SIZE(array))
+ 
+ int arch_evlist__add_default_attrs(struct evlist *evlist);
++struct evsel *arch_evlist__leader(struct list_head *list);
+ 
+ int evlist__add_dummy(struct evlist *evlist);
+ 
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index f294e43f17f3..6f5b9dfff360 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -1824,6 +1824,11 @@ parse_events__set_leader_for_uncore_aliase(char *name, struct list_head *list,
+ 	return ret;
+ }
+ 
++__weak struct evsel *arch_evlist__leader(struct list_head *list)
++{
++	return list_first_entry(list, struct evsel, core.node);
++}
++
+ void parse_events__set_leader(char *name, struct list_head *list,
+ 			      struct parse_events_state *parse_state)
+ {
+@@ -1837,9 +1842,10 @@ void parse_events__set_leader(char *name, struct list_head *list,
+ 	if (parse_events__set_leader_for_uncore_aliase(name, list, parse_state))
+ 		return;
+ 
+-	leader = list_first_entry(list, struct evsel, core.node);
++	leader = arch_evlist__leader(list);
+ 	__perf_evlist__set_leader(list, &leader->core);
+ 	leader->group_name = name ? strdup(name) : NULL;
++	list_move(&leader->core.node, list);
+ }
+ 
+ /* list_event is assumed to point to malloc'ed memory */
+-- 
+2.25.1
+
