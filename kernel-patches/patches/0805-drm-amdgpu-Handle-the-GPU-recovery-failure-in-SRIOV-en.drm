@@ -1,0 +1,98 @@
+From d4b4af19f7fc952b2525166b097f6e4bb25cca77 Mon Sep 17 00:00:00 2001
+From: Surbhi Kakarya <surbhi.kakarya@amd.com>
+Date: Wed, 26 Jan 2022 12:04:39 -0500
+Subject: [PATCH 0805/2251] drm/amdgpu: Handle the GPU recovery failure in
+ SRIOV environment.
+
+This patch handles the GPU recovery failure in sriov environment by
+retrying the reset if the first reset fails. To determine the condition
+of retry, a new macro AMDGPU_RETRY_SRIOV_RESET is added which returns
+true if failure is due to ETIMEDOUT, EINVAL or EBUSY, otherwise return
+false.A new macro AMDGPU_MAX_RETRY_LIMIT is used to limit the retry to 2.
+
+It also handles the return status in Post Asic Reset by updating the return
+code with asic_reset_res and eventually return the return code in
+amdgpu_job_timedout().
+
+Signed-off-by: Surbhi Kakarya <surbhi.kakarya@amd.com>
+Reviewed-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c    |  5 ++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 7c6c2c1f4d71..adca172917c9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -88,6 +88,8 @@ MODULE_FIRMWARE("amdgpu/vangogh_gpu_info.bin");
+ MODULE_FIRMWARE("amdgpu/yellow_carp_gpu_info.bin");
+ 
+ #define AMDGPU_RESUME_MS		2000
++#define AMDGPU_MAX_RETRY_LIMIT		2
++#define AMDGPU_RETRY_SRIOV_RESET(r) ((r) == -EBUSY || (r) == -ETIMEDOUT || (r) == -EINVAL)
+ 
+ const char *amdgpu_asic_name[] = {
+ 	"TAHITI",
+@@ -4439,7 +4441,9 @@ static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
+ {
+ 	int r;
+ 	struct amdgpu_hive_info *hive = NULL;
++	int retry_limit = 0;
+ 
++retry:
+ 	amdgpu_amdkfd_pre_reset(adev);
+ 
+ 	if (from_hypervisor)
+@@ -4486,6 +4490,14 @@ static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
+ 	}
+ 	amdgpu_virt_release_full_gpu(adev, true);
+ 
++	if (AMDGPU_RETRY_SRIOV_RESET(r)) {
++		if (retry_limit < AMDGPU_MAX_RETRY_LIMIT) {
++			retry_limit++;
++			goto retry;
++		} else
++			DRM_ERROR("GPU reset retry is beyond the retry limit\n");
++	}
++
+ 	return r;
+ }
+ 
+@@ -5200,6 +5212,9 @@ int amdgpu_device_gpu_recover_imp(struct amdgpu_device *adev,
+ 			drm_helper_resume_force_mode(adev_to_drm(tmp_adev));
+ 		}
+ 
++		if (tmp_adev->asic_reset_res)
++			r = tmp_adev->asic_reset_res;
++
+ 		tmp_adev->asic_reset_res = 0;
+ 
+ 		if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 38c9fd7b7ad4..7dc45c695d66 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -37,6 +37,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 	struct amdgpu_task_info ti;
+ 	struct amdgpu_device *adev = ring->adev;
+ 	int idx;
++	int r;
+ 
+ 	if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
+ 		DRM_INFO("%s - device unplugged skipping recovery on scheduler:%s",
+@@ -63,7 +64,9 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 		  ti.process_name, ti.tgid, ti.task_name, ti.pid);
+ 
+ 	if (amdgpu_device_should_recover_gpu(ring->adev)) {
+-		amdgpu_device_gpu_recover_imp(ring->adev, job);
++		r = amdgpu_device_gpu_recover(ring->adev, job);
++		if (r)
++			DRM_ERROR("GPU Recovery Failed: %d\n", r);
+ 	} else {
+ 		drm_sched_suspend_timeout(&ring->sched);
+ 		if (amdgpu_sriov_vf(adev))
+-- 
+2.25.1
+

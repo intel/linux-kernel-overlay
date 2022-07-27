@@ -1,0 +1,219 @@
+From 1624f536c905dc469024b5e1ed57702c89ccd65e Mon Sep 17 00:00:00 2001
+From: Wong Vee Khee <vee.khee.wong@linux.intel.com>
+Date: Thu, 14 Jul 2022 15:54:27 +0800
+Subject: [PATCH 5/6] net: stmmac: switch to use interrupt for hw
+ crosstimestamping
+
+Using current implementation of polling mode, there is high chances we
+will hit into timeout error when running phc2sys. Hence, update the
+implementation of hardware crosstimestamping to use the MAC interrupt
+service routine instead of polling for TSIS bit in the MAC Timestamp
+Interrupt Status register to be set.
+
+Cc: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: Wong Vee Khee <vee.khee.wong@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ .../net/ethernet/stmicro/stmmac/dwmac-intel.c | 25 ++++++++++++-------
+ drivers/net/ethernet/stmicro/stmmac/dwmac4.h  |  3 ++-
+ .../net/ethernet/stmicro/stmmac/dwmac4_core.c |  4 +++
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  1 +
+ .../ethernet/stmicro/stmmac/stmmac_hwtstamp.c |  5 ++++
+ .../net/ethernet/stmicro/stmmac/stmmac_ptp.c  | 12 +--------
+ include/linux/stmmac.h                        |  1 +
+ 7 files changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+index ea8e34d453a7..7722d998ae32 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+@@ -299,6 +299,11 @@ static void get_arttime(struct mii_bus *mii, int intel_adhoc_addr,
+ 	*art_time = ns;
+ }
+ 
++static int stmmac_cross_ts_isr(struct stmmac_priv *priv)
++{
++	return (readl(priv->ioaddr + GMAC_INT_STATUS) & GMAC_INT_TSIE);
++}
++
+ static int intel_crosststamp(ktime_t *device,
+ 			     struct system_counterval_t *system,
+ 			     void *ctx)
+@@ -314,8 +319,6 @@ static int intel_crosststamp(ktime_t *device,
+ 	u32 num_snapshot;
+ 	u32 gpio_value;
+ 	u32 acr_value;
+-	int ret;
+-	u32 v;
+ 	int i;
+ 
+ 	if (!boot_cpu_has(X86_FEATURE_ART))
+@@ -329,6 +332,8 @@ static int intel_crosststamp(ktime_t *device,
+ 	if (priv->plat->ext_snapshot_en)
+ 		return -EBUSY;
+ 
++	priv->plat->int_snapshot_en = 1;
++
+ 	mutex_lock(&priv->aux_ts_lock);
+ 	/* Enable Internal snapshot trigger */
+ 	acr_value = readl(ptpaddr + PTP_ACR);
+@@ -348,6 +353,7 @@ static int intel_crosststamp(ktime_t *device,
+ 		break;
+ 	default:
+ 		mutex_unlock(&priv->aux_ts_lock);
++		priv->plat->int_snapshot_en = 0;
+ 		return -EINVAL;
+ 	}
+ 	writel(acr_value, ptpaddr + PTP_ACR);
+@@ -369,13 +375,12 @@ static int intel_crosststamp(ktime_t *device,
+ 	gpio_value |= GMAC_GPO1;
+ 	writel(gpio_value, ioaddr + GMAC_GPIO_STATUS);
+ 
+-	/* Poll for time sync operation done */
+-	ret = readl_poll_timeout(priv->ioaddr + GMAC_INT_STATUS, v,
+-				 (v & GMAC_INT_TSIE), 100, 10000);
+-
+-	if (ret == -ETIMEDOUT) {
+-		pr_err("%s: Wait for time sync operation timeout\n", __func__);
+-		return ret;
++	/* Time sync done Indication - Interrupt method */
++	if (!wait_event_interruptible_timeout(priv->tstamp_busy_wait,
++					      stmmac_cross_ts_isr(priv),
++					      HZ / 100)) {
++		priv->plat->int_snapshot_en = 0;
++		return -ETIMEDOUT;
+ 	}
+ 
+ 	num_snapshot = (readl(ioaddr + GMAC_TIMESTAMP_STATUS) &
+@@ -393,6 +398,7 @@ static int intel_crosststamp(ktime_t *device,
+ 	}
+ 
+ 	system->cycles *= intel_priv->crossts_adj;
++	priv->plat->int_snapshot_en = 0;
+ 
+ 	return 0;
+ }
+@@ -577,6 +583,7 @@ static int intel_mgbe_common_data(struct pci_dev *pdev,
+ 
+ 	plat->has_crossts = true;
+ 	plat->crosststamp = intel_crosststamp;
++	plat->int_snapshot_en = 0;
+ 
+ 	/* Setup MSI vector offset specific to Intel mGbE controller */
+ 	plat->msi_mac_vec = 29;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4.h b/drivers/net/ethernet/stmicro/stmmac/dwmac4.h
+index 462ca7ed095a..71dad409f78b 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4.h
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4.h
+@@ -150,7 +150,8 @@
+ #define	GMAC_PCS_IRQ_DEFAULT	(GMAC_INT_RGSMIIS | GMAC_INT_PCS_LINK |	\
+ 				 GMAC_INT_PCS_ANE)
+ 
+-#define	GMAC_INT_DEFAULT_ENABLE	(GMAC_INT_PMT_EN | GMAC_INT_LPI_EN)
++#define	GMAC_INT_DEFAULT_ENABLE	(GMAC_INT_PMT_EN | GMAC_INT_LPI_EN | \
++				 GMAC_INT_TSIE)
+ 
+ enum dwmac4_irq_status {
+ 	time_stamp_irq = 0x00001000,
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c b/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
+index 412abfabd28b..8c9cb1b6299f 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
+@@ -23,6 +23,7 @@
+ static void dwmac4_core_init(struct mac_device_info *hw,
+ 			     struct net_device *dev)
+ {
++	struct stmmac_priv *priv = netdev_priv(dev);
+ 	void __iomem *ioaddr = hw->pcsr;
+ 	u32 value = readl(ioaddr + GMAC_CONFIG);
+ 
+@@ -58,6 +59,9 @@ static void dwmac4_core_init(struct mac_device_info *hw,
+ 		value |= GMAC_INT_FPE_EN;
+ 
+ 	writel(value, ioaddr + GMAC_INT_EN);
++
++	if (GMAC_INT_DEFAULT_ENABLE & GMAC_INT_TSIE)
++		init_waitqueue_head(&priv->tstamp_busy_wait);
+ }
+ 
+ static void dwmac4_rx_queue_enable(struct mac_device_info *hw,
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index 27935aeca8c2..cd719ecddcbe 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -268,6 +268,7 @@ struct stmmac_priv {
+ 	rwlock_t ptp_lock;
+ 	/* Protects auxiliary snapshot registers from concurrent access. */
+ 	struct mutex aux_ts_lock;
++	wait_queue_head_t tstamp_busy_wait;
+ 
+ 	void __iomem *mmcaddr;
+ 	void __iomem *ptpaddr;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+index 92d32940aff0..764832f4dae1 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+@@ -179,6 +179,11 @@ static void timestamp_interrupt(struct stmmac_priv *priv)
+ 	u64 ptp_time;
+ 	int i;
+ 
++	if (priv->plat->int_snapshot_en) {
++		wake_up(&priv->tstamp_busy_wait);
++		return;
++	}
++
+ 	tsync_int = readl(priv->ioaddr + GMAC_INT_STATUS) & GMAC_INT_TSIE;
+ 
+ 	if (!tsync_int)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+index e45fb191d8e6..4d11980dcd64 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.c
+@@ -175,11 +175,10 @@ static int stmmac_enable(struct ptp_clock_info *ptp,
+ 	struct stmmac_priv *priv =
+ 	    container_of(ptp, struct stmmac_priv, ptp_clock_ops);
+ 	void __iomem *ptpaddr = priv->ptpaddr;
+-	void __iomem *ioaddr = priv->hw->pcsr;
+ 	struct stmmac_pps_cfg *cfg;
+-	u32 intr_value, acr_value;
+ 	int ret = -EOPNOTSUPP;
+ 	unsigned long flags;
++	u32 acr_value;
+ 
+ 	switch (rq->type) {
+ 	case PTP_CLK_REQ_PEROUT:
+@@ -213,19 +212,10 @@ static int stmmac_enable(struct ptp_clock_info *ptp,
+ 			netdev_dbg(priv->dev, "Auxiliary Snapshot %d enabled.\n",
+ 				   priv->plat->ext_snapshot_num >>
+ 				   PTP_ACR_ATSEN_SHIFT);
+-			/* Enable Timestamp Interrupt */
+-			intr_value = readl(ioaddr + GMAC_INT_EN);
+-			intr_value |= GMAC_INT_TSIE;
+-			writel(intr_value, ioaddr + GMAC_INT_EN);
+-
+ 		} else {
+ 			netdev_dbg(priv->dev, "Auxiliary Snapshot %d disabled.\n",
+ 				   priv->plat->ext_snapshot_num >>
+ 				   PTP_ACR_ATSEN_SHIFT);
+-			/* Disable Timestamp Interrupt */
+-			intr_value = readl(ioaddr + GMAC_INT_EN);
+-			intr_value &= ~GMAC_INT_TSIE;
+-			writel(intr_value, ioaddr + GMAC_INT_EN);
+ 		}
+ 		writel(acr_value, ptpaddr + PTP_ACR);
+ 		mutex_unlock(&priv->aux_ts_lock);
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index 29917850f079..8df475db88c0 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -260,6 +260,7 @@ struct plat_stmmacenet_data {
+ 	bool has_crossts;
+ 	int int_snapshot_num;
+ 	int ext_snapshot_num;
++	bool int_snapshot_en;
+ 	bool ext_snapshot_en;
+ 	bool multi_msi_en;
+ 	int msi_mac_vec;
+-- 
+2.25.1
+
