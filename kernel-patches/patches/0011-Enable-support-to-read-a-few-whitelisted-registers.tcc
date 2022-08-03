@@ -1,7 +1,7 @@
-From 992eed32c5df0fd97a74bfec98f2a30bef99acc4 Mon Sep 17 00:00:00 2001
+From 1148ec2bc2c7462f647ed8e1b92795509ce3c76e Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 19:57:18 +0800
-Subject: [PATCH 11/19] Enable support to read a few whitelisted registers.
+Subject: [PATCH 11/23] Enable support to read a few whitelisted registers.
 
 After CONFIG_IO_STRICT_DEVMEM is enabled in kernel config,
 some registers cannot be read via /dev/mem anymore. This
@@ -304,5 +304,5 @@ index 90ae36c62fe2..3fe446173fcb 100644
 + */
 +#define TCC_GET_REGISTER _IOWR(IOCTL_TCC_MAGIC, IOCTL_TCC_GET_REGISTER, struct tcc_register_s *)
 -- 
-2.32.0
+2.25.1
 

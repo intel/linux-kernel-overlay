@@ -1,7 +1,7 @@
-From 6c1f689e5505e23fbb0e652ac698402658a4b9d1 Mon Sep 17 00:00:00 2001
+From 88a2cd23ea76b7997eb7d34aa106fe599d3d312f Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 11 Feb 2022 00:15:14 +0800
-Subject: [PATCH 18/19] Assume default hardware prefetch bitmask in measurement
+Subject: [PATCH 18/23] Assume default hardware prefetch bitmask in measurement
  function.
 
 Most platforms supporting tcc use same hardware prefetch bitmask,
@@ -461,5 +461,5 @@ index dc4663a5c555..9c1b03e3b630 100644
  #define TCC_MEASURE_USER_START     _IO(IOCTL_TCC_MAGIC, IOCTL_TCC_MEASURE_USER_START)
  #define TCC_MEASURE_USER_END       _IO(IOCTL_TCC_MAGIC, IOCTL_TCC_MEASURE_USER_END)
 -- 
-2.32.0
+2.25.1
 

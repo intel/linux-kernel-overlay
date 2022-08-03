@@ -1,7 +1,7 @@
-From c3597101b01fe4cce7d4140854a44655ca73f162 Mon Sep 17 00:00:00 2001
+From 9ea5b3d63a1f952c875ac071e23ca08f91d891b9 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 15 Jun 2020 09:55:13 +0800
-Subject: [PATCH 05/19] tcc: driver should exit if no psram entry found in
+Subject: [PATCH 05/23] tcc: driver should exit if no psram entry found in
  PTCT.
 
 In TCC SKU BIOS, PTCT is always presented in ACPI. If TCC option
@@ -15,10 +15,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 46330302796a..e500613c6bce 100644
+index d4f8e88dc6fe..5376ebc6d5b3 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1280,7 +1280,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1362,7 +1362,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  
  		ptr += entry->size;
  	}
@@ -58,5 +58,5 @@ index ee631d3e1a8e..544ab59b3a94 100644
 -MODULE_LICENSE("GPL v2");
 +MODULE_LICENSE("Dual BSD/GPL");
 -- 
-2.32.0
+2.25.1
 

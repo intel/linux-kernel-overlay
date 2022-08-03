@@ -1,7 +1,7 @@
-From d8031db18f30b04b146aea3882fe635e8094bb84 Mon Sep 17 00:00:00 2001
+From 8067b949a6a3fe114e27f348922ab0c69edc0e64 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 8 Jun 2020 00:40:45 +0800
-Subject: [PATCH 03/19] tcc: update license header
+Subject: [PATCH 03/23] tcc: update license header
 
 Fix error/warning in static analyze tool checking.
 Update license header to be dual license.
@@ -14,10 +14,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 62 insertions(+), 17 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 941c8f942d8c..46330302796a 100644
+index fa3ef5fc398f..d4f8e88dc6fe 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1238,9 +1238,6 @@ static inline bool is_TCC_range(u64 start, u64 end)
+@@ -1320,9 +1320,6 @@ static inline bool is_TCC_range(u64 start, u64 end)
  {
  	int i;
  
@@ -150,5 +150,5 @@ index 4d4e0557dddc..cd4a83f6e7e0 100644
  	p_memslot->minor = UNDEFINED_DEVNODE;
  	vaddr = memremap(p_memslot->paddr, p_memslot->size, MEMREMAP_WB);
 -- 
-2.32.0
+2.25.1
 

@@ -1,7 +1,7 @@
-From b9e507f023edc8d92bf7351156fee93aceddb0df Mon Sep 17 00:00:00 2001
+From 8a856a610fbd70c667c21c5ccac7f966f40da403 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Tue, 9 Nov 2021 00:05:41 +0800
-Subject: [PATCH 17/19] Support RPL in measurement function.
+Subject: [PATCH 17/23] Support RPL in measurement function.
 
 Fix sparse warnings.
 
@@ -149,5 +149,5 @@ index 7fcce803c874..dc4663a5c555 100644
  enum TCC_REG_PHASE {
  	TCC_PRE_MEM        = 0x00000000,
 -- 
-2.32.0
+2.25.1
 

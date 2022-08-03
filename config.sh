@@ -2,9 +2,9 @@
 # Global configurations which are used to build kernel overlay
 
 KVERSION=5
-KPATCHLEVEL=17
+KPATCHLEVEL=19
 KSUBLEVEL=0
-KEXTRAVERSION=-rc3
+KEXTRAVERSION=
 KRTV=
 
 KSRC_MIRROR=
