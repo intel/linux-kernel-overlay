@@ -1,4 +1,4 @@
-From f753c29093738c88b0fa77d1fa7c4d44f7187755 Mon Sep 17 00:00:00 2001
+From 124e6870c720e22e5436a1e35d610a0f8d094167 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 18 Jun 2021 00:38:44 +0800
 Subject: [PATCH 15/23] Fix issue found in acrn uos when convert cacheid to

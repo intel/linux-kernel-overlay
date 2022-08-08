@@ -1,4 +1,4 @@
-From 673508a7ae283325b208efbbc6f9bb283b2be043 Mon Sep 17 00:00:00 2001
+From 4ddb154baa73c824bc5e9c8657a9ad45500b6b49 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 18:48:46 +0800
 Subject: [PATCH 10/23] tcc: update RTCT table parser to support two versions
@@ -15,10 +15,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  3 files changed, 546 insertions(+), 88 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index f09c433d1210..c640a76a255f 100644
+index 2b730274584e..0c8b070b77e3 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1234,6 +1234,10 @@ static inline int acpi_parse_madt_ioapic_entries(void)
+@@ -1316,6 +1316,10 @@ static inline int acpi_parse_madt_ioapic_entries(void)
  static struct ptct_psram_region ptct_psram_regions[MAX_PSRAM_REGIONS];
  static u32 total_psram_region;
  
@@ -29,7 +29,7 @@ index f09c433d1210..c640a76a255f 100644
  static inline bool is_TCC_range(u64 start, u64 end)
  {
  	int i;
-@@ -1260,13 +1264,32 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1342,13 +1346,32 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  
  	struct acpi_ptct_entry_header *entry;
  	struct acpi_ptct_psram  *psram;
@@ -63,7 +63,7 @@ index f09c433d1210..c640a76a255f 100644
  
  	ptr = (u8 *)table;
  	ptr += PTCT_ACPI_HEADER_SIZE;
-@@ -1275,15 +1298,18 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1357,15 +1380,18 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  		entry = (struct acpi_ptct_entry_header *)(ptr);
  		offset += entry->size;
  
@@ -85,7 +85,7 @@ index f09c433d1210..c640a76a255f 100644
  
  	ptr = (u8 *)table;
  	ptr += PTCT_ACPI_HEADER_SIZE;
-@@ -1292,11 +1318,20 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1374,11 +1400,20 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  		entry = (struct acpi_ptct_entry_header *)(ptr);
  		offset += entry->size;
  
@@ -109,7 +109,7 @@ index f09c433d1210..c640a76a255f 100644
  		}
  		ptr += entry->size;
  	}
-@@ -1306,7 +1341,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1388,7 +1423,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  
  static void __init acpi_process_ptct(void)
  {
@@ -960,10 +960,10 @@ index a9f83c1d0722..fbdab419a241 100644
  
  module_init(tcc_buffer_init);
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index ea80534b4603..b89377231558 100644
+index d84695a907f5..e3205c806a81 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
-@@ -43,7 +43,8 @@
+@@ -44,7 +44,8 @@
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
  #define ACPI_SIG_PRMT           "PRMT"	/* Platform Runtime Mechanism Table */
@@ -973,7 +973,7 @@ index ea80534b4603..b89377231558 100644
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
-@@ -2260,7 +2261,48 @@ struct ptct_psram_region {
+@@ -2361,7 +2362,48 @@ struct ptct_psram_region {
  #define PTCT_ENTRY_PSRAM_SIZE	sizeof(struct acpi_ptct_psram)
  #define PTCT_ACPI_HEADER_SIZE	sizeof(struct acpi_table_header)
  #define PSRAM_REGION_INFO_SIZE	sizeof(struct ptct_psram_region)

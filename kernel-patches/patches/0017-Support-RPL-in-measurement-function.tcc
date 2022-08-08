@@ -1,4 +1,4 @@
-From d3101e50e587989538ebf751f76c9a4d5a85f539 Mon Sep 17 00:00:00 2001
+From 8a856a610fbd70c667c21c5ccac7f966f40da403 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Tue, 9 Nov 2021 00:05:41 +0800
 Subject: [PATCH 17/23] Support RPL in measurement function.

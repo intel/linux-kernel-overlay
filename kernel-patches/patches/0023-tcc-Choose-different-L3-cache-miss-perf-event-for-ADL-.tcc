@@ -1,4 +1,4 @@
-From 3bb1075bb8570193dabe36ed4a65e42b2c7cbb02 Mon Sep 17 00:00:00 2001
+From 173a445eebaf36fb5ade80d07673f88c9f48353f Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Tue, 19 Apr 2022 23:41:07 +0800
 Subject: [PATCH 23/23] tcc: Choose different L3 cache miss perf event for
@@ -12,10 +12,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/tcc/tcc_buffer.c b/drivers/tcc/tcc_buffer.c
-index fbe421241cba..6b547693d140 100644
+index c4fa8093eb9a..c40b253475fa 100644
 --- a/drivers/tcc/tcc_buffer.c
 +++ b/drivers/tcc/tcc_buffer.c
-@@ -308,6 +308,7 @@ static int tcc_perf_fn(void);
+@@ -306,6 +306,7 @@ static int tcc_perf_fn(void);
  #define MSR_MISC_FEATURE_CONTROL    0x000001a4
  #define READ_BYTE_SIZE              64
  #define MISC_MSR_BITS_COMMON        ((0x52ULL << 16) | 0xd1)
@@ -23,7 +23,7 @@ index fbe421241cba..6b547693d140 100644
  #define MISC_MSR_BITS_ALL_CLEAR     0x0
  #define PERFMON_EVENTSEL_BITMASK    (~(0x40ULL << 16))
  
-@@ -324,6 +325,7 @@ static u64 get_hardware_prefetcher_disable_bits(void)
+@@ -322,6 +323,7 @@ static u64 get_hardware_prefetcher_disable_bits(void)
  	case INTEL_FAM6_ATOM_TREMONT:
  	return 0x1F;
  	case INTEL_FAM6_ALDERLAKE:
@@ -31,7 +31,7 @@ index fbe421241cba..6b547693d140 100644
  	case INTEL_FAM6_RAPTORLAKE:
  	return 0x2F;
  	default:
-@@ -359,7 +361,10 @@ static int tcc_perf_fn(void)
+@@ -353,7 +355,10 @@ static int tcc_perf_fn(void)
  		msr_bits_l2h = (MISC_MSR_BITS_COMMON) | (0x2  << 8);
  		msr_bits_l2m = (MISC_MSR_BITS_COMMON) | (0x10 << 8);
  		msr_bits_l3h = (MISC_MSR_BITS_COMMON) | (0x4  << 8);
