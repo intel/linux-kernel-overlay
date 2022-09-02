@@ -1,7 +1,7 @@
-From 4a2bd585a1e0b3401dec3b63bee30bfc6102ed8f Mon Sep 17 00:00:00 2001
+From 3f2151305c11561071ba46e1f3267803fa11b8bb Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
-Subject: [PATCH 02/19] tcc: this is kernel driver to interface to TCC PTCM
+Subject: [PATCH 02/23] tcc: this is kernel driver to interface to TCC PTCM
  pesudo SRAM
 
 ACPI may include PTCT table. It PTCT is included, then there will
@@ -10,35 +10,34 @@ will allow user to interface these pesudo SRAM regions.
 
 Signed-off-by: Qiang Rao <qiang.rao@intel.com>
 ---
- drivers/Kconfig          |   2 +
+ drivers/Kconfig          |   1 +
  drivers/Makefile         |   1 +
  drivers/tcc/Kconfig      |   9 +
  drivers/tcc/Makefile     |   6 +
  drivers/tcc/tcc_buffer.c | 695 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 713 insertions(+)
+ 5 files changed, 712 insertions(+)
  create mode 100644 drivers/tcc/Kconfig
  create mode 100644 drivers/tcc/Makefile
  create mode 100644 drivers/tcc/tcc_buffer.c
 
 diff --git a/drivers/Kconfig b/drivers/Kconfig
-index 0d399ddaa185..253f498284ee 100644
+index 19ee995bd0ae..c391ee71bcf5 100644
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -236,4 +236,6 @@ source "drivers/interconnect/Kconfig"
- source "drivers/counter/Kconfig"
+@@ -239,4 +239,5 @@ source "drivers/peci/Kconfig"
  
- source "drivers/most/Kconfig"
-+
+ source "drivers/hte/Kconfig"
+ 
 +source "drivers/tcc/Kconfig"
  endmenu
 diff --git a/drivers/Makefile b/drivers/Makefile
-index a110338c860c..a8485501cde6 100644
+index 057857258bfd..f33ab487b8d6 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -187,3 +187,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
- obj-$(CONFIG_INTERCONNECT)	+= interconnect/
- obj-$(CONFIG_COUNTER)		+= counter/
+@@ -188,3 +188,4 @@ obj-$(CONFIG_COUNTER)		+= counter/
  obj-$(CONFIG_MOST)		+= most/
+ obj-$(CONFIG_PECI)		+= peci/
+ obj-$(CONFIG_HTE)		+= hte/
 +obj-$(CONFIG_X86_TCC_PTCM)	+= tcc/
 diff --git a/drivers/tcc/Kconfig b/drivers/tcc/Kconfig
 new file mode 100644
@@ -769,5 +768,5 @@ index 000000000000..4d4e0557dddc
 +
 +MODULE_LICENSE("GPL v2");
 -- 
-2.32.0
+2.25.1
 

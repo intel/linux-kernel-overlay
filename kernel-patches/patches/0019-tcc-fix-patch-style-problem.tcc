@@ -1,7 +1,7 @@
-From 94c7e4158b8f047e4c7902c6fc624ffb453ec6fb Mon Sep 17 00:00:00 2001
+From 77ef155be20602dc72bb0dcc39ab609c162a1534 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 10 Feb 2022 18:08:20 +0800
-Subject: [PATCH 19/19] tcc: fix patch style problem
+Subject: [PATCH 19/23] tcc: fix patch style problem
 
 Unnecessary blank lines are removed, sort local varibles.
 
@@ -12,10 +12,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 17 insertions(+), 30 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 38adb0a158e4..7a0285786f69 100644
+index 3bbae9b0de32..9f5a62f112ab 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1257,21 +1257,19 @@ static bool tcc_is_untracked_pat_range(u64 start, u64 end)
+@@ -1339,21 +1339,19 @@ static bool tcc_is_untracked_pat_range(u64 start, u64 end)
  
  static int __init acpi_parse_ptct(struct acpi_table_header *table)
  {
@@ -43,7 +43,7 @@ index 38adb0a158e4..7a0285786f69 100644
  	/* Parse PTCT table for the first round to determine PTCT version */
  	ptr = (u8 *)table;
  	ptr += PTCT_ACPI_HEADER_SIZE;
-@@ -1290,7 +1288,6 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1372,7 +1370,6 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  	}
  
  	/* Parse PTCT table for the second round to get number of regions*/
@@ -51,7 +51,7 @@ index 38adb0a158e4..7a0285786f69 100644
  	ptr = (u8 *)table;
  	ptr += PTCT_ACPI_HEADER_SIZE;
  
-@@ -1310,7 +1307,6 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1392,7 +1389,6 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  		return -EINVAL;
  
  	/* Parse for the third round to record address for each regions */
@@ -59,7 +59,7 @@ index 38adb0a158e4..7a0285786f69 100644
  	ptr = (u8 *)table;
  	ptr += PTCT_ACPI_HEADER_SIZE;
  
-@@ -1353,10 +1349,6 @@ static void __init acpi_process_ptct(void)
+@@ -1435,10 +1431,6 @@ static void __init acpi_process_ptct(void)
  		x86_platform.is_untracked_pat_range = tcc_is_untracked_pat_range;
  }
  
@@ -71,10 +71,10 @@ index 38adb0a158e4..7a0285786f69 100644
  {
  #ifdef CONFIG_X86_LOCAL_APIC
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index b89377231558..f8f3c5b02151 100644
+index e3205c806a81..5964f95a84c9 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
-@@ -2216,13 +2216,11 @@ struct acpi_prmt_handler_info {
+@@ -2317,13 +2317,11 @@ struct acpi_prmt_handler_info {
   *        Version 1
   *
   ******************************************************************************/
@@ -89,7 +89,7 @@ index b89377231558..f8f3c5b02151 100644
  enum acpi_ptct_entry {
  	ACPI_PTCT_ENTRY_PTCD_LIMITS              = 1,
  	ACPI_PTCT_ENTRY_PTCM_BINARY              = 2,
-@@ -2233,7 +2231,6 @@ enum acpi_ptct_entry {
+@@ -2334,7 +2332,6 @@ enum acpi_ptct_entry {
  	ACPI_PTCT_ENTRY_TIME_AWARE_SUBSYSTEMS    = 7,
  	ACPI_PTCT_ENTRY_REALTIME_IOMMU           = 8,
  	ACPI_PTCT_ENTRY_MEMORY_HIERARCHY_LATENCY = 9,
@@ -97,7 +97,7 @@ index b89377231558..f8f3c5b02151 100644
  	ACPI_PTCT_ENTRY_RESERVED
  };
  
-@@ -2270,19 +2267,17 @@ struct ptct_psram_region {
+@@ -2371,19 +2368,17 @@ struct ptct_psram_region {
   *
   ******************************************************************************/
  /* Values for Type field above */
@@ -128,5 +128,5 @@ index b89377231558..f8f3c5b02151 100644
  };
  
 -- 
-2.32.0
+2.25.1
 
