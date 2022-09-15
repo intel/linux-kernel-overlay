@@ -1,0 +1,123 @@
+From 28131aad1a076651027571a4f6eb698802fe2df3 Mon Sep 17 00:00:00 2001
+From: Leon Romanovsky <leonro@nvidia.com>
+Date: Thu, 29 Jul 2021 20:19:25 +0300
+Subject: [PATCH 76/80] devlink: Allocate devlink directly in requested net
+ namespace
+
+There is no need in extra call indirection and check from impossible
+flow where someone tries to set namespace without prior call
+to devlink_alloc().
+
+Instead of this extra logic and additional EXPORT_SYMBOL, use specialized
+devlink allocation function that receives net namespace as an argument.
+
+Such specialized API allows clear view when devlink initialized in wrong
+net namespace and/or kernel users don't try to change devlink namespace
+under the hood.
+
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ drivers/net/netdevsim/dev.c |  4 ++--
+ include/net/devlink.h       | 14 ++++++++++++--
+ net/core/devlink.c          | 13 ++++++++-----
+ 3 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index 9bbecf4d159b..22817f23b86c 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -1056,10 +1056,10 @@ int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
+ 	struct devlink *devlink;
+ 	int err;
+ 
+-	devlink = devlink_alloc(&nsim_dev_devlink_ops, sizeof(*nsim_dev));
++	devlink = devlink_alloc_ns(&nsim_dev_devlink_ops, sizeof(*nsim_dev),
++				   nsim_bus_dev->initial_net);
+ 	if (!devlink)
+ 		return -ENOMEM;
+-	devlink_net_set(devlink, nsim_bus_dev->initial_net);
+ 	nsim_dev = devlink_priv(devlink);
+ 	nsim_dev->nsim_bus_dev = nsim_bus_dev;
+ 	nsim_dev->switch_id.id_len = sizeof(nsim_dev->switch_id.id);
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index b01bb9bca5a2..6e36df9b5e18 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -1379,8 +1379,18 @@ static inline struct devlink *netdev_to_devlink(struct net_device *dev)
+ struct ib_device;
+ 
+ struct net *devlink_net(const struct devlink *devlink);
+-void devlink_net_set(struct devlink *devlink, struct net *net);
+-struct devlink *devlink_alloc(const struct devlink_ops *ops, size_t priv_size);
++/* This call is intended for software devices that can create
++ * devlink instances in other namespaces than init_net.
++ *
++ * Drivers that operate on real HW must use devlink_alloc() instead.
++ */
++struct devlink *devlink_alloc_ns(const struct devlink_ops *ops,
++				 size_t priv_size, struct net *net);
++static inline struct devlink *devlink_alloc(const struct devlink_ops *ops,
++					    size_t priv_size)
++{
++	return devlink_alloc_ns(ops, priv_size, &init_net);
++}
+ int devlink_register(struct devlink *devlink, struct device *dev);
+ void devlink_unregister(struct devlink *devlink);
+ void devlink_reload_enable(struct devlink *devlink);
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 72047750dcd9..70149ba30524 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -3199,7 +3199,7 @@ static int devlink_reload(struct devlink *devlink, struct net *dest_net,
+ 		return err;
+ 
+ 	if (dest_net && !net_eq(dest_net, curr_net))
+-		__devlink_net_set(devlink, dest_net);
++		write_pnet(&devlink->_net, dest_net);
+ 
+ 	err = devlink->ops->reload_up(devlink, action, limit, actions_performed, extack);
+ 	devlink_reload_failed_set(devlink, !!err);
+@@ -7955,15 +7955,18 @@ static bool devlink_reload_actions_valid(const struct devlink_ops *ops)
+ }
+ 
+ /**
+- *	devlink_alloc - Allocate new devlink instance resources
++ *	devlink_alloc_ns - Allocate new devlink instance resources
++ *	in specific namespace
+  *
+  *	@ops: ops
+  *	@priv_size: size of user private data
++ *	@net: net namespace
+  *
+  *	Allocate new devlink instance resources, including devlink index
+  *	and name.
+  */
+-struct devlink *devlink_alloc(const struct devlink_ops *ops, size_t priv_size)
++struct devlink *devlink_alloc_ns(const struct devlink_ops *ops,
++				 size_t priv_size, struct net *net)
+ {
+ 	struct devlink *devlink;
+ 
+@@ -7978,7 +7981,7 @@ struct devlink *devlink_alloc(const struct devlink_ops *ops, size_t priv_size)
+ 		return NULL;
+ 	devlink->ops = ops;
+ 	xa_init_flags(&devlink->snapshot_ids, XA_FLAGS_ALLOC);
+-	__devlink_net_set(devlink, &init_net);
++	write_pnet(&devlink->_net, net);
+ 	INIT_LIST_HEAD(&devlink->port_list);
+ 	INIT_LIST_HEAD(&devlink->sb_list);
+ 	INIT_LIST_HEAD_RCU(&devlink->dpipe_table_list);
+@@ -7993,7 +7996,7 @@ struct devlink *devlink_alloc(const struct devlink_ops *ops, size_t priv_size)
+ 	mutex_init(&devlink->reporters_lock);
+ 	return devlink;
+ }
+-EXPORT_SYMBOL_GPL(devlink_alloc);
++EXPORT_SYMBOL_GPL(devlink_alloc_ns);
+ 
+ /**
+  *	devlink_register - Register devlink instance
+-- 
+2.25.1
+
