@@ -1,0 +1,165 @@
+From ad3b46ae4404e70d5b4407d5621bec975b5ac6e5 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Mon, 8 Aug 2022 14:54:03 +0200
+Subject: [PATCH 2524/2871] drm/format-helper: Rework XRGB8888-to-GRAY8
+ conversion
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Update XRGB8888-to-GRAY8 conversion to support struct iosys_map
+and convert all users. Although these are single-plane color formats,
+the new interface supports multi-plane formats for consistency with
+drm_fb_blit().
+
+v2:
+	* update documentation (Sam)
+	* add TODO on vaddr location (Sam)
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Tested-by: Noralf Trønnes <noralf@tronnes.org>
+Reviewed-by: Sam Ravnborg <sam@ravnborg.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220808125406.20752-12-tzimmermann@suse.de
+---
+ drivers/gpu/drm/drm_format_helper.c | 46 +++++++++++++++++++++--------
+ drivers/gpu/drm/gud/gud_pipe.c      |  7 +++--
+ drivers/gpu/drm/tiny/st7586.c       |  5 +++-
+ include/drm/drm_format_helper.h     |  5 ++--
+ 4 files changed, 46 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_format_helper.c b/drivers/gpu/drm/drm_format_helper.c
+index 795d845c7e53..890370c0424f 100644
+--- a/drivers/gpu/drm/drm_format_helper.c
++++ b/drivers/gpu/drm/drm_format_helper.c
+@@ -613,25 +613,47 @@ static void drm_fb_xrgb8888_to_gray8_line(void *dbuf, const void *sbuf, unsigned
+ 
+ /**
+  * drm_fb_xrgb8888_to_gray8 - Convert XRGB8888 to grayscale
+- * @dst: 8-bit grayscale destination buffer
+- * @dst_pitch: Number of bytes between two consecutive scanlines within dst
+- * @vaddr: XRGB8888 source buffer
++ * @dst: Array of 8-bit grayscale destination buffers
++ * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
++ *             within @dst; can be NULL if scanlines are stored next to each other.
++ * @vmap: Array of XRGB8888 source buffers
+  * @fb: DRM framebuffer
+  * @clip: Clip rectangle area to copy
+  *
+- * Drm doesn't have native monochrome or grayscale support.
+- * Such drivers can announce the commonly supported XR24 format to userspace
+- * and use this function to convert to the native format.
++ * This function copies parts of a framebuffer to display memory and converts the
++ * color format during the process. Destination and framebuffer formats must match. The
++ * parameters @dst, @dst_pitch and @vmap refer to arrays. Each array must have at
++ * least as many entries as there are planes in @fb's format. Each entry stores the
++ * value for the format's respective color plane at the same index.
+  *
+- * Monochrome drivers will use the most significant bit,
+- * where 1 means foreground color and 0 background color.
++ * This function does not apply clipping on @dst (i.e. the destination is at the
++ * top-left corner).
+  *
+- * ITU BT.601 is used for the RGB -> luma (brightness) conversion.
++ * DRM doesn't have native monochrome or grayscale support. Drivers can use this
++ * function for grayscale devices that don't support XRGB8888 natively.Such
++ * drivers can announce the commonly supported XR24 format to userspace and use
++ * this function to convert to the native format. Monochrome drivers will use the
++ * most significant bit, where 1 means foreground color and 0 background color.
++ * ITU BT.601 is being used for the RGB -> luma (brightness) conversion.
+  */
+-void drm_fb_xrgb8888_to_gray8(void *dst, unsigned int dst_pitch, const void *vaddr,
+-			      const struct drm_framebuffer *fb, const struct drm_rect *clip)
++void drm_fb_xrgb8888_to_gray8(struct iosys_map *dst, const unsigned int *dst_pitch,
++			      const struct iosys_map *vmap, const struct drm_framebuffer *fb,
++			      const struct drm_rect *clip)
+ {
+-	drm_fb_xfrm(dst, dst_pitch, 1, vaddr, fb, clip, false, drm_fb_xrgb8888_to_gray8_line);
++	static const unsigned int default_dst_pitch[DRM_FORMAT_MAX_PLANES] = {
++		0, 0, 0, 0
++	};
++
++	if (!dst_pitch)
++		dst_pitch = default_dst_pitch;
++
++	/* TODO: handle vmap in I/O memory here */
++	if (dst[0].is_iomem)
++		drm_fb_xfrm_toio(dst[0].vaddr_iomem, dst_pitch[0], 1, vmap[0].vaddr, fb,
++				 clip, false, drm_fb_xrgb8888_to_gray8_line);
++	else
++		drm_fb_xfrm(dst[0].vaddr, dst_pitch[0], 1, vmap[0].vaddr, fb,
++			    clip, false, drm_fb_xrgb8888_to_gray8_line);
+ }
+ EXPORT_SYMBOL(drm_fb_xrgb8888_to_gray8);
+ 
+diff --git a/drivers/gpu/drm/gud/gud_pipe.c b/drivers/gpu/drm/gud/gud_pipe.c
+index 0caa228f736d..7c6dc2bcd14a 100644
+--- a/drivers/gpu/drm/gud/gud_pipe.c
++++ b/drivers/gpu/drm/gud/gud_pipe.c
+@@ -59,6 +59,7 @@ static size_t gud_xrgb8888_to_r124(u8 *dst, const struct drm_format_info *format
+ 	unsigned int bits_per_pixel = 8 / block_width;
+ 	unsigned int x, y, width, height;
+ 	u8 pix, *pix8, *block = dst; /* Assign to silence compiler warning */
++	struct iosys_map dst_map, vmap;
+ 	size_t len;
+ 	void *buf;
+ 
+@@ -74,7 +75,9 @@ static size_t gud_xrgb8888_to_r124(u8 *dst, const struct drm_format_info *format
+ 	if (!buf)
+ 		return 0;
+ 
+-	drm_fb_xrgb8888_to_gray8(buf, 0, src, fb, rect);
++	iosys_map_set_vaddr(&dst_map, buf);
++	iosys_map_set_vaddr(&vmap, src);
++	drm_fb_xrgb8888_to_gray8(&dst_map, NULL, &vmap, fb, rect);
+ 	pix8 = buf;
+ 
+ 	for (y = 0; y < height; y++) {
+@@ -194,7 +197,7 @@ static int gud_prep_flush(struct gud_device *gdrm, struct drm_framebuffer *fb,
+ 				goto end_cpu_access;
+ 			}
+ 		} else if (format->format == DRM_FORMAT_R8) {
+-			drm_fb_xrgb8888_to_gray8(buf, 0, vaddr, fb, rect);
++			drm_fb_xrgb8888_to_gray8(&dst, NULL, map_data, fb, rect);
+ 		} else if (format->format == DRM_FORMAT_RGB332) {
+ 			drm_fb_xrgb8888_to_rgb332(&dst, NULL, map_data, fb, rect);
+ 		} else if (format->format == DRM_FORMAT_RGB565) {
+diff --git a/drivers/gpu/drm/tiny/st7586.c b/drivers/gpu/drm/tiny/st7586.c
+index 5bd6ea1619d4..eef533f2a770 100644
+--- a/drivers/gpu/drm/tiny/st7586.c
++++ b/drivers/gpu/drm/tiny/st7586.c
+@@ -69,12 +69,15 @@ static void st7586_xrgb8888_to_gray332(u8 *dst, void *vaddr,
+ 	size_t len = (clip->x2 - clip->x1) * (clip->y2 - clip->y1);
+ 	unsigned int x, y;
+ 	u8 *src, *buf, val;
++	struct iosys_map dst_map, vmap;
+ 
+ 	buf = kmalloc(len, GFP_KERNEL);
+ 	if (!buf)
+ 		return;
+ 
+-	drm_fb_xrgb8888_to_gray8(buf, 0, vaddr, fb, clip);
++	iosys_map_set_vaddr(&dst_map, buf);
++	iosys_map_set_vaddr(&vmap, vaddr);
++	drm_fb_xrgb8888_to_gray8(&dst_map, NULL, &vmap, fb, clip);
+ 	src = buf;
+ 
+ 	for (y = clip->y1; y < clip->y2; y++) {
+diff --git a/include/drm/drm_format_helper.h b/include/drm/drm_format_helper.h
+index 6807440ce29c..68087c982497 100644
+--- a/include/drm/drm_format_helper.h
++++ b/include/drm/drm_format_helper.h
+@@ -32,8 +32,9 @@ void drm_fb_xrgb8888_to_rgb888(struct iosys_map *dst, const unsigned int *dst_pi
+ void drm_fb_xrgb8888_to_xrgb2101010(struct iosys_map *dst, const unsigned int *dst_pitch,
+ 				    const struct iosys_map *vmap, const struct drm_framebuffer *fb,
+ 				    const struct drm_rect *clip);
+-void drm_fb_xrgb8888_to_gray8(void *dst, unsigned int dst_pitch, const void *vaddr,
+-			      const struct drm_framebuffer *fb, const struct drm_rect *clip);
++void drm_fb_xrgb8888_to_gray8(struct iosys_map *dst, const unsigned int *dst_pitch,
++			      const struct iosys_map *vmap, const struct drm_framebuffer *fb,
++			      const struct drm_rect *clip);
+ 
+ int drm_fb_blit(struct iosys_map *dst, const unsigned int *dst_pitch, uint32_t dst_format,
+ 		const struct iosys_map *vmap, const struct drm_framebuffer *fb,
+-- 
+2.25.1
+

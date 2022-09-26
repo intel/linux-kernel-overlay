@@ -1,0 +1,149 @@
+From c0c111cef208505e78a32f3a1bb29cc91ef7643d Mon Sep 17 00:00:00 2001
+From: Igor Torrente <igormtorrente@gmail.com>
+Date: Mon, 5 Sep 2022 16:08:07 -0300
+Subject: [PATCH 2832/2871] drm: vkms: Add fb information to
+ `vkms_writeback_job`
+
+This commit is the groundwork to introduce new formats to the planes and
+writeback buffer. As part of it, a new buffer metadata field is added to
+`vkms_writeback_job`, this metadata is represented by the `vkms_frame_info`
+struct.
+
+Also adds two new function pointers (`line_to_frame_func` and
+`frame_to_line_func`) are defined to handle format conversion
+from/to internal format.
+
+A new internal format(`struct pixel_argb_u16`) is introduced to deal with
+all possible inputs. It consists of 16 bits fields that represent each of
+the channels.
+
+These things will allow us, in the future, to have different compositing
+and wb format types.
+
+V2: Change the code to get the drm_framebuffer reference and not copy its
+    contents (Thomas Zimmermann).
+V3: Drop the refcount in the wb code (Thomas Zimmermann).
+V5: Add {wb,plane}_format_transform_func to vkms_writeback_job
+    and vkms_plane_state (Pekka Paalanen)
+V6: Improvements to some struct/struct members names (Pekka Paalanen).
+    Splits this patch in two (Pekka Paalanen).
+V7: Replace line_to_frame_func and frame_to_line_func typedefs
+   with the function signature and void* (Melissa Wen).
+
+Reviewed-by: Melissa Wen <mwen@igalia.com>
+Signed-off-by: Igor Torrente <igormtorrente@gmail.com>
+Signed-off-by: Melissa Wen <melissa.srw@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220905190811.25024-6-igormtorrente@gmail.com
+---
+ drivers/gpu/drm/vkms/vkms_drv.h       | 23 ++++++++++++++++++-----
+ drivers/gpu/drm/vkms/vkms_writeback.c | 20 +++++++++++++++++---
+ 2 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 38c44943d915..0a67b8073f7e 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -23,11 +23,6 @@
+ 
+ #define NUM_OVERLAY_PLANES 8
+ 
+-struct vkms_writeback_job {
+-	struct iosys_map map[DRM_FORMAT_MAX_PLANES];
+-	struct iosys_map data[DRM_FORMAT_MAX_PLANES];
+-};
+-
+ struct vkms_frame_info {
+ 	struct drm_framebuffer *fb;
+ 	struct drm_rect src, dst;
+@@ -37,6 +32,22 @@ struct vkms_frame_info {
+ 	unsigned int cpp;
+ };
+ 
++struct pixel_argb_u16 {
++	u16 a, r, g, b;
++};
++
++struct line_buffer {
++	size_t n_pixels;
++	struct pixel_argb_u16 *pixels;
++};
++
++struct vkms_writeback_job {
++	struct iosys_map data[DRM_FORMAT_MAX_PLANES];
++	struct vkms_frame_info wb_frame_info;
++	void (*wb_write)(struct vkms_frame_info *frame_info,
++			 const struct line_buffer *buffer, int y);
++};
++
+ /**
+  * vkms_plane_state - Driver specific plane state
+  * @base: base plane state
+@@ -45,6 +56,8 @@ struct vkms_frame_info {
+ struct vkms_plane_state {
+ 	struct drm_shadow_plane_state base;
+ 	struct vkms_frame_info *frame_info;
++	void (*plane_read)(struct line_buffer *buffer,
++			   const struct vkms_frame_info *frame_info, int y);
+ };
+ 
+ struct vkms_plane {
+diff --git a/drivers/gpu/drm/vkms/vkms_writeback.c b/drivers/gpu/drm/vkms/vkms_writeback.c
+index d427b6c52d03..e0a1ba378fc9 100644
+--- a/drivers/gpu/drm/vkms/vkms_writeback.c
++++ b/drivers/gpu/drm/vkms/vkms_writeback.c
+@@ -75,12 +75,15 @@ static int vkms_wb_prepare_job(struct drm_writeback_connector *wb_connector,
+ 	if (!vkmsjob)
+ 		return -ENOMEM;
+ 
+-	ret = drm_gem_fb_vmap(job->fb, vkmsjob->map, vkmsjob->data);
++	ret = drm_gem_fb_vmap(job->fb, vkmsjob->wb_frame_info.map, vkmsjob->data);
+ 	if (ret) {
+ 		DRM_ERROR("vmap failed: %d\n", ret);
+ 		goto err_kfree;
+ 	}
+ 
++	vkmsjob->wb_frame_info.fb = job->fb;
++	drm_framebuffer_get(vkmsjob->wb_frame_info.fb);
++
+ 	job->priv = vkmsjob;
+ 
+ 	return 0;
+@@ -99,7 +102,9 @@ static void vkms_wb_cleanup_job(struct drm_writeback_connector *connector,
+ 	if (!job->fb)
+ 		return;
+ 
+-	drm_gem_fb_vunmap(job->fb, vkmsjob->map);
++	drm_gem_fb_vunmap(job->fb, vkmsjob->wb_frame_info.map);
++
++	drm_framebuffer_put(vkmsjob->wb_frame_info.fb);
+ 
+ 	vkmsdev = drm_device_to_vkms_device(job->fb->dev);
+ 	vkms_set_composer(&vkmsdev->output, false);
+@@ -116,14 +121,23 @@ static void vkms_wb_atomic_commit(struct drm_connector *conn,
+ 	struct drm_writeback_connector *wb_conn = &output->wb_connector;
+ 	struct drm_connector_state *conn_state = wb_conn->base.state;
+ 	struct vkms_crtc_state *crtc_state = output->composer_state;
++	struct drm_framebuffer *fb = connector_state->writeback_job->fb;
++	struct vkms_writeback_job *active_wb;
++	struct vkms_frame_info *wb_frame_info;
+ 
+ 	if (!conn_state)
+ 		return;
+ 
+ 	vkms_set_composer(&vkmsdev->output, true);
+ 
++	active_wb = conn_state->writeback_job->priv;
++	wb_frame_info = &active_wb->wb_frame_info;
++
+ 	spin_lock_irq(&output->composer_lock);
+-	crtc_state->active_writeback = conn_state->writeback_job->priv;
++	crtc_state->active_writeback = active_wb;
++	wb_frame_info->offset = fb->offsets[0];
++	wb_frame_info->pitch = fb->pitches[0];
++	wb_frame_info->cpp = fb->format->cpp[0];
+ 	crtc_state->wb_pending = true;
+ 	spin_unlock_irq(&output->composer_lock);
+ 	drm_writeback_queue_job(wb_conn, connector_state);
+-- 
+2.25.1
+

@@ -1,0 +1,116 @@
+From dd7964340d04e6965916b73bf6cf04bced123c35 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime@cerno.tech>
+Date: Mon, 11 Jul 2022 19:39:38 +0200
+Subject: [PATCH 2363/2871] drm/vc4: v3d: Rework the runtime_pm setup
+
+At bind time, vc4_v3d_bind() will read a register to retrieve the v3d
+version and make sure it's a version we're compatible with.
+
+However, the v3d has an optional clock that is enabled only after the
+register read-out and a power domain that wasn't enabled at all in the bind
+implementation. This was working fine at boot because both were enabled,
+but resulted in the version check failing if we were unbinding and
+rebinding the driver because the unbinding would have turned them off.
+
+The fix isn't as easy as calling pm_runtime_resume_and_get() prior to the
+register access to power up the power domain though.
+
+Indeed, the runtime_resume implementation will enable the clock mentioned
+above, call vc4_v3d_init_hw() and then vc4_irq_enable().
+
+Prior to the previous patch, vc4_irq_enable() needed to occur after our
+call to platform_get_irq() and vc4_irq_install(), since vc4_irq_enable()
+used to call enable_irq() and vc4_irq_install() will call request_irq().
+
+vc4_irq_install() will also do some register access, so needs the power
+domain to be on. So we ended up in a situation where
+vc4_v3d_runtime_resume() needed vc4_irq_install() to have been called
+before, and vc4_irq_install() needed vc4_v3d_runtime_resume().
+
+The previous patch removed the enable_irq() call in vc4_irq_enable() and
+thus removed the dependency of vc4_v3d_runtime_resume() on
+vc4_irq_install().
+
+Thus, we can now rework our bind implementation to call
+pm_runtime_resume_and_get() before our register access to make sure the
+power domain is on. vc4_v3d_runtime_resume() also takes care of turning the
+clock on and calling vc4_v3d_init_hw() so we can remove them from bind.
+
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+Link: https://lore.kernel.org/r/20220711173939.1132294-69-maxime@cerno.tech
+---
+ drivers/gpu/drm/vc4/vc4_v3d.c | 37 +++++++++++++++++++++--------------
+ 1 file changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_v3d.c b/drivers/gpu/drm/vc4/vc4_v3d.c
+index a2da0db73a5c..d82c86865079 100644
+--- a/drivers/gpu/drm/vc4/vc4_v3d.c
++++ b/drivers/gpu/drm/vc4/vc4_v3d.c
+@@ -463,41 +463,48 @@ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
+ 		}
+ 	}
+ 
++	ret = platform_get_irq(pdev, 0);
++	if (ret < 0)
++		return ret;
++	vc4->irq = ret;
++
++	pm_runtime_enable(dev);
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		goto err_disable_runtime_pm;
++
+ 	if (V3D_READ(V3D_IDENT0) != V3D_EXPECTED_IDENT0) {
+ 		DRM_ERROR("V3D_IDENT0 read 0x%08x instead of 0x%08x\n",
+ 			  V3D_READ(V3D_IDENT0), V3D_EXPECTED_IDENT0);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err_put_runtime_pm;
+ 	}
+ 
+-	ret = clk_prepare_enable(v3d->clk);
+-	if (ret != 0)
+-		return ret;
+-
+ 	/* Reset the binner overflow address/size at setup, to be sure
+ 	 * we don't reuse an old one.
+ 	 */
+ 	V3D_WRITE(V3D_BPOA, 0);
+ 	V3D_WRITE(V3D_BPOS, 0);
+ 
+-	vc4_v3d_init_hw(drm);
+-
+-	ret = platform_get_irq(pdev, 0);
+-	if (ret < 0)
+-		return ret;
+-	vc4->irq = ret;
+-
+ 	ret = vc4_irq_install(drm, vc4->irq);
+ 	if (ret) {
+ 		DRM_ERROR("Failed to install IRQ handler\n");
+-		return ret;
++		goto err_put_runtime_pm;
+ 	}
+ 
+-	pm_runtime_set_active(dev);
+ 	pm_runtime_use_autosuspend(dev);
+ 	pm_runtime_set_autosuspend_delay(dev, 40); /* a little over 2 frames. */
+-	pm_runtime_enable(dev);
+ 
+ 	return 0;
++
++err_put_runtime_pm:
++	pm_runtime_put(dev);
++
++err_disable_runtime_pm:
++	pm_runtime_disable(dev);
++
++	return ret;
+ }
+ 
+ static void vc4_v3d_unbind(struct device *dev, struct device *master,
+-- 
+2.25.1
+

@@ -1,0 +1,114 @@
+From 65b56d9f1d8a1baf99c318c1d0f33d0cb17ab70f Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime@cerno.tech>
+Date: Mon, 11 Jul 2022 19:39:23 +0200
+Subject: [PATCH 2348/2871] drm/vc4: txp: Protect device resources
+
+Our current code now mixes some resources whose lifetime are tied to the
+device (clocks, IO mappings, etc.) and some that are tied to the DRM device
+(encoder, bridge).
+
+The device one will be freed at unbind time, but the DRM one will only be
+freed when the last user of the DRM device closes its file handle.
+
+So we end up with a time window during which we can call the encoder hooks,
+but we don't have access to the underlying resources and device.
+
+Let's protect all those sections with drm_dev_enter() and drm_dev_exit() so
+that we bail out if we are during that window.
+
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+Link: https://lore.kernel.org/r/20220711173939.1132294-54-maxime@cerno.tech
+---
+ drivers/gpu/drm/vc4/vc4_txp.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_txp.c b/drivers/gpu/drm/vc4/vc4_txp.c
+index 7e5212bcf8e6..f6f61cf5f3f7 100644
+--- a/drivers/gpu/drm/vc4/vc4_txp.c
++++ b/drivers/gpu/drm/vc4/vc4_txp.c
+@@ -15,6 +15,7 @@
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_drv.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_fb_cma_helper.h>
+ #include <drm/drm_fourcc.h>
+@@ -275,6 +276,7 @@ static int vc4_txp_connector_atomic_check(struct drm_connector *conn,
+ static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
+ 					struct drm_atomic_state *state)
+ {
++	struct drm_device *drm = conn->dev;
+ 	struct drm_connector_state *conn_state = drm_atomic_get_new_connector_state(state,
+ 										    conn);
+ 	struct vc4_txp *txp = connector_to_vc4_txp(conn);
+@@ -282,6 +284,7 @@ static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
+ 	struct drm_display_mode *mode;
+ 	struct drm_framebuffer *fb;
+ 	u32 ctrl;
++	int idx;
+ 	int i;
+ 
+ 	if (WARN_ON(!conn_state->writeback_job))
+@@ -311,6 +314,9 @@ static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
+ 		 */
+ 		ctrl |= TXP_ALPHA_INVERT;
+ 
++	if (!drm_dev_enter(drm, &idx))
++		return;
++
+ 	gem = drm_fb_cma_get_gem_obj(fb, 0);
+ 	TXP_WRITE(TXP_DST_PTR, gem->paddr + fb->offsets[0]);
+ 	TXP_WRITE(TXP_DST_PITCH, fb->pitches[0]);
+@@ -321,6 +327,8 @@ static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
+ 	TXP_WRITE(TXP_DST_CTRL, ctrl);
+ 
+ 	drm_writeback_queue_job(&txp->connector, conn_state);
++
++	drm_dev_exit(idx);
+ }
+ 
+ static const struct drm_connector_helper_funcs vc4_txp_connector_helper_funcs = {
+@@ -347,7 +355,12 @@ static const struct drm_connector_funcs vc4_txp_connector_funcs = {
+ 
+ static void vc4_txp_encoder_disable(struct drm_encoder *encoder)
+ {
++	struct drm_device *drm = encoder->dev;
+ 	struct vc4_txp *txp = encoder_to_vc4_txp(encoder);
++	int idx;
++
++	if (!drm_dev_enter(drm, &idx))
++		return;
+ 
+ 	if (TXP_READ(TXP_DST_CTRL) & TXP_BUSY) {
+ 		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
+@@ -362,6 +375,8 @@ static void vc4_txp_encoder_disable(struct drm_encoder *encoder)
+ 	}
+ 
+ 	TXP_WRITE(TXP_DST_CTRL, TXP_POWERDOWN);
++
++	drm_dev_exit(idx);
+ }
+ 
+ static const struct drm_encoder_helper_funcs vc4_txp_encoder_helper_funcs = {
+@@ -445,6 +460,16 @@ static irqreturn_t vc4_txp_interrupt(int irq, void *data)
+ 	struct vc4_txp *txp = data;
+ 	struct vc4_crtc *vc4_crtc = &txp->base;
+ 
++	/*
++	 * We don't need to protect the register access using
++	 * drm_dev_enter() there because the interrupt handler lifetime
++	 * is tied to the device itself, and not to the DRM device.
++	 *
++	 * So when the device will be gone, one of the first thing we
++	 * will be doing will be to unregister the interrupt handler,
++	 * and then unregister the DRM device. drm_dev_enter() would
++	 * thus always succeed if we are here.
++	 */
+ 	TXP_WRITE(TXP_DST_CTRL, TXP_READ(TXP_DST_CTRL) & ~TXP_EI);
+ 	vc4_crtc_handle_vblank(vc4_crtc);
+ 	drm_writeback_signal_completion(&txp->connector, 0);
+-- 
+2.25.1
+
