@@ -1,7 +1,7 @@
-From c68ebfd839f1617d685c42e57c5de08439d1d666 Mon Sep 17 00:00:00 2001
+From 9c5d9f64306a3db7f214cb749eafcc829fc9a497 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 9 Apr 2021 16:22:34 +0800
-Subject: [PATCH 12/19] Remove Clock_Cycles_VT from MHL entry.
+Subject: [PATCH 12/23] Remove Clock_Cycles_VT from MHL entry.
 
 No numbers for Clock_Cycles_VT, so this element
 in MHL entry should be removed.
@@ -36,5 +36,5 @@ index b70cb689930d..d55653a107c4 100644
  
  		offset += entry_size / sizeof(u32);
 -- 
-2.32.0
+2.25.1
 

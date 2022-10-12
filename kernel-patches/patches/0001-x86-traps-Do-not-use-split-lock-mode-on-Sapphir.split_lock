@@ -1,0 +1,95 @@
+From 2d275d31525ca30d0ec19fc3b3d1149b0fecb1d4 Mon Sep 17 00:00:00 2001
+From: Andi Kleen <ak@linux.intel.com>
+Date: Wed, 23 Jun 2021 10:32:11 -0700
+Subject: [PATCH 1/2] x86/traps: Do not use split lock mode on Sapphire Rapids
+
+[Note I believe this patch needs to be both carried in the TDX host
+and the guest trees, because it's needed for both. My recommendation
+would be to merge it for both, whoever goes in first will merge
+it and the other can then drop it]
+
+Sapphire Rapids supports two different modes for trapping on split
+locks: the model specific split lock detection using the per core TEST MSR,
+as well as the DEBUGCTL based bus lock detection, enumerated using
+CPUID.
+
+commit 3aae57f0c3ba ("x86/split_lock: Enable the split lock feature ...")
+enabled the model specific split lock method.
+
+It has the advantage that it can detect split locks in the kernel, but
+it has the disadvantage that it is more impactful on the system and
+difficult to virtualize.
+
+There is also a difference on when they get detected -- before or after --
+but I don't think there is a meaningfull difference here for handling it,
+because both are good enough for warning or limiting DOS.
+
+The default mode is to warn, that is the split lock state will be changed
+for one instruction. But this requires changing the split lock state
+using the test MSR for the complete core, impacting other threads.
+
+For this reason the MSR cannot really be virtualized. In normal KVM mode
+this is only problem because the trapping is done at the host level
+and it does the single step from there. This means it is not truly
+virtualized (as in no message in the guest), but at least there
+is a warning on the host.
+
+Unfortunately this doesn't work with TDX where the TDX module cannot
+handle the necessary steps. It also cannot leave them to the host because
+that would require exposing the protected IP. Also the TDX module cannot
+change the MSR on entering/exiting because it can only virtualize
+per thread MSRs.
+
+What happens then is that both the host and the TDX guest enable split
+lock mode. The MSR access in the guest fails, but it still gets the #ACs
+delivered. It tries to single step them, but can never reset the state,
+which results in a endless loop in the guest on every split lock.
+
+That's another bug of course, it should kill instead, but even if we killed
+it would still break all the programs inside a TD that might be using
+bus locks.
+
+An easy solution is to not use the split lock mode, but the bus lock
+mode instead. It is configured using the DEBUGCTL MSR, which is per
+thread and fully virtualizable, and just works even in TDX mode.
+
+This has to be done both in the guest and the host.
+
+The drawbacks of using the bus lock method is that the host won't be able
+to detect bus locks in the kernel, but that seems only a minor drawback.
+There are enough other CPUs using split lock mode which would detect those,
+if they really happened. Right now the kernel should be clean of them
+anyways.
+
+So simply remove the Sapphire Rapids model from the split lock list,
+and it uses the enumerated bus lock mode instead.
+
+Note I only did it only on Sapphire Rapids, since there is no TDX
+support on Alderlake, and earlier CPUs didn't have a choice of the two
+modes. In principle it would be reasonable to drop it on Alderlake too
+(as in completely reverting 3aae57f0), except there won't be any kernel
+detection then.
+
+Fixes: 3aae57f0c3ba (" x86/split_lock: Enable the split ...")
+Cc: Fenghua.Yu@intel.com
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+---
+ arch/x86/kernel/cpu/intel.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+index 2d7ea5480ec3..787e1ffbb988 100644
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -1287,7 +1287,6 @@ static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
+ 	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT_L,	1),
+ 	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE_L,		1),
+ 	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE,		1),
+-	X86_MATCH_INTEL_FAM6_MODEL(SAPPHIRERAPIDS_X,	1),
+ 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE,		1),
+ 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_L,		1),
+ 	X86_MATCH_INTEL_FAM6_MODEL(RAPTORLAKE,		1),
+-- 
+2.25.1
+

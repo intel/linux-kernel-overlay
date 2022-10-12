@@ -1,7 +1,7 @@
-From 1b6369fba03dd0fdf7c5ac7bb1ccd914544f3083 Mon Sep 17 00:00:00 2001
+From 78b3c3ab46c56f4410998c1d795109428fbc482a Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Sat, 8 Aug 2020 18:02:04 +0800
-Subject: [PATCH 08/19] tcc: return error code to better match varies error
+Subject: [PATCH 08/23] tcc: return error code to better match varies error
  scenarios.
 
 Remove unused but set variable.
@@ -149,5 +149,5 @@ index ce5d565b68ee..c83e71948579 100644
  		ret = copy_to_user((struct tcc_buf_mem_req_s *)arg, &req_mem, sizeof(req_mem));
  		if (ret != 0)
 -- 
-2.32.0
+2.25.1
 
