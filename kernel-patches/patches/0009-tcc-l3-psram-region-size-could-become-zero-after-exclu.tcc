@@ -1,4 +1,4 @@
-From 24985b90eaf47b1906333d9af7d8e99f967519e3 Mon Sep 17 00:00:00 2001
+From a8c477dd36a9be111eb6474abaa453272004636a Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 4 Sep 2020 17:04:16 +0800
 Subject: [PATCH 09/23] tcc: l3 psram region size could become zero after

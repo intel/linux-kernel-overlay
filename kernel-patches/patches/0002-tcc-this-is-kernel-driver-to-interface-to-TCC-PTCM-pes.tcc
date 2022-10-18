@@ -1,4 +1,4 @@
-From cd6a1184ba391c371db9cce75b6753fcd949bcb5 Mon Sep 17 00:00:00 2001
+From 3f2151305c11561071ba46e1f3267803fa11b8bb Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 16 Oct 2020 15:17:44 +0800
 Subject: [PATCH 02/23] tcc: this is kernel driver to interface to TCC PTCM
@@ -21,23 +21,23 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  create mode 100644 drivers/tcc/tcc_buffer.c
 
 diff --git a/drivers/Kconfig b/drivers/Kconfig
-index 8d6cd5d08722..392b0c3b53f2 100644
+index 19ee995bd0ae..c391ee71bcf5 100644
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -239,4 +239,5 @@ source "drivers/most/Kconfig"
+@@ -239,4 +239,5 @@ source "drivers/peci/Kconfig"
  
- source "drivers/peci/Kconfig"
+ source "drivers/hte/Kconfig"
  
 +source "drivers/tcc/Kconfig"
  endmenu
 diff --git a/drivers/Makefile b/drivers/Makefile
-index 020780b6b4d2..5bfa39ea6040 100644
+index 057857258bfd..f33ab487b8d6 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -188,3 +188,4 @@ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
- obj-$(CONFIG_COUNTER)		+= counter/
+@@ -188,3 +188,4 @@ obj-$(CONFIG_COUNTER)		+= counter/
  obj-$(CONFIG_MOST)		+= most/
  obj-$(CONFIG_PECI)		+= peci/
+ obj-$(CONFIG_HTE)		+= hte/
 +obj-$(CONFIG_X86_TCC_PTCM)	+= tcc/
 diff --git a/drivers/tcc/Kconfig b/drivers/tcc/Kconfig
 new file mode 100644

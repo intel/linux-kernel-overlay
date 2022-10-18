@@ -1,8 +1,8 @@
 #!/bin/bash -x
 # Global configurations which are used to build kernel overlay
 
-KVERSION=5
-KPATCHLEVEL=18
+KVERSION=6
+KPATCHLEVEL=0
 KSUBLEVEL=0
 KEXTRAVERSION=
 KRTV=-rt11

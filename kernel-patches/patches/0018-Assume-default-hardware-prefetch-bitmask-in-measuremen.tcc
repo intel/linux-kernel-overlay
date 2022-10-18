@@ -1,4 +1,4 @@
-From eeb2966ef5e9b45ca8d46abe4c8ce465ec49def0 Mon Sep 17 00:00:00 2001
+From b7e39e2bb280bc6813a0a0789e5bd58076c955e1 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 11 Feb 2022 00:15:14 +0800
 Subject: [PATCH 18/23] Assume default hardware prefetch bitmask in measurement

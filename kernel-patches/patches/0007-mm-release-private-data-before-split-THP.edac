@@ -1,0 +1,79 @@
+From 363475243095d2d33ba8574d42df78160bc5238b Mon Sep 17 00:00:00 2001
+From: Yin Fengwei <fengwei.yin@intel.com>
+Date: Wed, 10 Aug 2022 14:49:07 +0800
+Subject: [PATCH 7/7] mm: release private data before split THP
+
+If there is private data attached to a THP, the refcount of THP will be
+increased and will prevent the THP from being split.  Attempt to release
+any private data attached to the THP before attempting the split to
+increase the chance of splitting successfully.
+
+There was a memory failure issue hit during HW error injection testing
+with 5.18 kernel + xfs as rootfs.  The test was killed and a system reboot
+was required to re-run the test.
+
+The issue was tracked down to a THP split failure caused by the memory
+failure not being handled.  The page dump showed:
+
+[ 1785.433075] page:0000000025f9530b refcount:18 mapcount:0 mapping:000000008162eea7 index:0xa10 pfn:0x2f0200
+[ 1785.443954] head:0000000025f9530b order:4 compound_mapcount:0 compound_pincount:0
+[ 1785.452408] memcg:ff4247f2d28e9000
+[ 1785.456304] aops:xfs_address_space_operations ino:8555182 dentry name:"baseos-filenames.solvx"
+[ 1785.466612] flags: 0x1000000000012036(referenced|uptodate|lru|active|private|head|node=0|zone=2)
+[ 1785.476514] raw: 1000000000012036 ffb9460f8bc07c08 ffb9460f8bc08408 ff4247f22e6299f8
+[ 1785.485268] raw: 0000000000000a10 ff4247f194ade900 00000012ffffffff ff4247f2d28e9000
+
+It was like the error was injected to a large folio for xfs with private
+data attached.
+
+With private data released before splitting the THP, the test case could
+be run successfully many times without rebooting the system.
+
+Link: https://lkml.kernel.org/r/20220810064907.582899-1-fengwei.yin@intel.com
+Co-developed-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Signed-off-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Signed-off-by: Yin Fengwei <fengwei.yin@intel.com>
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Aaron Lu <aaron.lu@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/huge_memory.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index e9414ee57c5b..cd1607406c8e 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2649,6 +2649,8 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 		mapping = NULL;
+ 		anon_vma_lock_write(anon_vma);
+ 	} else {
++		gfp_t gfp;
++
+ 		mapping = head->mapping;
+ 
+ 		/* Truncated ? */
+@@ -2657,8 +2659,16 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 			goto out;
+ 		}
+ 
+-		xas_split_alloc(&xas, head, compound_order(head),
+-				mapping_gfp_mask(mapping) & GFP_RECLAIM_MASK);
++		gfp = current_gfp_context(mapping_gfp_mask(mapping) &
++							GFP_RECLAIM_MASK);
++
++		if (folio_test_private(folio) &&
++				!filemap_release_folio(folio, gfp)) {
++			ret = -EBUSY;
++			goto out;
++		}
++
++		xas_split_alloc(&xas, head, compound_order(head), gfp);
+ 		if (xas_error(&xas)) {
+ 			ret = xas_error(&xas);
+ 			goto out;
+-- 
+2.25.1
+

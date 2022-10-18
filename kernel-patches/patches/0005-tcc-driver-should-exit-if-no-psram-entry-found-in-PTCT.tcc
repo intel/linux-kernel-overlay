@@ -1,4 +1,4 @@
-From 14d56b86185e468f57ffe480c21c7f2cd80fafda Mon Sep 17 00:00:00 2001
+From 3ed9554e2d2b9b1a2eb688bac69566ecd434586f Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Mon, 15 Jun 2020 09:55:13 +0800
 Subject: [PATCH 05/23] tcc: driver should exit if no psram entry found in
@@ -15,10 +15,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 204c0610bf6b..d9e7fadf33be 100644
+index d4f8e88dc6fe..5376ebc6d5b3 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1280,7 +1280,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
+@@ -1362,7 +1362,7 @@ static int __init acpi_parse_ptct(struct acpi_table_header *table)
  
  		ptr += entry->size;
  	}
