@@ -1,0 +1,152 @@
+From 3bd43a1d3a1ac27d2fdf29b2e95f46fc1c2bb559 Mon Sep 17 00:00:00 2001
+From: "Mazlan, Hazwan Arif" <hazwan.arif.mazlan@intel.com>
+Date: Fri, 14 Oct 2022 17:43:04 +0800
+Subject: [PATCH 13/16] drm/i915/guc: Record CTB info in error logs
+
+When debugging GuC communication issues, it is useful to have the CTB info available. So add the state and buffer contents to the error capture log.
+Also, add a sub-structure for the GuC specific error capture info as it is now becoming numerous.
+
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220728022028.2190627-5-John.C.Harrison@Intel.com
+---
+ drivers/gpu/drm/i915/i915_gpu_error.c | 56 ++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gpu_error.h | 19 ++++++++-
+ 2 files changed, 64 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index c7057056fc13..3756aeb28ec1 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -669,6 +669,18 @@ static void err_print_pciid(struct drm_i915_error_state_buf *m,
+ 		   pdev->subsystem_device);
+ }
+ 
++static void err_print_guc_ctb(struct drm_i915_error_state_buf *m,
++				const char *name,
++				const struct intel_ctb_coredump *ctb)
++{
++	if (!ctb->size)
++		return;
++
++	err_printf(m, "GuC %s CTB: raw: 0x%08X, 0x%08X/%08X, cached: 0x%08X/%08X, desc = 0x%08X, buf = 0x%08X x 0x%08X\n",
++			name, ctb->raw_status, ctb->raw_head, ctb->raw_tail,
++			ctb->head, ctb->tail, ctb->desc_offset, ctb->cmds_offset, ctb->size);
++}
++
+ static void err_print_uc(struct drm_i915_error_state_buf *m,
+ 			 const struct intel_uc_coredump *error_uc)
+ {
+@@ -676,8 +688,12 @@ static void err_print_uc(struct drm_i915_error_state_buf *m,
+ 
+ 	intel_uc_fw_dump(&error_uc->guc_fw, &p);
+ 	intel_uc_fw_dump(&error_uc->huc_fw, &p);
+-	err_printf(m, "GuC timestamp: 0x%08x\n", error_uc->timestamp);
+-	print_error_vma(m, NULL, error_uc->guc_log);
++	err_printf(m, "GuC timestamp: 0x%08x\n", error_uc->guc.timestamp);
++	print_error_vma(m, NULL, error_uc->guc.vma_log);
++	err_printf(m, "GuC CTB fence: %d\n", error_uc->guc.last_fence);
++	err_print_guc_ctb(m, "Send", error_uc->guc.ctb + 0);
++	err_print_guc_ctb(m, "Recv", error_uc->guc.ctb + 1);
++	print_error_vma(m, NULL, error_uc->guc.vma_ctb);
+ }
+ 
+ static void err_free_sgl(struct scatterlist *sgl)
+@@ -965,8 +981,8 @@ static void cleanup_uc(struct intel_uc_coredump *uc)
+ {
+ 	kfree(uc->guc_fw.path);
+ 	kfree(uc->huc_fw.path);
+-	i915_vma_coredump_free(uc->guc_log);
+-
++	i915_vma_coredump_free(uc->guc.vma_log);
++	i915_vma_coredump_free(uc->guc.vma_ctb);
+ 	kfree(uc);
+ }
+ 
+@@ -1534,6 +1550,23 @@ gt_record_engines(struct intel_gt_coredump *gt,
+ 	}
+ }
+ 
++static void gt_record_guc_ctb(struct intel_ctb_coredump *saved,
++				const struct intel_guc_ct_buffer *ctb,
++				const void *blob_ptr, struct intel_guc *guc)
++{
++	if (!ctb || !ctb->desc)
++		return;
++
++	saved->raw_status = ctb->desc->status;
++	saved->raw_head = ctb->desc->head;
++	saved->raw_tail = ctb->desc->tail;
++	saved->head = ctb->head;
++	saved->tail = ctb->tail;
++	saved->size = ctb->size;
++	saved->desc_offset = ((void *)ctb->desc) - blob_ptr;
++	saved->cmds_offset = ((void *)ctb->cmds) - blob_ptr;
++}
++
+ static struct intel_uc_coredump *
+ gt_record_uc(struct intel_gt_coredump *gt,
+ 	     struct i915_vma_compress *compress)
+@@ -1559,12 +1592,17 @@ gt_record_uc(struct intel_gt_coredump *gt,
+ 	 * Save the GuC log and include a timestamp reference for
+ 	 * converting the log times to system times.
+ 	 */
+-	error_uc->timestamp = intel_uncore_read(gt->_gt->uncore, GUCPMTIMESTAMP);
+-	error_uc->guc_log =
+-		i915_vma_coredump_create(gt->_gt,
+-					 uc->guc.log.vma, "GuC log buffer",
+-					 compress);
+ 
++	error_uc->guc.timestamp = intel_uncore_read(gt->_gt->uncore, GUCPMTIMESTAMP);
++	error_uc->guc.vma_log = i915_vma_coredump_create(gt->_gt, uc->guc.log.vma,
++						"GuC log buffer", compress);
++	error_uc->guc.vma_ctb = i915_vma_coredump_create(gt->_gt, uc->guc.ct.vma,
++						"GuC CT buffer", compress);
++	error_uc->guc.last_fence = uc->guc.ct.requests.last_fence;
++	gt_record_guc_ctb(error_uc->guc.ctb + 0, &uc->guc.ct.ctbs.send,
++			uc->guc.ct.ctbs.send.desc, (struct intel_guc *)&uc->guc);
++	gt_record_guc_ctb(error_uc->guc.ctb + 1, &uc->guc.ct.ctbs.recv,
++			uc->guc.ct.ctbs.send.desc, (struct intel_guc *)&uc->guc);
+ 
+ 	return error_uc;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.h b/drivers/gpu/drm/i915/i915_gpu_error.h
+index ece4a5b6922b..6df327acabaa 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.h
++++ b/drivers/gpu/drm/i915/i915_gpu_error.h
+@@ -114,6 +114,15 @@ struct intel_engine_coredump {
+ 	struct intel_engine_coredump *next;
+ };
+ 
++struct intel_ctb_coredump {
++	u32 raw_head, head;
++	u32 raw_tail, tail;
++	u32 raw_status;
++	u32 desc_offset;
++	u32 cmds_offset;
++	u32 size;
++};
++
+ struct intel_gt_coredump {
+ 	const struct intel_gt *_gt;
+ 	bool awake;
+@@ -152,8 +161,14 @@ struct intel_gt_coredump {
+ 	struct intel_uc_coredump {
+ 		struct intel_uc_fw guc_fw;
+ 		struct intel_uc_fw huc_fw;
+-		struct i915_vma_coredump *guc_log;
+-		u32 timestamp;
++		struct guc_info {
++			struct intel_ctb_coredump ctb[2];
++			struct i915_vma_coredump *vma_ctb;
++			struct i915_vma_coredump *vma_log;
++			u32 timestamp;
++			u16 last_fence;
++			bool is_guc_capture;
++		} guc;
+ 	} *uc;
+ 
+ 	struct intel_gt_coredump *next;
+-- 
+2.25.1
+
