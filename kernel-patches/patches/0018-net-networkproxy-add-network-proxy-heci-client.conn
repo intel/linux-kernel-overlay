@@ -1,0 +1,715 @@
+From 96c14abfdc401f92527c8ebffc7f796b3f8443d2 Mon Sep 17 00:00:00 2001
+From: Lay Kuan Loon <kuan.loon.lay@intel.com>
+Date: Wed, 20 Oct 2021 12:13:14 +0800
+Subject: [PATCH 18/54] net: networkproxy: add network proxy heci client
+
+Network Proxy framework communicates with the firmware of Network Proxy
+agent by using HECI interface.
+
+Signed-off-by: Song Yoong Siang <yoong.siang.song@intel.com>
+Signed-off-by: Lay Kuan Loon <kuan.loon.lay@intel.com>
+---
+ MAINTAINERS                                   |   2 +-
+ drivers/net/networkproxy/Kconfig              |   9 +
+ drivers/net/networkproxy/Makefile             |   1 +
+ .../net/networkproxy/network_proxy_configfs.c | 309 +++++++++++++++++
+ drivers/net/networkproxy/np_ishtp_client.c    | 325 ++++++++++++++++++
+ 5 files changed, 645 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/networkproxy/network_proxy_configfs.c
+ create mode 100644 drivers/net/networkproxy/np_ishtp_client.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 5405a7c91ca0..3b4e98f9f9de 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -13334,7 +13334,7 @@ M:	Ong Boon Leong <boon.leong.ong@intel.com>
+ M:	Song Yoong Siang <yoong.siang.song@intel.com>
+ L:	netdev@vger.kernel.org
+ S:	Maintained
+-F:	drivers/net/networkproxy
++F:	drivers/net/networkproxy/*
+ F:	include/linux/network_proxy*
+ 
+ NETXEN (1/10) GbE SUPPORT
+diff --git a/drivers/net/networkproxy/Kconfig b/drivers/net/networkproxy/Kconfig
+index 8b09f2c66c56..b69049cfc726 100644
+--- a/drivers/net/networkproxy/Kconfig
++++ b/drivers/net/networkproxy/Kconfig
+@@ -1,6 +1,7 @@
+ config NETWORK_PROXY
+ 	tristate "Network Proxy"
+ 	depends on CONFIGFS_FS && INTEL_ISH_HID
++	select NETWORK_PROXY_ISHTP
+ 	help
+ 	  Network proxy maintains network presence while Host is in
+ 	  low-power mode. Host is woke-up when there is print job or
+@@ -8,3 +9,11 @@ config NETWORK_PROXY
+ 	  This technology is described in ECMA-393 proxZzzy.
+ 	  It requires 2 devices to be registered to the Network Proxy
+ 	  framework: IPC Device and Network Device.
++
++config NETWORK_PROXY_ISHTP
++	tristate "Network Proxy ISHTP"
++	depends on NETWORK_PROXY
++	help
++	  Network Proxy framework communicates with the firmware of
++	  Network Proxy agent using HECI interface. Therefore, selecting
++	  this will also turn on INTEL_ISH_HID option.
+diff --git a/drivers/net/networkproxy/Makefile b/drivers/net/networkproxy/Makefile
+index 07bfc36af4a8..0073b7f8dae1 100644
+--- a/drivers/net/networkproxy/Makefile
++++ b/drivers/net/networkproxy/Makefile
+@@ -1,3 +1,4 @@
+ obj-$(CONFIG_NETWORK_PROXY) = network_proxy.o
++obj-$(CONFIG_NETWORK_PROXY_ISHTP) += np_ishtp_client.o
+ 
+ CFLAGS_np_ishtp_client.o += -I$(srctree)/drivers/hid/intel-ish-hid
+diff --git a/drivers/net/networkproxy/network_proxy_configfs.c b/drivers/net/networkproxy/network_proxy_configfs.c
+new file mode 100644
+index 000000000000..9a8cca6c9aad
+--- /dev/null
++++ b/drivers/net/networkproxy/network_proxy_configfs.c
+@@ -0,0 +1,309 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2022, Intel Corporation. */
++
++#include <linux/configfs.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/network_proxy.h>
++#include <linux/slab.h>
++#include <stddef.h>
++
++#define cfs_agent(item) to_np_cfs(item)->agent_info
++#define cfs_rules(item) to_np_cfs(item)->rules
++
++struct np_cfs {
++	struct configfs_subsystem subsys;
++	struct np_agent_info agent_info;
++	struct np_rules rules;
++};
++
++static inline struct np_cfs *to_np_cfs(struct config_item *item)
++{
++	return item ? container_of(to_configfs_subsystem(to_config_group(item)),
++			struct np_cfs, subsys) : NULL;
++}
++
++static ssize_t np_cfs_agent_version_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d.%d.%d\n", cfs_agent(item).major,
++		       cfs_agent(item).minor,
++		       cfs_agent(item).revision);
++}
++
++static ssize_t np_cfs_max_cls_rules_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_agent(item).max_cls_rules);
++}
++
++static ssize_t np_cfs_max_resp_rules_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_agent(item).max_resp_rules);
++}
++
++static ssize_t np_cfs_rules_group_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_rules(item).group);
++}
++
++static ssize_t np_cfs_rules_group_store(struct config_item *item,
++					const char *page, size_t count)
++{
++	unsigned long tmp;
++	int ret;
++
++	ret = kstrtoul(page, 0, &tmp);
++	if (ret)
++		return ret;
++
++	cfs_rules(item).group = tmp;
++
++	return count;
++}
++
++static ssize_t np_cfs_rules_type_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_rules(item).type);
++}
++
++static ssize_t np_cfs_rules_type_store(struct config_item *item,
++				       const char *page, size_t count)
++{
++	unsigned long tmp;
++	int ret;
++
++	ret = kstrtoul(page, 0, &tmp);
++	if (ret)
++		return ret;
++
++	cfs_rules(item).type = tmp;
++
++	return count;
++}
++
++static ssize_t np_cfs_rules_offset_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_rules(item).offset);
++}
++
++static ssize_t np_cfs_rules_offset_store(struct config_item *item,
++					 const char *page, size_t count)
++{
++	unsigned long tmp;
++	int ret;
++
++	ret = kstrtoul(page, 0, &tmp);
++	if (ret)
++		return ret;
++
++	if (tmp < 0) {
++		pr_err("Invalid offset\n");
++		return -EINVAL;
++	}
++
++	cfs_rules(item).offset = tmp;
++
++	return count;
++}
++
++static ssize_t np_cfs_rules_size_show(struct config_item *item, char *page)
++{
++	return sprintf(page, "%d\n", cfs_rules(item).size);
++}
++
++static ssize_t np_cfs_rules_size_store(struct config_item *item,
++				       const char *page, size_t count)
++{
++	unsigned long tmp;
++	int ret;
++
++	ret = kstrtoul(page, 0, &tmp);
++	if (ret)
++		return ret;
++
++	if (tmp <= 0) {
++		pr_err("Invalid size\n");
++		return -EINVAL;
++	}
++	cfs_rules(item).size = tmp;
++
++	return count;
++}
++
++static ssize_t np_cfs_rules_value_show(struct config_item *item, char *page)
++{
++	struct np_rules *rule;
++	void *content;
++	int size;
++	int ret;
++
++	rule = &(cfs_rules(item));
++	size = rule->size;
++
++	/* allocate buffer for data copy */
++	content = kzalloc(size, GFP_KERNEL);
++	if (!content)
++		return -ENOMEM;
++
++	/* actual read size store in size */
++	ret = netprox_read_rule(rule, content, &size);
++	if (ret == 0 && size > 0) {
++		memcpy(page, content, size);
++		ret = size;
++	}
++	kfree(content);
++
++	return ret;
++}
++
++static ssize_t np_cfs_rules_value_store(struct config_item *item,
++					const char *page, size_t count)
++{
++	struct np_rules *rule;
++	void *content;
++	int size;
++	int ret;
++
++	/* allocate rule, value is dynamic size according to count */
++	size = (sizeof(struct np_rules) + count);
++	rule = kzalloc(size, GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	/* copy the configfs np_rules group, type, offset, size */
++	memcpy(rule, &(cfs_rules(item)), sizeof(struct np_rules));
++
++	/* copy the content */
++	content = rule + 1;
++	memcpy(content, page, count);
++
++	ret = netprox_write_rule(rule, size);
++	if (!ret)
++		ret = count;
++
++	kfree(rule);
++
++	return ret;
++}
++
++static ssize_t np_cfs_ipc_send_show(struct config_item *item, char *page)
++{
++	return -EPERM;
++}
++
++static ssize_t np_cfs_ipc_send_store(struct config_item *item,
++				     const char *page, size_t count)
++{
++	struct np_ipc_hdr *ipc_hdr = (struct np_ipc_hdr *)page;
++	int ret;
++
++	ret = netprox_send_ipc_msg(ipc_hdr->command,
++				   (page + sizeof(struct np_ipc_hdr)),
++				   count - sizeof(struct np_ipc_hdr));
++	if (ret != 0)
++		return ret;
++
++	return count;
++}
++
++CONFIGFS_ATTR_RO(np_cfs_, agent_version);
++CONFIGFS_ATTR_RO(np_cfs_, max_cls_rules);
++CONFIGFS_ATTR_RO(np_cfs_, max_resp_rules);
++CONFIGFS_ATTR(np_cfs_, rules_group);
++CONFIGFS_ATTR(np_cfs_, rules_type);
++CONFIGFS_ATTR(np_cfs_, rules_offset);
++CONFIGFS_ATTR(np_cfs_, rules_size);
++CONFIGFS_ATTR(np_cfs_, rules_value);
++CONFIGFS_ATTR(np_cfs_, ipc_send);
++
++static struct configfs_attribute *np_cfs_attrs[] = {
++	&np_cfs_attr_agent_version,
++	&np_cfs_attr_max_cls_rules,
++	&np_cfs_attr_max_resp_rules,
++	&np_cfs_attr_rules_group,
++	&np_cfs_attr_rules_type,
++	&np_cfs_attr_rules_offset,
++	&np_cfs_attr_rules_size,
++	&np_cfs_attr_rules_value,
++	&np_cfs_attr_ipc_send,
++	NULL,
++};
++
++static const struct config_item_type np_cfs_type = {
++	.ct_attrs	= np_cfs_attrs,
++	.ct_owner	= THIS_MODULE,
++};
++
++static struct np_cfs np_subsys = {
++	.subsys = {
++		.su_group = {
++			.cg_item = {
++				.ci_namebuf = "networkproxy",
++				.ci_type = &np_cfs_type,
++			},
++		},
++	},
++};
++
++void netprox_configfs_agent_info(struct np_agent_info *info)
++{
++	np_subsys.agent_info.major = info->major;
++	np_subsys.agent_info.minor = info->minor;
++	np_subsys.agent_info.revision = info->revision;
++	np_subsys.agent_info.max_cls_rules = info->max_cls_rules;
++	np_subsys.agent_info.max_resp_rules = info->max_resp_rules;
++}
++
++static struct np_configfs np_configfs = {
++	.agent_info = &netprox_configfs_agent_info,
++};
++
++int netprox_configfs_init(void)
++{
++	struct configfs_subsystem *subsys = &np_subsys.subsys;
++	int ret;
++
++	ret = netprox_register_configfs(&np_configfs);
++	if (ret) {
++		pr_err("Error %d while registering Netprox configfs.\n",
++		       ret);
++		return ret;
++	}
++
++	config_group_init(&subsys->su_group);
++	mutex_init(&subsys->su_mutex);
++	ret = configfs_register_subsystem(subsys);
++	if (ret) {
++		pr_err("Error %d while registering subsystem %s\n",
++		       ret,
++		       subsys->su_group.cg_item.ci_namebuf);
++		goto out_unregister;
++	}
++
++	return 0;
++
++out_unregister:
++	configfs_unregister_subsystem(subsys);
++
++	return ret;
++}
++EXPORT_SYMBOL(netprox_configfs_init);
++
++void netprox_configfs_deinit(void)
++{
++	struct configfs_subsystem *subsys = &np_subsys.subsys;
++
++	configfs_unregister_subsystem(subsys);
++
++	netprox_deregister_configfs(&np_configfs);
++}
++EXPORT_SYMBOL(netprox_configfs_deinit);
++
++module_init(netprox_configfs_init);
++module_exit(netprox_configfs_deinit);
++
++MODULE_DESCRIPTION("Network Proxy Configfs");
++MODULE_AUTHOR("Song Yoong Siang <yoong.siang.song@intel.com>");
++MODULE_AUTHOR("Ong Boon Leong <boon.leong.ong@intel.com>");
++
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("networkproxy:*");
+diff --git a/drivers/net/networkproxy/np_ishtp_client.c b/drivers/net/networkproxy/np_ishtp_client.c
+new file mode 100644
+index 000000000000..1ead46fd7708
+--- /dev/null
++++ b/drivers/net/networkproxy/np_ishtp_client.c
+@@ -0,0 +1,325 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2022, Intel Corporation. */
++
++#include <linux/module.h>
++#include <linux/network_proxy.h>
++#include <linux/network_proxy_common.h>
++#include "ishtp/client.h"
++#include "ishtp/ishtp-dev.h"
++
++/* Rx ring buffer pool size */
++#define NP_CL_RX_RING_SIZE	32
++#define NP_CL_TX_RING_SIZE	16
++
++struct ishtp_cl_np {
++	struct ishtp_cl_device *cl_device;
++	struct ishtp_cl *ishtp_cl;
++	bool command_done;
++	wait_queue_head_t ishtp_np_wait;
++	struct np_ipcdev np_ipcdev;
++};
++
++static const guid_t np_ishtp_guid = GUID_INIT(0x1586a9d4, 0xae85, 0x4f4c,
++					      0x90, 0x72, 0x57, 0x56, 0x0b,
++					      0xd5, 0x27, 0x1e);
++
++static int np_ishtp_wait_for_response(struct ishtp_cl_np *ishtp_cl_np)
++{
++	if (ishtp_cl_np->command_done)
++		return 0;
++
++	wait_event_interruptible_timeout(ishtp_cl_np->ishtp_np_wait,
++					 ishtp_cl_np->command_done, 3 * HZ);
++
++	if (!ishtp_cl_np->command_done) {
++		dev_err(&ishtp_cl_np->ishtp_cl->device->dev,
++			"Timeout waiting for response from NP Agent\n");
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++static int np_ishtp_cl_send(void *ipc_cl, void *msg, int size, bool async)
++{
++	struct ishtp_cl_np *ishtp_cl_np;
++	struct ishtp_cl *ishtp_cl;
++	int status;
++
++	ishtp_cl = ipc_cl;
++	ishtp_cl_np = (struct ishtp_cl_np *)ishtp_cl->client_data;
++
++	if (!async)
++		ishtp_cl_np->command_done = false;
++
++	/* ishtp message send out */
++	status = ishtp_cl_send(ishtp_cl, (uint8_t *)msg, size);
++
++	if (!async && !status) {
++		/* wait for message send completely */
++		return np_ishtp_wait_for_response(ishtp_cl_np);
++	}
++
++	return status;
++}
++
++static void np_ishtp_report_bad_packet(struct ishtp_cl *ishtp_cl,
++				       void *recv_buf, size_t cur_pos,
++				       size_t payload_len)
++{
++	struct np_ipc_hdr *recv_msg = recv_buf;
++	struct ishtp_cl_np *ishtp_cl_np;
++
++	ishtp_cl_np = (struct ishtp_cl_np *)ishtp_cl->client_data;
++
++	dev_err(&ishtp_cl_np->ishtp_cl->device->dev, "BAD packet %02X\n"
++		"cur_pos=%u\n"
++		"[%02X %02X %02X %02X]\n"
++		"payload_len=%u\n"
++		"is_response=%02X\n",
++		recv_msg->command,
++		(unsigned int)cur_pos,
++		((unsigned char *)recv_msg)[0], ((unsigned char *)recv_msg)[1],
++		((unsigned char *)recv_msg)[2], ((unsigned char *)recv_msg)[3],
++		(unsigned int)payload_len,
++		recv_msg->command & ~NP_CMD_MASK);
++}
++
++static void np_ishtp_process_recv(struct ishtp_cl *ishtp_cl, void *recv_buf,
++				  size_t data_len)
++{
++	size_t payload_len, total_len, cur_pos;
++	struct ishtp_cl_np *ishtp_cl_np;
++	struct np_ipc_hdr *recv_msg;
++	unsigned char *payload;
++
++	ishtp_cl_np = (struct ishtp_cl_np *)ishtp_cl->client_data;
++
++	payload = recv_buf + sizeof(struct np_ipc_hdr);
++	total_len = data_len;
++	cur_pos = 0;
++
++	dev_dbg(&ishtp_cl_np->ishtp_cl->device->dev,
++		"np ipc receive ():+++ len=%zu\n", data_len);
++
++	do {
++		if (cur_pos + sizeof(struct np_ipc_hdr) > total_len) {
++			dev_err(&ishtp_cl_np->ishtp_cl->device->dev,
++				"np ipc: error, received %u < data hdr %u\n",
++				(unsigned int)data_len,
++				(unsigned int)sizeof(struct np_ipc_hdr));
++			ish_hw_reset(ishtp_cl->dev);
++			break;
++		}
++
++		recv_msg = (struct np_ipc_hdr *)(recv_buf + cur_pos);
++		payload_len = recv_msg->size;
++
++		/* Sanity checks */
++		if (cur_pos + payload_len + sizeof(struct np_ipc_hdr) >
++		    total_len) {
++			np_ishtp_report_bad_packet(ishtp_cl, recv_msg,
++						   cur_pos, payload_len);
++			ish_hw_reset(ishtp_cl->dev);
++			break;
++		}
++
++		dev_dbg(&ishtp_cl_np->ishtp_cl->device->dev,  "%s %d\n",
++			__func__, recv_msg->command & NP_CMD_MASK);
++
++		if (recv_msg->command & NP_IS_RESPONSE) {
++			/* response from NP Agent, ack network proxy command */
++			ishtp_cl_np->command_done = true;
++			wake_up_interruptible(&ishtp_cl_np->ishtp_np_wait);
++			dev_dbg(&ishtp_cl_np->ishtp_cl->device->dev,
++				"%s: Received response from Proxy Agent.\n",
++				__func__);
++		} else if (recv_msg->command >= NP_A2H_CMD_AGENT_READY &&
++				recv_msg->command < NP_A2H_CMD_MAX) {
++			/* command from NP Agent,
++			 * pass to network proxy framework
++			 */
++			netprox_ipc_recv(recv_msg->command, payload,
++					 payload_len);
++		} else {
++			/* unrecognized message */
++			np_ishtp_report_bad_packet(ishtp_cl, recv_msg,
++						   cur_pos, payload_len);
++			ish_hw_reset(ishtp_cl->dev);
++		}
++
++		cur_pos += payload_len + sizeof(struct np_ipc_hdr);
++		payload += payload_len + sizeof(struct np_ipc_hdr);
++
++	} while (cur_pos < total_len);
++}
++
++static void np_ishtp_cl_event_cb(struct ishtp_cl_device *device)
++{
++	struct ishtp_cl *ishtp_cl = ishtp_get_drvdata(device);
++	struct ishtp_cl_rb *rb_in_proc;
++	size_t r_length;
++
++	if (!ishtp_cl)
++		return;
++
++	while ((rb_in_proc = ishtp_cl_rx_get_rb(ishtp_cl)) != NULL) {
++		if (!rb_in_proc->buffer.data)
++			return;
++
++		r_length = rb_in_proc->buf_idx;
++
++		/* decide what to do with received data */
++		np_ishtp_process_recv(ishtp_cl, rb_in_proc->buffer.data,
++				      r_length);
++
++		ishtp_cl_io_rb_recycle(rb_in_proc);
++	}
++}
++
++static int np_ishtp_cl_init(struct ishtp_cl *ishtp_cl)
++{
++	struct ishtp_fw_client *fw_client;
++	struct ishtp_cl_np *ishtp_cl_np;
++	int status;
++
++	ishtp_cl_np = (struct ishtp_cl_np *)ishtp_cl->client_data;
++
++	status = ishtp_cl_link(ishtp_cl);
++	if (status) {
++		dev_err(&ishtp_cl_np->cl_device->dev,
++			"ishtp_cl_link failed\n");
++		return	-ENOMEM;
++	}
++
++	/* Connect to IPC of Network Proxy Agent */
++	ishtp_cl->rx_ring_size = NP_CL_RX_RING_SIZE;
++	ishtp_cl->tx_ring_size = NP_CL_TX_RING_SIZE;
++
++	fw_client = ishtp_fw_cl_get_client(ishtp_cl->dev, &np_ishtp_guid);
++	if (!fw_client) {
++		dev_err(&ishtp_cl_np->cl_device->dev,
++			"Network Proxy Agent uuid not found\n");
++		return -ENOENT;
++	}
++
++	ishtp_cl->fw_client_id = fw_client->client_id;
++	ishtp_cl->state = ISHTP_CL_CONNECTING;
++
++	status = ishtp_cl_connect(ishtp_cl);
++	if (status) {
++		dev_err(&ishtp_cl_np->cl_device->dev,
++			"Network Proxy Agent connect fail\n");
++		goto err_cl_unlink;
++	}
++
++	dev_dbg(&ishtp_cl_np->cl_device->dev,
++		"Network Proxy Agent connected\n");
++
++	/* Register read callback */
++	ishtp_register_event_cb(ishtp_cl->device, np_ishtp_cl_event_cb);
++
++	dev_dbg(&ishtp_cl_np->cl_device->dev, "successfully init\n");
++	return 0;
++
++err_cl_unlink:
++	ishtp_cl_unlink(ishtp_cl);
++	return status;
++}
++
++static void np_ishtp_cl_deinit(struct ishtp_cl *ishtp_cl)
++{
++	ishtp_cl_unlink(ishtp_cl);
++	ishtp_cl_flush_queues(ishtp_cl);
++
++	/* disband and free all Tx and Rx client-level rings */
++	ishtp_cl_free(ishtp_cl);
++}
++
++static int np_ishtp_cl_probe(struct ishtp_cl_device *cl_device)
++{
++	struct ishtp_cl_np *ishtp_cl_np;
++	struct ishtp_cl *ishtp_cl;
++	int status;
++
++	if (!cl_device)
++		return	-ENODEV;
++
++	ishtp_cl_np = devm_kzalloc(&cl_device->dev, sizeof(*ishtp_cl_np),
++				   GFP_KERNEL);
++	if (!ishtp_cl_np)
++		return -ENOMEM;
++
++	ishtp_cl = ishtp_cl_allocate(cl_device);
++	if (!ishtp_cl)
++		return -ENOMEM;
++
++	ishtp_set_drvdata(cl_device, ishtp_cl);
++	ishtp_cl->client_data = ishtp_cl_np;
++	ishtp_cl_np->ishtp_cl = ishtp_cl;
++	ishtp_cl_np->cl_device = cl_device;
++
++	init_waitqueue_head(&ishtp_cl_np->ishtp_np_wait);
++
++	status = np_ishtp_cl_init(ishtp_cl);
++
++	if (status) {
++		ishtp_cl_free(ishtp_cl);
++		return status;
++	}
++
++	ishtp_get_device(cl_device);
++
++	/* Register IPC device with Network Proxy Framework */
++	ishtp_cl_np->np_ipcdev.ipc_cl = ishtp_cl;
++	ishtp_cl_np->np_ipcdev.ipc_send = &np_ishtp_cl_send;
++	netprox_register_ipcdev(&ishtp_cl_np->np_ipcdev);
++
++	device_wakeup_enable(cl_device->ishtp_dev->devc);
++
++	return 0;
++}
++
++static void np_ishtp_cl_remove(struct ishtp_cl_device *cl_device)
++{
++	struct ishtp_cl *ishtp_cl = ishtp_get_drvdata(cl_device);
++
++	ishtp_cl->state = ISHTP_CL_DISCONNECTING;
++	ishtp_cl_disconnect(ishtp_cl);
++	ishtp_put_device(cl_device);
++	np_ishtp_cl_deinit(ishtp_cl);
++
++	ishtp_cl = NULL;
++}
++
++static struct ishtp_cl_driver np_ishtp_cl_driver = {
++	.name = "ishtp-network-proxy",
++	.guid = &np_ishtp_guid,
++	.probe = np_ishtp_cl_probe,
++	.remove = np_ishtp_cl_remove,
++};
++
++static int __init np_ishtp_ipc_init(void)
++{
++	int status;
++
++	/* Register ISHTP client device driver with ISHTP Bus */
++	status = ishtp_cl_driver_register(&np_ishtp_cl_driver, THIS_MODULE);
++
++	return status;
++}
++
++static void __exit np_ishtp_ipc_deinit(void)
++{
++	ishtp_cl_driver_unregister(&np_ishtp_cl_driver);
++}
++
++module_init(np_ishtp_ipc_init);
++module_exit(np_ishtp_ipc_deinit);
++
++MODULE_DESCRIPTION("ISHTP Network Proxy");
++MODULE_AUTHOR("Song Yoong Siang <yoong.siang.song@intel.com>");
++MODULE_AUTHOR("Ong Boon Leong <boon.leong.ong@intel.com>");
++
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("ishtp:*");
+-- 
+2.25.1
+
