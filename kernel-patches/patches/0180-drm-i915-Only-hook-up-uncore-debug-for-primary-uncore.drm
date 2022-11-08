@@ -1,0 +1,175 @@
+From 68b3dd2e40dcfe7caa33d6394d395f27c9a737c2 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 6 Sep 2022 16:49:22 -0700
+Subject: [PATCH 180/800] drm/i915: Only hook up uncore->debug for primary
+ uncore
+
+The original intent of intel_uncore_mmio_debug as described in commit
+0a9b26306d6a ("drm/i915: split out uncore_mmio_debug") was to be a
+singleton structure that could be shared between multiple GTs' uncore
+objects in a multi-tile system.  Somehow we went off track and
+started allocating separate instances of this structure for each GT,
+which defeats that original goal.
+
+But in reality, there isn't even a need to share the mmio_debug between
+multiple GTs; on all modern platforms (i.e., everything after gen7)
+unclaimed register accesses are something that can only be detected for
+display registers.  There's no point in grabbing the debug spinlock and
+checking for unclaimed accesses on an uncore used by an xehpsdv or pvc
+remote tile GT, or the uncore used by a mtl standalone media GT since
+all of the display accesses go through the primary intel_uncore.
+
+The simplest solution is to simply leave uncore->debug NULL on all
+intel_uncore instances except for the primary one.  This will allow us
+to avoid the pointless debug spinlock acquisition we've been doing on
+MMIO accesses coming in through these intel_uncores.
+
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220906234934.3655440-3-matthew.d.roper@intel.com
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_gt.c  |  9 ---------
+ drivers/gpu/drm/i915/i915_driver.c  |  2 +-
+ drivers/gpu/drm/i915/intel_uncore.c | 23 ++++++++++++++++++-----
+ drivers/gpu/drm/i915/intel_uncore.h |  3 +--
+ 4 files changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index b5e979460ca0..060ceb6e0fe4 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -781,21 +781,13 @@ static int intel_gt_tile_setup(struct intel_gt *gt, phys_addr_t phys_addr)
+ 	int ret;
+ 
+ 	if (!gt_is_root(gt)) {
+-		struct intel_uncore_mmio_debug *mmio_debug;
+ 		struct intel_uncore *uncore;
+ 
+ 		uncore = kzalloc(sizeof(*uncore), GFP_KERNEL);
+ 		if (!uncore)
+ 			return -ENOMEM;
+ 
+-		mmio_debug = kzalloc(sizeof(*mmio_debug), GFP_KERNEL);
+-		if (!mmio_debug) {
+-			kfree(uncore);
+-			return -ENOMEM;
+-		}
+-
+ 		gt->uncore = uncore;
+-		gt->uncore->debug = mmio_debug;
+ 
+ 		__intel_gt_init_early(gt);
+ 	}
+@@ -817,7 +809,6 @@ intel_gt_tile_cleanup(struct intel_gt *gt)
+ 	intel_uncore_cleanup_mmio(gt->uncore);
+ 
+ 	if (!gt_is_root(gt)) {
+-		kfree(gt->uncore->debug);
+ 		kfree(gt->uncore);
+ 		kfree(gt);
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 8ab908512800..839193092828 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -327,7 +327,7 @@ static int i915_driver_early_probe(struct drm_i915_private *dev_priv)
+ 	intel_device_info_subplatform_init(dev_priv);
+ 	intel_step_init(dev_priv);
+ 
+-	intel_uncore_mmio_debug_init_early(&dev_priv->mmio_debug);
++	intel_uncore_mmio_debug_init_early(dev_priv);
+ 
+ 	spin_lock_init(&dev_priv->irq_lock);
+ 	spin_lock_init(&dev_priv->gpu_error.lock);
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index e717ea55484a..6841f76533f9 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -44,14 +44,19 @@ fw_domains_get(struct intel_uncore *uncore, enum forcewake_domains fw_domains)
+ }
+ 
+ void
+-intel_uncore_mmio_debug_init_early(struct intel_uncore_mmio_debug *mmio_debug)
++intel_uncore_mmio_debug_init_early(struct drm_i915_private *i915)
+ {
+-	spin_lock_init(&mmio_debug->lock);
+-	mmio_debug->unclaimed_mmio_check = 1;
++	spin_lock_init(&i915->mmio_debug.lock);
++	i915->mmio_debug.unclaimed_mmio_check = 1;
++
++	i915->uncore.debug = &i915->mmio_debug;
+ }
+ 
+ static void mmio_debug_suspend(struct intel_uncore *uncore)
+ {
++	if (!uncore->debug)
++		return;
++
+ 	spin_lock(&uncore->debug->lock);
+ 
+ 	/* Save and disable mmio debugging for the user bypass */
+@@ -67,6 +72,9 @@ static bool check_for_unclaimed_mmio(struct intel_uncore *uncore);
+ 
+ static void mmio_debug_resume(struct intel_uncore *uncore)
+ {
++	if (!uncore->debug)
++		return;
++
+ 	spin_lock(&uncore->debug->lock);
+ 
+ 	if (!--uncore->debug->suspend_count)
+@@ -1705,7 +1713,7 @@ unclaimed_reg_debug(struct intel_uncore *uncore,
+ 		    const bool read,
+ 		    const bool before)
+ {
+-	if (likely(!uncore->i915->params.mmio_debug))
++	if (likely(!uncore->i915->params.mmio_debug) || !uncore->debug)
+ 		return;
+ 
+ 	/* interrupts are disabled and re-enabled around uncore->lock usage */
+@@ -2267,7 +2275,6 @@ void intel_uncore_init_early(struct intel_uncore *uncore,
+ 	uncore->i915 = gt->i915;
+ 	uncore->gt = gt;
+ 	uncore->rpm = &gt->i915->runtime_pm;
+-	uncore->debug = &gt->i915->mmio_debug;
+ }
+ 
+ static void uncore_raw_init(struct intel_uncore *uncore)
+@@ -2578,6 +2585,9 @@ bool intel_uncore_unclaimed_mmio(struct intel_uncore *uncore)
+ {
+ 	bool ret;
+ 
++	if (!uncore->debug)
++		return false;
++
+ 	spin_lock_irq(&uncore->debug->lock);
+ 	ret = check_for_unclaimed_mmio(uncore);
+ 	spin_unlock_irq(&uncore->debug->lock);
+@@ -2590,6 +2600,9 @@ intel_uncore_arm_unclaimed_mmio_detection(struct intel_uncore *uncore)
+ {
+ 	bool ret = false;
+ 
++	if (drm_WARN_ON(&uncore->i915->drm, !uncore->debug))
++		return false;
++
+ 	spin_lock_irq(&uncore->debug->lock);
+ 
+ 	if (unlikely(uncore->debug->unclaimed_mmio_check <= 0))
+diff --git a/drivers/gpu/drm/i915/intel_uncore.h b/drivers/gpu/drm/i915/intel_uncore.h
+index b1fa912a65e7..6100d0f4498a 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -210,8 +210,7 @@ intel_uncore_has_fifo(const struct intel_uncore *uncore)
+ 	return uncore->flags & UNCORE_HAS_FIFO;
+ }
+ 
+-void
+-intel_uncore_mmio_debug_init_early(struct intel_uncore_mmio_debug *mmio_debug);
++void intel_uncore_mmio_debug_init_early(struct drm_i915_private *i915);
+ void intel_uncore_init_early(struct intel_uncore *uncore,
+ 			     struct intel_gt *gt);
+ int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr);
+-- 
+2.25.1
+

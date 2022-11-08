@@ -1,0 +1,119 @@
+From 5e688cbcb2b648247efaf8db5de1629152735a30 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 6 Sep 2022 16:49:31 -0700
+Subject: [PATCH 189/800] drm/i915/mtl: Add gsi_offset when emitting aux table
+ invalidation
+
+The aux table invalidation registers are a bit unique --- they're
+engine-centric registers that reside in the GSI register space rather
+than within the engines' regular MMIO ranges.  That means that when
+issuing invalidation on engines in the standalone media GT, the GSI
+offset must be added to the regular MMIO offset for the invalidation
+registers.
+
+Cc: Aravind Iddamsetty <aravind.iddamsetty@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: Aravind Iddamsetty <aravind.iddamsetty@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220906234934.3655440-12-matthew.d.roper@intel.com
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gt/gen8_engine_cs.c | 15 ++++++++++-----
+ drivers/gpu/drm/i915/gt/gen8_engine_cs.h |  3 ++-
+ drivers/gpu/drm/i915/gt/intel_lrc.c      |  9 ++++++---
+ 3 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/gen8_engine_cs.c b/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
+index 98645797962f..e49fa6fa6aee 100644
+--- a/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/gen8_engine_cs.c
+@@ -165,10 +165,12 @@ static u32 preparser_disable(bool state)
+ 	return MI_ARB_CHECK | 1 << 8 | state;
+ }
+ 
+-u32 *gen12_emit_aux_table_inv(u32 *cs, const i915_reg_t inv_reg)
++u32 *gen12_emit_aux_table_inv(struct intel_gt *gt, u32 *cs, const i915_reg_t inv_reg)
+ {
++	u32 gsi_offset = gt->uncore->gsi_offset;
++
+ 	*cs++ = MI_LOAD_REGISTER_IMM(1) | MI_LRI_MMIO_REMAP_EN;
+-	*cs++ = i915_mmio_reg_offset(inv_reg);
++	*cs++ = i915_mmio_reg_offset(inv_reg) + gsi_offset;
+ 	*cs++ = AUX_INV;
+ 	*cs++ = MI_NOOP;
+ 
+@@ -254,7 +256,8 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
+ 
+ 		if (!HAS_FLAT_CCS(rq->engine->i915)) {
+ 			/* hsdes: 1809175790 */
+-			cs = gen12_emit_aux_table_inv(cs, GEN12_GFX_CCS_AUX_NV);
++			cs = gen12_emit_aux_table_inv(rq->engine->gt,
++						      cs, GEN12_GFX_CCS_AUX_NV);
+ 		}
+ 
+ 		*cs++ = preparser_disable(false);
+@@ -313,9 +316,11 @@ int gen12_emit_flush_xcs(struct i915_request *rq, u32 mode)
+ 
+ 	if (aux_inv) { /* hsdes: 1809175790 */
+ 		if (rq->engine->class == VIDEO_DECODE_CLASS)
+-			cs = gen12_emit_aux_table_inv(cs, GEN12_VD0_AUX_NV);
++			cs = gen12_emit_aux_table_inv(rq->engine->gt,
++						      cs, GEN12_VD0_AUX_NV);
+ 		else
+-			cs = gen12_emit_aux_table_inv(cs, GEN12_VE0_AUX_NV);
++			cs = gen12_emit_aux_table_inv(rq->engine->gt,
++						      cs, GEN12_VE0_AUX_NV);
+ 	}
+ 
+ 	if (mode & EMIT_INVALIDATE)
+diff --git a/drivers/gpu/drm/i915/gt/gen8_engine_cs.h b/drivers/gpu/drm/i915/gt/gen8_engine_cs.h
+index 32e3d2b831bb..e4d24c811dd6 100644
+--- a/drivers/gpu/drm/i915/gt/gen8_engine_cs.h
++++ b/drivers/gpu/drm/i915/gt/gen8_engine_cs.h
+@@ -13,6 +13,7 @@
+ #include "intel_gt_regs.h"
+ #include "intel_gpu_commands.h"
+ 
++struct intel_gt;
+ struct i915_request;
+ 
+ int gen8_emit_flush_rcs(struct i915_request *rq, u32 mode);
+@@ -45,7 +46,7 @@ u32 *gen8_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs);
+ u32 *gen11_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs);
+ u32 *gen12_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs);
+ 
+-u32 *gen12_emit_aux_table_inv(u32 *cs, const i915_reg_t inv_reg);
++u32 *gen12_emit_aux_table_inv(struct intel_gt *gt, u32 *cs, const i915_reg_t inv_reg);
+ 
+ static inline u32 *
+ __gen8_emit_pipe_control(u32 *batch, u32 flags0, u32 flags1, u32 offset)
+diff --git a/drivers/gpu/drm/i915/gt/intel_lrc.c b/drivers/gpu/drm/i915/gt/intel_lrc.c
+index 070cec4ff8a4..08214683e130 100644
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@ -1278,7 +1278,8 @@ gen12_emit_indirect_ctx_rcs(const struct intel_context *ce, u32 *cs)
+ 
+ 	/* hsdes: 1809175790 */
+ 	if (!HAS_FLAT_CCS(ce->engine->i915))
+-		cs = gen12_emit_aux_table_inv(cs, GEN12_GFX_CCS_AUX_NV);
++		cs = gen12_emit_aux_table_inv(ce->engine->gt,
++					      cs, GEN12_GFX_CCS_AUX_NV);
+ 
+ 	/* Wa_16014892111 */
+ 	if (IS_DG2(ce->engine->i915))
+@@ -1304,9 +1305,11 @@ gen12_emit_indirect_ctx_xcs(const struct intel_context *ce, u32 *cs)
+ 	/* hsdes: 1809175790 */
+ 	if (!HAS_FLAT_CCS(ce->engine->i915)) {
+ 		if (ce->engine->class == VIDEO_DECODE_CLASS)
+-			cs = gen12_emit_aux_table_inv(cs, GEN12_VD0_AUX_NV);
++			cs = gen12_emit_aux_table_inv(ce->engine->gt,
++						      cs, GEN12_VD0_AUX_NV);
+ 		else if (ce->engine->class == VIDEO_ENHANCEMENT_CLASS)
+-			cs = gen12_emit_aux_table_inv(cs, GEN12_VE0_AUX_NV);
++			cs = gen12_emit_aux_table_inv(ce->engine->gt,
++						      cs, GEN12_VE0_AUX_NV);
+ 	}
+ 
+ 	return cs;
+-- 
+2.25.1
+

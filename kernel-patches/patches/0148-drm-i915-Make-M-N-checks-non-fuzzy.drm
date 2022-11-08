@@ -1,0 +1,139 @@
+From b12218898cd63c81d1b990bac97370558896c1bb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 7 Sep 2022 12:10:49 +0300
+Subject: [PATCH 148/800] drm/i915: Make M/N checks non-fuzzy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Now that we no longer fuzz M/N during fastset these should
+match exctly.
+
+In order to get a match with what the BIOS does we need to round
+M/N down. And we do the opposite rounding when doing the readback.
+That gets us pretty much the same thing back.
+
+There can still be slight rounding differences between FDI M/N
+vs. the DPLL output so we allow for tiny deviation in
+intel_pipe_config_sanity_check().
+
+v2: Tweak rounding/sanity check stuff a bit
+
+Reviewed-by: Jani Nikula <jani.nikula@intel.com> #v1
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220907091057.11572-10-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c  | 52 ++++---------------
+ .../drm/i915/display/intel_modeset_verify.c   |  6 +--
+ 2 files changed, 13 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 9cff2035d9ff..4a0d5e13fb26 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -4494,7 +4494,8 @@ int intel_dotclock_calculate(int link_freq,
+ 	if (!m_n->link_n)
+ 		return 0;
+ 
+-	return div_u64(mul_u32_u32(m_n->link_m, link_freq), m_n->link_n);
++	return DIV_ROUND_UP_ULL(mul_u32_u32(m_n->link_m, link_freq),
++				m_n->link_n);
+ }
+ 
+ int intel_crtc_dotclock(const struct intel_crtc_state *pipe_config)
+@@ -5386,47 +5387,15 @@ bool intel_fuzzy_clock_check(int clock1, int clock2)
+ 	return false;
+ }
+ 
+-static bool
+-intel_compare_m_n(unsigned int m, unsigned int n,
+-		  unsigned int m2, unsigned int n2,
+-		  bool exact)
+-{
+-	if (m == m2 && n == n2)
+-		return true;
+-
+-	if (exact || !m || !n || !m2 || !n2)
+-		return false;
+-
+-	BUILD_BUG_ON(DATA_LINK_M_N_MASK > INT_MAX);
+-
+-	if (n > n2) {
+-		while (n > n2) {
+-			m2 <<= 1;
+-			n2 <<= 1;
+-		}
+-	} else if (n < n2) {
+-		while (n < n2) {
+-			m <<= 1;
+-			n <<= 1;
+-		}
+-	}
+-
+-	if (n != n2)
+-		return false;
+-
+-	return intel_fuzzy_clock_check(m, m2);
+-}
+-
+ static bool
+ intel_compare_link_m_n(const struct intel_link_m_n *m_n,
+-		       const struct intel_link_m_n *m2_n2,
+-		       bool exact)
++		       const struct intel_link_m_n *m2_n2)
+ {
+ 	return m_n->tu == m2_n2->tu &&
+-		intel_compare_m_n(m_n->data_m, m_n->data_n,
+-				  m2_n2->data_m, m2_n2->data_n, exact) &&
+-		intel_compare_m_n(m_n->link_m, m_n->link_n,
+-				  m2_n2->link_m, m2_n2->link_n, exact);
++		m_n->data_m == m2_n2->data_m &&
++		m_n->data_n == m2_n2->data_n &&
++		m_n->link_m == m2_n2->link_m &&
++		m_n->link_n == m2_n2->link_n;
+ }
+ 
+ static bool
+@@ -5620,8 +5589,7 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
+ 
+ #define PIPE_CONF_CHECK_M_N(name) do { \
+ 	if (!intel_compare_link_m_n(&current_config->name, \
+-				    &pipe_config->name,\
+-				    !fastset)) { \
++				    &pipe_config->name)) { \
+ 		pipe_config_mismatch(fastset, crtc, __stringify(name), \
+ 				     "(expected tu %i data %i/%i link %i/%i, " \
+ 				     "found tu %i, data %i/%i link %i/%i)", \
+@@ -5668,9 +5636,9 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
+  */
+ #define PIPE_CONF_CHECK_M_N_ALT(name, alt_name) do { \
+ 	if (!intel_compare_link_m_n(&current_config->name, \
+-				    &pipe_config->name, !fastset) && \
++				    &pipe_config->name) && \
+ 	    !intel_compare_link_m_n(&current_config->alt_name, \
+-				    &pipe_config->name, !fastset)) { \
++				    &pipe_config->name)) { \
+ 		pipe_config_mismatch(fastset, crtc, __stringify(name), \
+ 				     "(expected tu %i data %i/%i link %i/%i, " \
+ 				     "or tu %i data %i/%i link %i/%i, " \
+diff --git a/drivers/gpu/drm/i915/display/intel_modeset_verify.c b/drivers/gpu/drm/i915/display/intel_modeset_verify.c
+index a91586d77cb6..073607162acc 100644
+--- a/drivers/gpu/drm/i915/display/intel_modeset_verify.c
++++ b/drivers/gpu/drm/i915/display/intel_modeset_verify.c
+@@ -94,10 +94,10 @@ static void intel_pipe_config_sanity_check(struct drm_i915_private *dev_priv,
+ 
+ 		/*
+ 		 * FDI already provided one idea for the dotclock.
+-		 * Yell if the encoder disagrees.
++		 * Yell if the encoder disagrees. Allow for slight
++		 * rounding differences.
+ 		 */
+-		drm_WARN(&dev_priv->drm,
+-			 !intel_fuzzy_clock_check(fdi_dotclock, dotclock),
++		drm_WARN(&dev_priv->drm, abs(fdi_dotclock - dotclock) > 1,
+ 			 "FDI dotclock and encoder dotclock mismatch, fdi: %i, encoder: %i\n",
+ 			 fdi_dotclock, dotclock);
+ 	}
+-- 
+2.25.1
+
