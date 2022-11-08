@@ -1,0 +1,315 @@
+From bc2191f5e294fb1f8f648e9a7e6a044232b29556 Mon Sep 17 00:00:00 2001
+From: Daniel Latypov <dlatypov@google.com>
+Date: Tue, 25 Jan 2022 13:00:11 -0800
+Subject: [PATCH 245/800] kunit: factor out str constants from binary assertion
+ structs
+
+If the compiler doesn't optimize them away, each kunit assertion (use of
+KUNIT_EXPECT_EQ, etc.) can use 88 bytes of stack space in the worst and
+most common case. This has led to compiler warnings and a suggestion
+from Linus to move data from the structs into static const's where
+possible [1].
+
+This builds upon [2] which did so for the base struct kunit_assert type.
+That only reduced sizeof(struct kunit_binary_assert) from 88 to 64.
+
+Given these are by far the most commonly used asserts, this patch
+factors out the textual representations of the operands and comparator
+into another static const, saving 16 more bytes.
+
+In detail, KUNIT_EXPECT_EQ(test, 2 + 2, 5) yields the following struct
+  (struct kunit_binary_assert) {
+    .assert = <struct kunit_assert>,
+    .operation = "==",
+    .left_text = "2 + 2",
+    .left_value = 4,
+    .right_text = "5",
+    .right_value = 5,
+  }
+After this change
+  static const struct kunit_binary_assert_text __text = {
+    .operation = "==",
+    .left_text = "2 + 2",
+    .right_text = "5",
+  };
+  (struct kunit_binary_assert) {
+    .assert = <struct kunit_assert>,
+    .text = &__text,
+    .left_value = 4,
+    .right_value = 5,
+  }
+
+This also DRYs the code a bit more since these str fields were repeated
+for the string and pointer versions of kunit_binary_assert.
+
+Note: we could name the kunit_binary_assert_text fields left/right
+instead of left_text/right_text. But that would require changing the
+macros a bit since they have args called "left" and "right" which would
+be substituted in `.left = #left` as `.2 + 2 = \"2 + 2\"`.
+
+[1] https://groups.google.com/g/kunit-dev/c/i3fZXgvBrfA/m/VULQg1z6BAAJ
+[2] https://lore.kernel.org/linux-kselftest/20220113165931.451305-6-dlatypov@google.com/
+
+Signed-off-by: Daniel Latypov <dlatypov@google.com>
+Reviewed-by: David Gow <davidgow@google.com>
+Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+---
+ include/kunit/assert.h | 49 +++++++++++++++++++-----------------------
+ include/kunit/test.h   | 20 +++++++++++------
+ lib/kunit/assert.c     | 38 ++++++++++++++++----------------
+ 3 files changed, 54 insertions(+), 53 deletions(-)
+
+diff --git a/include/kunit/assert.h b/include/kunit/assert.h
+index a57625fd6f45..930bda1f5b03 100644
+--- a/include/kunit/assert.h
++++ b/include/kunit/assert.h
+@@ -150,14 +150,25 @@ void kunit_ptr_not_err_assert_format(const struct kunit_assert *assert,
+ 	.value = val							       \
+ }
+ 
++/**
++ * struct kunit_binary_assert_text - holds strings for &struct
++ *	kunit_binary_assert and friends to try and make the structs smaller.
++ * @operation: A string representation of the comparison operator (e.g. "==").
++ * @left_text: A string representation of the left expression (e.g. "2+2").
++ * @right_text: A string representation of the right expression (e.g. "2+2").
++ */
++struct kunit_binary_assert_text {
++	const char *operation;
++	const char *left_text;
++	const char *right_text;
++};
++
+ /**
+  * struct kunit_binary_assert - An expectation/assertion that compares two
+  *	non-pointer values (for example, KUNIT_EXPECT_EQ(test, 1 + 1, 2)).
+  * @assert: The parent of this type.
+- * @operation: A string representation of the comparison operator (e.g. "==").
+- * @left_text: A string representation of the expression in the left slot.
++ * @text: Holds the textual representations of the operands and op (e.g.  "==").
+  * @left_value: The actual evaluated value of the expression in the left slot.
+- * @right_text: A string representation of the expression in the right slot.
+  * @right_value: The actual evaluated value of the expression in the right slot.
+  *
+  * Represents an expectation/assertion that compares two non-pointer values. For
+@@ -166,10 +177,8 @@ void kunit_ptr_not_err_assert_format(const struct kunit_assert *assert,
+  */
+ struct kunit_binary_assert {
+ 	struct kunit_assert assert;
+-	const char *operation;
+-	const char *left_text;
++	const struct kunit_binary_assert_text *text;
+ 	long long left_value;
+-	const char *right_text;
+ 	long long right_value;
+ };
+ 
+@@ -182,10 +191,8 @@ void kunit_binary_assert_format(const struct kunit_assert *assert,
+  *	kunit_binary_assert, kunit_binary_ptr_assert, etc.
+  *
+  * @format_func: a function which formats the assert to a string.
+- * @op_str: A string representation of the comparison operator (e.g. "==").
+- * @left_str: A string representation of the expression in the left slot.
++ * @text_: Pointer to a kunit_binary_assert_text.
+  * @left_val: The actual evaluated value of the expression in the left slot.
+- * @right_str: A string representation of the expression in the right slot.
+  * @right_val: The actual evaluated value of the expression in the right slot.
+  *
+  * Initializes a binary assert like kunit_binary_assert,
+@@ -194,16 +201,12 @@ void kunit_binary_assert_format(const struct kunit_assert *assert,
+  * This is ultimately used by binary assertion macros like KUNIT_EXPECT_EQ, etc.
+  */
+ #define KUNIT_INIT_BINARY_ASSERT_STRUCT(format_func,			       \
+-					op_str,				       \
+-					left_str,			       \
++					text_,				       \
+ 					left_val,			       \
+-					right_str,			       \
+ 					right_val) {			       \
+ 	.assert = { .format = format_func },				       \
+-	.operation = op_str,						       \
+-	.left_text = left_str,						       \
++	.text = text_,							       \
+ 	.left_value = left_val,						       \
+-	.right_text = right_str,					       \
+ 	.right_value = right_val					       \
+ }
+ 
+@@ -211,10 +214,8 @@ void kunit_binary_assert_format(const struct kunit_assert *assert,
+  * struct kunit_binary_ptr_assert - An expectation/assertion that compares two
+  *	pointer values (for example, KUNIT_EXPECT_PTR_EQ(test, foo, bar)).
+  * @assert: The parent of this type.
+- * @operation: A string representation of the comparison operator (e.g. "==").
+- * @left_text: A string representation of the expression in the left slot.
++ * @text: Holds the textual representations of the operands and op (e.g.  "==").
+  * @left_value: The actual evaluated value of the expression in the left slot.
+- * @right_text: A string representation of the expression in the right slot.
+  * @right_value: The actual evaluated value of the expression in the right slot.
+  *
+  * Represents an expectation/assertion that compares two pointer values. For
+@@ -223,10 +224,8 @@ void kunit_binary_assert_format(const struct kunit_assert *assert,
+  */
+ struct kunit_binary_ptr_assert {
+ 	struct kunit_assert assert;
+-	const char *operation;
+-	const char *left_text;
++	const struct kunit_binary_assert_text *text;
+ 	const void *left_value;
+-	const char *right_text;
+ 	const void *right_value;
+ };
+ 
+@@ -238,10 +237,8 @@ void kunit_binary_ptr_assert_format(const struct kunit_assert *assert,
+  * struct kunit_binary_str_assert - An expectation/assertion that compares two
+  *	string values (for example, KUNIT_EXPECT_STREQ(test, foo, "bar")).
+  * @assert: The parent of this type.
+- * @operation: A string representation of the comparison operator (e.g. "==").
+- * @left_text: A string representation of the expression in the left slot.
++ * @text: Holds the textual representations of the operands and comparator.
+  * @left_value: The actual evaluated value of the expression in the left slot.
+- * @right_text: A string representation of the expression in the right slot.
+  * @right_value: The actual evaluated value of the expression in the right slot.
+  *
+  * Represents an expectation/assertion that compares two string values. For
+@@ -250,10 +247,8 @@ void kunit_binary_ptr_assert_format(const struct kunit_assert *assert,
+  */
+ struct kunit_binary_str_assert {
+ 	struct kunit_assert assert;
+-	const char *operation;
+-	const char *left_text;
++	const struct kunit_binary_assert_text *text;
+ 	const char *left_value;
+-	const char *right_text;
+ 	const char *right_value;
+ };
+ 
+diff --git a/include/kunit/test.h b/include/kunit/test.h
+index a93dfb8ff393..088ff394ae94 100644
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@ -874,16 +874,19 @@ void kunit_do_failed_assertion(struct kunit *test,
+ do {									       \
+ 	typeof(left) __left = (left);					       \
+ 	typeof(right) __right = (right);				       \
++	static const struct kunit_binary_assert_text __text = {		       \
++		.operation = #op,					       \
++		.left_text = #left,					       \
++		.right_text = #right,					       \
++	};								       \
+ 									       \
+ 	KUNIT_ASSERTION(test,						       \
+ 			assert_type,					       \
+ 			__left op __right,				       \
+ 			assert_class,					       \
+ 			KUNIT_INIT_BINARY_ASSERT_STRUCT(format_func,	       \
+-							#op,		       \
+-							#left,		       \
++							&__text,	       \
+ 							__left,		       \
+-							#right,		       \
+ 							__right),	       \
+ 			fmt,						       \
+ 			##__VA_ARGS__);					       \
+@@ -928,17 +931,20 @@ do {									       \
+ 				   ...)					       \
+ do {									       \
+ 	const char *__left = (left);					       \
+-	const char *__right = (right);				       \
++	const char *__right = (right);					       \
++	static const struct kunit_binary_assert_text __text = {		       \
++		.operation = #op,					       \
++		.left_text = #left,					       \
++		.right_text = #right,					       \
++	};								       \
+ 									       \
+ 	KUNIT_ASSERTION(test,						       \
+ 			assert_type,					       \
+ 			strcmp(__left, __right) op 0,			       \
+ 			kunit_binary_str_assert,			       \
+ 			KUNIT_INIT_BINARY_ASSERT_STRUCT(kunit_binary_str_assert_format,\
+-							#op,		       \
+-							#left,		       \
++							&__text,	       \
+ 							__left,		       \
+-							#right,		       \
+ 							__right),	       \
+ 			fmt,						       \
+ 			##__VA_ARGS__);					       \
+diff --git a/lib/kunit/assert.c b/lib/kunit/assert.c
+index c9c7ee0dfafa..d00d6d181ee8 100644
+--- a/lib/kunit/assert.c
++++ b/lib/kunit/assert.c
+@@ -122,18 +122,18 @@ void kunit_binary_assert_format(const struct kunit_assert *assert,
+ 
+ 	string_stream_add(stream,
+ 			  KUNIT_SUBTEST_INDENT "Expected %s %s %s, but\n",
+-			  binary_assert->left_text,
+-			  binary_assert->operation,
+-			  binary_assert->right_text);
+-	if (!is_literal(stream->test, binary_assert->left_text,
++			  binary_assert->text->left_text,
++			  binary_assert->text->operation,
++			  binary_assert->text->right_text);
++	if (!is_literal(stream->test, binary_assert->text->left_text,
+ 			binary_assert->left_value, stream->gfp))
+ 		string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == %lld\n",
+-				  binary_assert->left_text,
++				  binary_assert->text->left_text,
+ 				  binary_assert->left_value);
+-	if (!is_literal(stream->test, binary_assert->right_text,
++	if (!is_literal(stream->test, binary_assert->text->right_text,
+ 			binary_assert->right_value, stream->gfp))
+ 		string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == %lld",
+-				  binary_assert->right_text,
++				  binary_assert->text->right_text,
+ 				  binary_assert->right_value);
+ 	kunit_assert_print_msg(message, stream);
+ }
+@@ -150,14 +150,14 @@ void kunit_binary_ptr_assert_format(const struct kunit_assert *assert,
+ 
+ 	string_stream_add(stream,
+ 			  KUNIT_SUBTEST_INDENT "Expected %s %s %s, but\n",
+-			  binary_assert->left_text,
+-			  binary_assert->operation,
+-			  binary_assert->right_text);
++			  binary_assert->text->left_text,
++			  binary_assert->text->operation,
++			  binary_assert->text->right_text);
+ 	string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == %px\n",
+-			  binary_assert->left_text,
++			  binary_assert->text->left_text,
+ 			  binary_assert->left_value);
+ 	string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == %px",
+-			  binary_assert->right_text,
++			  binary_assert->text->right_text,
+ 			  binary_assert->right_value);
+ 	kunit_assert_print_msg(message, stream);
+ }
+@@ -190,16 +190,16 @@ void kunit_binary_str_assert_format(const struct kunit_assert *assert,
+ 
+ 	string_stream_add(stream,
+ 			  KUNIT_SUBTEST_INDENT "Expected %s %s %s, but\n",
+-			  binary_assert->left_text,
+-			  binary_assert->operation,
+-			  binary_assert->right_text);
+-	if (!is_str_literal(binary_assert->left_text, binary_assert->left_value))
++			  binary_assert->text->left_text,
++			  binary_assert->text->operation,
++			  binary_assert->text->right_text);
++	if (!is_str_literal(binary_assert->text->left_text, binary_assert->left_value))
+ 		string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == \"%s\"\n",
+-				  binary_assert->left_text,
++				  binary_assert->text->left_text,
+ 				  binary_assert->left_value);
+-	if (!is_str_literal(binary_assert->right_text, binary_assert->right_value))
++	if (!is_str_literal(binary_assert->text->right_text, binary_assert->right_value))
+ 		string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s == \"%s\"",
+-				  binary_assert->right_text,
++				  binary_assert->text->right_text,
+ 				  binary_assert->right_value);
+ 	kunit_assert_print_msg(message, stream);
+ }
+-- 
+2.25.1
+
