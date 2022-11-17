@@ -1,0 +1,149 @@
+From 082d1e267ee3ce25fdf031e3bcdb2eb50d8f8e77 Mon Sep 17 00:00:00 2001
+From: kumarama-i <aman.kumar@intel.com>
+Date: Sun, 13 Feb 2022 23:44:46 +0530
+Subject: [PATCH 1/2] serial: 8250_port: factor out
+ serial8250_do_restore_context()
+
+The new function serial8250_do_restore_context() is used to write the saved
+register values to the hardware. It is used in serial8250_do_set_termios() and
+will be used by the individual drivers to restore context when resuming.
+
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+---
+ drivers/tty/serial/8250/8250_port.c | 65 +++++++++++++++++++----------
+ include/linux/serial_8250.h         |  5 +++
+ 2 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index 7774c63ce53d..ead15ed55b42 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -2730,6 +2730,42 @@ void serial8250_update_uartclk(struct uart_port *port, unsigned int uartclk)
+ }
+ EXPORT_SYMBOL_GPL(serial8250_update_uartclk);
+ 
++void serial8250_do_restore_context(struct uart_port *port)
++{
++	struct uart_8250_port *up = up_to_u8250p(port);
++
++	/* Write extended features at first */
++	if (up->capabilities & UART_CAP_EFR) {
++		serial_port_out(port, UART_LCR, UART_LCR_CONF_MODE_B);
++		if (port->flags & UPF_EXAR_EFR)
++			serial_port_out(port, UART_XR_EFR, up->efr);
++		else
++			serial_port_out(port, UART_EFR, up->efr);
++	}
++
++	serial8250_set_divisor(port, up->baud, up->quot, up->frac);
++
++	/*
++	 * LCR DLAB must be set to enable 64-byte FIFO mode. If the FCR
++	 * is written without DLAB set, this mode will be disabled.
++	 */
++	if (port->type == PORT_16750)
++		serial_port_out(port, UART_FCR, up->fcr);
++
++	serial_port_out(port, UART_LCR, up->lcr);	/* reset DLAB */
++	if (port->type != PORT_16750) {
++		/* emulated UARTs (Lucent Venus 167x) need two steps */
++		if (up->fcr & UART_FCR_ENABLE_FIFO)
++			serial_port_out(port, UART_FCR, UART_FCR_ENABLE_FIFO);
++		serial_port_out(port, UART_FCR, up->fcr);	/* set fcr */
++	}
++	serial8250_set_mctrl(port, port->mctrl);
++
++	/* Enable interrupts at last */
++	serial_port_out(port, UART_IER, up->ier);
++}
++EXPORT_SYMBOL_GPL(serial8250_do_restore_context);
++
+ void
+ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 			  struct ktermios *old)
+@@ -2758,6 +2794,9 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 	spin_lock_irqsave(&port->lock, flags);
+ 
+ 	up->lcr = cval;					/* Save computed LCR */
++	up->baud = baud;				/* Save baud rate */
++	up->quot = quot;				/* Save quot */
++	up->frac = frac;				/* Save fraction */
+ 
+ 	if (up->capabilities & UART_CAP_FIFO && port->fifosize > 1) {
+ 		/* NOTE: If fifo_bug is not set, a user can set RX_trigger. */
+@@ -2823,8 +2862,6 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 	if (up->capabilities & UART_CAP_RTOIE)
+ 		up->ier |= UART_IER_RTOIE;
+ 
+-	serial8250_set_IER(up, up->ier);
+-
+ 	if (up->capabilities & UART_CAP_EFR) {
+ 		unsigned char efr = 0;
+ 		/*
+@@ -2835,30 +2872,12 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 		if (termios->c_cflag & CRTSCTS)
+ 			efr |= UART_EFR_CTS;
+ 
+-		serial_port_out(port, UART_LCR, UART_LCR_CONF_MODE_B);
+-		if (port->flags & UPF_EXAR_EFR)
+-			serial_port_out(port, UART_XR_EFR, efr);
+-		else
+-			serial_port_out(port, UART_EFR, efr);
++		up->efr = efr;
+ 	}
+ 
+-	serial8250_set_divisor(port, baud, quot, frac);
+-
+-	/*
+-	 * LCR DLAB must be set to enable 64-byte FIFO mode. If the FCR
+-	 * is written without DLAB set, this mode will be disabled.
+-	 */
+-	if (port->type == PORT_16750)
+-		serial_port_out(port, UART_FCR, up->fcr);
++	/* Write saved values to the registers */
++	serial8250_do_restore_context(port);
+ 
+-	serial_port_out(port, UART_LCR, up->lcr);	/* reset DLAB */
+-	if (port->type != PORT_16750) {
+-		/* emulated UARTs (Lucent Venus 167x) need two steps */
+-		if (up->fcr & UART_FCR_ENABLE_FIFO)
+-			serial_port_out(port, UART_FCR, UART_FCR_ENABLE_FIFO);
+-		serial_port_out(port, UART_FCR, up->fcr);	/* set fcr */
+-	}
+-	serial8250_set_mctrl(port, port->mctrl);
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 	serial8250_rpm_put(up);
+ 
+diff --git a/include/linux/serial_8250.h b/include/linux/serial_8250.h
+index aa011f668705..5bac4f4ecfb2 100644
+--- a/include/linux/serial_8250.h
++++ b/include/linux/serial_8250.h
+@@ -101,6 +101,7 @@ struct uart_8250_port {
+ 	bool			fifo_bug;	/* min RX trigger if enabled */
+ 	unsigned int		tx_loadsz;	/* transmit fifo load size */
+ 	unsigned char		acr;
++	unsigned char		efr;
+ 	unsigned char		fcr;
+ 	unsigned char		ier;
+ 	unsigned char		lcr;
+@@ -109,6 +110,9 @@ struct uart_8250_port {
+ 	unsigned char		mcr_force;	/* mask of forced bits */
+ 	unsigned char		cur_iotype;	/* Running I/O type */
+ 	unsigned int		rpm_tx_active;
++	unsigned int		baud;
++	unsigned int		quot;
++	unsigned int		frac;
+ 	unsigned char		canary;		/* non-zero during system sleep
+ 						 *   if no_console_suspend
+ 						 */
+@@ -160,6 +164,7 @@ extern int early_serial8250_setup(struct earlycon_device *device,
+ 					 const char *options);
+ extern void serial8250_update_uartclk(struct uart_port *port,
+ 				      unsigned int uartclk);
++extern void serial8250_do_restore_context(struct uart_port *port);
+ extern void serial8250_do_set_termios(struct uart_port *port,
+ 		struct ktermios *termios, struct ktermios *old);
+ extern void serial8250_do_set_ldisc(struct uart_port *port,
+-- 
+2.25.1
+
