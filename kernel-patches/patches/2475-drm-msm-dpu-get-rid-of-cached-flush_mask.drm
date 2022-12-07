@@ -1,0 +1,348 @@
+From 4b10a8996f31886141cefe49b0c8d52b7b6f7597 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Wed, 9 Feb 2022 20:25:03 +0300
+Subject: [PATCH 2475/2779] drm/msm/dpu: get rid of cached flush_mask
+
+Instead of querying the CTL for the flush mask (for SSPP, LM or DSPP),
+storing the mask in the mixer configuration and then pushing the mask to
+the CTL, tell CTL to cache the flush in place.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/473159/
+Link: https://lore.kernel.org/r/20220209172520.3719906-9-dmitry.baryshkov@linaro.org
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c    | 26 +++----
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h    |  1 -
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c |  6 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c  | 78 +++++++++------------
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h  | 35 ++++++---
+ 5 files changed, 69 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 2d3863514cb5..13ce321283ff 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -463,7 +463,8 @@ static void _dpu_crtc_blend_setup_mixer(struct drm_crtc *crtc,
+ 			_dpu_crtc_setup_blend_cfg(mixer + lm_idx,
+ 						pstate, format);
+ 
+-			mixer[lm_idx].flush_mask |= ctl->ops.get_bitmask_sspp(ctl, sspp_idx);
++			mixer[lm_idx].lm_ctl->ops.update_pending_flush_sspp(mixer[lm_idx].lm_ctl,
++									    sspp_idx);
+ 
+ 			if (bg_alpha_enable && !format->alpha_enable)
+ 				mixer[lm_idx].mixer_op_mode = 0;
+@@ -497,7 +498,6 @@ static void _dpu_crtc_blend_setup(struct drm_crtc *crtc)
+ 
+ 	for (i = 0; i < cstate->num_mixers; i++) {
+ 		mixer[i].mixer_op_mode = 0;
+-		mixer[i].flush_mask = 0;
+ 		if (mixer[i].lm_ctl->ops.clear_all_blendstages)
+ 			mixer[i].lm_ctl->ops.clear_all_blendstages(
+ 					mixer[i].lm_ctl);
+@@ -514,17 +514,14 @@ static void _dpu_crtc_blend_setup(struct drm_crtc *crtc)
+ 
+ 		lm->ops.setup_alpha_out(lm, mixer[i].mixer_op_mode);
+ 
+-		mixer[i].flush_mask |= ctl->ops.get_bitmask_mixer(ctl,
+-			mixer[i].hw_lm->idx);
+-
+ 		/* stage config flush mask */
+-		ctl->ops.update_pending_flush(ctl, mixer[i].flush_mask);
++		ctl->ops.update_pending_flush_mixer(ctl,
++			mixer[i].hw_lm->idx);
+ 
+-		DRM_DEBUG_ATOMIC("lm %d, op_mode 0x%X, ctl %d, flush mask 0x%x\n",
++		DRM_DEBUG_ATOMIC("lm %d, op_mode 0x%X, ctl %d\n",
+ 			mixer[i].hw_lm->idx - LM_0,
+ 			mixer[i].mixer_op_mode,
+-			ctl->idx - CTL_0,
+-			mixer[i].flush_mask);
++			ctl->idx - CTL_0);
+ 
+ 		ctl->ops.setup_blendstage(ctl, mixer[i].hw_lm->idx,
+ 			&stage_cfg);
+@@ -768,16 +765,9 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
+ 			dspp->ops.setup_pcc(dspp, &cfg);
+ 		}
+ 
+-		mixer[i].flush_mask |= ctl->ops.get_bitmask_dspp(ctl,
+-			mixer[i].hw_dspp->idx);
+-
+ 		/* stage config flush mask */
+-		ctl->ops.update_pending_flush(ctl, mixer[i].flush_mask);
+-
+-		DRM_DEBUG_ATOMIC("lm %d, ctl %d, flush mask 0x%x\n",
+-			mixer[i].hw_lm->idx - DSPP_0,
+-			ctl->idx - CTL_0,
+-			mixer[i].flush_mask);
++		ctl->ops.update_pending_flush_dspp(ctl,
++			mixer[i].hw_dspp->idx);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 9b67645c2574..539b68b1626a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -97,7 +97,6 @@ struct dpu_crtc_mixer {
+ 	struct dpu_hw_ctl *lm_ctl;
+ 	struct dpu_hw_dspp *hw_dspp;
+ 	u32 mixer_op_mode;
+-	u32 flush_mask;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 7f5dba96b2ff..9c6817b5a194 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -1981,7 +1981,6 @@ static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)
+ {
+ 	struct dpu_hw_mixer_cfg mixer;
+ 	int i, num_lm;
+-	u32 flush_mask = 0;
+ 	struct dpu_global_state *global_state;
+ 	struct dpu_hw_blk *hw_lm[2];
+ 	struct dpu_hw_mixer *hw_mixer[2];
+@@ -2000,9 +1999,8 @@ static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)
+ 
+ 	for (i = 0; i < num_lm; i++) {
+ 		hw_mixer[i] = to_dpu_hw_mixer(hw_lm[i]);
+-		flush_mask = phys_enc->hw_ctl->ops.get_bitmask_mixer(ctl, hw_mixer[i]->idx);
+-		if (phys_enc->hw_ctl->ops.update_pending_flush)
+-			phys_enc->hw_ctl->ops.update_pending_flush(ctl, flush_mask);
++		if (phys_enc->hw_ctl->ops.update_pending_flush_mixer)
++			phys_enc->hw_ctl->ops.update_pending_flush_mixer(ctl, hw_mixer[i]->idx);
+ 
+ 		/* clear all blendstages */
+ 		if (phys_enc->hw_ctl->ops.setup_blendstage)
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+index e12b7fa48a7b..a35ecb6676c8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+@@ -150,92 +150,84 @@ static inline void dpu_hw_ctl_trigger_flush(struct dpu_hw_ctl *ctx)
+ 	DPU_REG_WRITE(&ctx->hw, CTL_FLUSH, ctx->pending_flush_mask);
+ }
+ 
+-static uint32_t dpu_hw_ctl_get_bitmask_sspp(struct dpu_hw_ctl *ctx,
++static void dpu_hw_ctl_update_pending_flush_sspp(struct dpu_hw_ctl *ctx,
+ 	enum dpu_sspp sspp)
+ {
+-	uint32_t flushbits = 0;
+-
+ 	switch (sspp) {
+ 	case SSPP_VIG0:
+-		flushbits =  BIT(0);
++		ctx->pending_flush_mask |=  BIT(0);
+ 		break;
+ 	case SSPP_VIG1:
+-		flushbits = BIT(1);
++		ctx->pending_flush_mask |= BIT(1);
+ 		break;
+ 	case SSPP_VIG2:
+-		flushbits = BIT(2);
++		ctx->pending_flush_mask |= BIT(2);
+ 		break;
+ 	case SSPP_VIG3:
+-		flushbits = BIT(18);
++		ctx->pending_flush_mask |= BIT(18);
+ 		break;
+ 	case SSPP_RGB0:
+-		flushbits = BIT(3);
++		ctx->pending_flush_mask |= BIT(3);
+ 		break;
+ 	case SSPP_RGB1:
+-		flushbits = BIT(4);
++		ctx->pending_flush_mask |= BIT(4);
+ 		break;
+ 	case SSPP_RGB2:
+-		flushbits = BIT(5);
++		ctx->pending_flush_mask |= BIT(5);
+ 		break;
+ 	case SSPP_RGB3:
+-		flushbits = BIT(19);
++		ctx->pending_flush_mask |= BIT(19);
+ 		break;
+ 	case SSPP_DMA0:
+-		flushbits = BIT(11);
++		ctx->pending_flush_mask |= BIT(11);
+ 		break;
+ 	case SSPP_DMA1:
+-		flushbits = BIT(12);
++		ctx->pending_flush_mask |= BIT(12);
+ 		break;
+ 	case SSPP_DMA2:
+-		flushbits = BIT(24);
++		ctx->pending_flush_mask |= BIT(24);
+ 		break;
+ 	case SSPP_DMA3:
+-		flushbits = BIT(25);
++		ctx->pending_flush_mask |= BIT(25);
+ 		break;
+ 	case SSPP_CURSOR0:
+-		flushbits = BIT(22);
++		ctx->pending_flush_mask |= BIT(22);
+ 		break;
+ 	case SSPP_CURSOR1:
+-		flushbits = BIT(23);
++		ctx->pending_flush_mask |= BIT(23);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-
+-	return flushbits;
+ }
+ 
+-static uint32_t dpu_hw_ctl_get_bitmask_mixer(struct dpu_hw_ctl *ctx,
++static void dpu_hw_ctl_update_pending_flush_mixer(struct dpu_hw_ctl *ctx,
+ 	enum dpu_lm lm)
+ {
+-	uint32_t flushbits = 0;
+-
+ 	switch (lm) {
+ 	case LM_0:
+-		flushbits = BIT(6);
++		ctx->pending_flush_mask |= BIT(6);
+ 		break;
+ 	case LM_1:
+-		flushbits = BIT(7);
++		ctx->pending_flush_mask |= BIT(7);
+ 		break;
+ 	case LM_2:
+-		flushbits = BIT(8);
++		ctx->pending_flush_mask |= BIT(8);
+ 		break;
+ 	case LM_3:
+-		flushbits = BIT(9);
++		ctx->pending_flush_mask |= BIT(9);
+ 		break;
+ 	case LM_4:
+-		flushbits = BIT(10);
++		ctx->pending_flush_mask |= BIT(10);
+ 		break;
+ 	case LM_5:
+-		flushbits = BIT(20);
++		ctx->pending_flush_mask |= BIT(20);
+ 		break;
+ 	default:
+-		return -EINVAL;
++		break;
+ 	}
+ 
+-	flushbits |= CTL_FLUSH_MASK_CTL;
+-
+-	return flushbits;
++	ctx->pending_flush_mask |= CTL_FLUSH_MASK_CTL;
+ }
+ 
+ static void dpu_hw_ctl_update_pending_flush_intf(struct dpu_hw_ctl *ctx,
+@@ -294,29 +286,25 @@ static void dpu_hw_ctl_update_pending_flush_merge_3d_v1(struct dpu_hw_ctl *ctx,
+ 	ctx->pending_flush_mask |= BIT(MERGE_3D_IDX);
+ }
+ 
+-static uint32_t dpu_hw_ctl_get_bitmask_dspp(struct dpu_hw_ctl *ctx,
++static void dpu_hw_ctl_update_pending_flush_dspp(struct dpu_hw_ctl *ctx,
+ 	enum dpu_dspp dspp)
+ {
+-	uint32_t flushbits = 0;
+-
+ 	switch (dspp) {
+ 	case DSPP_0:
+-		flushbits = BIT(13);
++		ctx->pending_flush_mask |= BIT(13);
+ 		break;
+ 	case DSPP_1:
+-		flushbits = BIT(14);
++		ctx->pending_flush_mask |= BIT(14);
+ 		break;
+ 	case DSPP_2:
+-		flushbits = BIT(15);
++		ctx->pending_flush_mask |= BIT(15);
+ 		break;
+ 	case DSPP_3:
+-		flushbits = BIT(21);
++		ctx->pending_flush_mask |= BIT(21);
+ 		break;
+ 	default:
+-		return 0;
++		break;
+ 	}
+-
+-	return flushbits;
+ }
+ 
+ static u32 dpu_hw_ctl_poll_reset_status(struct dpu_hw_ctl *ctx, u32 timeout_us)
+@@ -685,9 +673,9 @@ static void _setup_ctl_ops(struct dpu_hw_ctl_ops *ops,
+ 	ops->wait_reset_status = dpu_hw_ctl_wait_reset_status;
+ 	ops->clear_all_blendstages = dpu_hw_ctl_clear_all_blendstages;
+ 	ops->setup_blendstage = dpu_hw_ctl_setup_blendstage;
+-	ops->get_bitmask_sspp = dpu_hw_ctl_get_bitmask_sspp;
+-	ops->get_bitmask_mixer = dpu_hw_ctl_get_bitmask_mixer;
+-	ops->get_bitmask_dspp = dpu_hw_ctl_get_bitmask_dspp;
++	ops->update_pending_flush_sspp = dpu_hw_ctl_update_pending_flush_sspp;
++	ops->update_pending_flush_mixer = dpu_hw_ctl_update_pending_flush_mixer;
++	ops->update_pending_flush_dspp = dpu_hw_ctl_update_pending_flush_dspp;
+ 	if (cap & BIT(DPU_CTL_FETCH_ACTIVE))
+ 		ops->set_active_pipes = dpu_hw_ctl_set_fetch_pipe_active;
+ };
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
+index 7d9ad6a3f9f6..96c012ec8467 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
+@@ -129,6 +129,32 @@ struct dpu_hw_ctl_ops {
+ 	void (*update_pending_flush_merge_3d)(struct dpu_hw_ctl *ctx,
+ 		enum dpu_merge_3d blk);
+ 
++	/**
++	 * OR in the given flushbits to the cached pending_flush_mask
++	 * No effect on hardware
++	 * @ctx       : ctl path ctx pointer
++	 * @blk       : SSPP block index
++	 */
++	void (*update_pending_flush_sspp)(struct dpu_hw_ctl *ctx,
++		enum dpu_sspp blk);
++
++	/**
++	 * OR in the given flushbits to the cached pending_flush_mask
++	 * No effect on hardware
++	 * @ctx       : ctl path ctx pointer
++	 * @blk       : LM block index
++	 */
++	void (*update_pending_flush_mixer)(struct dpu_hw_ctl *ctx,
++		enum dpu_lm blk);
++
++	/**
++	 * OR in the given flushbits to the cached pending_flush_mask
++	 * No effect on hardware
++	 * @ctx       : ctl path ctx pointer
++	 * @blk       : DSPP block index
++	 */
++	void (*update_pending_flush_dspp)(struct dpu_hw_ctl *ctx,
++		enum dpu_dspp blk);
+ 	/**
+ 	 * Write the value of the pending_flush_mask to hardware
+ 	 * @ctx       : ctl path ctx pointer
+@@ -171,15 +197,6 @@ struct dpu_hw_ctl_ops {
+ 	 */
+ 	int (*wait_reset_status)(struct dpu_hw_ctl *ctx);
+ 
+-	uint32_t (*get_bitmask_sspp)(struct dpu_hw_ctl *ctx,
+-		enum dpu_sspp blk);
+-
+-	uint32_t (*get_bitmask_mixer)(struct dpu_hw_ctl *ctx,
+-		enum dpu_lm blk);
+-
+-	uint32_t (*get_bitmask_dspp)(struct dpu_hw_ctl *ctx,
+-		enum dpu_dspp blk);
+-
+ 	/**
+ 	 * Set all blend stages to disabled
+ 	 * @ctx       : ctl path ctx pointer
+-- 
+2.25.1
+

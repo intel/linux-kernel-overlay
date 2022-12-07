@@ -1,0 +1,203 @@
+From 1433bbf1a8907809898c4022d80d2138063af460 Mon Sep 17 00:00:00 2001
+From: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+Date: Thu, 1 Sep 2022 23:03:39 -0700
+Subject: [PATCH 2247/2779] drm/i915/mtl: Obtain SAGV values from MMIO instead
+ of GT pcode mailbox
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From Meteorlake, Latency Level, SAGV bloack time are read from
+LATENCY_SAGV register instead of the GT driver pcode mailbox. DDR type
+and QGV information are also to be read from Mem SS registers.
+
+v2:
+ - Simplify MTL_MEM_SS_INFO_QGV_POINT macro(MattR)
+ - Nit: Rearrange the bit def's from higher to lower(MattR)
+ - Restore platform definition for ADL-P(MattR)
+ - Move back intel_qgv_point def to intel_bw.c(Jani)
+v3:
+ - Rebase
+
+Bspec: 64636, 64608
+
+Cc: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Original Author: Caz Yokoyama
+Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Signed-off-by: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220902060342.151824-9-radhakrishna.sripada@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_bw.c      | 42 +++++++++++++++++---
+ drivers/gpu/drm/i915/display/skl_watermark.c |  8 +++-
+ drivers/gpu/drm/i915/i915_reg.h              | 17 ++++++++
+ drivers/gpu/drm/i915/intel_dram.c            | 41 ++++++++++++++++++-
+ 4 files changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.c b/drivers/gpu/drm/i915/display/intel_bw.c
+index 6a1f0300430c..4ace026b29bd 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.c
++++ b/drivers/gpu/drm/i915/display/intel_bw.c
+@@ -139,6 +139,42 @@ int icl_pcode_restrict_qgv_points(struct drm_i915_private *dev_priv,
+ 	return 0;
+ }
+ 
++static int mtl_read_qgv_point_info(struct drm_i915_private *dev_priv,
++				   struct intel_qgv_point *sp, int point)
++{
++	u32 val, val2;
++	u16 dclk;
++
++	val = intel_uncore_read(&dev_priv->uncore,
++				MTL_MEM_SS_INFO_QGV_POINT_LOW(point));
++	val2 = intel_uncore_read(&dev_priv->uncore,
++				 MTL_MEM_SS_INFO_QGV_POINT_HIGH(point));
++	dclk = REG_FIELD_GET(MTL_DCLK_MASK, val);
++	sp->dclk = DIV_ROUND_UP((16667 * dclk), 1000);
++	sp->t_rp = REG_FIELD_GET(MTL_TRP_MASK, val);
++	sp->t_rcd = REG_FIELD_GET(MTL_TRCD_MASK, val);
++
++	sp->t_rdpre = REG_FIELD_GET(MTL_TRDPRE_MASK, val2);
++	sp->t_ras = REG_FIELD_GET(MTL_TRAS_MASK, val2);
++
++	sp->t_rc = sp->t_rp + sp->t_ras;
++
++	return 0;
++}
++
++static int
++intel_read_qgv_point_info(struct drm_i915_private *dev_priv,
++			  struct intel_qgv_point *sp,
++			  int point)
++{
++	if (DISPLAY_VER(dev_priv) >= 14)
++		return mtl_read_qgv_point_info(dev_priv, sp, point);
++	else if (IS_DG1(dev_priv))
++		return dg1_mchbar_read_qgv_point_info(dev_priv, sp, point);
++	else
++		return icl_pcode_read_qgv_point_info(dev_priv, sp, point);
++}
++
+ static int icl_get_qgv_points(struct drm_i915_private *dev_priv,
+ 			      struct intel_qgv_info *qi,
+ 			      bool is_y_tile)
+@@ -220,11 +256,7 @@ static int icl_get_qgv_points(struct drm_i915_private *dev_priv,
+ 	for (i = 0; i < qi->num_points; i++) {
+ 		struct intel_qgv_point *sp = &qi->points[i];
+ 
+-		if (IS_DG1(dev_priv))
+-			ret = dg1_mchbar_read_qgv_point_info(dev_priv, sp, i);
+-		else
+-			ret = icl_pcode_read_qgv_point_info(dev_priv, sp, i);
+-
++		ret = intel_read_qgv_point_info(dev_priv, sp, i);
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index cb297725d5b9..f773efe24e3e 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -72,7 +72,13 @@ intel_has_sagv(struct drm_i915_private *i915)
+ static u32
+ intel_sagv_block_time(struct drm_i915_private *i915)
+ {
+-	if (DISPLAY_VER(i915) >= 12) {
++	if (DISPLAY_VER(i915) >= 14) {
++		u32 val;
++
++		val = intel_uncore_read(&i915->uncore, MTL_LATENCY_SAGV);
++
++		return REG_FIELD_GET(MTL_LATENCY_QCLK_SAGV, val);
++	} else if (DISPLAY_VER(i915) >= 12) {
+ 		u32 val = 0;
+ 		int ret;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 99ce7281adb9..09752a7217f8 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -8328,4 +8328,21 @@ enum skl_power_gate {
+ #define  MTL_LATENCY_LEVEL_EVEN_MASK	REG_GENMASK(12, 0)
+ #define  MTL_LATENCY_LEVEL_ODD_MASK	REG_GENMASK(28, 16)
+ 
++#define MTL_LATENCY_SAGV		_MMIO(0x4578b)
++#define   MTL_LATENCY_QCLK_SAGV		REG_GENMASK(12, 0)
++
++#define MTL_MEM_SS_INFO_GLOBAL			_MMIO(0x45700)
++#define   MTL_N_OF_ENABLED_QGV_POINTS_MASK	REG_GENMASK(11, 8)
++#define   MTL_N_OF_POPULATED_CH_MASK		REG_GENMASK(7, 4)
++#define   MTL_DDR_TYPE_MASK			REG_GENMASK(3, 0)
++
++#define MTL_MEM_SS_INFO_QGV_POINT_LOW(point)	 _MMIO(0x45710 + (point) * 2)
++#define   MTL_TRCD_MASK			REG_GENMASK(31, 24)
++#define   MTL_TRP_MASK			REG_GENMASK(23, 16)
++#define   MTL_DCLK_MASK			REG_GENMASK(15, 0)
++
++#define MTL_MEM_SS_INFO_QGV_POINT_HIGH(point)	 _MMIO(0x45714 + (point) * 2)
++#define   MTL_TRAS_MASK			REG_GENMASK(16, 8)
++#define   MTL_TRDPRE_MASK		REG_GENMASK(7, 0)
++
+ #endif /* _I915_REG_H_ */
+diff --git a/drivers/gpu/drm/i915/intel_dram.c b/drivers/gpu/drm/i915/intel_dram.c
+index 437447119770..2403ccd52c74 100644
+--- a/drivers/gpu/drm/i915/intel_dram.c
++++ b/drivers/gpu/drm/i915/intel_dram.c
+@@ -466,6 +466,43 @@ static int gen12_get_dram_info(struct drm_i915_private *i915)
+ 	return icl_pcode_read_mem_global_info(i915);
+ }
+ 
++static int xelpdp_get_dram_info(struct drm_i915_private *i915)
++{
++	u32 val = intel_uncore_read(&i915->uncore, MTL_MEM_SS_INFO_GLOBAL);
++	struct dram_info *dram_info = &i915->dram_info;
++
++	val = REG_FIELD_GET(MTL_DDR_TYPE_MASK, val);
++	switch (val) {
++	case 0:
++		dram_info->type = INTEL_DRAM_DDR4;
++		break;
++	case 1:
++		dram_info->type = INTEL_DRAM_DDR5;
++		break;
++	case 2:
++		dram_info->type = INTEL_DRAM_LPDDR5;
++		break;
++	case 3:
++		dram_info->type = INTEL_DRAM_LPDDR4;
++		break;
++	case 4:
++		dram_info->type = INTEL_DRAM_DDR3;
++		break;
++	case 5:
++		dram_info->type = INTEL_DRAM_LPDDR3;
++		break;
++	default:
++		MISSING_CASE(val);
++		return -EINVAL;
++	}
++
++	dram_info->num_channels = REG_FIELD_GET(MTL_N_OF_POPULATED_CH_MASK, val);
++	dram_info->num_qgv_points = REG_FIELD_GET(MTL_N_OF_ENABLED_QGV_POINTS_MASK, val);
++	/* PSF GV points not supported in D14+ */
++
++	return 0;
++}
++
+ void intel_dram_detect(struct drm_i915_private *i915)
+ {
+ 	struct dram_info *dram_info = &i915->dram_info;
+@@ -480,7 +517,9 @@ void intel_dram_detect(struct drm_i915_private *i915)
+ 	 */
+ 	dram_info->wm_lv_0_adjust_needed = !IS_GEN9_LP(i915);
+ 
+-	if (GRAPHICS_VER(i915) >= 12)
++	if (DISPLAY_VER(i915) >= 14)
++		ret = xelpdp_get_dram_info(i915);
++	else if (GRAPHICS_VER(i915) >= 12)
+ 		ret = gen12_get_dram_info(i915);
+ 	else if (GRAPHICS_VER(i915) >= 11)
+ 		ret = gen11_get_dram_info(i915);
+-- 
+2.25.1
+
