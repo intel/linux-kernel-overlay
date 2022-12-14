@@ -1,7 +1,7 @@
-From 2e293653edaa3906038d9662ced9c6cbf82ebcac Mon Sep 17 00:00:00 2001
+From d5654eaba07eec8b5cc345c651e8f750c7907908 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 20 May 2021 17:57:47 +0800
-Subject: [PATCH 13/19] Add new IOCTL to read error log buffer.
+Subject: [PATCH 13/22] Add new IOCTL to read error log buffer.
 
 Include cache perf measurement; also include cpu affinity check
 when requesting buffer.
@@ -556,5 +556,5 @@ index 3fe446173fcb..a97d4197959a 100644
 +#define TCC_MEASURE_USER_START     _IO(IOCTL_TCC_MAGIC, IOCTL_TCC_MEASURE_USER_START)
 +#define TCC_MEASURE_USER_END       _IO(IOCTL_TCC_MAGIC, IOCTL_TCC_MEASURE_USER_END)
 -- 
-2.32.0
+2.25.1
 

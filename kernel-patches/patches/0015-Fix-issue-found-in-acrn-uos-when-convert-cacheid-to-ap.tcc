@@ -1,7 +1,7 @@
-From b4c77dd330ed3320430fdafc818e2f5a0c82750e Mon Sep 17 00:00:00 2001
+From 47015921a2a610b8d783a4a0dfea2f6d584cd981 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Fri, 18 Jun 2021 00:38:44 +0800
-Subject: [PATCH 15/19] Fix issue found in acrn uos when convert cacheid to
+Subject: [PATCH 15/22] Fix issue found in acrn uos when convert cacheid to
  apicid.
 
 Output errlog buffer to proc file.
@@ -246,5 +246,5 @@ index a97d4197959a..7fcce803c874 100644
  	} info;
  };
 -- 
-2.32.0
+2.25.1
 

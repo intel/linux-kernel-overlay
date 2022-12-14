@@ -1,7 +1,7 @@
-From 9ea04ae2daa859b7e7b7eaf52356f188c2ba63fc Mon Sep 17 00:00:00 2001
+From 56cd6e0b2d5db716ec23f600fe837e7b1dc9ff14 Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Tue, 8 Jun 2021 17:59:33 +0800
-Subject: [PATCH 14/19] Display errlog buffer raw data in kernel log as
+Subject: [PATCH 14/22] Display errlog buffer raw data in kernel log as
  requested once this driver is loaded.
 
 Fix W=1 warnings.
@@ -161,5 +161,5 @@ index e06f2ec466b7..dfbdc54379a3 100644
  	default:
  		return -ENOIOCTLCMD;
 -- 
-2.32.0
+2.25.1
 
