@@ -1,0 +1,4050 @@
+From 7f7bfc0af7bf659d8e92ec2c98eb88ca4b230c8b Mon Sep 17 00:00:00 2001
+From: zouxiaoh <xiaohong.zou@intel.com>
+Date: Tue, 6 Dec 2022 20:53:25 +0800
+Subject: [PATCH 1/4] media: intel-ipu6: implement new vc solution
+
+Signed-off-by: zouxiaoh <xiaohong.zou@intel.com>
+---
+ drivers/media/i2c/ar0234.c                    | 132 +++++-
+ drivers/media/i2c/d4xx.c                      | 148 ++----
+ drivers/media/i2c/imx390.c                    |  19 +-
+ drivers/media/i2c/ov13858_intel.c             |   4 +-
+ drivers/media/i2c/ti960-des.c                 | 432 +++++++++---------
+ drivers/media/i2c/ti960-reg.h                 |   6 +-
+ drivers/media/i2c/ti964.c                     |  29 +-
+ drivers/media/pci/intel/ipu-bus.c             |  39 +-
+ drivers/media/pci/intel/ipu-bus.h             |  12 +-
+ drivers/media/pci/intel/ipu-buttress.c        |  53 +--
+ drivers/media/pci/intel/ipu-buttress.h        |   3 +-
+ drivers/media/pci/intel/ipu-dma.c             |   2 -
+ drivers/media/pci/intel/ipu-isys-csi2.c       |   1 +
+ drivers/media/pci/intel/ipu-isys-queue.c      |   3 +-
+ drivers/media/pci/intel/ipu-isys-video.c      |   3 +
+ drivers/media/pci/intel/ipu-isys-video.h      |   2 +-
+ drivers/media/pci/intel/ipu-isys.c            | 156 ++++++-
+ drivers/media/pci/intel/ipu-isys.h            |   3 +
+ drivers/media/pci/intel/ipu-pdata.h           |   2 +
+ drivers/media/pci/intel/ipu-psys.c            |   6 +-
+ drivers/media/pci/intel/ipu-trace.c           |   2 +-
+ drivers/media/pci/intel/ipu.c                 |  74 ++-
+ drivers/media/pci/intel/ipu.h                 |   3 +-
+ drivers/media/pci/intel/ipu6/ipu-platform.h   |   7 +-
+ drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c |   6 +
+ drivers/media/pci/intel/ipu6/ipu6-isys-phy.c  |  70 +++
+ drivers/media/pci/intel/ipu6/ipu6-isys-phy.h  |   5 +
+ drivers/media/platform/intel/Makefile         |   3 +-
+ .../media/platform/intel/ipu6-acpi-common.c   | 357 +++++++++++++++
+ .../media/platform/intel/ipu6-acpi-pdata.c    |  20 +-
+ drivers/media/platform/intel/ipu6-acpi.c      | 350 +-------------
+ .../media/platform/intel/ipu6-adlrvp-pdata.c  | 122 +++--
+ .../media/platform/intel/ipu6-tglrvp-pdata.c  |  38 +-
+ include/media/ipu-acpi-pdata.h                |  19 +-
+ include/media/ipu-acpi.h                      |   4 +-
+ include/media/ipu-isys.h                      |  17 +-
+ 36 files changed, 1317 insertions(+), 835 deletions(-)
+ create mode 100644 drivers/media/platform/intel/ipu6-acpi-common.c
+
+diff --git a/drivers/media/i2c/ar0234.c b/drivers/media/i2c/ar0234.c
+index a139c745768e..c95f05936cb4 100644
+--- a/drivers/media/i2c/ar0234.c
++++ b/drivers/media/i2c/ar0234.c
+@@ -16,6 +16,8 @@
+ #include <media/ar0234.h>
+ #include <linux/version.h>
+ 
++#include <linux/ipu-isys.h>
++
+ #define AR0234_REG_VALUE_08BIT		1
+ #define AR0234_REG_VALUE_16BIT		2
+ 
+@@ -1338,7 +1340,6 @@ struct ar0234 {
+ 
+ 	/* V4L2 Controls */
+ 	struct v4l2_ctrl *link_freq;
+-	struct v4l2_ctrl *mipi_lanes;
+ 	struct v4l2_ctrl *vblank;
+ 	struct v4l2_ctrl *exposure;
+ 	struct v4l2_ctrl *analogue_gain;
+@@ -1357,6 +1358,8 @@ struct ar0234 {
+ 	struct v4l2_ctrl *hblank;
+ 	struct v4l2_ctrl *vflip;
+ 	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *query_sub_stream;
++	struct v4l2_ctrl *set_sub_stream;
+ 
+ 	/* Current mode */
+ 	const struct ar0234_mode *cur_mode;
+@@ -1368,6 +1371,8 @@ struct ar0234 {
+ 	bool streaming;
+ 
+ 	struct ar0234_platform_data *platform_data;
++
++	s64 sub_stream;
+ };
+ 
+ static int ar0234_read_reg(struct ar0234 *ar0234, u16 reg, u16 len, u32 *val)
+@@ -1493,6 +1498,8 @@ static u64 get_hblank(struct ar0234 *ar0234)
+ 	return hblank;
+ }
+ 
++static int ar0234_set_stream(struct v4l2_subdev *sd, int enable);
++
+ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct ar0234 *ar0234 = container_of(ctrl->handler,
+@@ -1502,6 +1509,15 @@ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
+ 	int ret = 0;
+ 	u32 val;
+ 
++	if (ctrl->id == V4L2_CID_IPU_SET_SUB_STREAM) {
++		val = (*ctrl->p_new.p_s64 & 0xFFFF);
++		dev_info(&client->dev, "V4L2_CID_IPU_SET_SUB_STREAM %x\n", val);
++		mutex_unlock(&ar0234->mutex);
++		ret = ar0234_set_stream(&ar0234->sd, val & 0x00FF);
++		mutex_lock(&ar0234->mutex);
++		return ret;
++	}
++
+ 	/* Propagate change of current control to all related controls */
+ 	if (ctrl->id == V4L2_CID_VBLANK) {
+ 		/* Update max exposure while meeting expected vblanking */
+@@ -1595,7 +1611,11 @@ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
+ 				val);
+ 		dev_info(&client->dev, "set hflip %d\n", ctrl->val);
+ 		break;
++	case V4L2_CID_IPU_QUERY_SUB_STREAM:
++		dev_dbg(&client->dev, "query stream\n");
++		break;
+ 	default:
++		dev_err(&client->dev, "unexpected ctrl id 0x%08x\n", ctrl->id);
+ 		ret = -EINVAL;
+ 		break;
+ 	}
+@@ -1681,13 +1701,89 @@ static struct v4l2_ctrl_config ar0234_frame_interval = {
+ 	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
+ };
+ 
++static struct v4l2_ctrl_config ar0234_q_sub_stream = {
++	.ops = &ar0234_ctrl_ops,
++	.id = V4L2_CID_IPU_QUERY_SUB_STREAM,
++	.name = "query virtual channel",
++	.type = V4L2_CTRL_TYPE_INTEGER_MENU,
++	.max = 1,
++	.min = 0,
++	.def = 0,
++	.menu_skip_mask = 0,
++	.qmenu_int = NULL,
++};
++
++static const struct v4l2_ctrl_config ar0234_s_sub_stream = {
++	.ops = &ar0234_ctrl_ops,
++	.id = V4L2_CID_IPU_SET_SUB_STREAM,
++	.name = "set virtual channel",
++	.type = V4L2_CTRL_TYPE_INTEGER64,
++	.max = 0xFFFF,
++	.min = 0,
++	.def = 0,
++	.step = 1,
++};
++
++#define MIPI_CSI2_TYPE_RAW8    0x2a
++#define MIPI_CSI2_TYPE_RAW10   0x2b
++
++static unsigned int mbus_code_to_mipi(u32 code)
++{
++	switch (code) {
++	case MEDIA_BUS_FMT_SGRBG10_1X10:
++		return MIPI_CSI2_TYPE_RAW10;
++	case MEDIA_BUS_FMT_SGRBG8_1X8:
++		return MIPI_CSI2_TYPE_RAW8;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++}
++
++static void set_sub_stream_fmt(s64 *sub_stream, u32 code)
++{
++       *sub_stream &= 0xFFFFFFFFFFFF0000;
++       *sub_stream |= code;
++}
++
++static void set_sub_stream_h(s64 *sub_stream, u32 height)
++{
++       s64 val = height;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFFFFFF0000FFFF;
++       *sub_stream |= val << 16;
++}
++
++static void set_sub_stream_w(s64 *sub_stream, u32 width)
++{
++       s64 val = width;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFF0000FFFFFFFF;
++       *sub_stream |= val << 32;
++}
++
++static void set_sub_stream_dt(s64 *sub_stream, u32 dt)
++{
++       s64 val = dt;
++       val &= 0xFF;
++       *sub_stream &= 0xFF00FFFFFFFFFFFF;
++       *sub_stream |= val << 48;
++}
++
++static void set_sub_stream_vc_id(s64 *sub_stream, u32 vc_id)
++{
++       s64 val = vc_id;
++       val &= 0xFF;
++       *sub_stream &= 0x00FFFFFFFFFFFFFF;
++       *sub_stream |= val << 56;
++}
++
+ static int ar0234_init_controls(struct ar0234 *ar0234)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&ar0234->sd);
+ 	struct v4l2_ctrl_handler *ctrl_hdlr;
+ 	s64 exposure_max;
+ 	s64 hblank;
+-	struct v4l2_ctrl_config cfg = { 0 };
+ 	int ret;
+ 
+ 	ctrl_hdlr = &ar0234->ctrl_handler;
+@@ -1763,12 +1859,27 @@ static int ar0234_init_controls(struct ar0234 *ar0234)
+ 	ar0234->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &ar0234_ctrl_ops,
+ 					  V4L2_CID_HFLIP, 0, 1, 1, 0);
+ 
++	ar0234_q_sub_stream.qmenu_int = &ar0234->sub_stream;
++	ar0234->query_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &ar0234_q_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new query sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
++	ar0234->set_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &ar0234_s_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new set sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
+ 	if (ctrl_hdlr->error)
+ 		return ctrl_hdlr->error;
+ 
+ 	ar0234->sd.ctrl_handler = ctrl_hdlr;
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void ar0234_update_pad_format(const struct ar0234_mode *mode,
+@@ -1803,7 +1914,9 @@ static int ar0234_start_streaming(struct ar0234 *ar0234)
+ 		}
+ 	}
+ 
++	ar0234->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 	ret = __v4l2_ctrl_handler_setup(ar0234->sd.ctrl_handler);
++	ar0234->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1836,7 +1949,6 @@ static int ar0234_set_stream(struct v4l2_subdev *sd, int enable)
+ 	struct ar0234 *ar0234 = to_ar0234(sd);
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	int ret = 0;
+-
+ 	if (ar0234->streaming == enable)
+ 		return 0;
+ 
+@@ -1926,9 +2038,7 @@ static int ar0234_set_format(struct v4l2_subdev *sd,
+ 	s32 vblank_def;
+ 	s64 hblank;
+ 	int i;
+-	s32 mipi_lanes;
+ 
+-	mipi_lanes = ar0234->mipi_lanes->val;
+ 	for (i = 0; i < ARRAY_SIZE(supported_modes); i++) {
+ 		if (supported_modes[i].width != fmt->format.width
+ 			|| supported_modes[i].height != fmt->format.height) {
+@@ -1939,10 +2049,6 @@ static int ar0234_set_format(struct v4l2_subdev *sd,
+ 			dev_dbg(&client->dev, "pixel format doesn't match\n");
+ 			continue;
+ 		}
+-		if (supported_modes[i].lanes != mipi_lanes) {
+-			dev_dbg(&client->dev, "mipi lanes doesn't match\n");
+-			continue;
+-		}
+ 		mode = &supported_modes[i];
+ 		break;
+ 	}
+@@ -1981,6 +2087,12 @@ static int ar0234_set_format(struct v4l2_subdev *sd,
+ 		__v4l2_ctrl_s_ctrl(ar0234->fps, mode->fps);
+ 
+ 		__v4l2_ctrl_s_ctrl(ar0234->frame_interval, 1000 / mode->fps);
++
++		set_sub_stream_fmt(&ar0234->sub_stream, mode->code);
++		set_sub_stream_h(&ar0234->sub_stream, mode->height);
++		set_sub_stream_w(&ar0234->sub_stream, mode->width);
++		set_sub_stream_dt(&ar0234->sub_stream, mbus_code_to_mipi(mode->code));
++		set_sub_stream_vc_id(&ar0234->sub_stream, 0);
+ 	}
+ 
+ 	mutex_unlock(&ar0234->mutex);
+diff --git a/drivers/media/i2c/d4xx.c b/drivers/media/i2c/d4xx.c
+index c423c5342878..b4ca67f7a103 100644
+--- a/drivers/media/i2c/d4xx.c
++++ b/drivers/media/i2c/d4xx.c
+@@ -1230,6 +1230,7 @@ static int ds5_sensor_set_fmt(struct v4l2_subdev *sd,
+ 	return __ds5_sensor_set_fmt(state, sensor, v4l2_state, fmt);
+ }
+ 
++#if 0 /* function not called */
+ static int ds5_configure(struct ds5 *state)
+ {
+ 	struct ds5_sensor *sensor;
+@@ -1415,6 +1416,7 @@ static int ds5_configure(struct ds5 *state)
+ 
+ 	return 0;
+ }
++#endif
+ 
+ static int ds5_configure_depth(struct ds5 *state)
+ {
+@@ -2443,7 +2445,6 @@ static int ds5_ctrl_init(struct ds5 *state)
+ 	struct v4l2_subdev *sd = &state->mux.sd.subdev;
+ 	int ret;
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	ret = v4l2_ctrl_handler_init(hdl, DS5_N_CONTROLS);
+ 	if (ret < 0) {
+ 		v4l2_err(sd, "cannot init ctrl handler (%d)\n", ret);
+@@ -2494,7 +2495,6 @@ static int ds5_ctrl_init(struct ds5 *state)
+ 
+ 	ctrls->query_sub_stream = v4l2_ctrl_new_custom(hdl, &d4xx_controls_q_sub_stream, NULL);
+ 	ctrls->set_sub_stream = v4l2_ctrl_new_custom(hdl, &d4xx_controls_s_sub_stream, NULL);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	if (hdl->error) {
+ 		v4l2_err(sd, "error creating controls (%d)\n", hdl->error);
+ 		ret = hdl->error;
+@@ -2506,7 +2506,6 @@ static int ds5_ctrl_init(struct ds5 *state)
+ 
+ 	state->mux.sd.subdev.ctrl_handler = hdl;
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	return 0;
+ }
+ 
+@@ -2518,10 +2517,8 @@ static int ds5_sensor_init(struct i2c_client *c, struct ds5 *state,
+ 	struct media_entity *entity = &sensor->sd.entity;
+ 	struct media_pad *pad = &sensor->pad;
+ 	dev_t *dev_num = &state->client->dev.devt;
+-
+-	dev_info(sd->dev, "%s(): %p %s %p %p", __func__, c, c->name, state, state->client);
+-
+ 	struct d4xx_pdata *dpdata = c->dev.platform_data;
++
+ 	v4l2_i2c_subdev_init(sd, c, ops);
+ 	sd->owner = THIS_MODULE;
+ 	sd->internal_ops = &ds5_sensor_internal_ops;
+@@ -2546,14 +2543,12 @@ static int ds5_sensor_register(struct ds5 *state, struct ds5_sensor *sensor)
+ 	// FIXME: is async needed?
+ 	ret = v4l2_device_register_subdev(state->mux.sd.subdev.v4l2_dev, sd);
+ 	if (ret < 0) {
+-		dev_err(sd->dev, "%s(): %d: %d\n", __func__, __LINE__, ret);
+ 		return ret;
+ 	}
+ 
+ 	ret = media_create_pad_link(entity, 0, &state->mux.sd.subdev.entity, sensor->mux_pad,
+ 				       MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
+ 	if (ret < 0) {
+-		dev_err(sd->dev, "%s(): %d: %d\n", __func__, __LINE__, ret);
+ 		goto e_sd;
+ 	}
+ 
+@@ -2803,7 +2798,6 @@ static int ds5_mux_set_fmt(struct v4l2_subdev *sd,
+ 		struct v4l2_subdev_state *v4l2_state,
+ 		struct v4l2_subdev_format *fmt)
+ {
+-	struct ds5 *state = container_of(sd, struct ds5, mux.sd.subdev);
+ 	struct v4l2_mbus_framefmt *ffmt;
+ 	u32 pad = fmt->pad;
+ 	int ret = 0;
+@@ -2932,19 +2926,18 @@ static int ds5_mux_s_frame_interval(struct v4l2_subdev *sd,
+ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ {
+ 	struct ds5 *state = container_of(sd, struct ds5, mux.sd.subdev);
+-	u16 streaming_depth, streaming_rgb, streaming_y8, rate, depth_status, rgb_status, y8_status, s_stream;
++	u16 streaming_depth, streaming_rgb, streaming_y8, rate, depth_status, rgb_status, y8_status;
+ 	int ret = 0;
+ 	u16 streaming, status;
+ 	u16 config_status_base, stream_status_base, stream_id;
+ 	unsigned int i = 0;
++	u16 err_status;
++	u16 tmp;
+ 
+ 	dev_info(&state->client->dev, "%s(): %s on = %d\n", __func__, state->mux.last_set->sd.name, on);
+ 
+ 	state->mux.last_set->streaming = on;
+ 
+-	//if (on)
+-	//	ret = ds5_configure(state);
+-
+ 	// TODO: remove, workaround for FW crash in start
+ 	msleep_range(100);
+ 
+@@ -2968,7 +2961,7 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ 
+ 		return 0;
+ 	}
+-#if 1 /* depth */
++
+ 	msleep_range(100);
+ 	if (on)
+ 		ret = ds5_configure_depth(state);
+@@ -2992,9 +2985,7 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ 			dev_err(&state->client->dev,
+ 				"start depth streaming failed, exit on timeout\n");
+ 		}
+-#endif
+ 
+-#if 1 /* RGB */
+ 	msleep_range(100);
+ 	if (on)
+ 		ret = ds5_configure_rgb(state);
+@@ -3019,8 +3010,6 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ 			dev_err(&state->client->dev,
+ 				"start RGB streaming failed, exit on timeout\n");
+ 		}
+-#endif
+-	//ds5_write(state, 0x1000,  on ? 0x201 : 0x102);
+ 
+ 	/* IR */
+ 	msleep_range(100);
+@@ -3049,11 +3038,9 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ 				"start imu streaming failed, exit on timeout\n");
+ 		}
+ 
+-	u16 err_status;
+ 	// TODO: this read seems to cause FW crash, need to debug
+ 	//ds5_read(state, 0x402, &rate);
+ 	rate = 0;
+-	u16 tmp;
+ 
+ 	ds5_read(state, 0x401a, &err_status);
+ 	ds5_read(state, 0x1004, &streaming_depth);
+@@ -3080,19 +3067,18 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
+ 
+ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ {
+-	u16 streaming_depth, streaming_rgb, streaming_y8, rate, depth_status, rgb_status, y8_status, s_stream;
++	u16 streaming_depth, streaming_rgb, streaming_y8, rate, depth_status, rgb_status, y8_status;
+ 	int ret = 0;
+ 	u16 streaming, status;
+ 	u16 config_status_base, stream_status_base, stream_id;
+ 	unsigned int i = 0;
++	u16 err_status;
++	u16 tmp;
+ 
+ 	dev_info(&state->client->dev, "%s(): %s on = %d\n", __func__, state->mux.last_set->sd.name, on);
+ 
+ 	state->mux.last_set->streaming = on;
+ 
+-	//if (on)
+-	//	ret = ds5_configure(state);
+-
+ 	// TODO: remove, workaround for FW crash in start
+ 	msleep_range(100);
+ 
+@@ -3102,28 +3088,23 @@ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ 		ds5_read(state, 0x4802, &rgb_status);
+ 
+ 		if ((vc_id == DS5_MUX_PAD_DEPTH_A - 1) || (vc_id == DS5_MUX_PAD_DEPTH_B - 1)) {
+-		msleep_range(100);
+-		ret = ds5_write(state, DS5_START_STOP_STREAM,
+-				DS5_STREAM_STOP | DS5_STREAM_DEPTH);
+-}
++			msleep_range(100);
++			ret = ds5_write(state, DS5_START_STOP_STREAM,
++					DS5_STREAM_STOP | DS5_STREAM_DEPTH);
++		}
+ 		if ((vc_id == DS5_MUX_PAD_RGB_A - 1) || (vc_id == DS5_MUX_PAD_RGB_B - 1)) {
+-		msleep_range(100);
+-		ret = ds5_write(state, DS5_START_STOP_STREAM,
+-				DS5_STREAM_STOP | DS5_STREAM_RGB);
+-}
+-/*
+-		msleep_range(100);
+-		ret = ds5_write(state, DS5_START_STOP_STREAM,
+-				DS5_STREAM_STOP | DS5_STREAM_IMU);
+-*/
++			msleep_range(100);
++			ret = ds5_write(state, DS5_START_STOP_STREAM,
++					DS5_STREAM_STOP | DS5_STREAM_RGB);
++		}
+ 		if ((vc_id == DS5_MUX_PAD_MOTION_T_A - 1) || (vc_id == DS5_MUX_PAD_MOTION_T_B - 1)) {
+-		msleep_range(100);
+-		ret = ds5_write(state, DS5_START_STOP_STREAM,
+-				DS5_STREAM_STOP | DS5_STREAM_IR);
+-}
++			msleep_range(100);
++			ret = ds5_write(state, DS5_START_STOP_STREAM,
++					DS5_STREAM_STOP | DS5_STREAM_IR);
++		}
+ 		return 0;
+ 	}
+-#if 1 /* depth */
++
+ 	msleep_range(100);
+ 	if ((on) && ((vc_id == DS5_MUX_PAD_DEPTH_A - 1) || (vc_id == DS5_MUX_PAD_DEPTH_B - 1))) {
+ 		ret = ds5_configure_depth(state);
+@@ -3148,9 +3129,7 @@ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ 				"start depth streaming failed, exit on timeout\n");
+ 		}
+ 	}
+-#endif
+ 
+-#if 1 /* RGB */
+ 	if ((on) && ((vc_id == DS5_MUX_PAD_RGB_A - 1) || (vc_id == DS5_MUX_PAD_RGB_B - 1))) {
+ 	msleep_range(100);
+ 	if (on)
+@@ -3174,11 +3153,9 @@ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ 
+ 		if (DS5_START_MAX_COUNT == i) {
+ 			dev_err(&state->client->dev,
+-				"start RGB streaming failed, exit on timeout\n");
++					"start RGB streaming failed, exit on timeout\n");
+ 		}
+-}
+-#endif
+-	//ds5_write(state, 0x1000,  on ? 0x201 : 0x102);
++	}
+ 
+ 	if ((on) && ((vc_id == DS5_MUX_PAD_MOTION_T_A - 1) || (vc_id == DS5_MUX_PAD_MOTION_T_B - 1))) {
+ 	msleep_range(100);
+@@ -3206,14 +3183,12 @@ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ 			dev_err(&state->client->dev,
+ 				"start imu streaming failed, exit on timeout\n");
+ 		}
+-}
++	}
+ 
+-	    u16 err_status;
+ 	// TODO: this read seems to cause FW crash, need to debug
+ 	//ds5_read(state, 0x402, &rate);
+ 	rate = 0;
+-    u16 tmp;
+-    ds5_read(state, 0x401a, &err_status);
++	ds5_read(state, 0x401a, &err_status);
+ 
+ 	ds5_read(state, 0x1004, &streaming_depth);
+ 	ds5_read(state, 0x1008, &streaming_rgb);
+@@ -3221,14 +3196,14 @@ static int ds5_mux_s_stream_vc(struct ds5 *state, u16 vc_id, u16 on)
+ 	ds5_read(state, 0x4800, &depth_status);
+ 	ds5_read(state, 0x4802, &rgb_status);
+ 	ds5_read(state, 0x4808, &y8_status);
+-    ds5_read(state, 0x4002, &tmp);
+-    ds5_read(state, 0x4022, &tmp);
+-    ds5_read(state, 0x4082, &tmp);
+-
+-    //ds5_write(state, 0x4002,  0x100 );
+-   //ds5_write(state, 0x4022,  0x0 );
+-    //ds5_read(state, 0x4002, &tmp);
+-    //ds5_read(state, 0x4022, &tmp);
++	ds5_read(state, 0x4002, &tmp);
++	ds5_read(state, 0x4022, &tmp);
++	ds5_read(state, 0x4082, &tmp);
++
++	//ds5_write(state, 0x4002,  0x100 );
++	//ds5_write(state, 0x4022,  0x0 );
++	//ds5_read(state, 0x4002, &tmp);
++	//ds5_read(state, 0x4022, &tmp);
+ 	msleep_range(DS5_START_POLL_TIME*50);
+ 
+ 	dev_info(&state->client->dev, "%s(): streaming %x-%x-%x depth status 0x%04x, rgb status 0x%04x, rate %u\n", __func__,
+@@ -3326,23 +3301,21 @@ static const struct v4l2_subdev_ops ds5_mux_subdev_ops = {
+ 	.video = &ds5_mux_video_ops,
+ };
+ 
++#if 0 /* function not used */
+ static int ds5_des_register(struct ds5 *state, struct ds5_des *des)
+ {
+ 	struct v4l2_subdev *sd = &des->sd;
+-	struct media_entity *entity = &des->sd.entity;
+ 	int ret;
+ 
+ 	// FIXME: is async needed?
+ 	ret = v4l2_device_register_subdev(state->mux.sd.subdev.v4l2_dev, sd);
+ 	if (ret < 0) {
+-		dev_err(sd->dev, "%s(): %d: %d\n", __func__, __LINE__, ret);
+ 		return ret;
+ 	}
+ 
+ 	//ret = media_create_pad_link(entity, 1, &state->mux.sd.subdev.entity, des->mux_pad,
+ 	//			       MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
+ 	//if (ret < 0) {
+-	//	dev_err(sd->dev, "%s(): %d: %d\n", __func__, __LINE__, ret);
+ 	//	goto e_sd;
+        // }
+ 
+@@ -3355,6 +3328,7 @@ static int ds5_des_register(struct ds5 *state, struct ds5_des *des)
+ 
+ 	return ret;
+ }
++#endif
+ 
+ static int ds5_mux_registered(struct v4l2_subdev *sd)
+ {
+@@ -3415,12 +3389,9 @@ static int ds5_mux_register(struct i2c_client *c, struct ds5 *state)
+ 
+ static int ds5_hw_init(struct i2c_client *c, struct ds5 *state)
+ {
+-	struct v4l2_subdev *sd = &state->mux.sd.subdev;
+ 	u16 mipi_status, n_lanes, phy, drate_min, drate_max;
+ 	int ret;
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+-
+ 	ret = ds5_read(state, DS5_MIPI_SUPPORT_LINES, &n_lanes);
+ 	if (!ret)
+ 		ret = ds5_read(state, DS5_MIPI_SUPPORT_PHY, &phy);
+@@ -3431,12 +3402,6 @@ static int ds5_hw_init(struct i2c_client *c, struct ds5 *state)
+ 	if (!ret)
+ 		ret = ds5_read(state, DS5_MIPI_DATARATE_MAX, &drate_max);
+ 
+-	if (!ret)
+-		dev_info(sd->dev, "%s(): %d: %u lanes, phy %x, data rate %u-%u\n",
+-			 __func__, __LINE__, n_lanes, phy, drate_min, drate_max);
+-
+-	dev_info(NULL, "%s(), line %d, set 2 lanes\n", __func__, __LINE__);
+-	// mjchen: 4 or 2 ?
+ 	n_lanes = 2;
+ 
+ 	ret = ds5_write(state, DS5_MIPI_LANE_NUMS, n_lanes - 1);
+@@ -3445,13 +3410,10 @@ static int ds5_hw_init(struct i2c_client *c, struct ds5 *state)
+ 
+ 	ret = ds5_read(state, DS5_MIPI_CONF_STATUS, &mipi_status);
+ 
+-	dev_info(sd->dev, "%s(): %d status %x\n", __func__, __LINE__,
+-		 mipi_status);
+-//	dev_info(sd->dev, "%s(): %d phandle %x node %s status %x\n", __func__, __LINE__,
+-//		 c->dev.of_node->phandle, c->dev.of_node->full_name, mipi_status);
+-
+ 	return ret;
+ }
++
++#if 0 /* not used function */
+ static int ds5_des_init(struct i2c_client *c, struct ds5 *state)
+ {
+ 	struct v4l2_subdev *sd = &state->max9296.des.sd;
+@@ -3479,6 +3441,7 @@ static int ds5_des_init(struct i2c_client *c, struct ds5 *state)
+ 	entity->function = MEDIA_ENT_F_CAM_SENSOR;
+ 	return media_entity_pads_init(entity, 2, pads);
+ }
++#endif
+ static int ds5_mux_init(struct i2c_client *c, struct ds5 *state)
+ {
+ 	struct v4l2_subdev *sd = &state->mux.sd.subdev;
+@@ -3528,7 +3491,6 @@ static int ds5_mux_init(struct i2c_client *c, struct ds5 *state)
+ e_ctrl:
+ 	v4l2_ctrl_handler_free(sd->ctrl_handler);
+ #endif
+-e_entity:
+ 	media_entity_cleanup(entity);
+ 
+ 	return ret;
+@@ -3611,7 +3573,6 @@ static int ds5_fixed_configuration(struct i2c_client *client, struct ds5 *state)
+ 	}
+ 	}
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	sensor = &state->rgb.sensor;
+ 	switch (dev_type) {
+ 	case DS5_DEVICE_TYPE_D43X:
+@@ -3639,7 +3600,6 @@ static int ds5_fixed_configuration(struct i2c_client *client, struct ds5 *state)
+ 	sensor->n_formats = 1;
+ 	sensor->mux_pad = DS5_MUX_PAD_IMU;
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	/* Development: set a configuration during probing */
+ 	if ((cfg0 & 0xff00) == 0x1800) {
+ 		/* MIPI CSI-2 YUV420 isn't supported by V4L, reconfigure to Y8 */
+@@ -3664,28 +3624,21 @@ static int ds5_fixed_configuration(struct i2c_client *client, struct ds5 *state)
+ 			return ret;
+ 	}
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	return 0;
+ }
+ 
+ static int ds5_parse_cam(struct i2c_client *client, struct ds5 *state)
+ {
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	int ret;
+ 
+ 	ret = ds5_fixed_configuration(client, state);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	ds5_sensor_format_init(&state->depth.sensor);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	ds5_sensor_format_init(&state->motion_t.sensor);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	ds5_sensor_format_init(&state->rgb.sensor);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	ds5_sensor_format_init(&state->imu.sensor);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 
+ 	return 0;
+ }
+@@ -3858,16 +3811,17 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
+ 
+ 	if (mutex_lock_interruptible(&state->lock))
+ 		return -ERESTARTSYS;
+-	switch (state->dfu_dev.dfu_state_flag) {
+ 
+-	case DS5_DFU_OPEN:
++	if (state->dfu_dev.dfu_state_flag == DS5_DFU_OPEN) {
+ 		ret = ds5_dfu_switch_to_dfu(state);
+ 		if (ret < 0) {
+ 			dev_err(&state->client->dev, "%s(): Switch to dfu failed (%d)\n", __func__, ret);
+ 			goto dfu_write_error;
+ 		}
+-		/*no break - proceed to recovery*/
+-	case DS5_DFU_RECOVERY:
++		state->dfu_dev.dfu_state_flag = DS5_DFU_RECOVERY;
++	}
++
++	if (state->dfu_dev.dfu_state_flag == DS5_DFU_RECOVERY) {
+ 		ret = ds5_dfu_detach(state);
+ 		if (ret < 0) {
+ 			dev_err(&state->client->dev, "%s(): Detach failed (%d)\n", __func__, ret);
+@@ -3875,9 +3829,9 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
+ 		}
+ 		state->dfu_dev.dfu_state_flag = DS5_DFU_IN_PROGRESS;
+ 		state->dfu_dev.init_v4l_f = 1;
++	}
+ 
+-		/*no break - proceed to download*/
+-	case DS5_DFU_IN_PROGRESS: {
++	if (state->dfu_dev.dfu_state_flag == DS5_DFU_IN_PROGRESS) {
+ 		unsigned int dfu_full_blocks = len / DFU_BLOCK_SIZE;
+ 		unsigned int dfu_part_blocks = len % DFU_BLOCK_SIZE;
+ 
+@@ -3911,14 +3865,11 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
+ 			state->dfu_dev.dfu_state_flag = DS5_DFU_DONE;
+ 		}
+ 		dev_notice(&state->client->dev, "%s(): DFU block (%d) bytes written\n", __func__, (int)len);
+-		break;
+-	}
+-	default:
++	} else {
+ 		dev_err(&state->client->dev, "%s(): Wrong state (%d)\n", __func__, state->dfu_dev.dfu_state_flag);
+ 		ret =  -EINVAL;
+ 		goto dfu_write_error;
+-
+-	};
++	}
+ 	mutex_unlock(&state->lock);
+ 	return len;
+ 
+@@ -4233,7 +4184,6 @@ static int ds5_probe(struct i2c_client *c, const struct i2c_device_id *id)
+ 		state->is_rgb = 1;
+ 
+ 	ret = ds5_v4l_init(c, state);
+-	dev_info(NULL, "%s(), line %d\n", __func__, __LINE__);
+ 	if (ret < 0)
+ 		goto e_chardev;
+ 	/* Override I2C drvdata */
+diff --git a/drivers/media/i2c/imx390.c b/drivers/media/i2c/imx390.c
+index 654793cf76a5..b4e5141278b6 100644
+--- a/drivers/media/i2c/imx390.c
++++ b/drivers/media/i2c/imx390.c
+@@ -1685,7 +1685,7 @@ static int __maybe_unused imx390_resume(struct device *dev)
+ }
+ 
+ static int imx390_set_format(struct v4l2_subdev *sd,
+-			     struct v4l2_subdev_pad_config *cfg,
++			     struct v4l2_subdev_state *sd_state,
+ 			     struct v4l2_subdev_format *fmt)
+ {
+ 	struct imx390 *imx390 = to_imx390(sd);
+@@ -1714,7 +1714,7 @@ static int imx390_set_format(struct v4l2_subdev *sd,
+ 
+ 	imx390_update_pad_format(mode, &fmt->format);
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+-		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
++		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+ 	} else {
+ 		imx390->cur_mode = mode;
+ 		__v4l2_ctrl_s_ctrl(imx390->link_freq, mode->link_freq_index);
+@@ -1746,14 +1746,14 @@ static int imx390_set_format(struct v4l2_subdev *sd,
+ }
+ 
+ static int imx390_get_format(struct v4l2_subdev *sd,
+-			     struct v4l2_subdev_pad_config *cfg,
++			     struct v4l2_subdev_state *sd_state,
+ 			     struct v4l2_subdev_format *fmt)
+ {
+ 	struct imx390 *imx390 = to_imx390(sd);
+ 
+ 	mutex_lock(&imx390->mutex);
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
+-		fmt->format = *v4l2_subdev_get_try_format(&imx390->sd, cfg,
++		fmt->format = *v4l2_subdev_get_try_format(&imx390->sd, sd_state,
+ 							  fmt->pad);
+ 	else
+ 		imx390_update_pad_format(imx390->cur_mode, &fmt->format);
+@@ -1774,14 +1774,13 @@ static int imx390_get_frame_desc(struct v4l2_subdev *sd,
+ 		desc->entry[i].flags = 0;
+ 		desc->entry[i].pixelcode = MEDIA_BUS_FMT_FIXED;
+ 		desc->entry[i].length = 0;
+-		desc->entry[i].bus.csi2.channel = i;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ static int imx390_enum_mbus_code(struct v4l2_subdev *sd,
+-				 struct v4l2_subdev_pad_config *cfg,
++				 struct v4l2_subdev_state *sd_state,
+ 				 struct v4l2_subdev_mbus_code_enum *code)
+ {
+ 	if (code->index >= ARRAY_SIZE(supported_formats))
+@@ -1793,7 +1792,7 @@ static int imx390_enum_mbus_code(struct v4l2_subdev *sd,
+ }
+ 
+ static int imx390_enum_frame_size(struct v4l2_subdev *sd,
+-				  struct v4l2_subdev_pad_config *cfg,
++				  struct v4l2_subdev_state *sd_state,
+ 				  struct v4l2_subdev_frame_size_enum *fse)
+ {
+ 	if (fse->index >= ARRAY_SIZE(supported_modes))
+@@ -1810,7 +1809,7 @@ static int imx390_enum_frame_size(struct v4l2_subdev *sd,
+ static int imx390_frame_rate[] = { 40, 20 };
+ 
+ static int imx390_enum_frame_interval(struct v4l2_subdev *subdev,
+-		struct v4l2_subdev_pad_config *cfg,
++		struct v4l2_subdev_state *sd_state,
+ 		struct v4l2_subdev_frame_interval_enum *fie)
+ {
+ 	int mode_size = ARRAY_SIZE(supported_modes);
+@@ -1840,7 +1839,7 @@ static int imx390_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+ 
+ 	mutex_lock(&imx390->mutex);
+ 	imx390_update_pad_format(&supported_modes[0],
+-				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
++				 v4l2_subdev_get_try_format(sd, fh->state, 0));
+ 	mutex_unlock(&imx390->mutex);
+ 
+ 	return 0;
+@@ -1994,7 +1993,7 @@ static int imx390_probe(struct i2c_client *client)
+ 		goto probe_error_v4l2_ctrl_handler_free;
+ 	}
+ 
+-	ret = v4l2_async_register_subdev_sensor_common(&imx390->sd);
++	ret = v4l2_async_register_subdev_sensor(&imx390->sd);
+ 	if (ret < 0) {
+ 		dev_err(&client->dev, "failed to register V4L2 subdev: %d",
+ 			ret);
+diff --git a/drivers/media/i2c/ov13858_intel.c b/drivers/media/i2c/ov13858_intel.c
+index 77d46f594a3c..11bf93018bab 100644
+--- a/drivers/media/i2c/ov13858_intel.c
++++ b/drivers/media/i2c/ov13858_intel.c
+@@ -1,5 +1,5 @@
+- //SPDX-License-Identifier: GPL-2.0
+- //Copyright (c) 2021 Intel Corporation.
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2022 Intel Corporation.
+ 
+ #include <linux/acpi.h>
+ #include <linux/i2c.h>
+diff --git a/drivers/media/i2c/ti960-des.c b/drivers/media/i2c/ti960-des.c
+index 5898aa312f7f..9d5227f22909 100644
+--- a/drivers/media/i2c/ti960-des.c
++++ b/drivers/media/i2c/ti960-des.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2020 Intel Corporation
++// Copyright (C) 2022 Intel Corporation
+ 
+ #include <linux/device.h>
+ #include <linux/gpio.h>
+@@ -8,6 +8,7 @@
+ #include <linux/wait.h>
+ #include <linux/delay.h>
+ #include <linux/platform_device.h>
++#include <linux/ipu-isys.h>
+ #include <linux/version.h>
+ 
+ #include <media/media-device.h>
+@@ -19,6 +20,9 @@
+ #include "ti960-reg.h"
+ #include "ti953.h"
+ 
++#define MIPI_CSI2_TYPE_RAW12   0x2c
++#define MIPI_CSI2_TYPE_YUV422_8	0x1e
++
+ struct ti960_subdev {
+ 	struct v4l2_subdev *sd;
+ 	unsigned short rx_port;
+@@ -47,8 +51,6 @@ struct ti960 {
+ 	struct rect *crop;
+ 	struct rect *compose;
+ 
+-	struct v4l2_subdev_route *ti960_route;
+-
+ 	unsigned int nsinks;
+ 	unsigned int nsources;
+ 	unsigned int nstreams;
+@@ -62,9 +64,15 @@ struct ti960 {
+ 
+ #define to_ti960(_sd) container_of(_sd, struct ti960, sd)
+ 
+-static const s64 ti960_op_sys_clock[] =  {400000000, 800000000};
++static const s64 ti960_op_sys_clock[] =  {200000000,
++					  400000000,
++					  600000000,
++					  800000000};
++
+ static const u8 ti960_op_sys_clock_reg_val[] = {
++	TI960_MIPI_400MBPS,
+ 	TI960_MIPI_800MBPS,
++	TI960_MIPI_1200MBPS,
+ 	TI960_MIPI_1600MBPS
+ };
+ 
+@@ -126,6 +134,52 @@ static struct regmap_config ti960_reg_config16 = {
+ 	.reg_format_endian = REGMAP_ENDIAN_BIG,
+ };
+ 
++static s64 ti960_query_sub_stream[NR_OF_TI960_SINK_PADS] = {
++	0, 0, 0, 0
++};
++
++static void set_sub_stream_fmt(int index, u32 code)
++{
++	ti960_query_sub_stream[index] &= 0xFFFFFFFFFFFF0000;
++	ti960_query_sub_stream[index] |= code;
++}
++
++static void set_sub_stream_h(int index, u32 height)
++{
++	s64 val = height & 0xFFFF;
++
++	ti960_query_sub_stream[index] &= 0xFFFFFFFF0000FFFF;
++	ti960_query_sub_stream[index] |= val << 16;
++}
++
++static void set_sub_stream_w(int index, u32 width)
++{
++	s64 val = width & 0xFFFF;
++
++	ti960_query_sub_stream[index] &= 0xFFFF0000FFFFFFFF;
++	ti960_query_sub_stream[index] |= val << 32;
++}
++
++static void set_sub_stream_dt(int index, u32 dt)
++{
++	s64 val = dt & 0xFF;
++
++	ti960_query_sub_stream[index] &= 0xFF00FFFFFFFFFFFF;
++	ti960_query_sub_stream[index] |= val << 48;
++}
++
++static void set_sub_stream_vc_id(int index, u32 vc_id)
++{
++	s64 val = vc_id & 0xFF;
++
++	ti960_query_sub_stream[index] &= 0x00FFFFFFFFFFFFFF;
++	ti960_query_sub_stream[index] |= val << 56;
++}
++
++static u8 ti960_set_sub_stream[] = {
++	0, 0, 0, 0
++};
++
+ int bus_switch(struct ti960 *va)
+ {
+ 	int ret;
+@@ -181,6 +235,7 @@ static int ti960_reg_write(struct ti960 *va, unsigned char reg, unsigned int val
+ 	int ret, retry, timeout = 10;
+ 
+ 	for (retry = 0; retry < timeout; retry++) {
++		dev_dbg(va->sd.dev, "write reg %x = %x", reg, val);
+ 		ret = regmap_write(va->regmap8, reg, val);
+ 		if (ret < 0) {
+ 			dev_err(va->sd.dev, "960 reg write ret=%x", ret);
+@@ -336,86 +391,9 @@ static int ti960_fsin_gpio_init(struct ti960 *va, unsigned short rx_port,
+ 	return rval;
+ }
+ 
+-static int ti960_get_routing(struct v4l2_subdev *sd,
+-				   struct v4l2_subdev_routing *route)
+-{
+-	struct ti960 *va = to_ti960(sd);
+-	int i, j;
+-
+-	/* active routing first */
+-	j = 0;
+-	for (i = 0; i < va->nstreams; ++i) {
+-		if (j >= route->num_routes)
+-			break;
+-		if (!(va->ti960_route[i].flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE))
+-			continue;
+-		route->routes[j].sink_pad = va->ti960_route[i].sink_pad;
+-		route->routes[j].sink_stream = va->ti960_route[i].sink_stream;
+-		route->routes[j].source_pad = va->ti960_route[i].source_pad;
+-		route->routes[j].source_stream = va->ti960_route[i].source_stream;
+-		route->routes[j].flags = va->ti960_route[i].flags;
+-		j++;
+-	}
+-
+-	for (i = 0; i < va->nstreams; ++i) {
+-		if (j >= route->num_routes)
+-			break;
+-		if (va->ti960_route[i].flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE)
+-			continue;
+-		route->routes[j].sink_pad = va->ti960_route[i].sink_pad;
+-		route->routes[j].sink_stream = va->ti960_route[i].sink_stream;
+-		route->routes[j].source_pad = va->ti960_route[i].source_pad;
+-		route->routes[j].source_stream = va->ti960_route[i].source_stream;
+-		route->routes[j].flags = va->ti960_route[i].flags;
+-		j++;
+-	}
+-
+-	route->num_routes = i;
+-
+-	return 0;
+-}
+-
+-static int ti960_set_routing(struct v4l2_subdev *sd,
+-				   struct v4l2_subdev_routing *route)
+-{
+-	struct ti960 *va = to_ti960(sd);
+-	int i, j, ret = 0;
+-
+-	for (i = 0; i < min(route->num_routes, va->nstreams); ++i) {
+-		struct v4l2_subdev_route *t = &route->routes[i];
+-
+-		if (t->sink_stream > va->nstreams - 1 ||
+-		    t->source_stream > va->nstreams - 1)
+-			continue;
+-
+-		if (t->source_pad != TI960_PAD_SOURCE)
+-			continue;
+-
+-		for (j = 0; j < va->nstreams; j++) {
+-			if (t->sink_pad == va->ti960_route[j].sink_pad &&
+-				t->source_pad == va->ti960_route[j].source_pad &&
+-				t->sink_stream == va->ti960_route[j].sink_stream &&
+-				t->source_stream == va->ti960_route[j].source_stream)
+-				break;
+-		}
+-
+-		if (j == va->nstreams)
+-			continue;
+-
+-		if (t->flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE)
+-			va->ti960_route[j].flags |=
+-				V4L2_SUBDEV_ROUTE_FL_ACTIVE;
+-		else if (!(t->flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE))
+-			va->ti960_route[j].flags &=
+-				(~V4L2_SUBDEV_ROUTE_FL_ACTIVE);
+-	}
+-
+-	return ret;
+-}
+-
+ static int ti960_enum_mbus_code(struct v4l2_subdev *sd,
+-				      struct v4l2_subdev_pad_config *cfg,
+-				      struct v4l2_subdev_mbus_code_enum *code)
++				struct v4l2_subdev_state *sd_state,
++				struct v4l2_subdev_mbus_code_enum *code)
+ {
+ 	struct ti960 *va = to_ti960(sd);
+ 	const uint32_t *supported_code =
+@@ -423,25 +401,6 @@ static int ti960_enum_mbus_code(struct v4l2_subdev *sd,
+ 	bool next_stream = false;
+ 	int i;
+ 
+-	if (code->stream & V4L2_SUBDEV_FLAG_NEXT_STREAM) {
+-		next_stream = true;
+-		code->stream &= ~V4L2_SUBDEV_FLAG_NEXT_STREAM;
+-	}
+-
+-	if (code->stream > va->nstreams)
+-		return -EINVAL;
+-
+-	if (next_stream) {
+-		if (!(va->pad[code->pad].flags & MEDIA_PAD_FL_MULTIPLEX))
+-			return -EINVAL;
+-		if (code->stream < va->nstreams - 1) {
+-			code->stream++;
+-			return 0;
+-		} else {
+-			return -EINVAL;
+-		}
+-	}
+-
+ 	for (i = 0; supported_code[i]; i++) {
+ 		if (i == code->index) {
+ 			code->code = supported_code[i];
+@@ -465,29 +424,12 @@ static const struct ti960_csi_data_format
+ 	return &va_csi_data_formats[0];
+ }
+ 
+-static int ti960_get_routing_remote_pad(struct v4l2_subdev *sd,
+-	unsigned int pad)
+-{
+-	struct ti960 *va = to_ti960(sd);
+-	int i;
+-
+-	for (i = 0; i < va->nstreams; ++i) {
+-		if (va->ti960_route[i].sink_pad == pad)
+-			return va->ti960_route[i].source_pad;
+-		if (va->ti960_route[i].source_pad == pad)
+-			return va->ti960_route[i].sink_pad;
+-	}
+-	return -1;
+-}
+-
+ static int ti960_get_frame_desc(struct v4l2_subdev *sd,
+ 	unsigned int pad, struct v4l2_mbus_frame_desc *desc)
+ {
+ 	struct ti960 *va = to_ti960(sd);
+ 	int sink_pad = pad;
+ 
+-	if (va->pad[pad].flags & MEDIA_PAD_FL_SOURCE)
+-		sink_pad = ti960_get_routing_remote_pad(sd, pad);
+ 	if (sink_pad >= 0) {
+ 		struct media_pad *remote_pad =
+ 			media_entity_remote_pad(&sd->entity.pads[sink_pad]);
+@@ -505,36 +447,39 @@ static int ti960_get_frame_desc(struct v4l2_subdev *sd,
+ 
+ static struct v4l2_mbus_framefmt *
+ __ti960_get_ffmt(struct v4l2_subdev *subdev,
+-			 struct v4l2_subdev_pad_config *cfg,
+-			 unsigned int pad, unsigned int which,
+-			 unsigned int stream)
++		 struct v4l2_subdev_state *sd_state,
++		 unsigned int pad, unsigned int which,
++		 unsigned int stream)
+ {
+ 	struct ti960 *va = to_ti960(subdev);
+ 
++	if (pad < 0 || pad >= NR_OF_TI960_PADS ||
++	    stream < 0 || stream >= va->nstreams) {
++		dev_err(subdev->dev, "%s invalid pad %d, or stream %d\n", __func__, pad, stream);
++		return NULL;
++	}
++
+ 	if (which == V4L2_SUBDEV_FORMAT_TRY)
+-		return v4l2_subdev_get_try_format(subdev, cfg, pad);
++		return v4l2_subdev_get_try_format(subdev, sd_state, pad);
+ 	else
+ 		return &va->ffmts[pad][stream];
+ }
+ 
+ static int ti960_get_format(struct v4l2_subdev *subdev,
+-				  struct v4l2_subdev_pad_config *cfg,
+-				struct v4l2_subdev_format *fmt)
++			    struct v4l2_subdev_state *sd_state,
++			    struct v4l2_subdev_format *fmt)
+ {
+ 	struct ti960 *va = to_ti960(subdev);
+ 
+-	if (fmt->stream > va->nstreams)
+-		return -EINVAL;
+-
+ 	mutex_lock(&va->mutex);
+-	fmt->format = *__ti960_get_ffmt(subdev, cfg, fmt->pad,
+-						    fmt->which, fmt->stream);
++	fmt->format = *__ti960_get_ffmt(subdev, sd_state, fmt->pad,
++					fmt->which, 0);
+ 	mutex_unlock(&va->mutex);
+ 
+-	dev_dbg(subdev->dev, "subdev_format: which: %s, pad: %d, stream: %d.\n",
++	dev_dbg(subdev->dev, "subdev_format: which: %s, pad: %d.\n",
+ 		 fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE ?
+ 		 "V4L2_SUBDEV_FORMAT_ACTIVE" : "V4L2_SUBDEV_FORMAT_TRY",
+-		 fmt->pad, fmt->stream);
++		 fmt->pad);
+ 
+ 	dev_dbg(subdev->dev, "framefmt: width: %d, height: %d, code: 0x%x.\n",
+ 	       fmt->format.width, fmt->format.height, fmt->format.code);
+@@ -543,22 +488,18 @@ static int ti960_get_format(struct v4l2_subdev *subdev,
+ }
+ 
+ static int ti960_set_format(struct v4l2_subdev *subdev,
+-				  struct v4l2_subdev_pad_config *cfg,
+-				struct v4l2_subdev_format *fmt)
++			    struct v4l2_subdev_state *sd_state,
++			    struct v4l2_subdev_format *fmt)
+ {
+ 	struct ti960 *va = to_ti960(subdev);
+ 	const struct ti960_csi_data_format *csi_format;
+ 	struct v4l2_mbus_framefmt *ffmt;
+ 
+-	if (fmt->stream > va->nstreams)
+-		return -EINVAL;
+-
+ 	csi_format = ti960_validate_csi_data_format(
+ 		fmt->format.code);
+ 
+ 	mutex_lock(&va->mutex);
+-	ffmt = __ti960_get_ffmt(subdev, cfg, fmt->pad, fmt->which,
+-				      fmt->stream);
++	ffmt = __ti960_get_ffmt(subdev, sd_state, fmt->pad, fmt->which, 0);
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+ 		ffmt->width = fmt->format.width;
+@@ -568,8 +509,22 @@ static int ti960_set_format(struct v4l2_subdev *subdev,
+ 	fmt->format = *ffmt;
+ 	mutex_unlock(&va->mutex);
+ 
+-	dev_dbg(subdev->dev, "framefmt: width: %d, height: %d, code: 0x%x.\n",
+-	       ffmt->width, ffmt->height, ffmt->code);
++	if (fmt->pad < NR_OF_TI960_SINK_PADS) {
++		set_sub_stream_fmt(fmt->pad, ffmt->code);
++		set_sub_stream_h(fmt->pad, ffmt->height);
++		set_sub_stream_w(fmt->pad, ffmt->width);
++
++		/* select correct csi-2 data type id */
++		if (ffmt->code >= MEDIA_BUS_FMT_UYVY8_1X16 &&
++				ffmt->code <= MEDIA_BUS_FMT_YVYU8_1X16)
++			set_sub_stream_dt(fmt->pad, MIPI_CSI2_TYPE_YUV422_8);
++		else
++			set_sub_stream_dt(fmt->pad, MIPI_CSI2_TYPE_RAW12);
++		set_sub_stream_vc_id(fmt->pad, fmt->pad);
++		dev_dbg(subdev->dev,
++			"framefmt: width: %d, height: %d, code: 0x%x.\n",
++			ffmt->width, ffmt->height, ffmt->code);
++	}
+ 
+ 	return 0;
+ }
+@@ -578,7 +533,7 @@ static int ti960_open(struct v4l2_subdev *subdev,
+ 				struct v4l2_subdev_fh *fh)
+ {
+ 	struct v4l2_mbus_framefmt *try_fmt =
+-		v4l2_subdev_get_try_format(subdev, fh->pad, 0);
++		v4l2_subdev_get_try_format(subdev, fh->state, 0);
+ 
+ 	struct v4l2_subdev_format fmt = {
+ 		.which = V4L2_SUBDEV_FORMAT_TRY,
+@@ -588,7 +543,6 @@ static int ti960_open(struct v4l2_subdev *subdev,
+ 			.height = TI960_MAX_HEIGHT,
+ 			.code = MEDIA_BUS_FMT_SBGGR12_1X12,
+ 		},
+-		.stream = 0,
+ 	};
+ 
+ 	*try_fmt = fmt.format;
+@@ -792,7 +746,7 @@ static int ti960_registered(struct v4l2_subdev *subdev)
+ 		for (l = 0; l < va->nsinks; l++) {
+ 			rval = media_create_pad_link(
+ 				&va->sub_devs[k].sd->entity, j,
+-				&va->sd.entity, l, 0);
++				&va->sd.entity, l, MEDIA_LNK_FL_DYNAMIC);
+ 			if (rval) {
+ 				dev_err(va->sd.dev,
+ 					"can't create link to %c\n",
+@@ -830,7 +784,7 @@ static int ti960_set_power(struct v4l2_subdev *subdev, int on)
+ 	val = TI960_CSI_ENABLE;
+ 	val |= TI960_CSI_CONTS_CLOCK;
+ 	/* Enable skew calculation when 1.6Gbps output is enabled. */
+-	if (v4l2_ctrl_g_ctrl(va->link_freq))
++	if (v4l2_ctrl_g_ctrl(va->link_freq) == 3)
+ 		val |= TI960_CSI_SKEWCAL;
+ 	return ti960_reg_write(va, TI960_CSI_CTL, val);
+ }
+@@ -853,10 +807,12 @@ static bool ti960_broadcast_mode(struct v4l2_subdev *subdev)
+ 		if (!remote_pad)
+ 			continue;
+ 
++		if (!ti960_set_sub_stream[i])
++			continue;
++
+ 		sd = media_entity_to_v4l2_subdev(remote_pad->entity);
+ 		fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+ 		fmt.pad = remote_pad->index;
+-		fmt.stream = 0;
+ 
+ 		rval = v4l2_subdev_call(sd, pad, get_fmt, NULL, &fmt);
+ 		if (rval)
+@@ -910,24 +866,11 @@ static int ti960_rx_port_config(struct ti960 *va, int sink, int rx_port)
+ 	/*
+ 	 * CSI VC MAPPING.
+ 	 */
+-	rval = regmap_read(va->regmap8, TI960_CSI_VC_MAP, &csi_vc_map);
+-	if (rval < 0) {
+-		dev_err(va->sd.dev, "960 reg read ret=%x", rval);
+-		return rval;
+-	}
+-	for (i = 0; i < va->nstreams; ++i) {
+-		if (!(va->ti960_route[i].flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE))
+-			continue;
+-		if (rx_port != va->ti960_route[i].sink_pad)
+-			continue;
+-		csi_vc_map &= ~(0x3 << (va->ti960_route[i].sink_stream & 0x3) * 2);
+-		csi_vc_map |= (va->ti960_route[i].source_stream & 0x3)
+-			<< (va->ti960_route[i].sink_stream & 0x3) * 2;
+-	}
+-	dev_dbg(va->sd.dev, "%s port %d, csi_vc_map %x",
+-		__func__, rx_port, csi_vc_map);
++	csi_vc_map = sink * 0x55;
++	dev_info(va->sd.dev, "%s sink pad %d, rx_port %d, csi_vc_map %x",
++		 __func__, sink, rx_port, csi_vc_map);
+ 	rval = ti960_reg_write(va, TI960_CSI_VC_MAP,
+-		csi_vc_map);
++			       csi_vc_map);
+ 	if (rval) {
+ 		dev_err(va->sd.dev, "Failed to set port config.\n");
+ 		return rval;
+@@ -949,6 +892,19 @@ static int ti960_find_subdev_index(struct ti960 *va, struct v4l2_subdev *sd)
+ 	return -EINVAL;
+ }
+ 
++static int ti960_find_subdev_index_by_rx_port(struct ti960 *va, u8 rx_port)
++{
++	int i;
++
++	for (i = 0; i < NR_OF_TI960_SINK_PADS; i++) {
++		if (va->sub_devs[i].rx_port == rx_port)
++			return i;
++	}
++	WARN_ON(1);
++
++	return -EINVAL;
++}
++
+ static int ti960_set_frame_sync(struct ti960 *va, int enable)
+ {
+ 	int i, rval;
+@@ -994,6 +950,9 @@ static int ti960_set_stream(struct v4l2_subdev *subdev, int enable)
+ 		if (!remote_pad)
+ 			continue;
+ 
++		if (!ti960_set_sub_stream[i])
++			continue;
++
+ 		/* Find ti960 subdev */
+ 		sd = media_entity_to_v4l2_subdev(remote_pad->entity);
+ 		j = ti960_find_subdev_index(va, sd);
+@@ -1116,35 +1075,57 @@ static int ti960_set_stream(struct v4l2_subdev *subdev, int enable)
+ 	return 0;
+ }
+ 
+-static struct v4l2_subdev_internal_ops ti960_sd_internal_ops = {
+-	.open = ti960_open,
+-	.registered = ti960_registered,
+-};
+-
+-static bool ti960_sd_has_route(struct media_entity *entity,
+-		unsigned int pad0, unsigned int pad1, int *stream)
++static int ti960_set_stream_vc(struct ti960 *va, u8 vc_id, u8 state)
+ {
+-	struct ti960 *va = to_ti960(media_entity_to_v4l2_subdev(entity));
++	unsigned short rx_port;
++	unsigned short ser_alias;
++	struct v4l2_subdev *sd;
++	int rval;
+ 	int i;
+ 
+-	if (va == NULL || stream == NULL ||
+-		*stream >= va->nstreams || *stream < 0)
+-		return false;
++	i = ti960_find_subdev_index_by_rx_port(va, vc_id);
++	if (i < 0)
++		return -EINVAL;
++	rx_port = va->sub_devs[i].rx_port;
++	ser_alias = va->sub_devs[i].ser_i2c_addr;
++	sd = va->sub_devs[i].sd;
++
++	rval = ti960_rx_port_config(va, vc_id, rx_port);
++	if (rval < 0)
++		return rval;
+ 
+-	for (i = 0; i < va->nstreams; ++i) {
+-		if ((va->ti960_route[*stream].flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE) &&
+-		((va->ti960_route[*stream].source_pad == pad0 &&
+-		 va->ti960_route[*stream].sink_pad == pad1) ||
+-		(va->ti960_route[*stream].source_pad == pad1 &&
+-		 va->ti960_route[*stream].sink_pad == pad0)))
+-			return true;
++	rval = v4l2_subdev_call(sd, video, s_stream, state);
++	if (rval) {
++		dev_err(va->sd.dev,
++				"Failed to set stream for %s, enable %d\n",
++				sd->name, state);
++		return rval;
+ 	}
++	dev_info(va->sd.dev, "set stream for %s, enable %d\n",
++			sd->name, state);
+ 
+-	return false;
++	/* RX port fordward */
++	rval = ti960_reg_set_bit(va, TI960_FWD_CTL1,
++			rx_port + 4, !state);
++	if (rval) {
++		dev_err(va->sd.dev,
++				"Failed to forward RX port%d. enable %d\n",
++				i, state);
++		return rval;
++	}
++	if (va->subdev_pdata[i].module_flags & TI960_FL_RESET) {
++		rval = reset_sensor(va, rx_port, ser_alias,
++				va->subdev_pdata[i].reset);
++		if (rval)
++			return rval;
++	}
++
++	return 0;
+ }
+ 
+-static const struct media_entity_operations ti960_sd_entity_ops = {
+-	.has_route = ti960_sd_has_route,
++static struct v4l2_subdev_internal_ops ti960_sd_internal_ops = {
++	.open = ti960_open,
++	.registered = ti960_registered,
+ };
+ 
+ static const struct v4l2_subdev_video_ops ti960_sd_video_ops = {
+@@ -1157,6 +1138,30 @@ static const struct v4l2_subdev_core_ops ti960_core_subdev_ops = {
+ 
+ static int ti960_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
++	struct ti960 *va = container_of(ctrl->handler,
++					     struct ti960, ctrl_handler);
++	struct i2c_client *client = v4l2_get_subdevdata(&va->sd);
++	u32 val;
++	u8 vc_id;
++	u8 state;
++
++	switch (ctrl->id) {
++	case V4L2_CID_IPU_SET_SUB_STREAM:
++		val = (*ctrl->p_new.p_s64 & 0xFFFF);
++		dev_info(va->sd.dev, "V4L2_CID_IPU_SET_SUB_STREAM %x\n", val);
++		vc_id = (val >> 8) & 0x00FF;
++		state = val & 0x00FF;
++		if (vc_id > NR_OF_TI960_SINK_PADS - 1)
++			dev_err(va->sd.dev, "invalid vc %d\n", vc_id);
++		else
++			ti960_set_sub_stream[vc_id] = state;
++
++		ti960_set_stream_vc(va, vc_id, state);
++		break;
++	default:
++		dev_info(va->sd.dev, "unknown control id: 0x%X\n", ctrl->id);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1170,10 +1175,10 @@ static const struct v4l2_ctrl_config ti960_controls[] = {
+ 		.id = V4L2_CID_LINK_FREQ,
+ 		.name = "V4L2_CID_LINK_FREQ",
+ 		.type = V4L2_CTRL_TYPE_INTEGER_MENU,
++		.min = 0,
+ 		.max = ARRAY_SIZE(ti960_op_sys_clock) - 1,
+-		.min =  0,
+-		.step  = 0,
+-		.def = 1,
++		.def = 3,
++		.menu_skip_mask = 0,
+ 		.qmenu_int = ti960_op_sys_clock,
+ 	},
+ 	{
+@@ -1181,10 +1186,31 @@ static const struct v4l2_ctrl_config ti960_controls[] = {
+ 		.id = V4L2_CID_TEST_PATTERN,
+ 		.name = "V4L2_CID_TEST_PATTERN",
+ 		.type = V4L2_CTRL_TYPE_INTEGER,
++		.min = 0,
+ 		.max = 1,
+-		.min =	0,
+-		.step  = 1,
++		.step = 1,
++		.def = 0,
++	},
++	{
++		.ops = &ti960_ctrl_ops,
++		.id = V4L2_CID_IPU_QUERY_SUB_STREAM,
++		.name = "query virtual channel",
++		.type = V4L2_CTRL_TYPE_INTEGER_MENU,
++		.max = ARRAY_SIZE(ti960_query_sub_stream) - 1,
++		.min = 0,
+ 		.def = 0,
++		.menu_skip_mask = 0,
++		.qmenu_int = ti960_query_sub_stream,
++	},
++	{
++		.ops = &ti960_ctrl_ops,
++		.id = V4L2_CID_IPU_SET_SUB_STREAM,
++		.name = "set virtual channel",
++		.type = V4L2_CTRL_TYPE_INTEGER64,
++		.max = 0xFFFF,
++		.min = 0,
++		.def = 0,
++		.step = 1,
+ 	},
+ };
+ 
+@@ -1193,8 +1219,6 @@ static const struct v4l2_subdev_pad_ops ti960_sd_pad_ops = {
+ 	.set_fmt = ti960_set_format,
+ 	.get_frame_desc = ti960_get_frame_desc,
+ 	.enum_mbus_code = ti960_enum_mbus_code,
+-	.set_routing = ti960_set_routing,
+-	.get_routing = ti960_get_routing,
+ };
+ 
+ static struct v4l2_subdev_ops ti960_sd_ops = {
+@@ -1212,11 +1236,9 @@ static int ti960_register_subdev(struct ti960 *va)
+ 	snprintf(va->sd.name, sizeof(va->sd.name), "TI960 %c",
+ 		va->pdata->suffix);
+ 
+-	va->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+-			V4L2_SUBDEV_FL_HAS_SUBSTREAMS;
++	va->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 
+ 	va->sd.internal_ops = &ti960_sd_internal_ops;
+-	va->sd.entity.ops = &ti960_sd_entity_ops;
+ 
+ 	v4l2_set_subdevdata(&va->sd, client);
+ 
+@@ -1252,8 +1274,7 @@ static int ti960_register_subdev(struct ti960 *va)
+ 
+ 	for (i = 0; i < va->nsinks; i++)
+ 		va->pad[i].flags = MEDIA_PAD_FL_SINK;
+-	va->pad[TI960_PAD_SOURCE].flags =
+-		MEDIA_PAD_FL_SOURCE | MEDIA_PAD_FL_MULTIPLEX;
++	va->pad[TI960_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
+ 	rval = media_entity_pads_init(&va->sd.entity,
+ 				      NR_OF_TI960_PADS, va->pad);
+ 	if (rval) {
+@@ -1413,25 +1434,6 @@ static int ti960_probe(struct i2c_client *client,
+ 			return -ENOMEM;
+ 	}
+ 
+-	va->ti960_route = devm_kcalloc(&client->dev, NR_OF_TI960_STREAMS,
+-		sizeof(struct v4l2_subdev_routing), GFP_KERNEL);
+-
+-	if (!va->ti960_route)
+-		return -ENOMEM;
+-
+-	/* routing for virtual channel supports */
+-	l = 0;
+-	for (i = 0; i < NR_OF_TI960_SINK_PADS; i++)
+-		for (j = 0; j < NR_OF_TI960_VCS_PER_SINK_PAD; j++)
+-			for (k = 0; k < NR_OF_TI960_VCS_SOURCE_PAD; k++) {
+-				va->ti960_route[l].sink_pad = i;
+-				va->ti960_route[l].sink_stream = j;
+-				va->ti960_route[l].source_pad = TI960_PAD_SOURCE;
+-				va->ti960_route[l].source_stream = k;
+-				va->ti960_route[l].flags = MEDIA_PAD_FL_MULTIPLEX;
+-				l++;
+-	}
+-
+ 	va->regmap8 = devm_regmap_init_i2c(client,
+ 					   &ti960_reg_config8);
+ 	if (IS_ERR(va->regmap8)) {
+diff --git a/drivers/media/i2c/ti960-reg.h b/drivers/media/i2c/ti960-reg.h
+index fbb63150ec57..6e410c67c7d9 100644
+--- a/drivers/media/i2c/ti960-reg.h
++++ b/drivers/media/i2c/ti960-reg.h
+@@ -1,5 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-/* Copyright (C) 2020 Intel Corporation */
++/* Copyright (C) 2022 Intel Corporation */
+ 
+ #ifndef TI960_REG_H
+ #define TI960_REG_H
+@@ -90,7 +90,7 @@ static const struct ti960_register_write ti960_init_settings[] = {
+ 	{0x33, 0x03},
+ 	{0x32, 0x12},
+ 	{0x33, 0x03},
+-	{0x20, 0x00},
++	{0x20, 0xf0},
+ 	{0x21, 0x03},
+ };
+ 
+@@ -135,7 +135,9 @@ static const struct ti960_register_write ti960_init_settings[] = {
+ #define TI960_GPIO3_FSIN	0xa0
+ #define TI960_GPIO2_MASK	0x0f
+ #define TI960_GPIO3_MASK	0xf0
++#define TI960_MIPI_400MBPS	0x3
+ #define TI960_MIPI_800MBPS	0x2
++#define TI960_MIPI_1200MBPS	0x1
+ #define TI960_MIPI_1600MBPS	0x0
+ #define TI960_CSI_ENABLE	0x1
+ #define TI960_CSI_CONTS_CLOCK	0x2
+diff --git a/drivers/media/i2c/ti964.c b/drivers/media/i2c/ti964.c
+index aff55c827871..4d80d75d1658 100644
+--- a/drivers/media/i2c/ti964.c
++++ b/drivers/media/i2c/ti964.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2016 - 2020 Intel Corporation
++// Copyright (C) 2016 - 2022 Intel Corporation
+ 
+ #include <linux/device.h>
+ #include <linux/gpio.h>
+@@ -283,8 +283,8 @@ static int ti964_set_routing(struct v4l2_subdev *sd,
+ }
+ 
+ static int ti964_enum_mbus_code(struct v4l2_subdev *sd,
+-				      struct v4l2_subdev_pad_config *cfg,
+-				      struct v4l2_subdev_mbus_code_enum *code)
++				struct v4l2_subdev_state *sd_state,
++				struct v4l2_subdev_mbus_code_enum *code)
+ {
+ 	struct ti964 *va = to_ti964(sd);
+ 	const uint32_t *supported_code =
+@@ -364,21 +364,21 @@ static int ti964_get_frame_desc(struct v4l2_subdev *sd,
+ 
+ static struct v4l2_mbus_framefmt *
+ __ti964_get_ffmt(struct v4l2_subdev *subdev,
+-			 struct v4l2_subdev_pad_config *cfg,
++			 struct v4l2_subdev_state *sd_state,
+ 			 unsigned int pad, unsigned int which,
+ 			 unsigned int stream)
+ {
+ 	struct ti964 *va = to_ti964(subdev);
+ 
+ 	if (which == V4L2_SUBDEV_FORMAT_TRY)
+-		return v4l2_subdev_get_try_format(subdev, cfg, pad);
++		return v4l2_subdev_get_try_format(subdev, sd_state, pad);
+ 	else
+ 		return &va->ffmts[pad][stream];
+ }
+ 
+ static int ti964_get_format(struct v4l2_subdev *subdev,
+-				  struct v4l2_subdev_pad_config *cfg,
+-				struct v4l2_subdev_format *fmt)
++			    struct v4l2_subdev_state *sd_state,
++			    struct v4l2_subdev_format *fmt)
+ {
+ 	struct ti964 *va = to_ti964(subdev);
+ 
+@@ -386,8 +386,8 @@ static int ti964_get_format(struct v4l2_subdev *subdev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&va->mutex);
+-	fmt->format = *__ti964_get_ffmt(subdev, cfg, fmt->pad,
+-						    fmt->which, fmt->stream);
++	fmt->format = *__ti964_get_ffmt(subdev, sd_state, fmt->pad,
++					fmt->which, fmt->stream);
+ 	mutex_unlock(&va->mutex);
+ 
+ 	dev_dbg(subdev->dev, "subdev_format: which: %s, pad: %d, stream: %d.\n",
+@@ -402,8 +402,8 @@ static int ti964_get_format(struct v4l2_subdev *subdev,
+ }
+ 
+ static int ti964_set_format(struct v4l2_subdev *subdev,
+-				  struct v4l2_subdev_pad_config *cfg,
+-				struct v4l2_subdev_format *fmt)
++			    struct v4l2_subdev_state *sd_state,
++			    struct v4l2_subdev_format *fmt)
+ {
+ 	struct ti964 *va = to_ti964(subdev);
+ 	const struct ti964_csi_data_format *csi_format;
+@@ -416,8 +416,8 @@ static int ti964_set_format(struct v4l2_subdev *subdev,
+ 		fmt->format.code);
+ 
+ 	mutex_lock(&va->mutex);
+-	ffmt = __ti964_get_ffmt(subdev, cfg, fmt->pad, fmt->which,
+-				      fmt->stream);
++	ffmt = __ti964_get_ffmt(subdev, sd_state, fmt->pad, fmt->which,
++				fmt->stream);
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+ 		ffmt->width = fmt->format.width;
+@@ -437,8 +437,7 @@ static int ti964_open(struct v4l2_subdev *subdev,
+ 				struct v4l2_subdev_fh *fh)
+ {
+ 	struct v4l2_mbus_framefmt *try_fmt =
+-		v4l2_subdev_get_try_format(subdev, fh->pad, 0);
+-
++		v4l2_subdev_get_try_format(subdev, fh->state, 0);
+ 	struct v4l2_subdev_format fmt = {
+ 		.which = V4L2_SUBDEV_FORMAT_TRY,
+ 		.pad = TI964_PAD_SOURCE,
+diff --git a/drivers/media/pci/intel/ipu-bus.c b/drivers/media/pci/intel/ipu-bus.c
+index d3b7f44c0e8a..8f3e8e14fbb0 100644
+--- a/drivers/media/pci/intel/ipu-bus.c
++++ b/drivers/media/pci/intel/ipu-bus.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2013 - 2020 Intel Corporation
++// Copyright (C) 2013 - 2022 Intel Corporation
+ 
+ #include <linux/delay.h>
+ #include <linux/device.h>
+@@ -100,6 +100,7 @@ static int ipu_bus_probe(struct device *dev)
+ 	}
+ 	rval = pm_runtime_get_sync(&adev->dev);
+ 	if (rval < 0) {
++		pm_runtime_put(&adev->dev);
+ 		dev_err(&adev->dev, "Failed to get runtime PM\n");
+ 		goto out_err;
+ 	}
+@@ -140,18 +141,21 @@ static struct mutex ipu_bus_mutex;
+ 
+ static void ipu_bus_release(struct device *dev)
+ {
++	struct ipu_bus_device *adev = to_ipu_bus_device(dev);
++
++	kfree(adev);
+ }
+ 
+-struct ipu_bus_device *ipu_bus_add_device(struct pci_dev *pdev,
+-					  struct device *parent, void *pdata,
+-					  struct ipu_buttress_ctrl *ctrl,
+-					  char *name, unsigned int nr)
++struct ipu_bus_device *ipu_bus_initialize_device(struct pci_dev *pdev,
++						 struct device *parent,
++						 void *pdata,
++						 struct ipu_buttress_ctrl *ctrl,
++						 char *name, unsigned int nr)
+ {
+ 	struct ipu_bus_device *adev;
+ 	struct ipu_device *isp = pci_get_drvdata(pdev);
+-	int rval;
+ 
+-	adev = devm_kzalloc(&pdev->dev, sizeof(*adev), GFP_KERNEL);
++	adev = kzalloc(sizeof(*adev), GFP_KERNEL);
+ 	if (!adev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -171,20 +175,29 @@ struct ipu_bus_device *ipu_bus_add_device(struct pci_dev *pdev,
+ 	mutex_init(&adev->resume_lock);
+ 	dev_set_name(&adev->dev, "%s%d", name, nr);
+ 
+-	rval = device_register(&adev->dev);
++	device_initialize(&adev->dev);
++	pm_runtime_forbid(&adev->dev);
++	pm_runtime_enable(&adev->dev);
++
++	return adev;
++}
++
++int ipu_bus_add_device(struct ipu_bus_device *adev)
++{
++	int rval;
++
++	rval = device_add(&adev->dev);
+ 	if (rval) {
+ 		put_device(&adev->dev);
+-		return ERR_PTR(rval);
++		return rval;
+ 	}
+ 
+ 	mutex_lock(&ipu_bus_mutex);
+-	list_add(&adev->list, &isp->devices);
++	list_add(&adev->list, &adev->isp->devices);
+ 	mutex_unlock(&ipu_bus_mutex);
+ 
+ 	pm_runtime_allow(&adev->dev);
+-	pm_runtime_enable(&adev->dev);
+-
+-	return adev;
++	return 0;
+ }
+ 
+ void ipu_bus_del_devices(struct pci_dev *pdev)
+diff --git a/drivers/media/pci/intel/ipu-bus.h b/drivers/media/pci/intel/ipu-bus.h
+index 1108cd377705..d5794457a3d6 100644
+--- a/drivers/media/pci/intel/ipu-bus.h
++++ b/drivers/media/pci/intel/ipu-bus.h
+@@ -1,5 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-/* Copyright (C) 2013 - 2020 Intel Corporation */
++/* Copyright (C) 2013 - 2022 Intel Corporation */
+ 
+ #ifndef IPU_BUS_H
+ #define IPU_BUS_H
+@@ -43,10 +43,12 @@ struct ipu_bus_driver {
+ 
+ #define to_ipu_bus_driver(_drv) container_of(_drv, struct ipu_bus_driver, drv)
+ 
+-struct ipu_bus_device *ipu_bus_add_device(struct pci_dev *pdev,
+-					  struct device *parent, void *pdata,
+-					  struct ipu_buttress_ctrl *ctrl,
+-					  char *name, unsigned int nr);
++struct ipu_bus_device *ipu_bus_initialize_device(struct pci_dev *pdev,
++						 struct device *parent,
++						 void *pdata,
++						 struct ipu_buttress_ctrl *ctrl,
++						 char *name, unsigned int nr);
++int ipu_bus_add_device(struct ipu_bus_device *adev);
+ void ipu_bus_del_devices(struct pci_dev *pdev);
+ 
+ int ipu_bus_register_driver(struct ipu_bus_driver *adrv);
+diff --git a/drivers/media/pci/intel/ipu-buttress.c b/drivers/media/pci/intel/ipu-buttress.c
+index 74577a2db741..d0a3bdf10a08 100644
+--- a/drivers/media/pci/intel/ipu-buttress.c
++++ b/drivers/media/pci/intel/ipu-buttress.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2013 - 2020 Intel Corporation
++// Copyright (C) 2013 - 2022 Intel Corporation
+ 
+ #include <linux/clk.h>
+ #include <linux/clkdev.h>
+@@ -1033,6 +1033,32 @@ int ipu_buttress_tsc_read(struct ipu_device *isp, u64 *val)
+ }
+ EXPORT_SYMBOL_GPL(ipu_buttress_tsc_read);
+ 
++int ipu_buttress_isys_freq_set(void *data, u64 val)
++{
++	struct ipu_device *isp = data;
++	int rval;
++
++	if (val < BUTTRESS_MIN_FORCE_IS_FREQ ||
++	    val > BUTTRESS_MAX_FORCE_IS_FREQ)
++		return -EINVAL;
++
++	rval = pm_runtime_get_sync(&isp->isys->dev);
++	if (rval < 0) {
++		pm_runtime_put(&isp->isys->dev);
++		dev_err(&isp->pdev->dev, "Runtime PM failed (%d)\n", rval);
++		return rval;
++	}
++
++	do_div(val, BUTTRESS_IS_FREQ_STEP);
++	if (val)
++		ipu_buttress_set_isys_ratio(isp, val);
++
++	pm_runtime_put(&isp->isys->dev);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipu_buttress_isys_freq_set);
++
+ #ifdef CONFIG_DEBUG_FS
+ 
+ static int ipu_buttress_reg_open(struct inode *inode, struct file *file)
+@@ -1158,31 +1184,6 @@ static int ipu_buttress_isys_freq_get(void *data, u64 *val)
+ 	return 0;
+ }
+ 
+-static int ipu_buttress_isys_freq_set(void *data, u64 val)
+-{
+-	struct ipu_device *isp = data;
+-	int rval;
+-
+-	if (val < BUTTRESS_MIN_FORCE_IS_FREQ ||
+-	    val > BUTTRESS_MAX_FORCE_IS_FREQ)
+-		return -EINVAL;
+-
+-	rval = pm_runtime_get_sync(&isp->isys->dev);
+-	if (rval < 0) {
+-		pm_runtime_put(&isp->isys->dev);
+-		dev_err(&isp->pdev->dev, "Runtime PM failed (%d)\n", rval);
+-		return rval;
+-	}
+-
+-	do_div(val, BUTTRESS_IS_FREQ_STEP);
+-	if (val)
+-		ipu_buttress_set_isys_ratio(isp, val);
+-
+-	pm_runtime_put(&isp->isys->dev);
+-
+-	return 0;
+-}
+-
+ DEFINE_SIMPLE_ATTRIBUTE(ipu_buttress_psys_force_freq_fops,
+ 			ipu_buttress_psys_force_freq_get,
+ 			ipu_buttress_psys_force_freq_set, "%llu\n");
+diff --git a/drivers/media/pci/intel/ipu-buttress.h b/drivers/media/pci/intel/ipu-buttress.h
+index 5865a35eae7e..cfe008f749f4 100644
+--- a/drivers/media/pci/intel/ipu-buttress.h
++++ b/drivers/media/pci/intel/ipu-buttress.h
+@@ -1,5 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-/* Copyright (C) 2013 - 2020 Intel Corporation */
++/* Copyright (C) 2013 - 2022 Intel Corporation */
+ 
+ #ifndef IPU_BUTTRESS_H
+ #define IPU_BUTTRESS_H
+@@ -125,6 +125,7 @@ void ipu_buttress_csi_port_config(struct ipu_device *isp,
+ 				  u32 legacy, u32 combo);
+ int ipu_buttress_restore(struct ipu_device *isp);
+ 
++int ipu_buttress_isys_freq_set(void *data, u64 val);
+ int ipu_buttress_psys_freq_get(void *data, u64 *val);
+ int ipu_get_i2c_bus_id(int adapter_id, char *adapter_bdf, int bdf_len);
+ #endif /* IPU_BUTTRESS_H */
+diff --git a/drivers/media/pci/intel/ipu-dma.c b/drivers/media/pci/intel/ipu-dma.c
+index 65cf49c681dd..d37762cb7841 100644
+--- a/drivers/media/pci/intel/ipu-dma.c
++++ b/drivers/media/pci/intel/ipu-dma.c
+@@ -109,7 +109,6 @@ static int __dma_free_buffer(struct device *dev, struct page **pages,
+ 
+ 	for (i = 0; i < count; i++) {
+ 		if (pages[i]) {
+-			__dma_clear_buffer(pages[i], PAGE_SIZE, attrs);
+ 			__free_pages(pages[i], 0);
+ 		}
+ 	}
+@@ -438,7 +437,6 @@ static int ipu_dma_map_sg(struct device *dev, struct scatterlist *sglist,
+ 			goto out_fail;
+ 
+ 		sg_dma_address(sg) = iova_addr << PAGE_SHIFT;
+-		sg->length = sg_dma_len(sg);
+ 
+ 		iova_addr += PAGE_ALIGN(sg_dma_len(sg)) >> PAGE_SHIFT;
+ 	}
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.c b/drivers/media/pci/intel/ipu-isys-csi2.c
+index c8b3b91d6ebc..b4a9be0dcb90 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2.c
+@@ -294,6 +294,7 @@ static int csi2_link_validate(struct media_link *link)
+ 	if (!v4l2_ctrl_g_ctrl(csi2->store_csi2_header)) {
+ 		struct media_pad *remote_pad =
+ 		    media_entity_remote_pad(&csi2->asd.pad[CSI2_PAD_SOURCE]);
++
+ 		if (remote_pad &&
+ 		    is_media_entity_v4l2_subdev(remote_pad->entity)) {
+ 			dev_err(&csi2->isys->adev->dev,
+diff --git a/drivers/media/pci/intel/ipu-isys-queue.c b/drivers/media/pci/intel/ipu-isys-queue.c
+index 83544968b268..04c98ab82852 100644
+--- a/drivers/media/pci/intel/ipu-isys-queue.c
++++ b/drivers/media/pci/intel/ipu-isys-queue.c
+@@ -612,8 +612,7 @@ int ipu_isys_link_fmt_validate(struct ipu_isys_queue *aq)
+ {
+ 	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+ 	struct v4l2_subdev_format fmt = { 0 };
+-			struct media_pad *pad =
+-				media_entity_remote_pad(av->vdev.entity.pads);
++	struct media_pad *pad = media_entity_remote_pad(av->vdev.entity.pads);
+ 	struct v4l2_subdev *sd;
+ 	int rval;
+ 
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index aa653bb520f2..9aa189cfdfed 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -22,6 +22,7 @@
+ #include "ipu-bus.h"
+ #include "ipu-cpd.h"
+ #include "ipu-isys.h"
++#include "ipu-buttress.h"
+ #include "ipu-isys-video.h"
+ #include "ipu-platform.h"
+ #include "ipu-platform-regs.h"
+@@ -605,6 +606,7 @@ static void get_stream_opened(struct ipu_isys_video *av)
+ 	spin_lock_irqsave(&av->isys->lock, flags);
+ 	av->isys->stream_opened++;
+ 	spin_unlock_irqrestore(&av->isys->lock, flags);
++
+ }
+ 
+ static void put_stream_opened(struct ipu_isys_video *av)
+@@ -614,6 +616,7 @@ static void put_stream_opened(struct ipu_isys_video *av)
+ 	spin_lock_irqsave(&av->isys->lock, flags);
+ 	av->isys->stream_opened--;
+ 	spin_unlock_irqrestore(&av->isys->lock, flags);
++
+ }
+ 
+ static int get_stream_handle(struct ipu_isys_video *av)
+diff --git a/drivers/media/pci/intel/ipu-isys-video.h b/drivers/media/pci/intel/ipu-isys-video.h
+index 0d43856f7ecf..6ba8f9e2aff3 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.h
++++ b/drivers/media/pci/intel/ipu-isys-video.h
+@@ -69,7 +69,7 @@ struct ipu_isys_pipeline {
+ 	atomic_t sequence;
+ 	unsigned int seq_index;
+ 	struct sequence_info seq[IPU_ISYS_MAX_PARALLEL_SOF];
+-	int source;	/* SSI stream source, sensor's source pad */
++	int source;	/* SSI stream source */
+ 	int stream_handle;	/* stream handle for CSS API */
+ 	unsigned int nr_output_pins;	/* How many firmware pins? */
+ 	enum ipu_isl_mode isl_mode;
+diff --git a/drivers/media/pci/intel/ipu-isys.c b/drivers/media/pci/intel/ipu-isys.c
+index 9d34d8fdbc46..eec73a3a09b3 100644
+--- a/drivers/media/pci/intel/ipu-isys.c
++++ b/drivers/media/pci/intel/ipu-isys.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2013 - 2021 Intel Corporation
++// Copyright (C) 2013 - 2022 Intel Corporation
+ 
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+@@ -16,6 +16,14 @@
+ #include <media/ipu-isys.h>
+ #include <media/v4l2-mc.h>
+ #include <media/v4l2-subdev.h>
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-async.h>
++#endif
+ #include "ipu.h"
+ #include "ipu-bus.h"
+ #include "ipu-cpd.h"
+@@ -30,6 +38,7 @@
+ #include "ipu-platform-buttress-regs.h"
+ 
+ #define ISYS_PM_QOS_VALUE	300
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ /*
+  * The param was passed from module to indicate if port
+  * could be optimized.
+@@ -37,11 +46,12 @@
+ static bool csi2_port_optimized = true;
+ module_param(csi2_port_optimized, bool, 0660);
+ MODULE_PARM_DESC(csi2_port_optimized, "IPU CSI2 port optimization");
++#endif
+ 
+-#define IPU_BUTTRESS_FABIC_CONTROL	    0x68
+-#define GDA_ENABLE_IWAKE_INDEX		    2
+-#define GDA_IWAKE_THRESHOLD_INDEX           1
+-#define GDA_IRQ_CRITICAL_THRESHOLD_INDEX    0
++#define IPU_BUTTRESS_FABIC_CONTROL		0x68
++#define GDA_ENABLE_IWAKE_INDEX			2
++#define GDA_IWAKE_THRESHOLD_INDEX		1
++#define GDA_IRQ_CRITICAL_THRESHOLD_INDEX	0
+ 
+ /* LTR & DID value are 10 bit at most */
+ #define LTR_DID_VAL_MAX		1023
+@@ -91,6 +101,7 @@ enum ltr_did_type {
+ 	LTR_TYPE_MAX
+ };
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ struct isys_i2c_test {
+ 	u8 bus_nr;
+ 	u16 addr;
+@@ -130,6 +141,7 @@ i2c_client *isys_find_i2c_subdev(struct i2c_adapter *adapter,
+ 		return NULL;
+ 	return test.client;
+ }
++#endif
+ static int
+ isys_complete_ext_device_registration(struct ipu_isys *isys,
+ 				      struct v4l2_subdev *sd,
+@@ -167,7 +179,7 @@ isys_complete_ext_device_registration(struct ipu_isys *isys,
+ 	v4l2_device_unregister_subdev(sd);
+ 	return rval;
+ }
+-
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ static int isys_register_ext_subdev(struct ipu_isys *isys,
+ 				    struct ipu_isys_subdev_info *sd_info)
+ {
+@@ -181,9 +193,16 @@ static int isys_register_ext_subdev(struct ipu_isys *isys,
+ 			sd_info->i2c.i2c_adapter_bdf,
+ 			sizeof(sd_info->i2c.i2c_adapter_bdf));
+ 	if (bus < 0) {
+-		dev_err(&isys->adev->dev, "Failed to find adapter!");
++		dev_err(&isys->adev->dev,
++			"getting i2c bus id for adapter %d (bdf %s) failed",
++			sd_info->i2c.i2c_adapter_id,
++			sd_info->i2c.i2c_adapter_bdf);
+ 		return -ENOENT;
+ 	}
++	dev_info(&isys->adev->dev,
++		 "got i2c bus id %d for adapter %d (bdf %s)", bus,
++		 sd_info->i2c.i2c_adapter_id,
++		 sd_info->i2c.i2c_adapter_bdf);
+ 	adapter = i2c_get_adapter(bus);
+ 	if (!adapter) {
+ 		dev_warn(&isys->adev->dev, "can't find adapter\n");
+@@ -247,6 +266,7 @@ static void isys_register_ext_subdevs(struct ipu_isys *isys)
+ 	for (sd_info = spdata->subdevs; *sd_info; sd_info++)
+ 		isys_register_ext_subdev(isys, *sd_info);
+ }
++#endif
+ 
+ static void isys_unregister_subdevices(struct ipu_isys *isys)
+ {
+@@ -267,12 +287,15 @@ static int isys_register_subdevices(struct ipu_isys *isys)
+ 	const struct ipu_isys_internal_csi2_pdata *csi2 =
+ 	    &isys->pdata->ipdata->csi2;
+ 	struct ipu_isys_csi2_be_soc *csi2_be_soc;
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 	struct ipu_isys_subdev_pdata *spdata = isys->pdata->spdata;
+ 	struct ipu_isys_subdev_info **sd_info;
+ 	DECLARE_BITMAP(csi2_enable, 32);
++#endif
+ 	unsigned int i, k;
+ 	int rval;
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 	/*
+ 	 * Here is somewhat a workaround, let each platform decide
+ 	 * if csi2 port can be optimized, which means only registered
+@@ -294,6 +317,7 @@ static int isys_register_subdevices(struct ipu_isys *isys)
+ 	} else {
+ 		bitmap_fill(csi2_enable, 32);
+ 	}
++#endif
+ 	isys->csi2 = devm_kcalloc(&isys->adev->dev, csi2->nports,
+ 				  sizeof(*isys->csi2), GFP_KERNEL);
+ 	if (!isys->csi2) {
+@@ -302,8 +326,10 @@ static int isys_register_subdevices(struct ipu_isys *isys)
+ 	}
+ 
+ 	for (i = 0; i < csi2->nports; i++) {
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 		if (!test_bit(i, csi2_enable))
+ 			continue;
++#endif
+ 		rval = ipu_isys_csi2_init(&isys->csi2[i], isys,
+ 					  isys->pdata->base +
+ 					  csi2->offsets[i], i);
+@@ -331,8 +357,10 @@ static int isys_register_subdevices(struct ipu_isys *isys)
+ 	}
+ 
+ 	for (i = 0; i < csi2->nports; i++) {
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 		if (!test_bit(i, csi2_enable))
+ 			continue;
++#endif
+ 		rval = media_create_pad_link(&isys->csi2[i].asd.sd.entity,
+ 					     CSI2_PAD_SOURCE,
+ 					     &isys->csi2_be.asd.sd.entity,
+@@ -608,6 +636,103 @@ static int isys_iwake_watermark_cleanup(struct ipu_isys *isys)
+ 	return 0;
+ }
+ 
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++/* The .bound() notifier callback when a match is found */
++static int isys_notifier_bound(struct v4l2_async_notifier *notifier,
++			       struct v4l2_subdev *sd,
++			       struct v4l2_async_subdev *asd)
++{
++	struct ipu_isys *isys = container_of(notifier,
++					struct ipu_isys, notifier);
++	struct sensor_async_subdev *s_asd = container_of(asd,
++				struct sensor_async_subdev, asd);
++
++	dev_info(&isys->adev->dev, "bind %s nlanes is %d port is %d\n",
++		sd->name, s_asd->csi2.nlanes, s_asd->csi2.port);
++	isys_complete_ext_device_registration(isys, sd, &s_asd->csi2);
++
++	return v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
++}
++
++static void isys_notifier_unbind(struct v4l2_async_notifier *notifier,
++				 struct v4l2_subdev *sd,
++				 struct v4l2_async_subdev *asd)
++{
++	struct ipu_isys *isys = container_of(notifier,
++					struct ipu_isys, notifier);
++
++	dev_info(&isys->adev->dev, "unbind %s\n", sd->name);
++}
++
++static int isys_notifier_complete(struct v4l2_async_notifier *notifier)
++{
++	struct ipu_isys *isys = container_of(notifier,
++					struct ipu_isys, notifier);
++
++	dev_info(&isys->adev->dev, "All sensor registration completed.\n");
++
++	return v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
++}
++
++static const struct v4l2_async_notifier_operations isys_async_ops = {
++	.bound = isys_notifier_bound,
++	.unbind = isys_notifier_unbind,
++	.complete = isys_notifier_complete,
++};
++
++static int isys_fwnode_parse(struct device *dev,
++			     struct v4l2_fwnode_endpoint *vep,
++			     struct v4l2_async_subdev *asd)
++{
++	struct sensor_async_subdev *s_asd =
++			container_of(asd, struct sensor_async_subdev, asd);
++
++	s_asd->csi2.port = vep->base.port;
++	s_asd->csi2.nlanes = vep->bus.mipi_csi2.num_data_lanes;
++
++	return 0;
++}
++
++static int isys_notifier_init(struct ipu_isys *isys)
++{
++	struct ipu_device *isp = isys->adev->isp;
++	size_t asd_struct_size = sizeof(struct sensor_async_subdev);
++	int ret;
++
++	v4l2_async_nf_init(&isys->notifier);
++	ret = v4l2_async_nf_parse_fwnode_endpoints(&isp->pdev->dev,
++						   &isys->notifier,
++						   asd_struct_size,
++						   isys_fwnode_parse);
++	if (ret < 0) {
++		dev_err(&isys->adev->dev,
++			"v4l2 parse_fwnode_endpoints() failed: %d\n", ret);
++		return ret;
++	}
++	if (list_empty(&isys->notifier.asd_list)) {
++		/* isys probe could continue with async subdevs missing */
++		dev_warn(&isys->adev->dev, "no subdev found in graph\n");
++		return 0;
++	}
++
++	isys->notifier.ops = &isys_async_ops;
++	ret = v4l2_async_nf_register(&isys->v4l2_dev, &isys->notifier);
++	if (ret) {
++		dev_err(&isys->adev->dev,
++			"failed to register async notifier : %d\n", ret);
++			v4l2_async_nf_cleanup(&isys->notifier);
++	}
++
++	return ret;
++}
++
++static void isys_notifier_cleanup(struct ipu_isys *isys)
++{
++	v4l2_async_nf_unregister(&isys->notifier);
++	v4l2_async_nf_cleanup(&isys->notifier);
++}
++#endif
++
+ static struct media_device_ops isys_mdev_ops = {
+ 	.link_notify = v4l2_pipeline_link_notify,
+ };
+@@ -645,7 +770,13 @@ static int isys_register_devices(struct ipu_isys *isys)
+ 	if (rval)
+ 		goto out_v4l2_device_unregister;
+ 
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++	rval = isys_notifier_init(isys);
++	if (rval)
++		goto out_isys_unregister_subdevices;
++#else
+ 	isys_register_ext_subdevs(isys);
++#endif
+ 
+ 	rval = v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
+ 	if (rval)
+@@ -654,8 +785,16 @@ static int isys_register_devices(struct ipu_isys *isys)
+ 	return 0;
+ 
+ out_isys_notifier_cleanup:
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++	isys_notifier_cleanup(isys);
++#endif
+ 
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++out_isys_unregister_subdevices:
+ 	isys_unregister_subdevices(isys);
++#else
++	isys_unregister_subdevices(isys);
++#endif
+ 
+ out_v4l2_device_unregister:
+ 	v4l2_device_unregister(&isys->v4l2_dev);
+@@ -798,6 +937,9 @@ static void isys_remove(struct ipu_bus_device *adev)
+ 	isys_iwake_watermark_cleanup(isys);
+ 
+ 	ipu_trace_uninit(&adev->dev);
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++	isys_notifier_cleanup(isys);
++#endif
+ 	isys_unregister_devices(isys);
+ 
+ 	cpu_latency_qos_remove_request(&isys->pm_qos);
+diff --git a/drivers/media/pci/intel/ipu-isys.h b/drivers/media/pci/intel/ipu-isys.h
+index db5ae2c92d6c..ad9169cb7e4f 100644
+--- a/drivers/media/pci/intel/ipu-isys.h
++++ b/drivers/media/pci/intel/ipu-isys.h
+@@ -194,6 +194,9 @@ struct ipu_isys {
+ 	spinlock_t listlock;	/* Protect framebuflist */
+ 	struct list_head framebuflist;
+ 	struct list_head framebuflist_fw;
++#if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
++	struct v4l2_async_notifier notifier;
++#endif
+ 	struct isys_iwake_watermark *iwake_watermark;
+ 
+ 	struct mutex reset_mutex;
+diff --git a/drivers/media/pci/intel/ipu-pdata.h b/drivers/media/pci/intel/ipu-pdata.h
+index 48185f75fa93..c029c05faeb0 100644
+--- a/drivers/media/pci/intel/ipu-pdata.h
++++ b/drivers/media/pci/intel/ipu-pdata.h
+@@ -228,7 +228,9 @@ struct ipu_isys_internal_pdata {
+ struct ipu_isys_pdata {
+ 	void __iomem *base;
+ 	const struct ipu_isys_internal_pdata *ipdata;
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 	struct ipu_isys_subdev_pdata *spdata;
++#endif
+ };
+ 
+ struct ipu_psys_internal_pdata {
+diff --git a/drivers/media/pci/intel/ipu-psys.c b/drivers/media/pci/intel/ipu-psys.c
+index da2b0707aedb..350172c3eace 100644
+--- a/drivers/media/pci/intel/ipu-psys.c
++++ b/drivers/media/pci/intel/ipu-psys.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2013 - 2020 Intel Corporation
++// Copyright (C) 2013 - 2022 Intel Corporation
+ 
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+@@ -1291,6 +1291,10 @@ static int ipu_psys_probe(struct ipu_bus_device *adev)
+ 	unsigned int minor;
+ 	int i, rval = -E2BIG;
+ 
++	/* firmware is not ready, so defer the probe */
++	if (!isp->pkg_dir)
++		return -EPROBE_DEFER;
++
+ 	rval = ipu_mmu_hw_init(adev->mmu);
+ 	if (rval)
+ 		return rval;
+diff --git a/drivers/media/pci/intel/ipu-trace.c b/drivers/media/pci/intel/ipu-trace.c
+index 7cedeab71697..1992589186f7 100644
+--- a/drivers/media/pci/intel/ipu-trace.c
++++ b/drivers/media/pci/intel/ipu-trace.c
+@@ -866,7 +866,7 @@ int ipu_trace_debugfs_add(struct ipu_device *isp, struct dentry *dir)
+ 
+ int ipu_trace_add(struct ipu_device *isp)
+ {
+-	if (ipu_trace_enable)
++	if (!ipu_trace_enable)
+ 		return 0;
+ 
+ 	isp->trace = devm_kzalloc(&isp->pdev->dev,
+diff --git a/drivers/media/pci/intel/ipu.c b/drivers/media/pci/intel/ipu.c
+index 9a8985cae0a8..32ebd777e80e 100644
+--- a/drivers/media/pci/intel/ipu.c
++++ b/drivers/media/pci/intel/ipu.c
+@@ -26,11 +26,15 @@
+ #include "ipu-platform-isys-csi2-reg.h"
+ #include "ipu-trace.h"
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ #include <media/ipu-isys.h>
+ #endif
++#endif
+ 
++#if IS_ENABLED(CONFIG_INTEL_IPU6_ACPI)
+ #include <media/ipu-acpi.h>
++#endif
+ 
+ #define IPU_PCI_BAR		0
+ enum ipu_version ipu_ver;
+@@ -40,12 +44,14 @@ static int isys_freq_overwrite = -1;
+ module_param(isys_freq_overwrite, int, 0660);
+ MODULE_PARM_DESC(isys_freq_overwrite, "overwrite isys freq default value");
+ 
++#if IS_ENABLED(CONFIG_INTEL_IPU6_ACPI)
+ static int isys_init_acpi_add_device(struct device *dev, void *priv,
+ 				struct ipu_isys_csi2_config *csi2,
+ 				bool reprobe)
+ {
+ 	return 0;
+ }
++#endif
+ 
+ static struct ipu_bus_device *ipu_isys_init(struct pci_dev *pdev,
+ 					    struct device *parent,
+@@ -53,8 +59,10 @@ static struct ipu_bus_device *ipu_isys_init(struct pci_dev *pdev,
+ 					    void __iomem *base,
+ 					    const struct ipu_isys_internal_pdata
+ 					    *ipdata,
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 					    struct ipu_isys_subdev_pdata
+ 					    *spdata,
++#endif
+ 					    unsigned int nr)
+ {
+ 	struct ipu_bus_device *isys;
+@@ -62,6 +70,7 @@ static struct ipu_bus_device *ipu_isys_init(struct pci_dev *pdev,
+ #if IS_ENABLED(CONFIG_INTEL_IPU6_ACPI)
+ 	struct ipu_isys_subdev_pdata *acpi_pdata;
+ #endif
++	int ret;
+ 
+ 	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+ 	if (!pdata)
+@@ -69,34 +78,47 @@ static struct ipu_bus_device *ipu_isys_init(struct pci_dev *pdev,
+ 
+ 	pdata->base = base;
+ 	pdata->ipdata = ipdata;
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 	pdata->spdata = spdata;
++#endif
+ 
+ 	/* Use 250MHz for ipu6 se */
+ 	if (ipu_ver == IPU_VER_6SE)
+ 		ctrl->ratio = IPU6SE_IS_FREQ_CTL_DEFAULT_RATIO;
+ 
+-	isys = ipu_bus_add_device(pdev, parent, pdata, ctrl,
+-				  IPU_ISYS_NAME, nr);
+-	if (IS_ERR(isys))
+-		return ERR_PTR(-ENOMEM);
+-
++	isys = ipu_bus_initialize_device(pdev, parent, pdata, ctrl,
++					 IPU_ISYS_NAME, nr);
++	if (IS_ERR(isys)) {
++		dev_err_probe(&pdev->dev, PTR_ERR(isys),
++			      "ipu_bus_add_device(isys) failed\n");
++		return ERR_CAST(isys);
++	}
+ #if IS_ENABLED(CONFIG_INTEL_IPU6_ACPI)
+ 	if (!spdata) {
+ 		dev_err(&pdev->dev, "No subdevice info provided");
+-		ipu_get_acpi_devices(isys, &isys->dev, &acpi_pdata, NULL, isys_init_acpi_add_device);
++		ipu_get_acpi_devices(isys, &isys->dev, &acpi_pdata, NULL,
++				     isys_init_acpi_add_device);
+ 		pdata->spdata = acpi_pdata;
+ 	} else {
+ 		dev_dbg(&pdev->dev, "Subdevice info found");
+-		ipu_get_acpi_devices(isys, &isys->dev, &acpi_pdata, &spdata, isys_init_acpi_add_device);
++		ipu_get_acpi_devices(isys, &isys->dev, &acpi_pdata, &spdata,
++				     isys_init_acpi_add_device);
+ 	}
+ #endif
+ 	isys->mmu = ipu_mmu_init(&pdev->dev, base, ISYS_MMID,
+ 				 &ipdata->hw_variant);
+-	if (IS_ERR(isys->mmu))
+-		return ERR_PTR(-ENOMEM);
++	if (IS_ERR(isys->mmu)) {
++		dev_err_probe(&pdev->dev, PTR_ERR(isys),
++			      "ipu_mmu_init(isys->mmu) failed\n");
++		return ERR_CAST(isys->mmu);
++	}
+ 
+ 	isys->mmu->dev = &isys->dev;
+ 
++	ret = ipu_bus_add_device(isys);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	return isys;
+ }
+ 
+@@ -109,6 +131,7 @@ static struct ipu_bus_device *ipu_psys_init(struct pci_dev *pdev,
+ {
+ 	struct ipu_bus_device *psys;
+ 	struct ipu_psys_pdata *pdata;
++	int ret;
+ 
+ 	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+ 	if (!pdata)
+@@ -117,18 +140,28 @@ static struct ipu_bus_device *ipu_psys_init(struct pci_dev *pdev,
+ 	pdata->base = base;
+ 	pdata->ipdata = ipdata;
+ 
+-	psys = ipu_bus_add_device(pdev, parent, pdata, ctrl,
+-				  IPU_PSYS_NAME, nr);
+-	if (IS_ERR(psys))
+-		return ERR_PTR(-ENOMEM);
++	psys = ipu_bus_initialize_device(pdev, parent, pdata, ctrl,
++					 IPU_PSYS_NAME, nr);
++	if (IS_ERR(psys)) {
++		dev_err_probe(&pdev->dev, PTR_ERR(psys),
++			      "ipu_bus_add_device(psys) failed\n");
++		return ERR_CAST(psys);
++	}
+ 
+ 	psys->mmu = ipu_mmu_init(&pdev->dev, base, PSYS_MMID,
+ 				 &ipdata->hw_variant);
+-	if (IS_ERR(psys->mmu))
+-		return ERR_PTR(-ENOMEM);
++	if (IS_ERR(psys->mmu)) {
++		dev_err_probe(&pdev->dev, PTR_ERR(psys),
++			      "ipu_mmu_init(psys->mmu) failed\n");
++		return ERR_CAST(psys->mmu);
++	}
+ 
+ 	psys->mmu->dev = &psys->dev;
+ 
++	ret = ipu_bus_add_device(psys);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	return psys;
+ }
+ 
+@@ -389,6 +422,7 @@ int request_cpd_fw(const struct firmware **firmware_p, const char *name,
+ }
+ EXPORT_SYMBOL(request_cpd_fw);
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ static inline int match_spdata(struct ipu_isys_subdev_info *sd,
+ 			const struct ipu_spdata_rep *rep)
+@@ -439,6 +473,7 @@ void fixup_spdata(const void *spdata_rep,
+ 	}
+ }
+ #endif
++#endif
+ 
+ static int ipu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+@@ -571,20 +606,19 @@ static int ipu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto out_ipu_bus_del_devices;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	rval = request_firmware(&isp->spdata_fw, IPU_SPDATA_NAME, &pdev->dev);
+ 	if (rval)
+ 		dev_warn(&isp->pdev->dev, "no spdata replace, using default\n");
+ 	else
+ 		fixup_spdata(isp->spdata_fw->data, pdev->dev.platform_data);
++#endif
+ #endif
+ 	rval = ipu_trace_add(isp);
+ 	if (rval)
+ 		dev_err(&pdev->dev, "Trace support not available\n");
+ 
+-	pm_runtime_put_noidle(&pdev->dev);
+-	pm_runtime_allow(&pdev->dev);
+-
+ 	/*
+ 	 * NOTE Device hierarchy below is important to ensure proper
+ 	 * runtime suspend and resume order.
+@@ -605,7 +639,9 @@ static int ipu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	isp->isys = ipu_isys_init(pdev, &pdev->dev,
+ 				  isys_ctrl, isys_base,
+ 				  &isys_ipdata,
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 				  pdev->dev.platform_data,
++#endif
+ 				  0);
+ 	if (IS_ERR(isp->isys)) {
+ 		rval = PTR_ERR(isp->isys);
+@@ -713,8 +749,10 @@ static int ipu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	ipu_bus_del_devices(pdev);
+ 	ipu_buttress_exit(isp);
+ 	release_firmware(isp->cpd_fw);
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	release_firmware(isp->spdata_fw);
++#endif
+ #endif
+ 
+ 	return rval;
+diff --git a/drivers/media/pci/intel/ipu.h b/drivers/media/pci/intel/ipu.h
+index 70adb36c691c..8a153ae2493c 100644
+--- a/drivers/media/pci/intel/ipu.h
++++ b/drivers/media/pci/intel/ipu.h
+@@ -80,9 +80,10 @@ struct ipu_device {
+ 	dma_addr_t pkg_dir_dma_addr;
+ 	unsigned int pkg_dir_size;
+ 	struct sg_table fw_sgt;
+-
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	const struct firmware *spdata_fw;
++#endif
+ #endif
+ 	void __iomem *base;
+ #ifdef CONFIG_DEBUG_FS
+diff --git a/drivers/media/pci/intel/ipu6/ipu-platform.h b/drivers/media/pci/intel/ipu6/ipu-platform.h
+index 668009843679..bb0b055ad1c6 100644
+--- a/drivers/media/pci/intel/ipu6/ipu-platform.h
++++ b/drivers/media/pci/intel/ipu6/ipu-platform.h
+@@ -12,8 +12,11 @@
+ #define IPU6_FIRMWARE_NAME		"intel/ipu6_fw.bin"
+ #define IPU6EPMTL_FIRMWARE_NAME		"intel/ipu6epmtl_fw.bin"
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ /* array of struct ipu_spdata_rep terminated by NULL */
+ #define IPU_SPDATA_NAME		"ipu6v1_spdata.bin"
++#endif
+ 
+ /*
+  * The following definitions are encoded to the media_device's model field so
+@@ -22,8 +25,8 @@
+  */
+ #define IPU_MEDIA_DEV_MODEL_NAME		"ipu6"
+ 
+-#define IPU6SE_ISYS_NUM_STREAMS          IPU6SE_NONSECURE_STREAM_ID_MAX
+-#define IPU6_ISYS_NUM_STREAMS            IPU6_NONSECURE_STREAM_ID_MAX
++#define IPU6SE_ISYS_NUM_STREAMS		IPU6SE_NONSECURE_STREAM_ID_MAX
++#define IPU6_ISYS_NUM_STREAMS		IPU6_NONSECURE_STREAM_ID_MAX
+ 
+ /* declearations, definitions in ipu6.c */
+ extern struct ipu_isys_internal_pdata isys_ipdata;
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c b/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
+index 3dbd64070d1a..68da67def4b5 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
+@@ -95,8 +95,14 @@ static int ipu6_csi2_phy_power_set(struct ipu_isys *isys,
+ 			return ret;
+ 
+ 		ipu6_isys_phy_reset(isys, phy_id, 0);
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ 		ipu6_isys_phy_common_init(isys, cfg);
+ 		ret = ipu6_isys_phy_config(isys, cfg);
++#else
++		ipu6_isys_phy_common_init(isys);
++
++		ret = ipu6_isys_phy_config(isys);
++#endif
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-phy.c b/drivers/media/pci/intel/ipu6/ipu6-isys-phy.c
+index 3216bb393e96..6ba2c72201fe 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-phy.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-phy.c
+@@ -497,6 +497,7 @@ int ipu6_isys_phy_ready(struct ipu_isys *isys, unsigned int phy_id)
+ 	return -ETIMEDOUT;
+ }
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ int ipu6_isys_phy_common_init(struct ipu_isys *isys, struct ipu_isys_csi2_config *cfg)
+ {
+ 	unsigned int phy_id;
+@@ -516,6 +517,32 @@ int ipu6_isys_phy_common_init(struct ipu_isys *isys, struct ipu_isys_csi2_config
+ 
+ 	return 0;
+ }
++#else
++int ipu6_isys_phy_common_init(struct ipu_isys *isys)
++{
++	unsigned int phy_id;
++	void __iomem *phy_base;
++	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
++	struct ipu_device *isp = adev->isp;
++	void __iomem *isp_base = isp->base;
++	struct v4l2_async_subdev *asd;
++	struct sensor_async_subdev *s_asd;
++	unsigned int i;
++
++	list_for_each_entry(asd, &isys->notifier.asd_list, asd_list) {
++		s_asd = container_of(asd, struct sensor_async_subdev, asd);
++		phy_id = s_asd->csi2.port / 4;
++		phy_base = isp_base + IPU6_ISYS_PHY_BASE(phy_id);
++
++		for (i = 0 ; i < ARRAY_SIZE(common_init_regs); i++) {
++			writel(common_init_regs[i].val,
++				phy_base + common_init_regs[i].reg);
++		}
++	}
++
++	return 0;
++}
++#endif
+ 
+ static int ipu6_isys_driver_port_to_phy_port(struct ipu_isys_csi2_config *cfg)
+ {
+@@ -548,6 +575,7 @@ static int ipu6_isys_driver_port_to_phy_port(struct ipu_isys_csi2_config *cfg)
+ 	return ret;
+ }
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ int ipu6_isys_phy_config(struct ipu_isys *isys, struct ipu_isys_csi2_config *cfg)
+ {
+ 	unsigned int phy_port, phy_id;
+@@ -595,3 +623,45 @@ int ipu6_isys_phy_config(struct ipu_isys *isys, struct ipu_isys_csi2_config *cfg
+ 
+ 	return 0;
+ }
++#else
++int ipu6_isys_phy_config(struct ipu_isys *isys)
++{
++	int phy_port;
++	unsigned int phy_id;
++	void __iomem *phy_base;
++	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
++	struct ipu_device *isp = adev->isp;
++	void __iomem *isp_base = isp->base;
++	const struct phy_reg **phy_config_regs;
++	struct v4l2_async_subdev *asd;
++	struct sensor_async_subdev *s_asd;
++	struct ipu_isys_csi2_config cfg;
++	int i;
++
++	list_for_each_entry(asd, &isys->notifier.asd_list, asd_list) {
++		s_asd = container_of(asd, struct sensor_async_subdev, asd);
++		cfg.port = s_asd->csi2.port;
++		cfg.nlanes = s_asd->csi2.nlanes;
++		phy_port = ipu6_isys_driver_port_to_phy_port(&cfg);
++		if (phy_port < 0) {
++			dev_err(&isys->adev->dev, "invalid port %d for lane %d",
++				cfg.port, cfg.nlanes);
++			return -ENXIO;
++		}
++
++		phy_id = cfg.port / 4;
++		phy_base = isp_base + IPU6_ISYS_PHY_BASE(phy_id);
++		dev_dbg(&isys->adev->dev, "port%d PHY%u lanes %u\n",
++			cfg.port, phy_id, cfg.nlanes);
++
++		phy_config_regs = config_regs[cfg.nlanes/2];
++		cfg.port = phy_port;
++		for (i = 0; phy_config_regs[cfg.port][i].reg; i++) {
++			writel(phy_config_regs[cfg.port][i].val,
++				phy_base + phy_config_regs[cfg.port][i].reg);
++		}
++	}
++
++	return 0;
++}
++#endif
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-phy.h b/drivers/media/pci/intel/ipu6/ipu6-isys-phy.h
+index 3e4411b5350e..49fd8aa4b4d9 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-phy.h
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-phy.h
+@@ -154,6 +154,11 @@ int ipu6_isys_phy_powerdown_ack(struct ipu_isys *isys, unsigned int phy_id);
+ int ipu6_isys_phy_reset(struct ipu_isys *isys, unsigned int phy_id,
+ 			bool assert);
+ int ipu6_isys_phy_ready(struct ipu_isys *isys, unsigned int phy_id);
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+ int ipu6_isys_phy_common_init(struct ipu_isys *isys, struct ipu_isys_csi2_config *cfg);
+ int ipu6_isys_phy_config(struct ipu_isys *isys, struct ipu_isys_csi2_config *cfg);
++#else
++int ipu6_isys_phy_common_init(struct ipu_isys *isys);
++int ipu6_isys_phy_config(struct ipu_isys *isys);
++#endif
+ #endif
+diff --git a/drivers/media/platform/intel/Makefile b/drivers/media/platform/intel/Makefile
+index 6e5efa073fee..2417a4b67a15 100644
+--- a/drivers/media/platform/intel/Makefile
++++ b/drivers/media/platform/intel/Makefile
+@@ -12,4 +12,5 @@ obj-$(CONFIG_INTEL_IPU6_TGLRVP_PDATA) += ipu6-tglrvp-pdata.o
+ obj-$(CONFIG_INTEL_IPU6_JSLRVP_PDATA) += ipu6-jslrvp-pdata.o
+ obj-$(CONFIG_INTEL_IPU6_ADLRVP_PDATA) += ipu6-adlrvp-pdata.o
+ obj-$(CONFIG_INTEL_IPU6_ACPI)         += ipu6-acpi.o \
+-					ipu6-acpi-pdata.o
++					ipu6-acpi-pdata.o \
++					ipu6-acpi-common.o
+diff --git a/drivers/media/platform/intel/ipu6-acpi-common.c b/drivers/media/platform/intel/ipu6-acpi-common.c
+new file mode 100644
+index 000000000000..dd17d4e29d40
+--- /dev/null
++++ b/drivers/media/platform/intel/ipu6-acpi-common.c
+@@ -0,0 +1,357 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2016--2022 Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/platform_device.h>
++#include <linux/version.h>
++#include <media/ipu-acpi-pdata.h>
++#include <media/ipu-acpi.h>
++
++static int get_integer_dsdt_data(struct device *dev, const u8 *dsdt,
++				 int func, u64 *out)
++{
++	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
++	union acpi_object *obj;
++
++	obj = acpi_evaluate_dsm(dev_handle, (void *)dsdt, 0, func, NULL);
++	if (!obj) {
++		dev_err(dev, "No dsdt\n");
++		return -ENODEV;
++	}
++	dev_dbg(dev, "ACPI type %d", obj->type);
++
++	if (obj->type != ACPI_TYPE_INTEGER) {
++		ACPI_FREE(obj);
++		return -ENODEV;
++	}
++	*out = obj->integer.value;
++	ACPI_FREE(obj);
++	return 0;
++}
++
++static int read_acpi_block(struct device *dev, char *id, void *data, u32 size)
++{
++	union acpi_object *obj;
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
++	int status;
++	u32 buffer_length;
++
++	status = acpi_evaluate_object(dev_handle, id, NULL, &buffer);
++	if (!ACPI_SUCCESS(status))
++		return -ENODEV;
++
++	obj = (union acpi_object *)buffer.pointer;
++	if (!obj || obj->type != ACPI_TYPE_BUFFER) {
++		dev_err(dev, "Could't read acpi buffer\n");
++		status = -ENODEV;
++		goto err;
++	}
++
++	if (obj->buffer.length > size) {
++		dev_err(dev, "Given buffer is too small\n");
++		status = -ENODEV;
++		goto err;
++	}
++
++	memcpy(data, obj->buffer.pointer, min(size, obj->buffer.length));
++	buffer_length = obj->buffer.length;
++	kfree(buffer.pointer);
++
++	return buffer_length;
++err:
++	kfree(buffer.pointer);
++	return status;
++}
++
++int ipu_acpi_get_gpio_data(struct device *dev, struct ipu_gpio_info *gpio, int size,
++				u64 *gpio_num)
++{
++	const u8 dsdt_cam_gpio[] = {
++		0x40, 0x46, 0x23, 0x79, 0x10, 0x9e, 0xea, 0x4f,
++		0xa5, 0xc1, 0xB5, 0xaa, 0x8b, 0x19, 0x75, 0x6f };
++
++	int i = 0, j = 0, retries = 0, loop = 0;
++	u64 num_gpio;
++
++	int rval = get_integer_dsdt_data(dev, dsdt_cam_gpio, 1, &num_gpio);
++
++	if (rval < 0) {
++		dev_err(dev, "Failed to get number of GPIO pins\n");
++		return rval;
++	}
++
++	dev_dbg(dev, "Num of gpio found = %lld", num_gpio);
++
++	if (num_gpio == 0) {
++		*gpio_num = num_gpio;
++		return rval;
++	}
++
++	if (num_gpio > size) {
++		dev_err(dev, "Incorrect number of GPIO pins\n");
++		return rval;
++	}
++
++	/* repeat until all gpio pin is saved */
++	while (i < num_gpio && loop <= LOOP_SIZE) {
++		u64 data;
++		struct gpio_desc *desc = NULL;
++
++		rval = get_integer_dsdt_data(dev, dsdt_cam_gpio, i + 2, &data);
++
++		if (rval < 0) {
++			dev_err(dev, "No gpio data\n");
++			return -ENODEV;
++		}
++
++		gpio[i].func = (data & 0xff);
++		gpio[i].valid = FALSE;
++
++		desc = gpiod_get_index(dev, NULL, i + retries, GPIOD_ASIS);
++
++		if (!IS_ERR(desc)) {
++			unsigned short pin = desc_to_gpio(desc);
++			bool save = TRUE;
++
++			/* always save first GPIO pin */
++			if (i == 0)
++				save = TRUE;
++
++			/* check subsequent GPIO pin for replicate */
++			else {
++				for (j = 0; j <= i; j++) {
++					/* retry if same as previous pin */
++					if (gpio[j].pin == pin) {
++						retries++;
++						save = FALSE;
++						gpiod_put(desc);
++						break;
++					}
++				}
++			}
++
++			/* save into array */
++			if (save == TRUE) {
++				gpio[i].pin = pin;
++				gpio[i].valid = TRUE;
++				gpiod_put(desc);
++				i++;
++				retries = 0;
++			}
++		}
++		loop++;
++	}
++	*gpio_num = num_gpio;
++
++	return rval;
++}
++
++int ipu_acpi_get_i2c_info(struct device *dev, struct ipu_i2c_info *i2c, int size, u64 *num)
++{
++	const u8 dsdt_cam_i2c[] = {
++		0x49, 0x75, 0x25, 0x26, 0x71, 0x92, 0xA4, 0x4C,
++		0xBB, 0x43, 0xC4, 0x89, 0x9D, 0x5A, 0x48, 0x81};
++
++	u64 num_i2c;
++	int i;
++	int rval = get_integer_dsdt_data(dev, dsdt_cam_i2c, 1, &num_i2c);
++
++	if (rval < 0) {
++		dev_err(dev, "Failed to get number of I2C\n");
++		return -ENODEV;
++	}
++
++	for (i = 0; i < num_i2c && i < size; i++) {
++		u64 data;
++
++		rval = get_integer_dsdt_data(dev, dsdt_cam_i2c, i + 2,
++					     &data);
++
++		if (rval < 0) {
++			dev_err(dev, "Failed to get I2C data\n");
++			return -ENODEV;
++		}
++
++		i2c[i].bus = ((data >> 24) & 0xff);
++		i2c[i].addr = (data >> 8) & 0xff;
++
++		dev_dbg(dev, "ACPI camera option: i2c bus %d addr %x",
++			i2c[i].bus, i2c[i].addr);
++	}
++
++	*num = num_i2c;
++
++	return 0;
++}
++
++static int match_depend(struct device *dev, const void *data)
++{
++	return (dev && dev->fwnode == data) ? 1 : 0;
++}
++
++int ipu_acpi_get_control_logic_data(struct device *dev,
++					struct control_logic_data **ctl_data)
++{
++	/* CLDB data */
++	struct control_logic_data_packed ctl_logic_data;
++	int ret = read_acpi_block(dev, "CLDB", &ctl_logic_data,
++				sizeof(ctl_logic_data));
++
++	if (ret < 0) {
++		dev_err(dev, "no such CLDB block");
++		return ret;
++	}
++
++	(*ctl_data)->type = ctl_logic_data.controllogictype;
++	(*ctl_data)->id = ctl_logic_data.controllogicid;
++	(*ctl_data)->sku = ctl_logic_data.sensorcardsku;
++
++	dev_dbg(dev, "CLDB data version %d clid %d cltype %d sku %d",
++		ctl_logic_data.version,
++		ctl_logic_data.controllogicid,
++		ctl_logic_data.controllogictype,
++		ctl_logic_data.sensorcardsku);
++
++	/* GPIO data */
++	ret = ipu_acpi_get_gpio_data(dev, (*ctl_data)->gpio, ARRAY_SIZE((*ctl_data)->gpio),
++				&((*ctl_data)->gpio_num));
++
++	if (ret < 0) {
++		dev_err(dev, "Failed to get GPIO data");
++		return ret;
++	}
++	return 0;
++}
++
++int ipu_acpi_get_dep_data(struct device *dev,
++			     struct control_logic_data *ctl_data)
++{
++	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
++	struct acpi_handle_list dep_devices;
++	acpi_status status;
++	int i;
++	int rval;
++
++	ctl_data->completed = false;
++
++	if (!acpi_has_method(dev_handle, "_DEP")) {
++		dev_err(dev, "ACPI does not have _DEP method");
++		return 0;
++	}
++
++	status = acpi_evaluate_reference(dev_handle, "_DEP", NULL,
++					 &dep_devices);
++
++	if (ACPI_FAILURE(status)) {
++		dev_err(dev, "Failed to evaluate _DEP.\n");
++		return -ENODEV;
++	}
++
++	for (i = 0; i < dep_devices.count; i++) {
++		struct acpi_device *device;
++		struct acpi_device_info *info;
++		struct device *p_dev;
++		int match;
++
++		status = acpi_get_object_info(dep_devices.handles[i], &info);
++		if (ACPI_FAILURE(status)) {
++			dev_err(dev, "Error reading _DEP device info\n");
++			continue;
++		}
++
++		match = info->valid & ACPI_VALID_HID &&
++			!strcmp(info->hardware_id.string, "INT3472");
++
++		kfree(info);
++
++		if (!match)
++			continue;
++
++		/* Process device IN3472 created by acpi */
++		device = acpi_fetch_acpi_dev(dep_devices.handles[i]);
++		if (!device) {
++			dev_err(dev, "INT3472 does not have dep device");
++			return -ENODEV;
++		}
++
++		dev_dbg(dev, "Depend ACPI device found: %s\n",
++			dev_name(&device->dev));
++
++		p_dev = bus_find_device(&platform_bus_type, NULL,
++					&device->fwnode, match_depend);
++
++		if (p_dev) {
++			dev_err(dev, "Dependent platform device found %s\n",
++				dev_name(p_dev));
++
++			/* obtain Control Logic Data from BIOS */
++			rval = ipu_acpi_get_control_logic_data(p_dev, &ctl_data);
++
++			if (rval) {
++				dev_err(dev, "Error getting Control Logic Data");
++				return rval;
++			}
++
++			ctl_data->completed = true;
++		} else
++			dev_err(dev, "Dependent platform device not found\n");
++	}
++
++	if (!ctl_data->completed) {
++		ctl_data->type = CL_EMPTY;
++		dev_err(dev, "No control logic data available");
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(ipu_acpi_get_dep_data);
++
++int ipu_acpi_get_cam_data(struct device *dev,
++			     struct sensor_bios_data *sensor)
++{
++	/* SSDB */
++	struct sensor_bios_data_packed sensor_data;
++
++	int ret = read_acpi_block(dev, "SSDB", &sensor_data,
++				  sizeof(sensor_data));
++
++	if (ret < 0) {
++		dev_err(dev, "Fail to read from SSDB");
++		return ret;
++	}
++
++	/* Xshutdown is not part of the ssdb data */
++	sensor->link = sensor_data.link;
++	sensor->lanes = sensor_data.lanes;
++	sensor->pprval = sensor_data.pprval;
++	sensor->pprunit = sensor_data.pprunit;
++
++	dev_dbg(dev, "sensor ACPI data: name %s link %d, lanes %d pprval %d pprunit %x",
++		dev_name(dev), sensor->link, sensor->lanes, sensor->pprval, sensor->pprunit);
++
++	/* I2C */
++	ret = ipu_acpi_get_i2c_info(dev, sensor->i2c, ARRAY_SIZE(sensor->i2c), &sensor->i2c_num);
++
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++EXPORT_SYMBOL(ipu_acpi_get_cam_data);
++
++MODULE_AUTHOR("Samu Onkalo <samu.onkalo@intel.com>");
++MODULE_AUTHOR("Khai Wen Ng <khai.wen.ng@intel.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("IPU6 ACPI support");
++
+diff --git a/drivers/media/platform/intel/ipu6-acpi-pdata.c b/drivers/media/platform/intel/ipu6-acpi-pdata.c
+index 46d35cf7b927..c68834e4e35e 100644
+--- a/drivers/media/platform/intel/ipu6-acpi-pdata.c
++++ b/drivers/media/platform/intel/ipu6-acpi-pdata.c
+@@ -21,6 +21,14 @@
+ #define SUFFIX_BASE 96
+ #define MSG_LEN 128
+ 
++static struct ipu_isys_subdev_pdata *ptr_built_in_pdata;
++
++void set_built_in_pdata(struct ipu_isys_subdev_pdata *pdata)
++{
++	ptr_built_in_pdata = pdata;
++};
++EXPORT_SYMBOL(set_built_in_pdata);
++
+ static struct ipu_isys_clk_mapping clk_mapping[] = {
+ 	{ CLKDEV_INIT(NULL, NULL, NULL), NULL }
+ };
+@@ -42,6 +50,7 @@ struct ipu_isys_subdev_pdata *get_acpi_subdev_pdata(void)
+ 	ptr = &acpi_subdev_pdata;
+ 	return ptr;
+ }
++EXPORT_SYMBOL(get_acpi_subdev_pdata);
+ 
+ void print_serdes_sdinfo(struct serdes_subdev_info *sdinfo)
+ {
+@@ -141,7 +150,7 @@ void print_subdev(struct ipu_isys_subdev_info *sd)
+ 	pr_debug("\t\treset_pin \t\t= %d", spdata->reset_pin);
+ 	pr_debug("\t\tdetect_pin \t\t= %d", spdata->detect_pin);
+ 
+-	for (i = 0; i < IPU_SPLATA_GPIO_NUM; i++)
++	for (i = 0; i < IPU_SPDATA_GPIO_NUM; i++)
+ 		pr_debug("\t\tgpios[%d] \t\t= %d", i, spdata->gpios[i]);
+ }
+ 
+@@ -249,7 +258,7 @@ void update_subdev(struct device *dev,
+ 	update_str(dev, "pdata irq_pin_name", old_pdata->irq_pin_name, new_pdata->irq_pin_name);
+ 	update_int(dev, "pdata reset_pin", &(old_pdata)->reset_pin, new_pdata->reset_pin);
+ 	update_int(dev, "pdata detect_pin", &(old_pdata)->detect_pin, new_pdata->detect_pin);
+-	update_inta(dev, "pdata gpios", old_pdata->gpios, new_pdata->gpios, IPU_SPLATA_GPIO_NUM);
++	update_inta(dev, "pdata gpios", old_pdata->gpios, new_pdata->gpios, IPU_SPDATA_GPIO_NUM);
+ }
+ 
+ void update_serdes_subdev(struct device *dev,
+@@ -370,7 +379,6 @@ void update_pdata(struct device *dev,
+ 			enum connection_type connect)
+ {
+ 	struct ipu_isys_subdev_info *acpi_subdev;
+-	struct ipu_isys_subdev_pdata *ptr_built_in_pdata;
+ 	bool found = false;
+ 
+ 	acpi_subdev = new_subdev;
+@@ -378,8 +386,6 @@ void update_pdata(struct device *dev,
+ 	/* update local ipu_isys_subdev_pdata */
+ 	add_local_subdevs(acpi_subdev);
+ 
+-	ptr_built_in_pdata = get_built_in_pdata();
+-
+ 	/* if there is existing pdata, update the existing one */
+ 	if (ptr_built_in_pdata) {
+ 		struct ipu_isys_subdev_info **subdevs, *sd_info;
+@@ -730,7 +736,8 @@ int populate_sensor_pdata(struct device *dev,
+ 
+ 		/* Use DISCRETE Control Logic or No Control Logic for serdes */
+ 		if (ctl_data->type != CL_DISCRETE && ctl_data->type != CL_EMPTY) {
+-			dev_err(dev, "IPU6 ACPI: Incorrect Control Logic Type for serdes");
++			dev_err(dev, "IPU6 ACPI: Incorrect Control Logic Type for serdes (%d)",
++				ctl_data->type);
+ 			return -1;
+ 		}
+ 
+@@ -834,6 +841,7 @@ int get_sensor_pdata(struct i2c_client *client,
+ 	kfree(ctl_data);
+ 	return rval;
+ }
++EXPORT_SYMBOL(get_sensor_pdata);
+ 
+ MODULE_AUTHOR("Khai Wen, Ng <khai.wen.ng@intel.com>");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/intel/ipu6-acpi.c b/drivers/media/platform/intel/ipu6-acpi.c
+index 8de3a5b42d4e..1e18ac2a3a21 100644
+--- a/drivers/media/platform/intel/ipu6-acpi.c
++++ b/drivers/media/platform/intel/ipu6-acpi.c
+@@ -43,76 +43,7 @@
+ #include <media/ti960.h>
+ #include <media/d4xx.h>
+ 
+-#define HID_BUFFER_SIZE 32
+-#define VCM_BUFFER_SIZE 32
+-
+-#define LOOP_SIZE 10
+ static LIST_HEAD(devices);
+-static LIST_HEAD(new_devs);
+-
+-struct ipu_isys_subdev_pdata *ptr_built_in_pdata;
+-
+-struct ipu_isys_subdev_pdata *get_built_in_pdata(void)
+-{
+-	return ptr_built_in_pdata;
+-}
+-
+-static int get_integer_dsdt_data(struct device *dev, const u8 *dsdt,
+-				 int func, u64 *out)
+-{
+-	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
+-	union acpi_object *obj;
+-
+-	obj = acpi_evaluate_dsm(dev_handle, (void *)dsdt, 0, func, NULL);
+-	if (!obj) {
+-		dev_err(dev, "No dsdt\n");
+-		return -ENODEV;
+-	}
+-	dev_dbg(dev, "ACPI type %d", obj->type);
+-
+-	if (obj->type != ACPI_TYPE_INTEGER) {
+-		ACPI_FREE(obj);
+-		return -ENODEV;
+-	}
+-	*out = obj->integer.value;
+-	ACPI_FREE(obj);
+-	return 0;
+-}
+-
+-static int read_acpi_block(struct device *dev, char *id, void *data, u32 size)
+-{
+-	union acpi_object *obj;
+-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+-	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
+-	int status;
+-	u32 buffer_length;
+-
+-	status = acpi_evaluate_object(dev_handle, id, NULL, &buffer);
+-	if (!ACPI_SUCCESS(status))
+-		return -ENODEV;
+-
+-	obj = (union acpi_object *)buffer.pointer;
+-	if (!obj || obj->type != ACPI_TYPE_BUFFER) {
+-		dev_err(dev, "Could't read acpi buffer\n");
+-		status = -ENODEV;
+-		goto err;
+-	}
+-
+-	if (obj->buffer.length > size) {
+-		dev_err(dev, "Given buffer is too small\n");
+-		status = -ENODEV;
+-		goto err;
+-	}
+-
+-	memcpy(data, obj->buffer.pointer, min(size, obj->buffer.length));
+-	buffer_length = obj->buffer.length;
+-	kfree(buffer.pointer);
+-
+-	return buffer_length;
+-err:
+-	kfree(buffer.pointer);
+-	return status;
+-}
+ 
+ static struct ipu_camera_module_data *add_device_to_list(
+ 	struct list_head *devices)
+@@ -127,281 +58,6 @@ static struct ipu_camera_module_data *add_device_to_list(
+ 	return cam_device;
+ }
+ 
+-static int ipu_acpi_get_gpio_data(struct device *dev, struct ipu_gpio_info *gpio, int size,
+-				u64 *gpio_num)
+-{
+-	const u8 dsdt_cam_gpio[] = {
+-		0x40, 0x46, 0x23, 0x79, 0x10, 0x9e, 0xea, 0x4f,
+-		0xa5, 0xc1, 0xB5, 0xaa, 0x8b, 0x19, 0x75, 0x6f };
+-
+-	int i = 0, j = 0, retries = 0, loop = 0;
+-	u64 num_gpio;
+-
+-	int rval = get_integer_dsdt_data(dev, dsdt_cam_gpio, 1, &num_gpio);
+-
+-	if (rval < 0) {
+-		dev_err(dev, "Failed to get number of GPIO pins\n");
+-		return rval;
+-	}
+-
+-	dev_dbg(dev, "Num of gpio found = %lld", num_gpio);
+-
+-	if (num_gpio == 0) {
+-		*gpio_num = num_gpio;
+-		return rval;
+-	}
+-
+-	if (num_gpio > size) {
+-		dev_err(dev, "Incorrect number of GPIO pins\n");
+-		return rval;
+-	}
+-
+-	/* repeat until all gpio pin is saved */
+-	while (i < num_gpio && loop <= LOOP_SIZE) {
+-		u64 data;
+-		struct gpio_desc *desc = NULL;
+-
+-		rval = get_integer_dsdt_data(dev, dsdt_cam_gpio, i + 2, &data);
+-
+-		if (rval < 0) {
+-			dev_err(dev, "No gpio data\n");
+-			return -ENODEV;
+-		}
+-
+-		gpio[i].func = (data & 0xff);
+-		gpio[i].valid = FALSE;
+-
+-		desc = gpiod_get_index(dev, NULL, i + retries, GPIOD_ASIS);
+-
+-		if (!IS_ERR(desc)) {
+-			unsigned short pin = desc_to_gpio(desc);
+-			bool save = TRUE;
+-
+-			/* always save first GPIO pin */
+-			if (i == 0)
+-				save = TRUE;
+-
+-			/* check subsequent GPIO pin for replicate */
+-			else {
+-				for (j = 0; j <= i; j++) {
+-					/* retry if same as previous pin */
+-					if (gpio[j].pin == pin) {
+-						retries++;
+-						save = FALSE;
+-						gpiod_put(desc);
+-						break;
+-					}
+-				}
+-			}
+-
+-			/* save into array */
+-			if (save == TRUE) {
+-				gpio[i].pin = pin;
+-				gpio[i].valid = TRUE;
+-				gpiod_put(desc);
+-				i++;
+-				retries = 0;
+-			}
+-		}
+-		loop++;
+-	}
+-	*gpio_num = num_gpio;
+-
+-	return rval;
+-}
+-
+-static int ipu_acpi_get_i2c_info(struct device *dev, struct ipu_i2c_info *i2c, int size, u64 *num)
+-{
+-	const u8 dsdt_cam_i2c[] = {
+-		0x49, 0x75, 0x25, 0x26, 0x71, 0x92, 0xA4, 0x4C,
+-		0xBB, 0x43, 0xC4, 0x89, 0x9D, 0x5A, 0x48, 0x81};
+-
+-	u64 num_i2c;
+-	int i;
+-	int rval = get_integer_dsdt_data(dev, dsdt_cam_i2c, 1, &num_i2c);
+-
+-	if (rval < 0) {
+-		dev_err(dev, "Failed to get number of I2C\n");
+-		return -ENODEV;
+-	}
+-
+-	for (i = 0; i < num_i2c && i < size; i++) {
+-		u64 data;
+-
+-		rval = get_integer_dsdt_data(dev, dsdt_cam_i2c, i + 2,
+-					     &data);
+-
+-		if (rval < 0) {
+-			dev_err(dev, "Failed to get I2C data\n");
+-			return -ENODEV;
+-		}
+-
+-		i2c[i].bus = ((data >> 24) & 0xff);
+-		i2c[i].addr = (data >> 8) & 0xff;
+-
+-		dev_dbg(dev, "ACPI camera option: i2c bus %d addr %x",
+-			i2c[i].bus, i2c[i].addr);
+-	}
+-
+-	*num = num_i2c;
+-
+-	return 0;
+-}
+-
+-static int match_depend(struct device *dev, const void *data)
+-{
+-	return (dev && dev->fwnode == data) ? 1 : 0;
+-}
+-
+-#define MAX_CONSUMERS 1
+-int ipu_acpi_get_control_logic_data(struct device *dev,
+-					struct control_logic_data **ctl_data)
+-{
+-	/* CLDB data */
+-	struct control_logic_data_packed ctl_logic_data;
+-	int ret = read_acpi_block(dev, "CLDB", &ctl_logic_data,
+-				sizeof(ctl_logic_data));
+-
+-	if (ret < 0) {
+-		dev_err(dev, "no such CLDB block");
+-		return ret;
+-	}
+-
+-	(*ctl_data)->type = ctl_logic_data.controllogictype;
+-	(*ctl_data)->id = ctl_logic_data.controllogicid;
+-	(*ctl_data)->sku = ctl_logic_data.sensorcardsku;
+-
+-	dev_dbg(dev, "CLDB data version %d clid %d cltype %d sku %d",
+-		ctl_logic_data.version,
+-		ctl_logic_data.controllogicid,
+-		ctl_logic_data.controllogictype,
+-		ctl_logic_data.sensorcardsku);
+-
+-	/* GPIO data */
+-	ret = ipu_acpi_get_gpio_data(dev, (*ctl_data)->gpio, ARRAY_SIZE((*ctl_data)->gpio),
+-				&((*ctl_data)->gpio_num));
+-
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to get GPIO data");
+-		return ret;
+-	}
+-	return 0;
+-}
+-
+-int ipu_acpi_get_dep_data(struct device *dev,
+-			     struct control_logic_data *ctl_data)
+-{
+-	struct acpi_handle *dev_handle = ACPI_HANDLE(dev);
+-	struct acpi_handle_list dep_devices;
+-	acpi_status status;
+-	int i;
+-	int rval;
+-
+-	ctl_data->completed = false;
+-
+-	if (!acpi_has_method(dev_handle, "_DEP")) {
+-		dev_err(dev, "ACPI does not have _DEP method");
+-		return 0;
+-	}
+-
+-	status = acpi_evaluate_reference(dev_handle, "_DEP", NULL,
+-					 &dep_devices);
+-
+-	if (ACPI_FAILURE(status)) {
+-		dev_err(dev, "Failed to evaluate _DEP.\n");
+-		return -ENODEV;
+-	}
+-
+-	for (i = 0; i < dep_devices.count; i++) {
+-		struct acpi_device *device;
+-		struct acpi_device_info *info;
+-		struct device *p_dev;
+-		int match;
+-
+-		status = acpi_get_object_info(dep_devices.handles[i], &info);
+-		if (ACPI_FAILURE(status)) {
+-			dev_err(dev, "Error reading _DEP device info\n");
+-			continue;
+-		}
+-
+-		match = info->valid & ACPI_VALID_HID &&
+-			!strcmp(info->hardware_id.string, "INT3472");
+-
+-		kfree(info);
+-
+-		if (!match)
+-			continue;
+-
+-		/* Process device IN3472 created by acpi */
+-		device = acpi_fetch_acpi_dev(dep_devices.handles[i]);
+-		if (!device) {
+-			dev_err(dev, "INT3472 does not have dep device");
+-			return -ENODEV;
+-		}
+-
+-		dev_dbg(dev, "Depend ACPI device found: %s\n",
+-			dev_name(&device->dev));
+-
+-		p_dev = bus_find_device(&platform_bus_type, NULL,
+-					&device->fwnode, match_depend);
+-
+-		if (p_dev) {
+-			dev_err(dev, "Dependent platform device found %s\n",
+-				dev_name(p_dev));
+-
+-			/* obtain Control Logic Data from BIOS */
+-			rval = ipu_acpi_get_control_logic_data(p_dev, &ctl_data);
+-
+-			if (rval) {
+-				dev_err(dev, "Error getting Control Logic Data");
+-				return rval;
+-			} else
+-				ctl_data->completed = true;
+-		} else
+-			dev_err(dev, "Dependent platform device not found\n");
+-	}
+-
+-	if (!ctl_data->completed) {
+-		ctl_data->type = CL_EMPTY;
+-		dev_err(dev, "No control logic data available");
+-	}
+-
+-	return 0;
+-}
+-
+-int ipu_acpi_get_cam_data(struct device *dev,
+-			     struct sensor_bios_data *sensor)
+-{
+-	/* SSDB */
+-	struct sensor_bios_data_packed sensor_data;
+-
+-	int ret = read_acpi_block(dev, "SSDB", &sensor_data,
+-				  sizeof(sensor_data));
+-
+-	if (ret < 0) {
+-		dev_err(dev, "Fail to read from SSDB");
+-		return ret;
+-	}
+-
+-	/* Xshutdown is not part of the ssdb data */
+-	sensor->link = sensor_data.link;
+-	sensor->lanes = sensor_data.lanes;
+-	sensor->pprval = sensor_data.pprval;
+-	sensor->pprunit = sensor_data.pprunit;
+-
+-	dev_dbg(dev, "sensor ACPI data: name %s link %d, lanes %d pprval %d pprunit %x",
+-		dev_name(dev), sensor->link, sensor->lanes, sensor->pprval, sensor->pprunit);
+-
+-	/* I2C */
+-	ret = ipu_acpi_get_i2c_info(dev, sensor->i2c, ARRAY_SIZE(sensor->i2c), &sensor->i2c_num);
+-
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL(ipu_acpi_get_cam_data);
+-
+ static const struct ipu_acpi_devices supported_devices[] = {
+ /*
+  *	{ "ACPI ID", sensor_name, get_sensor_pdata, NULL, 0, TYPE, serdes_name },	// Custom HID
+@@ -534,7 +190,7 @@ int ipu_get_acpi_devices(void *driver_data,
+ 		dev_dbg(dev, "Built-in pdata not found");
+ 	else {
+ 		dev_dbg(dev, "Built-in pdata found");
+-		ptr_built_in_pdata = *built_in_pdata;
++		set_built_in_pdata(*built_in_pdata);
+ 	}
+ 
+ 	if ((!fn) || (!driver_data))
+@@ -556,7 +212,7 @@ EXPORT_SYMBOL(ipu_get_acpi_devices);
+ 
+ static int __init ipu_acpi_init(void)
+ {
+-	ptr_built_in_pdata = NULL;
++	set_built_in_pdata(NULL);
+ 	return 0;
+ }
+ 
+@@ -569,5 +225,5 @@ module_exit(ipu_acpi_exit);
+ 
+ MODULE_AUTHOR("Samu Onkalo <samu.onkalo@intel.com>");
+ MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("IPU4 ACPI support");
++MODULE_DESCRIPTION("IPU6 ACPI support");
+ 
+diff --git a/drivers/media/platform/intel/ipu6-adlrvp-pdata.c b/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
+index d410e8f5f4d7..a0087e021621 100644
+--- a/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
++++ b/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
+@@ -7,14 +7,30 @@
+ #include <linux/pci.h>
+ 
+ #include <media/ipu-isys.h>
++#if IS_ENABLED(CONFIG_VIDEO_TI960)
+ #include <media/ti960.h>
++#endif
++#if IS_ENABLED(CONFIG_VIDEO_AR0234)
+ #include <media/ar0234.h>
++#endif
++#if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ #include <media/imx390.h>
++#endif
++#if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ #include <media/lt6911uxc.h>
++#endif
++#if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ #include <media/d4xx.h>
++#endif
+ 
+ #include "ipu.h"
+ 
++#if IS_ENABLED(CONFIG_VIDEO_AR0234)
++#define AR0234_LANES       2
++#define AR0234_I2C_ADDRESS 0x10
++
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ static void ar0234_fixup_spdata(const void *spdata_rep, void *spdata)
+ {
+ 	const struct ipu_spdata_rep *rep = spdata_rep;
+@@ -31,23 +47,7 @@ static void ar0234_fixup_spdata(const void *spdata_rep, void *spdata)
+ 		platform->suffix = rep->suffix;
+ 	}
+ }
+-
+-static void lt6911uxc_fixup_spdata(const void *spdata_rep, void *spdata)
+-{
+-	const struct ipu_spdata_rep *rep = spdata_rep;
+-	struct lt6911uxc_platform_data *platform = spdata;
+-
+-	if (spdata_rep && spdata) {
+-		platform->port = rep->port_n;
+-		platform->lanes = rep->lanes;
+-		platform->i2c_slave_address = rep->slave_addr_n;
+-		platform->gpios[0] = rep->gpios[0];
+-		platform->irq_pin = rep->irq_pin;
+-		platform->irq_pin_flags = rep->irq_pin_flags;
+-		strcpy(platform->irq_pin_name, rep->irq_pin_name);
+-		platform->suffix = rep->suffix;
+-	}
+-}
++#endif
+ 
+ #define AR0234_LANES       2
+ #define AR0234_I2C_ADDRESS 0x10
+@@ -78,7 +78,10 @@ static struct ipu_isys_subdev_info ar0234_sd_1 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:15.1",
+ 	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
+ };
+ 
+ static struct ipu_isys_csi2_config ar0234_csi2_cfg_2 = {
+@@ -107,8 +110,12 @@ static struct ipu_isys_subdev_info ar0234_sd_2 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:19.1",
+ 	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
+ };
++#endif
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ #define IMX390_LANES       4
+@@ -215,10 +222,9 @@ static struct ipu_isys_subdev_info imx390_sd_4 = {
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_TI960)
+-#define TI960_I2C_ADAPTER	2
+-#define TI960_I2C_ADAPTER_2	4
+ #define TI960_LANES	4
+ 
++#if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ #define IMX390A_ADDRESS		0x44
+ #define IMX390B_ADDRESS		0x45
+ #define IMX390C_ADDRESS		0x46
+@@ -244,12 +250,18 @@ static struct ti960_subdev_pdata imx390_d3cm_pdata_stub = {
+ 	.module_name = "imx390",
+ 	.fsin = 3, /* gpio 3 used for FSIN */
+ };
++#endif
+ 
+-static struct ipu_isys_csi2_config ti960_csi2_cfg = {
++static struct ipu_isys_csi2_config ti960_csi2_cfg_1 = {
+ 	.nlanes = TI960_LANES,
+ 	.port = 1,
+ };
+ 
++static struct ipu_isys_csi2_config ti960_csi2_cfg_2 = {
++	.nlanes = TI960_LANES,
++	.port = 2,
++};
++
+ static struct ti960_subdev_info ti960_subdevs[] = {
+ #if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ 	/* D3RCM */
+@@ -345,30 +357,71 @@ static struct ti960_subdev_info ti960_subdevs[] = {
+ #endif
+ };
+ 
+-static struct ti960_pdata ti960_pdata = {
++static struct ti960_pdata ti960_pdata_1 = {
+ 	.subdev_info = ti960_subdevs,
+ 	.subdev_num = ARRAY_SIZE(ti960_subdevs),
+ 	.reset_gpio = 0,
+-	.FPD_gpio = 175,
++	.FPD_gpio = -1,
+ 	.suffix = 'a',
+ };
+ 
+-static struct ipu_isys_subdev_info ti960_sd = {
+-	.csi2 = &ti960_csi2_cfg,
++static struct ti960_pdata ti960_pdata_2 = {
++	.subdev_info = ti960_subdevs,
++	.subdev_num = ARRAY_SIZE(ti960_subdevs),
++	.reset_gpio = 0,
++	.FPD_gpio = -1,
++	.suffix = 'b',
++};
++
++static struct ipu_isys_subdev_info ti960_sd_1 = {
++	.csi2 = &ti960_csi2_cfg_1,
+ 	.i2c = {
+ 		.board_info = {
+ 			 .type = "ti960",
+-			 .addr = TI960_I2C_ADDRESS,
+-			 .platform_data = &ti960_pdata,
++			 .addr = TI960_I2C_ADDRESS_2,
++			 .platform_data = &ti960_pdata_1,
+ 		},
+ 		.i2c_adapter_bdf = "0000:00:15.1",
+ 	}
+ };
++
++static struct ipu_isys_subdev_info ti960_sd_2 = {
++	.csi2 = &ti960_csi2_cfg_2,
++	.i2c = {
++		.board_info = {
++			 .type = "ti960",
++			 .addr = TI960_I2C_ADDRESS_2,
++			 .platform_data = &ti960_pdata_2,
++		},
++		.i2c_adapter_bdf = "0000:00:19.1",
++	}
++};
+ #endif
+ 
++#if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ #define LT6911UXC_LANES       4
+ #define LT6911UXC_I2C_ADDRESS 0x2B
+ 
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
++static void lt6911uxc_fixup_spdata(const void *spdata_rep, void *spdata)
++{
++	const struct ipu_spdata_rep *rep = spdata_rep;
++	struct lt6911uxc_platform_data *platform = spdata;
++
++	if (spdata_rep && spdata) {
++		platform->port = rep->port_n;
++		platform->lanes = rep->lanes;
++		platform->i2c_slave_address = rep->slave_addr_n;
++		platform->gpios[0] = rep->gpios[0];
++		platform->irq_pin = rep->irq_pin;
++		platform->irq_pin_flags = rep->irq_pin_flags;
++		strcpy(platform->irq_pin_name, rep->irq_pin_name);
++		platform->suffix = rep->suffix;
++	}
++}
++#endif
++
+ static struct ipu_isys_csi2_config lt6911uxc_csi2_cfg_1 = {
+ 	.nlanes = LT6911UXC_LANES,
+ 	.port = 1,
+@@ -397,7 +450,10 @@ static struct ipu_isys_subdev_info  lt6911uxc_sd_1 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:15.1",
+ 	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = lt6911uxc_fixup_spdata,
++#endif
+ };
+ 
+ static struct ipu_isys_csi2_config lt6911uxc_csi2_cfg_2 = {
+@@ -428,8 +484,12 @@ static struct ipu_isys_subdev_info lt6911uxc_sd_2 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:19.1",
+ 	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = lt6911uxc_fixup_spdata,
++#endif
+ };
++#endif
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ #define D4XX_LANES       2
+@@ -528,14 +588,18 @@ static struct ipu_isys_clk_mapping clk_mapping[] = {
+ 
+ static struct ipu_isys_subdev_pdata pdata = {
+ 	.subdevs = (struct ipu_isys_subdev_info *[]) {
++#if IS_ENABLED(CONFIG_VIDEO_AR0234)
+ 		&ar0234_sd_1,
+ 		&ar0234_sd_2,
++#endif
+ #if IS_ENABLED(CONFIG_VIDEO_TI960)
+-		//&ti960_sd,
+-		//&ti960_sd_2,
++		&ti960_sd_1,
++		&ti960_sd_2,
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ 		&lt6911uxc_sd_1,
+ 		&lt6911uxc_sd_2,
++#endif
+ #if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ 		&d4xx_sd_0,
+ 		&d4xx_sd_1,
+@@ -556,3 +620,5 @@ static void ipu6_quirk(struct pci_dev *pci_dev)
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, IPU6EP_ADL_P_PCI_ID, ipu6_quirk);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, IPU6EP_ADL_N_PCI_ID, ipu6_quirk);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, IPU6EP_RPL_P_PCI_ID, ipu6_quirk);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/intel/ipu6-tglrvp-pdata.c b/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+index 01daed54d0a7..547c224778d4 100644
+--- a/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
++++ b/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+@@ -64,6 +64,9 @@ static struct ipu_isys_subdev_info ov8856_sd_2 = {
+ 
+ #endif
+ 
++#if 0
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ static void ar0234_fixup_spdata(const void *spdata_rep, void *spdata)
+ {
+ 	const struct ipu_spdata_rep *rep = spdata_rep;
+@@ -80,6 +83,10 @@ static void ar0234_fixup_spdata(const void *spdata_rep, void *spdata)
+ 		platform->suffix = rep->suffix;
+ 	}
+ }
++#endif
++#endif
++
++#if IS_ENABLED(CONFIG_VIDEO_AR0234)
+ 
+ #define AR0234_LANES       2
+ #define AR0234_I2C_ADDRESS 0x10
+@@ -111,7 +118,12 @@ static struct ipu_isys_subdev_info ar0234_sd_1 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:15.3",
+ 	},
++#if 0
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
++#endif
+ };
+ 
+ static struct ipu_isys_csi2_config ar0234_csi2_cfg_2 = {
+@@ -140,7 +152,12 @@ static struct ipu_isys_subdev_info ar0234_sd_2 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:19.1",
+ 	},
++#if 0
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
++#endif
+ };
+ 
+ #if !IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+@@ -170,10 +187,14 @@ static struct ipu_isys_subdev_info ar0234_sd_3 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:15.2",
+ 	},
++#if 0
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
+ };
+ #endif
+-
++#endif
+ static struct ipu_isys_csi2_config ar0234_csi2_cfg_4 = {
+ 	.nlanes = AR0234_LANES,
+ 	.port = 5,
+@@ -200,8 +221,14 @@ static struct ipu_isys_subdev_info ar0234_sd_4 = {
+ 	},
+ 	.i2c_adapter_bdf = "0000:00:15.2",
+ 	},
++#if 0
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	.fixup_spdata = ar0234_fixup_spdata,
++#endif
+ };
++#endif
++#endif
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ #define IMX390_LANES       4
+@@ -479,6 +506,8 @@ static struct ipu_isys_subdev_info ti960_sd_2 = {
+ };
+ #endif
+ 
++#if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
++
+ #define LT6911UXC_LANES       4
+ #define LT6911UXC_I2C_ADDRESS 0x2B
+ 
+@@ -569,6 +598,7 @@ static struct ipu_isys_subdev_info lt6911uxc_sd_2 = {
+ 	.i2c_adapter_bdf = "0000:00:19.1",
+ 	},
+ };
++#endif
+ 
+ static struct ipu_isys_clk_mapping clk_mapping[] = {
+ 	{ CLKDEV_INIT(NULL, NULL, NULL), NULL }
+@@ -581,12 +611,14 @@ static struct ipu_isys_subdev_pdata pdata = {
+ 		&dw9714_sd_1,
+ 		&ov8856_sd_2,
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_AR0234)
+ 		&ar0234_sd_1,
+ 		&ar0234_sd_2,
+ #if !IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ 		&ar0234_sd_3,
+ #endif
+ 		&ar0234_sd_4,
++#endif
+ #if IS_ENABLED(CONFIG_VIDEO_IMX390)
+ 		&imx390_sd_1,
+ 		&imx390_sd_2,
+@@ -597,9 +629,11 @@ static struct ipu_isys_subdev_pdata pdata = {
+ 		&ti960_sd,
+ 		&ti960_sd_2,
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ 		&lt6911uxc_sd_0,	//Auxiliary port for 4k60fps
+ 		&lt6911uxc_sd_1,
+ 		&lt6911uxc_sd_2,
++#endif
+ 		NULL,
+ 	},
+ 	.clk_map = clk_mapping,
+@@ -610,3 +644,5 @@ static void ipu6_quirk(struct pci_dev *pci_dev)
+ 	pci_dev->dev.platform_data = &pdata;
+ }
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, IPU6_PCI_ID, ipu6_quirk);
++
++MODULE_LICENSE("GPL");
+diff --git a/include/media/ipu-acpi-pdata.h b/include/media/ipu-acpi-pdata.h
+index 858fa65b7bc5..73b2e78fc8fa 100644
+--- a/include/media/ipu-acpi-pdata.h
++++ b/include/media/ipu-acpi-pdata.h
+@@ -13,23 +13,14 @@
+ #define CL_DISCRETE 1
+ #define SERDES_MAX_PORT 4
+ #define SERDES_MAX_GPIO_POWERUP_SEQ 4
+-
+-int sensor_populate(struct device *dev,
+-			struct ipu_isys_subdev_info **sensor_sd,
+-			char sensor_name[I2C_NAME_SIZE],
+-			struct sensor_bios_data *cam_data,
+-			struct control_logic_data *ctl_data);
++#define LOOP_SIZE 10
+ 
+ int get_sensor_pdata(struct i2c_client *client,
+ 			struct ipu_camera_module_data *data,
+ 			struct ipu_i2c_helper *helper,
+ 			void *priv, size_t size,
+-			enum connection_type connect, const char *serdes_name);
+-
+-int get_serdes_pdata(struct i2c_client *client,
+-			struct ipu_camera_module_data *data,
+-			struct ipu_i2c_helper *helper,
+-			void *priv, size_t size);
++			enum connection_type connect,
++			const char *serdes_name);
+ 
+ struct ipu_isys_subdev_pdata *get_acpi_subdev_pdata(void);
+ 
+@@ -39,11 +30,11 @@ struct sensor_platform_data {
+ 	uint32_t i2c_slave_address;
+ 	int irq_pin;
+ 	unsigned int irq_pin_flags;
+-	char irq_pin_name[IPU_SPLATA_IRQ_PIN_NAME_LEN];
++	char irq_pin_name[IPU_SPDATA_IRQ_PIN_NAME_LEN];
+ 	int reset_pin;
+ 	int detect_pin;
+ 	char suffix;
+-	int gpios[IPU_SPLATA_GPIO_NUM];
++	int gpios[IPU_SPDATA_GPIO_NUM];
+ };
+ 
+ struct serdes_platform_data {
+diff --git a/include/media/ipu-acpi.h b/include/media/ipu-acpi.h
+index 83b1fb6308b1..67953db42715 100644
+--- a/include/media/ipu-acpi.h
++++ b/include/media/ipu-acpi.h
+@@ -28,6 +28,8 @@
+ #define GPIO_READY_STAT		0x13
+ #define GPIO_HDMI_DETECT	0x14
+ 
++void set_built_in_pdata(struct ipu_isys_subdev_pdata *pdata);
++
+ enum connection_type {
+ 	TYPE_DIRECT,
+ 	TYPE_SERDES
+@@ -122,7 +124,7 @@ struct ipu_gpio_info {
+ 
+ struct ipu_irq_info {
+ 	int irq_pin;
+-	char irq_pin_name[IPU_SPLATA_IRQ_PIN_NAME_LEN];
++	char irq_pin_name[IPU_SPDATA_IRQ_PIN_NAME_LEN];
+ };
+ 
+ /* Each I2C client linked to 1 set of CTL Logic */
+diff --git a/include/media/ipu-isys.h b/include/media/ipu-isys.h
+index a9201ab0c104..21a94ab61938 100644
+--- a/include/media/ipu-isys.h
++++ b/include/media/ipu-isys.h
+@@ -21,6 +21,13 @@ struct ipu_isys_subdev_i2c_info {
+ 	char i2c_adapter_bdf[32];
+ };
+ 
++#define IPU_SPDATA_NAME_LEN     20
++#define IPU_SPDATA_BDF_LEN      32
++#define IPU_SPLATA_GPIO_NUM 4
++#define IPU_SPLATA_IRQ_PIN_NAME_LEN 16
++
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ /**
+  * struct ipu_spdata_rep - override subdev platform data
+  *
+@@ -33,10 +40,6 @@ struct ipu_isys_subdev_i2c_info {
+  * identify a subdev with @name, @i2c_adapter_bdf_o and @slave_addr_o and
+  * configure it to use the new  @i2c_adapter_bdf_n and @slave_addr_n
+  */
+-#define IPU_SPDATA_NAME_LEN	20
+-#define IPU_SPDATA_BDF_LEN	32
+-#define IPU_SPLATA_GPIO_NUM 4
+-#define IPU_SPLATA_IRQ_PIN_NAME_LEN 16
+ struct ipu_spdata_rep {
+ 	/* i2c old information */
+ 	char name[IPU_SPDATA_NAME_LEN];
+@@ -57,12 +60,18 @@ struct ipu_spdata_rep {
+ 	char irq_pin_name[IPU_SPLATA_IRQ_PIN_NAME_LEN];
+ 	char suffix;
+ };
++#endif
+ 
+ struct ipu_isys_subdev_info {
+ 	struct ipu_isys_csi2_config *csi2;
+ 	struct ipu_isys_subdev_i2c_info i2c;
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
+ 	void (*fixup_spdata)(const void *spdata_rep, void *spdata);
++#endif
++#if IS_ENABLED(CONFIG_INTEL_IPU6_ACPI)
+ 	char *acpi_hid;
++#endif
+ };
+ 
+ struct ipu_isys_clk_mapping {
+-- 
+2.25.1
+
