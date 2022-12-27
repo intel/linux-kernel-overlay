@@ -1,0 +1,100 @@
+From fcbc3f93fa149ec25b8885a6b2fdfba3ae6bd62a Mon Sep 17 00:00:00 2001
+From: Nirmoy Das <nirmoy.das@intel.com>
+Date: Fri, 24 Jun 2022 13:08:21 +0200
+Subject: [PATCH 0806/2779] drm/i915: Fix a lockdep warning at error capture
+
+For some platfroms we use stop_machine version of
+gen8_ggtt_insert_page/gen8_ggtt_insert_entries to avoid a
+concurrent GGTT access bug but this causes a circular locking
+dependency warning:
+
+  Possible unsafe locking scenario:
+        CPU0                    CPU1
+        ----                    ----
+   lock(&ggtt->error_mutex);
+                                lock(dma_fence_map);
+                                lock(&ggtt->error_mutex);
+   lock(cpu_hotplug_lock);
+
+Fix this by calling gen8_ggtt_insert_page/gen8_ggtt_insert_entries
+directly at error capture which is concurrent GGTT access safe because
+reset path make sure of that.
+
+v2: Fix rebase conflict and added a comment.
+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/5595
+Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Nirmoy Das <nirmoy.das@intel.com>
+Reviewed-by: Andrzej Hajda <andrzej.hajda@intel.com>
+Signed-off-by: Ramalingam C <ramalingam.c@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220624110821.29190-1-nirmoy.das@intel.com
+---
+ drivers/gpu/drm/i915/gt/intel_ggtt.c  | 10 ++++++++++
+ drivers/gpu/drm/i915/gt/intel_gtt.h   |  9 +++++++++
+ drivers/gpu/drm/i915/i915_gpu_error.c |  8 ++++++--
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index ffff96180313..15a915bb4088 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -960,6 +960,16 @@ static int gen8_gmch_probe(struct i915_ggtt *ggtt)
+ 	if (intel_vm_no_concurrent_access_wa(i915)) {
+ 		ggtt->vm.insert_entries = bxt_vtd_ggtt_insert_entries__BKL;
+ 		ggtt->vm.insert_page    = bxt_vtd_ggtt_insert_page__BKL;
++
++		/*
++		 * Calling stop_machine() version of GGTT update function
++		 * at error capture/reset path will raise lockdep warning.
++		 * Allow calling gen8_ggtt_insert_* directly at reset path
++		 * which is safe from parallel GGTT updates.
++		 */
++		ggtt->vm.raw_insert_page = gen8_ggtt_insert_page;
++		ggtt->vm.raw_insert_entries = gen8_ggtt_insert_entries;
++
+ 		ggtt->vm.bind_async_flags =
+ 			I915_VMA_GLOBAL_BIND | I915_VMA_LOCAL_BIND;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index 29fd3a9e8b2e..e639434e97fd 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -306,6 +306,15 @@ struct i915_address_space {
+ 			       struct i915_vma_resource *vma_res,
+ 			       enum i915_cache_level cache_level,
+ 			       u32 flags);
++	void (*raw_insert_page)(struct i915_address_space *vm,
++				dma_addr_t addr,
++				u64 offset,
++				enum i915_cache_level cache_level,
++				u32 flags);
++	void (*raw_insert_entries)(struct i915_address_space *vm,
++				   struct i915_vma_resource *vma_res,
++				   enum i915_cache_level cache_level,
++				   u32 flags);
+ 	void (*cleanup)(struct i915_address_space *vm);
+ 
+ 	void (*foreach)(struct i915_address_space *vm,
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index bff8a111424a..f9b1969ed7ed 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -1104,8 +1104,12 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 
+ 		for_each_sgt_daddr(dma, iter, vma_res->bi.pages) {
+ 			mutex_lock(&ggtt->error_mutex);
+-			ggtt->vm.insert_page(&ggtt->vm, dma, slot,
+-					     I915_CACHE_NONE, 0);
++			if (ggtt->vm.raw_insert_page)
++				ggtt->vm.raw_insert_page(&ggtt->vm, dma, slot,
++							 I915_CACHE_NONE, 0);
++			else
++				ggtt->vm.insert_page(&ggtt->vm, dma, slot,
++						     I915_CACHE_NONE, 0);
+ 			mb();
+ 
+ 			s = io_mapping_map_wc(&ggtt->iomap, slot, PAGE_SIZE);
+-- 
+2.25.1
+

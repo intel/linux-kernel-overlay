@@ -1,0 +1,250 @@
+From 2273ccb236e3e4260003fa3f1c43d9d6ad944cb1 Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Sun, 2 Aug 2020 17:34:09 +0200
+Subject: [PATCH 2762/2779] drm/i915/ggtt: Add generic i915_ggtt ballooning
+ support
+
+Reserving part of the GGTT for the GuC requires same steps
+as in VGT GGTT ballooning. Add generic GGTT ballooning
+helpers to intel_ggtt.c to avoid code duplication.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Xiong Zhang <xiong.y.zhang@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Zawawi, Muhammad Zul Husni <muhammad.zul.husni.zawawi@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_ggtt.c | 68 ++++++++++++++++++++++------
+ drivers/gpu/drm/i915/gt/intel_gtt.h  |  4 ++
+ drivers/gpu/drm/i915/i915_vgpu.c     | 64 +++++---------------------
+ 3 files changed, 70 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index 30cf5c3369d9..70f422315323 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -502,29 +502,18 @@ void intel_ggtt_unbind_vma(struct i915_address_space *vm,
+ 
+ static int ggtt_reserve_guc_top(struct i915_ggtt *ggtt)
+ {
+-	u64 size;
+-	int ret;
+-
+ 	if (!intel_uc_uses_guc(&ggtt->vm.gt->uc))
+ 		return 0;
+ 
+ 	GEM_BUG_ON(ggtt->vm.total <= GUC_GGTT_TOP);
+-	size = ggtt->vm.total - GUC_GGTT_TOP;
+-
+-	ret = i915_gem_gtt_reserve(&ggtt->vm, NULL, &ggtt->uc_fw, size,
+-				   GUC_GGTT_TOP, I915_COLOR_UNEVICTABLE,
+-				   PIN_NOEVICT);
+-	if (ret)
+-		drm_dbg(&ggtt->vm.i915->drm,
+-			"Failed to reserve top of GGTT for GuC\n");
+ 
+-	return ret;
++	return i915_ggtt_balloon(ggtt, GUC_GGTT_TOP, ggtt->vm.total,
++				 &ggtt->uc_fw);
+ }
+ 
+ static void ggtt_release_guc_top(struct i915_ggtt *ggtt)
+ {
+-	if (drm_mm_node_allocated(&ggtt->uc_fw))
+-		drm_mm_remove_node(&ggtt->uc_fw);
++	i915_ggtt_deballoon(ggtt, &ggtt->uc_fw);
+ }
+ 
+ static void cleanup_init_ggtt(struct i915_ggtt *ggtt)
+@@ -1307,6 +1296,57 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt)
+ 	intel_ggtt_restore_fences(ggtt);
+ }
+ 
++/**
++ * i915_ggtt_balloon - reserve fixed space in an GGTT
++ * @ggtt: the &struct i915_ggtt
++ * @start: start offset inside the GGTT,
++ *          must be #I915_GTT_MIN_ALIGNMENT aligned
++ * @end: end offset inside the GGTT,
++ *        must be #I915_GTT_PAGE_SIZE aligned
++ * @node: the &struct drm_mm_node
++ *
++ * i915_ggtt_balloon() tries to reserve the @node from @start to @end inside
++ * GGTT the address space.
++ *
++ * Returns: 0 on success, -ENOSPC if no suitable hole is found.
++ */
++int i915_ggtt_balloon(struct i915_ggtt *ggtt, u64 start, u64 end,
++		      struct drm_mm_node *node)
++{
++	u64 size = end - start;
++	int err;
++
++	GEM_BUG_ON(start >= end);
++	drm_dbg(&ggtt->vm.i915->drm, "%sGGTT [%#llx-%#llx] %lluK\n",
++		"ballooning ", start, end, size / SZ_1K);
++
++	err = i915_gem_gtt_reserve(&ggtt->vm, NULL, node, size, start,
++				   I915_COLOR_UNEVICTABLE, PIN_NOEVICT);
++	if (unlikely(err)) {
++		drm_err(&ggtt->vm.i915->drm, "%sGGTT [%#llx-%#llx] %lluK\n",
++			"Failed to balloon ", node->start,
++			node->start + node->size, node->size / SZ_1K);
++		return err;
++	}
++
++	ggtt->vm.reserved += node->size;
++	return 0;
++}
++
++void i915_ggtt_deballoon(struct i915_ggtt *ggtt, struct drm_mm_node *node)
++{
++	if (!drm_mm_node_allocated(node))
++		return;
++
++	drm_dbg(&ggtt->vm.i915->drm, "%sGGTT [%#llx-%#llx] %lluK\n",
++		"deballooning ", node->start, node->start + node->size,
++		node->size / SZ_1K);
++
++	GEM_BUG_ON(ggtt->vm.reserved < node->size);
++	ggtt->vm.reserved -= node->size;
++	drm_mm_remove_node(node);
++}
++
+ void i915_ggtt_mark_pte_lost(struct drm_i915_private *i915, bool val)
+ {
+ 	to_gt(i915)->ggtt->pte_lost = val;
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index 062b78333fb2..9e156f981a5e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -590,6 +590,10 @@ static inline bool i915_ggtt_has_aperture(const struct i915_ggtt *ggtt)
+ 	return ggtt->mappable_end > 0;
+ }
+ 
++int i915_ggtt_balloon(struct i915_ggtt *ggtt, u64 start, u64 end,
++		      struct drm_mm_node *node);
++void i915_ggtt_deballoon(struct i915_ggtt *ggtt, struct drm_mm_node *node);
++
+ int i915_ppgtt_init_hw(struct intel_gt *gt);
+ 
+ struct i915_ppgtt *i915_ppgtt_create(struct intel_gt *gt,
+diff --git a/drivers/gpu/drm/i915/i915_vgpu.c b/drivers/gpu/drm/i915/i915_vgpu.c
+index c97323973f9b..8b10bb0aa46e 100644
+--- a/drivers/gpu/drm/i915/i915_vgpu.c
++++ b/drivers/gpu/drm/i915/i915_vgpu.c
+@@ -145,23 +145,6 @@ struct _balloon_info_ {
+ 
+ static struct _balloon_info_ bl_info;
+ 
+-static void vgt_deballoon_space(struct i915_ggtt *ggtt,
+-				struct drm_mm_node *node)
+-{
+-	struct drm_i915_private *dev_priv = ggtt->vm.i915;
+-	if (!drm_mm_node_allocated(node))
+-		return;
+-
+-	drm_dbg(&dev_priv->drm,
+-		"deballoon space: range [0x%llx - 0x%llx] %llu KiB.\n",
+-		node->start,
+-		node->start + node->size,
+-		node->size / 1024);
+-
+-	ggtt->vm.reserved -= node->size;
+-	drm_mm_remove_node(node);
+-}
+-
+ /**
+  * intel_vgt_deballoon - deballoon reserved graphics address trunks
+  * @ggtt: the global GGTT from which we reserved earlier
+@@ -180,30 +163,7 @@ void intel_vgt_deballoon(struct i915_ggtt *ggtt)
+ 	drm_dbg(&dev_priv->drm, "VGT deballoon.\n");
+ 
+ 	for (i = 0; i < 4; i++)
+-		vgt_deballoon_space(ggtt, &bl_info.space[i]);
+-}
+-
+-static int vgt_balloon_space(struct i915_ggtt *ggtt,
+-			     struct drm_mm_node *node,
+-			     unsigned long start, unsigned long end)
+-{
+-	struct drm_i915_private *dev_priv = ggtt->vm.i915;
+-	unsigned long size = end - start;
+-	int ret;
+-
+-	if (start >= end)
+-		return -EINVAL;
+-
+-	drm_info(&dev_priv->drm,
+-		 "balloon space: range [ 0x%lx - 0x%lx ] %lu KiB.\n",
+-		 start, end, size / 1024);
+-	ret = i915_gem_gtt_reserve(&ggtt->vm, NULL, node,
+-				   size, start, I915_COLOR_UNEVICTABLE,
+-				   0);
+-	if (!ret)
+-		ggtt->vm.reserved += size;
+-
+-	return ret;
++		i915_ggtt_deballoon(ggtt, &bl_info.space[i]);
+ }
+ 
+ /**
+@@ -292,32 +252,32 @@ int intel_vgt_balloon(struct i915_ggtt *ggtt)
+ 
+ 	/* Unmappable graphic memory ballooning */
+ 	if (unmappable_base > ggtt->mappable_end) {
+-		ret = vgt_balloon_space(ggtt, &bl_info.space[2],
+-					ggtt->mappable_end, unmappable_base);
++		ret = i915_ggtt_balloon(ggtt, ggtt->mappable_end,
++					unmappable_base, &bl_info.space[2]);
+ 
+ 		if (ret)
+ 			goto err;
+ 	}
+ 
+ 	if (unmappable_end < ggtt_end) {
+-		ret = vgt_balloon_space(ggtt, &bl_info.space[3],
+-					unmappable_end, ggtt_end);
++		ret = i915_ggtt_balloon(ggtt, unmappable_end, ggtt_end,
++					&bl_info.space[3]);
+ 		if (ret)
+ 			goto err_upon_mappable;
+ 	}
+ 
+ 	/* Mappable graphic memory ballooning */
+ 	if (mappable_base) {
+-		ret = vgt_balloon_space(ggtt, &bl_info.space[0],
+-					0, mappable_base);
++		ret = i915_ggtt_balloon(ggtt, 0, mappable_base,
++					&bl_info.space[0]);
+ 
+ 		if (ret)
+ 			goto err_upon_unmappable;
+ 	}
+ 
+ 	if (mappable_end < ggtt->mappable_end) {
+-		ret = vgt_balloon_space(ggtt, &bl_info.space[1],
+-					mappable_end, ggtt->mappable_end);
++		ret = i915_ggtt_balloon(ggtt, mappable_end, ggtt->mappable_end,
++					&bl_info.space[1]);
+ 
+ 		if (ret)
+ 			goto err_below_mappable;
+@@ -327,11 +287,11 @@ int intel_vgt_balloon(struct i915_ggtt *ggtt)
+ 	return 0;
+ 
+ err_below_mappable:
+-	vgt_deballoon_space(ggtt, &bl_info.space[0]);
++	i915_ggtt_deballoon(ggtt, &bl_info.space[0]);
+ err_upon_unmappable:
+-	vgt_deballoon_space(ggtt, &bl_info.space[3]);
++	i915_ggtt_deballoon(ggtt, &bl_info.space[3]);
+ err_upon_mappable:
+-	vgt_deballoon_space(ggtt, &bl_info.space[2]);
++	i915_ggtt_deballoon(ggtt, &bl_info.space[2]);
+ err:
+ 	drm_err(&dev_priv->drm, "VGT balloon fail\n");
+ 	return ret;
+-- 
+2.25.1
+

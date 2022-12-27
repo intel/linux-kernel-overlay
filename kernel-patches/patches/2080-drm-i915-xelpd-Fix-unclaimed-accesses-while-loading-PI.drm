@@ -1,0 +1,113 @@
+From d53bde5107797a97a86fb2a0e8091325da281f1a Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Mon, 8 Aug 2022 13:30:54 +0300
+Subject: [PATCH 2080/2779] drm/i915/xelpd: Fix unclaimed accesses while
+ loading PIPEDMC-C/D
+
+At the moment on DG2 at least loading the DMC firmware's PIPEDMC C and D
+programs leads to sporadic unclaimed register accesses while programming
+the initial state as described by the firmware's "MMIO init" table. This
+will also lead to later unclaimed accesses for unrelated transcoder/pipe
+registers backed by the pipe C and D display power wells.
+
+Disabling the PIPEDMC clock gating during initialization - similarly to
+Wa_16015201720 fixed this problem in my tests. While pipe A an B
+requires the clock gating to be disabled all the time pipe C and D
+requires this only while accessing the PIPEDMC registers.
+
+Bspec: 49193
+References: https://gitlab.freedesktop.org/drm/intel/-/issues/6526
+References: https://gitlab.freedesktop.org/drm/intel/-/issues/6308
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Arun R Murthy <arun.r.murthy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220808103054.3586074-1-imre.deak@intel.com
+---
+ .../drm/i915/display/intel_display_power.c    |  8 -----
+ drivers/gpu/drm/i915/display/intel_dmc.c      | 30 +++++++++++++++++++
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power.c b/drivers/gpu/drm/i915/display/intel_display_power.c
+index 0cc96e1323d3..9e9cb669cf01 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c
+@@ -1615,14 +1615,6 @@ static void icl_display_core_init(struct drm_i915_private *dev_priv,
+ 		intel_de_rmw(dev_priv, SOUTH_DSPCLK_GATE_D, 0,
+ 			     PCH_DPMGUNIT_CLOCK_GATE_DISABLE);
+ 
+-	/* Wa_16015201720:adl-p,dg2 */
+-	if (DISPLAY_VER(dev_priv) == 13) {
+-		intel_de_rmw(dev_priv, CLKGATE_DIS_PSL_EXT(PIPE_A),
+-			     0, PIPEDMC_GATING_DIS);
+-		intel_de_rmw(dev_priv, CLKGATE_DIS_PSL_EXT(PIPE_B),
+-			     0, PIPEDMC_GATING_DIS);
+-	}
+-
+ 	/* 1. Enable PCH reset handshake. */
+ 	intel_pch_reset_handshake(dev_priv, !HAS_PCH_NOP(dev_priv));
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.c b/drivers/gpu/drm/i915/display/intel_dmc.c
+index 00e18a4a5a5a..6c35212c3625 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc.c
+@@ -383,6 +383,30 @@ static void disable_all_event_handlers(struct drm_i915_private *i915)
+ 	}
+ }
+ 
++static void pipedmc_clock_gating_wa(struct drm_i915_private *i915, bool enable)
++{
++	enum pipe pipe;
++
++	if (DISPLAY_VER(i915) != 13)
++		return;
++
++	/*
++	 * Wa_16015201720:adl-p,dg2
++	 * The WA requires clock gating to be disabled all the time
++	 * for pipe A and B.
++	 * For pipe C and D clock gating needs to be disabled only
++	 * during initializing the firmware.
++	 */
++	if (enable)
++		for (pipe = PIPE_A; pipe <= PIPE_D; pipe++)
++			intel_de_rmw(i915, CLKGATE_DIS_PSL_EXT(pipe),
++				     0, PIPEDMC_GATING_DIS);
++	else
++		for (pipe = PIPE_C; pipe <= PIPE_D; pipe++)
++			intel_de_rmw(i915, CLKGATE_DIS_PSL_EXT(pipe),
++				     PIPEDMC_GATING_DIS, 0);
++}
++
+ /**
+  * intel_dmc_load_program() - write the firmware from memory to register.
+  * @dev_priv: i915 drm device.
+@@ -399,6 +423,8 @@ void intel_dmc_load_program(struct drm_i915_private *dev_priv)
+ 	if (!intel_dmc_has_payload(dev_priv))
+ 		return;
+ 
++	pipedmc_clock_gating_wa(dev_priv, true);
++
+ 	disable_all_event_handlers(dev_priv);
+ 
+ 	assert_rpm_wakelock_held(&dev_priv->runtime_pm);
+@@ -432,6 +458,8 @@ void intel_dmc_load_program(struct drm_i915_private *dev_priv)
+ 	 * here.
+ 	 */
+ 	disable_all_flip_queue_events(dev_priv);
++
++	pipedmc_clock_gating_wa(dev_priv, false);
+ }
+ 
+ /**
+@@ -446,7 +474,9 @@ void intel_dmc_disable_program(struct drm_i915_private *i915)
+ 	if (!intel_dmc_has_payload(i915))
+ 		return;
+ 
++	pipedmc_clock_gating_wa(i915, true);
+ 	disable_all_event_handlers(i915);
++	pipedmc_clock_gating_wa(i915, false);
+ }
+ 
+ void assert_dmc_loaded(struct drm_i915_private *i915)
+-- 
+2.25.1
+

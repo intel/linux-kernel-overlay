@@ -1,0 +1,135 @@
+From 3b55d8d33e1ea8843e0f48313e381d72424af801 Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Sat, 20 Aug 2022 00:33:04 -0700
+Subject: [PATCH 1783/2779] drm/ttm: Switch to using the new res callback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Apply new intersect and compatible callback instead
+of having a generic placement range verfications.
+
+v2: Added a separate callback for compatiblilty
+    checks (Christian)
+v3: Cleanups and removal of workarounds
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220820073304.178444-6-Arunpravin.PaneerSelvam@amd.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 45 +++++++------------------
+ drivers/gpu/drm/ttm/ttm_resource.c      | 17 ++--------
+ 2 files changed, 15 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 2e97099808ca..b1c455329023 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1330,11 +1330,12 @@ uint64_t amdgpu_ttm_tt_pte_flags(struct amdgpu_device *adev, struct ttm_tt *ttm,
+ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 					    const struct ttm_place *place)
+ {
+-	unsigned long num_pages = bo->resource->num_pages;
+ 	struct dma_resv_iter resv_cursor;
+-	struct amdgpu_res_cursor cursor;
+ 	struct dma_fence *f;
+ 
++	if (!amdgpu_bo_is_amdgpu_bo(bo))
++		return ttm_bo_eviction_valuable(bo, place);
++
+ 	/* Swapout? */
+ 	if (bo->resource->mem_type == TTM_PL_SYSTEM)
+ 		return true;
+@@ -1353,40 +1354,20 @@ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 			return false;
+ 	}
+ 
+-	switch (bo->resource->mem_type) {
+-	case AMDGPU_PL_PREEMPT:
+-		/* Preemptible BOs don't own system resources managed by the
+-		 * driver (pages, VRAM, GART space). They point to resources
+-		 * owned by someone else (e.g. pageable memory in user mode
+-		 * or a DMABuf). They are used in a preemptible context so we
+-		 * can guarantee no deadlocks and good QoS in case of MMU
+-		 * notifiers or DMABuf move notifiers from the resource owner.
+-		 */
++	/* Preemptible BOs don't own system resources managed by the
++	 * driver (pages, VRAM, GART space). They point to resources
++	 * owned by someone else (e.g. pageable memory in user mode
++	 * or a DMABuf). They are used in a preemptible context so we
++	 * can guarantee no deadlocks and good QoS in case of MMU
++	 * notifiers or DMABuf move notifiers from the resource owner.
++	 */
++	if (bo->resource->mem_type == AMDGPU_PL_PREEMPT)
+ 		return false;
+-	case TTM_PL_TT:
+-		if (amdgpu_bo_is_amdgpu_bo(bo) &&
+-		    amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)))
+-			return false;
+-		return true;
+ 
+-	case TTM_PL_VRAM:
+-		/* Check each drm MM node individually */
+-		amdgpu_res_first(bo->resource, 0, (u64)num_pages << PAGE_SHIFT,
+-				 &cursor);
+-		while (cursor.remaining) {
+-			if (place->fpfn < PFN_DOWN(cursor.start + cursor.size)
+-			    && !(place->lpfn &&
+-				 place->lpfn <= PFN_DOWN(cursor.start)))
+-				return true;
+-
+-			amdgpu_res_next(&cursor, cursor.size);
+-		}
++	if (bo->resource->mem_type == TTM_PL_TT &&
++	    amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)))
+ 		return false;
+ 
+-	default:
+-		break;
+-	}
+-
+ 	return ttm_bo_eviction_valuable(bo, place);
+ }
+ 
+diff --git a/drivers/gpu/drm/ttm/ttm_resource.c b/drivers/gpu/drm/ttm/ttm_resource.c
+index 0d1f862a582b..a729c32a1e48 100644
+--- a/drivers/gpu/drm/ttm/ttm_resource.c
++++ b/drivers/gpu/drm/ttm/ttm_resource.c
+@@ -276,17 +276,9 @@ bool ttm_resource_intersects(struct ttm_device *bdev,
+ 	if (!res)
+ 		return false;
+ 
+-	if (!place)
+-		return true;
+-
+ 	man = ttm_manager_type(bdev, res->mem_type);
+-	if (!man->func->intersects) {
+-		if (place->fpfn >= (res->start + res->num_pages) ||
+-		    (place->lpfn && place->lpfn <= res->start))
+-			return false;
+-
++	if (!place || !man->func->intersects)
+ 		return true;
+-	}
+ 
+ 	return man->func->intersects(man, res, place, size);
+ }
+@@ -314,13 +306,8 @@ bool ttm_resource_compatible(struct ttm_device *bdev,
+ 		return false;
+ 
+ 	man = ttm_manager_type(bdev, res->mem_type);
+-	if (!man->func->compatible) {
+-		if (res->start < place->fpfn ||
+-		    (place->lpfn && (res->start + res->num_pages) > place->lpfn))
+-			return false;
+-
++	if (!man->func->compatible)
+ 		return true;
+-	}
+ 
+ 	return man->func->compatible(man, res, place, size);
+ }
+-- 
+2.25.1
+

@@ -1,0 +1,306 @@
+From c127383f3ecf9094931c18cc7b1beaf0a422757a Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Mon, 28 Nov 2022 13:11:37 +0800
+Subject: [PATCH 0010/2779] Revert "Revert "drm/i915: Flush TLBs before
+ releasing backing store""
+
+This reverts commit 12d39f40068d546241a21af9ae6605783d6272aa.
+---
+ .../gpu/drm/i915/gem/i915_gem_object_types.h  |   1 -
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c     |  10 ++
+ drivers/gpu/drm/i915/gt/intel_gt.c            | 122 ++++++++++++++++++
+ drivers/gpu/drm/i915/gt/intel_gt.h            |   2 +
+ drivers/gpu/drm/i915/gt/intel_gt_types.h      |   2 +
+ drivers/gpu/drm/i915/i915_vma.c               |   2 +
+ drivers/gpu/drm/i915/intel_uncore.c           |  26 +++-
+ drivers/gpu/drm/i915/intel_uncore.h           |   2 +
+ 8 files changed, 162 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+index 1dbff032fa04..2c88bdb8ff7c 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+@@ -336,7 +336,6 @@ struct drm_i915_gem_object {
+ #define I915_TILING_QUIRK_BIT     8 /* unknown swizzling; do not release! */
+ #define I915_BO_PROTECTED         BIT(9)
+ #define I915_BO_WAS_BOUND_BIT     10
+-
+ 	/**
+ 	 * @mem_flags - Mutable placement-related flags
+ 	 *
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index 6cdc02ec12b4..97c820eee115 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -12,6 +12,8 @@
+ #include "i915_gem_lmem.h"
+ #include "i915_gem_mman.h"
+ 
++#include "gt/intel_gt.h"
++
+ void __i915_gem_object_set_pages(struct drm_i915_gem_object *obj,
+ 				 struct sg_table *pages,
+ 				 unsigned int sg_page_sizes)
+@@ -213,6 +215,14 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
+ 	__i915_gem_object_reset_page_iter(obj);
+ 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
+ 
++	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
++		struct drm_i915_private *i915 = to_i915(obj->base.dev);
++		intel_wakeref_t wakeref;
++
++		with_intel_runtime_pm_if_active(&i915->runtime_pm, wakeref)
++			intel_gt_invalidate_tlbs(to_gt(i915));
++	}
++
+ 	return pages;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 93fddb45de44..6724d5a04a26 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -36,6 +36,8 @@ static void __intel_gt_init_early(struct intel_gt *gt)
+ {
+ 	spin_lock_init(&gt->irq_lock);
+ 
++	mutex_init(&gt->tlb_invalidate_lock);
++
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+@@ -1167,3 +1169,123 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 
+ 	intel_sseu_dump(&info->sseu, p);
+ }
++
++struct reg_and_bit {
++	i915_reg_t reg;
++	u32 bit;
++};
++
++static struct reg_and_bit
++get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
++		const i915_reg_t *regs, const unsigned int num)
++{
++	const unsigned int class = engine->class;
++	struct reg_and_bit rb = { };
++
++	if (drm_WARN_ON_ONCE(&engine->i915->drm,
++			     class >= num || !regs[class].reg))
++		return rb;
++
++	rb.reg = regs[class];
++	if (gen8 && class == VIDEO_DECODE_CLASS)
++		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
++	else
++		rb.bit = engine->instance;
++
++	rb.bit = BIT(rb.bit);
++
++	return rb;
++}
++
++void intel_gt_invalidate_tlbs(struct intel_gt *gt)
++{
++	static const i915_reg_t gen8_regs[] = {
++		[RENDER_CLASS]			= GEN8_RTCR,
++		[VIDEO_DECODE_CLASS]		= GEN8_M1TCR, /* , GEN8_M2TCR */
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN8_VTCR,
++		[COPY_ENGINE_CLASS]		= GEN8_BTCR,
++	};
++	static const i915_reg_t gen12_regs[] = {
++		[RENDER_CLASS]			= GEN12_GFX_TLB_INV_CR,
++		[VIDEO_DECODE_CLASS]		= GEN12_VD_TLB_INV_CR,
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN12_VE_TLB_INV_CR,
++		[COPY_ENGINE_CLASS]		= GEN12_BLT_TLB_INV_CR,
++		[COMPUTE_CLASS]			= GEN12_COMPCTX_TLB_INV_CR,
++	};
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	const i915_reg_t *regs;
++	unsigned int num = 0;
++
++	if (I915_SELFTEST_ONLY(gt->awake == -ENODEV))
++		return;
++
++	if (GRAPHICS_VER(i915) == 12) {
++		regs = gen12_regs;
++		num = ARRAY_SIZE(gen12_regs);
++	} else if (GRAPHICS_VER(i915) >= 8 && GRAPHICS_VER(i915) <= 11) {
++		regs = gen8_regs;
++		num = ARRAY_SIZE(gen8_regs);
++	} else if (GRAPHICS_VER(i915) < 8) {
++		return;
++	}
++
++	if (drm_WARN_ONCE(&i915->drm, !num,
++			  "Platform does not implement TLB invalidation!"))
++		return;
++
++	GEM_TRACE("\n");
++
++	assert_rpm_wakelock_held(&i915->runtime_pm);
++
++	mutex_lock(&gt->tlb_invalidate_lock);
++	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
++
++	spin_lock_irq(&uncore->lock); /* serialise invalidate with GT reset */
++
++	for_each_engine(engine, gt, id) {
++		struct reg_and_bit rb;
++
++		rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++		if (!i915_mmio_reg_offset(rb.reg))
++			continue;
++
++		intel_uncore_write_fw(uncore, rb.reg, rb.bit);
++	}
++
++	spin_unlock_irq(&uncore->lock);
++
++	for_each_engine(engine, gt, id) {
++		/*
++		 * HW architecture suggest typical invalidation time at 40us,
++		 * with pessimistic cases up to 100us and a recommendation to
++		 * cap at 1ms. We go a bit higher just in case.
++		 */
++		const unsigned int timeout_us = 100;
++		const unsigned int timeout_ms = 4;
++		struct reg_and_bit rb;
++
++		rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++		if (!i915_mmio_reg_offset(rb.reg))
++			continue;
++
++		if (__intel_wait_for_register_fw(uncore,
++						 rb.reg, rb.bit, 0,
++						 timeout_us, timeout_ms,
++						 NULL))
++			drm_err_ratelimited(&gt->i915->drm,
++					    "%s TLB invalidation did not complete in %ums!\n",
++					    engine->name, timeout_ms);
++	}
++
++	/*
++	 * Use delayed put since a) we mostly expect a flurry of TLB
++	 * invalidations so it is good to avoid paying the forcewake cost and
++	 * b) it works around a bug in Icelake which cannot cope with too rapid
++	 * transitions.
++	 */
++	intel_uncore_forcewake_put_delayed(uncore, FORCEWAKE_ALL);
++	mutex_unlock(&gt->tlb_invalidate_lock);
++}
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.h b/drivers/gpu/drm/i915/gt/intel_gt.h
+index 58a411595f68..bd90d4ec2010 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@ -116,4 +116,6 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 
+ void intel_gt_watchdog_work(struct work_struct *work);
+ 
++void intel_gt_invalidate_tlbs(struct intel_gt *gt);
++
+ #endif /* __INTEL_GT_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_types.h b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+index 52f68279b012..7d8362c90943 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@ -78,6 +78,8 @@ struct intel_gt {
+ 	struct intel_gsc gsc;
+ 	struct intel_iov iov;
+ 
++	struct mutex tlb_invalidate_lock;
++
+ 	struct i915_wa_list wa_list;
+ 
+ 	struct intel_gt_timelines {
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index c25c0c394e40..04d12f278f57 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -537,6 +537,8 @@ int i915_vma_bind(struct i915_vma *vma,
+ 				   bind_flags);
+ 	}
+ 
++	set_bit(I915_BO_WAS_BOUND_BIT, &vma->obj->flags);
++
+ 	atomic_or(bind_flags, &vma->flags);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index a699d5ce633a..19cbe2a00cf0 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -725,7 +725,8 @@ void intel_uncore_forcewake_get__locked(struct intel_uncore *uncore,
+ }
+ 
+ static void __intel_uncore_forcewake_put(struct intel_uncore *uncore,
+-					 enum forcewake_domains fw_domains)
++					 enum forcewake_domains fw_domains,
++					 bool delayed)
+ {
+ 	struct intel_uncore_forcewake_domain *domain;
+ 	unsigned int tmp;
+@@ -740,7 +741,11 @@ static void __intel_uncore_forcewake_put(struct intel_uncore *uncore,
+ 			continue;
+ 		}
+ 
+-		fw_domains_put(uncore, domain->mask);
++		if (delayed &&
++		    !(domain->uncore->fw_domains_timer & domain->mask))
++			fw_domain_arm_timer(domain);
++		else
++			fw_domains_put(uncore, domain->mask);
+ 	}
+ }
+ 
+@@ -761,7 +766,20 @@ void intel_uncore_forcewake_put(struct intel_uncore *uncore,
+ 		return;
+ 
+ 	spin_lock_irqsave(&uncore->lock, irqflags);
+-	__intel_uncore_forcewake_put(uncore, fw_domains);
++	__intel_uncore_forcewake_put(uncore, fw_domains, false);
++	spin_unlock_irqrestore(&uncore->lock, irqflags);
++}
++
++void intel_uncore_forcewake_put_delayed(struct intel_uncore *uncore,
++					enum forcewake_domains fw_domains)
++{
++	unsigned long irqflags;
++
++	if (!uncore->fw_get_funcs)
++		return;
++
++	spin_lock_irqsave(&uncore->lock, irqflags);
++	__intel_uncore_forcewake_put(uncore, fw_domains, true);
+ 	spin_unlock_irqrestore(&uncore->lock, irqflags);
+ }
+ 
+@@ -803,7 +821,7 @@ void intel_uncore_forcewake_put__locked(struct intel_uncore *uncore,
+ 	if (!uncore->fw_get_funcs)
+ 		return;
+ 
+-	__intel_uncore_forcewake_put(uncore, fw_domains);
++	__intel_uncore_forcewake_put(uncore, fw_domains, false);
+ }
+ 
+ void assert_forcewakes_inactive(struct intel_uncore *uncore)
+diff --git a/drivers/gpu/drm/i915/intel_uncore.h b/drivers/gpu/drm/i915/intel_uncore.h
+index c2f10949da6e..52fe3d89dd2b 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -249,6 +249,8 @@ void intel_uncore_forcewake_get(struct intel_uncore *uncore,
+ 				enum forcewake_domains domains);
+ void intel_uncore_forcewake_put(struct intel_uncore *uncore,
+ 				enum forcewake_domains domains);
++void intel_uncore_forcewake_put_delayed(struct intel_uncore *uncore,
++					enum forcewake_domains domains);
+ void intel_uncore_forcewake_flush(struct intel_uncore *uncore,
+ 				  enum forcewake_domains fw_domains);
+ 
+-- 
+2.25.1
+

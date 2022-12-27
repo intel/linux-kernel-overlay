@@ -1,0 +1,153 @@
+From dbcf8b42ea8617e33a498b03a6cff2902ec10f64 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Thu, 8 Sep 2022 15:45:50 -0700
+Subject: [PATCH 2236/2779] drm/i915/uncore: Add GSI offset to uncore
+
+GT non-engine registers (referred to as "GSI" registers by the spec)
+have the same relative offsets on standalone media as they do on the
+primary GT, just with an additional "GSI offset" added to their MMIO
+address.  If we store this GSI offset in the standalone media's
+intel_uncore structure, it can be automatically applied to all GSI reg
+reads/writes that happen on that GT, allowing us to re-use our existing
+GT code with minimal changes.
+
+Forcewake and shadowed register tables for the media GT (which will be
+added in a future patch) are listed as final addresses that already
+include the GSI offset, so we also need to add the GSI offset before
+doing lookups of registers in one of those tables.
+
+v2:
+ - Add comment on raw_reg_*() macros explaining why we don't bother with
+   GSI offsets in them.  (Daniele)
+
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220908224550.821257-1-matthew.d.roper@intel.com
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_gt_types.h |  1 +
+ drivers/gpu/drm/i915/intel_uncore.c      | 10 +++++--
+ drivers/gpu/drm/i915/intel_uncore.h      | 34 ++++++++++++++++++++++--
+ 3 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_types.h b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+index 0e139f7d75ed..82dc28643572 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@ -274,6 +274,7 @@ struct intel_gt_definition {
+ 	enum intel_gt_type type;
+ 	char *name;
+ 	u32 mapping_base;
++	u32 gsi_offset;
+ 	intel_engine_mask_t engine_mask;
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 452b3a31e965..5cd423c7b646 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -928,6 +928,9 @@ find_fw_domain(struct intel_uncore *uncore, u32 offset)
+ {
+ 	const struct intel_forcewake_range *entry;
+ 
++	if (IS_GSI_REG(offset))
++		offset += uncore->gsi_offset;
++
+ 	entry = BSEARCH(offset,
+ 			uncore->fw_domains_table,
+ 			uncore->fw_domains_table_entries,
+@@ -1143,6 +1146,9 @@ static bool is_shadowed(struct intel_uncore *uncore, u32 offset)
+ 	if (drm_WARN_ON(&uncore->i915->drm, !uncore->shadowed_reg_table))
+ 		return false;
+ 
++	if (IS_GSI_REG(offset))
++		offset += uncore->gsi_offset;
++
+ 	return BSEARCH(offset,
+ 		       uncore->shadowed_reg_table,
+ 		       uncore->shadowed_reg_table_entries,
+@@ -1995,8 +2001,8 @@ static int __fw_domain_init(struct intel_uncore *uncore,
+ 
+ 	d->uncore = uncore;
+ 	d->wake_count = 0;
+-	d->reg_set = uncore->regs + i915_mmio_reg_offset(reg_set);
+-	d->reg_ack = uncore->regs + i915_mmio_reg_offset(reg_ack);
++	d->reg_set = uncore->regs + i915_mmio_reg_offset(reg_set) + uncore->gsi_offset;
++	d->reg_ack = uncore->regs + i915_mmio_reg_offset(reg_ack) + uncore->gsi_offset;
+ 
+ 	d->id = domain_id;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_uncore.h b/drivers/gpu/drm/i915/intel_uncore.h
+index 4acb78a03233..5022bac80b67 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -136,6 +136,16 @@ struct intel_uncore {
+ 
+ 	spinlock_t lock; /** lock is also taken in irq contexts. */
+ 
++	/*
++	 * Do we need to apply an additional offset to reach the beginning
++	 * of the basic non-engine GT registers (referred to as "GSI" on
++	 * newer platforms, or "GT block" on older platforms)?  If so, we'll
++	 * track that here and apply it transparently to registers in the
++	 * appropriate range to maintain compatibility with our existing
++	 * register definitions and GT code.
++	 */
++	u32 gsi_offset;
++
+ 	unsigned int flags;
+ #define UNCORE_HAS_FORCEWAKE		BIT(0)
+ #define UNCORE_HAS_FPGA_DBG_UNCLAIMED	BIT(1)
+@@ -294,19 +304,27 @@ intel_wait_for_register_fw(struct intel_uncore *uncore,
+ 					    2, timeout_ms, NULL);
+ }
+ 
++#define IS_GSI_REG(reg) ((reg) < 0x40000)
++
+ /* register access functions */
+ #define __raw_read(x__, s__) \
+ static inline u##x__ __raw_uncore_read##x__(const struct intel_uncore *uncore, \
+ 					    i915_reg_t reg) \
+ { \
+-	return read##s__(uncore->regs + i915_mmio_reg_offset(reg)); \
++	u32 offset = i915_mmio_reg_offset(reg); \
++	if (IS_GSI_REG(offset)) \
++		offset += uncore->gsi_offset; \
++	return read##s__(uncore->regs + offset); \
+ }
+ 
+ #define __raw_write(x__, s__) \
+ static inline void __raw_uncore_write##x__(const struct intel_uncore *uncore, \
+ 					   i915_reg_t reg, u##x__ val) \
+ { \
+-	write##s__(val, uncore->regs + i915_mmio_reg_offset(reg)); \
++	u32 offset = i915_mmio_reg_offset(reg); \
++	if (IS_GSI_REG(offset)) \
++		offset += uncore->gsi_offset; \
++	write##s__(val, uncore->regs + offset); \
+ }
+ __raw_read(8, b)
+ __raw_read(16, w)
+@@ -447,6 +465,18 @@ static inline int intel_uncore_write_and_verify(struct intel_uncore *uncore,
+ 	return (reg_val & mask) != expected_val ? -EINVAL : 0;
+ }
+ 
++/*
++ * The raw_reg_{read,write} macros are intended as a micro-optimization for
++ * interrupt handlers so that the pointer indirection on uncore->regs can
++ * be computed once (and presumably cached in a register) instead of generating
++ * extra load instructions for each MMIO access.
++ *
++ * Given that these macros are only intended for non-GSI interrupt registers
++ * (and the goal is to avoid extra instructions generated by the compiler),
++ * these macros do not account for uncore->gsi_offset.  Any caller that needs
++ * to use these macros on a GSI register is responsible for adding the
++ * appropriate GSI offset to the 'base' parameter.
++ */
+ #define raw_reg_read(base, reg) \
+ 	readl(base + i915_mmio_reg_offset(reg))
+ #define raw_reg_write(base, reg, value) \
+-- 
+2.25.1
+

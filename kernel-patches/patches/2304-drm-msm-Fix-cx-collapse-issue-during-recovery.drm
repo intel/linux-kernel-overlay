@@ -1,0 +1,99 @@
+From bc84c1ca4a90adf4bcc3f9e459f457328743d8e9 Mon Sep 17 00:00:00 2001
+From: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Date: Fri, 19 Aug 2022 01:52:12 +0530
+Subject: [PATCH 2304/2779] drm/msm: Fix cx collapse issue during recovery
+
+There are some hardware logic under CX domain. For a successful
+recovery, we should ensure cx headswitch collapses to ensure all the
+stale states are cleard out. This is especially true to for a6xx family
+where we can GMU co-processor.
+
+Currently, cx doesn't collapse due to a devlink between gpu and its
+smmu. So the *struct gpu device* needs to be runtime suspended to ensure
+that the iommu driver removes its vote on cx gdsc.
+
+Signed-off-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/498398/
+Link: https://lore.kernel.org/r/20220819015030.v5.4.I4ac27a0b34ea796ce0f938bb509e257516bc6f57@changeid
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c | 32 ++++++++++++++++++++++++---
+ drivers/gpu/drm/msm/msm_gpu.c         |  4 +---
+ 2 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index c8ad8aeca777..aa2ec9861361 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1261,7 +1261,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+-	int i;
++	int i, active_submits;
+ 
+ 	adreno_dump_info(gpu);
+ 
+@@ -1278,8 +1278,34 @@ static void a6xx_recover(struct msm_gpu *gpu)
+ 	 */
+ 	gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE, 0);
+ 
+-	gpu->funcs->pm_suspend(gpu);
+-	gpu->funcs->pm_resume(gpu);
++	pm_runtime_dont_use_autosuspend(&gpu->pdev->dev);
++
++	/* active_submit won't change until we make a submission */
++	mutex_lock(&gpu->active_lock);
++	active_submits = gpu->active_submits;
++
++	/*
++	 * Temporarily clear active_submits count to silence a WARN() in the
++	 * runtime suspend cb
++	 */
++	gpu->active_submits = 0;
++
++	/* Drop the rpm refcount from active submits */
++	if (active_submits)
++		pm_runtime_put(&gpu->pdev->dev);
++
++	/* And the final one from recover worker */
++	pm_runtime_put_sync(&gpu->pdev->dev);
++
++	pm_runtime_use_autosuspend(&gpu->pdev->dev);
++
++	if (active_submits)
++		pm_runtime_get(&gpu->pdev->dev);
++
++	pm_runtime_get_sync(&gpu->pdev->dev);
++
++	gpu->active_submits = active_submits;
++	mutex_unlock(&gpu->active_lock);
+ 
+ 	msm_gpu_hw_init(gpu);
+ }
+diff --git a/drivers/gpu/drm/msm/msm_gpu.c b/drivers/gpu/drm/msm/msm_gpu.c
+index da6242cbf87d..9ec9a99ffe77 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -422,9 +422,7 @@ static void recover_worker(struct kthread_work *work)
+ 		/* retire completed submits, plus the one that hung: */
+ 		retire_submits(gpu);
+ 
+-		pm_runtime_get_sync(&gpu->pdev->dev);
+ 		gpu->funcs->recover(gpu);
+-		pm_runtime_put_sync(&gpu->pdev->dev);
+ 
+ 		/*
+ 		 * Replay all remaining submits starting with highest priority
+@@ -441,7 +439,7 @@ static void recover_worker(struct kthread_work *work)
+ 		}
+ 	}
+ 
+-	pm_runtime_put_sync(&gpu->pdev->dev);
++	pm_runtime_put(&gpu->pdev->dev);
+ 
+ 	mutex_unlock(&gpu->lock);
+ 
+-- 
+2.25.1
+

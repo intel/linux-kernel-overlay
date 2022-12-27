@@ -1,0 +1,178 @@
+From 9139a596b461c6648a309f07b1cd46dca737a566 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 28 Jul 2022 11:14:40 +0300
+Subject: [PATCH 2073/2779] drm/i915/d12+: Disable DMC handlers during
+ loading/disabling the firmware
+
+Disable the DMC event handlers before loading the firmware and after
+uninitializing the display, to make sure the firmware is inactive. This
+matches the Bspec "Sequences for Display C5 and C6" page for GEN12+.
+
+Add a TODO comment for doing the same on pre-GEN12 platforms.
+
+v2:
+- Add a macro for the number of event handlers.
+- Disable the event handlers only on GEN12+.
+- s/dev_priv/i915/ in docbook comment.
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com> #v1
+Link: https://patchwork.freedesktop.org/patch/msgid/20220728081440.1676857-1-imre.deak@intel.com
+---
+ .../drm/i915/display/intel_display_power.c    |  3 +
+ drivers/gpu/drm/i915/display/intel_dmc.c      | 56 +++++++++++++++++--
+ drivers/gpu/drm/i915/display/intel_dmc.h      |  1 +
+ drivers/gpu/drm/i915/display/intel_dmc_regs.h |  2 +
+ 4 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power.c b/drivers/gpu/drm/i915/display/intel_display_power.c
+index f6173b4a0606..862ed080cb19 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c
+@@ -1433,6 +1433,7 @@ static void skl_display_core_uninit(struct drm_i915_private *dev_priv)
+ 		return;
+ 
+ 	gen9_disable_dc_states(dev_priv);
++	/* TODO: disable DMC program */
+ 
+ 	gen9_dbuf_disable(dev_priv);
+ 
+@@ -1500,6 +1501,7 @@ static void bxt_display_core_uninit(struct drm_i915_private *dev_priv)
+ 		return;
+ 
+ 	gen9_disable_dc_states(dev_priv);
++	/* TODO: disable DMC program */
+ 
+ 	gen9_dbuf_disable(dev_priv);
+ 
+@@ -1675,6 +1677,7 @@ static void icl_display_core_uninit(struct drm_i915_private *dev_priv)
+ 		return;
+ 
+ 	gen9_disable_dc_states(dev_priv);
++	intel_dmc_disable_program(dev_priv);
+ 
+ 	/* 1. Disable all display engine functions -> aready done */
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.c b/drivers/gpu/drm/i915/display/intel_dmc.c
+index ed28107cbd12..00e18a4a5a5a 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc.c
+@@ -277,6 +277,17 @@ static void gen9_set_dc_state_debugmask(struct drm_i915_private *dev_priv)
+ 	intel_de_posting_read(dev_priv, DC_STATE_DEBUG);
+ }
+ 
++static void disable_event_handler(struct drm_i915_private *i915,
++				  i915_reg_t ctl_reg, i915_reg_t htp_reg)
++{
++	intel_de_write(i915, ctl_reg,
++		       REG_FIELD_PREP(DMC_EVT_CTL_TYPE_MASK,
++				      DMC_EVT_CTL_TYPE_EDGE_0_1) |
++		       REG_FIELD_PREP(DMC_EVT_CTL_EVENT_ID_MASK,
++				      DMC_EVT_CTL_EVENT_ID_FALSE));
++	intel_de_write(i915, htp_reg, 0);
++}
++
+ static void
+ disable_flip_queue_event(struct drm_i915_private *i915,
+ 			 i915_reg_t ctl_reg, i915_reg_t htp_reg)
+@@ -299,12 +310,7 @@ disable_flip_queue_event(struct drm_i915_private *i915,
+ 		return;
+ 	}
+ 
+-	intel_de_write(i915, ctl_reg,
+-		       REG_FIELD_PREP(DMC_EVT_CTL_TYPE_MASK,
+-				      DMC_EVT_CTL_TYPE_EDGE_0_1) |
+-		       REG_FIELD_PREP(DMC_EVT_CTL_EVENT_ID_MASK,
+-				      DMC_EVT_CTL_EVENT_ID_FALSE));
+-	intel_de_write(i915, htp_reg, 0);
++	disable_event_handler(i915, ctl_reg, htp_reg);
+ }
+ 
+ static bool
+@@ -356,6 +362,27 @@ disable_all_flip_queue_events(struct drm_i915_private *i915)
+ 	}
+ }
+ 
++static void disable_all_event_handlers(struct drm_i915_private *i915)
++{
++	int id;
++
++	/* TODO: disable the event handlers on pre-GEN12 platforms as well */
++	if (DISPLAY_VER(i915) < 12)
++		return;
++
++	for (id = DMC_FW_MAIN; id < DMC_FW_MAX; id++) {
++		int handler;
++
++		if (!has_dmc_id_fw(i915, id))
++			continue;
++
++		for (handler = 0; handler < DMC_EVENT_HANDLER_COUNT_GEN12; handler++)
++			disable_event_handler(i915,
++					      DMC_EVT_CTL(i915, id, handler),
++					      DMC_EVT_HTP(i915, id, handler));
++	}
++}
++
+ /**
+  * intel_dmc_load_program() - write the firmware from memory to register.
+  * @dev_priv: i915 drm device.
+@@ -372,6 +399,8 @@ void intel_dmc_load_program(struct drm_i915_private *dev_priv)
+ 	if (!intel_dmc_has_payload(dev_priv))
+ 		return;
+ 
++	disable_all_event_handlers(dev_priv);
++
+ 	assert_rpm_wakelock_held(&dev_priv->runtime_pm);
+ 
+ 	preempt_disable();
+@@ -405,6 +434,21 @@ void intel_dmc_load_program(struct drm_i915_private *dev_priv)
+ 	disable_all_flip_queue_events(dev_priv);
+ }
+ 
++/**
++ * intel_dmc_disable_program() - disable the firmware
++ * @i915: i915 drm device
++ *
++ * Disable all event handlers in the firmware, making sure the firmware is
++ * inactive after the display is uninitialized.
++ */
++void intel_dmc_disable_program(struct drm_i915_private *i915)
++{
++	if (!intel_dmc_has_payload(i915))
++		return;
++
++	disable_all_event_handlers(i915);
++}
++
+ void assert_dmc_loaded(struct drm_i915_private *i915)
+ {
+ 	drm_WARN_ONCE(&i915->drm,
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.h b/drivers/gpu/drm/i915/display/intel_dmc.h
+index 41091aee3b47..67e03315ef99 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.h
++++ b/drivers/gpu/drm/i915/display/intel_dmc.h
+@@ -47,6 +47,7 @@ struct intel_dmc {
+ 
+ void intel_dmc_ucode_init(struct drm_i915_private *i915);
+ void intel_dmc_load_program(struct drm_i915_private *i915);
++void intel_dmc_disable_program(struct drm_i915_private *i915);
+ void intel_dmc_ucode_fini(struct drm_i915_private *i915);
+ void intel_dmc_ucode_suspend(struct drm_i915_private *i915);
+ void intel_dmc_ucode_resume(struct drm_i915_private *i915);
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc_regs.h b/drivers/gpu/drm/i915/display/intel_dmc_regs.h
+index 238620b55966..5e5e41644ddf 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc_regs.h
++++ b/drivers/gpu/drm/i915/display/intel_dmc_regs.h
+@@ -28,6 +28,8 @@
+ #define _DMC_REG(i915, dmc_id, reg) \
+ 	((reg) - __DMC_REG_MMIO_BASE + _DMC_REG_MMIO_BASE(i915, dmc_id))
+ 
++#define DMC_EVENT_HANDLER_COUNT_GEN12	8
++
+ #define _DMC_EVT_HTP_0			0x8f004
+ 
+ #define DMC_EVT_HTP(i915, dmc_id, handler) \
+-- 
+2.25.1
+
