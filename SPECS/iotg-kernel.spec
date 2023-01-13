@@ -60,18 +60,18 @@
 %global isrc 1
 
 %define pkgrelease  14
-%define rpmversion  5.15.71
+%define rpmversion  5.15.85
 %if %{?isrc}
-%define rcversion   rt51.
+%define rcversion   rt55.
 %endif
-%define embargoname 0104.lts2021_rt
+%define embargoname 0113.lts2021_rt
 
 %define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}230104T054143Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}230113T035939Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -466,7 +466,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo https://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git/
-%global kernel_src_tag v5.15.71-rt51
+%global kernel_src_tag v5.15.85-rt55
 # END OF PROJECT SPECIFIC MACROS
 
 
