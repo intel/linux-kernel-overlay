@@ -66,7 +66,7 @@
 %endif
 %define embargoname 0201.lts2022
 
-%define base_os_cfg_file base-os/centos.config-4.18.0-348.el8.x86_64
+%define base_os_cfg_file base-os/centos.config-intel-next.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
