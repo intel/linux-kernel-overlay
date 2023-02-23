@@ -1,0 +1,135 @@
+From 36f2de426fb25e33cf8e6b80193be84abb830189 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 10 Aug 2022 14:43:11 -0700
+Subject: [PATCH 20/34] sched/fair: Use IPCC scores to select a busiest
+ runqueue
+
+For two runqueues of equal priority and equal number of running of tasks,
+select the one whose current task would have the highest IPC class score
+if placed on the destination CPU.
+
+For now, use IPCC scores only for scheduling domains with the
+SD_ASYM_PACKING flag.
+
+Cc: Ben Segall <bsegall@google.com>
+Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Ionela Voinescu <ionela.voinescu@arm.com>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Lukasz Luba <lukasz.luba@arm.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Tim C. Chen <tim.c.chen@intel.com>
+Cc: Valentin Schneider <vschneid@redhat.com>
+Cc: x86@kernel.org
+Cc: linux-pm@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/fair.c | 64 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 0996339df429..a9a105092e7c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9269,6 +9269,37 @@ static bool sched_asym_ipcc_pick(struct sched_group *a,
+ 	return sched_asym_ipcc_prefer(a_stats, b_stats);
+ }
+ 
++/**
++ * ipcc_score_delta - Get the IPCC score delta wrt the load balance's dst_cpu
++ * @p:		A task
++ * @env:	Load balancing environment
++ *
++ * Returns: The IPCC score delta that @p would get if placed in the destination
++ * CPU of @env. LONG_MIN to indicate that the delta should not be used.
++ */
++static long ipcc_score_delta(struct task_struct *p, struct lb_env *env)
++{
++	unsigned long score_src, score_dst;
++	unsigned short ipcc = p->ipcc;
++
++	if (!sched_ipcc_enabled())
++		return LONG_MIN;
++
++	/* Only asym_packing uses IPCC scores at the moment. */
++	if (!(env->sd->flags & SD_ASYM_PACKING))
++		return LONG_MIN;
++
++	score_dst = arch_get_ipcc_score(ipcc, env->dst_cpu);
++	if (IS_ERR_VALUE(score_dst))
++		return LONG_MIN;
++
++	score_src = arch_get_ipcc_score(ipcc, task_cpu(p));
++	if (IS_ERR_VALUE(score_src))
++		return LONG_MIN;
++
++	return score_dst - score_src;
++}
++
+ #else /* CONFIG_IPC_CLASSES */
+ static void update_sg_lb_ipcc_stats(int dst_cpu, struct sg_lb_stats *sgs,
+ 				    struct rq *rq)
+@@ -9299,6 +9330,11 @@ static bool sched_asym_ipcc_pick(struct sched_group *a,
+ 	return false;
+ }
+ 
++static long ipcc_score_delta(struct task_struct *p, struct lb_env *env)
++{
++	return LONG_MIN;
++}
++
+ #endif /* CONFIG_IPC_CLASSES */
+ 
+ /**
+@@ -10459,6 +10495,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ {
+ 	struct rq *busiest = NULL, *rq;
+ 	unsigned long busiest_util = 0, busiest_load = 0, busiest_capacity = 1;
++	long busiest_ipcc_delta = LONG_MIN;
+ 	unsigned int busiest_nr = 0;
+ 	int i;
+ 
+@@ -10575,8 +10612,35 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 
+ 		case migrate_task:
+ 			if (busiest_nr < nr_running) {
++				struct task_struct *curr;
++
+ 				busiest_nr = nr_running;
+ 				busiest = rq;
++
++				/*
++				 * Remember the IPCC score delta of busiest::curr.
++				 * We may need it to break a tie with other queues
++				 * with equal nr_running.
++				 */
++				curr = rcu_dereference(busiest->curr);
++				busiest_ipcc_delta = ipcc_score_delta(curr, env);
++			/*
++			 * If rq and busiest have the same number of running
++			 * tasks and IPC classes are supported, pick rq if doing
++			 * so would give rq::curr a bigger IPC boost on dst_cpu.
++			 */
++			} else if (busiest_nr == nr_running) {
++				struct task_struct *curr;
++				long delta;
++
++				curr = rcu_dereference(rq->curr);
++				delta = ipcc_score_delta(curr, env);
++
++				if (busiest_ipcc_delta < delta) {
++					busiest_ipcc_delta = delta;
++					busiest_nr = nr_running;
++					busiest = rq;
++				}
+ 			}
+ 			break;
+ 
+-- 
+2.25.1
+

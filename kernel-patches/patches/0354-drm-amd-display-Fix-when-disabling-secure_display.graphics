@@ -1,0 +1,125 @@
+From d688bf19ca9fcbeb42f2eb69f306ecb076f8febf Mon Sep 17 00:00:00 2001
+From: Alan Liu <HaoPing.Liu@amd.com>
+Date: Thu, 24 Nov 2022 20:24:15 +0800
+Subject: [PATCH 0354/1096] drm/amd/display: Fix when disabling secure_display
+
+[Why]
+Fix problems when we disable secure_display.
+
+[How]
+- Reset secure display context after disabled
+- A secure_display_context is dedicate to a crtc, so we set the crtc for
+it when we create the context.
+
+Reviewed-by: Wayne Lin <Wayne.Lin@amd.com>
+Acked-by: Jasdeep Dhillon <jdhillon@amd.com>
+Signed-off-by: Alan Liu <HaoPing.Liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  2 +-
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c | 28 +++++++++++--------
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h |  5 ++--
+ 3 files changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index e6b2a88013ab..7ddb6e2af7fd 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1659,7 +1659,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	}
+ #endif
+ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+-	adev->dm.secure_display_ctxs = amdgpu_dm_crtc_secure_display_create_contexts(adev->dm.dc->caps.max_links);
++	adev->dm.secure_display_ctxs = amdgpu_dm_crtc_secure_display_create_contexts(adev);
+ #endif
+ 	if (dc_is_dmub_outbox_supported(adev->dm.dc)) {
+ 		init_completion(&adev->dm.dmub_aux_transfer_done);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index e81659c1692b..8bf33fa4abd9 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -217,14 +217,12 @@ int amdgpu_dm_crtc_configure_crc_source(struct drm_crtc *crtc,
+ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+ 		/* Disable secure_display if it was enabled */
+ 		if (!enable) {
+-			if (adev->dm.secure_display_ctxs) {
+-				for (i = 0; i < adev->mode_info.num_crtc; i++) {
+-					if (adev->dm.secure_display_ctxs[i].crtc == crtc) {
+-						/* stop ROI update on this crtc */
+-						flush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);
+-						dc_stream_forward_crc_window(stream_state, NULL, true);
+-						adev->dm.secure_display_ctxs[i].crtc = NULL;
+-					}
++			for (i = 0; i < adev->dm.dc->caps.max_links; i++) {
++				if (adev->dm.secure_display_ctxs[i].crtc == crtc) {
++					/* stop ROI update on this crtc */
++					flush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);
++					flush_work(&adev->dm.secure_display_ctxs[i].forward_roi_work);
++					dc_stream_forward_crc_window(stream_state, NULL, true);
+ 				}
+ 			}
+ 		}
+@@ -499,7 +497,12 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ 	}
+ 
+ 	secure_display_ctx = &adev->dm.secure_display_ctxs[acrtc->crtc_id];
+-	secure_display_ctx->crtc = crtc;
++	if (WARN_ON(secure_display_ctx->crtc != crtc)) {
++		/* We have set the crtc when creating secure_display_context,
++		 * don't expect it to be changed here.
++		 */
++		secure_display_ctx->crtc = crtc;
++	}
+ 
+ 	if (acrtc->dm_irq_params.window_param.update_win) {
+ 		/* prepare work for dmub to update ROI */
+@@ -530,19 +533,20 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ }
+ 
+ struct secure_display_context *
+-amdgpu_dm_crtc_secure_display_create_contexts(int num_crtc)
++amdgpu_dm_crtc_secure_display_create_contexts(struct amdgpu_device *adev)
+ {
+ 	struct secure_display_context *secure_display_ctxs = NULL;
+ 	int i;
+ 
+-	secure_display_ctxs = kcalloc(num_crtc, sizeof(struct secure_display_context), GFP_KERNEL);
++	secure_display_ctxs = kcalloc(AMDGPU_MAX_CRTCS, sizeof(struct secure_display_context), GFP_KERNEL);
+ 
+ 	if (!secure_display_ctxs)
+ 		return NULL;
+ 
+-	for (i = 0; i < num_crtc; i++) {
++	for (i = 0; i < adev->dm.dc->caps.max_links; i++) {
+ 		INIT_WORK(&secure_display_ctxs[i].forward_roi_work, amdgpu_dm_forward_crc_window);
+ 		INIT_WORK(&secure_display_ctxs[i].notify_ta_work, amdgpu_dm_crtc_notify_ta_to_read);
++		secure_display_ctxs[i].crtc = &adev->mode_info.crtcs[i]->base;
+ 	}
+ 
+ 	return secure_display_ctxs;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+index 4323f723c0de..935adca6f048 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+@@ -54,7 +54,7 @@ struct crc_window_param {
+ };
+ 
+ struct secure_display_context {
+-	/* work to notify PSP TA to transmit CRC over I2C */
++	/* work to notify PSP TA*/
+ 	struct work_struct notify_ta_work;
+ 
+ 	/* work to forward ROI to dmcu/dmub */
+@@ -95,7 +95,8 @@ void amdgpu_dm_crtc_handle_crc_irq(struct drm_crtc *crtc);
+ #ifdef CONFIG_DRM_AMD_SECURE_DISPLAY
+ bool amdgpu_dm_crc_window_is_activated(struct drm_crtc *crtc);
+ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc);
+-struct secure_display_context *amdgpu_dm_crtc_secure_display_create_contexts(int num_crtc);
++struct secure_display_context *amdgpu_dm_crtc_secure_display_create_contexts(
++						struct amdgpu_device *adev);
+ #else
+ #define amdgpu_dm_crc_window_is_activated(x)
+ #define amdgpu_dm_crtc_handle_crc_window_irq(x)
+-- 
+2.25.1
+

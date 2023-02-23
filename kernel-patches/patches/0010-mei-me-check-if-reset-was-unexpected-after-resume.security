@@ -1,0 +1,219 @@
+From 4f2d67d7ce6a7bc77f42ebd203660bb9a58cabcd Mon Sep 17 00:00:00 2001
+From: Vitaly Lubart <vitaly.lubart@intel.com>
+Date: Sun, 21 Aug 2022 20:15:21 +0300
+Subject: [PATCH 10/12] mei: me: check if reset was unexpected after resume
+
+GSC devices perform legal firmware initiated resets due to state transition
+that may appear as unexpected to the driver. Lower the log level for those
+devices to debug and save the firmware status registers.
+When the device comes out of the reset it is possible to check whether the
+resets was due to firmware error or exception and only than produce a warning.
+
+Signed-off-by: Vitaly Lubart <vitaly.lubart@intel.com>
+---
+ drivers/misc/mei/hw-me-regs.h |  4 +++
+ drivers/misc/mei/hw-me.c      | 48 ++++++++++++++++++++++++++++++++---
+ drivers/misc/mei/init.c       | 26 +++++++++++++++++--
+ drivers/misc/mei/mei_dev.h    | 35 +++++++++++++++++++++++--
+ 4 files changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/misc/mei/hw-me-regs.h b/drivers/misc/mei/hw-me-regs.h
+index bdc65d50b945..cecaf01c97cf 100644
+--- a/drivers/misc/mei/hw-me-regs.h
++++ b/drivers/misc/mei/hw-me-regs.h
+@@ -211,4 +211,8 @@ access to ME_CBD */
+ #define H_D0I3C_I3       0x00000004
+ #define H_D0I3C_RR       0x00000008
+ 
++#define FW_PM_CMOFF_TO_CMX_ERROR       0x1000000 /* CMoff->CMx wake after an error */
++#define FW_PM_CM_RESET_ERROR           0x5000000 /* CME reset due to exception */
++#define FW_PM_EVENT_MASK               0xf000000
++
+ #endif /* _MEI_HW_MEI_REGS_H_ */
+diff --git a/drivers/misc/mei/hw-me.c b/drivers/misc/mei/hw-me.c
+index da4ef0b51954..9b778c88e398 100644
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -482,6 +482,39 @@ static int mei_me_hw_ready_wait(struct mei_device *dev)
+ 	return 0;
+ }
+ 
++/**
++ * mei_me_check_fw_reset - check for the firmware reset error and exception conditions
++ *
++ * @dev: mei device
++ */
++static void mei_me_check_fw_reset(struct mei_device *dev)
++{
++	struct mei_fw_status fw_status;
++	int ret;
++	u32 fw_pm_event;
++
++	ret = mei_fw_status(dev, &fw_status);
++	if (ret) {
++		dev_err(dev->dev, "failed to read firmware status: %d\n", ret);
++		goto end;
++	}
++	fw_pm_event = fw_status.status[1] & FW_PM_EVENT_MASK;
++	if (fw_pm_event == FW_PM_CMOFF_TO_CMX_ERROR || fw_pm_event == FW_PM_CM_RESET_ERROR) {
++		if (dev->saved_fw_status_flag) {
++			char fw_sts_str[MEI_FW_STATUS_STR_SZ] = {0};
++
++			mei_fw_status2str(&dev->saved_fw_status, fw_sts_str, sizeof(fw_sts_str));
++			dev_warn(dev->dev, "unexpected reset: fw_pm_event = 0x%x, dev_state = %u fw status = %s\n",
++				 fw_pm_event, dev->saved_dev_state, fw_sts_str);
++		} else {
++			dev_warn(dev->dev, "unexpected reset: fw_pm_event = 0x%x\n", fw_pm_event);
++		}
++	}
++
++end:
++	dev->saved_fw_status_flag = false;
++}
++
+ /**
+  * mei_me_hw_start - hw start routine
+  *
+@@ -490,8 +523,12 @@ static int mei_me_hw_ready_wait(struct mei_device *dev)
+  */
+ static int mei_me_hw_start(struct mei_device *dev)
+ {
+-	int ret = mei_me_hw_ready_wait(dev);
++	int ret;
++
++	if (kind_is_gsc(dev) || kind_is_gscfi(dev))
++		mei_me_check_fw_reset(dev);
+ 
++	ret = mei_me_hw_ready_wait(dev);
+ 	if (ret)
+ 		return ret;
+ 	dev_dbg(dev->dev, "hw is ready\n");
+@@ -1300,8 +1337,13 @@ irqreturn_t mei_me_irq_thread_handler(int irq, void *dev_id)
+ 
+ 	/* check if ME wants a reset */
+ 	if (!mei_hw_is_ready(dev) && dev->dev_state != MEI_DEV_RESETTING) {
+-		dev_warn(dev->dev, "FW not ready: resetting: dev_state = %d pxp = %d\n",
+-			 dev->dev_state, dev->pxp_mode);
++		if (kind_is_gsc(dev) || kind_is_gscfi(dev)) {
++			dev_dbg(dev->dev, "FW not ready: resetting: dev_state = %d\n",
++				dev->dev_state);
++		} else {
++			dev_warn(dev->dev, "FW not ready: resetting: dev_state = %d\n",
++				 dev->dev_state);
++		}
+ 		if (dev->dev_state == MEI_DEV_POWERING_DOWN ||
+ 		    dev->dev_state == MEI_DEV_POWER_DOWN)
+ 			mei_cl_all_disconnect(dev);
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 5cc75a3314a6..26b7dc584130 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -89,6 +89,22 @@ void mei_cancel_work(struct mei_device *dev)
+ }
+ EXPORT_SYMBOL_GPL(mei_cancel_work);
+ 
++static void mei_save_fw_status(struct mei_device *dev)
++{
++	struct mei_fw_status fw_status;
++	int ret;
++
++	ret = mei_fw_status(dev, &fw_status);
++	if (ret) {
++		dev_err(dev->dev, "failed to read firmware status: %d\n", ret);
++		return;
++	}
++
++	dev->saved_dev_state = dev->dev_state;
++	dev->saved_fw_status_flag = true;
++	memcpy(&dev->saved_fw_status, &fw_status, sizeof(fw_status));
++}
++
+ /**
+  * mei_reset - resets host and fw.
+  *
+@@ -109,8 +125,14 @@ int mei_reset(struct mei_device *dev)
+ 		char fw_sts_str[MEI_FW_STATUS_STR_SZ];
+ 
+ 		mei_fw_status_str(dev, fw_sts_str, MEI_FW_STATUS_STR_SZ);
+-		dev_warn(dev->dev, "unexpected reset: dev_state = %s fw status = %s\n",
+-			 mei_dev_state_str(state), fw_sts_str);
++		if (kind_is_gsc(dev) || kind_is_gscfi(dev)) {
++			dev_dbg(dev->dev, "unexpected reset: dev_state = %s fw status = %s\n",
++				mei_dev_state_str(state), fw_sts_str);
++			mei_save_fw_status(dev);
++		} else {
++			dev_warn(dev->dev, "unexpected reset: dev_state = %s fw status = %s\n",
++				 mei_dev_state_str(state), fw_sts_str);
++		}
+ 	}
+ 
+ 	mei_clear_interrupts(dev);
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 996b70a988be..018e53e463e1 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -528,6 +528,10 @@ struct mei_dev_timeouts {
+  *
+  * @dbgfs_dir   : debugfs mei root directory
+  *
++ * @saved_fw_status      : saved firmware status
++ * @saved_dev_state      : saved device state
++ * @saved_fw_status_flag : flag indicating that firmware status was saved
++ *
+  * @ops:        : hw specific operations
+  * @hw          : hw specific data
+  */
+@@ -623,6 +627,10 @@ struct mei_device {
+ 	struct dentry *dbgfs_dir;
+ #endif /* CONFIG_DEBUG_FS */
+ 
++	struct mei_fw_status saved_fw_status;
++	enum mei_dev_state saved_dev_state;
++	bool saved_fw_status_flag;
++
+ 	const struct mei_hw_ops *ops;
+ 	char hw[] __aligned(sizeof(void *));
+ };
+@@ -850,8 +858,7 @@ ssize_t mei_fw_status2str(struct mei_fw_status *fw_sts, char *buf, size_t len);
+  *
+  * Return: number of bytes written or < 0 on failure
+  */
+-static inline ssize_t mei_fw_status_str(struct mei_device *dev,
+-					char *buf, size_t len)
++static inline ssize_t mei_fw_status_str(struct mei_device *dev, char *buf, size_t len)
+ {
+ 	struct mei_fw_status fw_status;
+ 	int ret;
+@@ -867,5 +874,29 @@ static inline ssize_t mei_fw_status_str(struct mei_device *dev,
+ 	return ret;
+ }
+ 
++/**
++ * kind_is_gsc - checks whether the device is gsc
++ *
++ * @dev: the device structure
++ *
++ * Return: whether the device is gsc
++ */
++static inline bool kind_is_gsc(struct mei_device *dev)
++{
++	/* check kind for NULL because it may be not set, like at the fist call to hw_start */
++	return dev->kind && (strcmp(dev->kind, "gsc") == 0);
++}
+ 
++/**
++ * kind_is_gscfi - checks whether the device is gscfi
++ *
++ * @dev: the device structure
++ *
++ * Return: whether the device is gscfi
++ */
++static inline bool kind_is_gscfi(struct mei_device *dev)
++{
++	/* check kind for NULL because it may be not set, like at the fist call to hw_start */
++	return dev->kind && (strcmp(dev->kind, "gscfi") == 0);
++}
+ #endif
+-- 
+2.25.1
+

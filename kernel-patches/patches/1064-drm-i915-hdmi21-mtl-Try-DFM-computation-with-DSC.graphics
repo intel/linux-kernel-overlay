@@ -1,0 +1,200 @@
+From 71bd74e63b8333aa10cc8a0c751521b91b8e8767 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Sat, 2 Apr 2022 12:22:12 +0530
+Subject: [PATCH 1064/1096] drm/i915/hdmi21/mtl: Try DFM computation with DSC
+
+For a given FRL rate and display mode, if the DFM requirement is not
+met try with DSC.
+This patch add support to try FRL DFM computation with DSC
+with different compressed bpp.
+
+v2: Avoided helper movement, and added prototype at the top.
+
+v3: Added debug prints for FRL DFM config with DSC.
+
+v4: Corrected condition for case where dfm cannot be supported.
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_hdmi.c | 119 +++++++++++++++++++++-
+ 1 file changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index 5d816f03ab77..3785a1d4d540 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -61,6 +61,14 @@
+ #include "intel_panel.h"
+ #include "intel_snps_phy.h"
+ 
++static int
++get_dsc_compressed_bpp(int num_slices, int slice_width, int hdmi_max_chunk_bytes,
++		       int src_fractional_bpp, int min_dsc_bpp, int max_dsc_bpp);
++
++static void
++get_dsc_min_max_bpp(enum intel_output_format output_format, u8 bpc,
++		    bool hdmi_all_bpp, int *min_dsc_bpp, int *max_dsc_bpp);
++
+ inline struct drm_i915_private *intel_hdmi_to_i915(struct intel_hdmi *intel_hdmi)
+ {
+ 	return to_i915(hdmi_to_dig_port(intel_hdmi)->base.base.dev);
+@@ -2159,9 +2167,9 @@ get_drm_color_format(enum intel_output_format output_format)
+ 	case INTEL_OUTPUT_FORMAT_RGB:
+ 		return DRM_COLOR_FORMAT_RGB444;
+ 	case INTEL_OUTPUT_FORMAT_YCBCR420:
+-		return DRM_COLOR_FORMAT_YCRCB420;
++		return DRM_COLOR_FORMAT_YCBCR420;
+ 	case INTEL_OUTPUT_FORMAT_YCBCR444:
+-		return DRM_COLOR_FORMAT_YCRCB444;
++		return DRM_COLOR_FORMAT_YCBCR444;
+ 	default:
+ 		return DRM_COLOR_FORMAT_RGB444;
+ 	}
+@@ -2183,6 +2191,87 @@ compute_frl_mn(struct intel_crtc_state *crtc_state, u32 ftb_avg_k)
+ 	crtc_state->frl.div18 = DIV_ROUND_UP_ULL(div_18_clk, 1000);
+ }
+ 
++static int get_dsc_slice_count(struct intel_hdmi *intel_hdmi,
++		               const struct drm_display_mode *mode,
++			       enum intel_output_format output_format,
++			       bool use_bigjoiner)
++{
++	/*
++	 * Bspec: 31627
++	 * max_slices per line 4, without big joiner, 8 with big joiner
++	 * max slice width in pixels 5120 without pipe joiner, 8192 with pipe joiner
++	 */
++#define SRC_MAX_SLICES                 4
++#define SRC_MAX_SLICES_BIG_JOINER      8
++#define SRC_MAX_SLICES_WIDTH            5120
++#define SRC_MAX_SLICES_WIDTH_BIG_JOINER        8192
++
++	int src_max_slices = SRC_MAX_SLICES;
++	int src_max_width = SRC_MAX_SLICES_WIDTH;
++	struct intel_connector *intel_connector = intel_hdmi->attached_connector;
++	struct drm_connector *connector = &intel_connector->base;
++	int hdmi_throughput = connector->display_info.hdmi.dsc_cap.clk_per_slice;
++	int hdmi_max_slices = connector->display_info.hdmi.dsc_cap.max_slices;
++
++	if (use_bigjoiner) {
++		src_max_slices = SRC_MAX_SLICES_BIG_JOINER;
++		src_max_width = SRC_MAX_SLICES_WIDTH_BIG_JOINER;
++	}
++
++	return intel_hdmi_dsc_get_num_slices(mode, output_format,
++			src_max_slices, src_max_width,
++			hdmi_max_slices, hdmi_throughput);
++}
++
++static bool
++intel_hdmi_can_support_frl_mode_with_dsc(struct intel_hdmi *intel_hdmi,
++					 struct intel_crtc_state *pipe_config,
++					 struct drm_hdmi_frl_dfm *frl_dfm)
++{
++	const struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
++	struct intel_connector *intel_connector = intel_hdmi->attached_connector;
++	struct drm_connector *connector = &intel_connector->base;
++	int hdmi_max_chunk_bytes = connector->display_info.hdmi.dsc_cap.total_chunk_kbytes * 1024;
++	bool hdmi_all_bpp = connector->display_info.hdmi.dsc_cap.all_bpp;
++	int slice_count, slice_width;
++	int src_frc_bpp, bpp, bpp_x16, max_dsc_bpp, min_dsc_bpp;
++	u8 bpc;
++
++	slice_count = get_dsc_slice_count(intel_hdmi, adjusted_mode,
++			pipe_config->output_format,
++			pipe_config->bigjoiner_pipes);
++	if (!slice_count)
++		return false;
++
++	slice_width = adjusted_mode->hdisplay / slice_count;
++
++	/*TODO Check for fractional bpp support from source */
++	src_frc_bpp = 0;
++	bpc = pipe_config->pipe_bpp / 3;
++
++	get_dsc_min_max_bpp(pipe_config->output_format, bpc, hdmi_all_bpp,
++			&min_dsc_bpp, &max_dsc_bpp);
++
++	for (bpp = max_dsc_bpp; bpp > min_dsc_bpp; bpp--) {
++		bpp_x16 = get_dsc_compressed_bpp(slice_count, slice_width,
++						 hdmi_max_chunk_bytes,
++						 src_frc_bpp, min_dsc_bpp, bpp);
++		if (!bpp_x16)
++			return false;
++
++		bpp = DIV_ROUND_UP(bpp_x16, 16);
++
++		/* Fill DSC related DFM input parameters */
++		frl_dfm->config.target_bpp_16 = bpp_x16;
++		frl_dfm->config.slice_width = slice_width;
++
++		if (drm_frl_dfm_dsc_requirement_met(frl_dfm))
++			return true;
++	}
++
++	return false;
++}
++
+ static int
+ intel_hdmi_compute_frl_config(struct intel_encoder *encoder,
+ 			      struct intel_crtc_state *pipe_config)
+@@ -2193,9 +2282,11 @@ intel_hdmi_compute_frl_config(struct intel_encoder *encoder,
+ 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	int max_rate = intel_hdmi->max_frl_rate;
++	int max_dsc_rate = intel_hdmi->max_dsc_frl_rate;
+ 	struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
+ 	bool can_support_frl_mode = false;
+ 	int i, j;
++	bool can_support_frl_mode_with_dsc = false;
+ 
+ 	/* Fill mode related input params */
+ 	frl_dfm.config.pixel_clock_nominal_khz = adjusted_mode->clock;
+@@ -2226,14 +2317,27 @@ intel_hdmi_compute_frl_config(struct intel_encoder *encoder,
+ 				can_support_frl_mode = true;
+ 				break;
+ 			}
++
++			if (!max_dsc_rate || max_dsc_rate < rate[i])
++				continue;
++			/* Try with DSC */
++			if (intel_hdmi_can_support_frl_mode_with_dsc(intel_hdmi,
++								     pipe_config,
++								     &frl_dfm)) {
++				can_support_frl_mode_with_dsc = true;
++				break;
++			}
+ 		}
+ 
+-		if (can_support_frl_mode)
++		if (can_support_frl_mode || can_support_frl_mode_with_dsc)
+ 			break;
+ 	}
+ 
+-	if (!can_support_frl_mode)
++	if (!can_support_frl_mode && !can_support_frl_mode_with_dsc) {
++		drm_dbg_kms(&dev_priv->drm, "Cannot support FRL mode\n");
++
+ 		goto no_frl_support;
++	}
+ 
+ 	/* Fill frl capacity output params */
+ 	pipe_config->frl.required_lanes = frl_dfm.config.lanes;
+@@ -2268,6 +2372,13 @@ intel_hdmi_compute_frl_config(struct intel_encoder *encoder,
+ 	pipe_config->frl.rsrc_sched_en = false;
+ 	pipe_config->frl.active_char_buf_threshold = 0;
+ 
++	if (can_support_frl_mode_with_dsc) {
++		pipe_config->frl.hcactive_tb = frl_dfm.params.hcactive_target;
++		pipe_config->frl.hctotal_tb = frl_dfm.params.hcactive_target + frl_dfm.params.hcblank_target;
++		drm_dbg_kms(&dev_priv->drm, "FRL DFM DSC config: hcactive_tb = %d, hctotal_tb = %d\n",
++			    pipe_config->frl.hcactive_tb, pipe_config->frl.hctotal_tb);
++	}
++
+ 	return 0;
+ 
+ no_frl_support:
+-- 
+2.25.1
+

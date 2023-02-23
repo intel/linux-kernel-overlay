@@ -1,0 +1,210 @@
+From 1d2095123742670decdbdc925e9a103ea8f69f2e Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Thu, 8 Sep 2022 14:51:21 +0530
+Subject: [PATCH 1062/1096] drm/i915/hdmi21/mtl: Add FRL clock computation
+ based on DFM
+
+Add clock computation when HDMI2.1 FRL mode is used.
+We start with max BPC supported and check if we can get a valid the
+Div clock 18 for any BPC for a given video mode with FRL transmission.
+
+To compute the clock, we start with maximum FRL rate and check if any FRL
+rate can support the video mode satisfying Data Flow metering requirements.
+The DFM parameters like tribyte borrowed, and audio configuration are
+computed and used along with FRL rate and lane count to calculate the
+clock.
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Co-authored-by: Vandita Kulkarni <vandita.kulkarni@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_hdmi.c | 154 +++++++++++++++++++++-
+ 1 file changed, 153 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index ca758d7a4f7c..be47d67e0c8b 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -27,6 +27,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/gcd.h>
+ #include <linux/hdmi.h>
+ #include <linux/i2c.h>
+ #include <linux/slab.h>
+@@ -38,6 +39,7 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_frl_dfm_helper.h>
+ #include <drm/intel_lpe_audio.h>
+ 
+ #include "i915_debugfs.h"
+@@ -2150,13 +2152,163 @@ static int intel_hdmi_compute_tmds_clock(struct intel_encoder *encoder,
+ 	return 0;
+ }
+ 
++static u32
++get_drm_color_format(enum intel_output_format output_format)
++{
++	switch (output_format) {
++	case INTEL_OUTPUT_FORMAT_RGB:
++		return DRM_COLOR_FORMAT_RGB444;
++	case INTEL_OUTPUT_FORMAT_YCBCR420:
++		return DRM_COLOR_FORMAT_YCRCB420;
++	case INTEL_OUTPUT_FORMAT_YCBCR444:
++		return DRM_COLOR_FORMAT_YCRCB444;
++	default:
++		return DRM_COLOR_FORMAT_RGB444;
++	}
++}
++
++static void
++compute_frl_mn(struct intel_crtc_state *crtc_state, u32 ftb_avg_k)
++{
++	u64 ftb_avg, div_18_clk, gcd_val;
++
++	ftb_avg = ftb_avg_k * 1000;
++	div_18_clk = mult_frac(1000000000, crtc_state->frl.required_rate, 18);
++	gcd_val = gcd(ftb_avg, div_18_clk);
++
++	crtc_state->frl.link_m_ext = DIV_ROUND_UP_ULL(ftb_avg, gcd_val);
++	crtc_state->frl.link_n_ext = DIV_ROUND_UP_ULL(div_18_clk, gcd_val);
++
++	/* Frl div 18 stored in Khz */
++	crtc_state->frl.div18 = DIV_ROUND_UP_ULL(div_18_clk, 1000);
++}
++
++static int
++intel_hdmi_compute_frl_config(struct intel_encoder *encoder,
++			      struct intel_crtc_state *pipe_config)
++{
++	int rate[] =  {48, 40, 32, 24, 18, 9};
++	int audio_freq_hz[] = {192000, 176400, 96000, 88200, 48000};
++	struct drm_hdmi_frl_dfm frl_dfm = {0};
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
++	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++	int max_rate = intel_hdmi->max_frl_rate;
++	struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
++	bool can_support_frl_mode = false;
++	int i, j;
++
++	/* Fill mode related input params */
++	frl_dfm.config.pixel_clock_nominal_khz = adjusted_mode->clock;
++	frl_dfm.config.hactive = adjusted_mode->hdisplay;
++	frl_dfm.config.hblank = adjusted_mode->htotal - adjusted_mode->hdisplay;
++
++	/* Fill color related input params */
++	frl_dfm.config.bpc = pipe_config->pipe_bpp / 3;
++	frl_dfm.config.color_format = get_drm_color_format(pipe_config->output_format);
++
++	/*
++	 * Check if the resolution can be supported in FRL mode
++	 * We try with maximum FRL rate and check if Data flow metring
++	 * requirements are met, otherwise a lower rate is tried.
++	 */
++	for (i = 0; i < ARRAY_SIZE(rate); i++) {
++		if (rate[i] > max_rate)
++			continue;
++		/* Fill the bw related input parameters */
++		frl_dfm.config.lanes = rate[i] < 24 ? 3 : 4;
++		frl_dfm.config.bit_rate_kbps = (rate[i] * 1000000) / frl_dfm.config.lanes;
++		for (j = 0; j < ARRAY_SIZE(audio_freq_hz); j++) {
++			/* Fill the audio related input params */
++			frl_dfm.config.audio_hz = audio_freq_hz[j];
++			frl_dfm.config.audio_channels = 8; /*Support 8 channel audio */
++
++			if (drm_frl_dfm_nondsc_requirement_met(&frl_dfm)) {
++				can_support_frl_mode = true;
++				break;
++			}
++		}
++
++		if (can_support_frl_mode)
++			break;
++	}
++
++	if (!can_support_frl_mode)
++		goto no_frl_support;
++
++	/* Fill frl capacity output params */
++	pipe_config->frl.required_lanes = frl_dfm.config.lanes;
++	pipe_config->frl.required_rate = frl_dfm.config.bit_rate_kbps / 1000000;
++	pipe_config->frl.tb_borrowed = frl_dfm.params.tb_borrowed;
++	pipe_config->frl.tb_actual = frl_dfm.params.tb_borrowed / 2;
++	drm_dbg_kms(&dev_priv->drm, "FRL DFM config: tb_borrowed = %d, tb_actual = %d\n",
++		    pipe_config->frl.tb_borrowed, pipe_config->frl.tb_actual);
++
++	/*
++	 * If no time borrowing required to transmit the active region,
++	 * min tb threshold is set to default of 492 tribytes.
++	 * Otherwise min tb threshold is 492 - (tb Borrowed / 2)
++	 */
++	if (frl_dfm.params.tb_borrowed && (frl_dfm.params.tb_borrowed / 2) <= 492)
++		pipe_config->frl.tb_threshold_min = 492 - (frl_dfm.params.tb_borrowed / 2);
++	else
++		pipe_config->frl.tb_threshold_min = 492;
++
++	compute_frl_mn(pipe_config, frl_dfm.params.ftb_avg_k);
++	drm_dbg_kms(&dev_priv->drm, "FRL Clock: link_m = %dHz, link_n = %dHz, div18 = %dKHz\n",
++		    pipe_config->frl.link_m_ext, pipe_config->frl.link_n_ext,
++		    pipe_config->frl.div18);
++
++	/*
++	 * TODO
++	 * 1. Calculate condition for Reseource based scheduling enable.
++	 * Disabling resource based scheduling for now.
++	 * 2. Active Character buffer threshold depends on cd clock bw.
++	 * Setting default value of 0.
++	 */
++	pipe_config->frl.rsrc_sched_en = false;
++	pipe_config->frl.active_char_buf_threshold = 0;
++
++	return 0;
++
++no_frl_support:
++	memset(&pipe_config->frl, 0, sizeof(pipe_config->frl));
++
++	return -EINVAL;
++}
++
++static int
++intel_hdmi_compute_frl_clock(struct intel_encoder *encoder,
++			     struct intel_crtc_state *crtc_state)
++{
++	int bpc;
++	int max_bpc = max(crtc_state->pipe_bpp / 3 , 8);
++
++	for (bpc = max_bpc; bpc >= 8; bpc -= 2) {
++		int ret;
++
++		if (!hdmi_bpc_possible(crtc_state, bpc))
++			continue;
++
++		crtc_state->pipe_bpp = bpc * 3;
++
++		ret = intel_hdmi_compute_frl_config(encoder, crtc_state);
++		if (!ret) {
++			/* Port clock is div18 clock rounded to 10 Khz */
++			crtc_state->port_clock = roundup(crtc_state->frl.div18, 10);
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
+ static int intel_hdmi_compute_clock(struct intel_encoder *encoder,
+ 				    struct intel_crtc_state *crtc_state,
+ 				    bool respect_downstream_limits,
+ 				    bool enable_frl)
+ {
+ 	if (enable_frl)
+-		return -EINVAL;
++		return intel_hdmi_compute_frl_clock(encoder, crtc_state);
+ 
+ 	return intel_hdmi_compute_tmds_clock(encoder, crtc_state, respect_downstream_limits);
+ }
+-- 
+2.25.1
+

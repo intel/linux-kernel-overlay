@@ -1,0 +1,191 @@
+From bb19fa077db04efc3e3b5295974f1fa8b9ab3a35 Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <wenjing.liu@amd.com>
+Date: Mon, 5 Dec 2022 18:05:46 -0500
+Subject: [PATCH 0411/1096] drm/amd/display: move dccg programming from link
+ hwss hpo dp to hwss
+
+[why] dccg clock programming shouldn't be part of link hwss programming
+sequence. The scope of link hwss is limited to encoder and phy
+programming.
+
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Wenjing Liu <wenjing.liu@amd.com>
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../display/dc/dce110/dce110_hw_sequencer.c   | 13 +++++
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    | 50 +++++++++++++++++++
+ .../amd/display/dc/link/link_hwss_hpo_dp.c    | 37 --------------
+ 3 files changed, 63 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index 913a1fe6b3da..16e3b079fc56 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -1142,6 +1142,10 @@ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+ 	struct dc_link *link = stream->link;
+ 	struct dc *dc = pipe_ctx->stream->ctx->dc;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
++	struct dccg *dccg = dc->res_pool->dccg;
++	struct timing_generator *tg = pipe_ctx->stream_res.tg;
++	struct dtbclk_dto_params dto_params = {0};
++	int dp_hpo_inst;
+ 
+ 	if (dc_is_hdmi_tmds_signal(pipe_ctx->stream->signal)) {
+ 		pipe_ctx->stream_res.stream_enc->funcs->stop_hdmi_info_packets(
+@@ -1161,6 +1165,15 @@ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+ 
+ 	link_hwss->reset_stream_encoder(pipe_ctx);
+ 
++	if (is_dp_128b_132b_signal(pipe_ctx)) {
++		dto_params.otg_inst = tg->inst;
++		dto_params.timing = &pipe_ctx->stream->timing;
++		dp_hpo_inst = pipe_ctx->stream_res.hpo_dp_stream_enc->inst;
++		dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
++		dccg->funcs->disable_symclk32_se(dccg, dp_hpo_inst);
++		dccg->funcs->set_dpstreamclk(dccg, REFCLK, tg->inst, dp_hpo_inst);
++	}
++
+ 	if (is_dp_128b_132b_signal(pipe_ctx)) {
+ 		/* TODO: This looks like a bug to me as we are disabling HPO IO when
+ 		 * we are just disabling a single HPO stream. Shouldn't we disable HPO
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index 366ba05cf8ef..c81b70c7f3f9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -2639,6 +2639,37 @@ void dcn20_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	hubp->mpcc_id = mpcc_id;
+ }
+ 
++static enum phyd32clk_clock_source get_phyd32clk_src(struct dc_link *link)
++{
++	switch (link->link_enc->transmitter) {
++	case TRANSMITTER_UNIPHY_A:
++		return PHYD32CLKA;
++	case TRANSMITTER_UNIPHY_B:
++		return PHYD32CLKB;
++	case TRANSMITTER_UNIPHY_C:
++		return PHYD32CLKC;
++	case TRANSMITTER_UNIPHY_D:
++		return PHYD32CLKD;
++	case TRANSMITTER_UNIPHY_E:
++		return PHYD32CLKE;
++	default:
++		return PHYD32CLKA;
++	}
++}
++
++static int get_odm_segment_count(struct pipe_ctx *pipe_ctx)
++{
++	struct pipe_ctx *odm_pipe = pipe_ctx->next_odm_pipe;
++	int count = 1;
++
++	while (odm_pipe != NULL) {
++		count++;
++		odm_pipe = odm_pipe->next_odm_pipe;
++	}
++
++	return count;
++}
++
+ void dcn20_enable_stream(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum dc_lane_count lane_count =
+@@ -2652,12 +2683,31 @@ void dcn20_enable_stream(struct pipe_ctx *pipe_ctx)
+ 	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
+ 	struct dc *dc = pipe_ctx->stream->ctx->dc;
++	struct dtbclk_dto_params dto_params = {0};
++	struct dccg *dccg = dc->res_pool->dccg;
++	enum phyd32clk_clock_source phyd32clk;
++	int dp_hpo_inst;
+ 
+ 	if (is_dp_128b_132b_signal(pipe_ctx)) {
+ 		if (dc->hwseq->funcs.setup_hpo_hw_control)
+ 			dc->hwseq->funcs.setup_hpo_hw_control(dc->hwseq, true);
+ 	}
+ 
++	if (is_dp_128b_132b_signal(pipe_ctx)) {
++		dp_hpo_inst = pipe_ctx->stream_res.hpo_dp_stream_enc->inst;
++		dccg->funcs->set_dpstreamclk(dccg, DTBCLK0, tg->inst, dp_hpo_inst);
++
++		phyd32clk = get_phyd32clk_src(link);
++		dccg->funcs->enable_symclk32_se(dccg, dp_hpo_inst, phyd32clk);
++
++		dto_params.otg_inst = tg->inst;
++		dto_params.pixclk_khz = pipe_ctx->stream->timing.pix_clk_100hz / 10;
++		dto_params.num_odm_segments = get_odm_segment_count(pipe_ctx);
++		dto_params.timing = &pipe_ctx->stream->timing;
++		dto_params.ref_dtbclk_khz = dc->clk_mgr->funcs->get_dtb_ref_clk_frequency(dc->clk_mgr);
++		dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
++	}
++
+ 	link_hwss->setup_stream_encoder(pipe_ctx);
+ 
+ 	if (pipe_ctx->plane_state && pipe_ctx->plane_state->flip_immediate != 1) {
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c b/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
+index 2f46e1ac4ce0..164d631e8809 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
+@@ -87,57 +87,20 @@ static void set_hpo_dp_hblank_min_symbol_width(struct pipe_ctx *pipe_ctx,
+ 			hblank_min_symbol_width);
+ }
+ 
+-static int get_odm_segment_count(struct pipe_ctx *pipe_ctx)
+-{
+-	struct pipe_ctx *odm_pipe = pipe_ctx->next_odm_pipe;
+-	int count = 1;
+-
+-	while (odm_pipe != NULL) {
+-		count++;
+-		odm_pipe = odm_pipe->next_odm_pipe;
+-	}
+-
+-	return count;
+-}
+-
+ static void setup_hpo_dp_stream_encoder(struct pipe_ctx *pipe_ctx)
+ {
+-	struct dc *dc = pipe_ctx->stream->ctx->dc;
+ 	struct hpo_dp_stream_encoder *stream_enc = pipe_ctx->stream_res.hpo_dp_stream_enc;
+ 	struct hpo_dp_link_encoder *link_enc = pipe_ctx->link_res.hpo_dp_link_enc;
+-	struct dccg *dccg = dc->res_pool->dccg;
+-	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+-	struct dtbclk_dto_params dto_params = {0};
+-	enum phyd32clk_clock_source phyd32clk = get_phyd32clk_src(pipe_ctx->stream->link);
+ 
+-	dto_params.otg_inst = tg->inst;
+-	dto_params.pixclk_khz = pipe_ctx->stream->timing.pix_clk_100hz / 10;
+-	dto_params.num_odm_segments = get_odm_segment_count(pipe_ctx);
+-	dto_params.timing = &pipe_ctx->stream->timing;
+-	dto_params.ref_dtbclk_khz = dc->clk_mgr->funcs->get_dtb_ref_clk_frequency(dc->clk_mgr);
+-
+-	dccg->funcs->set_dpstreamclk(dccg, DTBCLK0, tg->inst, stream_enc->inst);
+-	dccg->funcs->enable_symclk32_se(dccg, stream_enc->inst, phyd32clk);
+-	dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
+ 	stream_enc->funcs->enable_stream(stream_enc);
+ 	stream_enc->funcs->map_stream_to_link(stream_enc, stream_enc->inst, link_enc->inst);
+ }
+ 
+ static void reset_hpo_dp_stream_encoder(struct pipe_ctx *pipe_ctx)
+ {
+-	struct dc *dc = pipe_ctx->stream->ctx->dc;
+ 	struct hpo_dp_stream_encoder *stream_enc = pipe_ctx->stream_res.hpo_dp_stream_enc;
+-	struct dccg *dccg = dc->res_pool->dccg;
+-	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+-	struct dtbclk_dto_params dto_params = {0};
+-
+-	dto_params.otg_inst = tg->inst;
+-	dto_params.timing = &pipe_ctx->stream->timing;
+ 
+ 	stream_enc->funcs->disable(stream_enc);
+-	dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
+-	dccg->funcs->disable_symclk32_se(dccg, stream_enc->inst);
+-	dccg->funcs->set_dpstreamclk(dccg, REFCLK, tg->inst, stream_enc->inst);
+ }
+ 
+ static void setup_hpo_dp_stream_attribute(struct pipe_ctx *pipe_ctx)
+-- 
+2.25.1
+

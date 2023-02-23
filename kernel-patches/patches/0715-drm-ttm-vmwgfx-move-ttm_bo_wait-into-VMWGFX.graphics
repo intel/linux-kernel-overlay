@@ -1,0 +1,196 @@
+From 69dda044bc2093bb7b47578b469d1b7fa354ade9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 9 May 2022 13:26:49 +0200
+Subject: [PATCH 0715/1096] drm/ttm/vmwgfx: move ttm_bo_wait into VMWGFX
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Not used anymore by other drivers or TTM itself.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Zack Rusin <zackr@vmware.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221125102137.1801-9-christian.koenig@amd.com
+---
+ drivers/gpu/drm/ttm/ttm_bo.c        | 44 +++++++++++------------------
+ drivers/gpu/drm/ttm/ttm_bo_util.c   | 19 ++++++++-----
+ drivers/gpu/drm/vmwgfx/ttm_object.h | 25 ++++++++++++++++
+ include/drm/ttm/ttm_bo.h            |  1 -
+ 4 files changed, 53 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index cd266a067773..326a3d13a829 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1087,47 +1087,35 @@ void ttm_bo_unmap_virtual(struct ttm_buffer_object *bo)
+ EXPORT_SYMBOL(ttm_bo_unmap_virtual);
+ 
+ /**
+- * ttm_bo_wait - wait for buffer idle.
++ * ttm_bo_wait_ctx - wait for buffer idle.
+  *
+  * @bo:  The buffer object.
+- * @interruptible:  Use interruptible wait.
+- * @no_wait:  Return immediately if buffer is busy.
++ * @ctx: defines how to wait
+  *
+- * This function must be called with the bo::mutex held, and makes
+- * sure any previous rendering to the buffer is completed.
+- * Note: It might be necessary to block validations before the
+- * wait by reserving the buffer.
+- * Returns -EBUSY if no_wait is true and the buffer is busy.
+- * Returns -ERESTARTSYS if interrupted by a signal.
++ * Waits for the buffer to be idle. Used timeout depends on the context.
++ * Returns -EBUSY if wait timed outt, -ERESTARTSYS if interrupted by a signal or
++ * zero on success.
+  */
+-int ttm_bo_wait(struct ttm_buffer_object *bo,
+-		bool interruptible, bool no_wait)
++int ttm_bo_wait_ctx(struct ttm_buffer_object *bo, struct ttm_operation_ctx *ctx)
+ {
+-	long timeout = 15 * HZ;
++	long ret;
+ 
+-	if (no_wait) {
+-		if (dma_resv_test_signaled(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP))
++	if (ctx->no_wait_gpu) {
++		if (dma_resv_test_signaled(bo->base.resv,
++					   DMA_RESV_USAGE_BOOKKEEP))
+ 			return 0;
+ 		else
+ 			return -EBUSY;
+ 	}
+ 
+-	timeout = dma_resv_wait_timeout(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP,
+-					interruptible, timeout);
+-	if (timeout < 0)
+-		return timeout;
+-
+-	if (timeout == 0)
++	ret = dma_resv_wait_timeout(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP,
++				    ctx->interruptible, 15 * HZ);
++	if (unlikely(ret < 0))
++		return ret;
++	if (unlikely(ret == 0))
+ 		return -EBUSY;
+-
+ 	return 0;
+ }
+-EXPORT_SYMBOL(ttm_bo_wait);
+-
+-int ttm_bo_wait_ctx(struct ttm_buffer_object *bo, struct ttm_operation_ctx *ctx)
+-{
+-	return ttm_bo_wait(bo, ctx->interruptible, ctx->no_wait_gpu);
+-}
+ EXPORT_SYMBOL(ttm_bo_wait_ctx);
+ 
+ int ttm_bo_swapout(struct ttm_buffer_object *bo, struct ttm_operation_ctx *ctx,
+@@ -1135,7 +1123,7 @@ int ttm_bo_swapout(struct ttm_buffer_object *bo, struct ttm_operation_ctx *ctx,
+ {
+ 	struct ttm_place place;
+ 	bool locked;
+-	int ret;
++	long ret;
+ 
+ 	/*
+ 	 * While the bo may already reside in SYSTEM placement, set
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index 03ad8bc00fca..7635d7d6b13b 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -548,9 +548,13 @@ EXPORT_SYMBOL(ttm_bo_vunmap);
+ static int ttm_bo_wait_free_node(struct ttm_buffer_object *bo,
+ 				 bool dst_use_tt)
+ {
+-	int ret;
+-	ret = ttm_bo_wait(bo, false, false);
+-	if (ret)
++	long ret;
++
++	ret = dma_resv_wait_timeout(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP,
++				    false, 15 * HZ);
++	if (ret == 0)
++		return -EBUSY;
++	if (ret < 0)
+ 		return ret;
+ 
+ 	if (!dst_use_tt)
+@@ -711,8 +715,7 @@ int ttm_bo_pipeline_gutting(struct ttm_buffer_object *bo)
+ 		return ret;
+ 
+ 	/* If already idle, no need for ghost object dance. */
+-	ret = ttm_bo_wait(bo, false, true);
+-	if (ret != -EBUSY) {
++	if (dma_resv_test_signaled(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP)) {
+ 		if (!bo->ttm) {
+ 			/* See comment below about clearing. */
+ 			ret = ttm_tt_create(bo, true);
+@@ -749,8 +752,10 @@ int ttm_bo_pipeline_gutting(struct ttm_buffer_object *bo)
+ 
+ 	ret = dma_resv_copy_fences(&ghost->base._resv, bo->base.resv);
+ 	/* Last resort, wait for the BO to be idle when we are OOM */
+-	if (ret)
+-		ttm_bo_wait(bo, false, false);
++	if (ret) {
++		dma_resv_wait_timeout(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP,
++				      false, MAX_SCHEDULE_TIMEOUT);
++	}
+ 
+ 	dma_resv_unlock(&ghost->base._resv);
+ 	ttm_bo_put(ghost);
+diff --git a/drivers/gpu/drm/vmwgfx/ttm_object.h b/drivers/gpu/drm/vmwgfx/ttm_object.h
+index 8098a3846bae..95a9679f9d39 100644
+--- a/drivers/gpu/drm/vmwgfx/ttm_object.h
++++ b/drivers/gpu/drm/vmwgfx/ttm_object.h
+@@ -42,6 +42,8 @@
+ #include <linux/list.h>
+ #include <linux/rcupdate.h>
+ 
++#include <drm/ttm/ttm_bo.h>
++
+ /**
+  * enum ttm_object_type
+  *
+@@ -307,4 +309,27 @@ extern int ttm_prime_handle_to_fd(struct ttm_object_file *tfile,
+ #define ttm_prime_object_kfree(__obj, __prime)		\
+ 	kfree_rcu(__obj, __prime.base.rhead)
+ 
++struct ttm_base_object *
++ttm_base_object_noref_lookup(struct ttm_object_file *tfile, uint64_t key);
++
++/**
++ * ttm_base_object_noref_release - release a base object pointer looked up
++ * without reference
++ *
++ * Releases a base object pointer looked up with ttm_base_object_noref_lookup().
++ */
++static inline void ttm_base_object_noref_release(void)
++{
++	__acquire(RCU);
++	rcu_read_unlock();
++}
++
++static inline int ttm_bo_wait(struct ttm_buffer_object *bo, bool intr,
++			      bool no_wait)
++{
++	struct ttm_operation_ctx ctx = { intr, no_wait };
++
++	return ttm_bo_wait_ctx(bo, &ctx);
++}
++
+ #endif
+diff --git a/include/drm/ttm/ttm_bo.h b/include/drm/ttm/ttm_bo.h
+index d87232472435..8b113c384236 100644
+--- a/include/drm/ttm/ttm_bo.h
++++ b/include/drm/ttm/ttm_bo.h
+@@ -347,7 +347,6 @@ static inline void *ttm_kmap_obj_virtual(struct ttm_bo_kmap_obj *map,
+ 	return map->virtual;
+ }
+ 
+-int ttm_bo_wait(struct ttm_buffer_object *bo, bool interruptible, bool no_wait);
+ int ttm_bo_wait_ctx(struct ttm_buffer_object *bo,
+ 		    struct ttm_operation_ctx *ctx);
+ int ttm_bo_validate(struct ttm_buffer_object *bo,
+-- 
+2.25.1
+

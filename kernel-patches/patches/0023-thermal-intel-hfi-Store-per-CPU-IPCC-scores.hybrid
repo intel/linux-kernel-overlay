@@ -1,0 +1,118 @@
+From c6d8c5299022b20d764392e65710956ac3619469 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Mon, 14 Nov 2022 08:23:41 -0800
+Subject: [PATCH 23/34] thermal: intel: hfi: Store per-CPU IPCC scores
+
+The scheduler reads the IPCC scores when balancing load. These reads can
+be quite frequent. Hardware can also update the HFI table frequently.
+Concurrent access may cause a lot of lock contention. It gets worse as the
+number of CPUs increases.
+
+Instead, create separate per-CPU IPCC scores that the scheduler can read
+without the HFI table lock.
+
+Cc: Ben Segall <bsegall@google.com>
+Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Ionela Voinescu <ionela.voinescu@arm.com>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Lukasz Luba <lukasz.luba@arm.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Tim C. Chen <tim.c.chen@intel.com>
+Cc: Valentin Schneider <vschneid@redhat.com>
+Cc: x86@kernel.org
+Cc: linux-pm@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ drivers/thermal/intel/intel_hfi.c | 46 +++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/drivers/thermal/intel/intel_hfi.c b/drivers/thermal/intel/intel_hfi.c
+index 2527ae3836c7..b06021828892 100644
+--- a/drivers/thermal/intel/intel_hfi.c
++++ b/drivers/thermal/intel/intel_hfi.c
+@@ -29,6 +29,7 @@
+ #include <linux/kernel.h>
+ #include <linux/math.h>
+ #include <linux/mutex.h>
++#include <linux/percpu.h>
+ #include <linux/percpu-defs.h>
+ #include <linux/printk.h>
+ #include <linux/processor.h>
+@@ -170,6 +171,43 @@ static struct workqueue_struct *hfi_updates_wq;
+ #define HFI_UPDATE_INTERVAL		HZ
+ #define HFI_MAX_THERM_NOTIFY_COUNT	16
+ 
++#ifdef CONFIG_IPC_CLASSES
++static int __percpu *hfi_ipcc_scores;
++
++static int alloc_hfi_ipcc_scores(void)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_ITD))
++		return 0;
++
++	hfi_ipcc_scores = __alloc_percpu(sizeof(*hfi_ipcc_scores) *
++					 hfi_features.nr_classes,
++					 sizeof(*hfi_ipcc_scores));
++
++	return !hfi_ipcc_scores;
++}
++
++static void set_hfi_ipcc_score(void *caps, int cpu)
++{
++	int i, *hfi_class;
++
++	if (!cpu_feature_enabled(X86_FEATURE_ITD))
++		return;
++
++	hfi_class = per_cpu_ptr(hfi_ipcc_scores, cpu);
++
++	for (i = 0;  i < hfi_features.nr_classes; i++) {
++		struct hfi_cpu_data *class_caps;
++
++		class_caps = caps + i * hfi_features.class_stride;
++		WRITE_ONCE(hfi_class[i], class_caps->perf_cap);
++	}
++}
++
++#else
++static int alloc_hfi_ipcc_scores(void) { return 0; }
++static void set_hfi_ipcc_score(void *caps, int cpu) { }
++#endif /* CONFIG_IPC_CLASSES */
++
+ static void get_hfi_caps(struct hfi_instance *hfi_instance,
+ 			 struct thermal_genl_cpu_caps *cpu_caps)
+ {
+@@ -192,6 +230,8 @@ static void get_hfi_caps(struct hfi_instance *hfi_instance,
+ 		cpu_caps[i].efficiency = caps->ee_cap << 2;
+ 
+ 		++i;
++
++		set_hfi_ipcc_score(caps, cpu);
+ 	}
+ 	raw_spin_unlock_irq(&hfi_instance->table_lock);
+ }
+@@ -580,8 +620,14 @@ void __init intel_hfi_init(void)
+ 	if (!hfi_updates_wq)
+ 		goto err_nomem;
+ 
++	if (alloc_hfi_ipcc_scores())
++		goto err_ipcc;
++
+ 	return;
+ 
++err_ipcc:
++	destroy_workqueue(hfi_updates_wq);
++
+ err_nomem:
+ 	for (j = 0; j < i; ++j) {
+ 		hfi_instance = &hfi_instances[j];
+-- 
+2.25.1
+

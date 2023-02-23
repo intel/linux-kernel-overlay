@@ -1,0 +1,777 @@
+From f56ce6aca8510072c5ca93a84bb7f044aa7ba4ec Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Mon, 29 Nov 2021 13:55:14 -0800
+Subject: [PATCH 1033/1096] NOT_UPSTREAM: drm/i915/huc: load HuC via non-POR
+ GSC engine flow
+
+The initial plan for HuC on MTL was to use the same flow as DG2 (i.e.
+HuC loading and auth done via a PXP command submitted to the GSC).
+However, this has proven non-viable for MTL, so there is a fuse update
+coming to switch to a new flow (loading via DMA + auth via GSC).
+
+The plan is to deploy a PCODE update to flip the fuse on existing HW,
+but until that's ready we need to keep support for the old flow. We're
+never going to upstream this, hence the NOT_UPSTREAM tag.
+
+We can re-use the DG2 code for the messaging, but since we now communicate
+directly with the GSC we need to wrap it using the appropriate headers,
+which were previously handled by the mei driver.
+
+To support this, the PXP code has been updated with the ability to send
+commands via the GSC engine instead of mei_pxp. Note that the expectation
+is that the other PXP changes for MTL will require something similar, so
+that part of the code might be moved to another patch that will stick around.
+
+v2: HuC authentication for MTL re-uses the stream-cmd objects
+    that was part of the pxp-component initialization for pre-MTL
+    hardware. With PXPs GSC-CS backend coming soon, its initialized
+    as mutually exclusive to PXPs tee-pxp-component backend so
+    lets ensure we still allocate the stream-cmd objects as
+    a commonly required resource.
+     1. rename the stream-cmd allocation and freeing functions
+        as intel_pxp_alloc_common_stream_cmd_objs and
+        intel_pxp_free_common_stream_cmd_objs
+     2. export those functions from intel_pxp_tee.h and ensure that
+        GSC-CS backend calls this allocation and freeing at init/fini.
+
+v3: fix tee_mutex init location
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+---
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.c  |  61 ++++++++-
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.h  |   3 +
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c  |  16 +++
+ drivers/gpu/drm/i915/gt/uc/intel_huc.c     |   7 +-
+ drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c  |  19 ++-
+ drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c   |  30 +++--
+ drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h   |   2 +
+ drivers/gpu/drm/i915/pxp/intel_pxp.c       |  16 ++-
+ drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c |   2 -
+ drivers/gpu/drm/i915/pxp/intel_pxp_huc.c   |  22 ++--
+ drivers/gpu/drm/i915/pxp/intel_pxp_huc.h   |   4 +-
+ drivers/gpu/drm/i915/pxp/intel_pxp_tee.c   | 137 ++++++++++++++++-----
+ drivers/gpu/drm/i915/pxp/intel_pxp_tee.h   |   7 ++
+ drivers/gpu/drm/i915/pxp/intel_pxp_types.h |   2 +
+ 14 files changed, 270 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.c
+index ab7aa1bb485c..69447d24f8f4 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.c
+@@ -30,6 +30,35 @@ bool intel_gsc_uc_fw_init_done(struct intel_gsc_uc *gsc)
+ 	return fw_status & GSC_FW_INIT_COMPLETE_BIT;
+ }
+ 
++struct gsc_heci_pkt {
++	u64 addr_in;
++	u32 size_in;
++	u64 addr_out;
++	u32 size_out;
++};
++
++static int emit_gsc_heci_pkt(struct i915_request *rq, struct gsc_heci_pkt *pkt)
++{
++	u32* cs;
++
++	cs = intel_ring_begin(rq, 8);
++	if (IS_ERR(cs))
++		return PTR_ERR(cs);
++
++	*cs++ = GSC_HECI_CMD_PKT;
++	*cs++ = lower_32_bits(pkt->addr_in);
++	*cs++ = upper_32_bits(pkt->addr_in);
++	*cs++ = pkt->size_in;
++	*cs++ = lower_32_bits(pkt->addr_out);
++	*cs++ = upper_32_bits(pkt->addr_out);
++	*cs++ = pkt->size_out;
++	*cs++ = 0;
++
++	intel_ring_advance(rq, cs);
++
++	return 0;
++}
++
+ static int emit_gsc_fw_load(struct i915_request *rq, struct intel_gsc_uc *gsc)
+ {
+ 	u32 offset = i915_ggtt_offset(gsc->local);
+@@ -49,7 +78,12 @@ static int emit_gsc_fw_load(struct i915_request *rq, struct intel_gsc_uc *gsc)
+ 	return 0;
+ }
+ 
+-static int gsc_fw_load(struct intel_gsc_uc *gsc)
++/*
++ * Our submissions to GSC are going to be either a FW load or an heci pkt, but
++ * all the request emission logic is the same so we can use a common func and
++ * just add the correct cmd
++ */
++static int submit_to_gsc_fw(struct intel_gsc_uc *gsc, struct gsc_heci_pkt *pkt)
+ {
+ 	struct intel_context *ce = gsc->ce;
+ 	struct i915_request *rq;
+@@ -68,7 +102,10 @@ static int gsc_fw_load(struct intel_gsc_uc *gsc)
+ 			goto out_rq;
+ 	}
+ 
+-	err = emit_gsc_fw_load(rq, gsc);
++	if (pkt)
++		err = emit_gsc_heci_pkt(rq, pkt);
++	else
++		err = emit_gsc_fw_load(rq, gsc);
+ 	if (err)
+ 		goto out_rq;
+ 
+@@ -89,12 +126,30 @@ static int gsc_fw_load(struct intel_gsc_uc *gsc)
+ 
+ 	if (err)
+ 		drm_err(&gsc_uc_to_gt(gsc)->i915->drm,
+-			"Request submission for GSC load failed (%d)\n",
++			"Request submission for GSC failed (%d)\n",
+ 			err);
+ 
+ 	return err;
+ }
+ 
++static int gsc_fw_load(struct intel_gsc_uc *gsc)
++{
++	return submit_to_gsc_fw(gsc, NULL);
++}
++
++int intel_gsc_fw_heci_send(struct intel_gsc_uc *gsc, u64 addr_in, u32 size_in,
++			   u64 addr_out, u32 size_out)
++{
++	struct gsc_heci_pkt pkt = {
++		.addr_in = addr_in,
++		.size_in = size_in,
++		.addr_out = addr_out,
++		.size_out = size_out
++	};
++
++	return submit_to_gsc_fw(gsc, &pkt);
++}
++
+ static int gsc_fw_load_prepare(struct intel_gsc_uc *gsc)
+ {
+ 	struct intel_gt *gt = gsc_uc_to_gt(gsc);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.h b/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.h
+index f4c1106bb2a9..519e7c4b73e3 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_fw.h
+@@ -14,4 +14,7 @@ struct intel_uncore;
+ int intel_gsc_uc_fw_upload(struct intel_gsc_uc *gsc);
+ bool intel_gsc_uc_fw_init_done(struct intel_gsc_uc *gsc);
+ 
++int intel_gsc_fw_heci_send(struct intel_gsc_uc *gsc, u64 addr_in, u32 size_in,
++			   u64 addr_out, u32 size_out);
++
+ #endif
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+index 8693c5ecc4e6..013e6ab782b0 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+@@ -6,6 +6,7 @@
+ #include <linux/types.h>
+ 
+ #include "gt/intel_gt.h"
++#include "pxp/intel_pxp_types.h"
+ #include "intel_gsc_uc.h"
+ #include "intel_gsc_fw.h"
+ #include "i915_drv.h"
+@@ -37,6 +38,21 @@ static void gsc_work(struct work_struct *work)
+ 			actions &= ~GSC_ACTION_FW_LOAD;
+ 		else if (ret)
+ 			goto out_put;
++
++		if (!ret && intel_uc_uses_huc(&gt->uc)) {
++			/*
++			 * This is an async work, so we need to make sure PXP
++			 * init is complete. Note that this temporary code that
++			 * is going to be updated/removed when the new POR HuC
++			 * loading flow is implemented, so to keep things simple
++			 * we just wait on the stream_cmd (which is what we
++			 * need) to be allocated, instead of adding a more
++			 * proper sync point for PXP init complete.
++			 */
++			ret = wait_for(gt->i915->pxp && gt->i915->pxp->stream_cmd.vma, 500);
++			if (!ret)
++				intel_huc_fw_load_and_auth_via_gsc(&gt->uc.huc);
++		}
+ 	}
+ 
+ 	if (actions & (GSC_ACTION_FW_LOAD | GSC_ACTION_SW_PROXY)) {
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc.c b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+index 410905da8e97..23f31ad0449d 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+@@ -313,9 +313,9 @@ static int check_huc_loading_mode(struct intel_huc *huc)
+ 		return -ENOEXEC;
+ 	}
+ 
+-	/* make sure we can access the GSC via the mei driver if we need it */
++	/* make sure we can access the GSC if we need it */
+ 	if (!(IS_ENABLED(CONFIG_INTEL_MEI_PXP) && IS_ENABLED(CONFIG_INTEL_MEI_GSC)) &&
+-	    fw_needs_gsc) {
++	    !HAS_ENGINE(gt, GSC0) && fw_needs_gsc) {
+ 		drm_info(&gt->i915->drm,
+ 			 "Can't load HuC due to missing MEI modules\n");
+ 		return -EIO;
+@@ -328,7 +328,8 @@ static int check_huc_loading_mode(struct intel_huc *huc)
+ 
+ int intel_huc_init(struct intel_huc *huc)
+ {
+-	struct drm_i915_private *i915 = huc_to_gt(huc)->i915;
++	struct intel_gt *gt = huc_to_gt(huc);
++	struct drm_i915_private *i915 = gt->i915;
+ 	int err;
+ 
+ 	err = check_huc_loading_mode(huc);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+index 534b0aa43316..a8e332973182 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+@@ -12,6 +12,7 @@
+ 
+ int intel_huc_fw_load_and_auth_via_gsc(struct intel_huc *huc)
+ {
++	u64 address;
+ 	int ret;
+ 
+ 	if (!intel_huc_is_loaded_by_gsc(huc))
+@@ -32,13 +33,25 @@ int intel_huc_fw_load_and_auth_via_gsc(struct intel_huc *huc)
+ 
+ 	GEM_WARN_ON(intel_uc_fw_is_loaded(&huc->fw));
+ 
+-	ret = intel_pxp_huc_load_and_auth(huc_to_gt(huc)->i915->pxp);
++	if (intel_uc_supports_gsc_uc(&huc_to_gt(huc)->uc)) {
++		intel_uc_fw_bind_ggtt(&huc->fw);
++		address = huc->fw.dummy.start;
++	} else {
++		address = i915_gem_object_get_dma_address(huc->fw.obj, 0);
++	}
++
++	ret = intel_pxp_huc_load_and_auth(huc_to_gt(huc)->i915->pxp, address);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	intel_uc_fw_change_status(&huc->fw, INTEL_UC_FIRMWARE_TRANSFERRED);
+ 
+-	return intel_huc_wait_for_auth_complete(huc);
++	ret = intel_huc_wait_for_auth_complete(huc);
++
++out:
++	if (intel_uc_supports_gsc_uc(&huc_to_gt(huc)->uc))
++		intel_uc_fw_unbind_ggtt(&huc->fw);
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+index ce5814e4f4a8..7f9a05e4ba9c 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+@@ -101,7 +101,8 @@ void intel_uc_fw_change_status(struct intel_uc_fw *uc_fw,
+ 	fw_def(BROXTON,      0, guc_mmp(bxt,  70, 1, 1)) \
+ 	fw_def(SKYLAKE,      0, guc_mmp(skl,  70, 1, 1))
+ 
+-#define INTEL_HUC_FIRMWARE_DEFS(fw_def, huc_raw, huc_mmp, huc_gsc) \
++#define INTEL_HUC_FIRMWARE_DEFS(fw_def, huc_raw, huc_mmp, huc_gsc, huc_gsc_mmp) \
++	fw_def(METEORLAKE,   0, huc_gsc_mmp(mtl, 8, 3, 7)) \
+ 	fw_def(DG2,          0, huc_gsc(dg2)) \
+ 	fw_def(ALDERLAKE_P,  0, huc_raw(tgl)) \
+ 	fw_def(ALDERLAKE_P,  0, huc_mmp(tgl,  7, 9, 3)) \
+@@ -151,6 +152,14 @@ void intel_uc_fw_change_status(struct intel_uc_fw *uc_fw,
+ 	__stringify(patch_) "." \
+ 	__stringify(build_) ".bin"
+ 
++#define __MAKE_UC_FW_PATH_MMPP(prefix_, name_, major_, minor_, patch_, postfix_) \
++	"i915/" \
++	__stringify(prefix_) "_" name_ "_" \
++	__stringify(major_) "." \
++	__stringify(minor_) "." \
++	__stringify(patch_) "_" \
++	postfix_ ".bin"
++
+ /* Minor for internal driver use, not part of file name */
+ #define MAKE_GUC_FW_PATH_MAJOR(prefix_, major_, minor_) \
+ 	__MAKE_UC_FW_PATH_MAJOR(prefix_, "guc", major_)
+@@ -164,6 +173,9 @@ void intel_uc_fw_change_status(struct intel_uc_fw *uc_fw,
+ #define MAKE_HUC_FW_PATH_GSC(prefix_) \
+ 	__MAKE_UC_FW_PATH_BLANK(prefix_, "huc_gsc")
+ 
++#define MAKE_HUC_FW_PATH_GSC_MMP(prefix_, major_, minor_, patch_) \
++	__MAKE_UC_FW_PATH_MMPP(prefix_, "huc", major_, minor_, patch_, "gsc")
++
+ #define MAKE_HUC_FW_PATH_MMP(prefix_, major_, minor_, patch_) \
+ 	__MAKE_UC_FW_PATH_MMP(prefix_, "huc", major_, minor_, patch_)
+ 
+@@ -179,7 +191,7 @@ void intel_uc_fw_change_status(struct intel_uc_fw *uc_fw,
+ 	MODULE_FIRMWARE(uc_);
+ 
+ INTEL_GUC_FIRMWARE_DEFS(INTEL_UC_MODULE_FW, MAKE_GUC_FW_PATH_MAJOR, MAKE_GUC_FW_PATH_MMP)
+-INTEL_HUC_FIRMWARE_DEFS(INTEL_UC_MODULE_FW, MAKE_HUC_FW_PATH_BLANK, MAKE_HUC_FW_PATH_MMP, MAKE_HUC_FW_PATH_GSC)
++INTEL_HUC_FIRMWARE_DEFS(INTEL_UC_MODULE_FW, MAKE_HUC_FW_PATH_BLANK, MAKE_HUC_FW_PATH_MMP, MAKE_HUC_FW_PATH_GSC, MAKE_HUC_FW_PATH_GSC_MMP)
+ INTEL_GSC_FIRMWARE_DEFS(INTEL_UC_MODULE_FW, MAKE_GSC_FW_PATH)
+ 
+ /*
+@@ -230,6 +242,10 @@ struct __packed uc_fw_blob {
+ #define HUC_FW_BLOB_GSC(prefix_) \
+ 	UC_FW_BLOB_NEW(0, 0, 0, true, MAKE_HUC_FW_PATH_GSC(prefix_))
+ 
++#define HUC_FW_BLOB_GSC_MMP(prefix_, major_, minor_, patch_) \
++	UC_FW_BLOB_NEW(major_, minor_, patch_, true, \
++		       MAKE_HUC_FW_PATH_GSC_MMP(prefix_, major_, minor_, patch_))
++
+ #define GSC_FW_BLOB(prefix_, major_, minor_, patch_, build_) \
+ 	UC_FW_BLOB_OLD(major_, minor_, patch_, \
+ 		       MAKE_GSC_FW_PATH(prefix_, major_, minor_, patch_, build_))
+@@ -259,7 +275,7 @@ __uc_fw_auto_select(struct drm_i915_private *i915, struct intel_uc_fw *uc_fw)
+ 		INTEL_GUC_FIRMWARE_DEFS(MAKE_FW_LIST, GUC_FW_BLOB, GUC_FW_BLOB_MMP)
+ 	};
+ 	static const struct uc_fw_platform_requirement blobs_huc[] = {
+-		INTEL_HUC_FIRMWARE_DEFS(MAKE_FW_LIST, HUC_FW_BLOB, HUC_FW_BLOB_MMP, HUC_FW_BLOB_GSC)
++		INTEL_HUC_FIRMWARE_DEFS(MAKE_FW_LIST, HUC_FW_BLOB, HUC_FW_BLOB_MMP, HUC_FW_BLOB_GSC, HUC_FW_BLOB_GSC_MMP)
+ 	};
+ 	static const struct uc_fw_platform_requirement blobs_gsc[] = {
+ 		INTEL_GSC_FIRMWARE_DEFS(MAKE_FW_LIST, GSC_FW_BLOB)
+@@ -876,7 +892,7 @@ static u32 uc_fw_ggtt_offset(struct intel_uc_fw *uc_fw)
+ 	return lower_32_bits(node->start + offset);
+ }
+ 
+-static void uc_fw_bind_ggtt(struct intel_uc_fw *uc_fw)
++void intel_uc_fw_bind_ggtt(struct intel_uc_fw *uc_fw)
+ {
+ 	struct drm_i915_gem_object *obj = uc_fw->obj;
+ 	struct i915_ggtt *ggtt = __uc_fw_to_gt(uc_fw)->ggtt;
+@@ -902,7 +918,7 @@ static void uc_fw_bind_ggtt(struct intel_uc_fw *uc_fw)
+ 		ggtt->vm.insert_entries(&ggtt->vm, dummy, I915_CACHE_NONE, pte_flags);
+ }
+ 
+-static void uc_fw_unbind_ggtt(struct intel_uc_fw *uc_fw)
++void intel_uc_fw_unbind_ggtt(struct intel_uc_fw *uc_fw)
+ {
+ 	struct drm_i915_gem_object *obj = uc_fw->obj;
+ 	struct i915_ggtt *ggtt = __uc_fw_to_gt(uc_fw)->ggtt;
+@@ -1000,9 +1016,9 @@ int intel_uc_fw_upload(struct intel_uc_fw *uc_fw, u32 dst_offset, u32 dma_flags)
+ 		return -ENOEXEC;
+ 
+ 	/* Call custom loader */
+-	uc_fw_bind_ggtt(uc_fw);
++	intel_uc_fw_bind_ggtt(uc_fw);
+ 	err = uc_fw_xfer(uc_fw, dst_offset, dma_flags);
+-	uc_fw_unbind_ggtt(uc_fw);
++	intel_uc_fw_unbind_ggtt(uc_fw);
+ 	if (err)
+ 		goto fail;
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
+index 6ba00e6b3975..300ebbcfc2fc 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
+@@ -285,6 +285,8 @@ void intel_uc_fw_init_early(struct intel_uc_fw *uc_fw,
+ 			    enum intel_uc_fw_type type);
+ int intel_uc_fw_fetch(struct intel_uc_fw *uc_fw);
+ void intel_uc_fw_cleanup_fetch(struct intel_uc_fw *uc_fw);
++void intel_uc_fw_bind_ggtt(struct intel_uc_fw *uc_fw);
++void intel_uc_fw_unbind_ggtt(struct intel_uc_fw *uc_fw);
+ int intel_uc_fw_upload(struct intel_uc_fw *uc_fw, u32 offset, u32 dma_flags);
+ int intel_uc_fw_init(struct intel_uc_fw *uc_fw);
+ void intel_uc_fw_fini(struct intel_uc_fw *uc_fw);
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index 6052756352e6..fbfdd83b4e37 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -165,12 +165,16 @@ static struct intel_gt *find_gt_for_required_teelink(struct drm_i915_private *i9
+ {
+ 	/*
+ 	 * NOTE: Only certain platforms require PXP-tee-backend dependencies
+-	 * for HuC authentication. For now, its limited to DG2.
++	 * for HuC authentication.
+ 	 */
+ 	if (IS_ENABLED(CONFIG_INTEL_MEI_PXP) && IS_ENABLED(CONFIG_INTEL_MEI_GSC) &&
+ 	    intel_huc_is_loaded_by_gsc(&i915->gt0.uc.huc) && intel_uc_uses_huc(&i915->gt0.uc))
+ 		return &i915->gt0;
+ 
++	/* On MTL we use a PXP command via the GSC engine for HuC loading */
++	if (i915->media_gt && intel_uc_supports_gsc_uc(&i915->media_gt->uc))
++		return i915->media_gt;
++
+ 	return NULL;
+ }
+ 
+@@ -228,6 +232,14 @@ int intel_pxp_init(struct drm_i915_private *i915)
+ 
+ 	i915->pxp->ctrl_gt = gt;
+ 
++	mutex_init(&i915->pxp->tee_mutex);
++
++	if (intel_pxp_alloc_common_stream_cmd_objs(i915->pxp)) {
++		kfree(i915->pxp);
++		i915->pxp = NULL;
++		return -ENOMEM;
++	}
++
+ 	/*
+ 	 * If full PXP feature is not available but HuC is loaded by GSC on pre-MTL
+ 	 * such as DG2, we can skip the init of the full PXP session/object management
+@@ -260,6 +272,8 @@ void intel_pxp_fini(struct drm_i915_private *i915)
+ 
+ 	destroy_vcs_context(i915->pxp);
+ 
++	intel_pxp_free_common_stream_cmd_objs(i915->pxp);
++
+ 	kfree(i915->pxp);
+ 	i915->pxp = NULL;
+ }
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+index 066df4fc001f..5dcfb1313db0 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+@@ -235,8 +235,6 @@ gsccs_allocate_execution_resource(struct intel_pxp *pxp)
+ 	if (!engine)
+ 		return -ENODEV;
+ 
+-	mutex_init(&pxp->tee_mutex);
+-
+ 	/*
+ 	 * Now, allocate, pin and map two objects, one for the heci message packet
+ 	 * and another for the batch buffer we submit into GSC engine (that includes the packet).
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_huc.c b/drivers/gpu/drm/i915/pxp/intel_pxp_huc.c
+index 64609d1b1c0f..cd8adee2748e 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_huc.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_huc.c
+@@ -14,35 +14,39 @@
+ #include "intel_pxp_types.h"
+ #include "intel_pxp_cmd_interface_43.h"
+ 
+-int intel_pxp_huc_load_and_auth(struct intel_pxp *pxp)
++int intel_pxp_huc_load_and_auth(struct intel_pxp *pxp, u64 address)
+ {
+ 	struct intel_gt *gt;
+ 	struct intel_huc *huc;
+ 	struct pxp43_start_huc_auth_in huc_in = {0};
+ 	struct pxp43_start_huc_auth_out huc_out = {0};
+-	dma_addr_t huc_phys_addr;
+ 	u8 client_id = 0;
+ 	u8 fence_id = 0;
+ 	int err;
+ 
+-	if (!pxp || !pxp->pxp_component)
++	if (!pxp)
+ 		return -ENODEV;
+ 
+ 	gt = pxp->ctrl_gt;
+ 	huc = &gt->uc.huc;
+ 
+-	huc_phys_addr = i915_gem_object_get_dma_address(huc->fw.obj, 0);
+-
+ 	/* write the PXP message into the lmem (the sg list) */
+ 	huc_in.header.api_version = PXP_APIVER(4, 3);
+ 	huc_in.header.command_id  = PXP43_CMDID_START_HUC_AUTH;
+ 	huc_in.header.status      = 0;
+ 	huc_in.header.buffer_len  = sizeof(huc_in.huc_base_address);
+-	huc_in.huc_base_address   = huc_phys_addr;
++	huc_in.huc_base_address   = address;
++
++	if (intel_uc_supports_gsc_uc(&gt->uc))
++		err = intel_pxp_gsc_fw_message(pxp, &huc_in, sizeof(huc_in),
++					       &huc_out, sizeof(huc_out));
++	else if (pxp->pxp_component)
++		err = intel_pxp_tee_stream_message(pxp, client_id, fence_id,
++						   &huc_in, sizeof(huc_in),
++						   &huc_out, sizeof(huc_out));
++	else
++		err = -ENODEV;
+ 
+-	err = intel_pxp_tee_stream_message(pxp, client_id, fence_id,
+-					   &huc_in, sizeof(huc_in),
+-					   &huc_out, sizeof(huc_out));
+ 	if (err < 0) {
+ 		drm_err(&gt->i915->drm,
+ 			"Failed to send HuC load and auth command to GSC [%d]!\n",
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_huc.h b/drivers/gpu/drm/i915/pxp/intel_pxp_huc.h
+index e40847a91c39..d37361fcc3ce 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_huc.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_huc.h
+@@ -6,8 +6,10 @@
+ #ifndef __INTEL_PXP_HUC_H__
+ #define __INTEL_PXP_HUC_H__
+ 
++#include <linux/types.h>
++
+ struct intel_pxp;
+ 
+-int intel_pxp_huc_load_and_auth(struct intel_pxp *pxp);
++int intel_pxp_huc_load_and_auth(struct intel_pxp *pxp, u64 address);
+ 
+ #endif /* __INTEL_PXP_HUC_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+index d9d248b48093..7b9de9db1ccb 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+@@ -10,6 +10,9 @@
+ 
+ #include "gem/i915_gem_lmem.h"
+ 
++#include "gt/uc/intel_gsc_fw.h"
++#include "gt/uc/intel_gsc_fwif.h"
++
+ #include "i915_drv.h"
+ 
+ #include "intel_pxp.h"
+@@ -80,6 +83,9 @@ int intel_pxp_tee_stream_message(struct intel_pxp *pxp,
+ 	struct scatterlist *sg;
+ 	int ret;
+ 
++	if (intel_uc_supports_gsc_uc(&pxp->ctrl_gt->uc))
++		return -ENODEV;
++
+ 	if (msg_in_len > max_msg_size || msg_out_len > max_msg_size)
+ 		return -ENOSPC;
+ 
+@@ -108,6 +114,61 @@ int intel_pxp_tee_stream_message(struct intel_pxp *pxp,
+ 	return ret;
+ }
+ 
++int intel_pxp_gsc_fw_message(struct intel_pxp *pxp,
++			     void *msg_in, size_t msg_in_len,
++			     void *msg_out, size_t msg_out_len)
++{
++	struct intel_gt *gt = pxp->ctrl_gt;
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_gsc_mtl_header *header = pxp->stream_cmd.vaddr;
++	const size_t max_msg_size = PAGE_SIZE - sizeof(*header);
++	void *payload = pxp->stream_cmd.vaddr + sizeof(*header);
++	u64 addr;
++	u32 reply_size;
++	int ret;
++
++	if (!intel_uc_uses_gsc_uc(&gt->uc))
++		return -ENODEV;
++
++	if (msg_in_len > max_msg_size || msg_out_len > max_msg_size)
++		return -ENOSPC;
++
++	GEM_BUG_ON(!pxp->stream_cmd.vma);
++	addr = i915_ggtt_offset(pxp->stream_cmd.vma);
++
++	mutex_lock(&pxp->tee_mutex);
++
++	memset(header, 0, sizeof(*header));
++	header->validity_marker = GSC_HECI_VALIDITY_MARKER;
++	header->gsc_address = HECI_MEADDRESS_PXP;
++	header->header_version = MTL_GSC_HEADER_VERSION;
++	header->message_size = msg_in_len + sizeof(*header);
++
++	memcpy(payload, msg_in, msg_in_len);
++
++	/* Wa_22016122933: Making sure the data is visible to GSC right away */
++	intel_guc_write_barrier(&gt->uc.guc);
++
++	ret = intel_gsc_fw_heci_send(&gt->uc.gsc, addr, header->message_size,
++				     addr, msg_out_len + sizeof(*header));
++	if (ret) {
++		drm_err(&i915->drm, "failed to send gsc PXP msg (%d)\n", ret);
++		goto unlock;
++	}
++
++	/* we use the same mem for the reply, so header is in the same loc */
++	reply_size = header->message_size - sizeof(*header);
++	if (reply_size != msg_out_len)
++		drm_err(&i915->drm, "unexpected PXP reply size %u (%u)\n",
++			reply_size, (u32)msg_out_len);
++
++	memcpy(msg_out, payload, msg_out_len);
++
++unlock:
++	mutex_unlock(&pxp->tee_mutex);
++	return ret;
++}
++
+ /**
+  * i915_pxp_tee_component_bind - bind function to pass the function pointers to pxp_tee
+  * @i915_kdev: pointer to i915 kernel device
+@@ -127,6 +188,10 @@ static int i915_pxp_tee_component_bind(struct device *i915_kdev,
+ 	intel_wakeref_t wakeref;
+ 	int ret = 0;
+ 
++	/* If we control the GSC there is no need for the mei_pxp component */
++	if (unlikely(intel_uc_supports_gsc_uc(uc)))
++		return -EIO;
++
+ 	if (!HAS_HECI_PXP(i915)) {
+ 		pxp->dev_link = device_link_add(i915_kdev, tee_kdev, DL_FLAG_STATELESS);
+ 		if (drm_WARN_ON(&i915->drm, !pxp->dev_link))
+@@ -187,21 +252,28 @@ static const struct component_ops i915_pxp_tee_component_ops = {
+ 	.unbind = i915_pxp_tee_component_unbind,
+ };
+ 
+-static int alloc_streaming_command(struct intel_pxp *pxp)
++int intel_pxp_alloc_common_stream_cmd_objs(struct intel_pxp *pxp)
+ {
+-	struct drm_i915_private *i915 = pxp->ctrl_gt->i915;
++	struct intel_gt *gt = pxp->ctrl_gt;
++	struct drm_i915_private *i915 = gt->i915;
+ 	struct drm_i915_gem_object *obj = NULL;
++	struct i915_vma *vma = NULL;
+ 	void *cmd;
+ 	int err;
+ 
+ 	pxp->stream_cmd.obj = NULL;
+ 	pxp->stream_cmd.vaddr = NULL;
++	pxp->stream_cmd.vma = NULL;
+ 
+-	if (!IS_DGFX(i915))
++	if (!IS_DGFX(i915) && !intel_uc_uses_gsc_uc(&gt->uc))
+ 		return 0;
+ 
+-	/* allocate lmem object of one page for PXP command memory and store it */
+-	obj = i915_gem_object_create_lmem(i915, PAGE_SIZE, I915_BO_ALLOC_CONTIGUOUS);
++	/* allocate object of one page for PXP command memory and store it */
++	if (HAS_LMEM(i915))
++		obj = i915_gem_object_create_lmem(i915, PAGE_SIZE, I915_BO_ALLOC_CONTIGUOUS);
++	else
++		obj = i915_gem_object_create_shmem(i915, PAGE_SIZE);
++
+ 	if (IS_ERR(obj)) {
+ 		drm_err(&i915->drm, "Failed to allocate pxp streaming command!\n");
+ 		return PTR_ERR(obj);
+@@ -221,13 +293,28 @@ static int alloc_streaming_command(struct intel_pxp *pxp)
+ 		goto out_unpin;
+ 	}
+ 
++	if (intel_uc_uses_gsc_uc(&gt->uc)) {
++		vma = i915_vma_instance(obj, &gt->ggtt->vm, NULL);
++		if (IS_ERR(vma)) {
++			err = PTR_ERR(vma);
++			goto out_unmap;
++		}
++
++		err = i915_vma_pin(vma, 0, 0, PIN_GLOBAL);
++		if (err)
++			goto out_unmap;
++	}
++
+ 	memset(cmd, 0, obj->base.size);
+ 
+ 	pxp->stream_cmd.obj = obj;
+ 	pxp->stream_cmd.vaddr = cmd;
++	pxp->stream_cmd.vma = vma;
+ 
+ 	return 0;
+ 
++out_unmap:
++	i915_gem_object_unpin_map(obj);
+ out_unpin:
+ 	i915_gem_object_unpin_pages(obj);
+ out_put:
+@@ -235,13 +322,16 @@ static int alloc_streaming_command(struct intel_pxp *pxp)
+ 	return err;
+ }
+ 
+-static void free_streaming_command(struct intel_pxp *pxp)
++void intel_pxp_free_common_stream_cmd_objs(struct intel_pxp *pxp)
+ {
+ 	struct drm_i915_gem_object *obj = fetch_and_zero(&pxp->stream_cmd.obj);
+ 
+ 	if (!obj)
+ 		return;
+ 
++	if (pxp->stream_cmd.vma)
++		i915_vma_unpin(fetch_and_zero(&pxp->stream_cmd.vma));
++
+ 	i915_gem_object_unpin_map(obj);
+ 	i915_gem_object_unpin_pages(obj);
+ 	i915_gem_object_put(obj);
+@@ -253,39 +343,28 @@ int intel_pxp_tee_component_init(struct intel_pxp *pxp)
+ 	struct intel_gt *gt = pxp->ctrl_gt;
+ 	struct drm_i915_private *i915 = gt->i915;
+ 
+-	mutex_init(&pxp->tee_mutex);
+-
+-	ret = alloc_streaming_command(pxp);
+-	if (ret)
+-		return ret;
++	if (!intel_uc_supports_gsc_uc(&gt->uc)) {
++		ret = component_add_typed(i915->drm.dev, &i915_pxp_tee_component_ops,
++					  I915_COMPONENT_PXP);
++		if (ret < 0) {
++			drm_err(&i915->drm, "Failed to add PXP component (%d)\n", ret);
++			return ret;
++		}
+ 
+-	ret = component_add_typed(i915->drm.dev, &i915_pxp_tee_component_ops,
+-				  I915_COMPONENT_PXP);
+-	if (ret < 0) {
+-		drm_err(&i915->drm, "Failed to add PXP component (%d)\n", ret);
+-		goto out_free;
++		pxp->pxp_component_added = true;
+ 	}
+ 
+-	pxp->pxp_component_added = true;
+-
+ 	return 0;
+-
+-out_free:
+-	free_streaming_command(pxp);
+-	return ret;
+ }
+ 
+ void intel_pxp_tee_component_fini(struct intel_pxp *pxp)
+ {
+ 	struct drm_i915_private *i915 = pxp->ctrl_gt->i915;
+ 
+-	if (!pxp->pxp_component_added)
+-		return;
+-
+-	component_del(i915->drm.dev, &i915_pxp_tee_component_ops);
+-	pxp->pxp_component_added = false;
+-
+-	free_streaming_command(pxp);
++	if (pxp->pxp_component_added) {
++		component_del(i915->drm.dev, &i915_pxp_tee_component_ops);
++		pxp->pxp_component_added = false;
++	}
+ }
+ 
+ int intel_pxp_tee_cmd_create_arb_session(struct intel_pxp *pxp,
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.h b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.h
+index aeb3dfe7ce96..b6129d3367d1 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.h
+@@ -19,4 +19,11 @@ int intel_pxp_tee_stream_message(struct intel_pxp *pxp,
+ 				 void *msg_in, size_t msg_in_len,
+ 				 void *msg_out, size_t msg_out_len);
+ 
++int intel_pxp_alloc_common_stream_cmd_objs(struct intel_pxp *pxp);
++void intel_pxp_free_common_stream_cmd_objs(struct intel_pxp *pxp);
++
++int intel_pxp_gsc_fw_message(struct intel_pxp *pxp,
++			     void *msg_in, size_t msg_in_len,
++			     void *msg_out, size_t msg_out_len);
++
+ #endif /* __INTEL_PXP_TEE_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+index 73392fbab7ee..5493a6a3917b 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+@@ -15,6 +15,7 @@ struct intel_context;
+ struct intel_gt;
+ struct i915_pxp_component;
+ struct drm_i915_private;
++struct i915_vma;
+ 
+ /**
+  * struct intel_pxp - pxp state
+@@ -87,6 +88,7 @@ struct intel_pxp {
+ 	/** @stream_cmd: LMEM obj used to send stream PXP commands to the GSC */
+ 	struct {
+ 		struct drm_i915_gem_object *obj; /* contains PXP command memory */
++		struct i915_vma *vma; /* vma for the obj - MTL+ */
+ 		void *vaddr; /* virtual memory for PXP command */
+ 	} stream_cmd;
+ 
+-- 
+2.25.1
+

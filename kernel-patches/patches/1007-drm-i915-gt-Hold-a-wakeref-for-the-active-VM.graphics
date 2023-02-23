@@ -1,0 +1,95 @@
+From e96c50e951db270931f28ba06ef4b9a05ae189f7 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 12 Aug 2022 21:47:39 +0100
+Subject: [PATCH 1007/1096] drm/i915/gt: Hold a wakeref for the active VM
+
+There may be a disconnect between the GT used by the engine and the GT
+used for the VM, requiring us to hold a wakeref on both while the GPU is
+active with this request.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Acked-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_context.h       | 15 +++++++++++----
+ drivers/gpu/drm/i915/gt/intel_context_types.h |  2 ++
+ drivers/gpu/drm/i915/gt/intel_engine_pm.c     |  4 ++++
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_context.h b/drivers/gpu/drm/i915/gt/intel_context.h
+index 0a8d553da3f4..582faa21181e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context.h
++++ b/drivers/gpu/drm/i915/gt/intel_context.h
+@@ -14,6 +14,7 @@
+ #include "i915_drv.h"
+ #include "intel_context_types.h"
+ #include "intel_engine_types.h"
++#include "intel_gt_pm.h"
+ #include "intel_ring_types.h"
+ #include "intel_timeline_types.h"
+ #include "i915_trace.h"
+@@ -207,8 +208,11 @@ void intel_context_exit_engine(struct intel_context *ce);
+ static inline void intel_context_enter(struct intel_context *ce)
+ {
+ 	lockdep_assert_held(&ce->timeline->mutex);
+-	if (!ce->active_count++)
+-		ce->ops->enter(ce);
++	if (ce->active_count++)
++		return;
++
++	ce->ops->enter(ce);
++	ce->wakeref = intel_gt_pm_get(ce->vm->gt);
+ }
+ 
+ static inline void intel_context_mark_active(struct intel_context *ce)
+@@ -222,8 +226,11 @@ static inline void intel_context_exit(struct intel_context *ce)
+ {
+ 	lockdep_assert_held(&ce->timeline->mutex);
+ 	GEM_BUG_ON(!ce->active_count);
+-	if (!--ce->active_count)
+-		ce->ops->exit(ce);
++	if (--ce->active_count)
++		return;
++
++	intel_gt_pm_put_async(ce->vm->gt, ce->wakeref);
++	ce->ops->exit(ce);
+ }
+ 
+ static inline struct intel_context *intel_context_get(struct intel_context *ce)
+diff --git a/drivers/gpu/drm/i915/gt/intel_context_types.h b/drivers/gpu/drm/i915/gt/intel_context_types.h
+index e36670f2e626..5dc39a9d7a50 100644
+--- a/drivers/gpu/drm/i915/gt/intel_context_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_context_types.h
+@@ -17,6 +17,7 @@
+ #include "i915_utils.h"
+ #include "intel_engine_types.h"
+ #include "intel_sseu.h"
++#include "intel_wakeref.h"
+ 
+ #include "uc/intel_guc_fwif.h"
+ 
+@@ -110,6 +111,7 @@ struct intel_context {
+ 	u32 ring_size;
+ 	struct intel_ring *ring;
+ 	struct intel_timeline *timeline;
++	intel_wakeref_t wakeref;
+ 
+ 	unsigned long flags;
+ #define CONTEXT_BARRIER_BIT		0
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_pm.c b/drivers/gpu/drm/i915/gt/intel_engine_pm.c
+index 7063dea21129..c2d17c97bfe9 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_pm.c
+@@ -114,6 +114,10 @@ __queue_and_release_pm(struct i915_request *rq,
+ 
+ 	ENGINE_TRACE(engine, "parking\n");
+ 
++	GEM_BUG_ON(rq->context->active_count != 1);
++	__intel_gt_pm_get(engine->gt);
++	rq->context->wakeref = intel_wakeref_track(&engine->gt->wakeref);
++
+ 	/*
+ 	 * We have to serialise all potential retirement paths with our
+ 	 * submission, as we don't want to underflow either the
+-- 
+2.25.1
+

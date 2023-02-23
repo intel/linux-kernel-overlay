@@ -1,0 +1,182 @@
+From 8e87c04f6dcb3001af49b94bcddab61fe9d865e8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 18 Nov 2022 20:22:21 +0100
+Subject: [PATCH 0223/1096] drm/ttm: remove ttm_bo_(un)lock_delayed_workqueue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Those functions never worked correctly since it is still perfectly
+possible that a buffer object is released and the background worker
+restarted even after calling them.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221125102137.1801-2-christian.koenig@amd.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c |  6 +-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c  |  4 +---
+ drivers/gpu/drm/radeon/radeon_device.c      |  5 -----
+ drivers/gpu/drm/radeon/radeon_pm.c          |  4 +---
+ drivers/gpu/drm/ttm/ttm_bo.c                | 14 --------------
+ include/drm/ttm/ttm_bo_api.h                | 16 ----------------
+ 6 files changed, 3 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index 0f16d3c09309..f60753f97ac5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -1717,7 +1717,7 @@ static void amdgpu_ib_preempt_mark_partial_job(struct amdgpu_ring *ring)
+ 
+ static int amdgpu_debugfs_ib_preempt(void *data, u64 val)
+ {
+-	int r, resched, length;
++	int r, length;
+ 	struct amdgpu_ring *ring;
+ 	struct dma_fence **fences = NULL;
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)data;
+@@ -1747,8 +1747,6 @@ static int amdgpu_debugfs_ib_preempt(void *data, u64 val)
+ 	/* stop the scheduler */
+ 	kthread_park(ring->sched.thread);
+ 
+-	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
+-
+ 	/* preempt the IB */
+ 	r = amdgpu_ring_preempt_ib(ring);
+ 	if (r) {
+@@ -1785,8 +1783,6 @@ static int amdgpu_debugfs_ib_preempt(void *data, u64 val)
+ 
+ 	up_read(&adev->reset_domain->sem);
+ 
+-	ttm_bo_unlock_delayed_workqueue(&adev->mman.bdev, resched);
+-
+ pro_end:
+ 	kfree(fences);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index fbf2f24169eb..e7f4a4c8e61b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -3997,10 +3997,8 @@ void amdgpu_device_fini_hw(struct amdgpu_device *adev)
+ 	}
+ 	amdgpu_fence_driver_hw_fini(adev);
+ 
+-	if (adev->mman.initialized) {
++	if (adev->mman.initialized)
+ 		flush_delayed_work(&adev->mman.bdev.wq);
+-		ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
+-	}
+ 
+ 	if (adev->pm_sysfs_en)
+ 		amdgpu_pm_sysfs_fini(adev);
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 6344454a7721..9a556f505685 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -1772,7 +1772,6 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 	bool saved = false;
+ 
+ 	int i, r;
+-	int resched;
+ 
+ 	down_write(&rdev->exclusive_lock);
+ 
+@@ -1784,8 +1783,6 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 	atomic_inc(&rdev->gpu_reset_counter);
+ 
+ 	radeon_save_bios_scratch_regs(rdev);
+-	/* block TTM */
+-	resched = ttm_bo_lock_delayed_workqueue(&rdev->mman.bdev);
+ 	radeon_suspend(rdev);
+ 	radeon_hpd_fini(rdev);
+ 
+@@ -1844,8 +1841,6 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 	/* reset hpd state */
+ 	radeon_hpd_init(rdev);
+ 
+-	ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
+-
+ 	rdev->in_reset = true;
+ 	rdev->needs_reset = false;
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_pm.c b/drivers/gpu/drm/radeon/radeon_pm.c
+index 04c693ca419a..cbc554928bcc 100644
+--- a/drivers/gpu/drm/radeon/radeon_pm.c
++++ b/drivers/gpu/drm/radeon/radeon_pm.c
+@@ -1853,11 +1853,10 @@ static bool radeon_pm_debug_check_in_vbl(struct radeon_device *rdev, bool finish
+ static void radeon_dynpm_idle_work_handler(struct work_struct *work)
+ {
+ 	struct radeon_device *rdev;
+-	int resched;
++
+ 	rdev = container_of(work, struct radeon_device,
+ 				pm.dynpm_idle_work.work);
+ 
+-	resched = ttm_bo_lock_delayed_workqueue(&rdev->mman.bdev);
+ 	mutex_lock(&rdev->pm.mutex);
+ 	if (rdev->pm.dynpm_state == DYNPM_STATE_ACTIVE) {
+ 		int not_processed = 0;
+@@ -1908,7 +1907,6 @@ static void radeon_dynpm_idle_work_handler(struct work_struct *work)
+ 				      msecs_to_jiffies(RADEON_IDLE_LOOP_MS));
+ 	}
+ 	mutex_unlock(&rdev->pm.mutex);
+-	ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index c3f4b33136e5..b77262a623e0 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -418,20 +418,6 @@ void ttm_bo_put(struct ttm_buffer_object *bo)
+ }
+ EXPORT_SYMBOL(ttm_bo_put);
+ 
+-int ttm_bo_lock_delayed_workqueue(struct ttm_device *bdev)
+-{
+-	return cancel_delayed_work_sync(&bdev->wq);
+-}
+-EXPORT_SYMBOL(ttm_bo_lock_delayed_workqueue);
+-
+-void ttm_bo_unlock_delayed_workqueue(struct ttm_device *bdev, int resched)
+-{
+-	if (resched)
+-		schedule_delayed_work(&bdev->wq,
+-				      ((HZ / 100) < 1) ? 1 : HZ / 100);
+-}
+-EXPORT_SYMBOL(ttm_bo_unlock_delayed_workqueue);
+-
+ static int ttm_bo_bounce_temp_buffer(struct ttm_buffer_object *bo,
+ 				     struct ttm_resource **mem,
+ 				     struct ttm_operation_ctx *ctx,
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 44a538ee5e2a..7758347c461c 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -290,22 +290,6 @@ void ttm_bo_move_to_lru_tail(struct ttm_buffer_object *bo);
+ void ttm_bo_set_bulk_move(struct ttm_buffer_object *bo,
+ 			  struct ttm_lru_bulk_move *bulk);
+ 
+-/**
+- * ttm_bo_lock_delayed_workqueue
+- *
+- * Prevent the delayed workqueue from running.
+- * Returns
+- * True if the workqueue was queued at the time
+- */
+-int ttm_bo_lock_delayed_workqueue(struct ttm_device *bdev);
+-
+-/**
+- * ttm_bo_unlock_delayed_workqueue
+- *
+- * Allows the delayed workqueue to run.
+- */
+-void ttm_bo_unlock_delayed_workqueue(struct ttm_device *bdev, int resched);
+-
+ /**
+  * ttm_bo_eviction_valuable
+  *
+-- 
+2.25.1
+

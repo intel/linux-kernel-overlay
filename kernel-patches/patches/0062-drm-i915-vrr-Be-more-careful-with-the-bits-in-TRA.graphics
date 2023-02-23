@@ -1,0 +1,98 @@
+From bcf69f00b66f6a198324416b75d2e4646dfc7a70 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 2 Dec 2022 15:44:12 +0200
+Subject: [PATCH 0062/1096] drm/i915/vrr: Be more careful with the bits in
+ TRANS_VRR_CTL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On mtl (at least) clearing the guardband bits in the same write
+as the enable bit gets cleared seems to cause an immediate FIFO
+underrun. Thus is seems that we need to first clear just the
+enable bit, then wait for the VRR live status to indicate the
+transcoder has exited VRR mode (this step is documented in Bspec
+as well), and finally we can clear out the rest of the TRANS_VRR_CTL
+for good measure.
+
+I did this without any RMWs in case we want to toggle VRR on/off
+via DSB in the future, and as we know DSB can't read registers.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221202134412.21943-5-ville.syrjala@linux.intel.com
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_vrr.c | 36 +++++++++++++++---------
+ 1 file changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.c b/drivers/gpu/drm/i915/display/intel_vrr.c
+index 753e7b211708..5ff6aed9575e 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.c
++++ b/drivers/gpu/drm/i915/display/intel_vrr.c
+@@ -161,31 +161,36 @@ intel_vrr_compute_config(struct intel_crtc_state *crtc_state,
+ 	crtc_state->mode_flags |= I915_MODE_FLAG_VRR;
+ }
+ 
++static u32 trans_vrr_ctl(const struct intel_crtc_state *crtc_state)
++{
++	struct drm_i915_private *i915 = to_i915(crtc_state->uapi.crtc->dev);
++
++	if (DISPLAY_VER(i915) >= 13)
++		return VRR_CTL_IGN_MAX_SHIFT | VRR_CTL_FLIP_LINE_EN |
++			XELPD_VRR_CTL_VRR_GUARDBAND(crtc_state->vrr.guardband);
++	else
++		return VRR_CTL_IGN_MAX_SHIFT | VRR_CTL_FLIP_LINE_EN |
++			VRR_CTL_PIPELINE_FULL(crtc_state->vrr.pipeline_full) |
++			VRR_CTL_PIPELINE_FULL_OVERRIDE;
++}
++
+ void intel_vrr_enable(struct intel_encoder *encoder,
+ 		      const struct intel_crtc_state *crtc_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
+-	u32 trans_vrr_ctl;
+ 
+ 	if (!crtc_state->vrr.enable)
+ 		return;
+ 
+-	if (DISPLAY_VER(dev_priv) >= 13)
+-		trans_vrr_ctl = VRR_CTL_VRR_ENABLE |
+-			VRR_CTL_IGN_MAX_SHIFT | VRR_CTL_FLIP_LINE_EN |
+-			XELPD_VRR_CTL_VRR_GUARDBAND(crtc_state->vrr.guardband);
+-	else
+-		trans_vrr_ctl = VRR_CTL_VRR_ENABLE |
+-			VRR_CTL_IGN_MAX_SHIFT | VRR_CTL_FLIP_LINE_EN |
+-			VRR_CTL_PIPELINE_FULL(crtc_state->vrr.pipeline_full) |
+-			VRR_CTL_PIPELINE_FULL_OVERRIDE;
+-
+ 	intel_de_write(dev_priv, TRANS_VRR_VMIN(cpu_transcoder), crtc_state->vrr.vmin - 1);
+ 	intel_de_write(dev_priv, TRANS_VRR_VMAX(cpu_transcoder), crtc_state->vrr.vmax - 1);
+-	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder), trans_vrr_ctl);
++	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder), trans_vrr_ctl(crtc_state));
+ 	intel_de_write(dev_priv, TRANS_VRR_FLIPLINE(cpu_transcoder), crtc_state->vrr.flipline - 1);
+ 	intel_de_write(dev_priv, TRANS_PUSH(cpu_transcoder), TRANS_PUSH_EN);
++
++	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder),
++		       VRR_CTL_VRR_ENABLE | trans_vrr_ctl(crtc_state));
+ }
+ 
+ void intel_vrr_send_push(const struct intel_crtc_state *crtc_state)
+@@ -222,8 +227,13 @@ void intel_vrr_disable(const struct intel_crtc_state *old_crtc_state)
+ 	if (!old_crtc_state->vrr.enable)
+ 		return;
+ 
+-	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder), 0);
++	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder),
++		       trans_vrr_ctl(old_crtc_state));
++	intel_de_wait_for_clear(dev_priv, TRANS_VRR_STATUS(cpu_transcoder),
++				VRR_STATUS_VRR_EN_LIVE, 1000);
++
+ 	intel_de_write(dev_priv, TRANS_PUSH(cpu_transcoder), 0);
++	intel_de_write(dev_priv, TRANS_VRR_CTL(cpu_transcoder), 0);
+ }
+ 
+ void intel_vrr_get_config(struct intel_crtc *crtc,
+-- 
+2.25.1
+
