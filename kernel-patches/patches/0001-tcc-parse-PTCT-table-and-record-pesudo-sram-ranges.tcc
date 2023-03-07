@@ -1,7 +1,7 @@
-From 3ba9770ba7871e3bdfdf16f4c29153a1121e1d39 Mon Sep 17 00:00:00 2001
+From f5cce690afcc627b2b672a33a22d5c1c00f13a7a Mon Sep 17 00:00:00 2001
 From: Qiang Rao <qiang.rao@intel.com>
 Date: Thu, 22 Jul 2021 16:02:33 +0800
-Subject: [PATCH 01/16] tcc: parse PTCT table and record pesudo sram ranges
+Subject: [PATCH 01/22] tcc: parse PTCT table and record pesudo sram ranges
 
 ACPI may include PTCT table. If PTCT is included, this table need to be parsed
 and records all pesudo SRAM ranges indicated in the table. These pesudo SRAM
@@ -16,10 +16,10 @@ Signed-off-by: Qiang Rao <qiang.rao@intel.com>
  2 files changed, 149 insertions(+)
 
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
-index 14bcd59bcdee..802e7a5b4dc6 100644
+index 907cc98b1938..fa3ef5fc398f 100644
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
-@@ -1218,6 +1218,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
+@@ -1309,6 +1309,96 @@ static inline int acpi_parse_madt_ioapic_entries(void)
  }
  #endif	/* !CONFIG_X86_IO_APIC */
  
@@ -116,7 +116,7 @@ index 14bcd59bcdee..802e7a5b4dc6 100644
  static void __init early_acpi_process_madt(void)
  {
  #ifdef CONFIG_X86_LOCAL_APIC
-@@ -1600,6 +1690,11 @@ int __init acpi_boot_init(void)
+@@ -1723,6 +1813,11 @@ int __init acpi_boot_init(void)
  	if (IS_ENABLED(CONFIG_ACPI_BGRT) && !acpi_nobgrt)
  		acpi_table_parse(ACPI_SIG_BGRT, acpi_parse_bgrt);
  
@@ -129,10 +129,10 @@ index 14bcd59bcdee..802e7a5b4dc6 100644
  		x86_init.pci.init = pci_acpi_init;
  
 diff --git a/include/acpi/actbl2.h b/include/acpi/actbl2.h
-index a47b32a5cbde..44e7d7baa72f 100644
+index 655102bc6d14..d84695a907f5 100644
 --- a/include/acpi/actbl2.h
 +++ b/include/acpi/actbl2.h
-@@ -41,6 +41,7 @@
+@@ -44,6 +44,7 @@
  #define ACPI_SIG_PMTT           "PMTT"	/* Platform Memory Topology Table */
  #define ACPI_SIG_PPTT           "PPTT"	/* Processor Properties Topology Table */
  #define ACPI_SIG_PRMT           "PRMT"	/* Platform Runtime Mechanism Table */
@@ -140,7 +140,7 @@ index a47b32a5cbde..44e7d7baa72f 100644
  #define ACPI_SIG_RASF           "RASF"	/* RAS Feature table */
  #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
  #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
-@@ -1923,6 +1924,59 @@ struct acpi_prmt_handler_info {
+@@ -2309,6 +2310,59 @@ struct acpi_prmt_handler_info {
  	u64 acpi_param_buffer_address;
  };
  
@@ -201,5 +201,5 @@ index a47b32a5cbde..44e7d7baa72f 100644
   *
   * RASF - RAS Feature Table (ACPI 5.0)
 -- 
-2.32.0
+2.25.1
 
