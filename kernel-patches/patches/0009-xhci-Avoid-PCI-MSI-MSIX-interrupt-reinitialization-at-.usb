@@ -1,0 +1,117 @@
+From 14e5ca5571f35b478e1be1dfad2319237e5595d0 Mon Sep 17 00:00:00 2001
+From: Josue David Hernandez Gutierrez <josue.d.hernandez.gutierrez@intel.com>
+Date: Thu, 31 Mar 2022 11:08:28 -0600
+Subject: [PATCH 09/21] xhci: Avoid PCI MSI/MSIX interrupt reinitialization at
+ resume
+
+xhci MSI setup is currently done at the same time as xHC host is started
+in xhci_run(). This couples the generic xhci code with PCI, and will
+reconfigure MSI/MSIX interrupts every time xHC is started.
+
+Decouple MSI/MSIX configuration from generic xhci code by moving MSI/MSIX
+part to a PCI specific xhci_pci_run() function overriding xhci_run().
+
+This allows us to remove unnecessay MSI/MSIX reconfiguration done every
+time PCI xhci resumes from suspend. i.e. remove the xhci_cleanup_msix()
+call from xhci_resume() and the xhci_try_enale_msi() call in xhci_run()
+called a bit later by xhci_resume()
+
+[minor changes and commit message rewrite -Mathias]
+
+Signed-off-by: Josue David Hernandez Gutierrez <josue.d.hernandez.gutierrez@intel.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+---
+ drivers/usb/host/xhci-pci.c | 15 +++++++++++++++
+ drivers/usb/host/xhci.c     |  8 ++------
+ drivers/usb/host/xhci.h     |  1 +
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index fb988e4ea924..5f006d199cd6 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -78,14 +78,29 @@ static const char hcd_name[] = "xhci_hcd";
+ static struct hc_driver __read_mostly xhci_pci_hc_driver;
+ 
+ static int xhci_pci_setup(struct usb_hcd *hcd);
++static int xhci_pci_run(struct usb_hcd *hcd);
+ static int xhci_pci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
+ 				      struct usb_tt *tt, gfp_t mem_flags);
+ 
+ static const struct xhci_driver_overrides xhci_pci_overrides __initconst = {
+ 	.reset = xhci_pci_setup,
++	.start = xhci_pci_run,
+ 	.update_hub_device = xhci_pci_update_hub_device,
+ };
+ 
++static int xhci_pci_run(struct usb_hcd *hcd)
++{
++	int ret;
++
++	if (usb_hcd_is_primary_hcd(hcd)) {
++		ret = xhci_try_enable_msi(hcd);
++		if (ret)
++			return ret;
++	}
++
++	return xhci_run(hcd);
++}
++
+ /* called after powerup, by probe or system-pm "wakeup" */
+ static int xhci_pci_reinit(struct xhci_hcd *xhci, struct pci_dev *pdev)
+ {
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 6183ce8574b1..d08e2ba744f8 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -432,7 +432,7 @@ static void __maybe_unused xhci_msix_sync_irqs(struct xhci_hcd *xhci)
+ 	}
+ }
+ 
+-static int xhci_try_enable_msi(struct usb_hcd *hcd)
++int xhci_try_enable_msi(struct usb_hcd *hcd)
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+ 	struct pci_dev  *pdev;
+@@ -486,6 +486,7 @@ static int xhci_try_enable_msi(struct usb_hcd *hcd)
+ 	hcd->irq = pdev->irq;
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(xhci_try_enable_msi);
+ 
+ #else
+ 
+@@ -701,10 +702,6 @@ int xhci_run(struct usb_hcd *hcd)
+ 
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "xhci_run");
+ 
+-	ret = xhci_try_enable_msi(hcd);
+-	if (ret)
+-		return ret;
+-
+ 	temp_64 = xhci_read_64(xhci, &ir->ir_set->erst_dequeue);
+ 	temp_64 &= ~ERST_PTR_MASK;
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+@@ -1246,7 +1243,6 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 		spin_unlock_irq(&xhci->lock);
+ 		if (retval)
+ 			return retval;
+-		xhci_cleanup_msix(xhci);
+ 
+ 		xhci_dbg(xhci, "// Disabling event ring interrupts\n");
+ 		temp = readl(&xhci->op_regs->status);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 786002bb35db..26fccc8d9055 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -2143,6 +2143,7 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated);
+ 
+ irqreturn_t xhci_irq(struct usb_hcd *hcd);
+ irqreturn_t xhci_msi_irq(int irq, void *hcd);
++int xhci_try_enable_msi(struct usb_hcd *hcd);
+ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev);
+ int xhci_alloc_tt_info(struct xhci_hcd *xhci,
+ 		struct xhci_virt_device *virt_dev,
+-- 
+2.25.1
+
