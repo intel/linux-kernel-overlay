@@ -1,0 +1,123 @@
+From fdd424b9bf23fde056ae4d8924c3096614c5024e Mon Sep 17 00:00:00 2001
+From: Song Yoong Siang <yoong.siang.song@intel.com>
+Date: Wed, 8 Sep 2021 22:45:23 +0800
+Subject: [PATCH 71/78] net: stmmac: Prevent double release for suspended port
+ in stmmac_release
+
+Reboot operation will hang if there is suspended port present. During
+reboot, stmmac_release() is called to perform "release" for available
+port. But, if there is a port already suspended, there will be "double
+release" happens in stmmac_release().
+
+So, to fix this, add pm_runtime_suspended(priv->device) checking so
+that, for suspended port, skip any "release" operation that already done
+in stmmac_suspend().
+
+Signed-off-by: Song Yoong Siang <yoong.siang.song@intel.com>
+Signed-off-by: Michael Sit Wei Hong <michael.wei.hong.sit@intel.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 66 +++++++++++--------
+ 1 file changed, 38 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index adfd6be85a4e..379841d7d4f3 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3943,43 +3943,57 @@ static void stmmac_fpe_stop_wq(struct stmmac_priv *priv)
+  */
+ static int stmmac_release(struct net_device *dev)
+ {
+-	struct stmmac_priv *priv = netdev_priv(dev);
+ 	u32 chan;
++	struct stmmac_priv *priv = netdev_priv(dev);
++	bool suspended = pm_runtime_suspended(priv->device);
+ 
+ 	netif_tx_disable(dev);
+-	/* Use pm_runtime_get_sync() call paired with pm_runtime_put() call to
+-	 * ensure that the device is not put into runtime suspend during the
+-	 * operation.
++	/* For suspended device/port, skip the release operation that already
++	 * done in stmmac_suspend().
+ 	 */
+-	pm_runtime_get_sync(priv->device);
++	if (!suspended) {
++		/* Use pm_runtime_get_sync() call paired with pm_runtime_put()
++		 * call to ensure that the device is not put into runtime
++		 * suspend during the operation.
++		 */
++		pm_runtime_get_sync(priv->device);
+ 
+-	if (device_may_wakeup(priv->device))
+-		phylink_speed_down(priv->phylink, false);
+-	/* Stop and disconnect the PHY */
+-	phylink_stop(priv->phylink);
+-	phylink_disconnect_phy(priv->phylink);
++		if (device_may_wakeup(priv->device))
++			phylink_speed_down(priv->phylink, false);
++		/* Stop and disconnect the PHY */
++		phylink_stop(priv->phylink);
++		phylink_disconnect_phy(priv->phylink);
+ 
+-	stmmac_disable_all_queues(priv);
++		stmmac_disable_all_queues(priv);
+ 
+-	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
+-		hrtimer_cancel(&priv->dma_conf.tx_queue[chan].txtimer);
++		for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
++			hrtimer_cancel(&priv->dma_conf.tx_queue[chan].txtimer);
+ 
+-	netif_tx_disable(dev);
++		/* Free the IRQ lines */
++		stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
+ 
+-	/* Free the IRQ lines */
+-	stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
++		if (priv->eee_enabled) {
++			priv->tx_path_in_lpi_mode = false;
++			del_timer_sync(&priv->eee_ctrl_timer);
++		}
+ 
+-	if (priv->eee_enabled) {
+-		priv->tx_path_in_lpi_mode = false;
+-		del_timer_sync(&priv->eee_ctrl_timer);
+-	}
++		/* Stop TX/RX DMA and clear the descriptors */
++		stmmac_stop_all_dma(priv);
+ 
+-	/* Stop TX/RX DMA and clear the descriptors */
+-	stmmac_stop_all_dma(priv);
++		/* Disable the MAC Rx/Tx */
++		stmmac_mac_set(priv, priv->ioaddr, false);
++
++		netif_carrier_off(dev);
++
++		if (priv->dma_cap.fpesel)
++			stmmac_fpe_stop_wq(priv);
++	}
+ 
+ 	/* Release and free the Rx/Tx resources */
+ 	free_dma_desc_resources(priv, &priv->dma_conf);
+ 
++	stmmac_release_ptp(priv);
++
+ 	/* Disable the MAC Rx/Tx */
+ 	stmmac_mac_set(priv, priv->ioaddr, false);
+ 
+@@ -3989,12 +4003,8 @@ static int stmmac_release(struct net_device *dev)
+ 
+ 	netif_carrier_off(dev);
+ 
+-	stmmac_release_ptp(priv);
+-
+-	pm_runtime_put(priv->device);
+-
+-	if (priv->dma_cap.fpesel)
+-		stmmac_fpe_stop_wq(priv);
++	if (!suspended)
++		pm_runtime_put(priv->device);
+ 
+ 	return 0;
+ }
+-- 
+2.17.1
+
