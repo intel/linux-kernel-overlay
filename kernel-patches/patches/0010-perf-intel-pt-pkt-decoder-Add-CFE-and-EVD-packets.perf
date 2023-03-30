@@ -1,0 +1,284 @@
+From b44a869ef2c516c28693fead40e79f2add201b07 Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Mon, 24 Jan 2022 10:41:39 +0200
+Subject: [PATCH 10/29] perf intel-pt: pkt-decoder: Add CFE and EVD packets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As of Intel SDM (https://www.intel.com/sdm) version 076, there is a new
+Intel PT feature called Event Trace which requires 2 new packets CFE and
+EVD. Add them to the packet decoder and packet decoder test.
+
+Committer notes:
+
+I got the "Intel® 64 and IA-32 architectures software developer’s manual
+combined volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D, and 4" PDF at:
+
+  https://cdrdv2.intel.com/v1/dl/getContent/671200
+
+And these new packets are described in page 3951:
+
+<quote>
+32.2.4
+
+Event Trace is a capability that exposes details about the asynchronous
+events, when they are generated, and when their corresponding software
+event handler completes execution. These include:
+
+o Interrupts, including NMI and SMI, including the interrupt vector when
+defined.
+
+o Faults, exceptions including the fault vector.
+
+— Page faults additionally include the page fault address, when in context.
+
+o Event handler returns, including IRET and RSM.
+
+o VM exits and VM entries.¹
+
+— VM exits include the values written to the “exit reason” and “exit qualification” VMCS fields.
+INIT and SIPI events.
+
+o TSX aborts, including the abort status returned for the RTM instructions.
+
+o Shutdown.
+
+Additionally, it provides indication of the status of the Interrupt Flag
+(IF), to indicate when interrupts are masked.
+</quote>
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Link: https://lore.kernel.org/r/20220124084201.2699795-4-adrian.hunter@intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ .../x86/tests/intel-pt-pkt-decoder-test.c     |  8 ++++
+ .../util/intel-pt-decoder/intel-pt-decoder.c  | 32 +++++++++++++++
+ .../intel-pt-decoder/intel-pt-pkt-decoder.c   | 40 +++++++++++++++++++
+ .../intel-pt-decoder/intel-pt-pkt-decoder.h   |  3 ++
+ 4 files changed, 83 insertions(+)
+
+diff --git a/tools/perf/arch/x86/tests/intel-pt-pkt-decoder-test.c b/tools/perf/arch/x86/tests/intel-pt-pkt-decoder-test.c
+index 65808dfea23cf..c7bb2b99763b8 100644
+--- a/tools/perf/arch/x86/tests/intel-pt-pkt-decoder-test.c
++++ b/tools/perf/arch/x86/tests/intel-pt-pkt-decoder-test.c
+@@ -169,6 +169,14 @@ struct test_data {
+ 	{2, {0x02, 0xb3}, INTEL_PT_BLK_4_CTX, {INTEL_PT_BEP_IP, 0, 0}, 0, 0 },
+ 	{2, {0x02, 0x33}, INTEL_PT_BLK_8_CTX, {INTEL_PT_BEP, 0, 0}, 0, 0 },
+ 	{2, {0x02, 0xb3}, INTEL_PT_BLK_8_CTX, {INTEL_PT_BEP_IP, 0, 0}, 0, 0 },
++	/* Control Flow Event Packet */
++	{4, {0x02, 0x13, 0x01, 0x03}, 0, {INTEL_PT_CFE, 1, 3}, 0, 0 },
++	{4, {0x02, 0x13, 0x81, 0x03}, 0, {INTEL_PT_CFE_IP, 1, 3}, 0, 0 },
++	{4, {0x02, 0x13, 0x1f, 0x00}, 0, {INTEL_PT_CFE, 0x1f, 0}, 0, 0 },
++	{4, {0x02, 0x13, 0x9f, 0xff}, 0, {INTEL_PT_CFE_IP, 0x1f, 0xff}, 0, 0 },
++	/*  */
++	{11, {0x02, 0x53, 0x09, 1, 2, 3, 4, 5, 6, 7}, 0, {INTEL_PT_EVD, 0x09, 0x7060504030201}, 0, 0 },
++	{11, {0x02, 0x53, 0x3f, 2, 3, 4, 5, 6, 7, 8}, 0, {INTEL_PT_EVD, 0x3f, 0x8070605040302}, 0, 0 },
+ 	/* Terminator */
+ 	{0, {0}, 0, {0, 0, 0}, 0, 0 },
+ };
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
+index b0034ee4bba50..49e2467c286e6 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
+@@ -819,6 +819,9 @@ static int intel_pt_calc_cyc_cb(struct intel_pt_pkt_info *pkt_info)
+ 	case INTEL_PT_BIP:
+ 	case INTEL_PT_BEP:
+ 	case INTEL_PT_BEP_IP:
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++	case INTEL_PT_EVD:
+ 		return 0;
+ 
+ 	case INTEL_PT_MTC:
+@@ -1872,6 +1875,9 @@ static int intel_pt_walk_psbend(struct intel_pt_decoder *decoder)
+ 		case INTEL_PT_BIP:
+ 		case INTEL_PT_BEP:
+ 		case INTEL_PT_BEP_IP:
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
+ 			decoder->have_tma = false;
+ 			intel_pt_log("ERROR: Unexpected packet\n");
+ 			err = -EAGAIN;
+@@ -1974,6 +1980,9 @@ static int intel_pt_walk_fup_tip(struct intel_pt_decoder *decoder)
+ 		case INTEL_PT_BIP:
+ 		case INTEL_PT_BEP:
+ 		case INTEL_PT_BEP_IP:
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
+ 			intel_pt_log("ERROR: Missing TIP after FUP\n");
+ 			decoder->pkt_state = INTEL_PT_STATE_ERR3;
+ 			decoder->pkt_step = 0;
+@@ -2133,6 +2142,9 @@ static int intel_pt_vm_psb_lookahead_cb(struct intel_pt_pkt_info *pkt_info)
+ 	case INTEL_PT_TIP:
+ 	case INTEL_PT_PSB:
+ 	case INTEL_PT_TRACESTOP:
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++	case INTEL_PT_EVD:
+ 	default:
+ 		return 1;
+ 	}
+@@ -2652,6 +2664,9 @@ static int intel_pt_vm_time_correlation(struct intel_pt_decoder *decoder)
+ 			decoder->blk_type = 0;
+ 			break;
+ 
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
+ 		case INTEL_PT_MODE_EXEC:
+ 		case INTEL_PT_MODE_TSX:
+ 		case INTEL_PT_MNT:
+@@ -2788,6 +2803,9 @@ static int intel_pt_hop_trace(struct intel_pt_decoder *decoder, bool *no_tip, in
+ 	case INTEL_PT_BIP:
+ 	case INTEL_PT_BEP:
+ 	case INTEL_PT_BEP_IP:
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++	case INTEL_PT_EVD:
+ 	default:
+ 		return HOP_PROCESS;
+ 	}
+@@ -2856,6 +2874,9 @@ static int intel_pt_psb_lookahead_cb(struct intel_pt_pkt_info *pkt_info)
+ 	case INTEL_PT_BIP:
+ 	case INTEL_PT_BEP:
+ 	case INTEL_PT_BEP_IP:
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++	case INTEL_PT_EVD:
+ 		if (data->after_psbend) {
+ 			data->after_psbend -= 1;
+ 			if (!data->after_psbend)
+@@ -3222,6 +3243,11 @@ static int intel_pt_walk_trace(struct intel_pt_decoder *decoder)
+ 			}
+ 			goto next;
+ 
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
++			break;
++
+ 		default:
+ 			return intel_pt_bug(decoder);
+ 		}
+@@ -3264,6 +3290,9 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
+ 		case INTEL_PT_BIP:
+ 		case INTEL_PT_BEP:
+ 		case INTEL_PT_BEP_IP:
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
+ 			intel_pt_log("ERROR: Unexpected packet\n");
+ 			err = -ENOENT;
+ 			goto out;
+@@ -3475,6 +3504,9 @@ static int intel_pt_walk_to_ip(struct intel_pt_decoder *decoder)
+ 		case INTEL_PT_BIP:
+ 		case INTEL_PT_BEP:
+ 		case INTEL_PT_BEP_IP:
++		case INTEL_PT_CFE:
++		case INTEL_PT_CFE_IP:
++		case INTEL_PT_EVD:
+ 		default:
+ 			break;
+ 		}
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
+index f737b801dd2c7..06621c39d062e 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
+@@ -64,6 +64,9 @@ static const char * const packet_name[] = {
+ 	[INTEL_PT_BIP]		= "BIP",
+ 	[INTEL_PT_BEP]		= "BEP",
+ 	[INTEL_PT_BEP_IP]	= "BEP",
++	[INTEL_PT_CFE]		= "CFE",
++	[INTEL_PT_CFE_IP]	= "CFE",
++	[INTEL_PT_EVD]		= "EVD",
+ };
+ 
+ const char *intel_pt_pkt_name(enum intel_pt_pkt_type type)
+@@ -329,6 +332,29 @@ static int intel_pt_get_bep_ip(size_t len, struct intel_pt_pkt *packet)
+ 	return 2;
+ }
+ 
++static int intel_pt_get_cfe(const unsigned char *buf, size_t len,
++			    struct intel_pt_pkt *packet)
++{
++	if (len < 4)
++		return INTEL_PT_NEED_MORE_BYTES;
++	packet->type = buf[2] & 0x80 ? INTEL_PT_CFE_IP : INTEL_PT_CFE;
++	packet->count = buf[2] & 0x1f;
++	packet->payload = buf[3];
++	return 4;
++}
++
++static int intel_pt_get_evd(const unsigned char *buf, size_t len,
++			    struct intel_pt_pkt *packet)
++{
++	if (len < 11)
++		return INTEL_PT_NEED_MORE_BYTES;
++	packet->type = INTEL_PT_EVD;
++	packet->count = buf[2] & 0x3f;
++	packet->payload = buf[3];
++	memcpy_le64(&packet->payload, buf + 3, 8);
++	return 11;
++}
++
+ static int intel_pt_get_ext(const unsigned char *buf, size_t len,
+ 			    struct intel_pt_pkt *packet)
+ {
+@@ -375,6 +401,10 @@ static int intel_pt_get_ext(const unsigned char *buf, size_t len,
+ 		return intel_pt_get_bep(len, packet);
+ 	case 0xb3: /* BEP with IP */
+ 		return intel_pt_get_bep_ip(len, packet);
++	case 0x13: /* CFE */
++		return intel_pt_get_cfe(buf, len, packet);
++	case 0x53: /* EVD */
++		return intel_pt_get_evd(buf, len, packet);
+ 	default:
+ 		return INTEL_PT_BAD_PACKET;
+ 	}
+@@ -625,6 +655,9 @@ void intel_pt_upd_pkt_ctx(const struct intel_pt_pkt *packet,
+ 	case INTEL_PT_MWAIT:
+ 	case INTEL_PT_BEP:
+ 	case INTEL_PT_BEP_IP:
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++	case INTEL_PT_EVD:
+ 		*ctx = INTEL_PT_NO_CTX;
+ 		break;
+ 	case INTEL_PT_BBP:
+@@ -753,6 +786,13 @@ int intel_pt_pkt_desc(const struct intel_pt_pkt *packet, char *buf,
+ 	case INTEL_PT_BIP:
+ 		return snprintf(buf, buf_len, "%s ID 0x%02x Value 0x%llx",
+ 				name, packet->count, payload);
++	case INTEL_PT_CFE:
++	case INTEL_PT_CFE_IP:
++		return snprintf(buf, buf_len, "%s IP:%d Type 0x%02x Vector 0x%llx",
++				name, packet->type == INTEL_PT_CFE_IP, packet->count, payload);
++	case INTEL_PT_EVD:
++		return snprintf(buf, buf_len, "%s Type 0x%02x Payload 0x%llx",
++				name, packet->count, payload);
+ 	default:
+ 		break;
+ 	}
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.h b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.h
+index 996090cb84f66..496ba4be875ca 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.h
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.h
+@@ -56,6 +56,9 @@ enum intel_pt_pkt_type {
+ 	INTEL_PT_BIP,
+ 	INTEL_PT_BEP,
+ 	INTEL_PT_BEP_IP,
++	INTEL_PT_CFE,
++	INTEL_PT_CFE_IP,
++	INTEL_PT_EVD,
+ };
+ 
+ struct intel_pt_pkt {
+-- 
+2.25.1
+
