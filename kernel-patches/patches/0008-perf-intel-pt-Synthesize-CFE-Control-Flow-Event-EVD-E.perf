@@ -1,0 +1,147 @@
+From 256cebc02ab9ec3a5514678e2b4e986e256e7786 Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Mon, 24 Jan 2022 10:41:50 +0200
+Subject: [PATCH 08/29] perf intel-pt: Synthesize CFE (Control Flow Event) /
+ EVD (Event Data) event
+
+Synthesize an attribute event and sample events for Intel PT Event Trace
+events represented by CFE and EVD packets.
+
+Committer notes:
+
+Make 'struct perf_synth_intel_evd evd[]' evd[0] at the end of 'struct
+perf_synth_intel_evt' as it is breaking the build with in many compilers
+with (e.g. clang version 13.0.0 (Fedora 13.0.0-3.fc35)):
+
+  util/intel-pt.c:2213:31: error: field 'cfe' with variable sized type 'struct perf_synth_intel_evt' not at the end of a struct or class is a GNU extension [-Werror,-Wgnu-variable-sized-type-not-at-end]
+                  struct perf_synth_intel_evt cfe;
+                                              ^
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Link: https://lore.kernel.org/r/20220124084201.2699795-15-adrian.hunter@intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/util/event.h    |  2 +-
+ tools/perf/util/intel-pt.c | 62 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/util/event.h b/tools/perf/util/event.h
+index 727b722b54382..a6ca31c3f1a5f 100644
+--- a/tools/perf/util/event.h
++++ b/tools/perf/util/event.h
+@@ -305,7 +305,7 @@ struct perf_synth_intel_evt {
+ 		};
+ 		u32	cfe;
+ 	};
+-	struct perf_synth_intel_evd evd[];
++	struct perf_synth_intel_evd evd[0];
+ };
+ 
+ struct perf_synth_intel_iflag_chg {
+diff --git a/tools/perf/util/intel-pt.c b/tools/perf/util/intel-pt.c
+index 93d126f84bf7d..eade08f038c63 100644
+--- a/tools/perf/util/intel-pt.c
++++ b/tools/perf/util/intel-pt.c
+@@ -49,6 +49,7 @@
+ #define INTEL_PT_CFG_PASS_THRU	BIT_ULL(0)
+ #define INTEL_PT_CFG_PWR_EVT_EN	BIT_ULL(4)
+ #define INTEL_PT_CFG_BRANCH_EN	BIT_ULL(13)
++#define INTEL_PT_CFG_EVT_EN	BIT_ULL(31)
+ 
+ struct range {
+ 	u64 start;
+@@ -120,6 +121,9 @@ struct intel_pt {
+ 	bool sample_pebs;
+ 	struct evsel *pebs_evsel;
+ 
++	u64 evt_sample_type;
++	u64 evt_id;
++
+ 	u64 tsc_bit;
+ 	u64 mtc_bit;
+ 	u64 mtc_freq_bits;
+@@ -2165,6 +2169,45 @@ static int intel_pt_synth_pebs_sample(struct intel_pt_queue *ptq)
+ 	return err;
+ }
+ 
++static int intel_pt_synth_events_sample(struct intel_pt_queue *ptq)
++{
++	struct intel_pt *pt = ptq->pt;
++	union perf_event *event = ptq->event_buf;
++	struct perf_sample sample = { .ip = 0, };
++	struct {
++		struct perf_synth_intel_evt cfe;
++		struct perf_synth_intel_evd evd[INTEL_PT_MAX_EVDS];
++	} raw;
++	int i;
++
++	if (intel_pt_skip_event(pt))
++		return 0;
++
++	intel_pt_prep_p_sample(pt, ptq, event, &sample);
++
++	sample.id        = ptq->pt->evt_id;
++	sample.stream_id = ptq->pt->evt_id;
++
++	raw.cfe.type     = ptq->state->cfe_type;
++	raw.cfe.reserved = 0;
++	raw.cfe.ip       = !!(ptq->state->flags & INTEL_PT_FUP_IP);
++	raw.cfe.vector   = ptq->state->cfe_vector;
++	raw.cfe.evd_cnt  = ptq->state->evd_cnt;
++
++	for (i = 0; i < ptq->state->evd_cnt; i++) {
++		raw.evd[i].et       = 0;
++		raw.evd[i].evd_type = ptq->state->evd[i].type;
++		raw.evd[i].payload  = ptq->state->evd[i].payload;
++	}
++
++	sample.raw_size = perf_synth__raw_size(raw) +
++			  ptq->state->evd_cnt * sizeof(struct perf_synth_intel_evd);
++	sample.raw_data = perf_synth__raw_data(&raw);
++
++	return intel_pt_deliver_synth_event(pt, event, &sample,
++					    pt->evt_sample_type);
++}
++
+ static int intel_pt_synth_error(struct intel_pt *pt, int code, int cpu,
+ 				pid_t pid, pid_t tid, u64 ip, u64 timestamp)
+ {
+@@ -2264,6 +2307,14 @@ static int intel_pt_sample(struct intel_pt_queue *ptq)
+ 			return err;
+ 	}
+ 
++	if (pt->synth_opts.intr_events) {
++		if (state->type & INTEL_PT_EVT) {
++			err = intel_pt_synth_events_sample(ptq);
++			if (err)
++				return err;
++		}
++	}
++
+ 	if (pt->sample_pwr_events) {
+ 		if (state->type & INTEL_PT_PSB_EVT) {
+ 			err = intel_pt_synth_psb_sample(ptq);
+@@ -3461,6 +3512,17 @@ static int intel_pt_synth_events(struct intel_pt *pt,
+ 		id += 1;
+ 	}
+ 
++	if (pt->synth_opts.intr_events && (evsel->core.attr.config & INTEL_PT_CFG_EVT_EN)) {
++		attr.config = PERF_SYNTH_INTEL_EVT;
++		err = intel_pt_synth_event(session, "evt", &attr, id);
++		if (err)
++			return err;
++		pt->evt_sample_type = attr.sample_type;
++		pt->evt_id = id;
++		intel_pt_set_event_name(evlist, id, "evt");
++		id += 1;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+
