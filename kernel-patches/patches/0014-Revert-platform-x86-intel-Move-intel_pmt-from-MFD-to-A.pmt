@@ -1,0 +1,878 @@
+From f61a4fca7e145a95ed1a58dba2a5e145c600ce0b Mon Sep 17 00:00:00 2001
+From: "Qiao, Wei" <wei.qiao@intel.com>
+Date: Fri, 24 Mar 2023 16:48:01 +0800
+Subject: [PATCH 14/35] Revert "platform/x86/intel: Move intel_pmt from MFD to
+ Auxiliary Bus"
+
+This reverts commit b497c57a2ce07987f4b7bbefb51dbce027e5f7ed.
+---
+ MAINTAINERS                            |  14 +-
+ drivers/mfd/Kconfig                    |  10 +
+ drivers/mfd/Makefile                   |   1 +
+ drivers/mfd/intel_pmt.c                | 261 ++++++++++++++++
+ drivers/platform/x86/intel/Kconfig     |  11 -
+ drivers/platform/x86/intel/Makefile    |   2 -
+ drivers/platform/x86/intel/vsec.c      | 408 -------------------------
+ drivers/platform/x86/intel/vsec.h      |  43 ---
+ drivers/platform/x86/intel_pmt_class.h |   5 +-
+ 9 files changed, 279 insertions(+), 476 deletions(-)
+ create mode 100644 drivers/mfd/intel_pmt.c
+ delete mode 100644 drivers/platform/x86/intel/vsec.c
+ delete mode 100644 drivers/platform/x86/intel/vsec.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 79ebdb62930b..7db2e27092e7 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9105,10 +9105,11 @@ F:	drivers/mfd/intel_soc_pmic*
+ F:	include/linux/mfd/intel_msic.h
+ F:	include/linux/mfd/intel_soc_pmic*
+ 
+-INTEL PMT DRIVERS
+-M:	David E. Box <david.e.box@linux.intel.com>
+-S:	Supported
+-F:	drivers/platform/x86/intel/pmt/
++INTEL PMT DRIVER
++M:	"David E. Box" <david.e.box@linux.intel.com>
++S:	Maintained
++F:	drivers/mfd/intel_pmt.c
++F:	drivers/platform/x86/intel_pmt_*
+ 
+ INTEL PRO/WIRELESS 2100, 2200BG, 2915ABG NETWORK CONNECTION SUPPORT
+ M:	Stanislav Yakovlev <stas.yakovlev@gmail.com>
+@@ -9177,11 +9178,6 @@ L:	platform-driver-x86@vger.kernel.org
+ S:	Maintained
+ F:	drivers/platform/x86/intel-uncore-frequency.c
+ 
+-INTEL VENDOR SPECIFIC EXTENDED CAPABILITIES DRIVER
+-M:	David E. Box <david.e.box@linux.intel.com>
+-S:	Supported
+-F:	drivers/platform/x86/intel/vsec.*
+-
+ INTEL VIRTUAL BUTTON DRIVER
+ M:	AceLan Kao <acelan.kao@canonical.com>
+ L:	platform-driver-x86@vger.kernel.org
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 39f4a2e89dff..dbb9d832df60 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -695,6 +695,16 @@ config MFD_INTEL_PMC_BXT
+ 	  Register and P-unit access. In addition this creates devices
+ 	  for iTCO watchdog and telemetry that are part of the PMC.
+ 
++config MFD_INTEL_PMT
++	tristate "Intel Platform Monitoring Technology (PMT) support"
++	depends on PCI
++	select MFD_CORE
++	help
++	  The Intel Platform Monitoring Technology (PMT) is an interface that
++	  provides access to hardware monitor registers. This driver supports
++	  Telemetry, Watcher, and Crashlog PMT capabilities/devices for
++	  platforms starting from Tiger Lake.
++
+ config MFD_IPAQ_MICRO
+ 	bool "Atmel Micro ASIC (iPAQ h3100/h3600/h3700) Support"
+ 	depends on SA1100_H3100 || SA1100_H3600
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 2bec479569c5..f302c9abcbda 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -217,6 +217,7 @@ obj-$(CONFIG_MFD_INTEL_LPSS_PCI)	+= intel-lpss-pci.o
+ obj-$(CONFIG_MFD_INTEL_LPSS_ACPI)	+= intel-lpss-acpi.o
+ obj-$(CONFIG_MFD_INTEL_MSIC)	+= intel_msic.o
+ obj-$(CONFIG_MFD_INTEL_PMC_BXT)	+= intel_pmc_bxt.o
++obj-$(CONFIG_MFD_INTEL_PMT)	+= intel_pmt.o
+ obj-$(CONFIG_MFD_PALMAS)	+= palmas.o
+ obj-$(CONFIG_MFD_VIPERBOARD)    += viperboard.o
+ obj-$(CONFIG_MFD_RC5T583)	+= rc5t583.o rc5t583-irq.o
+diff --git a/drivers/mfd/intel_pmt.c b/drivers/mfd/intel_pmt.c
+new file mode 100644
+index 000000000000..dd7eb614c28e
+--- /dev/null
++++ b/drivers/mfd/intel_pmt.c
+@@ -0,0 +1,261 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel Platform Monitoring Technology PMT driver
++ *
++ * Copyright (c) 2020, Intel Corporation.
++ * All Rights Reserved.
++ *
++ * Author: David E. Box <david.e.box@linux.intel.com>
++ */
++
++#include <linux/bits.h>
++#include <linux/kernel.h>
++#include <linux/mfd/core.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++#include <linux/types.h>
++
++/* Intel DVSEC capability vendor space offsets */
++#define INTEL_DVSEC_ENTRIES		0xA
++#define INTEL_DVSEC_SIZE		0xB
++#define INTEL_DVSEC_TABLE		0xC
++#define INTEL_DVSEC_TABLE_BAR(x)	((x) & GENMASK(2, 0))
++#define INTEL_DVSEC_TABLE_OFFSET(x)	((x) & GENMASK(31, 3))
++#define INTEL_DVSEC_ENTRY_SIZE		4
++
++/* PMT capabilities */
++#define DVSEC_INTEL_ID_TELEMETRY	2
++#define DVSEC_INTEL_ID_WATCHER		3
++#define DVSEC_INTEL_ID_CRASHLOG		4
++
++struct intel_dvsec_header {
++	u16	length;
++	u16	id;
++	u8	num_entries;
++	u8	entry_size;
++	u8	tbir;
++	u32	offset;
++};
++
++enum pmt_quirks {
++	/* Watcher capability not supported */
++	PMT_QUIRK_NO_WATCHER	= BIT(0),
++
++	/* Crashlog capability not supported */
++	PMT_QUIRK_NO_CRASHLOG	= BIT(1),
++
++	/* Use shift instead of mask to read discovery table offset */
++	PMT_QUIRK_TABLE_SHIFT	= BIT(2),
++
++	/* DVSEC not present (provided in driver data) */
++	PMT_QUIRK_NO_DVSEC	= BIT(3),
++};
++
++struct pmt_platform_info {
++	unsigned long quirks;
++	struct intel_dvsec_header **capabilities;
++};
++
++static const struct pmt_platform_info tgl_info = {
++	.quirks = PMT_QUIRK_NO_WATCHER | PMT_QUIRK_NO_CRASHLOG |
++		  PMT_QUIRK_TABLE_SHIFT,
++};
++
++/* DG1 Platform with DVSEC quirk*/
++static struct intel_dvsec_header dg1_telemetry = {
++	.length = 0x10,
++	.id = 2,
++	.num_entries = 1,
++	.entry_size = 3,
++	.tbir = 0,
++	.offset = 0x466000,
++};
++
++static struct intel_dvsec_header *dg1_capabilities[] = {
++	&dg1_telemetry,
++	NULL
++};
++
++static const struct pmt_platform_info dg1_info = {
++	.quirks = PMT_QUIRK_NO_DVSEC,
++	.capabilities = dg1_capabilities,
++};
++
++static int pmt_add_dev(struct pci_dev *pdev, struct intel_dvsec_header *header,
++		       unsigned long quirks)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res, *tmp;
++	struct mfd_cell *cell;
++	const char *name;
++	int count = header->num_entries;
++	int size = header->entry_size;
++	int id = header->id;
++	int i;
++
++	switch (id) {
++	case DVSEC_INTEL_ID_TELEMETRY:
++		name = "pmt_telemetry";
++		break;
++	case DVSEC_INTEL_ID_WATCHER:
++		if (quirks & PMT_QUIRK_NO_WATCHER) {
++			dev_info(dev, "Watcher not supported\n");
++			return -EINVAL;
++		}
++		name = "pmt_watcher";
++		break;
++	case DVSEC_INTEL_ID_CRASHLOG:
++		if (quirks & PMT_QUIRK_NO_CRASHLOG) {
++			dev_info(dev, "Crashlog not supported\n");
++			return -EINVAL;
++		}
++		name = "pmt_crashlog";
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!header->num_entries || !header->entry_size) {
++		dev_err(dev, "Invalid count or size for %s header\n", name);
++		return -EINVAL;
++	}
++
++	cell = devm_kzalloc(dev, sizeof(*cell), GFP_KERNEL);
++	if (!cell)
++		return -ENOMEM;
++
++	res = devm_kcalloc(dev, count, sizeof(*res), GFP_KERNEL);
++	if (!res)
++		return -ENOMEM;
++
++	if (quirks & PMT_QUIRK_TABLE_SHIFT)
++		header->offset >>= 3;
++
++	/*
++	 * The PMT DVSEC contains the starting offset and count for a block of
++	 * discovery tables, each providing access to monitoring facilities for
++	 * a section of the device. Create a resource list of these tables to
++	 * provide to the driver.
++	 */
++	for (i = 0, tmp = res; i < count; i++, tmp++) {
++		tmp->start = pdev->resource[header->tbir].start +
++			     header->offset + i * (size << 2);
++		tmp->end = tmp->start + (size << 2) - 1;
++		tmp->flags = IORESOURCE_MEM;
++	}
++
++	cell->resources = res;
++	cell->num_resources = count;
++	cell->name = name;
++
++	return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, cell, 1, NULL, 0,
++				    NULL);
++}
++
++static int pmt_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct pmt_platform_info *info;
++	unsigned long quirks = 0;
++	bool found_devices = false;
++	int ret, pos = 0;
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	info = (struct pmt_platform_info *)id->driver_data;
++
++	if (info)
++		quirks = info->quirks;
++
++	if (info && (info->quirks & PMT_QUIRK_NO_DVSEC)) {
++		struct intel_dvsec_header **header;
++
++		header = info->capabilities;
++		while (*header) {
++			ret = pmt_add_dev(pdev, *header, quirks);
++			if (ret)
++				dev_warn(&pdev->dev,
++					 "Failed to add device for DVSEC id %d\n",
++					 (*header)->id);
++			else
++				found_devices = true;
++
++			++header;
++		}
++	} else {
++		do {
++			struct intel_dvsec_header header;
++			u32 table;
++			u16 vid;
++
++			pos = pci_find_next_ext_capability(pdev, pos, PCI_EXT_CAP_ID_DVSEC);
++			if (!pos)
++				break;
++
++			pci_read_config_word(pdev, pos + PCI_DVSEC_HEADER1, &vid);
++			if (vid != PCI_VENDOR_ID_INTEL)
++				continue;
++
++			pci_read_config_word(pdev, pos + PCI_DVSEC_HEADER2,
++					     &header.id);
++			pci_read_config_byte(pdev, pos + INTEL_DVSEC_ENTRIES,
++					     &header.num_entries);
++			pci_read_config_byte(pdev, pos + INTEL_DVSEC_SIZE,
++					     &header.entry_size);
++			pci_read_config_dword(pdev, pos + INTEL_DVSEC_TABLE,
++					      &table);
++
++			header.tbir = INTEL_DVSEC_TABLE_BAR(table);
++			header.offset = INTEL_DVSEC_TABLE_OFFSET(table);
++
++			ret = pmt_add_dev(pdev, &header, quirks);
++			if (ret)
++				continue;
++
++			found_devices = true;
++		} while (true);
++	}
++
++	if (!found_devices)
++		return -ENODEV;
++
++	pm_runtime_put(&pdev->dev);
++	pm_runtime_allow(&pdev->dev);
++
++	return 0;
++}
++
++static void pmt_pci_remove(struct pci_dev *pdev)
++{
++	pm_runtime_forbid(&pdev->dev);
++	pm_runtime_get_sync(&pdev->dev);
++}
++
++#define PCI_DEVICE_ID_INTEL_PMT_ADL	0x467d
++#define PCI_DEVICE_ID_INTEL_PMT_DG1	0x490e
++#define PCI_DEVICE_ID_INTEL_PMT_OOBMSM	0x09a7
++#define PCI_DEVICE_ID_INTEL_PMT_TGL	0x9a0d
++static const struct pci_device_id pmt_pci_ids[] = {
++	{ PCI_DEVICE_DATA(INTEL, PMT_ADL, &tgl_info) },
++	{ PCI_DEVICE_DATA(INTEL, PMT_DG1, &dg1_info) },
++	{ PCI_DEVICE_DATA(INTEL, PMT_OOBMSM, NULL) },
++	{ PCI_DEVICE_DATA(INTEL, PMT_TGL, &tgl_info) },
++	{ }
++};
++MODULE_DEVICE_TABLE(pci, pmt_pci_ids);
++
++static struct pci_driver pmt_pci_driver = {
++	.name = "intel-pmt",
++	.id_table = pmt_pci_ids,
++	.probe = pmt_pci_probe,
++	.remove = pmt_pci_remove,
++};
++module_pci_driver(pmt_pci_driver);
++
++MODULE_AUTHOR("David E. Box <david.e.box@linux.intel.com>");
++MODULE_DESCRIPTION("Intel Platform Monitoring Technology PMT driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/platform/x86/intel/Kconfig b/drivers/platform/x86/intel/Kconfig
+index d516a51845a4..3a38f124356f 100644
+--- a/drivers/platform/x86/intel/Kconfig
++++ b/drivers/platform/x86/intel/Kconfig
+@@ -4,14 +4,3 @@
+ #
+ 
+ source "drivers/platform/x86/intel/pmc/Kconfig"
+-
+-config INTEL_VSEC
+-	tristate "Intel Vendor Specific Extended Capabilities Driver"
+-	depends on PCI
+-	select AUXILIARY_BUS
+-	help
+-	  Adds support for feature drivers exposed using Intel PCIe VSEC and
+-	  DVSEC.
+-
+-	  To compile this driver as a module, choose M here: the module will
+-	  be called intel_vsec.
+diff --git a/drivers/platform/x86/intel/Makefile b/drivers/platform/x86/intel/Makefile
+index 405ce110d4de..0934d3c2f7f2 100644
+--- a/drivers/platform/x86/intel/Makefile
++++ b/drivers/platform/x86/intel/Makefile
+@@ -5,5 +5,3 @@
+ #
+ 
+ obj-$(CONFIG_INTEL_PMC_CORE)		+= pmc/
+-intel_vsec-y				:= vsec.o
+-obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
+diff --git a/drivers/platform/x86/intel/vsec.c b/drivers/platform/x86/intel/vsec.c
+deleted file mode 100644
+index c3bdd75ed690..000000000000
+--- a/drivers/platform/x86/intel/vsec.c
++++ /dev/null
+@@ -1,408 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Intel Vendor Specific Extended Capabilities auxiliary bus driver
+- *
+- * Copyright (c) 2021, Intel Corporation.
+- * All Rights Reserved.
+- *
+- * Author: David E. Box <david.e.box@linux.intel.com>
+- *
+- * This driver discovers and creates auxiliary devices for Intel defined PCIe
+- * "Vendor Specific" and "Designated Vendor Specific" Extended Capabilities,
+- * VSEC and DVSEC respectively. The driver supports features on specific PCIe
+- * endpoints that exist primarily to expose them.
+- */
+-
+-#include <linux/auxiliary_bus.h>
+-#include <linux/bits.h>
+-#include <linux/kernel.h>
+-#include <linux/idr.h>
+-#include <linux/module.h>
+-#include <linux/pci.h>
+-#include <linux/types.h>
+-
+-#include "vsec.h"
+-
+-/* Intel DVSEC offsets */
+-#define INTEL_DVSEC_ENTRIES		0xA
+-#define INTEL_DVSEC_SIZE		0xB
+-#define INTEL_DVSEC_TABLE		0xC
+-#define INTEL_DVSEC_TABLE_BAR(x)	((x) & GENMASK(2, 0))
+-#define INTEL_DVSEC_TABLE_OFFSET(x)	((x) & GENMASK(31, 3))
+-#define TABLE_OFFSET_SHIFT		3
+-
+-static DEFINE_IDA(intel_vsec_ida);
+-
+-/**
+- * struct intel_vsec_header - Common fields of Intel VSEC and DVSEC registers.
+- * @rev:         Revision ID of the VSEC/DVSEC register space
+- * @length:      Length of the VSEC/DVSEC register space
+- * @id:          ID of the feature
+- * @num_entries: Number of instances of the feature
+- * @entry_size:  Size of the discovery table for each feature
+- * @tbir:        BAR containing the discovery tables
+- * @offset:      BAR offset of start of the first discovery table
+- */
+-struct intel_vsec_header {
+-	u8	rev;
+-	u16	length;
+-	u16	id;
+-	u8	num_entries;
+-	u8	entry_size;
+-	u8	tbir;
+-	u32	offset;
+-};
+-
+-/* Platform specific data */
+-struct intel_vsec_platform_info {
+-	struct intel_vsec_header **capabilities;
+-	unsigned long quirks;
+-};
+-
+-enum intel_vsec_id {
+-	VSEC_ID_TELEMETRY	= 2,
+-	VSEC_ID_WATCHER		= 3,
+-	VSEC_ID_CRASHLOG	= 4,
+-};
+-
+-static enum intel_vsec_id intel_vsec_allow_list[] = {
+-	VSEC_ID_TELEMETRY,
+-	VSEC_ID_WATCHER,
+-	VSEC_ID_CRASHLOG,
+-};
+-
+-static const char *intel_vsec_name(enum intel_vsec_id id)
+-{
+-	switch (id) {
+-	case VSEC_ID_TELEMETRY:
+-		return "telemetry";
+-
+-	case VSEC_ID_WATCHER:
+-		return "watcher";
+-
+-	case VSEC_ID_CRASHLOG:
+-		return "crashlog";
+-
+-	default:
+-		return NULL;
+-	}
+-}
+-
+-static bool intel_vsec_allowed(u16 id)
+-{
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(intel_vsec_allow_list); i++)
+-		if (intel_vsec_allow_list[i] == id)
+-			return true;
+-
+-	return false;
+-}
+-
+-static bool intel_vsec_disabled(u16 id, unsigned long quirks)
+-{
+-	switch (id) {
+-	case VSEC_ID_WATCHER:
+-		return !!(quirks & VSEC_QUIRK_NO_WATCHER);
+-
+-	case VSEC_ID_CRASHLOG:
+-		return !!(quirks & VSEC_QUIRK_NO_CRASHLOG);
+-
+-	default:
+-		return false;
+-	}
+-}
+-
+-static void intel_vsec_remove_aux(void *data)
+-{
+-	auxiliary_device_delete(data);
+-	auxiliary_device_uninit(data);
+-}
+-
+-static void intel_vsec_dev_release(struct device *dev)
+-{
+-	struct intel_vsec_device *intel_vsec_dev = dev_to_ivdev(dev);
+-
+-	ida_free(intel_vsec_dev->ida, intel_vsec_dev->auxdev.id);
+-	kfree(intel_vsec_dev->resource);
+-	kfree(intel_vsec_dev);
+-}
+-
+-static int intel_vsec_add_aux(struct pci_dev *pdev, struct intel_vsec_device *intel_vsec_dev,
+-			      const char *name)
+-{
+-	struct auxiliary_device *auxdev = &intel_vsec_dev->auxdev;
+-	int ret;
+-
+-	ret = ida_alloc(intel_vsec_dev->ida, GFP_KERNEL);
+-	if (ret < 0) {
+-		kfree(intel_vsec_dev);
+-		return ret;
+-	}
+-
+-	auxdev->id = ret;
+-	auxdev->name = name;
+-	auxdev->dev.parent = &pdev->dev;
+-	auxdev->dev.release = intel_vsec_dev_release;
+-
+-	ret = auxiliary_device_init(auxdev);
+-	if (ret < 0) {
+-		ida_free(intel_vsec_dev->ida, auxdev->id);
+-		kfree(intel_vsec_dev->resource);
+-		kfree(intel_vsec_dev);
+-		return ret;
+-	}
+-
+-	ret = auxiliary_device_add(auxdev);
+-	if (ret < 0) {
+-		auxiliary_device_uninit(auxdev);
+-		return ret;
+-	}
+-
+-	return devm_add_action_or_reset(&pdev->dev, intel_vsec_remove_aux, auxdev);
+-}
+-
+-static int intel_vsec_add_dev(struct pci_dev *pdev, struct intel_vsec_header *header,
+-			   unsigned long quirks)
+-{
+-	struct intel_vsec_device *intel_vsec_dev;
+-	struct resource *res, *tmp;
+-	int i;
+-
+-	if (!intel_vsec_allowed(header->id) || intel_vsec_disabled(header->id, quirks))
+-		return -EINVAL;
+-
+-	if (!header->num_entries) {
+-		dev_dbg(&pdev->dev, "Invalid 0 entry count for header id %d\n", header->id);
+-		return -EINVAL;
+-	}
+-
+-	if (!header->entry_size) {
+-		dev_dbg(&pdev->dev, "Invalid 0 entry size for header id %d\n", header->id);
+-		return -EINVAL;
+-	}
+-
+-	intel_vsec_dev = kzalloc(sizeof(*intel_vsec_dev), GFP_KERNEL);
+-	if (!intel_vsec_dev)
+-		return -ENOMEM;
+-
+-	res = kcalloc(header->num_entries, sizeof(*res), GFP_KERNEL);
+-	if (!res) {
+-		kfree(intel_vsec_dev);
+-		return -ENOMEM;
+-	}
+-
+-	if (quirks & VSEC_QUIRK_TABLE_SHIFT)
+-		header->offset >>= TABLE_OFFSET_SHIFT;
+-
+-	/*
+-	 * The DVSEC/VSEC contains the starting offset and count for a block of
+-	 * discovery tables. Create a resource array of these tables to the
+-	 * auxiliary device driver.
+-	 */
+-	for (i = 0, tmp = res; i < header->num_entries; i++, tmp++) {
+-		tmp->start = pdev->resource[header->tbir].start +
+-			     header->offset + i * (header->entry_size * sizeof(u32));
+-		tmp->end = tmp->start + (header->entry_size * sizeof(u32)) - 1;
+-		tmp->flags = IORESOURCE_MEM;
+-	}
+-
+-	intel_vsec_dev->pcidev = pdev;
+-	intel_vsec_dev->resource = res;
+-	intel_vsec_dev->num_resources = header->num_entries;
+-	intel_vsec_dev->quirks = quirks;
+-	intel_vsec_dev->ida = &intel_vsec_ida;
+-
+-	return intel_vsec_add_aux(pdev, intel_vsec_dev, intel_vsec_name(header->id));
+-}
+-
+-static bool intel_vsec_walk_header(struct pci_dev *pdev, unsigned long quirks,
+-				struct intel_vsec_header **header)
+-{
+-	bool have_devices = false;
+-	int ret;
+-
+-	for ( ; *header; header++) {
+-		ret = intel_vsec_add_dev(pdev, *header, quirks);
+-		if (ret)
+-			dev_info(&pdev->dev, "Could not add device for DVSEC id %d\n",
+-				 (*header)->id);
+-		else
+-			have_devices = true;
+-	}
+-
+-	return have_devices;
+-}
+-
+-static bool intel_vsec_walk_dvsec(struct pci_dev *pdev, unsigned long quirks)
+-{
+-	bool have_devices = false;
+-	int pos = 0;
+-
+-	do {
+-		struct intel_vsec_header header;
+-		u32 table, hdr;
+-		u16 vid;
+-		int ret;
+-
+-		pos = pci_find_next_ext_capability(pdev, pos, PCI_EXT_CAP_ID_DVSEC);
+-		if (!pos)
+-			break;
+-
+-		pci_read_config_dword(pdev, pos + PCI_DVSEC_HEADER1, &hdr);
+-		vid = PCI_DVSEC_HEADER1_VID(hdr);
+-		if (vid != PCI_VENDOR_ID_INTEL)
+-			continue;
+-
+-		/* Support only revision 1 */
+-		header.rev = PCI_DVSEC_HEADER1_REV(hdr);
+-		if (header.rev != 1) {
+-			dev_info(&pdev->dev, "Unsupported DVSEC revision %d\n", header.rev);
+-			continue;
+-		}
+-
+-		header.length = PCI_DVSEC_HEADER1_LEN(hdr);
+-
+-		pci_read_config_byte(pdev, pos + INTEL_DVSEC_ENTRIES, &header.num_entries);
+-		pci_read_config_byte(pdev, pos + INTEL_DVSEC_SIZE, &header.entry_size);
+-		pci_read_config_dword(pdev, pos + INTEL_DVSEC_TABLE, &table);
+-
+-		header.tbir = INTEL_DVSEC_TABLE_BAR(table);
+-		header.offset = INTEL_DVSEC_TABLE_OFFSET(table);
+-
+-		pci_read_config_dword(pdev, pos + PCI_DVSEC_HEADER2, &hdr);
+-		header.id = PCI_DVSEC_HEADER2_ID(hdr);
+-
+-		ret = intel_vsec_add_dev(pdev, &header, quirks);
+-		if (ret)
+-			continue;
+-
+-		have_devices = true;
+-	} while (true);
+-
+-	return have_devices;
+-}
+-
+-static bool intel_vsec_walk_vsec(struct pci_dev *pdev, unsigned long quirks)
+-{
+-	bool have_devices = false;
+-	int pos = 0;
+-
+-	do {
+-		struct intel_vsec_header header;
+-		u32 table, hdr;
+-		int ret;
+-
+-		pos = pci_find_next_ext_capability(pdev, pos, PCI_EXT_CAP_ID_VNDR);
+-		if (!pos)
+-			break;
+-
+-		pci_read_config_dword(pdev, pos + PCI_VNDR_HEADER, &hdr);
+-
+-		/* Support only revision 1 */
+-		header.rev = PCI_VNDR_HEADER_REV(hdr);
+-		if (header.rev != 1) {
+-			dev_info(&pdev->dev, "Unsupported VSEC revision %d\n", header.rev);
+-			continue;
+-		}
+-
+-		header.id = PCI_VNDR_HEADER_ID(hdr);
+-		header.length = PCI_VNDR_HEADER_LEN(hdr);
+-
+-		/* entry, size, and table offset are the same as DVSEC */
+-		pci_read_config_byte(pdev, pos + INTEL_DVSEC_ENTRIES, &header.num_entries);
+-		pci_read_config_byte(pdev, pos + INTEL_DVSEC_SIZE, &header.entry_size);
+-		pci_read_config_dword(pdev, pos + INTEL_DVSEC_TABLE, &table);
+-
+-		header.tbir = INTEL_DVSEC_TABLE_BAR(table);
+-		header.offset = INTEL_DVSEC_TABLE_OFFSET(table);
+-
+-		ret = intel_vsec_add_dev(pdev, &header, quirks);
+-		if (ret)
+-			continue;
+-
+-		have_devices = true;
+-	} while (true);
+-
+-	return have_devices;
+-}
+-
+-static int intel_vsec_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+-{
+-	struct intel_vsec_platform_info *info;
+-	bool have_devices = false;
+-	unsigned long quirks = 0;
+-	int ret;
+-
+-	ret = pcim_enable_device(pdev);
+-	if (ret)
+-		return ret;
+-
+-	info = (struct intel_vsec_platform_info *)id->driver_data;
+-	if (info)
+-		quirks = info->quirks;
+-
+-	if (intel_vsec_walk_dvsec(pdev, quirks))
+-		have_devices = true;
+-
+-	if (intel_vsec_walk_vsec(pdev, quirks))
+-		have_devices = true;
+-
+-	if (info && (info->quirks & VSEC_QUIRK_NO_DVSEC) &&
+-	    intel_vsec_walk_header(pdev, quirks, info->capabilities))
+-		have_devices = true;
+-
+-	if (!have_devices)
+-		return -ENODEV;
+-
+-	return 0;
+-}
+-
+-/* TGL info */
+-static const struct intel_vsec_platform_info tgl_info = {
+-	.quirks = VSEC_QUIRK_NO_WATCHER | VSEC_QUIRK_NO_CRASHLOG | VSEC_QUIRK_TABLE_SHIFT,
+-};
+-
+-/* DG1 info */
+-static struct intel_vsec_header dg1_telemetry = {
+-	.length = 0x10,
+-	.id = 2,
+-	.num_entries = 1,
+-	.entry_size = 3,
+-	.tbir = 0,
+-	.offset = 0x466000,
+-};
+-
+-static struct intel_vsec_header *dg1_capabilities[] = {
+-	&dg1_telemetry,
+-	NULL
+-};
+-
+-static const struct intel_vsec_platform_info dg1_info = {
+-	.capabilities = dg1_capabilities,
+-	.quirks = VSEC_QUIRK_NO_DVSEC,
+-};
+-
+-#define PCI_DEVICE_ID_INTEL_VSEC_ADL		0x467d
+-#define PCI_DEVICE_ID_INTEL_VSEC_DG1		0x490e
+-#define PCI_DEVICE_ID_INTEL_VSEC_OOBMSM		0x09a7
+-#define PCI_DEVICE_ID_INTEL_VSEC_TGL		0x9a0d
+-static const struct pci_device_id intel_vsec_pci_ids[] = {
+-	{ PCI_DEVICE_DATA(INTEL, VSEC_ADL, &tgl_info) },
+-	{ PCI_DEVICE_DATA(INTEL, VSEC_DG1, &dg1_info) },
+-	{ PCI_DEVICE_DATA(INTEL, VSEC_OOBMSM, NULL) },
+-	{ PCI_DEVICE_DATA(INTEL, VSEC_TGL, &tgl_info) },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(pci, intel_vsec_pci_ids);
+-
+-static struct pci_driver intel_vsec_pci_driver = {
+-	.name = "intel_vsec",
+-	.id_table = intel_vsec_pci_ids,
+-	.probe = intel_vsec_pci_probe,
+-};
+-module_pci_driver(intel_vsec_pci_driver);
+-
+-MODULE_AUTHOR("David E. Box <david.e.box@linux.intel.com>");
+-MODULE_DESCRIPTION("Intel Extended Capabilities auxiliary bus driver");
+-MODULE_LICENSE("GPL v2");
+diff --git a/drivers/platform/x86/intel/vsec.h b/drivers/platform/x86/intel/vsec.h
+deleted file mode 100644
+index 4cc36678e8c5..000000000000
+--- a/drivers/platform/x86/intel/vsec.h
++++ /dev/null
+@@ -1,43 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef _VSEC_H
+-#define _VSEC_H
+-
+-#include <linux/auxiliary_bus.h>
+-#include <linux/bits.h>
+-
+-struct pci_dev;
+-struct resource;
+-
+-enum intel_vsec_quirks {
+-	/* Watcher feature not supported */
+-	VSEC_QUIRK_NO_WATCHER	= BIT(0),
+-
+-	/* Crashlog feature not supported */
+-	VSEC_QUIRK_NO_CRASHLOG	= BIT(1),
+-
+-	/* Use shift instead of mask to read discovery table offset */
+-	VSEC_QUIRK_TABLE_SHIFT	= BIT(2),
+-
+-	/* DVSEC not present (provided in driver data) */
+-	VSEC_QUIRK_NO_DVSEC	= BIT(3),
+-};
+-
+-struct intel_vsec_device {
+-	struct auxiliary_device auxdev;
+-	struct pci_dev *pcidev;
+-	struct resource *resource;
+-	struct ida *ida;
+-	unsigned long quirks;
+-	int num_resources;
+-};
+-
+-static inline struct intel_vsec_device *dev_to_ivdev(struct device *dev)
+-{
+-	return container_of(dev, struct intel_vsec_device, auxdev.dev);
+-}
+-
+-static inline struct intel_vsec_device *auxdev_to_ivdev(struct auxiliary_device *auxdev)
+-{
+-	return container_of(auxdev, struct intel_vsec_device, auxdev);
+-}
+-#endif
+diff --git a/drivers/platform/x86/intel_pmt_class.h b/drivers/platform/x86/intel_pmt_class.h
+index db11d58867ce..1337019c2873 100644
+--- a/drivers/platform/x86/intel_pmt_class.h
++++ b/drivers/platform/x86/intel_pmt_class.h
+@@ -2,14 +2,13 @@
+ #ifndef _INTEL_PMT_CLASS_H
+ #define _INTEL_PMT_CLASS_H
+ 
++#include <linux/platform_device.h>
+ #include <linux/xarray.h>
+ #include <linux/types.h>
+ #include <linux/bits.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ 
+-#include "../vsec.h"
+-
+ /* PMT access types */
+ #define ACCESS_BARID		2
+ #define ACCESS_LOCAL		3
+@@ -48,7 +47,7 @@ struct intel_pmt_namespace {
+ bool intel_pmt_is_early_client_hw(struct device *dev);
+ int intel_pmt_dev_create(struct intel_pmt_entry *entry,
+ 			 struct intel_pmt_namespace *ns,
+-			 struct intel_vsec_device *dev, int idx);
++			 struct platform_device *pdev, int idx);
+ void intel_pmt_dev_destroy(struct intel_pmt_entry *entry,
+ 			   struct intel_pmt_namespace *ns);
+ #endif
+-- 
+2.25.1
+
