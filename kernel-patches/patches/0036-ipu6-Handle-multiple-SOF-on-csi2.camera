@@ -1,0 +1,246 @@
+From d00ed5e51748b20df6cf70792d2adeb8f261f2c8 Mon Sep 17 00:00:00 2001
+From: zouxiaoh <xiaohong.zou@intel.com>
+Date: Wed, 22 Mar 2023 15:44:57 +0800
+Subject: [PATCH 36/60] ipu6: Handle multiple SOF on csi2
+
+[Issue]
+For VC cases, more than 1 SOF will be generated from
+csi2 device. IPU driver needs to handle multiple SOF cases.
+
+[Test Platform]
+ADLRVP+ti960+4ximx390
+
+Signed-off-by: Qingwu Zhang <qingwu.zhang@intel.com>
+Signed-off-by: zouxiaoh <xiaohong.zou@intel.com>
+---
+ drivers/media/pci/intel/ipu-isys-csi2.c       | 51 ++++++++++---------
+ drivers/media/pci/intel/ipu-isys-csi2.h       |  9 ++--
+ drivers/media/pci/intel/ipu-isys.c            |  4 +-
+ .../intel/ipu6/ipu-platform-isys-csi2-reg.h   |  4 +-
+ .../media/pci/intel/ipu6/ipu-platform-isys.h  |  3 +-
+ drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c | 12 +++--
+ 6 files changed, 46 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.c b/drivers/media/pci/intel/ipu-isys-csi2.c
+index b4a9be0dcb90..60a4891d15f7 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2.c
+@@ -535,7 +535,7 @@ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
+ 	return rval;
+ }
+ 
+-void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2)
++void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2, unsigned int vc)
+ {
+ 	struct ipu_isys_pipeline *ip = NULL;
+ 	struct v4l2_event ev = {
+@@ -546,10 +546,11 @@ void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2)
+ 	unsigned int i;
+ 
+ 	spin_lock_irqsave(&csi2->isys->lock, flags);
+-	csi2->in_frame = true;
++	csi2->in_frame[vc] = true;
+ 
+ 	for (i = 0; i < IPU_ISYS_MAX_STREAMS; i++) {
+ 		if (csi2->isys->pipes[i] &&
++		    csi2->isys->pipes[i]->vc == vc &&
+ 		    csi2->isys->pipes[i]->csi2 == csi2) {
+ 			ip = csi2->isys->pipes[i];
+ 			break;
+@@ -567,11 +568,11 @@ void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2)
+ 
+ 	v4l2_event_queue(vdev, &ev);
+ 	dev_dbg(&csi2->isys->adev->dev,
+-		"sof_event::csi2-%i sequence: %i\n",
+-		csi2->index, ev.u.frame_sync.frame_sequence);
++		"sof_event::csi2-%i CPU-timestamp:%lld, sequence:%i, vc:%d\n",
++		csi2->index, ktime_get_ns(), ev.u.frame_sync.frame_sequence, vc);
+ }
+ 
+-void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2)
++void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2, unsigned int vc)
+ {
+ 	struct ipu_isys_pipeline *ip = NULL;
+ 	unsigned long flags;
+@@ -579,12 +580,13 @@ void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2)
+ 	u32 frame_sequence;
+ 
+ 	spin_lock_irqsave(&csi2->isys->lock, flags);
+-	csi2->in_frame = false;
+-	if (csi2->wait_for_sync)
++	csi2->in_frame[vc] = false;
++	if (csi2->wait_for_sync[vc])
+ 		complete(&csi2->eof_completion);
+ 
+ 	for (i = 0; i < IPU_ISYS_MAX_STREAMS; i++) {
+ 		if (csi2->isys->pipes[i] &&
++		    csi2->isys->pipes[i]->vc == vc &&
+ 		    csi2->isys->pipes[i]->csi2 == csi2) {
+ 			ip = csi2->isys->pipes[i];
+ 			break;
+@@ -596,8 +598,8 @@ void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2)
+ 		spin_unlock_irqrestore(&csi2->isys->lock, flags);
+ 
+ 		dev_dbg(&csi2->isys->adev->dev,
+-			"eof_event::csi2-%i sequence: %i\n",
+-			csi2->index, frame_sequence);
++			"eof_event: csi2-%i sequence: %i, vc: %d\n",
++			csi2->index, frame_sequence, vc);
+ 		return;
+ 	}
+ 
+@@ -608,24 +610,27 @@ void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2)
+ void ipu_isys_csi2_wait_last_eof(struct ipu_isys_csi2 *csi2)
+ {
+ 	unsigned long flags, tout;
++	unsigned int i;
+ 
+-	spin_lock_irqsave(&csi2->isys->lock, flags);
++	for (i = 0; i < NR_OF_CSI2_VC; i++) {
++		spin_lock_irqsave(&csi2->isys->lock, flags);
++
++		if (!csi2->in_frame[i]) {
++			spin_unlock_irqrestore(&csi2->isys->lock, flags);
++			continue;
++		}
+ 
+-	if (!csi2->in_frame) {
++		reinit_completion(&csi2->eof_completion);
++		csi2->wait_for_sync[i] = true;
+ 		spin_unlock_irqrestore(&csi2->isys->lock, flags);
+-		return;
++		tout = wait_for_completion_timeout(&csi2->eof_completion,
++						   IPU_EOF_TIMEOUT_JIFFIES);
++		if (!tout)
++			dev_err(&csi2->isys->adev->dev,
++				"csi2-%d: timeout at sync to eof of vc %d\n",
++				csi2->index, i);
++		csi2->wait_for_sync[i] = false;
+ 	}
+-
+-	reinit_completion(&csi2->eof_completion);
+-	csi2->wait_for_sync = true;
+-	spin_unlock_irqrestore(&csi2->isys->lock, flags);
+-	tout = wait_for_completion_timeout(&csi2->eof_completion,
+-					   IPU_EOF_TIMEOUT_JIFFIES);
+-	if (!tout)
+-		dev_err(&csi2->isys->adev->dev,
+-			"csi2-%d: timeout at sync to eof\n",
+-			csi2->index);
+-	csi2->wait_for_sync = false;
+ }
+ 
+ struct ipu_isys_buffer *
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.h b/drivers/media/pci/intel/ipu-isys-csi2.h
+index e7f99ab2fe41..15c19bb09d4a 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.h
++++ b/drivers/media/pci/intel/ipu-isys-csi2.h
+@@ -89,9 +89,10 @@ struct ipu_isys_csi2 {
+ 	unsigned int nlanes;
+ 	unsigned int index;
+ 	atomic_t sof_sequence;
++	bool in_frame[NR_OF_CSI2_VC];
++	bool wait_for_sync[NR_OF_CSI2_VC];
++
+ 	unsigned int stream_count;
+-	bool in_frame;
+-	bool wait_for_sync;
+ 
+ 	struct v4l2_ctrl *store_csi2_header;
+ };
+@@ -149,8 +150,8 @@ void ipu_isys_csi2_cleanup(struct ipu_isys_csi2 *csi2);
+ struct ipu_isys_buffer *
+ ipu_isys_csi2_get_short_packet_buffer(struct ipu_isys_pipeline *ip,
+ 				      struct ipu_isys_buffer_list *bl);
+-void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2);
+-void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2);
++void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2, unsigned int vc);
++void ipu_isys_csi2_eof_event(struct ipu_isys_csi2 *csi2, unsigned int vc);
+ void ipu_isys_csi2_wait_last_eof(struct ipu_isys_csi2 *csi2);
+ 
+ /* interface for platform specific */
+diff --git a/drivers/media/pci/intel/ipu-isys.c b/drivers/media/pci/intel/ipu-isys.c
+index 09f0bf3958ff..afe6b21b44d3 100644
+--- a/drivers/media/pci/intel/ipu-isys.c
++++ b/drivers/media/pci/intel/ipu-isys.c
+@@ -1153,7 +1153,7 @@ int isys_isr_one(struct ipu_bus_device *adev)
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_FRAME_SOF:
+ 		if (pipe->csi2)
+-			ipu_isys_csi2_sof_event(pipe->csi2);
++			ipu_isys_csi2_sof_event(pipe->csi2, pipe->vc);
+ 
+ 		pipe->seq[pipe->seq_index].sequence =
+ 		    atomic_read(&pipe->sequence) - 1;
+@@ -1167,7 +1167,7 @@ int isys_isr_one(struct ipu_bus_device *adev)
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_FRAME_EOF:
+ 		if (pipe->csi2)
+-			ipu_isys_csi2_eof_event(pipe->csi2);
++			ipu_isys_csi2_eof_event(pipe->csi2, pipe->vc);
+ 
+ 		dev_dbg(&adev->dev,
+ 			"eof: handle %d: (index %u), timestamp 0x%16.16llx\n",
+diff --git a/drivers/media/pci/intel/ipu6/ipu-platform-isys-csi2-reg.h b/drivers/media/pci/intel/ipu6/ipu-platform-isys-csi2-reg.h
+index 6cfad53e16eb..e3a9437fd5c9 100644
+--- a/drivers/media/pci/intel/ipu6/ipu-platform-isys-csi2-reg.h
++++ b/drivers/media/pci/intel/ipu6/ipu-platform-isys-csi2-reg.h
+@@ -54,8 +54,8 @@
+ #define CSI_RX_NUM_ERRORS_IN_IRQ		20
+ #define CSI_RX_NUM_IRQ				32
+ 
+-#define IPU_CSI_RX_IRQ_FS_VC		1
+-#define IPU_CSI_RX_IRQ_FE_VC		2
++#define IPU_CSI_RX_IRQ_FS_VC(chn)	(1 << ((chn) * 2))
++#define IPU_CSI_RX_IRQ_FE_VC(chn)	(2 << ((chn) * 2))
+ 
+ /* PPI2CSI */
+ #define CSI_REG_PPI2CSI_ENABLE                  0x200
+diff --git a/drivers/media/pci/intel/ipu6/ipu-platform-isys.h b/drivers/media/pci/intel/ipu6/ipu-platform-isys.h
+index ce2aae70c3c1..961a11f5f2eb 100644
+--- a/drivers/media/pci/intel/ipu6/ipu-platform-isys.h
++++ b/drivers/media/pci/intel/ipu6/ipu-platform-isys.h
+@@ -10,9 +10,8 @@
+  * FW support max 16 streams
+  */
+ #define IPU_ISYS_MAX_STREAMS		16
+-
+ #define NR_OF_CSI2_BE_SOC_STREAMS	16
+-
++#define NR_OF_CSI2_VC			16
+ #define IPU_ISYS_CSI2_ENTITY_PREFIX	"Intel IPU6 CSI-2"
+ 
+ #define ISYS_UNISPART_IRQS	(IPU_ISYS_UNISPART_IRQ_SW |	\
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c b/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
+index 68da67def4b5..c2f73625b155 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-csi2.c
+@@ -612,6 +612,7 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
+ void ipu_isys_csi2_isr(struct ipu_isys_csi2 *csi2)
+ {
+ 	u32 status;
++	unsigned int i;
+ 
+ 	ipu6_isys_register_errors(csi2);
+ 
+@@ -621,10 +622,13 @@ void ipu_isys_csi2_isr(struct ipu_isys_csi2 *csi2)
+ 	writel(status, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
+ 	       CSI_PORT_REG_BASE_IRQ_CLEAR_OFFSET);
+ 
+-	if (status & IPU_CSI_RX_IRQ_FS_VC)
+-		ipu_isys_csi2_sof_event(csi2);
+-	if (status & IPU_CSI_RX_IRQ_FE_VC)
+-		ipu_isys_csi2_eof_event(csi2);
++	for (i = 0; i < NR_OF_CSI2_VC; i++) {
++		if (status & IPU_CSI_RX_IRQ_FS_VC(i))
++			ipu_isys_csi2_sof_event(csi2, i);
++
++		if (status & IPU_CSI_RX_IRQ_FE_VC(i))
++			ipu_isys_csi2_eof_event(csi2, i);
++	}
+ }
+ 
+ unsigned int ipu_isys_csi2_get_current_field(struct ipu_isys_pipeline *ip,
+-- 
+2.25.1
+

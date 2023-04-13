@@ -1,0 +1,200 @@
+From d899ccac2ab59606b615b5760f0232e0d939c963 Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Tue, 7 Sep 2021 19:39:01 +0300
+Subject: [PATCH 09/13] perf/x86: Add new event for AUX output counter index
+
+PEBS-via-PT records contain a mask of applicable counters. To identify
+which event belongs to which counter, a side-band event is needed. Until
+now, there has been no side-band event, and consequently users were limited
+to using a single event.
+
+Add such a side-band event. Note the event is optimised to output only
+when the counter index changes for an event. That works only so long as
+all PEBS-via-PT events are scheduled together, which they are for a
+recording session because they are in a single group.
+
+Also no attribute bit is used to select the new event, so a new
+kernel is not compatible with older perf tools.  The assumption
+being that PEBS-via-PT is sufficiently esoteric that users will not
+be troubled by this.
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20210907163903.11820-2-adrian.hunter@intel.com
+---
+ arch/x86/events/core.c          |  6 ++++++
+ arch/x86/events/intel/core.c    | 16 ++++++++++++++++
+ arch/x86/events/perf_event.h    |  1 +
+ include/linux/perf_event.h      |  1 +
+ include/uapi/linux/perf_event.h | 15 +++++++++++++++
+ kernel/events/core.c            | 30 ++++++++++++++++++++++++++++++
+ 6 files changed, 69 insertions(+)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 81d5e0a1f48c..32cec290d3ad 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -66,6 +66,8 @@ DEFINE_STATIC_CALL_NULL(x86_pmu_enable_all,  *x86_pmu.enable_all);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_enable,	     *x86_pmu.enable);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_disable,     *x86_pmu.disable);
+ 
++DEFINE_STATIC_CALL_NULL(x86_pmu_assign, *x86_pmu.assign);
++
+ DEFINE_STATIC_CALL_NULL(x86_pmu_add,  *x86_pmu.add);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_del,  *x86_pmu.del);
+ DEFINE_STATIC_CALL_NULL(x86_pmu_read, *x86_pmu.read);
+@@ -1215,6 +1217,8 @@ static inline void x86_assign_hw_event(struct perf_event *event,
+ 	hwc->last_cpu = smp_processor_id();
+ 	hwc->last_tag = ++cpuc->tags[i];
+ 
++	static_call_cond(x86_pmu_assign)(event, idx);
++
+ 	switch (hwc->idx) {
+ 	case INTEL_PMC_IDX_FIXED_BTS:
+ 	case INTEL_PMC_IDX_FIXED_VLBR:
+@@ -2005,6 +2009,8 @@ static void x86_pmu_static_call_update(void)
+ 	static_call_update(x86_pmu_enable, x86_pmu.enable);
+ 	static_call_update(x86_pmu_disable, x86_pmu.disable);
+ 
++	static_call_update(x86_pmu_assign, x86_pmu.assign);
++
+ 	static_call_update(x86_pmu_add, x86_pmu.add);
+ 	static_call_update(x86_pmu_del, x86_pmu.del);
+ 	static_call_update(x86_pmu_read, x86_pmu.read);
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index b3c22f7053dd..26929942e4b6 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -2423,6 +2423,12 @@ static void intel_pmu_disable_event(struct perf_event *event)
+ 		intel_pmu_pebs_disable(event);
+ }
+ 
++static void intel_pmu_assign_event(struct perf_event *event, int idx)
++{
++	if (is_pebs_pt(event))
++		perf_report_aux_output_id(event, idx);
++}
++
+ static void intel_pmu_del_event(struct perf_event *event)
+ {
+ 	if (needs_branch_stack(event))
+@@ -4577,8 +4583,16 @@ static int intel_pmu_check_period(struct perf_event *event, u64 value)
+ 	return intel_pmu_has_bts_period(event, value) ? -EINVAL : 0;
+ }
+ 
++static void intel_aux_output_init(void)
++{
++	/* Refer also intel_pmu_aux_output_match() */
++	if (x86_pmu.intel_cap.pebs_output_pt_available)
++		x86_pmu.assign = intel_pmu_assign_event;
++}
++
+ static int intel_pmu_aux_output_match(struct perf_event *event)
+ {
++	/* intel_pmu_assign_event() is needed, refer intel_aux_output_init() */
+ 	if (!x86_pmu.intel_cap.pebs_output_pt_available)
+ 		return 0;
+ 
+@@ -6496,6 +6510,8 @@ __init int intel_pmu_init(void)
+ 	if (is_hybrid())
+ 		intel_pmu_check_hybrid_pmus((u64)fixed_mask);
+ 
++	intel_aux_output_init();
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 01ea1bf5c27e..f9685ed58c70 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -740,6 +740,7 @@ struct x86_pmu {
+ 	void		(*enable_all)(int added);
+ 	void		(*enable)(struct perf_event *);
+ 	void		(*disable)(struct perf_event *);
++	void		(*assign)(struct perf_event *event, int idx);
+ 	void		(*add)(struct perf_event *);
+ 	void		(*del)(struct perf_event *);
+ 	void		(*read)(struct perf_event *event);
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 014eb0a963fc..4f2f563d1051 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1413,6 +1413,7 @@ perf_event_addr_filters(struct perf_event *event)
+ }
+ 
+ extern void perf_event_addr_filters_sync(struct perf_event *event);
++extern void perf_report_aux_output_id(struct perf_event *event, u64 hw_id);
+ 
+ extern int perf_output_begin(struct perf_output_handle *handle,
+ 			     struct perf_sample_data *data,
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index f92880a15645..c89535de1ec8 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -1141,6 +1141,21 @@ enum perf_event_type {
+ 	 */
+ 	PERF_RECORD_TEXT_POKE			= 20,
+ 
++	/*
++	 * Data written to the AUX area by hardware due to aux_output, may need
++	 * to be matched to the event by an architecture-specific hardware ID.
++	 * This records the hardware ID, but requires sample_id to provide the
++	 * event ID. e.g. Intel PT uses this record to disambiguate PEBS-via-PT
++	 * records from multiple events.
++	 *
++	 * struct {
++	 *	struct perf_event_header	header;
++	 *	u64				hw_id;
++	 *	struct sample_id		sample_id;
++	 * };
++	 */
++	PERF_RECORD_AUX_OUTPUT_HW_ID		= 21,
++
+ 	PERF_RECORD_MAX,			/* non-ABI */
+ };
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index d8795036202a..ebe79f37339b 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -9258,6 +9258,36 @@ static void perf_log_itrace_start(struct perf_event *event)
+ 	perf_output_end(&handle);
+ }
+ 
++void perf_report_aux_output_id(struct perf_event *event, u64 hw_id)
++{
++	struct perf_output_handle handle;
++	struct perf_sample_data sample;
++	struct perf_aux_event {
++		struct perf_event_header        header;
++		u64				hw_id;
++	} rec;
++	int ret;
++
++	if (event->parent)
++		event = event->parent;
++
++	rec.header.type	= PERF_RECORD_AUX_OUTPUT_HW_ID;
++	rec.header.misc	= 0;
++	rec.header.size	= sizeof(rec);
++	rec.hw_id	= hw_id;
++
++	perf_event_header__init_id(&rec.header, &sample, event);
++	ret = perf_output_begin(&handle, &sample, event, rec.header.size);
++
++	if (ret)
++		return;
++
++	perf_output_put(&handle, rec);
++	perf_event__output_id_sample(event, &handle, &sample);
++
++	perf_output_end(&handle);
++}
++
+ static int
+ __perf_event_account_interrupt(struct perf_event *event, int throttle)
+ {
+-- 
+2.25.1
+

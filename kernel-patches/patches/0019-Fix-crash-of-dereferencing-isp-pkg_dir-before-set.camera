@@ -1,0 +1,97 @@
+From 8e443b2c1809bc334cb844cc1fa243ef604005e8 Mon Sep 17 00:00:00 2001
+From: zouxiaoh <xiaohong.zou@intel.com>
+Date: Wed, 22 Mar 2023 15:44:14 +0800
+Subject: [PATCH 19/60] Fix crash of dereferencing isp->pkg_dir before set
+
+This fixes a crash on a ThinkPad X1 Yoga Gen 7 in the following
+scenario (which happens every boot!):
+
+1. intel-ipu6 gets loaded by udev based on its PCI modalias
+2. ipu_pci_probe() exits with -EPROBE_DEFER because the int3472 driver
+   for the power-ctrl has not loaded yet
+3. intel-ipu6-isys + intel-ipu6-psys get loaded by udev based on
+   the PCI modaliases they contain
+4. intel-ipu6-isys + intel-ipu6-psys register their ipu_bus_driver-s
+   with ipu_bus_register_driver()
+5. ipu_pci_probe() exits with -EPROBE_DEFER a couple more times
+6. udev loads the int3472 driver
+7. ipu_pci_probe() no longer hits a path resulting -EPROBE_DEFER,
+   instead it calls ipu_psys_init()
+8. ipu_psys_init() calls ipu_bus_add_device(psys), which immediately
+   causes the intel-ipu6-psys driver, which has already been
+   registered, to bind
+9. ipu_psys_probe() tries to defer isp->pkg_dir which has not been set
+   yet. The problem is that ipu_pci_probe() sets isp->pkg_dir after
+   calling ipu_psys_init().
+
+Fixing this is non trivial:
+
+We cannot simply set isp->pkg_dir before calling ipu_psys_init()
+because the ipu_buttress_map_fw_image() and ipu_cpd_create_pkg_dir()
+calls necessary for this require isp->psys which comes from
+ipu_psys_init(). So there is a circular dependency.
+
+It seems there are various assumptions in the driver that the isys
+and psys modules will only be loaded after ipu_pci_probe() has
+completed successfully and thus that ipu_sys_probe() and
+ipu_psys_probe() will only run after ipu_pci_probe() has completed
+successfully.
+
+Rather then chasing down all the issues caused by this, I have chosen
+to emulate this behavior by making ipu_bus_probe() return
+-EPROBE_DEFER until ipu_pci_probe() has completed.
+
+An additional advantage of this is that the isys + psys probe
+functions will now run asynchronously speeding up the boot a bit.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Hao Yao <hao.yao@intel.com>
+Signed-off-by: zouxiaoh <xiaohong.zou@intel.com>
+---
+ drivers/media/pci/intel/ipu-bus.c | 3 +++
+ drivers/media/pci/intel/ipu.c     | 2 ++
+ drivers/media/pci/intel/ipu.h     | 1 +
+ 3 files changed, 6 insertions(+)
+
+diff --git a/drivers/media/pci/intel/ipu-bus.c b/drivers/media/pci/intel/ipu-bus.c
+index d3b7f44c0e8a..6e6bdfa653e1 100644
+--- a/drivers/media/pci/intel/ipu-bus.c
++++ b/drivers/media/pci/intel/ipu-bus.c
+@@ -91,6 +91,9 @@ static int ipu_bus_probe(struct device *dev)
+ 	struct ipu_bus_driver *adrv = to_ipu_bus_driver(dev->driver);
+ 	int rval;
+ 
++	if (!adev->isp->ipu_bus_ready_to_probe)
++		return -EPROBE_DEFER;
++
+ 	dev_dbg(dev, "bus probe dev %s\n", dev_name(dev));
+ 
+ 	adev->adrv = adrv;
+diff --git a/drivers/media/pci/intel/ipu.c b/drivers/media/pci/intel/ipu.c
+index 65e30bd9d79e..29d6bd832500 100644
+--- a/drivers/media/pci/intel/ipu.c
++++ b/drivers/media/pci/intel/ipu.c
+@@ -710,6 +710,8 @@ static int ipu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	pm_runtime_put_noidle(&pdev->dev);
+ 	pm_runtime_allow(&pdev->dev);
+ 
++	isp->ipu_bus_ready_to_probe = true;
++
+ 	return 0;
+ 
+ out_ipu_bus_del_devices:
+diff --git a/drivers/media/pci/intel/ipu.h b/drivers/media/pci/intel/ipu.h
+index bbf7831f1d2b..744b71489845 100644
+--- a/drivers/media/pci/intel/ipu.h
++++ b/drivers/media/pci/intel/ipu.h
+@@ -94,6 +94,7 @@ struct ipu_device {
+ 	bool flr_done;
+ 	bool ipc_reinit;
+ 	bool secure_mode;
++	bool ipu_bus_ready_to_probe;
+ 
+ 	int (*cpd_fw_reload)(struct ipu_device *isp);
+ };
+-- 
+2.25.1
+
