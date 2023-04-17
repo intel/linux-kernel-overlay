@@ -1,0 +1,134 @@
+From 97115afe4d712963c44fba3e829d5784666b75d1 Mon Sep 17 00:00:00 2001
+From: Mustapha Ghaddar <mustapha.ghaddar@amd.com>
+Date: Wed, 26 Oct 2022 13:54:27 -0400
+Subject: [PATCH 0808/2236] drm/amd/display: Fix fallback issues for DP LL 1.4a
+ tests
+
+[WHY]
+Unlike DP or USBC, the USB4 link does not get its own encoder and
+has to share therefore verify_caps is skipped.
+
+[HOW]
+Fix the fallback logic for automated tests and take that
+into consideration for LT and LS.
+
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Alan Liu <HaoPing.Liu@amd.com>
+Signed-off-by: Mustapha Ghaddar <mustapha.ghaddar@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  | 22 ++++++++++++++++---
+ .../drm/amd/display/dc/core/dc_link_dpia.c    | 15 ++++++++-----
+ drivers/gpu/drm/amd/display/dc/dc_link.h      |  1 +
+ 3 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index b0cfe21871e4..a3e1aeccd3f5 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -4554,9 +4554,19 @@ void dc_link_dp_handle_link_loss(struct dc_link *link)
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
+ 		pipe_ctx = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx && pipe_ctx->stream && !pipe_ctx->stream->dpms_off &&
+-				pipe_ctx->stream->link == link && !pipe_ctx->prev_odm_pipe)
++		if (pipe_ctx && pipe_ctx->stream && !pipe_ctx->stream->dpms_off
++				&& pipe_ctx->stream->link == link && !pipe_ctx->prev_odm_pipe) {
++			// Always use max settings here for DP 1.4a LL Compliance CTS
++			if (link->is_automated) {
++				pipe_ctx->link_config.dp_link_settings.lane_count =
++						link->verified_link_cap.lane_count;
++				pipe_ctx->link_config.dp_link_settings.link_rate =
++						link->verified_link_cap.link_rate;
++				pipe_ctx->link_config.dp_link_settings.link_spread =
++						link->verified_link_cap.link_spread;
++			}
+ 			core_link_enable_stream(link->dc->current_state, pipe_ctx);
++		}
+ 	}
+ }
+ 
+@@ -4597,6 +4607,8 @@ bool dc_link_handle_hpd_rx_irq(struct dc_link *link, union hpd_irq_data *out_hpd
+ 	}
+ 
+ 	if (hpd_irq_dpcd_data.bytes.device_service_irq.bits.AUTOMATED_TEST) {
++		// Workaround for DP 1.4a LL Compliance CTS as USB4 has to share encoders unlike DP and USBC
++		link->is_automated = true;
+ 		device_service_clear.bits.AUTOMATED_TEST = 1;
+ 		core_link_write_dpcd(
+ 			link,
+@@ -7240,6 +7252,7 @@ void dp_retrain_link_dp_test(struct dc_link *link,
+ 	struct pipe_ctx *pipes =
+ 			&link->dc->current_state->res_ctx.pipe_ctx[0];
+ 	unsigned int i;
++	bool do_fallback = false;
+ 
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
+@@ -7272,13 +7285,16 @@ void dp_retrain_link_dp_test(struct dc_link *link,
+ 			memset(&link->cur_link_settings, 0,
+ 				sizeof(link->cur_link_settings));
+ 
++			if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA)
++				do_fallback = true;
++
+ 			perform_link_training_with_retries(
+ 					link_setting,
+ 					skip_video_pattern,
+ 					LINK_TRAINING_ATTEMPTS,
+ 					&pipes[i],
+ 					SIGNAL_TYPE_DISPLAY_PORT,
+-					false);
++					do_fallback);
+ 
+ 			link->dc->hwss.enable_stream(&pipes[i]);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dpia.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dpia.c
+index 74e36b34d3f7..d130d58ac08e 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dpia.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dpia.c
+@@ -791,10 +791,14 @@ static enum link_training_result dpia_training_eq_transparent(
+ 		}
+ 
+ 		if (dp_is_ch_eq_done(lane_count, dpcd_lane_status) &&
+-		    dp_is_symbol_locked(link->cur_link_settings.lane_count, dpcd_lane_status) &&
+-		    dp_is_interlane_aligned(dpcd_lane_status_updated)) {
+-			result =  LINK_TRAINING_SUCCESS;
+-			break;
++				dp_is_symbol_locked(link->cur_link_settings.lane_count, dpcd_lane_status)) {
++			/* Take into consideration corner case for DP 1.4a LL Compliance CTS as USB4
++			 * has to share encoders unlike DP and USBC
++			 */
++			if (dp_is_interlane_aligned(dpcd_lane_status_updated) || (link->is_automated && retries_eq)) {
++				result =  LINK_TRAINING_SUCCESS;
++				break;
++			}
+ 		}
+ 
+ 		/* Update VS/PE. */
+@@ -1008,7 +1012,8 @@ enum link_training_result dc_link_dpia_perform_link_training(
+ 	 */
+ 	if (result == LINK_TRAINING_SUCCESS) {
+ 		msleep(5);
+-		result = dp_check_link_loss_status(link, &lt_settings);
++		if (!link->is_automated)
++			result = dp_check_link_loss_status(link, &lt_settings);
+ 	} else if (result == LINK_TRAINING_ABORT) {
+ 		dpia_training_abort(link, &lt_settings, repeater_id);
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_link.h b/drivers/gpu/drm/amd/display/dc/dc_link.h
+index edb4532eaa39..dc6afe33bca2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_link.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_link.h
+@@ -184,6 +184,7 @@ struct dc_link {
+ 	bool is_dig_mapping_flexible;
+ 	bool hpd_status; /* HPD status of link without physical HPD pin. */
+ 	bool is_hpd_pending; /* Indicates a new received hpd */
++	bool is_automated; /* Indicates automated testing */
+ 
+ 	bool edp_sink_present;
+ 
+-- 
+2.25.1
+

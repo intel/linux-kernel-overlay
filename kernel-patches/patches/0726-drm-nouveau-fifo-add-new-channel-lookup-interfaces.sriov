@@ -1,0 +1,835 @@
+From 1f2ba71a9812c15ebe485ae2711a05734b7780e7 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:29 +1000
+Subject: [PATCH 0726/2236] drm/nouveau/fifo: add new channel lookup interfaces
+
+- supports per-runlist CHIDs
+- channel group lock held across reference, rather than global lock
+
+v2:
+- remove unnecessary parenthesis
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/engine/falcon.h  |  2 +-
+ .../drm/nouveau/include/nvkm/engine/fifo.h    | 11 ++--
+ .../gpu/drm/nouveau/nvkm/engine/ce/gt215.c    |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/cipher/g84.c  | 11 ++--
+ drivers/gpu/drm/nouveau/nvkm/engine/falcon.c  |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   | 57 -------------------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   | 50 ++++++++++++++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.c  | 10 ++--
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv04.c   | 17 +++---
+ .../gpu/drm/nouveau/nvkm/engine/fifo/priv.h   |  3 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.c   | 47 +++++++++++++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.h   |  3 +
+ .../gpu/drm/nouveau/nvkm/engine/gr/gf100.c    | 10 ++--
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv04.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv10.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c | 10 ++--
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv25.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv2a.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv30.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv34.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv35.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv40.c |  4 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv50.c | 10 ++--
+ .../gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c   |  4 +-
+ .../gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c   |  4 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/sec/g98.c |  6 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/sw/base.c |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv50.c | 11 ++--
+ 28 files changed, 166 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+index b593407b9e36..176f0921d82f 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+@@ -66,7 +66,7 @@ struct nvkm_falcon_func {
+ 		u32  size;
+ 	} data;
+ 	void (*init)(struct nvkm_falcon *);
+-	void (*intr)(struct nvkm_falcon *, struct nvkm_fifo_chan *);
++	void (*intr)(struct nvkm_falcon *, struct nvkm_chan *);
+ 
+ 	u32 debug;
+ 	u32 fbif;
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index d3412c916290..a47667d00f3a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -34,6 +34,10 @@ struct nvkm_chan {
+ 	struct nvkm_fifo_engn engn[NVKM_FIFO_ENGN_NR];
+ };
+ 
++struct nvkm_chan *nvkm_chan_get_chid(struct nvkm_engine *, int id, unsigned long *irqflags);
++struct nvkm_chan *nvkm_chan_get_inst(struct nvkm_engine *, u64 inst, unsigned long *irqflags);
++void nvkm_chan_put(struct nvkm_chan **, unsigned long irqflags);
++
+ struct nvkm_fifo {
+ 	const struct nvkm_fifo_func *func;
+ 	struct nvkm_engine engine;
+@@ -62,13 +66,6 @@ void nvkm_fifo_fault(struct nvkm_fifo *, struct nvkm_fault_data *);
+ void nvkm_fifo_pause(struct nvkm_fifo *, unsigned long *);
+ void nvkm_fifo_start(struct nvkm_fifo *, unsigned long *);
+ 
+-void nvkm_fifo_chan_put(struct nvkm_fifo *, unsigned long flags,
+-			struct nvkm_fifo_chan **);
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_inst(struct nvkm_fifo *, u64 inst, unsigned long *flags);
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_chid(struct nvkm_fifo *, int chid, unsigned long *flags);
+-
+ int nv04_fifo_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_fifo **);
+ int nv10_fifo_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_fifo **);
+ int nv17_fifo_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_fifo **);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/ce/gt215.c b/drivers/gpu/drm/nouveau/nvkm/engine/ce/gt215.c
+index 09a112af2f89..c9bf6305c3ec 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/ce/gt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/ce/gt215.c
+@@ -40,7 +40,7 @@ gt215_ce_isr_error_name[] = {
+ };
+ 
+ void
+-gt215_ce_intr(struct nvkm_falcon *ce, struct nvkm_fifo_chan *chan)
++gt215_ce_intr(struct nvkm_falcon *ce, struct nvkm_chan *chan)
+ {
+ 	struct nvkm_subdev *subdev = &ce->engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+@@ -55,9 +55,9 @@ gt215_ce_intr(struct nvkm_falcon *ce, struct nvkm_fifo_chan *chan)
+ 
+ 	nvkm_error(subdev, "DISPATCH_ERROR %04x [%s] ch %d [%010llx %s] "
+ 			   "subc %d mthd %04x data %08x\n", ssta,
+-		   en ? en->name : "", chan ? chan->chid : -1,
++		   en ? en->name : "", chan ? chan->id : -1,
+ 		   chan ? chan->inst->addr : 0,
+-		   chan ? chan->object.client->name : "unknown",
++		   chan ? chan->name : "unknown",
+ 		   subc, mthd, data);
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/cipher/g84.c b/drivers/gpu/drm/nouveau/nvkm/engine/cipher/g84.c
+index be2a7181dc15..caca4f639895 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/cipher/g84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/cipher/g84.c
+@@ -81,8 +81,7 @@ g84_cipher_intr(struct nvkm_engine *cipher)
+ {
+ 	struct nvkm_subdev *subdev = &cipher->subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo *fifo = device->fifo;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	u32 stat = nvkm_rd32(device, 0x102130);
+ 	u32 mthd = nvkm_rd32(device, 0x102190);
+ 	u32 data = nvkm_rd32(device, 0x102194);
+@@ -90,16 +89,16 @@ g84_cipher_intr(struct nvkm_engine *cipher)
+ 	unsigned long flags;
+ 	char msg[128];
+ 
+-	chan = nvkm_fifo_chan_inst(fifo, (u64)inst << 12, &flags);
++	chan = nvkm_chan_get_inst(cipher, (u64)inst << 12, &flags);
+ 	if (stat) {
+ 		nvkm_snprintbf(msg, sizeof(msg), g84_cipher_intr_mask, stat);
+ 		nvkm_error(subdev,  "%08x [%s] ch %d [%010llx %s] "
+ 				    "mthd %04x data %08x\n", stat, msg,
+-			   chan ? chan->chid : -1, (u64)inst << 12,
+-			   chan ? chan->object.client->name : "unknown",
++			   chan ? chan->id : -1, (u64)inst << 12,
++			   chan ? chan->name : "unknown",
+ 			   mthd, data);
+ 	}
+-	nvkm_fifo_chan_put(fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ 
+ 	nvkm_wr32(device, 0x102130, stat);
+ 	nvkm_wr32(device, 0x10200c, 0x10);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c b/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c
+index 43b7dec45179..d619b40a42c3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c
+@@ -65,10 +65,10 @@ nvkm_falcon_intr(struct nvkm_engine *engine)
+ 	u32 dest = nvkm_rd32(device, base + 0x01c);
+ 	u32 intr = nvkm_rd32(device, base + 0x008) & dest & ~(dest >> 16);
+ 	u32 inst = nvkm_rd32(device, base + 0x050) & 0x3fffffff;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	unsigned long flags;
+ 
+-	chan = nvkm_fifo_chan_inst(device->fifo, (u64)inst << 12, &flags);
++	chan = nvkm_chan_get_inst(engine, (u64)inst << 12, &flags);
+ 
+ 	if (intr & 0x00000040) {
+ 		if (falcon->func->intr) {
+@@ -89,7 +89,7 @@ nvkm_falcon_intr(struct nvkm_engine *engine)
+ 		nvkm_wr32(device, base + 0x004, intr);
+ 	}
+ 
+-	nvkm_fifo_chan_put(device->fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ static int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index e51fb10a04f7..83da63bdf3c4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -62,63 +62,6 @@ nvkm_fifo_fault(struct nvkm_fifo *fifo, struct nvkm_fault_data *info)
+ 	return fifo->func->mmu_fault->recover(fifo, info);
+ }
+ 
+-void
+-nvkm_fifo_chan_put(struct nvkm_fifo *fifo, unsigned long flags,
+-		   struct nvkm_fifo_chan **pchan)
+-{
+-	struct nvkm_fifo_chan *chan = *pchan;
+-	if (likely(chan)) {
+-		*pchan = NULL;
+-		spin_unlock_irqrestore(&fifo->lock, flags);
+-	}
+-}
+-
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_inst_locked(struct nvkm_fifo *fifo, u64 inst)
+-{
+-	struct nvkm_fifo_chan *chan;
+-	list_for_each_entry(chan, &fifo->chan, head) {
+-		if (chan->inst->addr == inst) {
+-			list_del(&chan->head);
+-			list_add(&chan->head, &fifo->chan);
+-			return chan;
+-		}
+-	}
+-	return NULL;
+-}
+-
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_inst(struct nvkm_fifo *fifo, u64 inst, unsigned long *rflags)
+-{
+-	struct nvkm_fifo_chan *chan;
+-	unsigned long flags;
+-	spin_lock_irqsave(&fifo->lock, flags);
+-	if ((chan = nvkm_fifo_chan_inst_locked(fifo, inst))) {
+-		*rflags = flags;
+-		return chan;
+-	}
+-	spin_unlock_irqrestore(&fifo->lock, flags);
+-	return NULL;
+-}
+-
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_chid(struct nvkm_fifo *fifo, int chid, unsigned long *rflags)
+-{
+-	struct nvkm_fifo_chan *chan;
+-	unsigned long flags;
+-	spin_lock_irqsave(&fifo->lock, flags);
+-	list_for_each_entry(chan, &fifo->chan, head) {
+-		if (chan->chid == chid) {
+-			list_del(&chan->head);
+-			list_add(&chan->head, &fifo->chan);
+-			*rflags = flags;
+-			return chan;
+-		}
+-	}
+-	spin_unlock_irqrestore(&fifo->lock, flags);
+-	return NULL;
+-}
+-
+ void
+ nvkm_fifo_kevent(struct nvkm_fifo *fifo, int chid)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index ea8148bad45e..bfbd5ec9a720 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -302,6 +302,56 @@ nvkm_fifo_chan_dtor(struct nvkm_object *object)
+ 	return data;
+ }
+ 
++void
++nvkm_chan_put(struct nvkm_chan **pchan, unsigned long irqflags)
++{
++	struct nvkm_chan *chan = *pchan;
++
++	if (!chan)
++		return;
++
++	*pchan = NULL;
++	spin_unlock_irqrestore(&chan->cgrp->lock, irqflags);
++}
++
++struct nvkm_chan *
++nvkm_chan_get_inst(struct nvkm_engine *engine, u64 inst, unsigned long *pirqflags)
++{
++	struct nvkm_fifo *fifo = engine->subdev.device->fifo;
++	struct nvkm_runl *runl;
++	struct nvkm_engn *engn;
++	struct nvkm_chan *chan;
++
++	nvkm_runl_foreach(runl, fifo) {
++		nvkm_runl_foreach_engn(engn, runl) {
++			if (engine == &fifo->engine || engn->engine == engine) {
++				chan = nvkm_runl_chan_get_inst(runl, inst, pirqflags);
++				if (chan || engn->engine == engine)
++					return chan;
++			}
++		}
++	}
++
++	return NULL;
++}
++
++struct nvkm_chan *
++nvkm_chan_get_chid(struct nvkm_engine *engine, int id, unsigned long *pirqflags)
++{
++	struct nvkm_fifo *fifo = engine->subdev.device->fifo;
++	struct nvkm_runl *runl;
++	struct nvkm_engn *engn;
++
++	nvkm_runl_foreach(runl, fifo) {
++		nvkm_runl_foreach_engn(engn, runl) {
++			if (fifo->chid || engn->engine == engine)
++				return nvkm_runl_chan_get_chid(runl, id, pirqflags);
++		}
++	}
++
++	return NULL;
++}
++
+ static const struct nvkm_object_func
+ nvkm_fifo_chan_func = {
+ 	.dtor = nvkm_fifo_chan_dtor,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+index 7fc4c37b407f..7c1db7721ff6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -84,13 +84,13 @@ gf100_runq_intr(struct nvkm_runq *runq, struct nvkm_runl *null)
+ 
+ 	if (show) {
+ 		nvkm_snprintbf(msg, sizeof(msg), runq->func->intr_0_names, show);
+-		chan = nvkm_fifo_chan_chid(runq->fifo, chid, &flags);
++		chan = nvkm_chan_get_chid(&runq->fifo->engine, chid, &flags);
+ 		nvkm_error(subdev, "PBDMA%d: %08x [%s] ch %d [%010llx %s] "
+ 				   "subc %d mthd %04x data %08x\n",
+ 			   runq->id, show, msg, chid, chan ? chan->inst->addr : 0,
+ 			   chan ? chan->object.client->name : "unknown",
+ 			   subc, mthd, data);
+-		nvkm_fifo_chan_put(runq->fifo, flags, &chan);
++		nvkm_chan_put(&chan, flags);
+ 	}
+ 
+ 	nvkm_wr32(device, 0x0400c0 + (runq->id * 0x2000), 0x80600008);
+@@ -367,9 +367,9 @@ gf100_fifo_mmu_fault_recover(struct nvkm_fifo *fifo, struct nvkm_fault_data *inf
+ 	struct nvkm_device *device = subdev->device;
+ 	const struct nvkm_enum *er, *ee, *ec, *ea;
+ 	struct nvkm_engine *engine = NULL;
+-	struct nvkm_fifo_chan *chan;
+ 	struct nvkm_runl *runl;
+ 	struct nvkm_engn *engn;
++	struct nvkm_chan *chan;
+ 	unsigned long flags;
+ 	char ct[8] = "HUB/";
+ 
+@@ -409,7 +409,7 @@ gf100_fifo_mmu_fault_recover(struct nvkm_fifo *fifo, struct nvkm_fault_data *inf
+ 		}
+ 	}
+ 
+-	chan = nvkm_fifo_chan_inst(fifo, info->inst, &flags);
++	chan = nvkm_chan_get_inst(&fifo->engine, info->inst, &flags);
+ 
+ 	nvkm_error(subdev,
+ 		   "fault %02x [%s] at %016llx engine %02x [%s] client %02x "
+@@ -427,7 +427,7 @@ gf100_fifo_mmu_fault_recover(struct nvkm_fifo *fifo, struct nvkm_fault_data *inf
+ 	if (engine && chan)
+ 		gf100_fifo_recover(gf100_fifo(fifo), engine, (void *)chan);
+ 
+-	nvkm_fifo_chan_put(fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ static const struct nvkm_fifo_func_mmu_fault
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+index b899127cfd72..85f22fce11ed 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+@@ -30,7 +30,6 @@
+ #include "channv04.h"
+ #include "regsnv04.h"
+ 
+-#include <core/client.h>
+ #include <core/ramht.h>
+ #include <subdev/instmem.h>
+ #include <subdev/mc.h>
+@@ -241,7 +240,7 @@ nv04_fifo_intr_cache_error(struct nvkm_fifo *fifo, u32 chid, u32 get)
+ {
+ 	struct nvkm_subdev *subdev = &fifo->engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	unsigned long flags;
+ 	u32 pull0 = nvkm_rd32(device, 0x003250);
+ 	u32 mthd, data;
+@@ -264,12 +263,12 @@ nv04_fifo_intr_cache_error(struct nvkm_fifo *fifo, u32 chid, u32 get)
+ 
+ 	if (!(pull0 & 0x00000100) ||
+ 	    !nv04_fifo_swmthd(device, chid, mthd, data)) {
+-		chan = nvkm_fifo_chan_chid(fifo, chid, &flags);
++		chan = nvkm_chan_get_chid(&fifo->engine, chid, &flags);
+ 		nvkm_error(subdev, "CACHE_ERROR - "
+ 			   "ch %d [%s] subc %d mthd %04x data %08x\n",
+-			   chid, chan ? chan->object.client->name : "unknown",
++			   chid, chan ? chan->name : "unknown",
+ 			   (mthd >> 13) & 7, mthd & 0x1ffc, data);
+-		nvkm_fifo_chan_put(fifo, flags, &chan);
++		nvkm_chan_put(&chan, flags);
+ 	}
+ 
+ 	nvkm_wr32(device, NV04_PFIFO_CACHE1_DMA_PUSH, 0);
+@@ -296,12 +295,12 @@ nv04_fifo_intr_dma_pusher(struct nvkm_fifo *fifo, u32 chid)
+ 	u32 dma_put = nvkm_rd32(device, 0x003240);
+ 	u32 push = nvkm_rd32(device, 0x003220);
+ 	u32 state = nvkm_rd32(device, 0x003228);
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	unsigned long flags;
+ 	const char *name;
+ 
+-	chan = nvkm_fifo_chan_chid(fifo, chid, &flags);
+-	name = chan ? chan->object.client->name : "unknown";
++	chan = nvkm_chan_get_chid(&fifo->engine, chid, &flags);
++	name = chan ? chan->name : "unknown";
+ 	if (device->card_type == NV_50) {
+ 		u32 ho_get = nvkm_rd32(device, 0x003328);
+ 		u32 ho_put = nvkm_rd32(device, 0x003320);
+@@ -332,7 +331,7 @@ nv04_fifo_intr_dma_pusher(struct nvkm_fifo *fifo, u32 chid)
+ 		if (dma_get != dma_put)
+ 			nvkm_wr32(device, 0x003244, dma_put);
+ 	}
+-	nvkm_fifo_chan_put(fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ 
+ 	nvkm_wr32(device, 0x003228, 0x00000000);
+ 	nvkm_wr32(device, 0x003220, 0x00000001);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+index 19c6e706f33e..7bc7b89ffd18 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+@@ -14,9 +14,6 @@ struct gk104_fifo_chan;
+ void nvkm_fifo_kevent(struct nvkm_fifo *, int chid);
+ void nvkm_fifo_recover_chan(struct nvkm_fifo *, int chid);
+ 
+-struct nvkm_fifo_chan *
+-nvkm_fifo_chan_inst_locked(struct nvkm_fifo *, u64 inst);
+-
+ struct nvkm_fifo_chan_oclass;
+ struct nvkm_fifo_func {
+ 	void *(*dtor)(struct nvkm_fifo *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+index 0b75565bfbc1..e4984e1e7c65 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+@@ -20,12 +20,59 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ #include "runl.h"
++#include "cgrp.h"
+ #include "chan.h"
+ #include "chid.h"
+ #include "priv.h"
+ 
++#include <core/gpuobj.h>
+ #include <subdev/top.h>
+ 
++struct nvkm_chan *
++nvkm_runl_chan_get_inst(struct nvkm_runl *runl, u64 inst, unsigned long *pirqflags)
++{
++	struct nvkm_chid *chid = runl->chid;
++	struct nvkm_chan *chan;
++	unsigned long flags;
++	int id;
++
++	spin_lock_irqsave(&chid->lock, flags);
++	for_each_set_bit(id, chid->used, chid->nr) {
++		chan = chid->data[id];
++		if (likely(chan)) {
++			if (chan->inst->addr == inst) {
++				spin_lock(&chan->cgrp->lock);
++				*pirqflags = flags;
++				spin_unlock(&chid->lock);
++				return chan;
++			}
++		}
++	}
++	spin_unlock_irqrestore(&chid->lock, flags);
++	return NULL;
++}
++
++struct nvkm_chan *
++nvkm_runl_chan_get_chid(struct nvkm_runl *runl, int id, unsigned long *pirqflags)
++{
++	struct nvkm_chid *chid = runl->chid;
++	struct nvkm_chan *chan;
++	unsigned long flags;
++
++	spin_lock_irqsave(&chid->lock, flags);
++	if (!WARN_ON(id >= chid->nr)) {
++		chan = chid->data[id];
++		if (likely(chan)) {
++			spin_lock(&chan->cgrp->lock);
++			*pirqflags = flags;
++			spin_unlock(&chid->lock);
++			return chan;
++		}
++	}
++	spin_unlock_irqrestore(&chid->lock, flags);
++	return NULL;
++}
++
+ void
+ nvkm_runl_del(struct nvkm_runl *runl)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+index b223da2d4399..e618e326b3c3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+@@ -51,6 +51,9 @@ struct nvkm_engn *nvkm_runl_add(struct nvkm_runl *, int engi, const struct nvkm_
+ 				enum nvkm_subdev_type, int inst);
+ void nvkm_runl_del(struct nvkm_runl *);
+ 
++struct nvkm_chan *nvkm_runl_chan_get_chid(struct nvkm_runl *, int chid, unsigned long *irqflags);
++struct nvkm_chan *nvkm_runl_chan_get_inst(struct nvkm_runl *, u64 inst, unsigned long *irqflags);
++
+ #define nvkm_runl_find_engn(engn,runl,cond) nvkm_list_find(engn, &(runl)->engns, head, (cond))
+ 
+ #define nvkm_runl_foreach(runl,fifo) list_for_each_entry((runl), &(fifo)->runls, head)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
+index f16eabf4f642..68da77df856a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
+@@ -1548,7 +1548,7 @@ gf100_gr_intr(struct nvkm_gr *base)
+ 	struct gf100_gr *gr = gf100_gr(base);
+ 	struct nvkm_subdev *subdev = &gr->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	unsigned long flags;
+ 	u64 inst = nvkm_rd32(device, 0x409b00) & 0x0fffffff;
+ 	u32 stat = nvkm_rd32(device, 0x400100);
+@@ -1561,10 +1561,10 @@ gf100_gr_intr(struct nvkm_gr *base)
+ 	const char *name = "unknown";
+ 	int chid = -1;
+ 
+-	chan = nvkm_fifo_chan_inst(device->fifo, (u64)inst << 12, &flags);
++	chan = nvkm_chan_get_inst(&gr->base.engine, (u64)inst << 12, &flags);
+ 	if (chan) {
+-		name = chan->object.client->name;
+-		chid = chan->chid;
++		name = chan->name;
++		chid = chan->id;
+ 	}
+ 
+ 	if (device->card_type < NV_E0 || subc < 4)
+@@ -1631,7 +1631,7 @@ gf100_gr_intr(struct nvkm_gr *base)
+ 	}
+ 
+ 	nvkm_wr32(device, 0x400500, 0x00010001);
+-	nvkm_fifo_chan_put(device->fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ static void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv04.c
+index 0bc1a238de43..81bd682c2102 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv04.c
+@@ -1192,7 +1192,7 @@ nv04_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv04_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	*ctx_reg(chan, NV04_PGRAPH_DEBUG_3) = 0xfad4ff31;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv10.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv10.c
+index 942450b33bc6..7fe6e58f6bab 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv10.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv10.c
+@@ -1011,7 +1011,7 @@ nv10_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv10_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	NV_WRITE_CTX(0x00400e88, 0x08000000);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c
+index 6bff10cee71b..75434f5de7ad 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c
+@@ -83,7 +83,7 @@ nv20_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv20_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+@@ -182,7 +182,7 @@ nv20_gr_intr(struct nvkm_gr *base)
+ 	struct nv20_gr *gr = nv20_gr(base);
+ 	struct nvkm_subdev *subdev = &gr->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	u32 stat = nvkm_rd32(device, NV03_PGRAPH_INTR);
+ 	u32 nsource = nvkm_rd32(device, NV03_PGRAPH_NSOURCE);
+ 	u32 nstatus = nvkm_rd32(device, NV03_PGRAPH_NSTATUS);
+@@ -196,7 +196,7 @@ nv20_gr_intr(struct nvkm_gr *base)
+ 	char msg[128], src[128], sta[128];
+ 	unsigned long flags;
+ 
+-	chan = nvkm_fifo_chan_chid(device->fifo, chid, &flags);
++	chan = nvkm_chan_get_chid(&gr->base.engine, chid, &flags);
+ 
+ 	nvkm_wr32(device, NV03_PGRAPH_INTR, stat);
+ 	nvkm_wr32(device, NV04_PGRAPH_FIFO, 0x00000001);
+@@ -209,11 +209,11 @@ nv20_gr_intr(struct nvkm_gr *base)
+ 				   "nstatus %08x [%s] ch %d [%s] subc %d "
+ 				   "class %04x mthd %04x data %08x\n",
+ 			   show, msg, nsource, src, nstatus, sta, chid,
+-			   chan ? chan->object.client->name : "unknown",
++			   chan ? chan->name : "unknown",
+ 			   subc, class, mthd, data);
+ 	}
+ 
+-	nvkm_fifo_chan_put(device->fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv25.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv25.c
+index f3a56f17d94a..94685e4d4f87 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv25.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv25.c
+@@ -29,7 +29,7 @@ nv25_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv25_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv2a.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv2a.c
+index f268d2642d29..2d6273675291 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv2a.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv2a.c
+@@ -29,7 +29,7 @@ nv2a_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv2a_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv30.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv30.c
+index e5737cdf2fa1..647bd6fede04 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv30.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv30.c
+@@ -30,7 +30,7 @@ nv30_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv30_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv34.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv34.c
+index 1ab2da8ebf4e..2eae3fe4ef4e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv34.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv34.c
+@@ -29,7 +29,7 @@ nv34_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv34_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv35.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv35.c
+index 591260f5676b..657d7cdba369 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv35.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv35.c
+@@ -29,7 +29,7 @@ nv35_gr_chan_new(struct nvkm_gr *base, struct nvkm_fifo_chan *fifoch,
+ 		return -ENOMEM;
+ 	nvkm_object_ctor(&nv35_gr_chan, oclass, &chan->object);
+ 	chan->gr = gr;
+-	chan->chid = fifoch->chid;
++	chan->chid = fifoch->id;
+ 	*pobject = &chan->object;
+ 
+ 	ret = nvkm_memory_new(gr->base.engine.subdev.device,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv40.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv40.c
+index 67f3535ff97e..d2df097a6cf6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv40.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv40.c
+@@ -275,8 +275,8 @@ nv40_gr_intr(struct nvkm_gr *base)
+ 				   "nstatus %08x [%s] ch %d [%08x %s] subc %d "
+ 				   "class %04x mthd %04x data %08x\n",
+ 			   show, msg, nsource, src, nstatus, sta,
+-			   chan ? chan->fifo->chid : -1, inst << 4,
+-			   chan ? chan->fifo->object.client->name : "unknown",
++			   chan ? chan->fifo->id : -1, inst << 4,
++			   chan ? chan->fifo->name : "unknown",
+ 			   subc, class, mthd, data);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv50.c
+index 563a10097e95..1ba18a8e380f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv50.c
+@@ -622,7 +622,7 @@ nv50_gr_intr(struct nvkm_gr *base)
+ 	struct nv50_gr *gr = nv50_gr(base);
+ 	struct nvkm_subdev *subdev = &gr->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	u32 stat = nvkm_rd32(device, 0x400100);
+ 	u32 inst = nvkm_rd32(device, 0x40032c) & 0x0fffffff;
+ 	u32 addr = nvkm_rd32(device, 0x400704);
+@@ -637,10 +637,10 @@ nv50_gr_intr(struct nvkm_gr *base)
+ 	char msg[128];
+ 	int chid = -1;
+ 
+-	chan = nvkm_fifo_chan_inst(device->fifo, (u64)inst << 12, &flags);
++	chan = nvkm_chan_get_inst(&gr->base.engine, (u64)inst << 12, &flags);
+ 	if (chan)  {
+-		name = chan->object.client->name;
+-		chid = chan->chid;
++		name = chan->name;
++		chid = chan->id;
+ 	}
+ 
+ 	if (show & 0x00100000) {
+@@ -672,7 +672,7 @@ nv50_gr_intr(struct nvkm_gr *base)
+ 	if (nvkm_rd32(device, 0x400824) & (1 << 31))
+ 		nvkm_wr32(device, 0x400824, nvkm_rd32(device, 0x400824) & ~(1 << 31));
+ 
+-	nvkm_fifo_chan_put(device->fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
+index b1054db4c1b8..cb0c3991b2ad 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
+@@ -213,8 +213,8 @@ nv31_mpeg_intr(struct nvkm_engine *engine)
+ 
+ 	if (show) {
+ 		nvkm_error(subdev, "ch %d [%s] %08x %08x %08x %08x\n",
+-			   mpeg->chan ? mpeg->chan->fifo->chid : -1,
+-			   mpeg->chan ? mpeg->chan->object.client->name :
++			   mpeg->chan ? mpeg->chan->fifo->id : -1,
++			   mpeg->chan ? mpeg->chan->fifo->name :
+ 			   "unknown", stat, type, mthd, data);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
+index 521ce43a2871..0890a279458e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
+@@ -182,8 +182,8 @@ nv44_mpeg_intr(struct nvkm_engine *engine)
+ 
+ 	if (show) {
+ 		nvkm_error(subdev, "ch %d [%08x %s] %08x %08x %08x %08x\n",
+-			   chan ? chan->fifo->chid : -1, inst << 4,
+-			   chan ? chan->object.client->name : "unknown",
++			   chan ? chan->fifo->id : -1, inst << 4,
++			   chan ? chan->fifo->name : "unknown",
+ 			   stat, type, mthd, data);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/sec/g98.c b/drivers/gpu/drm/nouveau/nvkm/engine/sec/g98.c
+index 1b87df03c823..c15b2cbf506b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/sec/g98.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/sec/g98.c
+@@ -40,7 +40,7 @@ static const struct nvkm_enum g98_sec_isr_error_name[] = {
+ };
+ 
+ static void
+-g98_sec_intr(struct nvkm_falcon *sec, struct nvkm_fifo_chan *chan)
++g98_sec_intr(struct nvkm_falcon *sec, struct nvkm_chan *chan)
+ {
+ 	struct nvkm_subdev *subdev = &sec->engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+@@ -54,9 +54,9 @@ g98_sec_intr(struct nvkm_falcon *sec, struct nvkm_fifo_chan *chan)
+ 
+ 	nvkm_error(subdev, "DISPATCH_ERROR %04x [%s] ch %d [%010llx %s] "
+ 			   "subc %d mthd %04x data %08x\n", ssta,
+-		   en ? en->name : "UNKNOWN", chan ? chan->chid : -1,
++		   en ? en->name : "UNKNOWN", chan ? chan->id : -1,
+ 		   chan ? chan->inst->addr : 0,
+-		   chan ? chan->object.client->name : "unknown",
++		   chan ? chan->name : "unknown",
+ 		   subc, mthd, data);
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/sw/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/sw/base.c
+index 14871d0bd746..a9d464db6974 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/sw/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/sw/base.c
+@@ -35,7 +35,7 @@ nvkm_sw_mthd(struct nvkm_sw *sw, int chid, int subc, u32 mthd, u32 data)
+ 
+ 	spin_lock_irqsave(&sw->engine.lock, flags);
+ 	list_for_each_entry(chan, &sw->chan, head) {
+-		if (chan->fifo->chid == chid) {
++		if (chan->fifo->id == chid) {
+ 			handled = nvkm_sw_chan_mthd(chan, subc, mthd, data);
+ 			list_del(&chan->head);
+ 			list_add(&chan->head, &sw->chan);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv50.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv50.c
+index 95fd8f834010..48641735168e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/nv50.c
+@@ -137,8 +137,7 @@ nv50_fb_intr(struct nvkm_fb *base)
+ 	struct nv50_fb *fb = nv50_fb(base);
+ 	struct nvkm_subdev *subdev = &fb->base.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_fifo *fifo = device->fifo;
+-	struct nvkm_fifo_chan *chan;
++	struct nvkm_chan *chan;
+ 	const struct nvkm_enum *en, *re, *cl, *sc;
+ 	u32 trap[6], idx, inst;
+ 	u8 st0, st1, st2, st3;
+@@ -178,18 +177,18 @@ nv50_fb_intr(struct nvkm_fb *base)
+ 	else if (en && en->data) sc = nvkm_enum_find(en->data, st3);
+ 	else                     sc = NULL;
+ 
+-	chan = nvkm_fifo_chan_inst(fifo, inst, &flags);
++	chan = nvkm_chan_get_inst(&device->fifo->engine, inst, &flags);
+ 	nvkm_error(subdev, "trapped %s at %02x%04x%04x on channel %d [%08x %s] "
+ 			   "engine %02x [%s] client %02x [%s] "
+ 			   "subclient %02x [%s] reason %08x [%s]\n",
+ 		   (trap[5] & 0x00000100) ? "read" : "write",
+ 		   trap[5] & 0xff, trap[4] & 0xffff, trap[3] & 0xffff,
+-		   chan ? chan->chid : -1, inst,
+-		   chan ? chan->object.client->name : "unknown",
++		   chan ? chan->id : -1, inst,
++		   chan ? chan->name : "unknown",
+ 		   st0, en ? en->name : "",
+ 		   st2, cl ? cl->name : "", st3, sc ? sc->name : "",
+ 		   st1, re ? re->name : "");
+-	nvkm_fifo_chan_put(fifo, flags, &chan);
++	nvkm_chan_put(&chan, flags);
+ }
+ 
+ static int
+-- 
+2.25.1
+

@@ -1,0 +1,650 @@
+From 5c926ed660a60154b086f8979930b1bb00a69c4f Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:27 +1000
+Subject: [PATCH 0720/2236] drm/nouveau/fifo: tidy up non-stall intr handling
+
+- removes a layer of indirection in the intr handling
+- prevents non-stall ctrl racing with unknown intrs
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |  7 ++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   | 34 ++---------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   |  3 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/g84.c    | 33 +++++++----
+ .../gpu/drm/nouveau/nvkm/engine/fifo/g98.c    |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.c  | 59 ++++++++++++-------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.c  | 27 ++-------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.h  |  3 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk110.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk208.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gm107.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gm200.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gp100.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gv100.c  |  3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv04.c   |  2 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv50.h   |  2 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/priv.h   |  7 ++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/tu102.c  |  7 ++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/uchan.c  |  3 +
+ 20 files changed, 93 insertions(+), 118 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index 446d058f558a..d3412c916290 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -44,13 +44,16 @@ struct nvkm_fifo {
+ 	struct list_head runqs;
+ 	struct list_head runls;
+ 
++	struct {
++#define NVKM_FIFO_NONSTALL_EVENT BIT(0)
++		struct nvkm_event event;
++	} nonstall;
++
+ 	int nr;
+ 	struct list_head chan;
+ 	spinlock_t lock;
+ 	struct mutex mutex;
+ 
+-#define NVKM_FIFO_EVENT_NON_STALL_INTR BIT(0)
+-	struct nvkm_event uevent; /* async user trigger */
+ #define NVKM_FIFO_EVENT_KILLED         BIT(0)
+ 	struct nvkm_event kevent; /* channel killed */
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index d93e71870d8d..d2a9e891939f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -129,32 +129,6 @@ static const struct nvkm_event_func
+ nvkm_fifo_kevent_func = {
+ };
+ 
+-static void
+-nvkm_fifo_uevent_fini(struct nvkm_event *event, int type, int index)
+-{
+-	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), uevent);
+-	fifo->func->uevent_fini(fifo);
+-}
+-
+-static void
+-nvkm_fifo_uevent_init(struct nvkm_event *event, int type, int index)
+-{
+-	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), uevent);
+-	fifo->func->uevent_init(fifo);
+-}
+-
+-static const struct nvkm_event_func
+-nvkm_fifo_uevent_func = {
+-	.init = nvkm_fifo_uevent_init,
+-	.fini = nvkm_fifo_uevent_fini,
+-};
+-
+-void
+-nvkm_fifo_uevent(struct nvkm_fifo *fifo)
+-{
+-	nvkm_event_ntfy(&fifo->uevent, 0, NVKM_FIFO_EVENT_NON_STALL_INTR);
+-}
+-
+ static int
+ nvkm_fifo_class_new(struct nvkm_device *device, const struct nvkm_oclass *oclass,
+ 		    void *argv, u32 argc, struct nvkm_object **pobject)
+@@ -365,7 +339,7 @@ nvkm_fifo_dtor(struct nvkm_engine *engine)
+ 	if (fifo->func->dtor)
+ 		data = fifo->func->dtor(fifo);
+ 	nvkm_event_fini(&fifo->kevent);
+-	nvkm_event_fini(&fifo->uevent);
++	nvkm_event_fini(&fifo->nonstall.event);
+ 	mutex_destroy(&fifo->mutex);
+ 	return data;
+ }
+@@ -402,9 +376,9 @@ nvkm_fifo_ctor(const struct nvkm_fifo_func *func, struct nvkm_device *device,
+ 	nr = func->chid_nr(fifo);
+ 	fifo->nr = nr;
+ 
+-	if (func->uevent_init) {
+-		ret = nvkm_event_init(&nvkm_fifo_uevent_func, &fifo->engine.subdev, 1, 1,
+-				      &fifo->uevent);
++	if (func->nonstall) {
++		ret = nvkm_event_init(func->nonstall, &fifo->engine.subdev, 1, 1,
++				      &fifo->nonstall.event);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index 5fabf7373079..ea8148bad45e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -223,9 +223,6 @@ nvkm_fifo_chan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct n
+ 	union nvif_chan_event_args *args = argv;
+ 
+ 	switch (args->v0.type) {
+-	case NVIF_CHAN_EVENT_V0_NON_STALL_INTR:
+-		return nvkm_uevent_add(uevent, &chan->fifo->uevent, 0,
+-				       NVKM_FIFO_EVENT_NON_STALL_INTR, NULL);
+ 	case NVIF_CHAN_EVENT_V0_KILLED:
+ 		return nvkm_uevent_add(uevent, &chan->fifo->kevent, chan->chid,
+ 				       NVKM_FIFO_EVENT_KILLED, NULL);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
+index 122929b7d74f..afaa2dea4ef8 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
+@@ -37,20 +37,34 @@ const struct nvkm_engn_func
+ g84_engn = {
+ };
+ 
+-void
+-g84_fifo_uevent_fini(struct nvkm_fifo *fifo)
++static void
++g84_fifo_nonstall_block(struct nvkm_event *event, int type, int index)
+ {
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x40000000, 0x00000000);
++	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), nonstall.event);
++	unsigned long flags;
++
++	spin_lock_irqsave(&fifo->lock, flags);
++	nvkm_mask(fifo->engine.subdev.device, 0x002140, 0x40000000, 0x00000000);
++	spin_unlock_irqrestore(&fifo->lock, flags);
+ }
+ 
+-void
+-g84_fifo_uevent_init(struct nvkm_fifo *fifo)
++static void
++g84_fifo_nonstall_allow(struct nvkm_event *event, int type, int index)
+ {
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x40000000, 0x40000000);
++	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), nonstall.event);
++	unsigned long flags;
++
++	spin_lock_irqsave(&fifo->lock, flags);
++	nvkm_mask(fifo->engine.subdev.device, 0x002140, 0x40000000, 0x40000000);
++	spin_unlock_irqrestore(&fifo->lock, flags);
+ }
+ 
++const struct nvkm_event_func
++g84_fifo_nonstall = {
++	.init = g84_fifo_nonstall_allow,
++	.fini = g84_fifo_nonstall_block,
++};
++
+ int
+ g84_fifo_engine_id(struct nvkm_fifo *base, struct nvkm_engine *engine)
+ {
+@@ -105,8 +119,7 @@ g84_fifo = {
+ 	.engine_id = g84_fifo_engine_id,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.uevent_init = g84_fifo_uevent_init,
+-	.uevent_fini = g84_fifo_uevent_fini,
++	.nonstall = &g84_fifo_nonstall,
+ 	.runl = &nv50_runl,
+ 	.engn = &g84_engn,
+ 	.engn_sw = &nv50_engn_sw,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g98.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g98.c
+index 118a773412fc..a912e1ba4339 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g98.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g98.c
+@@ -59,8 +59,7 @@ g98_fifo = {
+ 	.engine_id = g84_fifo_engine_id,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.uevent_init = g84_fifo_uevent_init,
+-	.uevent_fini = g84_fifo_uevent_fini,
++	.nonstall = &g84_fifo_nonstall,
+ 	.runl = &nv50_runl,
+ 	.engn = &g84_engn,
+ 	.engn_sw = &nv50_engn_sw,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+index 1a7ec75ce893..3d091604fd0a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -39,20 +39,6 @@
+ 
+ #include <nvif/class.h>
+ 
+-static void
+-gf100_fifo_uevent_init(struct nvkm_fifo *fifo)
+-{
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x80000000, 0x80000000);
+-}
+-
+-static void
+-gf100_fifo_uevent_fini(struct nvkm_fifo *fifo)
+-{
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x80000000, 0x00000000);
+-}
+-
+ static const struct nvkm_chan_func
+ gf100_chan = {
+ };
+@@ -177,6 +163,34 @@ static const struct nvkm_runl_func
+ gf100_runl = {
+ };
+ 
++static void
++gf100_fifo_nonstall_allow(struct nvkm_event *event, int type, int index)
++{
++	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), nonstall.event);
++	unsigned long flags;
++
++	spin_lock_irqsave(&fifo->lock, flags);
++	nvkm_mask(fifo->engine.subdev.device, 0x002140, 0x80000000, 0x80000000);
++	spin_unlock_irqrestore(&fifo->lock, flags);
++}
++
++void
++gf100_fifo_nonstall_block(struct nvkm_event *event, int type, int index)
++{
++	struct nvkm_fifo *fifo = container_of(event, typeof(*fifo), nonstall.event);
++	unsigned long flags;
++
++	spin_lock_irqsave(&fifo->lock, flags);
++	nvkm_mask(fifo->engine.subdev.device, 0x002140, 0x80000000, 0x00000000);
++	spin_unlock_irqrestore(&fifo->lock, flags);
++}
++
++const struct nvkm_event_func
++gf100_fifo_nonstall = {
++	.init = gf100_fifo_nonstall_allow,
++	.fini = gf100_fifo_nonstall_block,
++};
++
+ static struct nvkm_engine *
+ gf100_fifo_id_engine(struct nvkm_fifo *fifo, int engi)
+ {
+@@ -490,9 +504,9 @@ gf100_fifo_intr_runlist(struct gf100_fifo *fifo)
+ }
+ 
+ static void
+-gf100_fifo_intr_engine_unit(struct gf100_fifo *fifo, int engn)
++gf100_fifo_intr_engine_unit(struct nvkm_fifo *fifo, int engn)
+ {
+-	struct nvkm_subdev *subdev = &fifo->base.engine.subdev;
++	struct nvkm_subdev *subdev = &fifo->engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 	u32 intr = nvkm_rd32(device, 0x0025a8 + (engn * 0x04));
+ 	u32 inte = nvkm_rd32(device, 0x002628);
+@@ -503,12 +517,11 @@ gf100_fifo_intr_engine_unit(struct gf100_fifo *fifo, int engn)
+ 	for (unkn = 0; unkn < 8; unkn++) {
+ 		u32 ints = (intr >> (unkn * 0x04)) & inte;
+ 		if (ints & 0x1) {
+-			nvkm_fifo_uevent(&fifo->base);
++			nvkm_event_ntfy(&fifo->nonstall.event, 0, NVKM_FIFO_NONSTALL_EVENT);
+ 			ints &= ~1;
+ 		}
+ 		if (ints) {
+-			nvkm_error(subdev, "ENGINE %d %d %01x",
+-				   engn, unkn, ints);
++			nvkm_error(subdev, "ENGINE %d %d %01x", engn, unkn, ints);
+ 			nvkm_mask(device, 0x002628, ints, 0);
+ 		}
+ 	}
+@@ -519,9 +532,10 @@ gf100_fifo_intr_engine(struct gf100_fifo *fifo)
+ {
+ 	struct nvkm_device *device = fifo->base.engine.subdev.device;
+ 	u32 mask = nvkm_rd32(device, 0x0025a4);
++
+ 	while (mask) {
+ 		u32 unit = __ffs(mask);
+-		gf100_fifo_intr_engine_unit(fifo, unit);
++		gf100_fifo_intr_engine_unit(&fifo->base, unit);
+ 		mask &= ~(1 << unit);
+ 	}
+ }
+@@ -596,7 +610,9 @@ gf100_fifo_intr(struct nvkm_inth *inth)
+ 
+ 	if (stat) {
+ 		nvkm_error(subdev, "INTR %08x\n", stat);
++		spin_lock(&fifo->lock);
+ 		nvkm_mask(device, 0x002140, stat, 0x00000000);
++		spin_unlock(&fifo->lock);
+ 		nvkm_wr32(device, 0x002100, stat);
+ 	}
+ 
+@@ -744,8 +760,7 @@ gf100_fifo = {
+ 	.intr = gf100_fifo_intr,
+ 	.mmu_fault = &gf100_fifo_mmu_fault,
+ 	.engine_id = gf100_fifo_engine_id,
+-	.uevent_init = gf100_fifo_uevent_init,
+-	.uevent_fini = gf100_fifo_uevent_fini,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gf100_runl,
+ 	.runq = &gf100_runq,
+ 	.engn = &gf100_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+index 07fa79194870..9c25a27eeb2e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -100,20 +100,6 @@ const struct nvkm_engn_func
+ gk104_engn_ce = {
+ };
+ 
+-void
+-gk104_fifo_uevent_fini(struct nvkm_fifo *fifo)
+-{
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x80000000, 0x00000000);
+-}
+-
+-void
+-gk104_fifo_uevent_init(struct nvkm_fifo *fifo)
+-{
+-	struct nvkm_device *device = fifo->engine.subdev.device;
+-	nvkm_mask(device, 0x002140, 0x80000000, 0x80000000);
+-}
+-
+ static const struct nvkm_bitfield gk104_fifo_pbdma_intr_1[] = {
+ 	{ 0x00000001, "HCE_RE_ILLEGAL_OP" },
+ 	{ 0x00000002, "HCE_RE_ALIGNB" },
+@@ -873,12 +859,6 @@ gk104_fifo_intr_runlist(struct gk104_fifo *fifo)
+ 	}
+ }
+ 
+-void
+-gk104_fifo_intr_engine(struct gk104_fifo *fifo)
+-{
+-	nvkm_fifo_uevent(&fifo->base);
+-}
+-
+ irqreturn_t
+ gk104_fifo_intr(struct nvkm_inth *inth)
+ {
+@@ -960,13 +940,15 @@ gk104_fifo_intr(struct nvkm_inth *inth)
+ 
+ 	if (stat & 0x80000000) {
+ 		nvkm_wr32(device, 0x002100, 0x80000000);
+-		gk104_fifo_intr_engine(gk104_fifo(fifo));
++		nvkm_event_ntfy(&fifo->nonstall.event, 0, NVKM_FIFO_NONSTALL_EVENT);
+ 		stat &= ~0x80000000;
+ 	}
+ 
+ 	if (stat) {
+ 		nvkm_error(subdev, "INTR %08x\n", stat);
++		spin_lock(&fifo->lock);
+ 		nvkm_mask(device, 0x002140, stat, 0x00000000);
++		spin_unlock(&fifo->lock);
+ 		nvkm_wr32(device, 0x002100, stat);
+ 	}
+ 
+@@ -1175,11 +1157,10 @@ gk104_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gk104_fifo_runlist,
+ 	.pbdma = &gk104_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gk104_runl,
+ 	.runq = &gk104_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+index 23328a8c19b3..8d72eaa55568 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+@@ -69,13 +69,10 @@ void gk104_fifo_engine_status(struct gk104_fifo *fifo, int engn,
+ void gk104_fifo_intr_pbdma_0(struct gk104_fifo *fifo, int unit);
+ void gk104_fifo_intr_pbdma_1(struct gk104_fifo *fifo, int unit);
+ void gk104_fifo_intr_runlist(struct gk104_fifo *fifo);
+-void gk104_fifo_intr_engine(struct gk104_fifo *fifo);
+ void *gk104_fifo_dtor(struct nvkm_fifo *base);
+ int gk104_fifo_oneinit(struct nvkm_fifo *);
+ void gk104_fifo_init(struct nvkm_fifo *base);
+ void gk104_fifo_fini(struct nvkm_fifo *base);
+-void gk104_fifo_uevent_fini(struct nvkm_fifo *fifo);
+-void gk104_fifo_uevent_init(struct nvkm_fifo *fifo);
+ 
+ extern const struct gk104_fifo_pbdma_func gk104_fifo_pbdma;
+ void gk104_fifo_pbdma_init(struct gk104_fifo *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+index ed3aa170d429..9350fbcf0db9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+@@ -93,11 +93,10 @@ gk110_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gk110_fifo_runlist,
+ 	.pbdma = &gk104_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gk110_runl,
+ 	.runq = &gk104_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
+index 7219dc92f451..d50f32c530a5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
+@@ -72,10 +72,9 @@ gk208_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gk110_fifo_runlist,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.pbdma = &gk208_fifo_pbdma,
+ 	.runl = &gk110_runl,
+ 	.runq = &gk208_runq,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
+index 9dfa93d914e0..add5e1a8de0a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
+@@ -43,11 +43,10 @@ gk20a_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gk110_fifo_runlist,
+ 	.pbdma = &gk208_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gk110_runl,
+ 	.runq = &gk208_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+index 4b67fe1ed81a..50c6bec03f92 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+@@ -133,11 +133,10 @@ gm107_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gm107_fifo_runlist,
+ 	.pbdma = &gk208_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gm107_runl,
+ 	.runq = &gk208_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
+index 5c81f8b8d6c0..497b0e9c7c32 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
+@@ -63,11 +63,10 @@ gm200_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gm107_fifo_runlist,
+ 	.pbdma = &gm200_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gm107_runl,
+ 	.runq = &gk208_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+index d90ba4170d98..3fa8c0a1d191 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+@@ -105,11 +105,10 @@ gp100_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gm107_fifo_runlist,
+ 	.pbdma = &gm200_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gp100_runl,
+ 	.runq = &gk208_runq,
+ 	.engn = &gk104_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+index c2b32688cbd1..a715dbdcd27e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+@@ -332,11 +332,10 @@ gv100_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+ 	.runlist = &gv100_fifo_runlist,
+ 	.pbdma = &gm200_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &gv100_runl,
+ 	.runq = &gv100_runq,
+ 	.engn = &gv100_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+index 4f3fed0fcb50..b899127cfd72 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+@@ -384,7 +384,7 @@ nv04_fifo_intr(struct nvkm_inth *inth)
+ 
+ 		if (stat & 0x40000000) {
+ 			nvkm_wr32(device, 0x002100, 0x40000000);
+-			nvkm_fifo_uevent(fifo);
++			nvkm_event_ntfy(&fifo->nonstall.event, 0, NVKM_FIFO_NONSTALL_EVENT);
+ 			stat &= ~0x40000000;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.h
+index b8f7201ba7f5..db5fb45a3aa5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.h
+@@ -19,6 +19,4 @@ void nv50_fifo_init(struct nvkm_fifo *);
+ void nv50_fifo_runlist_update(struct nv50_fifo *);
+ 
+ int g84_fifo_engine_id(struct nvkm_fifo *, struct nvkm_engine *);
+-void g84_fifo_uevent_init(struct nvkm_fifo *);
+-void g84_fifo_uevent_fini(struct nvkm_fifo *);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+index f314f107f2eb..d9cb4967b799 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+@@ -8,7 +8,6 @@ struct nvkm_memory;
+ struct gk104_fifo;
+ struct gk104_fifo_chan;
+ 
+-void nvkm_fifo_uevent(struct nvkm_fifo *);
+ void nvkm_fifo_kevent(struct nvkm_fifo *, int chid);
+ void nvkm_fifo_recover_chan(struct nvkm_fifo *, int chid);
+ 
+@@ -46,8 +45,6 @@ struct nvkm_fifo_func {
+ 	int (*engine_id)(struct nvkm_fifo *, struct nvkm_engine *);
+ 	void (*pause)(struct nvkm_fifo *, unsigned long *);
+ 	void (*start)(struct nvkm_fifo *, unsigned long *);
+-	void (*uevent_init)(struct nvkm_fifo *);
+-	void (*uevent_fini)(struct nvkm_fifo *);
+ 	void (*recover_chan)(struct nvkm_fifo *, int chid);
+ 
+ 	const struct gk104_fifo_runlist_func {
+@@ -65,6 +62,8 @@ struct nvkm_fifo_func {
+ 		void (*init_timeout)(struct gk104_fifo *);
+ 	} *pbdma;
+ 
++	const struct nvkm_event_func *nonstall;
++
+ 	const struct nvkm_runl_func *runl;
+ 	const struct nvkm_runq_func *runq;
+ 	const struct nvkm_engn_func *engn;
+@@ -110,12 +109,14 @@ int nv50_fifo_chid_ctor(struct nvkm_fifo *, int);
+ extern const struct nvkm_runl_func nv50_runl;
+ extern const struct nvkm_engn_func nv50_engn_sw;
+ 
++extern const struct nvkm_event_func g84_fifo_nonstall;
+ extern const struct nvkm_engn_func g84_engn;
+ extern const struct nvkm_chan_func g84_chan;
+ 
+ int gf100_fifo_chid_ctor(struct nvkm_fifo *, int);
+ int gf100_fifo_runq_nr(struct nvkm_fifo *);
+ void gf100_fifo_intr_mmu_fault_unit(struct nvkm_fifo *, int);
++extern const struct nvkm_event_func gf100_fifo_nonstall;
+ extern const struct nvkm_engn_func gf100_engn_sw;
+ 
+ int gk104_fifo_chid_nr(struct nvkm_fifo *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+index ae399c6a192d..6551376cbdd4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+@@ -430,13 +430,15 @@ tu102_fifo_intr(struct nvkm_inth *inth)
+ 
+ 	if (stat & 0x80000000) {
+ 		nvkm_wr32(device, 0x002100, 0x80000000);
+-		gk104_fifo_intr_engine(gk104_fifo(fifo));
++		nvkm_event_ntfy(&fifo->nonstall.event, 0, NVKM_FIFO_NONSTALL_EVENT);
+ 		stat &= ~0x80000000;
+ 	}
+ 
+ 	if (stat) {
+ 		nvkm_error(subdev, "INTR %08x\n", stat);
++		spin_lock(&fifo->lock);
+ 		nvkm_mask(device, 0x002140, stat, 0x00000000);
++		spin_unlock(&fifo->lock);
+ 		nvkm_wr32(device, 0x002100, stat);
+ 	}
+ 
+@@ -461,11 +463,10 @@ tu102_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.engine_id = gk104_fifo_engine_id,
+-	.uevent_init = gk104_fifo_uevent_init,
+-	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = tu102_fifo_recover_chan,
+ 	.runlist = &tu102_fifo_runlist,
+ 	.pbdma = &tu102_fifo_pbdma,
++	.nonstall = &gf100_fifo_nonstall,
+ 	.runl = &tu102_runl,
+ 	.runq = &gv100_runq,
+ 	.engn = &gv100_engn,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+index 6f920e0e1008..c4f404840806 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+@@ -39,6 +39,7 @@ static int
+ nvkm_uchan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct nvkm_uevent *uevent)
+ {
+ 	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++	struct nvkm_runl *runl = chan->cgrp->runl;
+ 	union nvif_chan_event_args *args = argv;
+ 
+ 	if (!uevent)
+@@ -48,6 +49,8 @@ nvkm_uchan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct nvkm_
+ 
+ 	switch (args->v0.type) {
+ 	case NVIF_CHAN_EVENT_V0_NON_STALL_INTR:
++		return nvkm_uevent_add(uevent, &runl->fifo->nonstall.event, 0,
++				       NVKM_FIFO_NONSTALL_EVENT, NULL);
+ 	case NVIF_CHAN_EVENT_V0_KILLED:
+ 		return chan->object.func->uevent(&chan->object, argv, argc, uevent);
+ 	default:
+-- 
+2.25.1
+

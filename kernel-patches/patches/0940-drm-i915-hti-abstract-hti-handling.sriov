@@ -1,0 +1,247 @@
+From 0b17a8110f23e79b32770e4bf63a4557553bfd57 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Wed, 9 Nov 2022 16:42:06 +0200
+Subject: [PATCH 0940/2236] drm/i915/hti: abstract hti handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The HTI or HDPORT handling is sprinkled around. Centralize to one place.
+
+Add a note about how subtle the mapping from HDPORT_STATE register to
+dpll mask actually is.
+
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221109144209.3624739-1-jani.nikula@intel.com
+---
+ drivers/gpu/drm/i915/Makefile                 |  1 +
+ drivers/gpu/drm/i915/display/intel_ddi.c      |  9 +----
+ drivers/gpu/drm/i915/display/intel_display.c  |  8 +---
+ drivers/gpu/drm/i915/display/intel_dpll_mgr.c | 11 +-----
+ drivers/gpu/drm/i915/display/intel_hti.c      | 38 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_hti.h      | 18 +++++++++
+ drivers/gpu/drm/i915/display/intel_hti_regs.h | 16 ++++++++
+ drivers/gpu/drm/i915/i915_reg.h               |  5 ---
+ 8 files changed, 79 insertions(+), 27 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/display/intel_hti.c
+ create mode 100644 drivers/gpu/drm/i915/display/intel_hti.h
+ create mode 100644 drivers/gpu/drm/i915/display/intel_hti_regs.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index d09248c3b176..01974b82d205 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -248,6 +248,7 @@ i915-y += \
+ 	display/intel_global_state.o \
+ 	display/intel_hdcp.o \
+ 	display/intel_hotplug.o \
++	display/intel_hti.o \
+ 	display/intel_lpe_audio.o \
+ 	display/intel_modeset_verify.o \
+ 	display/intel_modeset_setup.o \
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 477dd9b72ea3..8621f24f80db 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -57,6 +57,7 @@
+ #include "intel_hdcp.h"
+ #include "intel_hdmi.h"
+ #include "intel_hotplug.h"
++#include "intel_hti.h"
+ #include "intel_lspcon.h"
+ #include "intel_mg_phy_regs.h"
+ #include "intel_pps.h"
+@@ -4114,12 +4115,6 @@ intel_ddi_max_lanes(struct intel_digital_port *dig_port)
+ 	return max_lanes;
+ }
+ 
+-static bool hti_uses_phy(struct drm_i915_private *i915, enum phy phy)
+-{
+-	return i915->hti_state & HDPORT_ENABLED &&
+-	       i915->hti_state & HDPORT_DDI_USED(phy);
+-}
+-
+ static enum hpd_pin xelpd_hpd_pin(struct drm_i915_private *dev_priv,
+ 				  enum port port)
+ {
+@@ -4248,7 +4243,7 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ 	 * driver.  In that case we should skip initializing the corresponding
+ 	 * outputs.
+ 	 */
+-	if (hti_uses_phy(dev_priv, phy)) {
++	if (intel_hti_uses_phy(dev_priv, phy)) {
+ 		drm_dbg_kms(&dev_priv->drm, "PORT %c / PHY %c reserved by HTI\n",
+ 			    port_name(port), phy_name(phy));
+ 		return;
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 265c491d658a..2a1b83094162 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -101,6 +101,7 @@
+ #include "intel_frontbuffer.h"
+ #include "intel_hdcp.h"
+ #include "intel_hotplug.h"
++#include "intel_hti.h"
+ #include "intel_modeset_verify.h"
+ #include "intel_modeset_setup.h"
+ #include "intel_overlay.h"
+@@ -8740,12 +8741,7 @@ int intel_modeset_init_nogem(struct drm_i915_private *i915)
+ 	if (i915->display.cdclk.max_cdclk_freq == 0)
+ 		intel_update_max_cdclk(i915);
+ 
+-	/*
+-	 * If the platform has HTI, we need to find out whether it has reserved
+-	 * any display resources before we create our display outputs.
+-	 */
+-	if (INTEL_INFO(i915)->display.has_hti)
+-		i915->hti_state = intel_de_read(i915, HDPORT_STATE);
++	intel_hti_init(i915);
+ 
+ 	/* Just disable it once at startup */
+ 	intel_vga_disable(i915);
+diff --git a/drivers/gpu/drm/i915/display/intel_dpll_mgr.c b/drivers/gpu/drm/i915/display/intel_dpll_mgr.c
+index 79579dca3c7e..1974eb580ed1 100644
+--- a/drivers/gpu/drm/i915/display/intel_dpll_mgr.c
++++ b/drivers/gpu/drm/i915/display/intel_dpll_mgr.c
+@@ -31,6 +31,7 @@
+ #include "intel_dpio_phy.h"
+ #include "intel_dpll.h"
+ #include "intel_dpll_mgr.h"
++#include "intel_hti.h"
+ #include "intel_mg_phy_regs.h"
+ #include "intel_pch_refclk.h"
+ #include "intel_tc.h"
+@@ -3164,14 +3165,6 @@ static void icl_update_active_dpll(struct intel_atomic_state *state,
+ 	icl_set_active_port_dpll(crtc_state, port_dpll_id);
+ }
+ 
+-static u32 intel_get_hti_plls(struct drm_i915_private *i915)
+-{
+-	if (!(i915->hti_state & HDPORT_ENABLED))
+-		return 0;
+-
+-	return REG_FIELD_GET(HDPORT_DPLL_USED_MASK, i915->hti_state);
+-}
+-
+ static int icl_compute_combo_phy_dpll(struct intel_atomic_state *state,
+ 				      struct intel_crtc *crtc)
+ {
+@@ -3246,7 +3239,7 @@ static int icl_get_combo_phy_dpll(struct intel_atomic_state *state,
+ 	}
+ 
+ 	/* Eliminate DPLLs from consideration if reserved by HTI */
+-	dpll_mask &= ~intel_get_hti_plls(dev_priv);
++	dpll_mask &= ~intel_hti_dpll_mask(dev_priv);
+ 
+ 	port_dpll->pll = intel_find_shared_dpll(state, crtc,
+ 						&port_dpll->hw_state,
+diff --git a/drivers/gpu/drm/i915/display/intel_hti.c b/drivers/gpu/drm/i915/display/intel_hti.c
+new file mode 100644
+index 000000000000..3dfd7203f01c
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_hti.c
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2022 Intel Corporation
++ */
++
++#include "i915_drv.h"
++#include "intel_de.h"
++#include "intel_display.h"
++#include "intel_hti.h"
++#include "intel_hti_regs.h"
++
++void intel_hti_init(struct drm_i915_private *i915)
++{
++	/*
++	 * If the platform has HTI, we need to find out whether it has reserved
++	 * any display resources before we create our display outputs.
++	 */
++	if (INTEL_INFO(i915)->display.has_hti)
++		i915->hti_state = intel_de_read(i915, HDPORT_STATE);
++}
++
++bool intel_hti_uses_phy(struct drm_i915_private *i915, enum phy phy)
++{
++	return i915->hti_state & HDPORT_ENABLED &&
++		i915->hti_state & HDPORT_DDI_USED(phy);
++}
++
++u32 intel_hti_dpll_mask(struct drm_i915_private *i915)
++{
++	if (!(i915->hti_state & HDPORT_ENABLED))
++		return 0;
++
++	/*
++	 * Note: This is subtle. The values must coincide with what's defined
++	 * for the platform.
++	 */
++	return REG_FIELD_GET(HDPORT_DPLL_USED_MASK, i915->hti_state);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_hti.h b/drivers/gpu/drm/i915/display/intel_hti.h
+new file mode 100644
+index 000000000000..2893d6668657
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_hti.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2022 Intel Corporation
++ */
++
++#ifndef __INTEL_HTI_H__
++#define __INTEL_HTI_H__
++
++#include <linux/types.h>
++
++struct drm_i915_private;
++enum phy;
++
++void intel_hti_init(struct drm_i915_private *i915);
++bool intel_hti_uses_phy(struct drm_i915_private *i915, enum phy phy);
++u32 intel_hti_dpll_mask(struct drm_i915_private *i915);
++
++#endif /* __INTEL_HTI_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_hti_regs.h b/drivers/gpu/drm/i915/display/intel_hti_regs.h
+new file mode 100644
+index 000000000000..e206f2837fc8
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_hti_regs.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2022 Intel Corporation
++ */
++
++#ifndef __INTEL_HTI_REGS_H__
++#define __INTEL_HTI_REGS_H__
++
++#include "i915_reg_defs.h"
++
++#define HDPORT_STATE			_MMIO(0x45050)
++#define   HDPORT_DPLL_USED_MASK		REG_GENMASK(15, 12)
++#define   HDPORT_DDI_USED(phy)		REG_BIT(2 * (phy) + 1)
++#define   HDPORT_ENABLED		REG_BIT(0)
++
++#endif /* __INTEL_HTI_REGS_H__ */
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index d47dca9040c4..c51bc6c4b1ed 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1080,11 +1080,6 @@
+ #define MBUS_JOIN_PIPE_SELECT(pipe)	REG_FIELD_PREP(MBUS_JOIN_PIPE_SELECT_MASK, pipe)
+ #define MBUS_JOIN_PIPE_SELECT_NONE	MBUS_JOIN_PIPE_SELECT(7)
+ 
+-#define HDPORT_STATE			_MMIO(0x45050)
+-#define   HDPORT_DPLL_USED_MASK		REG_GENMASK(15, 12)
+-#define   HDPORT_DDI_USED(phy)		REG_BIT(2 * (phy) + 1)
+-#define   HDPORT_ENABLED		REG_BIT(0)
+-
+ /* Make render/texture TLB fetches lower priorty than associated data
+  *   fetches. This is not turned on by default
+  */
+-- 
+2.25.1
+

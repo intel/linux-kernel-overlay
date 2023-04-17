@@ -1,0 +1,487 @@
+From 918b1abc716ef780eb08428c97eadbc24b177c9d Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:30 +1000
+Subject: [PATCH 0728/2236] drm/nouveau/fifo: add runlist wait()
+
+- adds g8x/turing registers, which were missing before
+- switches fermi to polled wait, like later hw (see: 4f2fc25c0f8bc...)
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |  4 +++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   |  5 +++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.c  | 23 +++++++------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.h  |  1 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.c  | 33 +++++++++++--------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.h  |  2 --
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk110.c  |  2 ++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gm107.c  |  2 ++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gp100.c  |  2 ++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gv100.c  |  2 ++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv50.c   | 27 +++++++++++++--
+ .../gpu/drm/nouveau/nvkm/engine/fifo/priv.h   |  3 ++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.c   |  9 +++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.h   |  5 +++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/tu102.c  | 14 ++++++--
+ 15 files changed, 102 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index 5a5c37480400..a4cc7f07bb89 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -54,6 +54,10 @@ struct nvkm_fifo {
+ 		struct nvkm_event event;
+ 	} nonstall;
+ 
++	struct {
++		u32 chan_msec;
++	} timeout;
++
+ 	int nr;
+ 	struct list_head chan;
+ 	spinlock_t lock;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index 83da63bdf3c4..e08d8d14a19a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -319,6 +319,11 @@ nvkm_fifo_ctor(const struct nvkm_fifo_func *func, struct nvkm_device *device,
+ 	fifo->func = func;
+ 	INIT_LIST_HEAD(&fifo->runqs);
+ 	INIT_LIST_HEAD(&fifo->runls);
++	/*TODO: Needs to be >CTXSW_TIMEOUT, so RC can recover before this is hit.
++	 *      CTXSW_TIMEOUT HW default seems to differ between GPUs, so just a
++	 *      large number for now until we support changing it.
++	 */
++	fifo->timeout.chan_msec = 10000;
+ 	spin_lock_init(&fifo->lock);
+ 	mutex_init(&fifo->mutex);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+index 7c1db7721ff6..70a2609479b9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -115,12 +115,19 @@ gf100_runq = {
+ 	.intr_0_names = gf100_runq_intr_0_names,
+ };
+ 
++static bool
++gf100_runl_pending(struct nvkm_runl *runl)
++{
++	return nvkm_rd32(runl->fifo->engine.subdev.device, 0x00227c) & 0x00100000;
++}
++
+ void
+ gf100_fifo_runlist_commit(struct gf100_fifo *fifo)
+ {
+ 	struct gf100_fifo_chan *chan;
+ 	struct nvkm_subdev *subdev = &fifo->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
++	struct nvkm_runl *runl = nvkm_runl_first(&fifo->base);
+ 	struct nvkm_memory *cur;
+ 	int nr = 0;
+ 	int target;
+@@ -150,10 +157,7 @@ gf100_fifo_runlist_commit(struct gf100_fifo *fifo)
+ 				    (target << 28));
+ 	nvkm_wr32(device, 0x002274, 0x01f00000 | nr);
+ 
+-	if (wait_event_timeout(fifo->runlist.wait,
+-			       !(nvkm_rd32(device, 0x00227c) & 0x00100000),
+-			       msecs_to_jiffies(2000)) == 0)
+-		nvkm_error(subdev, "runlist update timeout\n");
++	runl->func->wait(runl);
+ 	mutex_unlock(&fifo->base.mutex);
+ }
+ 
+@@ -175,6 +179,8 @@ gf100_fifo_runlist_insert(struct gf100_fifo *fifo, struct gf100_fifo_chan *chan)
+ 
+ static const struct nvkm_runl_func
+ gf100_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gf100_runl_pending,
+ };
+ 
+ static void
+@@ -558,14 +564,13 @@ gf100_fifo_intr_pbdma(struct nvkm_fifo *fifo)
+ }
+ 
+ static void
+-gf100_fifo_intr_runlist(struct gf100_fifo *fifo)
++gf100_fifo_intr_runlist(struct nvkm_fifo *fifo)
+ {
+-	struct nvkm_subdev *subdev = &fifo->base.engine.subdev;
++	struct nvkm_subdev *subdev = &fifo->engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 	u32 intr = nvkm_rd32(device, 0x002a00);
+ 
+ 	if (intr & 0x10000000) {
+-		wake_up(&fifo->runlist.wait);
+ 		nvkm_wr32(device, 0x002a00, 0x10000000);
+ 		intr &= ~0x10000000;
+ 	}
+@@ -660,7 +665,7 @@ gf100_fifo_intr(struct nvkm_inth *inth)
+ 	}
+ 
+ 	if (stat & 0x40000000) {
+-		gf100_fifo_intr_runlist(gf100_fifo(fifo));
++		gf100_fifo_intr_runlist(fifo);
+ 		stat &= ~0x40000000;
+ 	}
+ 
+@@ -779,8 +784,6 @@ gf100_fifo_oneinit(struct nvkm_fifo *base)
+ 	if (ret)
+ 		return ret;
+ 
+-	init_waitqueue_head(&fifo->runlist.wait);
+-
+ 	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST, 128 * 0x1000,
+ 			      0x1000, false, &fifo->user.mem);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.h
+index 82b8467545a8..8e0c1a5e3c57 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.h
+@@ -20,7 +20,6 @@ struct gf100_fifo {
+ 	struct {
+ 		struct nvkm_memory *mem[2];
+ 		int active;
+-		wait_queue_head_t wait;
+ 	} runlist;
+ 
+ 	struct {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+index de8e3a17d79e..c816654dc245 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -197,12 +197,21 @@ gk104_runq = {
+ 	.intr_0_names = gk104_runq_intr_0_names,
+ };
+ 
++bool
++gk104_runl_pending(struct nvkm_runl *runl)
++{
++	struct nvkm_device *device = runl->fifo->engine.subdev.device;
++
++	return nvkm_rd32(device, 0x002284 + (runl->id * 0x08)) & 0x00100000;
++}
++
+ void
+ gk104_fifo_runlist_commit(struct gk104_fifo *fifo, int runl,
+ 			  struct nvkm_memory *mem, int nr)
+ {
+ 	struct nvkm_subdev *subdev = &fifo->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
++	struct nvkm_runl *rl = nvkm_runl_get(&fifo->base, runl, 0);
+ 	int target;
+ 
+ 	switch (nvkm_memory_target(mem)) {
+@@ -217,11 +226,7 @@ gk104_fifo_runlist_commit(struct gk104_fifo *fifo, int runl,
+ 				    (target << 28));
+ 	nvkm_wr32(device, 0x002274, (runl << 20) | nr);
+ 
+-	if (nvkm_msec(device, 2000,
+-		if (!(nvkm_rd32(device, 0x002284 + (runl * 0x08)) & 0x00100000))
+-			break;
+-	) < 0)
+-		nvkm_error(subdev, "runlist %d update timeout\n", runl);
++	rl->func->wait(rl);
+ }
+ 
+ void
+@@ -299,6 +304,8 @@ gk104_fifo_runlist = {
+ 
+ static const struct nvkm_runl_func
+ gk104_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gk104_runl_pending,
+ };
+ 
+ int
+@@ -736,15 +743,14 @@ gk104_fifo_intr_dropped_fault(struct nvkm_fifo *fifo)
+ }
+ 
+ void
+-gk104_fifo_intr_runlist(struct gk104_fifo *fifo)
++gk104_fifo_intr_runlist(struct nvkm_fifo *fifo)
+ {
+-	struct nvkm_device *device = fifo->base.engine.subdev.device;
++	struct nvkm_device *device = fifo->engine.subdev.device;
++	struct nvkm_runl *runl;
+ 	u32 mask = nvkm_rd32(device, 0x002a00);
+-	while (mask) {
+-		int runl = __ffs(mask);
+-		wake_up(&fifo->runlist[runl].wait);
+-		nvkm_wr32(device, 0x002a00, 1 << runl);
+-		mask &= ~(1 << runl);
++
++	nvkm_runl_foreach_cond(runl, fifo, mask & BIT(runl->id)) {
++		nvkm_wr32(device, 0x002a00, BIT(runl->id));
+ 	}
+ }
+ 
+@@ -810,7 +816,7 @@ gk104_fifo_intr(struct nvkm_inth *inth)
+ 	}
+ 
+ 	if (stat & 0x40000000) {
+-		gk104_fifo_intr_runlist(gk104_fifo(fifo));
++		gk104_fifo_intr_runlist(fifo);
+ 		stat &= ~0x40000000;
+ 	}
+ 
+@@ -949,7 +955,6 @@ gk104_fifo_oneinit(struct nvkm_fifo *base)
+ 				return ret;
+ 		}
+ 
+-		init_waitqueue_head(&fifo->runlist[i].wait);
+ 		INIT_LIST_HEAD(&fifo->runlist[i].cgrp);
+ 		INIT_LIST_HEAD(&fifo->runlist[i].chan);
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+index 13f1efcc9e24..7cff1529ae35 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+@@ -30,7 +30,6 @@ struct gk104_fifo {
+ 	struct {
+ 		struct nvkm_memory *mem[2];
+ 		int next;
+-		wait_queue_head_t wait;
+ 		struct list_head cgrp;
+ 		struct list_head chan;
+ 		u32 engm;
+@@ -63,7 +62,6 @@ void gk104_fifo_runlist_remove(struct gk104_fifo *, struct gk104_fifo_chan *);
+ void gk104_fifo_runlist_update(struct gk104_fifo *, int runl);
+ void gk104_fifo_engine_status(struct gk104_fifo *fifo, int engn,
+ 			      struct gk104_fifo_engine_status *status);
+-void gk104_fifo_intr_runlist(struct gk104_fifo *fifo);
+ void *gk104_fifo_dtor(struct nvkm_fifo *base);
+ int gk104_fifo_oneinit(struct nvkm_fifo *);
+ void gk104_fifo_init(struct nvkm_fifo *base);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+index 5271f5504854..bcc78b35d4e2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+@@ -60,6 +60,8 @@ gk110_fifo_runlist = {
+ 
+ const struct nvkm_runl_func
+ gk110_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gk104_runl_pending,
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+index ecf4e6d94866..b6a2210f42c2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+@@ -54,6 +54,8 @@ gm107_fifo_runlist = {
+ 
+ const struct nvkm_runl_func
+ gm107_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gk104_runl_pending,
+ };
+ 
+ static const struct nvkm_enum
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+index 0ca14b08ca3a..b810175209d1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+@@ -31,6 +31,8 @@
+ 
+ static const struct nvkm_runl_func
+ gp100_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gk104_runl_pending,
+ };
+ 
+ static const struct nvkm_enum
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+index 49d7c9e7fb8a..7ad04e97a82d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+@@ -84,6 +84,8 @@ gv100_fifo_runlist = {
+ 
+ static const struct nvkm_runl_func
+ gv100_runl = {
++	.wait = nv50_runl_wait,
++	.pending = gk104_runl_pending,
+ };
+ 
+ const struct nvkm_enum
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+index 46013aea97d6..16e59d8ea325 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+@@ -25,11 +25,12 @@
+ #include "chid.h"
+ #include "runl.h"
+ 
++#include <core/gpuobj.h>
++#include <subdev/timer.h>
++
+ #include "nv50.h"
+ #include "channv50.h"
+ 
+-#include <core/gpuobj.h>
+-
+ #include <nvif/class.h>
+ 
+ static const struct nvkm_chan_func
+@@ -74,8 +75,30 @@ nv50_fifo_runlist_update(struct nv50_fifo *fifo)
+ 	mutex_unlock(&fifo->base.mutex);
+ }
+ 
++static bool
++nv50_runl_pending(struct nvkm_runl *runl)
++{
++	return nvkm_rd32(runl->fifo->engine.subdev.device, 0x0032ec) & 0x00000100;
++}
++
++int
++nv50_runl_wait(struct nvkm_runl *runl)
++{
++	struct nvkm_fifo *fifo = runl->fifo;
++
++	nvkm_msec(fifo->engine.subdev.device, fifo->timeout.chan_msec,
++		if (!nvkm_runl_update_pending(runl))
++			return 0;
++		usleep_range(1, 2);
++	);
++
++	return -ETIMEDOUT;
++}
++
+ const struct nvkm_runl_func
+ nv50_runl = {
++	.wait = nv50_runl_wait,
++	.pending = nv50_runl_pending,
+ };
+ 
+ void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+index 7bc7b89ffd18..bab3cfbc5fcf 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+@@ -101,6 +101,7 @@ int nv10_fifo_chid_nr(struct nvkm_fifo *);
+ int nv50_fifo_chid_nr(struct nvkm_fifo *);
+ int nv50_fifo_chid_ctor(struct nvkm_fifo *, int);
+ extern const struct nvkm_runl_func nv50_runl;
++int nv50_runl_wait(struct nvkm_runl *);
+ extern const struct nvkm_engn_func nv50_engn_sw;
+ 
+ extern const struct nvkm_event_func g84_fifo_nonstall;
+@@ -123,6 +124,7 @@ int gk104_fifo_chid_nr(struct nvkm_fifo *);
+ int gk104_fifo_runl_ctor(struct nvkm_fifo *);
+ void gk104_fifo_init_pbdmas(struct nvkm_fifo *, u32);
+ irqreturn_t gk104_fifo_intr(struct nvkm_inth *);
++void gk104_fifo_intr_runlist(struct nvkm_fifo *);
+ void gk104_fifo_intr_chsw(struct nvkm_fifo *);
+ void gk104_fifo_intr_bind(struct nvkm_fifo *);
+ extern const struct nvkm_fifo_func_mmu_fault gk104_fifo_mmu_fault;
+@@ -131,6 +133,7 @@ extern const struct nvkm_enum gk104_fifo_mmu_fault_hubclient[];
+ extern const struct nvkm_enum gk104_fifo_mmu_fault_gpcclient[];
+ void gk104_fifo_recover_chan(struct nvkm_fifo *, int);
+ int gk104_fifo_engine_id(struct nvkm_fifo *, struct nvkm_engine *);
++bool gk104_runl_pending(struct nvkm_runl *);
+ extern const struct nvkm_runq_func gk104_runq;
+ void gk104_runq_init(struct nvkm_runq *);
+ bool gk104_runq_intr(struct nvkm_runq *, struct nvkm_runl *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+index e4984e1e7c65..0e1d703456b6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+@@ -73,6 +73,15 @@ nvkm_runl_chan_get_chid(struct nvkm_runl *runl, int id, unsigned long *pirqflags
+ 	return NULL;
+ }
+ 
++bool
++nvkm_runl_update_pending(struct nvkm_runl *runl)
++{
++	if (!runl->func->pending(runl))
++		return false;
++
++	return true;
++}
++
+ void
+ nvkm_runl_del(struct nvkm_runl *runl)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+index e618e326b3c3..7682731c3af6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+@@ -24,6 +24,8 @@ struct nvkm_engn {
+ 
+ struct nvkm_runl {
+ 	const struct nvkm_runl_func {
++		int (*wait)(struct nvkm_runl *);
++		bool (*pending)(struct nvkm_runl *);
+ 	} *func;
+ 	struct nvkm_fifo *fifo;
+ 	int id;
+@@ -50,13 +52,16 @@ struct nvkm_runl *nvkm_runl_get(struct nvkm_fifo *, int runi, u32 addr);
+ struct nvkm_engn *nvkm_runl_add(struct nvkm_runl *, int engi, const struct nvkm_engn_func *,
+ 				enum nvkm_subdev_type, int inst);
+ void nvkm_runl_del(struct nvkm_runl *);
++bool nvkm_runl_update_pending(struct nvkm_runl *);
+ 
+ struct nvkm_chan *nvkm_runl_chan_get_chid(struct nvkm_runl *, int chid, unsigned long *irqflags);
+ struct nvkm_chan *nvkm_runl_chan_get_inst(struct nvkm_runl *, u64 inst, unsigned long *irqflags);
+ 
+ #define nvkm_runl_find_engn(engn,runl,cond) nvkm_list_find(engn, &(runl)->engns, head, (cond))
+ 
++#define nvkm_runl_first(fifo) list_first_entry(&(fifo)->runls, struct nvkm_runl, head)
+ #define nvkm_runl_foreach(runl,fifo) list_for_each_entry((runl), &(fifo)->runls, head)
++#define nvkm_runl_foreach_cond(runl,fifo,cond) nvkm_list_foreach(runl, &(fifo)->runls, head, (cond))
+ #define nvkm_runl_foreach_engn(engn,runl) list_for_each_entry((engn), &(runl)->engns, head)
+ #define nvkm_runl_foreach_engn_cond(engn,runl,cond) \
+ 	nvkm_list_foreach(engn, &(runl)->engns, head, (cond))
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+index 47de0b97534a..f0564fa400b7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+@@ -35,6 +35,14 @@ static const struct nvkm_chan_func
+ tu102_chan = {
+ };
+ 
++static bool
++tu102_runl_pending(struct nvkm_runl *runl)
++{
++	struct nvkm_device *device = runl->fifo->engine.subdev.device;
++
++	return nvkm_rd32(device, 0x002b0c + (runl->id * 0x10)) & 0x00008000;
++}
++
+ static void
+ tu102_fifo_runlist_commit(struct gk104_fifo *fifo, int runl,
+ 			  struct nvkm_memory *mem, int nr)
+@@ -46,8 +54,6 @@ tu102_fifo_runlist_commit(struct gk104_fifo *fifo, int runl,
+ 	nvkm_wr32(device, 0x002b00 + (runl * 0x10), lower_32_bits(addr));
+ 	nvkm_wr32(device, 0x002b04 + (runl * 0x10), upper_32_bits(addr));
+ 	nvkm_wr32(device, 0x002b08 + (runl * 0x10), nr);
+-
+-	/*XXX: how to wait? can you even wait? */
+ }
+ 
+ static const struct gk104_fifo_runlist_func
+@@ -60,6 +66,8 @@ tu102_fifo_runlist = {
+ 
+ static const struct nvkm_runl_func
+ tu102_runl = {
++	.wait = nv50_runl_wait,
++	.pending = tu102_runl_pending,
+ };
+ 
+ static const struct nvkm_enum
+@@ -319,7 +327,7 @@ tu102_fifo_intr(struct nvkm_inth *inth)
+ 	}
+ 
+ 	if (stat & 0x40000000) {
+-		gk104_fifo_intr_runlist(gk104_fifo(fifo));
++		gk104_fifo_intr_runlist(fifo);
+ 		stat &= ~0x40000000;
+ 	}
+ 
+-- 
+2.25.1
+

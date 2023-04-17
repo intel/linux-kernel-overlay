@@ -1,0 +1,360 @@
+From 1eab8e81978ea36b43fb6472263ec654925d53e5 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Fri, 30 Sep 2022 00:12:58 -0400
+Subject: [PATCH 0120/2236] drm/sched: Add FIFO sched policy to run queue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When many entities are competing for the same run queue
+on the same scheduler, we observe an unusually long wait
+times and some jobs get starved. This has been observed on GPUVis.
+
+The issue is due to the Round Robin policy used by schedulers
+to pick up the next entity's job queue for execution. Under stress
+of many entities and long job queues within entity some
+jobs could be stuck for very long time in it's entity's
+queue before being popped from the queue and executed
+while for other entities with smaller job queues a job
+might execute earlier even though that job arrived later
+then the job in the long queue.
+
+Fix:
+Add FIFO selection policy to entities in run queue, chose next entity
+on run queue in such order that if job on one entity arrived
+earlier then job on another entity the first job will start
+executing earlier regardless of the length of the entity's job
+queue.
+
+v2:
+Switch to rb tree structure for entities based on TS of
+oldest job waiting in the job queue of an entity. Improves next
+entity extraction to O(1). Entity TS update
+O(log N) where N is the number of entities in the run-queue
+
+Drop default option in module control parameter.
+
+v3:
+Various cosmetical fixes and minor refactoring of fifo update function. (Luben)
+
+v4:
+Switch drm_sched_rq_select_entity_fifo to in order search (Luben)
+
+v5: Fix up drm_sched_rq_select_entity_fifo loop (Luben)
+
+v6: Add missing drm_sched_rq_remove_fifo_locked
+
+v7: Fix ts sampling bug and more cosmetic stuff (Luben)
+
+v8: Fix module parameter string (Luben)
+
+Cc: Luben Tuikov <luben.tuikov@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Direct Rendering Infrastructure - Development <dri-devel@lists.freedesktop.org>
+Cc: AMD Graphics <amd-gfx@lists.freedesktop.org>
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Tested-by: Yunxiang Li (Teddy) <Yunxiang.Li@amd.com>
+Signed-off-by: Luben Tuikov <luben.tuikov@amd.com>
+Reviewed-by: Luben Tuikov <luben.tuikov@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220930041258.1050247-1-luben.tuikov@amd.com
+---
+ drivers/gpu/drm/scheduler/sched_entity.c | 20 +++++
+ drivers/gpu/drm/scheduler/sched_main.c   | 96 +++++++++++++++++++++++-
+ include/drm/gpu_scheduler.h              | 32 ++++++++
+ 3 files changed, 145 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/scheduler/sched_entity.c b/drivers/gpu/drm/scheduler/sched_entity.c
+index 4b913dbb7d7b..c97bc1149663 100644
+--- a/drivers/gpu/drm/scheduler/sched_entity.c
++++ b/drivers/gpu/drm/scheduler/sched_entity.c
+@@ -73,6 +73,7 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
+ 	entity->priority = priority;
+ 	entity->sched_list = num_sched_list > 1 ? sched_list : NULL;
+ 	entity->last_scheduled = NULL;
++	RB_CLEAR_NODE(&entity->rb_tree_node);
+ 
+ 	if(num_sched_list)
+ 		entity->rq = &sched_list[0]->sched_rq[entity->priority];
+@@ -448,6 +449,19 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
+ 	smp_wmb();
+ 
+ 	spsc_queue_pop(&entity->job_queue);
++
++	/*
++	 * Update the entity's location in the min heap according to
++	 * the timestamp of the next job, if any.
++	 */
++	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO) {
++		struct drm_sched_job *next;
++
++		next = to_drm_sched_job(spsc_queue_peek(&entity->job_queue));
++		if (next)
++			drm_sched_rq_update_fifo(entity, next->submit_ts);
++	}
++
+ 	return sched_job;
+ }
+ 
+@@ -512,6 +526,7 @@ void drm_sched_entity_push_job(struct drm_sched_job *sched_job)
+ 	atomic_inc(entity->rq->sched->score);
+ 	WRITE_ONCE(entity->last_user, current->group_leader);
+ 	first = spsc_queue_push(&entity->job_queue, &sched_job->queue_node);
++	sched_job->submit_ts = ktime_get();
+ 
+ 	/* first job wakes up scheduler */
+ 	if (first) {
+@@ -523,8 +538,13 @@ void drm_sched_entity_push_job(struct drm_sched_job *sched_job)
+ 			DRM_ERROR("Trying to push to a killed entity\n");
+ 			return;
+ 		}
++
+ 		drm_sched_rq_add_entity(entity->rq, entity);
+ 		spin_unlock(&entity->rq_lock);
++
++		if (drm_sched_policy == DRM_SCHED_POLICY_FIFO)
++			drm_sched_rq_update_fifo(entity, sched_job->submit_ts);
++
+ 		drm_sched_wakeup(entity->rq->sched);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
+index e5a4ecde0063..2fab218d7082 100644
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -62,6 +62,55 @@
+ #define to_drm_sched_job(sched_job)		\
+ 		container_of((sched_job), struct drm_sched_job, queue_node)
+ 
++int drm_sched_policy = DRM_SCHED_POLICY_RR;
++
++/**
++ * DOC: sched_policy (int)
++ * Used to override default entities scheduling policy in a run queue.
++ */
++MODULE_PARM_DESC(sched_policy, "Specify schedule policy for entities on a runqueue, " __stringify(DRM_SCHED_POLICY_RR) " = Round Robin (default), " __stringify(DRM_SCHED_POLICY_FIFO) " = use FIFO.");
++module_param_named(sched_policy, drm_sched_policy, int, 0444);
++
++static __always_inline bool drm_sched_entity_compare_before(struct rb_node *a,
++							    const struct rb_node *b)
++{
++	struct drm_sched_entity *ent_a =  rb_entry((a), struct drm_sched_entity, rb_tree_node);
++	struct drm_sched_entity *ent_b =  rb_entry((b), struct drm_sched_entity, rb_tree_node);
++
++	return ktime_before(ent_a->oldest_job_waiting, ent_b->oldest_job_waiting);
++}
++
++static inline void drm_sched_rq_remove_fifo_locked(struct drm_sched_entity *entity)
++{
++	struct drm_sched_rq *rq = entity->rq;
++
++	if (!RB_EMPTY_NODE(&entity->rb_tree_node)) {
++		rb_erase_cached(&entity->rb_tree_node, &rq->rb_tree_root);
++		RB_CLEAR_NODE(&entity->rb_tree_node);
++	}
++}
++
++void drm_sched_rq_update_fifo(struct drm_sched_entity *entity, ktime_t ts)
++{
++	/*
++	 * Both locks need to be grabbed, one to protect from entity->rq change
++	 * for entity from within concurrent drm_sched_entity_select_rq and the
++	 * other to update the rb tree structure.
++	 */
++	spin_lock(&entity->rq_lock);
++	spin_lock(&entity->rq->lock);
++
++	drm_sched_rq_remove_fifo_locked(entity);
++
++	entity->oldest_job_waiting = ts;
++
++	rb_add_cached(&entity->rb_tree_node, &entity->rq->rb_tree_root,
++		      drm_sched_entity_compare_before);
++
++	spin_unlock(&entity->rq->lock);
++	spin_unlock(&entity->rq_lock);
++}
++
+ /**
+  * drm_sched_rq_init - initialize a given run queue struct
+  *
+@@ -75,6 +124,7 @@ static void drm_sched_rq_init(struct drm_gpu_scheduler *sched,
+ {
+ 	spin_lock_init(&rq->lock);
+ 	INIT_LIST_HEAD(&rq->entities);
++	rq->rb_tree_root = RB_ROOT_CACHED;
+ 	rq->current_entity = NULL;
+ 	rq->sched = sched;
+ }
+@@ -92,9 +142,12 @@ void drm_sched_rq_add_entity(struct drm_sched_rq *rq,
+ {
+ 	if (!list_empty(&entity->list))
+ 		return;
++
+ 	spin_lock(&rq->lock);
++
+ 	atomic_inc(rq->sched->score);
+ 	list_add_tail(&entity->list, &rq->entities);
++
+ 	spin_unlock(&rq->lock);
+ }
+ 
+@@ -111,23 +164,30 @@ void drm_sched_rq_remove_entity(struct drm_sched_rq *rq,
+ {
+ 	if (list_empty(&entity->list))
+ 		return;
++
+ 	spin_lock(&rq->lock);
++
+ 	atomic_dec(rq->sched->score);
+ 	list_del_init(&entity->list);
++
+ 	if (rq->current_entity == entity)
+ 		rq->current_entity = NULL;
++
++	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO)
++		drm_sched_rq_remove_fifo_locked(entity);
++
+ 	spin_unlock(&rq->lock);
+ }
+ 
+ /**
+- * drm_sched_rq_select_entity - Select an entity which could provide a job to run
++ * drm_sched_rq_select_entity_rr - Select an entity which could provide a job to run
+  *
+  * @rq: scheduler run queue to check.
+  *
+  * Try to find a ready entity, returns NULL if none found.
+  */
+ static struct drm_sched_entity *
+-drm_sched_rq_select_entity(struct drm_sched_rq *rq)
++drm_sched_rq_select_entity_rr(struct drm_sched_rq *rq)
+ {
+ 	struct drm_sched_entity *entity;
+ 
+@@ -163,6 +223,34 @@ drm_sched_rq_select_entity(struct drm_sched_rq *rq)
+ 	return NULL;
+ }
+ 
++/**
++ * drm_sched_rq_select_entity_fifo - Select an entity which provides a job to run
++ *
++ * @rq: scheduler run queue to check.
++ *
++ * Find oldest waiting ready entity, returns NULL if none found.
++ */
++static struct drm_sched_entity *
++drm_sched_rq_select_entity_fifo(struct drm_sched_rq *rq)
++{
++	struct rb_node *rb;
++
++	spin_lock(&rq->lock);
++	for (rb = rb_first_cached(&rq->rb_tree_root); rb; rb = rb_next(rb)) {
++		struct drm_sched_entity *entity;
++
++		entity = rb_entry(rb, struct drm_sched_entity, rb_tree_node);
++		if (drm_sched_entity_is_ready(entity)) {
++			rq->current_entity = entity;
++			reinit_completion(&entity->entity_idle);
++			break;
++		}
++	}
++	spin_unlock(&rq->lock);
++
++	return rb ? rb_entry(rb, struct drm_sched_entity, rb_tree_node) : NULL;
++}
++
+ /**
+  * drm_sched_job_done - complete a job
+  * @s_job: pointer to the job which is done
+@@ -803,7 +891,9 @@ drm_sched_select_entity(struct drm_gpu_scheduler *sched)
+ 
+ 	/* Kernel run queue has higher priority than normal run queue*/
+ 	for (i = DRM_SCHED_PRIORITY_COUNT - 1; i >= DRM_SCHED_PRIORITY_MIN; i--) {
+-		entity = drm_sched_rq_select_entity(&sched->sched_rq[i]);
++		entity = drm_sched_policy == DRM_SCHED_POLICY_FIFO ?
++			drm_sched_rq_select_entity_fifo(&sched->sched_rq[i]) :
++			drm_sched_rq_select_entity_rr(&sched->sched_rq[i]);
+ 		if (entity)
+ 			break;
+ 	}
+diff --git a/include/drm/gpu_scheduler.h b/include/drm/gpu_scheduler.h
+index 2ae4fd62e01c..ca11716d084a 100644
+--- a/include/drm/gpu_scheduler.h
++++ b/include/drm/gpu_scheduler.h
+@@ -59,6 +59,12 @@ enum drm_sched_priority {
+ 	DRM_SCHED_PRIORITY_UNSET = -2
+ };
+ 
++/* Used to chose between FIFO and RR jobs scheduling */
++extern int drm_sched_policy;
++
++#define DRM_SCHED_POLICY_RR    0
++#define DRM_SCHED_POLICY_FIFO  1
++
+ /**
+  * struct drm_sched_entity - A wrapper around a job queue (typically
+  * attached to the DRM file_priv).
+@@ -205,6 +211,21 @@ struct drm_sched_entity {
+ 	 * drm_sched_entity_fini().
+ 	 */
+ 	struct completion		entity_idle;
++
++	/**
++	 * @oldest_job_waiting:
++	 *
++	 * Marks earliest job waiting in SW queue
++	 */
++	ktime_t				oldest_job_waiting;
++
++	/**
++	 * @rb_tree_node:
++	 *
++	 * The node used to insert this entity into time based priority queue
++	 */
++	struct rb_node			rb_tree_node;
++
+ };
+ 
+ /**
+@@ -214,6 +235,7 @@ struct drm_sched_entity {
+  * @sched: the scheduler to which this rq belongs to.
+  * @entities: list of the entities to be scheduled.
+  * @current_entity: the entity which is to be scheduled.
++ * @rb_tree_root: root of time based priory queue of entities for FIFO scheduling
+  *
+  * Run queue is a set of entities scheduling command submissions for
+  * one specific ring. It implements the scheduling policy that selects
+@@ -224,6 +246,7 @@ struct drm_sched_rq {
+ 	struct drm_gpu_scheduler	*sched;
+ 	struct list_head		entities;
+ 	struct drm_sched_entity		*current_entity;
++	struct rb_root_cached		rb_tree_root;
+ };
+ 
+ /**
+@@ -323,6 +346,13 @@ struct drm_sched_job {
+ 
+ 	/** @last_dependency: tracks @dependencies as they signal */
+ 	unsigned long			last_dependency;
++
++	/**
++	 * @submit_ts:
++	 *
++	 * When the job was pushed into the entity queue.
++	 */
++	ktime_t                         submit_ts;
+ };
+ 
+ static inline bool drm_sched_invalidate_job(struct drm_sched_job *s_job,
+@@ -512,6 +542,8 @@ void drm_sched_rq_add_entity(struct drm_sched_rq *rq,
+ void drm_sched_rq_remove_entity(struct drm_sched_rq *rq,
+ 				struct drm_sched_entity *entity);
+ 
++void drm_sched_rq_update_fifo(struct drm_sched_entity *entity, ktime_t ts);
++
+ int drm_sched_entity_init(struct drm_sched_entity *entity,
+ 			  enum drm_sched_priority priority,
+ 			  struct drm_gpu_scheduler **sched_list,
+-- 
+2.25.1
+

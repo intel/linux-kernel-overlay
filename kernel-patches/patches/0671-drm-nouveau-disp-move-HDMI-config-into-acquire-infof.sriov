@@ -1,0 +1,1476 @@
+From 4772916bfcd55a17f073f55d1d7eec77e518e5fd Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:33 +1000
+Subject: [PATCH 0671/2236] drm/nouveau/disp: move HDMI config into acquire +
+ infoframe methods
+
+v2:
+- fix typo in sorhdmi/g84 struct initialiser (kbuild test robot)
+v3:
+- less convoluted flow control in nvkm_uoutp_mthd_acquire_tmds() (lyude)
+v4:
+- we don't support hdmi on original nv50, don't try
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/dispnv50/disp.c       | 172 +++++++-----------
+ drivers/gpu/drm/nouveau/include/nvif/cl5070.h |  14 --
+ drivers/gpu/drm/nouveau/include/nvif/if0012.h |  24 ++-
+ drivers/gpu/drm/nouveau/include/nvif/outp.h   |   5 +-
+ drivers/gpu/drm/nouveau/nvif/outp.c           |  28 ++-
+ .../gpu/drm/nouveau/nvkm/engine/disp/g84.c    |  91 +++++----
+ .../gpu/drm/nouveau/nvkm/engine/disp/ga102.c  |   5 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/gf119.c  |  93 ++++++----
+ .../gpu/drm/nouveau/nvkm/engine/disp/gk104.c  |  85 +++++----
+ .../gpu/drm/nouveau/nvkm/engine/disp/gm107.c  |   4 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/gm200.c  |  13 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/gp100.c  |   5 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/gt215.c  |  89 +++++----
+ .../gpu/drm/nouveau/nvkm/engine/disp/gv100.c  |  95 ++++++----
+ .../gpu/drm/nouveau/nvkm/engine/disp/ior.h    |  23 ++-
+ .../gpu/drm/nouveau/nvkm/engine/disp/mcp77.c  |   4 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/mcp89.c  |   4 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/outp.h   |   3 +
+ .../drm/nouveau/nvkm/engine/disp/rootnv50.c   |  45 -----
+ .../gpu/drm/nouveau/nvkm/engine/disp/tu102.c  |   5 +-
+ .../gpu/drm/nouveau/nvkm/engine/disp/uoutp.c  |  74 ++++++++
+ 21 files changed, 503 insertions(+), 378 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index 0a8404686f16..edf899670287 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -48,6 +48,7 @@
+ #include <nvif/cl0002.h>
+ #include <nvif/cl5070.h>
+ #include <nvif/event.h>
++#include <nvif/if0012.h>
+ #include <nvif/if0014.h>
+ #include <nvif/timer.h>
+ 
+@@ -744,123 +745,85 @@ nv50_audio_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ /******************************************************************************
+  * HDMI
+  *****************************************************************************/
+-static void
+-nv50_hdmi_disable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc)
+-{
+-	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+-	struct nv50_disp *disp = nv50_disp(encoder->dev);
+-	struct {
+-		struct nv50_disp_mthd_v1 base;
+-		struct nv50_disp_sor_hdmi_pwr_v0 pwr;
+-	} args = {
+-		.base.version = 1,
+-		.base.method = NV50_DISP_MTHD_V1_SOR_HDMI_PWR,
+-		.base.hasht  = nv_encoder->dcb->hasht,
+-		.base.hashm  = (0xf0ff & nv_encoder->dcb->hashm) |
+-			       (0x0100 << nv_crtc->index),
+-	};
+-
+-	nvif_mthd(&disp->disp->object, 0, &args, sizeof(args));
+-}
+-
+ static void
+ nv50_hdmi_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 		 struct nouveau_connector *nv_connector, struct drm_atomic_state *state,
+-		 struct drm_display_mode *mode)
++		 struct drm_display_mode *mode, bool hda)
+ {
+ 	struct nouveau_drm *drm = nouveau_drm(encoder->dev);
+ 	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+-	struct nv50_disp *disp = nv50_disp(encoder->dev);
+-	struct {
+-		struct nv50_disp_mthd_v1 base;
+-		struct nv50_disp_sor_hdmi_pwr_v0 pwr;
+-		u8 infoframes[2 * 17]; /* two frames, up to 17 bytes each */
+-	} args = {
+-		.base.version = 1,
+-		.base.method = NV50_DISP_MTHD_V1_SOR_HDMI_PWR,
+-		.base.hasht  = nv_encoder->dcb->hasht,
+-		.base.hashm  = (0xf0ff & nv_encoder->dcb->hashm) |
+-			       (0x0100 << nv_crtc->index),
+-		.pwr.state = 1,
+-		.pwr.rekey = 56, /* binary driver, and tegra, constant */
+-	};
+-	struct drm_hdmi_info *hdmi;
++	struct drm_hdmi_info *hdmi = &nv_connector->base.display_info.hdmi;
++	union hdmi_infoframe infoframe;
++	const u8 rekey = 56; /* binary driver, and tegra, constant */
++	u8 config, scdc = 0;
+ 	u32 max_ac_packet;
+-	union hdmi_infoframe avi_frame;
+-	union hdmi_infoframe vendor_frame;
+-	bool high_tmds_clock_ratio = false, scrambling = false;
+-	u8 config;
+-	int ret;
+-	int size;
+-
+-	if (!drm_detect_hdmi_monitor(nv_connector->edid))
+-		return;
+-
+-	hdmi = &nv_connector->base.display_info.hdmi;
+-
+-	ret = drm_hdmi_avi_infoframe_from_display_mode(&avi_frame.avi,
+-						       &nv_connector->base, mode);
+-	if (!ret) {
+-		drm_hdmi_avi_infoframe_quant_range(&avi_frame.avi,
+-						   &nv_connector->base, mode,
+-						   HDMI_QUANTIZATION_RANGE_FULL);
+-		/* We have an AVI InfoFrame, populate it to the display */
+-		args.pwr.avi_infoframe_length
+-			= hdmi_infoframe_pack(&avi_frame, args.infoframes, 17);
+-	}
+-
+-	ret = drm_hdmi_vendor_infoframe_from_display_mode(&vendor_frame.vendor.hdmi,
+-							  &nv_connector->base, mode);
+-	if (!ret) {
+-		/* We have a Vendor InfoFrame, populate it to the display */
+-		args.pwr.vendor_infoframe_length
+-			= hdmi_infoframe_pack(&vendor_frame,
+-					      args.infoframes
+-					      + args.pwr.avi_infoframe_length,
+-					      17);
+-	}
++	struct {
++		struct nvif_outp_infoframe_v0 infoframe;
++		u8 data[17];
++	} args;
++	int ret, size;
+ 
+ 	max_ac_packet  = mode->htotal - mode->hdisplay;
+-	max_ac_packet -= args.pwr.rekey;
++	max_ac_packet -= rekey;
+ 	max_ac_packet -= 18; /* constant from tegra */
+-	args.pwr.max_ac_packet = max_ac_packet / 32;
++	max_ac_packet /= 32;
+ 
+ 	if (hdmi->scdc.scrambling.supported) {
+-		high_tmds_clock_ratio = mode->clock > 340000;
+-		scrambling = high_tmds_clock_ratio ||
+-			hdmi->scdc.scrambling.low_rates;
+-	}
++		const bool high_tmds_clock_ratio = mode->clock > 340000;
+ 
+-	args.pwr.scdc =
+-		NV50_DISP_SOR_HDMI_PWR_V0_SCDC_SCRAMBLE * scrambling |
+-		NV50_DISP_SOR_HDMI_PWR_V0_SCDC_DIV_BY_4 * high_tmds_clock_ratio;
++		ret = drm_scdc_readb(nv_encoder->i2c, SCDC_TMDS_CONFIG, &config);
++		if (ret < 0) {
++			NV_ERROR(drm, "Failure to read SCDC_TMDS_CONFIG: %d\n", ret);
++			return;
++		}
+ 
+-	size = sizeof(args.base)
+-		+ sizeof(args.pwr)
+-		+ args.pwr.avi_infoframe_length
+-		+ args.pwr.vendor_infoframe_length;
+-	nvif_mthd(&disp->disp->object, 0, &args, size);
++		config &= ~(SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE);
++		if (high_tmds_clock_ratio || hdmi->scdc.scrambling.low_rates)
++			config |= SCDC_SCRAMBLING_ENABLE;
++		if (high_tmds_clock_ratio)
++			config |= SCDC_TMDS_BIT_CLOCK_RATIO_BY_40;
+ 
+-	nv50_audio_enable(encoder, nv_crtc, nv_connector, state, mode);
++		ret = drm_scdc_writeb(nv_encoder->i2c, SCDC_TMDS_CONFIG, config);
++		if (ret < 0)
++			NV_ERROR(drm, "Failure to write SCDC_TMDS_CONFIG = 0x%02x: %d\n",
++				 config, ret);
+ 
+-	/* If SCDC is supported by the downstream monitor, update
+-	 * divider / scrambling settings to what we programmed above.
+-	 */
+-	if (!hdmi->scdc.scrambling.supported)
+-		return;
++		if (high_tmds_clock_ratio || hdmi->scdc.scrambling.low_rates)
++			scdc |= NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_SCRAMBLE;
++		if (high_tmds_clock_ratio)
++			scdc |= NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_DIV_BY_4;
++	}
+ 
+-	ret = drm_scdc_readb(nv_encoder->i2c, SCDC_TMDS_CONFIG, &config);
+-	if (ret < 0) {
+-		NV_ERROR(drm, "Failure to read SCDC_TMDS_CONFIG: %d\n", ret);
++	ret = nvif_outp_acquire_tmds(&nv_encoder->outp, nv_crtc->index, true,
++				     max_ac_packet, rekey, scdc, hda);
++	if (ret)
+ 		return;
++
++	/* AVI InfoFrame. */
++	args.infoframe.version = 0;
++	args.infoframe.head = nv_crtc->index;
++
++	if (!drm_hdmi_avi_infoframe_from_display_mode(&infoframe.avi, &nv_connector->base, mode)) {
++		drm_hdmi_avi_infoframe_quant_range(&infoframe.avi, &nv_connector->base, mode,
++						   HDMI_QUANTIZATION_RANGE_FULL);
++
++		size = hdmi_infoframe_pack(&infoframe, args.data, 17);
++	} else {
++		size = 0;
+ 	}
+-	config &= ~(SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE);
+-	config |= SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 * high_tmds_clock_ratio;
+-	config |= SCDC_SCRAMBLING_ENABLE * scrambling;
+-	ret = drm_scdc_writeb(nv_encoder->i2c, SCDC_TMDS_CONFIG, config);
+-	if (ret < 0)
+-		NV_ERROR(drm, "Failure to write SCDC_TMDS_CONFIG = 0x%02x: %d\n",
+-			 config, ret);
++
++	nvif_outp_infoframe(&nv_encoder->outp, NVIF_OUTP_INFOFRAME_V0_AVI, &args.infoframe, size);
++
++	/* Vendor InfoFrame. */
++	if (!drm_hdmi_vendor_infoframe_from_display_mode(&infoframe.vendor.hdmi,
++							 &nv_connector->base, mode))
++		size = hdmi_infoframe_pack(&infoframe, args.data, 17);
++	else
++		size = 0;
++
++	nvif_outp_infoframe(&nv_encoder->outp, NVIF_OUTP_INFOFRAME_V0_VSI, &args.infoframe, size);
++
++	nv50_audio_enable(encoder, nv_crtc, nv_connector, state, mode);
+ }
+ 
+ /******************************************************************************
+@@ -1622,7 +1585,6 @@ nv50_sor_atomic_disable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 
+ 	nv_encoder->update(nv_encoder, nv_crtc->index, NULL, 0, 0);
+ 	nv50_audio_disable(encoder, nv_crtc);
+-	nv50_hdmi_disable(&nv_encoder->base.base, nv_crtc);
+ 	nvif_outp_release(&nv_encoder->outp);
+ 	nv_encoder->crtc = NULL;
+ }
+@@ -1636,6 +1598,7 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 		nv50_head_atom(drm_atomic_get_new_crtc_state(state, &nv_crtc->base));
+ 	struct drm_display_mode *mode = &asyh->state.adjusted_mode;
+ 	struct nv50_disp *disp = nv50_disp(encoder->dev);
++	struct nvif_outp *outp = &nv_encoder->outp;
+ 	struct drm_device *dev = encoder->dev;
+ 	struct nouveau_drm *drm = nouveau_drm(dev);
+ 	struct nouveau_connector *nv_connector;
+@@ -1657,7 +1620,12 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 
+ 	switch (nv_encoder->dcb->type) {
+ 	case DCB_OUTPUT_TMDS:
+-		nvif_outp_acquire_tmds(&nv_encoder->outp, hda);
++		if (disp->disp->object.oclass == NV50_DISP ||
++		    !drm_detect_hdmi_monitor(nv_connector->edid))
++			nvif_outp_acquire_tmds(outp, nv_crtc->index, false, 0, 0, 0, false);
++		else
++			nv50_hdmi_enable(encoder, nv_crtc, nv_connector, state, mode, hda);
++
+ 		if (nv_encoder->outp.or.link & 1) {
+ 			proto = NV507D_SOR_SET_CONTROL_PROTOCOL_SINGLE_TMDS_A;
+ 			/* Only enable dual-link if:
+@@ -1673,8 +1641,6 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 		} else {
+ 			proto = NV507D_SOR_SET_CONTROL_PROTOCOL_SINGLE_TMDS_B;
+ 		}
+-
+-		nv50_hdmi_enable(&nv_encoder->base.base, nv_crtc, nv_connector, state, mode);
+ 		break;
+ 	case DCB_OUTPUT_LVDS:
+ 		proto = NV507D_SOR_SET_CONTROL_PROTOCOL_LVDS_CUSTOM;
+@@ -1900,7 +1866,7 @@ nv50_pior_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 	switch (nv_encoder->dcb->type) {
+ 	case DCB_OUTPUT_TMDS:
+ 		ctrl |= NVDEF(NV507D, PIOR_SET_CONTROL, PROTOCOL, EXT_TMDS_ENC);
+-		nvif_outp_acquire_tmds(&nv_encoder->outp, false);
++		nvif_outp_acquire_tmds(&nv_encoder->outp, false, false, 0, 0, 0, false);
+ 		break;
+ 	case DCB_OUTPUT_DP:
+ 		ctrl |= NVDEF(NV507D, PIOR_SET_CONTROL, PROTOCOL, EXT_TMDS_ENC);
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+index f371fc7a1d10..6389558dda1f 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+@@ -29,7 +29,6 @@ struct nv50_disp_scanoutpos_v0 {
+ struct nv50_disp_mthd_v1 {
+ 	__u8  version;
+ #define NV50_DISP_MTHD_V1_SOR_HDA_ELD                                      0x21
+-#define NV50_DISP_MTHD_V1_SOR_HDMI_PWR                                     0x22
+ #define NV50_DISP_MTHD_V1_SOR_DP_MST_LINK                                  0x25
+ #define NV50_DISP_MTHD_V1_SOR_DP_MST_VCPI                                  0x26
+ 	__u8  method;
+@@ -44,19 +43,6 @@ struct nv50_disp_sor_hda_eld_v0 {
+ 	__u8  data[];
+ };
+ 
+-struct nv50_disp_sor_hdmi_pwr_v0 {
+-	__u8  version;
+-	__u8  state;
+-	__u8  max_ac_packet;
+-	__u8  rekey;
+-	__u8  avi_infoframe_length;
+-	__u8  vendor_infoframe_length;
+-#define NV50_DISP_SOR_HDMI_PWR_V0_SCDC_SCRAMBLE (1 << 0)
+-#define NV50_DISP_SOR_HDMI_PWR_V0_SCDC_DIV_BY_4 (1 << 1)
+-	__u8  scdc;
+-	__u8  pad07[1];
+-};
+-
+ struct nv50_disp_sor_dp_mst_link_v0 {
+ 	__u8  version;
+ 	__u8  state;
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/if0012.h b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+index 4fcb9e4f5d76..06ed372cbe5a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/if0012.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+@@ -13,6 +13,7 @@ union nvif_outp_args {
+ #define NVIF_OUTP_V0_LOAD_DETECT 0x00
+ #define NVIF_OUTP_V0_ACQUIRE     0x01
+ #define NVIF_OUTP_V0_RELEASE     0x02
++#define NVIF_OUTP_V0_INFOFRAME   0x03
+ 
+ union nvif_outp_load_detect_args {
+ 	struct nvif_outp_load_detect_v0 {
+@@ -37,8 +38,15 @@ union nvif_outp_acquire_args {
+ 		__u8 pad04[4];
+ 		union {
+ 			struct {
+-				__u8 hda;
+-				__u8 pad01[7];
++				__u8 head;
++				__u8 hdmi;
++				__u8 hdmi_max_ac_packet;
++				__u8 hdmi_rekey;
++#define NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_SCRAMBLE (1 << 0)
++#define NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_DIV_BY_4 (1 << 1)
++				__u8 hdmi_scdc;
++				__u8 hdmi_hda;
++				__u8 pad06[2];
+ 			} tmds;
+ 			struct {
+ 				__u8 dual;
+@@ -57,4 +65,16 @@ union nvif_outp_release_args {
+ 	struct nvif_outp_release_vn {
+ 	} vn;
+ };
++
++union nvif_outp_infoframe_args {
++	struct nvif_outp_infoframe_v0 {
++		__u8 version;
++#define NVIF_OUTP_INFOFRAME_V0_AVI 0
++#define NVIF_OUTP_INFOFRAME_V0_VSI 1
++		__u8 type;
++		__u8 head;
++		__u8 pad03[5];
++		__u8 data[];
++	} v0;
++};
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/outp.h b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+index e247d441afc1..dd7e603d13c9 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/outp.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+@@ -2,6 +2,7 @@
+ #ifndef __NVIF_OUTP_H__
+ #define __NVIF_OUTP_H__
+ #include <nvif/object.h>
++#include <nvif/if0012.h>
+ struct nvif_disp;
+ 
+ struct nvif_outp {
+@@ -17,8 +18,10 @@ int nvif_outp_ctor(struct nvif_disp *, const char *name, int id, struct nvif_out
+ void nvif_outp_dtor(struct nvif_outp *);
+ int nvif_outp_load_detect(struct nvif_outp *, u32 loadval);
+ int nvif_outp_acquire_rgb_crt(struct nvif_outp *);
+-int nvif_outp_acquire_tmds(struct nvif_outp *, bool hda);
++int nvif_outp_acquire_tmds(struct nvif_outp *, int head,
++			   bool hdmi, u8 max_ac_packet, u8 rekey, u8 scdc, bool hda);
+ int nvif_outp_acquire_lvds(struct nvif_outp *, bool dual, bool bpc8);
+ int nvif_outp_acquire_dp(struct nvif_outp *, bool hda);
+ void nvif_outp_release(struct nvif_outp *);
++int nvif_outp_infoframe(struct nvif_outp *, u8 type, struct nvif_outp_infoframe_v0 *, u32 size);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvif/outp.c b/drivers/gpu/drm/nouveau/nvif/outp.c
+index 58cd629657fb..987bc3a9e7bf 100644
+--- a/drivers/gpu/drm/nouveau/nvif/outp.c
++++ b/drivers/gpu/drm/nouveau/nvif/outp.c
+@@ -24,7 +24,18 @@
+ #include <nvif/printf.h>
+ 
+ #include <nvif/class.h>
+-#include <nvif/if0012.h>
++
++int
++nvif_outp_infoframe(struct nvif_outp *outp, u8 type, struct nvif_outp_infoframe_v0 *args, u32 size)
++{
++	int ret;
++
++	args->type = type;
++
++	ret = nvif_mthd(&outp->object, NVIF_OUTP_V0_INFOFRAME, args, sizeof(*args) + size);
++	NVIF_ERRON(ret, &outp->object, "[INFOFRAME type:%d size:%d]", type, size);
++	return ret;
++}
+ 
+ void
+ nvif_outp_release(struct nvif_outp *outp)
+@@ -82,16 +93,25 @@ nvif_outp_acquire_lvds(struct nvif_outp *outp, bool dual, bool bpc8)
+ }
+ 
+ int
+-nvif_outp_acquire_tmds(struct nvif_outp *outp, bool hda)
++nvif_outp_acquire_tmds(struct nvif_outp *outp, int head,
++		       bool hdmi, u8 max_ac_packet, u8 rekey, u8 scdc, bool hda)
+ {
+ 	struct nvif_outp_acquire_v0 args;
+ 	int ret;
+ 
+-	args.tmds.hda = hda;
++	args.tmds.head = head;
++	args.tmds.hdmi = hdmi;
++	args.tmds.hdmi_max_ac_packet = max_ac_packet;
++	args.tmds.hdmi_rekey = rekey;
++	args.tmds.hdmi_scdc = scdc;
++	args.tmds.hdmi_hda = hda;
+ 
+ 	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_TMDS, &args);
+ 	NVIF_ERRON(ret, &outp->object,
+-		   "[ACQUIRE proto:TMDS hda:%d] or:%d link:%d", args.tmds.hda, args.or, args.link);
++		   "[ACQUIRE proto:TMDS head:%d hdmi:%d max_ac_packet:%d rekey:%d scdc:%d hda:%d]"
++		   " or:%d link:%d", args.tmds.head, args.tmds.hdmi, args.tmds.hdmi_max_ac_packet,
++		   args.tmds.hdmi_rekey, args.tmds.hdmi_scdc, args.tmds.hdmi_hda,
++		   args.or, args.link);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/g84.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/g84.c
+index 4966a51af3d7..23ae451ba473 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/g84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/g84.c
+@@ -29,9 +29,54 @@
+ 
+ #include <nvif/class.h>
+ 
+-void
+-g84_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+-		  u8 rekey, u8 *avi, u8 avi_size, u8 *vendor, u8 vendor_size)
++static void
++g84_sor_hdmi_infoframe_vsi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe vsi;
++	const u32 hoff = head * 0x800;
++
++	nvkm_mask(device, 0x61653c + hoff, 0x00010001, 0x00010000);
++	if (!size)
++		return;
++
++	pack_hdmi_infoframe(&vsi, data, size);
++
++	nvkm_wr32(device, 0x616544 + hoff, vsi.header);
++	nvkm_wr32(device, 0x616548 + hoff, vsi.subpack0_low);
++	nvkm_wr32(device, 0x61654c + hoff, vsi.subpack0_high);
++	/* Is there a second (or up to fourth?) set of subpack registers here? */
++	/* nvkm_wr32(device, 0x616550 + hoff, vsi.subpack1_low); */
++	/* nvkm_wr32(device, 0x616554 + hoff, vsi.subpack1_high); */
++
++	nvkm_mask(device, 0x61653c + hoff, 0x00010001, 0x00010001);
++}
++
++static void
++g84_sor_hdmi_infoframe_avi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe avi;
++	const u32 hoff = head * 0x800;
++
++	pack_hdmi_infoframe(&avi, data, size);
++
++	nvkm_mask(device, 0x616520 + hoff, 0x00000001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x616528 + hoff, avi.header);
++	nvkm_wr32(device, 0x61652c + hoff, avi.subpack0_low);
++	nvkm_wr32(device, 0x616530 + hoff, avi.subpack0_high);
++	nvkm_wr32(device, 0x616534 + hoff, avi.subpack1_low);
++	nvkm_wr32(device, 0x616538 + hoff, avi.subpack1_high);
++
++	nvkm_mask(device, 0x616520 + hoff, 0x00000001, 0x00000001);
++}
++
++
++static void
++g84_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet, u8 rekey)
+ {
+ 	struct nvkm_device *device = ior->disp->engine.subdev.device;
+ 	const u32 ctrl = 0x40000000 * enable |
+@@ -39,31 +84,13 @@ g84_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+ 			 max_ac_packet << 16 |
+ 			 rekey;
+ 	const u32 hoff = head * 0x800;
+-	struct packed_hdmi_infoframe avi_infoframe;
+-	struct packed_hdmi_infoframe vendor_infoframe;
+-
+-	pack_hdmi_infoframe(&avi_infoframe, avi, avi_size);
+-	pack_hdmi_infoframe(&vendor_infoframe, vendor, vendor_size);
+ 
+ 	if (!(ctrl & 0x40000000)) {
+ 		nvkm_mask(device, 0x6165a4 + hoff, 0x40000000, 0x00000000);
+-		nvkm_mask(device, 0x61653c + hoff, 0x00000001, 0x00000000);
+-		nvkm_mask(device, 0x616520 + hoff, 0x00000001, 0x00000000);
+ 		nvkm_mask(device, 0x616500 + hoff, 0x00000001, 0x00000000);
+ 		return;
+ 	}
+ 
+-	/* AVI InfoFrame */
+-	nvkm_mask(device, 0x616520 + hoff, 0x00000001, 0x00000000);
+-	if (avi_size) {
+-		nvkm_wr32(device, 0x616528 + hoff, avi_infoframe.header);
+-		nvkm_wr32(device, 0x61652c + hoff, avi_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x616530 + hoff, avi_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x616534 + hoff, avi_infoframe.subpack1_low);
+-		nvkm_wr32(device, 0x616538 + hoff, avi_infoframe.subpack1_high);
+-		nvkm_mask(device, 0x616520 + hoff, 0x00000001, 0x00000001);
+-	}
+-
+ 	/* Audio InfoFrame */
+ 	nvkm_mask(device, 0x616500 + hoff, 0x00000001, 0x00000000);
+ 	nvkm_wr32(device, 0x616508 + hoff, 0x000a0184);
+@@ -71,17 +98,6 @@ g84_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+ 	nvkm_wr32(device, 0x616510 + hoff, 0x00000000);
+ 	nvkm_mask(device, 0x616500 + hoff, 0x00000001, 0x00000001);
+ 
+-	/* Vendor InfoFrame */
+-	nvkm_mask(device, 0x61653c + hoff, 0x00010001, 0x00010000);
+-	if (vendor_size) {
+-		nvkm_wr32(device, 0x616544 + hoff, vendor_infoframe.header);
+-		nvkm_wr32(device, 0x616548 + hoff, vendor_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x61654c + hoff, vendor_infoframe.subpack0_high);
+-		/* Is there a second (or up to fourth?) set of subpack registers here? */
+-		/* nvkm_wr32(device, 0x616550 + hoff, vendor_infoframe->subpack1_low); */
+-		/* nvkm_wr32(device, 0x616554 + hoff, vendor_infoframe->subpack1_high); */
+-		nvkm_mask(device, 0x61653c + hoff, 0x00010001, 0x00010001);
+-	}
+ 
+ 	nvkm_mask(device, 0x6165d0 + hoff, 0x00070001, 0x00010001); /* SPARE, HW_CTS */
+ 	nvkm_mask(device, 0x616568 + hoff, 0x00010101, 0x00000000); /* ACR_CTRL, ?? */
+@@ -96,14 +112,19 @@ g84_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+ 	nvkm_mask(device, 0x6165a4 + hoff, 0x5f1f007f, ctrl);
+ }
+ 
++const struct nvkm_ior_func_hdmi
++g84_sor_hdmi = {
++	.ctrl = g84_sor_hdmi_ctrl,
++	.infoframe_avi = g84_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = g84_sor_hdmi_infoframe_vsi,
++};
++
+ static const struct nvkm_ior_func
+ g84_sor = {
+ 	.state = nv50_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = nv50_sor_clock,
+-	.hdmi = {
+-		.ctrl = g84_sor_hdmi_ctrl,
+-	},
++	.hdmi = &g84_sor_hdmi,
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
+index 7489d0d7fce0..52099b75f52a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ga102.c
+@@ -105,10 +105,7 @@ ga102_sor = {
+ 	.state = gv100_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = ga102_sor_clock,
+-	.hdmi = {
+-		.ctrl = gv100_sor_hdmi_ctrl,
+-		.scdc = gm200_sor_hdmi_scdc,
+-	},
++	.hdmi = &gv100_sor_hdmi,
+ 	.dp = &ga102_sor_dp,
+ 	.hda = &gv100_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
+index 39822f1b5b95..a48e9bdf4cd0 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
+@@ -202,19 +202,61 @@ gf119_sor_dp = {
+ };
+ 
+ static void
+-gf119_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+-		    u8 rekey, u8 *avi, u8 avi_size, u8 *vendor, u8 vendor_size)
++gf119_sor_hdmi_infoframe_vsi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe vsi;
++	const u32 hoff = head * 0x800;
++
++	pack_hdmi_infoframe(&vsi, data, size);
++
++	nvkm_mask(device, 0x616730 + hoff, 0x00010001, 0x00010000);
++	if (!size)
++		return;
++
++	/*
++	 * These appear to be the audio infoframe registers,
++	 * but no other set of infoframe registers has yet
++	 * been found.
++	 */
++	nvkm_wr32(device, 0x616738 + hoff, vsi.header);
++	nvkm_wr32(device, 0x61673c + hoff, vsi.subpack0_low);
++	nvkm_wr32(device, 0x616740 + hoff, vsi.subpack0_high);
++	/* Is there a second (or further?) set of subpack registers here? */
++
++	nvkm_mask(device, 0x616730 + hoff, 0x00000001, 0x00000001);
++}
++
++static void
++gf119_sor_hdmi_infoframe_avi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe avi;
++	const u32 hoff = head * 0x800;
++
++	pack_hdmi_infoframe(&avi, data, size);
++
++	nvkm_mask(device, 0x616714 + hoff, 0x00000001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x61671c + hoff, avi.header);
++	nvkm_wr32(device, 0x616720 + hoff, avi.subpack0_low);
++	nvkm_wr32(device, 0x616724 + hoff, avi.subpack0_high);
++	nvkm_wr32(device, 0x616728 + hoff, avi.subpack1_low);
++	nvkm_wr32(device, 0x61672c + hoff, avi.subpack1_high);
++
++	nvkm_mask(device, 0x616714 + hoff, 0x00000001, 0x00000001);
++}
++
++static void
++gf119_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet, u8 rekey)
+ {
+ 	struct nvkm_device *device = ior->disp->engine.subdev.device;
+ 	const u32 ctrl = 0x40000000 * enable |
+ 			 max_ac_packet << 16 |
+ 			 rekey;
+ 	const u32 hoff = head * 0x800;
+-	struct packed_hdmi_infoframe avi_infoframe;
+-	struct packed_hdmi_infoframe vendor_infoframe;
+-
+-	pack_hdmi_infoframe(&avi_infoframe, avi, avi_size);
+-	pack_hdmi_infoframe(&vendor_infoframe, vendor, vendor_size);
+ 
+ 	if (!(ctrl & 0x40000000)) {
+ 		nvkm_mask(device, 0x616798 + hoff, 0x40000000, 0x00000000);
+@@ -224,32 +266,6 @@ gf119_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 		return;
+ 	}
+ 
+-	/* AVI InfoFrame */
+-	nvkm_mask(device, 0x616714 + hoff, 0x00000001, 0x00000000);
+-	if (avi_size) {
+-		nvkm_wr32(device, 0x61671c + hoff, avi_infoframe.header);
+-		nvkm_wr32(device, 0x616720 + hoff, avi_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x616724 + hoff, avi_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x616728 + hoff, avi_infoframe.subpack1_low);
+-		nvkm_wr32(device, 0x61672c + hoff, avi_infoframe.subpack1_high);
+-		nvkm_mask(device, 0x616714 + hoff, 0x00000001, 0x00000001);
+-	}
+-
+-	/* GENERIC(?) / Vendor InfoFrame? */
+-	nvkm_mask(device, 0x616730 + hoff, 0x00010001, 0x00010000);
+-	if (vendor_size) {
+-		/*
+-		 * These appear to be the audio infoframe registers,
+-		 * but no other set of infoframe registers has yet
+-		 * been found.
+-		 */
+-		nvkm_wr32(device, 0x616738 + hoff, vendor_infoframe.header);
+-		nvkm_wr32(device, 0x61673c + hoff, vendor_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x616740 + hoff, vendor_infoframe.subpack0_high);
+-		/* Is there a second (or further?) set of subpack registers here? */
+-		nvkm_mask(device, 0x616730 + hoff, 0x00000001, 0x00000001);
+-	}
+-
+ 	/* ??? InfoFrame? */
+ 	nvkm_mask(device, 0x6167a4 + hoff, 0x00000001, 0x00000000);
+ 	nvkm_wr32(device, 0x6167ac + hoff, 0x00000010);
+@@ -259,6 +275,13 @@ gf119_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 	nvkm_mask(device, 0x616798 + hoff, 0x401f007f, ctrl);
+ }
+ 
++static const struct nvkm_ior_func_hdmi
++gf119_sor_hdmi = {
++	.ctrl = gf119_sor_hdmi_ctrl,
++	.infoframe_avi = gf119_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = gf119_sor_hdmi_infoframe_vsi,
++};
++
+ void
+ gf119_sor_clock(struct nvkm_ior *sor)
+ {
+@@ -305,9 +328,7 @@ gf119_sor = {
+ 	.state = gf119_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gf119_sor_hdmi_ctrl,
+-	},
++	.hdmi = &gf119_sor_hdmi,
+ 	.dp = &gf119_sor_dp,
+ 	.hda = &gf119_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gk104.c
+index 7248e9ec835e..876a21a0cebb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gk104.c
+@@ -30,8 +30,51 @@
+ #include <nvif/class.h>
+ 
+ void
+-gk104_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+-		    u8 rekey, u8 *avi, u8 avi_size, u8 *vendor, u8 vendor_size)
++gk104_sor_hdmi_infoframe_vsi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe vsi;
++	const u32 hoff = head * 0x400;
++
++	pack_hdmi_infoframe(&vsi, data, size);
++
++	/* GENERIC(?) / Vendor InfoFrame? */
++	nvkm_mask(device, 0x690100 + hoff, 0x00010001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x690108 + hoff, vsi.header);
++	nvkm_wr32(device, 0x69010c + hoff, vsi.subpack0_low);
++	nvkm_wr32(device, 0x690110 + hoff, vsi.subpack0_high);
++	/* Is there a second (or further?) set of subpack registers here? */
++	nvkm_mask(device, 0x690100 + hoff, 0x00000001, 0x00000001);
++}
++
++void
++gk104_sor_hdmi_infoframe_avi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe avi;
++	const u32 hoff = head * 0x400;
++
++	pack_hdmi_infoframe(&avi, data, size);
++
++	/* AVI InfoFrame */
++	nvkm_mask(device, 0x690000 + hoff, 0x00000001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x690008 + hoff, avi.header);
++	nvkm_wr32(device, 0x69000c + hoff, avi.subpack0_low);
++	nvkm_wr32(device, 0x690010 + hoff, avi.subpack0_high);
++	nvkm_wr32(device, 0x690014 + hoff, avi.subpack1_low);
++	nvkm_wr32(device, 0x690018 + hoff, avi.subpack1_high);
++
++	nvkm_mask(device, 0x690000 + hoff, 0x00000001, 0x00000001);
++}
++
++void
++gk104_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet, u8 rekey)
+ {
+ 	struct nvkm_device *device = ior->disp->engine.subdev.device;
+ 	const u32 ctrl = 0x40000000 * enable |
+@@ -39,11 +82,6 @@ gk104_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 			 rekey;
+ 	const u32 hoff = head * 0x800;
+ 	const u32 hdmi = head * 0x400;
+-	struct packed_hdmi_infoframe avi_infoframe;
+-	struct packed_hdmi_infoframe vendor_infoframe;
+-
+-	pack_hdmi_infoframe(&avi_infoframe, avi, avi_size);
+-	pack_hdmi_infoframe(&vendor_infoframe, vendor, vendor_size);
+ 
+ 	if (!(ctrl & 0x40000000)) {
+ 		nvkm_mask(device, 0x616798 + hoff, 0x40000000, 0x00000000);
+@@ -53,28 +91,6 @@ gk104_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 		return;
+ 	}
+ 
+-	/* AVI InfoFrame */
+-	nvkm_mask(device, 0x690000 + hdmi, 0x00000001, 0x00000000);
+-	if (avi_size) {
+-		nvkm_wr32(device, 0x690008 + hdmi, avi_infoframe.header);
+-		nvkm_wr32(device, 0x69000c + hdmi, avi_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x690010 + hdmi, avi_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x690014 + hdmi, avi_infoframe.subpack1_low);
+-		nvkm_wr32(device, 0x690018 + hdmi, avi_infoframe.subpack1_high);
+-		nvkm_mask(device, 0x690000 + hdmi, 0x00000001, 0x00000001);
+-	}
+-
+-	/* GENERIC(?) / Vendor InfoFrame? */
+-	nvkm_mask(device, 0x690100 + hdmi, 0x00010001, 0x00000000);
+-	if (vendor_size) {
+-		nvkm_wr32(device, 0x690108 + hdmi, vendor_infoframe.header);
+-		nvkm_wr32(device, 0x69010c + hdmi, vendor_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x690110 + hdmi, vendor_infoframe.subpack0_high);
+-		/* Is there a second (or further?) set of subpack registers here? */
+-		nvkm_mask(device, 0x690100 + hdmi, 0x00000001, 0x00000001);
+-	}
+-
+-
+ 	/* ??? InfoFrame? */
+ 	nvkm_mask(device, 0x6900c0 + hdmi, 0x00000001, 0x00000000);
+ 	nvkm_wr32(device, 0x6900cc + hdmi, 0x00000010);
+@@ -87,14 +103,19 @@ gk104_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 	nvkm_mask(device, 0x616798 + hoff, 0x401f007f, ctrl);
+ }
+ 
++const struct nvkm_ior_func_hdmi
++gk104_sor_hdmi = {
++	.ctrl = gk104_sor_hdmi_ctrl,
++	.infoframe_avi = gk104_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = gk104_sor_hdmi_infoframe_vsi,
++};
++
+ static const struct nvkm_ior_func
+ gk104_sor = {
+ 	.state = gf119_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gk104_sor_hdmi_ctrl,
+-	},
++	.hdmi = &gk104_sor_hdmi,
+ 	.dp = &gf119_sor_dp,
+ 	.hda = &gf119_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm107.c
+index 9e9ef49bd8ac..b4d8e868616f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm107.c
+@@ -70,9 +70,7 @@ gm107_sor = {
+ 	.state = gf119_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gk104_sor_hdmi_ctrl,
+-	},
++	.hdmi = &gk104_sor_hdmi,
+ 	.dp = &gm107_sor_dp,
+ 	.hda = &gf119_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm200.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm200.c
+index 4ecc8f98af6e..562ebae57d44 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gm200.c
+@@ -79,6 +79,14 @@ gm200_sor_hdmi_scdc(struct nvkm_ior *ior, u8 scdc)
+ 	ior->tmds.high_speed = !!(scdc & 0x2);
+ }
+ 
++const struct nvkm_ior_func_hdmi
++gm200_sor_hdmi = {
++	.ctrl = gk104_sor_hdmi_ctrl,
++	.scdc = gm200_sor_hdmi_scdc,
++	.infoframe_avi = gk104_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = gk104_sor_hdmi_infoframe_vsi,
++};
++
+ void
+ gm200_sor_route_set(struct nvkm_outp *outp, struct nvkm_ior *ior)
+ {
+@@ -131,10 +139,7 @@ gm200_sor = {
+ 	.state = gf119_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gk104_sor_hdmi_ctrl,
+-		.scdc = gm200_sor_hdmi_scdc,
+-	},
++	.hdmi = &gm200_sor_hdmi,
+ 	.dp = &gm200_sor_dp,
+ 	.hda = &gf119_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp100.c
+index 7172a9dfd89b..7f1eb4332040 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp100.c
+@@ -37,10 +37,7 @@ gp100_sor = {
+ 	.state = gf119_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gk104_sor_hdmi_ctrl,
+-		.scdc = gm200_sor_hdmi_scdc,
+-	},
++	.hdmi = &gm200_sor_hdmi,
+ 	.dp = &gm200_sor_dp,
+ 	.hda = &gf119_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gt215.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gt215.c
+index 70c49e7af9cf..a2c7c6f83dcd 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gt215.c
+@@ -92,9 +92,53 @@ gt215_sor_dp = {
+ 	.watermark = g94_sor_dp_watermark,
+ };
+ 
+-void
+-gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+-		    u8 rekey, u8 *avi, u8 avi_size, u8 *vendor, u8 vendor_size)
++static void
++gt215_sor_hdmi_infoframe_vsi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe vsi;
++	const u32 soff = nv50_ior_base(ior);
++
++	pack_hdmi_infoframe(&vsi, data, size);
++
++	nvkm_mask(device, 0x61c53c + soff, 0x00010001, 0x00010000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x61c544 + soff, vsi.header);
++	nvkm_wr32(device, 0x61c548 + soff, vsi.subpack0_low);
++	nvkm_wr32(device, 0x61c54c + soff, vsi.subpack0_high);
++	/* Is there a second (or up to fourth?) set of subpack registers here? */
++	/* nvkm_wr32(device, 0x61c550 + soff, vsi.subpack1_low); */
++	/* nvkm_wr32(device, 0x61c554 + soff, vsi.subpack1_high); */
++
++	nvkm_mask(device, 0x61c53c + soff, 0x00010001, 0x00010001);
++}
++
++static void
++gt215_sor_hdmi_infoframe_avi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe avi;
++	const u32 soff = nv50_ior_base(ior);
++
++	pack_hdmi_infoframe(&avi, data, size);
++
++	nvkm_mask(device, 0x61c520 + soff, 0x00000001, 0x00000000);
++	if (size)
++		return;
++
++	nvkm_wr32(device, 0x61c528 + soff, avi.header);
++	nvkm_wr32(device, 0x61c52c + soff, avi.subpack0_low);
++	nvkm_wr32(device, 0x61c530 + soff, avi.subpack0_high);
++	nvkm_wr32(device, 0x61c534 + soff, avi.subpack1_low);
++	nvkm_wr32(device, 0x61c538 + soff, avi.subpack1_high);
++
++	nvkm_mask(device, 0x61c520 + soff, 0x00000001, 0x00000001);
++}
++
++static void
++gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet, u8 rekey)
+ {
+ 	struct nvkm_device *device = ior->disp->engine.subdev.device;
+ 	const u32 ctrl = 0x40000000 * enable |
+@@ -102,11 +146,6 @@ gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 			 max_ac_packet << 16 |
+ 			 rekey;
+ 	const u32 soff = nv50_ior_base(ior);
+-	struct packed_hdmi_infoframe avi_infoframe;
+-	struct packed_hdmi_infoframe vendor_infoframe;
+-
+-	pack_hdmi_infoframe(&avi_infoframe, avi, avi_size);
+-	pack_hdmi_infoframe(&vendor_infoframe, vendor, vendor_size);
+ 
+ 	if (!(ctrl & 0x40000000)) {
+ 		nvkm_mask(device, 0x61c5a4 + soff, 0x40000000, 0x00000000);
+@@ -116,17 +155,6 @@ gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 		return;
+ 	}
+ 
+-	/* AVI InfoFrame */
+-	nvkm_mask(device, 0x61c520 + soff, 0x00000001, 0x00000000);
+-	if (avi_size) {
+-		nvkm_wr32(device, 0x61c528 + soff, avi_infoframe.header);
+-		nvkm_wr32(device, 0x61c52c + soff, avi_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x61c530 + soff, avi_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x61c534 + soff, avi_infoframe.subpack1_low);
+-		nvkm_wr32(device, 0x61c538 + soff, avi_infoframe.subpack1_high);
+-		nvkm_mask(device, 0x61c520 + soff, 0x00000001, 0x00000001);
+-	}
+-
+ 	/* Audio InfoFrame */
+ 	nvkm_mask(device, 0x61c500 + soff, 0x00000001, 0x00000000);
+ 	nvkm_wr32(device, 0x61c508 + soff, 0x000a0184);
+@@ -134,18 +162,6 @@ gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 	nvkm_wr32(device, 0x61c510 + soff, 0x00000000);
+ 	nvkm_mask(device, 0x61c500 + soff, 0x00000001, 0x00000001);
+ 
+-	/* Vendor InfoFrame */
+-	nvkm_mask(device, 0x61c53c + soff, 0x00010001, 0x00010000);
+-	if (vendor_size) {
+-		nvkm_wr32(device, 0x61c544 + soff, vendor_infoframe.header);
+-		nvkm_wr32(device, 0x61c548 + soff, vendor_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x61c54c + soff, vendor_infoframe.subpack0_high);
+-		/* Is there a second (or up to fourth?) set of subpack registers here? */
+-		/* nvkm_wr32(device, 0x61c550 + soff, vendor_infoframe.subpack1_low); */
+-		/* nvkm_wr32(device, 0x61c554 + soff, vendor_infoframe.subpack1_high); */
+-		nvkm_mask(device, 0x61c53c + soff, 0x00010001, 0x00010001);
+-	}
+-
+ 	nvkm_mask(device, 0x61c5d0 + soff, 0x00070001, 0x00010001); /* SPARE, HW_CTS */
+ 	nvkm_mask(device, 0x61c568 + soff, 0x00010101, 0x00000000); /* ACR_CTRL, ?? */
+ 	nvkm_mask(device, 0x61c578 + soff, 0x80000000, 0x80000000); /* ACR_0441_ENABLE */
+@@ -159,14 +175,19 @@ gt215_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 	nvkm_mask(device, 0x61c5a4 + soff, 0x5f1f007f, ctrl);
+ }
+ 
++const struct nvkm_ior_func_hdmi
++gt215_sor_hdmi = {
++	.ctrl = gt215_sor_hdmi_ctrl,
++	.infoframe_avi = gt215_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = gt215_sor_hdmi_infoframe_vsi,
++};
++
+ static const struct nvkm_ior_func
+ gt215_sor = {
+ 	.state = g94_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = nv50_sor_clock,
+-	.hdmi = {
+-		.ctrl = gt215_sor_hdmi_ctrl,
+-	},
++	.hdmi = &gt215_sor_hdmi,
+ 	.dp = &gt215_sor_dp,
+ 	.hda = &gt215_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gv100.c
+index 6b9d49270fa7..115d0997fd62 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gv100.c
+@@ -96,9 +96,54 @@ gv100_sor_dp = {
+ 	.watermark = gv100_sor_dp_watermark,
+ };
+ 
+-void
+-gv100_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet,
+-		    u8 rekey, u8 *avi, u8 avi_size, u8 *vendor, u8 vendor_size)
++static void
++gv100_sor_hdmi_infoframe_vsi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe vsi;
++	const u32 hoff = head * 0x400;
++
++	pack_hdmi_infoframe(&vsi, data, size);
++
++	nvkm_mask(device, 0x6f0100 + hoff, 0x00010001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x6f0108 + hoff, vsi.header);
++	nvkm_wr32(device, 0x6f010c + hoff, vsi.subpack0_low);
++	nvkm_wr32(device, 0x6f0110 + hoff, vsi.subpack0_high);
++	nvkm_wr32(device, 0x6f0114 + hoff, 0x00000000);
++	nvkm_wr32(device, 0x6f0118 + hoff, 0x00000000);
++	nvkm_wr32(device, 0x6f011c + hoff, 0x00000000);
++	nvkm_wr32(device, 0x6f0120 + hoff, 0x00000000);
++	nvkm_wr32(device, 0x6f0124 + hoff, 0x00000000);
++	nvkm_mask(device, 0x6f0100 + hoff, 0x00000001, 0x00000001);
++}
++
++static void
++gv100_sor_hdmi_infoframe_avi(struct nvkm_ior *ior, int head, void *data, u32 size)
++{
++	struct nvkm_device *device = ior->disp->engine.subdev.device;
++	struct packed_hdmi_infoframe avi;
++	const u32 hoff = head * 0x400;
++
++	pack_hdmi_infoframe(&avi, data, size);
++
++	nvkm_mask(device, 0x6f0000 + hoff, 0x00000001, 0x00000000);
++	if (!size)
++		return;
++
++	nvkm_wr32(device, 0x6f0008 + hoff, avi.header);
++	nvkm_wr32(device, 0x6f000c + hoff, avi.subpack0_low);
++	nvkm_wr32(device, 0x6f0010 + hoff, avi.subpack0_high);
++	nvkm_wr32(device, 0x6f0014 + hoff, avi.subpack1_low);
++	nvkm_wr32(device, 0x6f0018 + hoff, avi.subpack1_high);
++
++	nvkm_mask(device, 0x6f0000 + hoff, 0x00000001, 0x00000001);
++}
++
++static void
++gv100_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packet, u8 rekey)
+ {
+ 	struct nvkm_device *device = ior->disp->engine.subdev.device;
+ 	const u32 ctrl = 0x40000000 * enable |
+@@ -106,11 +151,6 @@ gv100_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 			 rekey;
+ 	const u32 hoff = head * 0x800;
+ 	const u32 hdmi = head * 0x400;
+-	struct packed_hdmi_infoframe avi_infoframe;
+-	struct packed_hdmi_infoframe vendor_infoframe;
+-
+-	pack_hdmi_infoframe(&avi_infoframe, avi, avi_size);
+-	pack_hdmi_infoframe(&vendor_infoframe, vendor, vendor_size);
+ 
+ 	if (!(ctrl & 0x40000000)) {
+ 		nvkm_mask(device, 0x6165c0 + hoff, 0x40000000, 0x00000000);
+@@ -120,32 +160,6 @@ gv100_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 		return;
+ 	}
+ 
+-	/* AVI InfoFrame (AVI). */
+-	nvkm_mask(device, 0x6f0000 + hdmi, 0x00000001, 0x00000000);
+-	if (avi_size) {
+-		nvkm_wr32(device, 0x6f0008 + hdmi, avi_infoframe.header);
+-		nvkm_wr32(device, 0x6f000c + hdmi, avi_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x6f0010 + hdmi, avi_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x6f0014 + hdmi, avi_infoframe.subpack1_low);
+-		nvkm_wr32(device, 0x6f0018 + hdmi, avi_infoframe.subpack1_high);
+-		nvkm_mask(device, 0x6f0000 + hdmi, 0x00000001, 0x00000001);
+-	}
+-
+-	/* Vendor-specific InfoFrame (VSI). */
+-	nvkm_mask(device, 0x6f0100 + hdmi, 0x00010001, 0x00000000);
+-	if (vendor_size) {
+-		nvkm_wr32(device, 0x6f0108 + hdmi, vendor_infoframe.header);
+-		nvkm_wr32(device, 0x6f010c + hdmi, vendor_infoframe.subpack0_low);
+-		nvkm_wr32(device, 0x6f0110 + hdmi, vendor_infoframe.subpack0_high);
+-		nvkm_wr32(device, 0x6f0114 + hdmi, 0x00000000);
+-		nvkm_wr32(device, 0x6f0118 + hdmi, 0x00000000);
+-		nvkm_wr32(device, 0x6f011c + hdmi, 0x00000000);
+-		nvkm_wr32(device, 0x6f0120 + hdmi, 0x00000000);
+-		nvkm_wr32(device, 0x6f0124 + hdmi, 0x00000000);
+-		nvkm_mask(device, 0x6f0100 + hdmi, 0x00000001, 0x00000001);
+-	}
+-
+-
+ 	/* General Control (GCP). */
+ 	nvkm_mask(device, 0x6f00c0 + hdmi, 0x00000001, 0x00000000);
+ 	nvkm_wr32(device, 0x6f00cc + hdmi, 0x00000010);
+@@ -158,6 +172,14 @@ gv100_sor_hdmi_ctrl(struct nvkm_ior *ior, int head, bool enable, u8 max_ac_packe
+ 	nvkm_mask(device, 0x6165c0 + hoff, 0x401f007f, ctrl);
+ }
+ 
++const struct nvkm_ior_func_hdmi
++gv100_sor_hdmi = {
++	.ctrl = gv100_sor_hdmi_ctrl,
++	.scdc = gm200_sor_hdmi_scdc,
++	.infoframe_avi = gv100_sor_hdmi_infoframe_avi,
++	.infoframe_vsi = gv100_sor_hdmi_infoframe_vsi,
++};
++
+ void
+ gv100_sor_state(struct nvkm_ior *sor, struct nvkm_ior_state *state)
+ {
+@@ -190,10 +212,7 @@ gv100_sor = {
+ 	.state = gv100_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gv100_sor_hdmi_ctrl,
+-		.scdc = gm200_sor_hdmi_scdc,
+-	},
++	.hdmi = &gv100_sor_hdmi,
+ 	.dp = &gv100_sor_dp,
+ 	.hda = &gv100_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
+index 671c4674ffcc..da1b1a626ef2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ior.h
+@@ -63,12 +63,12 @@ struct nvkm_ior_func {
+ 	void (*war_2)(struct nvkm_ior *);
+ 	void (*war_3)(struct nvkm_ior *);
+ 
+-	struct {
+-		void (*ctrl)(struct nvkm_ior *, int head, bool enable,
+-			     u8 max_ac_packet, u8 rekey, u8 *avi, u8 avi_size,
+-			     u8 *vendor, u8 vendor_size);
++	const struct nvkm_ior_func_hdmi {
++		void (*ctrl)(struct nvkm_ior *, int head, bool enable, u8 max_ac_packet, u8 rekey);
+ 		void (*scdc)(struct nvkm_ior *, u8 scdc);
+-	} hdmi;
++		void (*infoframe_avi)(struct nvkm_ior *, int head, void *data, u32 size);
++		void (*infoframe_vsi)(struct nvkm_ior *, int head, void *data, u32 size);
++	} *hdmi;
+ 
+ 	const struct nvkm_ior_func_dp {
+ 		u8 lanes[4];
+@@ -124,9 +124,10 @@ void nv50_sor_power(struct nvkm_ior *, bool, bool, bool, bool, bool);
+ void nv50_sor_clock(struct nvkm_ior *);
+ 
+ int g84_sor_new(struct nvkm_disp *, int);
+-void g84_sor_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
++extern const struct nvkm_ior_func_hdmi g84_sor_hdmi;
+ 
+ int g94_sor_cnt(struct nvkm_disp *, unsigned long *);
++
+ void g94_sor_state(struct nvkm_ior *, struct nvkm_ior_state *);
+ extern const struct nvkm_ior_func_dp g94_sor_dp;
+ int g94_sor_dp_links(struct nvkm_ior *, struct nvkm_i2c_aux *);
+@@ -137,7 +138,7 @@ void g94_sor_dp_audio_sym(struct nvkm_ior *, int, u16, u32);
+ void g94_sor_dp_activesym(struct nvkm_ior *, int, u8, u8, u8, u8);
+ void g94_sor_dp_watermark(struct nvkm_ior *, int, u8);
+ 
+-void gt215_sor_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
++extern const struct nvkm_ior_func_hdmi gt215_sor_hdmi;
+ void gt215_sor_dp_audio(struct nvkm_ior *, int, bool);
+ extern const struct nvkm_ior_func_hda gt215_sor_hda;
+ 
+@@ -156,12 +157,16 @@ void gf119_sor_hda_hpd(struct nvkm_ior *, int, bool);
+ void gf119_sor_hda_eld(struct nvkm_ior *, int, u8 *, u8);
+ 
+ int gk104_sor_new(struct nvkm_disp *, int);
+-void gk104_sor_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
++extern const struct nvkm_ior_func_hdmi gk104_sor_hdmi;
++void gk104_sor_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8);
++void gk104_sor_hdmi_infoframe_avi(struct nvkm_ior *, int, void *, u32);
++void gk104_sor_hdmi_infoframe_vsi(struct nvkm_ior *, int, void *, u32);
+ 
+ void gm107_sor_dp_pattern(struct nvkm_ior *, int);
+ 
+ void gm200_sor_route_set(struct nvkm_outp *, struct nvkm_ior *);
+ int gm200_sor_route_get(struct nvkm_outp *, int *);
++extern const struct nvkm_ior_func_hdmi gm200_sor_hdmi;
+ void gm200_sor_hdmi_scdc(struct nvkm_ior *, u8);
+ extern const struct nvkm_ior_func_dp gm200_sor_dp;
+ void gm200_sor_dp_drive(struct nvkm_ior *, int, int, int, int, int);
+@@ -170,7 +175,7 @@ int gp100_sor_new(struct nvkm_disp *, int);
+ 
+ int gv100_sor_cnt(struct nvkm_disp *, unsigned long *);
+ void gv100_sor_state(struct nvkm_ior *, struct nvkm_ior_state *);
+-void gv100_sor_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
++extern const struct nvkm_ior_func_hdmi gv100_sor_hdmi;
+ void gv100_sor_dp_audio(struct nvkm_ior *, int, bool);
+ void gv100_sor_dp_audio_sym(struct nvkm_ior *, int, u16, u32);
+ void gv100_sor_dp_watermark(struct nvkm_ior *, int, u8);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp77.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp77.c
+index 916b1d477b0b..841e3b69fcaf 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp77.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp77.c
+@@ -31,9 +31,7 @@ mcp77_sor = {
+ 	.state = g94_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = nv50_sor_clock,
+-	.hdmi = {
+-		.ctrl = g84_sor_hdmi_ctrl,
+-	},
++	.hdmi = &g84_sor_hdmi,
+ 	.dp = &g94_sor_dp,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp89.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp89.c
+index a5a0b9439374..f96ba4752655 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp89.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/mcp89.c
+@@ -44,9 +44,7 @@ mcp89_sor = {
+ 	.state = g94_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = nv50_sor_clock,
+-	.hdmi = {
+-		.ctrl = gt215_sor_hdmi_ctrl,
+-	},
++	.hdmi = &gt215_sor_hdmi,
+ 	.dp = &mcp89_sor_dp,
+ 	.hda = &gt215_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/outp.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/outp.h
+index 16aadcedcbda..eb9cd1146825 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/outp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/outp.h
+@@ -60,6 +60,9 @@ struct nvkm_outp {
+ 	};
+ 
+ 	struct nvkm_object object;
++	struct {
++		struct nvkm_head *head;
++	} asy;
+ };
+ 
+ int nvkm_outp_new_(const struct nvkm_outp_func *, struct nvkm_disp *, int index,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+index f028ab17f8cf..9c481fa49bc5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+@@ -121,51 +121,6 @@ nv50_disp_root_mthd_(struct nvkm_object *object, u32 mthd, void *data, u32 size)
+ 			ior->func->hda->hpd(ior, hidx, false);
+ 		}
+ 
+-		return 0;
+-	}
+-		break;
+-	case NV50_DISP_MTHD_V1_SOR_HDMI_PWR: {
+-		union {
+-			struct nv50_disp_sor_hdmi_pwr_v0 v0;
+-		} *args = data;
+-		u8 *vendor, vendor_size;
+-		u8 *avi, avi_size;
+-		int ret = -ENOSYS;
+-
+-		nvif_ioctl(object, "disp sor hdmi ctrl size %d\n", size);
+-		if (!(ret = nvif_unpack(ret, &data, &size, args->v0, 0, 0, true))) {
+-			nvif_ioctl(object, "disp sor hdmi ctrl vers %d state %d "
+-					   "max_ac_packet %d rekey %d scdc %d\n",
+-				   args->v0.version, args->v0.state,
+-				   args->v0.max_ac_packet, args->v0.rekey,
+-				   args->v0.scdc);
+-			if (args->v0.max_ac_packet > 0x1f || args->v0.rekey > 0x7f)
+-				return -EINVAL;
+-			if ((args->v0.avi_infoframe_length
+-			     + args->v0.vendor_infoframe_length) > size)
+-				return -EINVAL;
+-			else
+-			if ((args->v0.avi_infoframe_length
+-			     + args->v0.vendor_infoframe_length) < size)
+-				return -E2BIG;
+-			avi = data;
+-			avi_size = args->v0.avi_infoframe_length;
+-			vendor = avi + avi_size;
+-			vendor_size = args->v0.vendor_infoframe_length;
+-		} else
+-			return ret;
+-
+-		if (!outp->ior->func->hdmi.ctrl)
+-			return -ENODEV;
+-
+-		outp->ior->func->hdmi.ctrl(outp->ior, hidx, args->v0.state,
+-					   args->v0.max_ac_packet,
+-					   args->v0.rekey, avi, avi_size,
+-					   vendor, vendor_size);
+-
+-		if (outp->ior->func->hdmi.scdc)
+-			outp->ior->func->hdmi.scdc(outp->ior, args->v0.scdc);
+-
+ 		return 0;
+ 	}
+ 		break;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
+index e4ad1a6f6c88..f5242a672279 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/tu102.c
+@@ -88,10 +88,7 @@ tu102_sor = {
+ 	.state = gv100_sor_state,
+ 	.power = nv50_sor_power,
+ 	.clock = gf119_sor_clock,
+-	.hdmi = {
+-		.ctrl = gv100_sor_hdmi_ctrl,
+-		.scdc = gm200_sor_hdmi_scdc,
+-	},
++	.hdmi = &gv100_sor_hdmi,
+ 	.dp = &tu102_sor_dp,
+ 	.hda = &gv100_sor_hda,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+index 7e0cef0f80a9..f82100b1a45d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+@@ -21,22 +21,88 @@
+  */
+ #define nvkm_uoutp(p) container_of((p), struct nvkm_outp, object)
+ #include "outp.h"
++#include "head.h"
+ #include "ior.h"
+ 
+ #include <nvif/if0012.h>
+ 
++static int
++nvkm_uoutp_mthd_infoframe(struct nvkm_outp *outp, void *argv, u32 argc)
++{
++	struct nvkm_ior *ior = outp->ior;
++	union nvif_outp_infoframe_args *args = argv;
++
++	if (argc < sizeof(args->v0) || args->v0.version != 0)
++		return -ENOSYS;
++	if (!nvkm_head_find(outp->disp, args->v0.head))
++		return -EINVAL;
++
++	switch (ior->func->hdmi ? args->v0.type : 0xff) {
++	case NVIF_OUTP_INFOFRAME_V0_AVI:
++		ior->func->hdmi->infoframe_avi(ior, args->v0.head, argv, argc);
++		return 0;
++	case NVIF_OUTP_INFOFRAME_V0_VSI:
++		ior->func->hdmi->infoframe_vsi(ior, args->v0.head, argv, argc);
++		return 0;
++	default:
++		break;
++	}
++
++	return -EINVAL;
++}
++
+ static int
+ nvkm_uoutp_mthd_release(struct nvkm_outp *outp, void *argv, u32 argc)
+ {
++	struct nvkm_head *head = outp->asy.head;
++	struct nvkm_ior *ior = outp->ior;
+ 	union nvif_outp_release_args *args = argv;
+ 
+ 	if (argc != sizeof(args->vn))
+ 		return -ENOSYS;
+ 
++	if (ior->func->hdmi && head) {
++		ior->func->hdmi->infoframe_avi(ior, head->id, NULL, 0);
++		ior->func->hdmi->infoframe_vsi(ior, head->id, NULL, 0);
++		ior->func->hdmi->ctrl(ior, head->id, false, 0, 0);
++	}
++
+ 	nvkm_outp_release(outp, NVKM_OUTP_USER);
+ 	return 0;
+ }
+ 
++static int
++nvkm_uoutp_mthd_acquire_tmds(struct nvkm_outp *outp, u8 head, u8 hdmi, u8 hdmi_max_ac_packet,
++			     u8 hdmi_rekey, u8 hdmi_scdc, u8 hdmi_hda)
++{
++	struct nvkm_ior *ior;
++	int ret;
++
++	if (!(outp->asy.head = nvkm_head_find(outp->disp, head)))
++		return -EINVAL;
++
++	ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, hdmi && hdmi_hda);
++	if (ret)
++		return ret;
++
++	ior = outp->ior;
++
++	if (hdmi) {
++		if (!ior->func->hdmi ||
++		    hdmi_max_ac_packet > 0x1f || hdmi_rekey > 0x7f ||
++		    (hdmi_scdc && !ior->func->hdmi->scdc)) {
++			nvkm_outp_release(outp, NVKM_OUTP_USER);
++			return -EINVAL;
++		}
++
++		ior->func->hdmi->ctrl(ior, head, hdmi, hdmi_max_ac_packet, hdmi_rekey);
++		if (ior->func->hdmi->scdc)
++			ior->func->hdmi->scdc(ior, hdmi_scdc);
++	}
++
++	return 0;
++}
++
+ static int
+ nvkm_uoutp_mthd_acquire_lvds(struct nvkm_outp *outp, bool dual, bool bpc8)
+ {
+@@ -63,6 +129,13 @@ nvkm_uoutp_mthd_acquire(struct nvkm_outp *outp, void *argv, u32 argc)
+ 		ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, false);
+ 		break;
+ 	case NVIF_OUTP_ACQUIRE_V0_TMDS:
++		ret = nvkm_uoutp_mthd_acquire_tmds(outp, args->v0.tmds.head,
++							 args->v0.tmds.hdmi,
++							 args->v0.tmds.hdmi_max_ac_packet,
++							 args->v0.tmds.hdmi_rekey,
++							 args->v0.tmds.hdmi_scdc,
++							 args->v0.tmds.hdmi_hda);
++		break;
+ 	case NVIF_OUTP_ACQUIRE_V0_DP:
+ 		ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, args->v0.dp.hda);
+ 		break;
+@@ -110,6 +183,7 @@ nvkm_uoutp_mthd_acquired(struct nvkm_outp *outp, u32 mthd, void *argv, u32 argc)
+ {
+ 	switch (mthd) {
+ 	case NVIF_OUTP_V0_RELEASE    : return nvkm_uoutp_mthd_release    (outp, argv, argc);
++	case NVIF_OUTP_V0_INFOFRAME  : return nvkm_uoutp_mthd_infoframe  (outp, argv, argc);
+ 	default:
+ 		break;
+ 	}
+-- 
+2.25.1
+

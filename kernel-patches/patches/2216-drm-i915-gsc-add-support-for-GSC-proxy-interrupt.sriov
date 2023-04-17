@@ -1,0 +1,323 @@
+From 43783f19d4a67323ad03412781f2acc2c2d553e7 Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Thu, 1 Dec 2022 14:16:23 -0800
+Subject: [PATCH 2216/2236] drm/i915/gsc: add support for GSC proxy interrupt
+
+The GSC notifies us of a proxy request via the HECI2 interrupt. The
+interrupt must be enabled both in the HECI layer and in our usual gt irq
+programming; for the latter, the interrupt is enabled via the same enable
+register as the GSC CS, but it does have its own mask register. When the
+interrupt is received, we also need to de-assert it in both layers.
+
+The handling of the proxy request is deferred to the same worker that we
+use for GSC load. New flags have been added to distinguish between the
+init case and the proxy interrupt.
+
+v2: rename action defines (Alan)
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_gt_irq.c       | 22 ++++++++--
+ drivers/gpu/drm/i915/gt/intel_gt_regs.h      |  3 ++
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c | 45 ++++++++++++++++++-
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.h |  1 +
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c    | 46 ++++++++++++++++----
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h    |  3 ++
+ 6 files changed, 106 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_irq.c b/drivers/gpu/drm/i915/gt/intel_gt_irq.c
+index c360776a98b5..aee157b2f18e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_irq.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_irq.c
+@@ -15,6 +15,7 @@
+ #include "intel_uncore.h"
+ #include "intel_rps.h"
+ #include "pxp/intel_pxp_irq.h"
++#include "uc/intel_gsc_proxy.h"
+ 
+ static void guc_irq_handler(struct intel_guc *guc, u16 iir)
+ {
+@@ -81,6 +82,9 @@ gen11_other_irq_handler(struct intel_gt *gt, const u8 instance,
+ 	if (instance == OTHER_GSC_INSTANCE)
+ 		return intel_gsc_irq_handler(gt, iir);
+ 
++	if (instance == OTHER_GSC_HECI_2_INSTANCE)
++		return intel_gsc_proxy_irq_handler(&gt->uc.gsc, iir);
++
+ 	WARN_ONCE(1, "unhandled other interrupt instance=0x%x, iir=0x%x\n",
+ 		  instance, iir);
+ }
+@@ -100,6 +104,8 @@ static struct intel_gt *pick_gt(struct intel_gt *gt, u8 class, u8 instance)
+ 	case VIDEO_ENHANCEMENT_CLASS:
+ 		return media_gt;
+ 	case OTHER_CLASS:
++		if (instance == OTHER_GSC_HECI_2_INSTANCE)
++			return media_gt;
+ 		if ((instance == OTHER_GSC_INSTANCE || instance == OTHER_KCR_INSTANCE) &&
+ 		    HAS_ENGINE(media_gt, GSC0))
+ 			return media_gt;
+@@ -257,6 +263,7 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 	u32 irqs = GT_RENDER_USER_INTERRUPT;
+ 	u32 guc_mask = intel_uc_wants_guc(&gt->uc) ? GUC_INTR_GUC2HOST : 0;
+ 	u32 gsc_mask = 0;
++	u32 heci_mask = 0;
+ 	u32 dmask;
+ 	u32 smask;
+ 
+@@ -268,10 +275,16 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 	dmask = irqs << 16 | irqs;
+ 	smask = irqs << 16;
+ 
+-	if (HAS_ENGINE(gt, GSC0))
++	if (HAS_ENGINE(gt, GSC0)) {
++		/*
++		 * the heci2 interrupt is enabled via the same register as the
++		 * GSC interrupt, but it has its own mask register.
++		 */
+ 		gsc_mask = irqs;
+-	else if (HAS_HECI_GSC(gt->i915))
++		heci_mask = GSC_IRQ_INTF(1); /* HECI2 IRQ for SW Proxy*/
++	} else if (HAS_HECI_GSC(gt->i915)) {
+ 		gsc_mask = GSC_IRQ_INTF(0) | GSC_IRQ_INTF(1);
++	}
+ 
+ 	BUILD_BUG_ON(irqs & 0xffff0000);
+ 
+@@ -281,7 +294,7 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 	if (CCS_MASK(gt))
+ 		intel_uncore_write(uncore, GEN12_CCS_RSVD_INTR_ENABLE, smask);
+ 	if (gsc_mask)
+-		intel_uncore_write(uncore, GEN11_GUNIT_CSME_INTR_ENABLE, gsc_mask);
++		intel_uncore_write(uncore, GEN11_GUNIT_CSME_INTR_ENABLE, gsc_mask | heci_mask);
+ 
+ 	/* Unmask irqs on RCS, BCS, VCS and VECS engines. */
+ 	intel_uncore_write(uncore, GEN11_RCS0_RSVD_INTR_MASK, ~smask);
+@@ -309,6 +322,9 @@ void gen11_gt_irq_postinstall(struct intel_gt *gt)
+ 		intel_uncore_write(uncore, GEN12_CCS2_CCS3_INTR_MASK, ~dmask);
+ 	if (gsc_mask)
+ 		intel_uncore_write(uncore, GEN11_GUNIT_CSME_INTR_MASK, ~gsc_mask);
++	if (heci_mask)
++		intel_uncore_write(uncore, GEN11_HECI2_RSVD_INTR_MASK,
++				   ~REG_FIELD_PREP(ENGINE1_MASK, heci_mask));
+ 
+ 	if (guc_mask) {
+ 		/* the enable bit is common for both GTs but the masks are separate */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_regs.h b/drivers/gpu/drm/i915/gt/intel_gt_regs.h
+index 7fa18a3b3957..066ac8dde265 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_regs.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_regs.h
+@@ -1581,6 +1581,7 @@
+ 
+ #define GEN11_GT_INTR_DW(x)			_MMIO(0x190018 + ((x) * 4))
+ #define   GEN11_CSME				(31)
++#define   GEN12_HECI_2				(30)
+ #define   GEN11_GUNIT				(28)
+ #define   GEN11_GUC				(25)
+ #define   MTL_MGUC				(24)
+@@ -1622,6 +1623,7 @@
+ /* irq instances for OTHER_CLASS */
+ #define   OTHER_GUC_INSTANCE			0
+ #define   OTHER_GTPM_INSTANCE			1
++#define   OTHER_GSC_HECI_2_INSTANCE		3
+ #define   OTHER_KCR_INSTANCE			4
+ #define   OTHER_GSC_INSTANCE			6
+ #define   OTHER_MEDIA_GUC_INSTANCE		16
+@@ -1637,6 +1639,7 @@
+ #define GEN12_VCS6_VCS7_INTR_MASK		_MMIO(0x1900b4)
+ #define GEN11_VECS0_VECS1_INTR_MASK		_MMIO(0x1900d0)
+ #define GEN12_VECS2_VECS3_INTR_MASK		_MMIO(0x1900d4)
++#define GEN11_HECI2_RSVD_INTR_MASK		_MMIO(0x1900e4)
+ #define GEN11_GUC_SG_INTR_MASK			_MMIO(0x1900e8)
+ #define MTL_GUC_MGUC_INTR_MASK			_MMIO(0x1900e8) /* MTL+ */
+ #define GEN11_GPM_WGBOXPERF_INTR_MASK		_MMIO(0x1900ec)
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c
+index c6bef8ae0579..d871ffadebfd 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c
+@@ -36,6 +36,11 @@
+  *     restart from there) or with an end message.
+  */
+ 
++#define INTEL_GSC_HECI2_H_CSR _MMIO(0x117004)
++#define  CSR_H_INTERRUPT_ENABLE	BIT(0)
++#define  CSR_H_INTERRUPT_STATUS	BIT(1)
++#define  CSR_H_RESET		BIT(4)
++
+ /* how long do we wait for the component to load on boot? */
+ #define GSC_PROXY_INIT_TIMEOUT_MS 20000
+ 
+@@ -294,17 +299,48 @@ int intel_gsc_proxy_request_handler(struct intel_gsc_uc *gsc)
+ 			"GSC proxy worker called without the component being bound!\n");
+ 		err = -EIO;
+ 	} else {
++		/*
++		 * write the status bit to clear it and allow new proxy
++		 * interrupts to be generated while we handle the current
++		 * request, but be sure not to write the reset bit
++		 */
++		intel_uncore_rmw(gt->uncore, INTEL_GSC_HECI2_H_CSR,
++				 CSR_H_RESET, CSR_H_INTERRUPT_STATUS);
+ 		err = proxy_query(gsc);
+ 	}
+ 	mutex_unlock(&gsc->proxy.mutex);
+ 	return err;
+ }
+ 
++void intel_gsc_proxy_irq_handler(struct intel_gsc_uc *gsc, u32 iir)
++{
++	struct intel_gt *gt = gsc_uc_to_gt(gsc);
++
++	if (unlikely(!iir))
++		return;
++
++	lockdep_assert_held(gt->irq_lock);
++
++	if (!gsc->proxy.component) {
++		drm_err(&gt->i915->drm,
++			"GSC proxy irq received without the component being bound!\n");
++		return;
++	}
++
++	gsc->gsc_work_actions |= GSC_ACTION_SW_PROXY;
++	queue_work(gsc->wq, &gsc->work);
++}
++
+ static int i915_gsc_proxy_component_bind(struct device *i915_kdev,
+ 					 struct device *tee_kdev, void *data)
+ {
+ 	struct drm_i915_private *i915 = kdev_to_i915(i915_kdev);
+-	struct intel_gsc_uc *gsc = &i915->media_gt->uc.gsc;
++	struct intel_gt *gt = i915->media_gt;
++	struct intel_gsc_uc *gsc = &gt->uc.gsc;
++
++	/* enable HECI2 IRQs */
++	intel_uncore_rmw(gt->uncore, INTEL_GSC_HECI2_H_CSR,
++			 0, CSR_H_INTERRUPT_ENABLE);
+ 
+ 	mutex_lock(&gsc->proxy.mutex);
+ 	gsc->proxy.component = data;
+@@ -318,11 +354,16 @@ static void i915_gsc_proxy_component_unbind(struct device *i915_kdev,
+ 					    struct device *tee_kdev, void *data)
+ {
+ 	struct drm_i915_private *i915 = kdev_to_i915(i915_kdev);
+-	struct intel_gsc_uc *gsc = &i915->media_gt->uc.gsc;
++	struct intel_gt *gt = i915->media_gt;
++	struct intel_gsc_uc *gsc = &gt->uc.gsc;
+ 
+ 	mutex_lock(&gsc->proxy.mutex);
+ 	gsc->proxy.component = NULL;
+ 	mutex_unlock(&gsc->proxy.mutex);
++
++	/* disable HECI2 IRQs */
++	intel_uncore_rmw(gt->uncore, INTEL_GSC_HECI2_H_CSR,
++			 CSR_H_INTERRUPT_ENABLE, 0);
+ }
+ 
+ static const struct component_ops i915_gsc_proxy_component_ops = {
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.h b/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.h
+index da3e9dd5d820..c55bafcbaec4 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.h
+@@ -13,5 +13,6 @@ struct intel_gsc_uc;
+ int intel_gsc_proxy_init(struct intel_gsc_uc *gsc);
+ void intel_gsc_proxy_fini(struct intel_gsc_uc *gsc);
+ int intel_gsc_proxy_request_handler(struct intel_gsc_uc *gsc);
++void intel_gsc_proxy_irq_handler(struct intel_gsc_uc *gsc, u32 iir);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+index 1655c9b2b912..8693c5ecc4e6 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+@@ -16,6 +16,7 @@ static void gsc_work(struct work_struct *work)
+ 	struct intel_gsc_uc *gsc = container_of(work, typeof(*gsc), work);
+ 	struct intel_gt *gt = gsc_uc_to_gt(gsc);
+ 	intel_wakeref_t wakeref;
++	u32 actions;
+ 	int ret;
+ 
+ 	wakeref = intel_runtime_pm_get(gt->uncore->rpm);
+@@ -25,16 +26,37 @@ static void gsc_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	ret = intel_gsc_uc_fw_upload(gsc);
+-	if (ret)
+-		goto out_put;
+-
+-	ret = intel_gsc_proxy_request_handler(gsc);
+-	if (ret)
+-		goto out_put;
++	spin_lock_irq(gt->irq_lock);
++	actions = gsc->gsc_work_actions;
++	gsc->gsc_work_actions = 0;
++	spin_unlock_irq(gt->irq_lock);
++
++	if (actions & GSC_ACTION_FW_LOAD) {
++		ret = intel_gsc_uc_fw_upload(gsc);
++		if (ret == -EEXIST) /* skip proxy if not a new load */
++			actions &= ~GSC_ACTION_FW_LOAD;
++		else if (ret)
++			goto out_put;
++	}
+ 
+-	drm_dbg(&gt->i915->drm, "GSC Proxy initialized\n");
+-	intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_RUNNING);
++	if (actions & (GSC_ACTION_FW_LOAD | GSC_ACTION_SW_PROXY)) {
++		if (!intel_gsc_uc_fw_init_done(gsc)) {
++			drm_err(&gt->i915->drm,
++				"Proxy request received with GSC not loaded!\n");
++			goto out_put;
++		}
++
++		ret = intel_gsc_proxy_request_handler(gsc);
++		if (ret)
++			goto out_put;
++
++		/* mark the GSC FW init as done the first time we run this */
++		if (actions & GSC_ACTION_FW_LOAD) {
++			drm_dbg(&gt->i915->drm,
++				"GSC Proxy initialized\n");
++			intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_RUNNING);
++		}
++	}
+ 
+ out_put:
+ 	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+@@ -165,11 +187,17 @@ void intel_gsc_uc_flush_work(struct intel_gsc_uc *gsc)
+ 
+ void intel_gsc_uc_load_start(struct intel_gsc_uc *gsc)
+ {
++	struct intel_gt *gt = gsc_uc_to_gt(gsc);
++
+ 	if (!intel_uc_fw_is_loadable(&gsc->fw))
+ 		return;
+ 
+ 	if (intel_gsc_uc_fw_init_done(gsc))
+ 		return;
+ 
++	spin_lock_irq(gt->irq_lock);
++	gsc->gsc_work_actions |= GSC_ACTION_FW_LOAD;
++	spin_unlock_irq(gt->irq_lock);
++
+ 	queue_work(gsc->wq, &gsc->work);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
+index 725bade3c680..d3667ff40507 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
+@@ -23,6 +23,9 @@ struct intel_gsc_uc {
+ 	/* for delayed load and proxy handling */
+ 	struct workqueue_struct *wq;
+ 	struct work_struct work;
++	u32 gsc_work_actions; /* protected by gt->irq_lock */
++#define GSC_ACTION_FW_LOAD BIT(0)
++#define GSC_ACTION_SW_PROXY BIT(1)
+ 
+ 	struct {
+ 		struct i915_gsc_proxy_component *component;
+-- 
+2.25.1
+

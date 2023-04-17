@@ -1,0 +1,257 @@
+From be9ed4349a6e5dd2e62de8b2e841c147e3641344 Mon Sep 17 00:00:00 2001
+From: Alvin Lee <Alvin.Lee2@amd.com>
+Date: Wed, 7 Dec 2022 20:19:49 -0500
+Subject: [PATCH 1597/2236] drm/amd/display: Turn on phantom OTG before
+ disabling phantom pipe
+
+[Description]
+- Proper phantom pipe disable sequence was missing in
+  commit_planes_for_stream
+- If disabling phantom pipe, turn on phantom OTG first, and turn
+  off the phantom OTG after the plane is disabled
+- Also update sequence for enabling / disabling phantom streams
+  (apply_ctx_to_hw). When enabling phantom pipes, enable before
+  doing front end programming for phantom pipes. If disabling
+  phantom pipes, disable after front end programming (i.e. after
+  phantom plane disable)
+- TODO: Still need to properly handle transition case when a phantom
+  pipe is transitioned directly into a real pipe (need to fully disable
+  the phantom pipe first)
+
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Alvin Lee <Alvin.Lee2@amd.com>
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 58 ++++++++-----------
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    | 24 ++++++++
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.c    | 36 ++++++++++++
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.h    |  2 +
+ .../gpu/drm/amd/display/dc/dcn32/dcn32_init.c |  1 +
+ .../gpu/drm/amd/display/dc/inc/hw_sequencer.h |  1 +
+ 6 files changed, 88 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index e265faff4c3d..f41933845d2a 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -3326,6 +3326,7 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	struct pipe_ctx *top_pipe_to_program = NULL;
+ 	bool should_lock_all_pipes = (update_type != UPDATE_TYPE_FAST);
+ 	bool subvp_prev_use = false;
++	bool subvp_curr_use = false;
+ 
+ 	// Once we apply the new subvp context to hardware it won't be in the
+ 	// dc->current_state anymore, so we have to cache it before we apply
+@@ -3382,6 +3383,15 @@ static void commit_planes_for_stream(struct dc *dc,
+ 			break;
+ 	}
+ 
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) {
++			subvp_curr_use = true;
++			break;
++		}
++	}
++
+ 	if (stream->test_pattern.type != DP_TEST_PATTERN_VIDEO_MODE) {
+ 		struct pipe_ctx *mpcc_pipe;
+ 		struct pipe_ctx *odm_pipe;
+@@ -3653,42 +3663,22 @@ static void commit_planes_for_stream(struct dc *dc,
+ 					top_pipe_to_program->stream_res.tg);
+ 		}
+ 
+-	/* For phantom pipe OTG enable, it has to be done after any previous pipe
+-	 * that was in use has already been programmed at gotten its double buffer
+-	 * update for "disable".
+-	 */
+-	if (update_type != UPDATE_TYPE_FAST) {
+-		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+-			struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+-
+-			/* If an active, non-phantom pipe is being transitioned into a phantom
+-			 * pipe, wait for the double buffer update to complete first before we do
+-			 * ANY phantom pipe programming.
+-			 */
+-			if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM &&
+-					old_pipe->stream && old_pipe->stream->mall_stream_config.type != SUBVP_PHANTOM) {
+-				old_pipe->stream_res.tg->funcs->wait_for_state(
+-						old_pipe->stream_res.tg,
+-						CRTC_STATE_VBLANK);
+-				old_pipe->stream_res.tg->funcs->wait_for_state(
+-						old_pipe->stream_res.tg,
+-						CRTC_STATE_VACTIVE);
+-			}
++	if (subvp_curr_use) {
++		/* If enabling subvp or transitioning from subvp->subvp, enable the
++		 * phantom streams before we program front end for the phantom pipes.
++		 */
++		if (update_type != UPDATE_TYPE_FAST) {
++			if (dc->hwss.enable_phantom_streams)
++				dc->hwss.enable_phantom_streams(dc, context);
+ 		}
+-		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			struct pipe_ctx *new_pipe = &context->res_ctx.pipe_ctx[i];
++	}
+ 
+-			if ((new_pipe->stream && new_pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) ||
+-					subvp_prev_use) {
+-				// If old context or new context has phantom pipes, apply
+-				// the phantom timings now. We can't change the phantom
+-				// pipe configuration safely without driver acquiring
+-				// the DMCUB lock first.
+-				dc->hwss.apply_ctx_to_hw(dc, context);
+-				break;
+-			}
+-		}
++	if (subvp_prev_use && !subvp_curr_use) {
++		/* If disabling subvp, disable phantom streams after front end
++		 * programming has completed (we turn on phantom OTG in order
++		 * to complete the plane disable for phantom pipes).
++		 */
++		dc->hwss.apply_ctx_to_hw(dc, context);
+ 	}
+ 
+ 	if (update_type != UPDATE_TYPE_FAST)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index 6291a241158a..366ba05cf8ef 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -582,6 +582,9 @@ void dcn20_plane_atomic_disable(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 	if (pipe_ctx->stream_res.gsl_group != 0)
+ 		dcn20_setup_gsl_group_as_lock(dc, pipe_ctx, false);
+ 
++	if (hubp->funcs->hubp_update_mall_sel)
++		hubp->funcs->hubp_update_mall_sel(hubp, 0, false);
++
+ 	dc->hwss.set_flip_control_gsl(pipe_ctx, false);
+ 
+ 	hubp->funcs->hubp_clk_cntl(hubp, false);
+@@ -605,6 +608,9 @@ void dcn20_plane_atomic_disable(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 
+ void dcn20_disable_plane(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ {
++	bool is_phantom = pipe_ctx->plane_state && pipe_ctx->plane_state->is_phantom;
++	struct timing_generator *tg = is_phantom ? pipe_ctx->stream_res.tg : NULL;
++
+ 	DC_LOGGER_INIT(dc->ctx->logger);
+ 
+ 	if (!pipe_ctx->plane_res.hubp || pipe_ctx->plane_res.hubp->power_gated)
+@@ -612,6 +618,12 @@ void dcn20_disable_plane(struct dc *dc, struct pipe_ctx *pipe_ctx)
+ 
+ 	dcn20_plane_atomic_disable(dc, pipe_ctx);
+ 
++	/* Turn back off the phantom OTG after the phantom plane is fully disabled
++	 */
++	if (is_phantom)
++		if (tg && tg->funcs->disable_phantom_crtc)
++			tg->funcs->disable_phantom_crtc(tg);
++
+ 	DC_LOG_DC("Power down front end %d\n",
+ 					pipe_ctx->pipe_idx);
+ }
+@@ -1803,6 +1815,18 @@ void dcn20_program_front_end_for_ctx(
+ 		dcn20_detect_pipe_changes(&dc->current_state->res_ctx.pipe_ctx[i],
+ 				&context->res_ctx.pipe_ctx[i]);
+ 
++	/* When disabling phantom pipes, turn on phantom OTG first (so we can get double
++	 * buffer updates properly)
++	 */
++	for (i = 0; i < dc->res_pool->pipe_count; i++)
++		if (context->res_ctx.pipe_ctx[i].update_flags.bits.disable
++				&& dc->current_state->res_ctx.pipe_ctx[i].stream->mall_stream_config.type == SUBVP_PHANTOM) {
++			struct timing_generator *tg = dc->current_state->res_ctx.pipe_ctx[i].stream_res.tg;
++
++			if (tg->funcs->enable_crtc)
++				tg->funcs->enable_crtc(tg);
++		}
++
+ 	/* OTG blank before disabling all front ends */
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++)
+ 		if (context->res_ctx.pipe_ctx[i].update_flags.bits.disable
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+index 2f0ebe1f6c45..c10d8a60380a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+@@ -1451,3 +1451,39 @@ void dcn32_update_dsc_pg(struct dc *dc,
+ 		}
+ 	}
+ }
++
++void dcn32_enable_phantom_streams(struct dc *dc, struct dc_state *context)
++{
++	unsigned int i;
++
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++		struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++
++		/* If an active, non-phantom pipe is being transitioned into a phantom
++		 * pipe, wait for the double buffer update to complete first before we do
++		 * ANY phantom pipe programming.
++		 */
++		if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM &&
++				old_pipe->stream && old_pipe->stream->mall_stream_config.type != SUBVP_PHANTOM) {
++			old_pipe->stream_res.tg->funcs->wait_for_state(
++					old_pipe->stream_res.tg,
++					CRTC_STATE_VBLANK);
++			old_pipe->stream_res.tg->funcs->wait_for_state(
++					old_pipe->stream_res.tg,
++					CRTC_STATE_VACTIVE);
++		}
++	}
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *new_pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (new_pipe->stream && new_pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) {
++			// If old context or new context has phantom pipes, apply
++			// the phantom timings now. We can't change the phantom
++			// pipe configuration safely without driver acquiring
++			// the DMCUB lock first.
++			dc->hwss.apply_ctx_to_hw(dc, context);
++			break;
++		}
++	}
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+index 7de36529cf99..e9e9534f3668 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+@@ -102,4 +102,6 @@ void dcn32_update_dsc_pg(struct dc *dc,
+ 		struct dc_state *context,
+ 		bool safe_to_disable);
+ 
++void dcn32_enable_phantom_streams(struct dc *dc, struct dc_state *context);
++
+ #endif /* __DC_HWSS_DCN32_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+index a4e9fd5307c6..a02918eaa2c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+@@ -106,6 +106,7 @@ static const struct hw_sequencer_funcs dcn32_funcs = {
+ 	.set_disp_pattern_generator = dcn30_set_disp_pattern_generator,
+ 	.get_dcc_en_bits = dcn10_get_dcc_en_bits,
+ 	.commit_subvp_config = dcn32_commit_subvp_config,
++	.enable_phantom_streams = dcn32_enable_phantom_streams,
+ 	.subvp_pipe_control_lock = dcn32_subvp_pipe_control_lock,
+ 	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ 	.update_phantom_vp_position = dcn32_update_phantom_vp_position,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index c43523f9ff6d..88ac723d10aa 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -266,6 +266,7 @@ struct hw_sequencer_funcs {
+ 	void (*apply_update_flags_for_phantom)(struct pipe_ctx *phantom_pipe);
+ 
+ 	void (*commit_subvp_config)(struct dc *dc, struct dc_state *context);
++	void (*enable_phantom_streams)(struct dc *dc, struct dc_state *context);
+ 	void (*subvp_pipe_control_lock)(struct dc *dc,
+ 			struct dc_state *context,
+ 			bool lock,
+-- 
+2.25.1
+

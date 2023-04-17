@@ -1,0 +1,164 @@
+From 2a9a6e0f64e97d5ec8e6315c66a5c302ea9c83a7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 22 Jun 2022 18:54:45 +0300
+Subject: [PATCH 0090/2236] drm/i915: Split vlv_compute_pipe_wm() into two
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Split vlv_compute_pipe_wm() into two halves. The first half computes
+the new raw watermarks, and the second half munges those up into real
+watermarks for the particular pipe.
+
+We can reuse the second half for watermark sanitation as well.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220622155452.32587-3-ville.syrjala@linux.intel.com
+Reviewed-by: Stanislav Lisovskiy <stanslav.lisovskiy@intel.com>
+---
+ drivers/gpu/drm/i915/intel_pm.c | 114 ++++++++++++++++++--------------
+ 1 file changed, 64 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 06318e8ac9ca..de25c3301022 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -1865,64 +1865,17 @@ static bool vlv_raw_crtc_wm_is_valid(const struct intel_crtc_state *crtc_state,
+ 		vlv_raw_plane_wm_is_valid(crtc_state, PLANE_CURSOR, level);
+ }
+ 
+-static int vlv_compute_pipe_wm(struct intel_atomic_state *state,
+-			       struct intel_crtc *crtc)
++static int _vlv_compute_pipe_wm(struct intel_crtc_state *crtc_state)
+ {
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+-	struct intel_crtc_state *crtc_state =
+-		intel_atomic_get_new_crtc_state(state, crtc);
+ 	struct vlv_wm_state *wm_state = &crtc_state->wm.vlv.optimal;
+ 	const struct vlv_fifo_state *fifo_state =
+ 		&crtc_state->wm.vlv.fifo_state;
+ 	u8 active_planes = crtc_state->active_planes & ~BIT(PLANE_CURSOR);
+ 	int num_active_planes = hweight8(active_planes);
+-	bool needs_modeset = drm_atomic_crtc_needs_modeset(&crtc_state->uapi);
+-	const struct intel_plane_state *old_plane_state;
+-	const struct intel_plane_state *new_plane_state;
+-	struct intel_plane *plane;
+ 	enum plane_id plane_id;
+-	int level, ret, i;
+-	unsigned int dirty = 0;
+-
+-	for_each_oldnew_intel_plane_in_state(state, plane,
+-					     old_plane_state,
+-					     new_plane_state, i) {
+-		if (new_plane_state->hw.crtc != &crtc->base &&
+-		    old_plane_state->hw.crtc != &crtc->base)
+-			continue;
+-
+-		if (vlv_raw_plane_wm_compute(crtc_state, new_plane_state))
+-			dirty |= BIT(plane->id);
+-	}
+-
+-	/*
+-	 * DSPARB registers may have been reset due to the
+-	 * power well being turned off. Make sure we restore
+-	 * them to a consistent state even if no primary/sprite
+-	 * planes are initially active.
+-	 */
+-	if (needs_modeset)
+-		crtc_state->fifo_changed = true;
+-
+-	if (!dirty)
+-		return 0;
+-
+-	/* cursor changes don't warrant a FIFO recompute */
+-	if (dirty & ~BIT(PLANE_CURSOR)) {
+-		const struct intel_crtc_state *old_crtc_state =
+-			intel_atomic_get_old_crtc_state(state, crtc);
+-		const struct vlv_fifo_state *old_fifo_state =
+-			&old_crtc_state->wm.vlv.fifo_state;
+-
+-		ret = vlv_compute_fifo(crtc_state);
+-		if (ret)
+-			return ret;
+-
+-		if (needs_modeset ||
+-		    memcmp(old_fifo_state, fifo_state,
+-			   sizeof(*fifo_state)) != 0)
+-			crtc_state->fifo_changed = true;
+-	}
++	int level;
+ 
+ 	/* initially allow all levels */
+ 	wm_state->num_levels = intel_wm_num_levels(dev_priv);
+@@ -1969,6 +1922,67 @@ static int vlv_compute_pipe_wm(struct intel_atomic_state *state,
+ 	return 0;
+ }
+ 
++static int vlv_compute_pipe_wm(struct intel_atomic_state *state,
++			       struct intel_crtc *crtc)
++{
++	struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
++	bool needs_modeset = drm_atomic_crtc_needs_modeset(&crtc_state->uapi);
++	const struct intel_plane_state *old_plane_state;
++	const struct intel_plane_state *new_plane_state;
++	struct intel_plane *plane;
++	unsigned int dirty = 0;
++	int i;
++
++	for_each_oldnew_intel_plane_in_state(state, plane,
++					     old_plane_state,
++					     new_plane_state, i) {
++		if (new_plane_state->hw.crtc != &crtc->base &&
++		    old_plane_state->hw.crtc != &crtc->base)
++			continue;
++
++		if (vlv_raw_plane_wm_compute(crtc_state, new_plane_state))
++			dirty |= BIT(plane->id);
++	}
++
++	/*
++	 * DSPARB registers may have been reset due to the
++	 * power well being turned off. Make sure we restore
++	 * them to a consistent state even if no primary/sprite
++	 * planes are initially active. We also force a FIFO
++	 * recomputation so that we are sure to sanitize the
++	 * FIFO setting we took over from the BIOS even if there
++	 * are no active planes on the crtc.
++	 */
++	if (needs_modeset)
++		dirty = ~0;
++
++	if (!dirty)
++		return 0;
++
++	/* cursor changes don't warrant a FIFO recompute */
++	if (dirty & ~BIT(PLANE_CURSOR)) {
++		const struct intel_crtc_state *old_crtc_state =
++			intel_atomic_get_old_crtc_state(state, crtc);
++		const struct vlv_fifo_state *old_fifo_state =
++			&old_crtc_state->wm.vlv.fifo_state;
++		const struct vlv_fifo_state *new_fifo_state =
++			&crtc_state->wm.vlv.fifo_state;
++		int ret;
++
++		ret = vlv_compute_fifo(crtc_state);
++		if (ret)
++			return ret;
++
++		if (needs_modeset ||
++		    memcmp(old_fifo_state, new_fifo_state,
++			   sizeof(*new_fifo_state)) != 0)
++			crtc_state->fifo_changed = true;
++	}
++
++	return _vlv_compute_pipe_wm(crtc_state);
++}
++
+ #define VLV_FIFO(plane, value) \
+ 	(((value) << DSPARB_ ## plane ## _SHIFT_VLV) & DSPARB_ ## plane ## _MASK_VLV)
+ 
+-- 
+2.25.1
+

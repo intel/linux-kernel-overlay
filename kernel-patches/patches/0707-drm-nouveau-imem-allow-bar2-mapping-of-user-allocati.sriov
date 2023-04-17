@@ -1,0 +1,178 @@
+From 4a753f09137256d6a0f2a312d8bf9dcb64008f6b Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:21 +1000
+Subject: [PATCH 0707/2236] drm/nouveau/imem: allow bar2 mapping of user
+ allocations
+
+Will be used to init client-allocated USERD to default values.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/core/memory.h    |  2 ++
+ .../drm/nouveau/include/nvkm/subdev/instmem.h |  2 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c  |  8 ++++++
+ .../drm/nouveau/nvkm/subdev/instmem/base.c    | 12 +++++++++
+ .../drm/nouveau/nvkm/subdev/instmem/nv50.c    | 27 +++++++++++++++----
+ .../drm/nouveau/nvkm/subdev/instmem/priv.h    |  1 +
+ 6 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h b/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h
+index 74d3f1a809d7..d3b6a68ddda3 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h
+@@ -37,6 +37,7 @@ struct nvkm_memory_func {
+ 	void (*release)(struct nvkm_memory *);
+ 	int (*map)(struct nvkm_memory *, u64 offset, struct nvkm_vmm *,
+ 		   struct nvkm_vma *, void *argv, u32 argc);
++	int (*kmap)(struct nvkm_memory *, struct nvkm_memory **);
+ };
+ 
+ struct nvkm_memory_ptrs {
+@@ -63,6 +64,7 @@ void nvkm_memory_tags_put(struct nvkm_memory *, struct nvkm_device *,
+ #define nvkm_memory_boot(p,v) (p)->func->boot((p),(v))
+ #define nvkm_memory_map(p,o,vm,va,av,ac)                                       \
+ 	(p)->func->map((p),(o),(vm),(va),(av),(ac))
++#define nvkm_memory_kmap(p,i) ((p)->func->kmap ? (p)->func->kmap((p), (i)) : -ENOSYS)
+ 
+ /* accessor macros - kmap()/done() must bracket use of the other accessor
+  * macros to guarantee correct behaviour across all chipsets
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
+index f967b97d163c..fcdaefc99fe8 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
+@@ -28,7 +28,7 @@ u32 nvkm_instmem_rd32(struct nvkm_instmem *, u32 addr);
+ void nvkm_instmem_wr32(struct nvkm_instmem *, u32 addr, u32 data);
+ int nvkm_instobj_new(struct nvkm_instmem *, u32 size, u32 align, bool zero,
+ 		     struct nvkm_memory **);
+-
++int nvkm_instobj_wrap(struct nvkm_device *, struct nvkm_memory *, struct nvkm_memory **);
+ 
+ int nv04_instmem_new(struct nvkm_device *, enum nvkm_subdev_type, int, struct nvkm_instmem **);
+ int nv40_instmem_new(struct nvkm_device *, enum nvkm_subdev_type, int, struct nvkm_instmem **);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c
+index 03b1bdb27770..5c34416cb637 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c
+@@ -25,6 +25,7 @@
+ #include "ram.h"
+ 
+ #include <core/memory.h>
++#include <subdev/instmem.h>
+ #include <subdev/mmu.h>
+ 
+ struct nvkm_vram {
+@@ -34,6 +35,12 @@ struct nvkm_vram {
+ 	struct nvkm_mm_node *mn;
+ };
+ 
++static int
++nvkm_vram_kmap(struct nvkm_memory *memory, struct nvkm_memory **pmemory)
++{
++	return nvkm_instobj_wrap(nvkm_vram(memory)->ram->fb->subdev.device, memory, pmemory);
++}
++
+ static int
+ nvkm_vram_map(struct nvkm_memory *memory, u64 offset, struct nvkm_vmm *vmm,
+ 	      struct nvkm_vma *vma, void *argv, u32 argc)
+@@ -98,6 +105,7 @@ nvkm_vram = {
+ 	.addr = nvkm_vram_addr,
+ 	.size = nvkm_vram_size,
+ 	.map = nvkm_vram_map,
++	.kmap = nvkm_vram_kmap,
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
+index cd8163a52bb6..e0e4f97be029 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
+@@ -89,6 +89,18 @@ nvkm_instobj_ctor(const struct nvkm_memory_func *func,
+ 	spin_unlock(&imem->lock);
+ }
+ 
++int
++nvkm_instobj_wrap(struct nvkm_device *device,
++		  struct nvkm_memory *memory, struct nvkm_memory **pmemory)
++{
++	struct nvkm_instmem *imem = device->imem;
++
++	if (!imem->func->memory_wrap)
++		return -ENOSYS;
++
++	return imem->func->memory_wrap(imem, memory, pmemory);
++}
++
+ int
+ nvkm_instobj_new(struct nvkm_instmem *imem, u32 size, u32 align, bool zero,
+ 		 struct nvkm_memory **pmemory)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c
+index c51bac76174c..4b2d7465d22f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c
+@@ -348,13 +348,11 @@ nv50_instobj_func = {
+ };
+ 
+ static int
+-nv50_instobj_new(struct nvkm_instmem *base, u32 size, u32 align, bool zero,
+-		 struct nvkm_memory **pmemory)
++nv50_instobj_wrap(struct nvkm_instmem *base,
++		  struct nvkm_memory *memory, struct nvkm_memory **pmemory)
+ {
+ 	struct nv50_instmem *imem = nv50_instmem(base);
+ 	struct nv50_instobj *iobj;
+-	struct nvkm_device *device = imem->base.subdev.device;
+-	u8 page = max(order_base_2(align), 12);
+ 
+ 	if (!(iobj = kzalloc(sizeof(*iobj), GFP_KERNEL)))
+ 		return -ENOMEM;
+@@ -365,7 +363,25 @@ nv50_instobj_new(struct nvkm_instmem *base, u32 size, u32 align, bool zero,
+ 	refcount_set(&iobj->maps, 0);
+ 	INIT_LIST_HEAD(&iobj->lru);
+ 
+-	return nvkm_ram_get(device, 0, 1, page, size, true, true, &iobj->ram);
++	iobj->ram = nvkm_memory_ref(memory);
++	return 0;
++}
++
++static int
++nv50_instobj_new(struct nvkm_instmem *imem, u32 size, u32 align, bool zero,
++		 struct nvkm_memory **pmemory)
++{
++	u8 page = max(order_base_2(align), 12);
++	struct nvkm_memory *ram;
++	int ret;
++
++	ret = nvkm_ram_get(imem->subdev.device, 0, 1, page, size, true, true, &ram);
++	if (ret)
++		return ret;
++
++	ret = nv50_instobj_wrap(imem, ram, pmemory);
++	nvkm_memory_unref(&ram);
++	return ret;
+ }
+ 
+ /******************************************************************************
+@@ -382,6 +398,7 @@ static const struct nvkm_instmem_func
+ nv50_instmem = {
+ 	.fini = nv50_instmem_fini,
+ 	.memory_new = nv50_instobj_new,
++	.memory_wrap = nv50_instobj_wrap,
+ 	.zero = false,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/priv.h b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/priv.h
+index 56c15e30a5dd..fe92986a3885 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/priv.h
+@@ -12,6 +12,7 @@ struct nvkm_instmem_func {
+ 	void (*wr32)(struct nvkm_instmem *, u32 addr, u32 data);
+ 	int (*memory_new)(struct nvkm_instmem *, u32 size, u32 align,
+ 			  bool zero, struct nvkm_memory **);
++	int (*memory_wrap)(struct nvkm_instmem *, struct nvkm_memory *, struct nvkm_memory **);
+ 	bool zero;
+ };
+ 
+-- 
+2.25.1
+

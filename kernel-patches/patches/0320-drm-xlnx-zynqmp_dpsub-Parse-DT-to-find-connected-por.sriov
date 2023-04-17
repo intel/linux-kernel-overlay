@@ -1,0 +1,136 @@
+From c63be3af7ab6e842474f751267783ea07a0ef788 Mon Sep 17 00:00:00 2001
+From: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Date: Fri, 6 Aug 2021 14:29:52 +0300
+Subject: [PATCH 0320/2236] drm: xlnx: zynqmp_dpsub: Parse DT to find connected
+ ports
+
+To prepare for live video input support, parse the device tree to find
+the connected ports. Warn about unsupported configurations, and error
+out when invalid.
+
+Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+---
+ drivers/gpu/drm/xlnx/zynqmp_dpsub.c | 54 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/xlnx/zynqmp_dpsub.h | 13 +++++++
+ 2 files changed, 67 insertions(+)
+
+diff --git a/drivers/gpu/drm/xlnx/zynqmp_dpsub.c b/drivers/gpu/drm/xlnx/zynqmp_dpsub.c
+index 86faa6edda4b..6627a1ec7791 100644
+--- a/drivers/gpu/drm/xlnx/zynqmp_dpsub.c
++++ b/drivers/gpu/drm/xlnx/zynqmp_dpsub.c
+@@ -12,6 +12,7 @@
+ #include <linux/clk.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/module.h>
++#include <linux/of_graph.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -142,6 +143,55 @@ static int zynqmp_dpsub_init_clocks(struct zynqmp_dpsub *dpsub)
+ 	return 0;
+ }
+ 
++static int zynqmp_dpsub_parse_dt(struct zynqmp_dpsub *dpsub)
++{
++	struct device_node *np;
++	unsigned int i;
++
++	/*
++	 * For backward compatibility with old device trees that don't contain
++	 * ports, consider that only the DP output port is connected if no
++	 * ports child no exists.
++	 */
++	np = of_get_child_by_name(dpsub->dev->of_node, "ports");
++	of_node_put(np);
++	if (!np) {
++		dev_warn(dpsub->dev, "missing ports, update DT bindings\n");
++		dpsub->connected_ports = BIT(ZYNQMP_DPSUB_PORT_OUT_DP);
++		return 0;
++	}
++
++	/* Check which ports are connected. */
++	for (i = 0; i < ZYNQMP_DPSUB_NUM_PORTS; ++i) {
++		struct device_node *np;
++
++		np = of_graph_get_remote_node(dpsub->dev->of_node, i, -1);
++		if (np) {
++			dpsub->connected_ports |= BIT(i);
++			of_node_put(np);
++		}
++	}
++
++	/* Sanity checks. */
++	if ((dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_LIVE_VIDEO)) ||
++	    (dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_LIVE_GFX)))
++		dev_warn(dpsub->dev, "live video unsupported, ignoring\n");
++
++	if (dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_LIVE_AUDIO))
++		dev_warn(dpsub->dev, "live audio unsupported, ignoring\n");
++
++	if ((dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_OUT_VIDEO)) ||
++	    (dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_OUT_AUDIO)))
++		dev_warn(dpsub->dev, "output to PL unsupported, ignoring\n");
++
++	if (!(dpsub->connected_ports & BIT(ZYNQMP_DPSUB_PORT_OUT_DP))) {
++		dev_err(dpsub->dev, "DP output port not connected\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ void zynqmp_dpsub_release(struct zynqmp_dpsub *dpsub)
+ {
+ 	kfree(dpsub->disp);
+@@ -171,6 +221,10 @@ static int zynqmp_dpsub_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_mem;
+ 
++	ret = zynqmp_dpsub_parse_dt(dpsub);
++	if (ret < 0)
++		goto err_mem;
++
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/xlnx/zynqmp_dpsub.h b/drivers/gpu/drm/xlnx/zynqmp_dpsub.h
+index 6c6029ad9bc5..6ded6e45ac0a 100644
+--- a/drivers/gpu/drm/xlnx/zynqmp_dpsub.h
++++ b/drivers/gpu/drm/xlnx/zynqmp_dpsub.h
+@@ -22,6 +22,16 @@ struct zynqmp_dpsub_drm;
+ 
+ #define ZYNQMP_DPSUB_NUM_LAYERS				2
+ 
++enum zynqmp_dpsub_port {
++	ZYNQMP_DPSUB_PORT_LIVE_VIDEO,
++	ZYNQMP_DPSUB_PORT_LIVE_GFX,
++	ZYNQMP_DPSUB_PORT_LIVE_AUDIO,
++	ZYNQMP_DPSUB_PORT_OUT_VIDEO,
++	ZYNQMP_DPSUB_PORT_OUT_AUDIO,
++	ZYNQMP_DPSUB_PORT_OUT_DP,
++	ZYNQMP_DPSUB_NUM_PORTS,
++};
++
+ enum zynqmp_dpsub_format {
+ 	ZYNQMP_DPSUB_FORMAT_RGB,
+ 	ZYNQMP_DPSUB_FORMAT_YCRCB444,
+@@ -37,6 +47,7 @@ enum zynqmp_dpsub_format {
+  * @vid_clk_from_ps: True of the video clock comes from PS, false from PL
+  * @aud_clk: Audio clock
+  * @aud_clk_from_ps: True of the audio clock comes from PS, false from PL
++ * @connected_ports: Bitmask of connected ports in the device tree
+  * @drm: The DRM/KMS device data
+  * @bridge: The DP encoder bridge
+  * @disp: The display controller
+@@ -52,6 +63,8 @@ struct zynqmp_dpsub {
+ 	struct clk *aud_clk;
+ 	bool aud_clk_from_ps;
+ 
++	unsigned int connected_ports;
++
+ 	struct zynqmp_dpsub_drm *drm;
+ 	struct drm_bridge *bridge;
+ 
+-- 
+2.25.1
+

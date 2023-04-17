@@ -1,0 +1,253 @@
+From 12db4c14e1258f969cb6eb1ea1741005eb1c49a5 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:54 +1000
+Subject: [PATCH 0700/2236] drm/nouveau/fault/tu102: switch to explicit intr
+ handlers
+
+- reads vectors from HW, rather than being hardcoded
+- removes hacks to support routing via old interfaces
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/subdev/fault.h   |   2 +
+ .../gpu/drm/nouveau/nvkm/subdev/fault/priv.h  |   2 +
+ .../gpu/drm/nouveau/nvkm/subdev/fault/tu102.c | 107 ++++++++----------
+ .../gpu/drm/nouveau/nvkm/subdev/mc/tu102.c    |  13 ---
+ 4 files changed, 52 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fault.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fault.h
+index e781c5e4dcae..e40bbf378a8d 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fault.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fault.h
+@@ -7,6 +7,8 @@ struct nvkm_fault {
+ 	const struct nvkm_fault_func *func;
+ 	struct nvkm_subdev subdev;
+ 
++	struct nvkm_inth info_fault;
++
+ 	struct nvkm_fault_buffer *buffer[2];
+ 	int buffer_nr;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fault/priv.h b/drivers/gpu/drm/nouveau/nvkm/subdev/fault/priv.h
+index 30cc0d088897..a5510332c402 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fault/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fault/priv.h
+@@ -16,6 +16,8 @@ struct nvkm_fault_buffer {
+ 	u32 put;
+ 	struct nvkm_memory *mem;
+ 	u64 addr;
++
++	struct nvkm_inth inth;
+ };
+ 
+ int nvkm_fault_new_(const struct nvkm_fault_func *, struct nvkm_device *, enum nvkm_subdev_type,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fault/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fault/tu102.c
+index 917a7343db31..967efaddae28 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fault/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fault/tu102.c
+@@ -24,20 +24,27 @@
+ #include <core/memory.h>
+ #include <subdev/mc.h>
+ #include <subdev/mmu.h>
++#include <subdev/vfn.h>
+ #include <engine/fifo.h>
+ 
+ #include <nvif/class.h>
+ 
++static irqreturn_t
++tu102_fault_buffer_notify(struct nvkm_inth *inth)
++{
++	struct nvkm_fault_buffer *buffer = container_of(inth, typeof(*buffer), inth);
++
++	nvkm_event_ntfy(&buffer->fault->event, buffer->id, NVKM_FAULT_BUFFER_EVENT_PENDING);
++	return IRQ_HANDLED;
++}
++
+ static void
+ tu102_fault_buffer_intr(struct nvkm_fault_buffer *buffer, bool enable)
+ {
+-	/*XXX: Earlier versions of RM touched the old regs on Turing,
+-	 *     which don't appear to actually work anymore, but newer
+-	 *     versions of RM don't appear to touch anything at all..
+-	 */
+-	struct nvkm_device *device = buffer->fault->subdev.device;
+-
+-	nvkm_mc_intr_mask(device, NVKM_SUBDEV_FAULT, 0, enable);
++	if (enable)
++		nvkm_inth_allow(&buffer->inth);
++	else
++		nvkm_inth_block(&buffer->inth);
+ }
+ 
+ static void
+@@ -46,10 +53,6 @@ tu102_fault_buffer_fini(struct nvkm_fault_buffer *buffer)
+ 	struct nvkm_device *device = buffer->fault->subdev.device;
+ 	const u32 foff = buffer->id * 0x20;
+ 
+-	/* Disable the fault interrupts */
+-	nvkm_wr32(device, 0xb81408, 0x1);
+-	nvkm_wr32(device, 0xb81410, 0x10);
+-
+ 	nvkm_mask(device, 0xb83010 + foff, 0x80000000, 0x00000000);
+ }
+ 
+@@ -59,10 +62,6 @@ tu102_fault_buffer_init(struct nvkm_fault_buffer *buffer)
+ 	struct nvkm_device *device = buffer->fault->subdev.device;
+ 	const u32 foff = buffer->id * 0x20;
+ 
+-	/* Enable the fault interrupts */
+-	nvkm_wr32(device, 0xb81208, 0x1);
+-	nvkm_wr32(device, 0xb81210, 0x10);
+-
+ 	nvkm_mask(device, 0xb83010 + foff, 0xc0000000, 0x40000000);
+ 	nvkm_wr32(device, 0xb83004 + foff, upper_32_bits(buffer->addr));
+ 	nvkm_wr32(device, 0xb83000 + foff, lower_32_bits(buffer->addr));
+@@ -82,9 +81,10 @@ tu102_fault_buffer_info(struct nvkm_fault_buffer *buffer)
+ 	buffer->put = 0xb8300c + foff;
+ }
+ 
+-static void
+-tu102_fault_intr_fault(struct nvkm_fault *fault)
++static irqreturn_t
++tu102_fault_info_fault(struct nvkm_inth *inth)
+ {
++	struct nvkm_fault *fault = container_of(inth, typeof(*fault), info_fault);
+ 	struct nvkm_subdev *subdev = &fault->subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 	struct nvkm_fault_data info;
+@@ -106,45 +106,9 @@ tu102_fault_intr_fault(struct nvkm_fault *fault)
+ 	info.reason = (info1 & 0x0000001f);
+ 
+ 	nvkm_fifo_fault(device->fifo, &info);
+-}
+-
+-static void
+-tu102_fault_intr(struct nvkm_fault *fault)
+-{
+-	struct nvkm_subdev *subdev = &fault->subdev;
+-	struct nvkm_device *device = subdev->device;
+-	u32 stat = nvkm_rd32(device, 0xb83094);
+-
+-	if (stat & 0x80000000) {
+-		tu102_fault_intr_fault(fault);
+-		nvkm_wr32(device, 0xb83094, 0x80000000);
+-		stat &= ~0x80000000;
+-	}
+-
+-	if (stat & 0x00000200) {
+-		/* Clear the associated interrupt flag */
+-		nvkm_wr32(device, 0xb81010, 0x10);
+ 
+-		if (fault->buffer[0]) {
+-			nvkm_event_ntfy(&fault->event, 0, NVKM_FAULT_BUFFER_EVENT_PENDING);
+-			stat &= ~0x00000200;
+-		}
+-	}
+-
+-	/* Replayable MMU fault */
+-	if (stat & 0x00000100) {
+-		/* Clear the associated interrupt flag */
+-		nvkm_wr32(device, 0xb81008, 0x1);
+-
+-		if (fault->buffer[1]) {
+-			nvkm_event_ntfy(&fault->event, 1, NVKM_FAULT_BUFFER_EVENT_PENDING);
+-			stat &= ~0x00000100;
+-		}
+-	}
+-
+-	if (stat) {
+-		nvkm_debug(subdev, "intr %08x\n", stat);
+-	}
++	nvkm_wr32(device, 0xb83094, 0x80000000);
++	return IRQ_HANDLED;
+ }
+ 
+ static void
+@@ -155,23 +119,48 @@ tu102_fault_fini(struct nvkm_fault *fault)
+ 
+ 	if (fault->buffer[0])
+ 		fault->func->buffer.fini(fault->buffer[0]);
+-	/*XXX: disable priv faults */
++
++	nvkm_inth_block(&fault->info_fault);
+ }
+ 
+ static void
+ tu102_fault_init(struct nvkm_fault *fault)
+ {
+-	/*XXX: enable priv faults */
++	nvkm_inth_allow(&fault->info_fault);
++
+ 	fault->func->buffer.init(fault->buffer[0]);
+ 	nvkm_event_ntfy_allow(&fault->nrpfb);
+ }
+ 
++static int
++tu102_fault_oneinit(struct nvkm_fault *fault)
++{
++	struct nvkm_device *device = fault->subdev.device;
++	struct nvkm_intr *intr = &device->vfn->intr;
++	int ret, i;
++
++	ret = nvkm_inth_add(intr, nvkm_rd32(device, 0x100ee0) & 0x0000ffff,
++			    NVKM_INTR_PRIO_NORMAL, &fault->subdev, tu102_fault_info_fault,
++			    &fault->info_fault);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < fault->buffer_nr; i++) {
++		ret = nvkm_inth_add(intr, nvkm_rd32(device, 0x100ee4 + (i * 4)) >> 16,
++				    NVKM_INTR_PRIO_NORMAL, &fault->subdev,
++				    tu102_fault_buffer_notify, &fault->buffer[i]->inth);
++		if (ret)
++			return ret;
++	}
++
++	return gv100_fault_oneinit(fault);
++}
++
+ static const struct nvkm_fault_func
+ tu102_fault = {
+-	.oneinit = gv100_fault_oneinit,
++	.oneinit = tu102_fault_oneinit,
+ 	.init = tu102_fault_init,
+ 	.fini = tu102_fault_fini,
+-	.intr = tu102_fault_intr,
+ 	.buffer.nr = 2,
+ 	.buffer.entry_size = 32,
+ 	.buffer.info = tu102_fault_buffer_info,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
+index a96084b34a78..630a9c9e7ac9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
+@@ -39,11 +39,6 @@ tu102_mc_intr_update(struct tu102_mc *mc)
+ 		nvkm_wr32(device, 0x000180 + (i * 0x04), ~mask);
+ 		nvkm_wr32(device, 0x000160 + (i * 0x04),  mask);
+ 	}
+-
+-	if (mask & 0x00000200)
+-		nvkm_wr32(device, 0xb81608, 0x6);
+-	else
+-		nvkm_wr32(device, 0xb81610, 0x6);
+ }
+ 
+ static void
+@@ -88,14 +83,6 @@ tu102_mc_intr_stat(struct nvkm_mc *mc)
+ 	struct nvkm_device *device = mc->subdev.device;
+ 	u32 intr0 = nvkm_rd32(device, 0x000100);
+ 	u32 intr1 = nvkm_rd32(device, 0x000104);
+-	u32 intr_top = nvkm_rd32(device, 0xb81600);
+-
+-	/* Turing and above route the MMU fault interrupts via a different
+-	 * interrupt tree with different control registers. For the moment remap
+-	 * them back to the old PMC vector.
+-	 */
+-	if (intr_top & 0x00000006)
+-		intr0 |= 0x00000200;
+ 
+ 	return intr0 | intr1;
+ }
+-- 
+2.25.1
+

@@ -1,0 +1,88 @@
+From 3c13e6bab726555c2c10d6677514777739c74349 Mon Sep 17 00:00:00 2001
+From: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Date: Thu, 10 Nov 2022 17:19:12 +0000
+Subject: [PATCH 1037/2236] i915/uncore: Acquire fw before loop in
+ intel_uncore_read64_2x32
+
+PMU reads the GT timestamp as a 2x32 mmio read and since upper and lower
+32 bit registers are read in a loop, there is a latency involved between
+getting the GT timestamp and the CPU timestamp. As part of the
+resolution, refactor intel_uncore_read64_2x32 to acquire forcewake and
+uncore lock prior to reading upper and lower regs.
+
+Signed-off-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221110171913.670286-2-umesh.nerlige.ramappa@intel.com
+(cherry picked from commit e746f84b8e813816951b63485134927ed6763a1b)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+---
+ drivers/gpu/drm/i915/intel_uncore.h | 44 ++++++++++++++++++++---------
+ 1 file changed, 30 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_uncore.h b/drivers/gpu/drm/i915/intel_uncore.h
+index 5449146a0624..e9e38490815d 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -382,20 +382,6 @@ __uncore_write(write_notrace, 32, l, false)
+  */
+ __uncore_read(read64, 64, q, true)
+ 
+-static inline u64
+-intel_uncore_read64_2x32(struct intel_uncore *uncore,
+-			 i915_reg_t lower_reg, i915_reg_t upper_reg)
+-{
+-	u32 upper, lower, old_upper, loop = 0;
+-	upper = intel_uncore_read(uncore, upper_reg);
+-	do {
+-		old_upper = upper;
+-		lower = intel_uncore_read(uncore, lower_reg);
+-		upper = intel_uncore_read(uncore, upper_reg);
+-	} while (upper != old_upper && loop++ < 2);
+-	return (u64)upper << 32 | lower;
+-}
+-
+ #define intel_uncore_posting_read(...) ((void)intel_uncore_read_notrace(__VA_ARGS__))
+ #define intel_uncore_posting_read16(...) ((void)intel_uncore_read16_notrace(__VA_ARGS__))
+ 
+@@ -455,6 +441,36 @@ static inline void intel_uncore_rmw_fw(struct intel_uncore *uncore,
+ 		intel_uncore_write_fw(uncore, reg, val);
+ }
+ 
++static inline u64
++intel_uncore_read64_2x32(struct intel_uncore *uncore,
++			 i915_reg_t lower_reg, i915_reg_t upper_reg)
++{
++	u32 upper, lower, old_upper, loop = 0;
++	enum forcewake_domains fw_domains;
++	unsigned long flags;
++
++	fw_domains = intel_uncore_forcewake_for_reg(uncore, lower_reg,
++						    FW_REG_READ);
++
++	fw_domains |= intel_uncore_forcewake_for_reg(uncore, upper_reg,
++						    FW_REG_READ);
++
++	spin_lock_irqsave(&uncore->lock, flags);
++	intel_uncore_forcewake_get__locked(uncore, fw_domains);
++
++	upper = intel_uncore_read_fw(uncore, upper_reg);
++	do {
++		old_upper = upper;
++		lower = intel_uncore_read_fw(uncore, lower_reg);
++		upper = intel_uncore_read_fw(uncore, upper_reg);
++	} while (upper != old_upper && loop++ < 2);
++
++	intel_uncore_forcewake_put__locked(uncore, fw_domains);
++	spin_unlock_irqrestore(&uncore->lock, flags);
++
++	return (u64)upper << 32 | lower;
++}
++
+ static inline int intel_uncore_write_and_verify(struct intel_uncore *uncore,
+ 						i915_reg_t reg, u32 val,
+ 						u32 mask, u32 expected_val)
+-- 
+2.25.1
+

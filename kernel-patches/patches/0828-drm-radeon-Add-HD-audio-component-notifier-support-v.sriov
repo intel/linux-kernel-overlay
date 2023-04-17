@@ -1,0 +1,281 @@
+From 6508c9cecc69b69883bb8798fe3cf4a4b640fbf0 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Mon, 24 Oct 2022 17:40:54 +0200
+Subject: [PATCH 0828/2236] drm/radeon: Add HD-audio component notifier support
+ (v6)
+
+This patch adds the support for the notification of HD-audio hotplug
+via the already existing drm_audio_component framework to radeon
+driver.  This allows us more reliable hotplug notification and ELD
+transfer without accessing HD-audio bus; it's more efficient, and more
+importantly, it works without waking up the runtime PM.
+
+The implementation is rather simplistic: radeon driver provides the
+get_eld ops for HD-audio, and it notifies the audio hotplug via
+pin_eld_notify callback upon each radeon_audio_enable() call.
+The pin->id is referred as the port number passed to the notifier
+callback, and the corresponding connector is looked through the
+encoder list in the get_eld callback in turn.
+
+The bind and unbind callbacks handle the device-link so that it
+assures the PM call order.
+
+Also, as a gratis bonus, this patch "fixes" the regression by the
+recent change in HD-audio to be more strict for the HDMI/DP
+connection, too.  Since the HD-audio HDMI/DP codec requires both the
+connection bit and the valid ELD to be provided, it started failing on
+some RADEON gfx boards where the ELD update performed instably.  As
+this change switches the communication to a direct way between the
+audio and the graphics drivers, now the system receives the proper
+ELD, and the HDMI/DP hotplug starts working again.
+
+[ v2: fix the logic in radeon_audio_component_get_eld to walk the
+  connector list since that is where the EDID lives and we can
+  derive the encoder from the connector because the encoder has
+  not been assigned at this point (i.e., during monitor probe).
+
+  v3: the component binding is moved outside radeon_audio_init() and
+  _fini(), as those are called from suspend/resume, too.
+  Drop modeset lock calls that caused Oops.
+  Moved Kconfig change so that it can be applied on older kernels.
+
+  v4: revive drm_modeset_lock*() again, add the missing
+  device_link_remove() call at unbinding
+
+  v5: squash in mutex fix
+
+  v6: squash in fix for audio get_eld callback ]
+
+Link: https://gitlab.freedesktop.org/drm/amd/-/issues/1569
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/Kconfig                |   1 +
+ drivers/gpu/drm/radeon/radeon.h        |   8 ++
+ drivers/gpu/drm/radeon/radeon_audio.c  | 117 +++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon_device.c |   4 +
+ 4 files changed, 130 insertions(+)
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 34f5a092c99e..fa986075e8fb 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -243,6 +243,7 @@ config DRM_RADEON
+         select DRM_KMS_HELPER
+         select DRM_TTM
+ 	select DRM_TTM_HELPER
++	select SND_HDA_COMPONENT if SND_HDA_CORE
+ 	select POWER_SUPPLY
+ 	select HWMON
+ 	select BACKLIGHT_CLASS_DEVICE
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 166c18d62f6d..2e7161acd443 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -79,6 +79,7 @@
+ #include <drm/ttm/ttm_execbuf_util.h>
+ 
+ #include <drm/drm_gem.h>
++#include <drm/drm_audio_component.h>
+ 
+ #include "radeon_family.h"
+ #include "radeon_mode.h"
+@@ -1796,6 +1797,9 @@ struct r600_audio {
+ 	struct radeon_audio_funcs *hdmi_funcs;
+ 	struct radeon_audio_funcs *dp_funcs;
+ 	struct radeon_audio_basic_funcs *funcs;
++	struct drm_audio_component *component;
++	bool component_registered;
++	struct mutex component_mutex;
+ };
+ 
+ /*
+@@ -2994,6 +2998,10 @@ void radeon_irq_kms_set_irq_n_enabled(struct radeon_device *rdev,
+ 				      bool enable, const char *name,
+ 				      unsigned n);
+ 
++/* Audio component binding */
++void radeon_audio_component_init(struct radeon_device *rdev);
++void radeon_audio_component_fini(struct radeon_device *rdev);
++
+ #include "radeon_object.h"
+ 
+ #endif
+diff --git a/drivers/gpu/drm/radeon/radeon_audio.c b/drivers/gpu/drm/radeon/radeon_audio.c
+index 7c5e80d03fc9..d6ccaf24ee0c 100644
+--- a/drivers/gpu/drm/radeon/radeon_audio.c
++++ b/drivers/gpu/drm/radeon/radeon_audio.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <linux/gcd.h>
++#include <linux/component.h>
+ 
+ #include <drm/drm_crtc.h>
+ #include "dce6_afmt.h"
+@@ -180,6 +181,8 @@ static struct radeon_audio_funcs dce6_dp_funcs = {
+ 	.dpms = evergreen_dp_enable,
+ };
+ 
++static void radeon_audio_component_notify(struct radeon_device *rdev, int port);
++
+ static void radeon_audio_enable(struct radeon_device *rdev,
+ 				struct r600_audio_pin *pin, u8 enable_mask)
+ {
+@@ -207,6 +210,8 @@ static void radeon_audio_enable(struct radeon_device *rdev,
+ 
+ 	if (rdev->audio.funcs->enable)
+ 		rdev->audio.funcs->enable(rdev, pin, enable_mask);
++
++	radeon_audio_component_notify(rdev, pin->id);
+ }
+ 
+ static void radeon_audio_interface_init(struct radeon_device *rdev)
+@@ -721,3 +726,115 @@ unsigned int radeon_audio_decode_dfs_div(unsigned int div)
+ 	else
+ 		return 0;
+ }
++
++/*
++ * Audio component support
++ */
++static void radeon_audio_component_notify(struct radeon_device *rdev, int port)
++{
++	struct drm_audio_component *acomp;
++
++	mutex_lock(&rdev->audio.component_mutex);
++	acomp = rdev->audio.component;
++	if (acomp && acomp->audio_ops && acomp->audio_ops->pin_eld_notify)
++		acomp->audio_ops->pin_eld_notify(acomp->audio_ops->audio_ptr,
++						 port, -1);
++	mutex_unlock(&rdev->audio.component_mutex);
++}
++
++static int radeon_audio_component_get_eld(struct device *kdev, int port,
++					  int pipe, bool *enabled,
++					  unsigned char *buf, int max_bytes)
++{
++	struct drm_device *dev = dev_get_drvdata(kdev);
++	struct radeon_device *rdev = dev->dev_private;
++	struct drm_encoder *encoder;
++	struct radeon_encoder *radeon_encoder;
++	struct radeon_encoder_atom_dig *dig;
++	struct drm_connector *connector;
++	int ret = 0;
++
++	*enabled = false;
++	if (!rdev->audio.enabled || !rdev->mode_info.mode_config_initialized)
++		return 0;
++
++	list_for_each_entry(encoder, &rdev->ddev->mode_config.encoder_list, head) {
++		if (!radeon_encoder_is_digital(encoder))
++			continue;
++		radeon_encoder = to_radeon_encoder(encoder);
++		dig = radeon_encoder->enc_priv;
++		if (!dig->pin || dig->pin->id != port)
++			continue;
++		connector = radeon_get_connector_for_encoder(encoder);
++		if (!connector)
++			continue;
++		*enabled = true;
++		ret = drm_eld_size(connector->eld);
++		memcpy(buf, connector->eld, min(max_bytes, ret));
++		break;
++	}
++
++	return ret;
++}
++
++static const struct drm_audio_component_ops radeon_audio_component_ops = {
++	.get_eld = radeon_audio_component_get_eld,
++};
++
++static int radeon_audio_component_bind(struct device *kdev,
++				       struct device *hda_kdev, void *data)
++{
++	struct drm_device *dev = dev_get_drvdata(kdev);
++	struct radeon_device *rdev = dev->dev_private;
++	struct drm_audio_component *acomp = data;
++
++	if (WARN_ON(!device_link_add(hda_kdev, kdev, DL_FLAG_STATELESS)))
++		return -ENOMEM;
++
++	mutex_lock(&rdev->audio.component_mutex);
++	acomp->ops = &radeon_audio_component_ops;
++	acomp->dev = kdev;
++	rdev->audio.component = acomp;
++	mutex_unlock(&rdev->audio.component_mutex);
++
++	return 0;
++}
++
++static void radeon_audio_component_unbind(struct device *kdev,
++					  struct device *hda_kdev, void *data)
++{
++	struct drm_device *dev = dev_get_drvdata(kdev);
++	struct radeon_device *rdev = dev->dev_private;
++	struct drm_audio_component *acomp = data;
++
++	device_link_remove(hda_kdev, kdev);
++
++	mutex_lock(&rdev->audio.component_mutex);
++	rdev->audio.component = NULL;
++	acomp->ops = NULL;
++	acomp->dev = NULL;
++	mutex_unlock(&rdev->audio.component_mutex);
++}
++
++static const struct component_ops radeon_audio_component_bind_ops = {
++	.bind	= radeon_audio_component_bind,
++	.unbind	= radeon_audio_component_unbind,
++};
++
++void radeon_audio_component_init(struct radeon_device *rdev)
++{
++	if (rdev->audio.component_registered ||
++	    !radeon_audio || !radeon_audio_chipset_supported(rdev))
++		return;
++
++	if (!component_add(rdev->dev, &radeon_audio_component_bind_ops))
++		rdev->audio.component_registered = true;
++}
++
++void radeon_audio_component_fini(struct radeon_device *rdev)
++{
++	if (rdev->audio.component_registered) {
++		component_del(rdev->dev, &radeon_audio_component_bind_ops);
++		rdev->audio.component_registered = false;
++	}
++}
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 262e2bcb30c3..6344454a7721 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -1312,6 +1312,7 @@ int radeon_device_init(struct radeon_device *rdev,
+ 	mutex_init(&rdev->pm.mutex);
+ 	mutex_init(&rdev->gpu_clock_mutex);
+ 	mutex_init(&rdev->srbm_mutex);
++	mutex_init(&rdev->audio.component_mutex);
+ 	init_rwsem(&rdev->pm.mclk_lock);
+ 	init_rwsem(&rdev->exclusive_lock);
+ 	init_waitqueue_head(&rdev->irq.vblank_queue);
+@@ -1451,6 +1452,8 @@ int radeon_device_init(struct radeon_device *rdev,
+ 			goto failed;
+ 	}
+ 
++	radeon_audio_component_init(rdev);
++
+ 	r = radeon_ib_ring_tests(rdev);
+ 	if (r)
+ 		DRM_ERROR("ib ring test failed (%d).\n", r);
+@@ -1513,6 +1516,7 @@ void radeon_device_fini(struct radeon_device *rdev)
+ 	rdev->shutdown = true;
+ 	/* evict vram memory */
+ 	radeon_bo_evict_vram(rdev);
++	radeon_audio_component_fini(rdev);
+ 	radeon_fini(rdev);
+ 	if (!pci_is_thunderbolt_attached(rdev->pdev))
+ 		vga_switcheroo_unregister_client(rdev->pdev);
+-- 
+2.25.1
+

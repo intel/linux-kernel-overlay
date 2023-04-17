@@ -1,0 +1,152 @@
+From 187767c0b5a4192eb317c8973eb08b42358f4bb0 Mon Sep 17 00:00:00 2001
+From: Badal Nilawar <badal.nilawar@intel.com>
+Date: Fri, 4 Nov 2022 00:15:59 +0530
+Subject: [PATCH 0851/2236] drm/i915/mtl: Add Wa_14017073508 for SAMedia
+
+This workaround is added for Media tile of MTL A step. It is to help
+pcode workaround which handles the hardware issue seen during package C2/C3
+transitions due to RC6 entry/exit transitions on Media tile. As a part of
+workaround pcode expect kmd to send mailbox message "media busy" when
+components of Media tile are in use and "media idle" otherwise.
+As per workaround description gucrc need to be disabled so enabled
+host based RC for Media tile.
+
+v2:
+ - Correct workaround id (Matt)
+ - Fix review comments (Rodrigo)
+
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+Cc: Vinay Belgaumkar <vinay.belgaumkar@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Badal Nilawar <badal.nilawar@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Anshuman Gupta <anshuman.gupta@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221103184559.2306481-1-badal.nilawar@intel.com
+---
+ drivers/gpu/drm/i915/gt/intel_gt_pm.c     | 27 +++++++++++++++++++++++
+ drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c | 13 ++++++++++-
+ drivers/gpu/drm/i915/i915_drv.h           |  4 ++++
+ drivers/gpu/drm/i915/i915_reg.h           |  9 ++++++++
+ 4 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_pm.c b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+index d48a9e3091ec..f877076c3cc6 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+@@ -20,10 +20,31 @@
+ #include "intel_rc6.h"
+ #include "intel_rps.h"
+ #include "intel_wakeref.h"
++#include "intel_pcode.h"
+ #include "pxp/intel_pxp_pm.h"
+ 
+ #define I915_GT_SUSPEND_IDLE_TIMEOUT (HZ / 2)
+ 
++static void mtl_media_busy(struct intel_gt *gt)
++{
++	/* Wa_14017073508: mtl */
++	if (IS_MTL_GRAPHICS_STEP(gt->i915, P, STEP_A0, STEP_B0) &&
++	    gt->type == GT_MEDIA)
++		snb_pcode_write_p(gt->uncore, PCODE_MBOX_GT_STATE,
++				  PCODE_MBOX_GT_STATE_MEDIA_BUSY,
++				  PCODE_MBOX_GT_STATE_DOMAIN_MEDIA, 0);
++}
++
++static void mtl_media_idle(struct intel_gt *gt)
++{
++	/* Wa_14017073508: mtl */
++	if (IS_MTL_GRAPHICS_STEP(gt->i915, P, STEP_A0, STEP_B0) &&
++	    gt->type == GT_MEDIA)
++		snb_pcode_write_p(gt->uncore, PCODE_MBOX_GT_STATE,
++				  PCODE_MBOX_GT_STATE_MEDIA_NOT_BUSY,
++				  PCODE_MBOX_GT_STATE_DOMAIN_MEDIA, 0);
++}
++
+ static void user_forcewake(struct intel_gt *gt, bool suspend)
+ {
+ 	int count = atomic_read(&gt->user_wakeref);
+@@ -71,6 +92,9 @@ static int __gt_unpark(struct intel_wakeref *wf)
+ 
+ 	GT_TRACE(gt, "\n");
+ 
++	/* Wa_14017073508: mtl */
++	mtl_media_busy(gt);
++
+ 	/*
+ 	 * It seems that the DMC likes to transition between the DC states a lot
+ 	 * when there are no connected displays (no active power domains) during
+@@ -120,6 +144,9 @@ static int __gt_park(struct intel_wakeref *wf)
+ 	GEM_BUG_ON(!wakeref);
+ 	intel_display_power_put_async(i915, POWER_DOMAIN_GT_IRQ, wakeref);
+ 
++	/* Wa_14017073508: mtl */
++	mtl_media_idle(gt);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c
+index 8f8dd05835c5..b5855091cf6a 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c
+@@ -11,9 +11,20 @@
+ 
+ static bool __guc_rc_supported(struct intel_guc *guc)
+ {
++	struct intel_gt *gt = guc_to_gt(guc);
++
++	/*
++	 * Wa_14017073508: mtl
++	 * Do not enable gucrc to avoid additional interrupts which
++	 * may disrupt pcode wa.
++	 */
++	if (IS_MTL_GRAPHICS_STEP(gt->i915, P, STEP_A0, STEP_B0) &&
++	    gt->type == GT_MEDIA)
++		return false;
++
+ 	/* GuC RC is unavailable for pre-Gen12 */
+ 	return guc->submission_supported &&
+-		GRAPHICS_VER(guc_to_gt(guc)->i915) >= 12;
++		GRAPHICS_VER(gt->i915) >= 12;
+ }
+ 
+ static bool __guc_rc_selected(struct intel_guc *guc)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 05b3300cc4ed..659b92382ff2 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -740,6 +740,10 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
+ #define IS_XEHPSDV_GRAPHICS_STEP(__i915, since, until) \
+ 	(IS_XEHPSDV(__i915) && IS_GRAPHICS_STEP(__i915, since, until))
+ 
++#define IS_MTL_GRAPHICS_STEP(__i915, variant, since, until) \
++	(IS_SUBPLATFORM(__i915, INTEL_METEORLAKE, INTEL_SUBPLATFORM_##variant) && \
++	 IS_GRAPHICS_STEP(__i915, since, until))
++
+ /*
+  * DG2 hardware steppings are a bit unusual.  The hardware design was forked to
+  * create three variants (G10, G11, and G12) which each have distinct
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index ad1f0ce6632c..d47dca9040c4 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6613,6 +6613,15 @@
+ /*   XEHP_PCODE_FREQUENCY_CONFIG param2 */
+ #define     PCODE_MBOX_DOMAIN_NONE		0x0
+ #define     PCODE_MBOX_DOMAIN_MEDIAFF		0x3
++
++/* Wa_14017210380: mtl */
++#define   PCODE_MBOX_GT_STATE			0x50
++/* sub-commands (param1) */
++#define     PCODE_MBOX_GT_STATE_MEDIA_BUSY	0x1
++#define     PCODE_MBOX_GT_STATE_MEDIA_NOT_BUSY	0x2
++/* param2 */
++#define     PCODE_MBOX_GT_STATE_DOMAIN_MEDIA	0x1
++
+ #define GEN6_PCODE_DATA				_MMIO(0x138128)
+ #define   GEN6_PCODE_FREQ_IA_RATIO_SHIFT	8
+ #define   GEN6_PCODE_FREQ_RING_RATIO_SHIFT	16
+-- 
+2.25.1
+

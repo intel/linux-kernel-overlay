@@ -1,0 +1,309 @@
+From 2a60b3a5d72f32280e9dd80370dbf06cb1bba05b Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:25 +1000
+Subject: [PATCH 0716/2236] drm/nouveau/fifo: expose per-runlist CHID
+ information
+
+DRM uses this to setup fence-related items.
+
+- nouveau_chan.runlist will always be "0" for the moment, not an issue
+  as GPUs prior to ampere have system-wide channel IDs,
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/cl0080.h |  4 +-
+ drivers/gpu/drm/nouveau/nouveau_chan.c        | 47 +++++++++++++++++--
+ drivers/gpu/drm/nouveau/nouveau_chan.h        |  2 +
+ drivers/gpu/drm/nouveau/nouveau_drm.c         |  1 +
+ drivers/gpu/drm/nouveau/nouveau_drv.h         |  8 +++-
+ drivers/gpu/drm/nouveau/nouveau_fence.c       |  8 +---
+ drivers/gpu/drm/nouveau/nv84_fence.c          | 22 +++++----
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   |  9 ++++
+ 8 files changed, 80 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/cl0080.h b/drivers/gpu/drm/nouveau/include/nvif/cl0080.h
+index 59759c4fb62e..8b5a240d57e4 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/cl0080.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/cl0080.h
+@@ -68,7 +68,7 @@ struct nv_device_time_v0 {
+ 
+ /* Returns the number of available runlists. */
+ #define NV_DEVICE_HOST_RUNLISTS                       NV_DEVICE_HOST(0x00000000)
+-/* Returns the number of available channels. */
++/* Returns the number of available channels (0 if per-runlist). */
+ #define NV_DEVICE_HOST_CHANNELS                       NV_DEVICE_HOST(0x00000001)
+ 
+ /* Returns a mask of available engine types on runlist(data). */
+@@ -90,4 +90,6 @@ struct nv_device_time_v0 {
+ #define NV_DEVICE_HOST_RUNLIST_ENGINES_SEC2                          0x00004000
+ #define NV_DEVICE_HOST_RUNLIST_ENGINES_NVDEC                         0x00008000
+ #define NV_DEVICE_HOST_RUNLIST_ENGINES_NVENC                         0x00010000
++/* Returns the number of available channels on runlist(data). */
++#define NV_DEVICE_HOST_RUNLIST_CHANNELS               NV_DEVICE_HOST(0x00000101)
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nouveau_chan.c b/drivers/gpu/drm/nouveau/nouveau_chan.c
+index 3b5cbb67f15b..5b7042d94e80 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.c
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.c
+@@ -543,6 +543,12 @@ nouveau_channel_new(struct nouveau_drm *drm, struct nvif_device *device,
+ 	return ret;
+ }
+ 
++void
++nouveau_channels_fini(struct nouveau_drm *drm)
++{
++	kfree(drm->runl);
++}
++
+ int
+ nouveau_channels_init(struct nouveau_drm *drm)
+ {
+@@ -550,20 +556,53 @@ nouveau_channels_init(struct nouveau_drm *drm)
+ 		struct nv_device_info_v1 m;
+ 		struct {
+ 			struct nv_device_info_v1_data channels;
++			struct nv_device_info_v1_data runlists;
+ 		} v;
+ 	} args = {
+ 		.m.version = 1,
+ 		.m.count = sizeof(args.v) / sizeof(args.v.channels),
+ 		.v.channels.mthd = NV_DEVICE_HOST_CHANNELS,
++		.v.runlists.mthd = NV_DEVICE_HOST_RUNLISTS,
+ 	};
+ 	struct nvif_object *device = &drm->client.device.object;
+-	int ret;
++	int ret, i;
+ 
+ 	ret = nvif_object_mthd(device, NV_DEVICE_V0_INFO, &args, sizeof(args));
+-	if (ret || args.v.channels.mthd == NV_DEVICE_INFO_INVALID)
++	if (ret ||
++	    args.v.runlists.mthd == NV_DEVICE_INFO_INVALID || !args.v.runlists.data ||
++	    args.v.channels.mthd == NV_DEVICE_INFO_INVALID)
+ 		return -ENODEV;
+ 
+-	drm->chan.nr = args.v.channels.data;
+-	drm->chan.context_base = dma_fence_context_alloc(drm->chan.nr);
++	drm->chan_nr = drm->chan_total = args.v.channels.data;
++	drm->runl_nr = fls64(args.v.runlists.data);
++	drm->runl = kcalloc(drm->runl_nr, sizeof(*drm->runl), GFP_KERNEL);
++	if (!drm->runl)
++		return -ENOMEM;
++
++	if (drm->chan_nr == 0) {
++		for (i = 0; i < drm->runl_nr; i++) {
++			if (!(args.v.runlists.data & BIT(i)))
++				continue;
++
++			args.v.channels.mthd = NV_DEVICE_HOST_RUNLIST_CHANNELS;
++			args.v.channels.data = i;
++
++			ret = nvif_object_mthd(device, NV_DEVICE_V0_INFO, &args, sizeof(args));
++			if (ret || args.v.channels.mthd == NV_DEVICE_INFO_INVALID)
++				return -ENODEV;
++
++			drm->runl[i].chan_nr = args.v.channels.data;
++			drm->runl[i].chan_id_base = drm->chan_total;
++			drm->runl[i].context_base = dma_fence_context_alloc(drm->runl[i].chan_nr);
++
++			drm->chan_total += drm->runl[i].chan_nr;
++		}
++	} else {
++		drm->runl[0].context_base = dma_fence_context_alloc(drm->chan_nr);
++		for (i = 1; i < drm->runl_nr; i++)
++			drm->runl[i].context_base = drm->runl[0].context_base;
++
++	}
++
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nouveau_chan.h b/drivers/gpu/drm/nouveau/nouveau_chan.h
+index 7ffee796a67a..40467e8c9668 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.h
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.h
+@@ -16,6 +16,7 @@ struct nouveau_channel {
+ 	struct nouveau_drm *drm;
+ 	struct nouveau_vmm *vmm;
+ 
++	int runlist;
+ 	int chid;
+ 	u64 inst;
+ 	u32 token;
+@@ -55,6 +56,7 @@ struct nouveau_channel {
+ };
+ 
+ int nouveau_channels_init(struct nouveau_drm *);
++void nouveau_channels_fini(struct nouveau_drm *);
+ 
+ int  nouveau_channel_new(struct nouveau_drm *, struct nvif_device *, bool priv, u64 runm,
+ 			 u32 vram, u32 gart, struct nouveau_channel **);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index c03ce19352a9..2ab3b394e7ea 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -425,6 +425,7 @@ nouveau_accel_fini(struct nouveau_drm *drm)
+ 	nouveau_accel_gr_fini(drm);
+ 	if (drm->fence)
+ 		nouveau_fence(drm)->dtor(drm);
++	nouveau_channels_fini(drm);
+ }
+ 
+ static void
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.h b/drivers/gpu/drm/nouveau/nouveau_drv.h
+index 6fb636020f7f..d6dd07bfa64a 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -174,10 +174,14 @@ struct nouveau_drm {
+ 	void *fence;
+ 
+ 	/* Global channel management. */
++	int chan_total; /* Number of channels across all runlists. */
++	int chan_nr;	/* 0 if per-runlist CHIDs. */
++	int runl_nr;
+ 	struct {
+-		int nr;
++		int chan_nr;
++		int chan_id_base;
+ 		u64 context_base;
+-	} chan;
++	} *runl;
+ 
+ 	/* context for accelerated drm-internal operations */
+ 	struct nouveau_channel *cechan;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.c b/drivers/gpu/drm/nouveau/nouveau_fence.c
+index c4c8af16af02..ee5e9d40c166 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.c
+@@ -77,10 +77,6 @@ nouveau_local_fence(struct dma_fence *fence, struct nouveau_drm *drm)
+ 	    fence->ops != &nouveau_fence_ops_uevent)
+ 		return NULL;
+ 
+-	if (fence->context < drm->chan.context_base ||
+-	    fence->context >= drm->chan.context_base + drm->chan.nr)
+-		return NULL;
+-
+ 	return from_fence(fence);
+ }
+ 
+@@ -184,7 +180,7 @@ nouveau_fence_context_new(struct nouveau_channel *chan, struct nouveau_fence_cha
+ 	INIT_LIST_HEAD(&fctx->flip);
+ 	INIT_LIST_HEAD(&fctx->pending);
+ 	spin_lock_init(&fctx->lock);
+-	fctx->context = chan->drm->chan.context_base + chan->chid;
++	fctx->context = chan->drm->runl[chan->runlist].context_base + chan->chid;
+ 
+ 	if (chan == chan->drm->cechan)
+ 		strcpy(fctx->name, "copy engine channel");
+@@ -200,7 +196,7 @@ nouveau_fence_context_new(struct nouveau_channel *chan, struct nouveau_fence_cha
+ 	args.host.version = 0;
+ 	args.host.type = NVIF_CHAN_EVENT_V0_NON_STALL_INTR;
+ 
+-	ret = nvif_event_ctor(&chan->user, "fenceNonStallIntr", chan->chid,
++	ret = nvif_event_ctor(&chan->user, "fenceNonStallIntr", (chan->runlist << 16) | chan->chid,
+ 			      nouveau_fence_wait_uevent_handler, false,
+ 			      &args.base, sizeof(args), &fctx->event);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nv84_fence.c b/drivers/gpu/drm/nouveau/nv84_fence.c
+index c3526a8622e3..a01fd934c85e 100644
+--- a/drivers/gpu/drm/nouveau/nv84_fence.c
++++ b/drivers/gpu/drm/nouveau/nv84_fence.c
+@@ -76,12 +76,18 @@ nv84_fence_sync32(struct nouveau_channel *chan, u64 virtual, u32 sequence)
+ 	return ret;
+ }
+ 
++static inline u32
++nv84_fence_chid(struct nouveau_channel *chan)
++{
++	return chan->drm->runl[chan->runlist].chan_id_base + chan->chid;
++}
++
+ static int
+ nv84_fence_emit(struct nouveau_fence *fence)
+ {
+ 	struct nouveau_channel *chan = fence->channel;
+ 	struct nv84_fence_chan *fctx = chan->fence;
+-	u64 addr = fctx->vma->addr + chan->chid * 16;
++	u64 addr = fctx->vma->addr + nv84_fence_chid(chan) * 16;
+ 
+ 	return fctx->base.emit32(chan, addr, fence->base.seqno);
+ }
+@@ -91,7 +97,7 @@ nv84_fence_sync(struct nouveau_fence *fence,
+ 		struct nouveau_channel *prev, struct nouveau_channel *chan)
+ {
+ 	struct nv84_fence_chan *fctx = chan->fence;
+-	u64 addr = fctx->vma->addr + prev->chid * 16;
++	u64 addr = fctx->vma->addr + nv84_fence_chid(prev) * 16;
+ 
+ 	return fctx->base.sync32(chan, addr, fence->base.seqno);
+ }
+@@ -100,7 +106,7 @@ static u32
+ nv84_fence_read(struct nouveau_channel *chan)
+ {
+ 	struct nv84_fence_priv *priv = chan->drm->fence;
+-	return nouveau_bo_rd32(priv->bo, chan->chid * 16/4);
++	return nouveau_bo_rd32(priv->bo, nv84_fence_chid(chan) * 16/4);
+ }
+ 
+ static void
+@@ -109,7 +115,7 @@ nv84_fence_context_del(struct nouveau_channel *chan)
+ 	struct nv84_fence_priv *priv = chan->drm->fence;
+ 	struct nv84_fence_chan *fctx = chan->fence;
+ 
+-	nouveau_bo_wr32(priv->bo, chan->chid * 16 / 4, fctx->base.sequence);
++	nouveau_bo_wr32(priv->bo, nv84_fence_chid(chan) * 16 / 4, fctx->base.sequence);
+ 	mutex_lock(&priv->mutex);
+ 	nouveau_vma_del(&fctx->vma);
+ 	mutex_unlock(&priv->mutex);
+@@ -152,9 +158,9 @@ nv84_fence_suspend(struct nouveau_drm *drm)
+ 	struct nv84_fence_priv *priv = drm->fence;
+ 	int i;
+ 
+-	priv->suspend = vmalloc(array_size(sizeof(u32), drm->chan.nr));
++	priv->suspend = vmalloc(array_size(sizeof(u32), drm->chan_total));
+ 	if (priv->suspend) {
+-		for (i = 0; i < drm->chan.nr; i++)
++		for (i = 0; i < drm->chan_total; i++)
+ 			priv->suspend[i] = nouveau_bo_rd32(priv->bo, i*4);
+ 	}
+ 
+@@ -168,7 +174,7 @@ nv84_fence_resume(struct nouveau_drm *drm)
+ 	int i;
+ 
+ 	if (priv->suspend) {
+-		for (i = 0; i < drm->chan.nr; i++)
++		for (i = 0; i < drm->chan_total; i++)
+ 			nouveau_bo_wr32(priv->bo, i*4, priv->suspend[i]);
+ 		vfree(priv->suspend);
+ 		priv->suspend = NULL;
+@@ -216,7 +222,7 @@ nv84_fence_create(struct nouveau_drm *drm)
+ 		  * will lose CPU/GPU coherency!
+ 		  */
+ 		NOUVEAU_GEM_DOMAIN_GART | NOUVEAU_GEM_DOMAIN_COHERENT;
+-	ret = nouveau_bo_new(&drm->client, 16 * drm->chan.nr, 0,
++	ret = nouveau_bo_new(&drm->client, 16 * drm->chan_total, 0,
+ 			     domain, 0, 0, NULL, NULL, &priv->bo);
+ 	if (ret == 0) {
+ 		ret = nouveau_bo_pin(priv->bo, domain, false);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index 2ccc0b3a3ecd..0f603d9f00cb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -271,6 +271,15 @@ nvkm_fifo_info(struct nvkm_engine *engine, u64 mthd, u64 *data)
+ 			return 0;
+ 		}
+ 		return -EINVAL;
++	case NV_DEVICE_HOST_RUNLIST_CHANNELS:
++		if (!fifo->chid) {
++			runl = nvkm_runl_get(fifo, *data, 0);
++			if (runl) {
++				*data = runl->chid->nr;
++				return 0;
++			}
++		}
++		return -EINVAL;
+ 	default:
+ 		break;
+ 	}
+-- 
+2.25.1
+

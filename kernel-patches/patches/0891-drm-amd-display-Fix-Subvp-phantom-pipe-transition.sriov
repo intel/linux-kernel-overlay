@@ -1,0 +1,241 @@
+From 033031ca6b52c314e404a78cfa2c4924955c69b1 Mon Sep 17 00:00:00 2001
+From: Alvin Lee <Alvin.Lee2@amd.com>
+Date: Fri, 4 Nov 2022 11:06:42 -0400
+Subject: [PATCH 0891/2236] drm/amd/display: Fix Subvp phantom pipe transition
+
+[Description]
+- When transitioning a pipe in use (non-phantom) to become
+  a phantom pipe, we must fully disable the pipe first before
+  doing any phantom pipe programming
+- Move phantom OTG enablement to after "regular" front-end
+  programming sequence (including wait for vupdate)
+- If a pipe is being transitioned into a phantom pipe,
+  fully disable it first
+
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Tom Chung <chiahsuan.chung@amd.com>
+Signed-off-by: Alvin Lee <Alvin.Lee2@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 54 +++++++++++++------
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    | 38 +++++++------
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.c    | 27 ++++++++++
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.h    |  2 +
+ .../gpu/drm/amd/display/dc/dcn32/dcn32_init.c |  1 +
+ .../gpu/drm/amd/display/dc/inc/hw_sequencer.h |  1 +
+ 6 files changed, 87 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 0a252a65a678..1c3de3a1671e 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -3408,22 +3408,6 @@ static void commit_planes_for_stream(struct dc *dc,
+ 		dc->hwss.pipe_control_lock(dc, top_pipe_to_program, true);
+ 	}
+ 
+-	if (update_type != UPDATE_TYPE_FAST) {
+-		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			struct pipe_ctx *new_pipe = &context->res_ctx.pipe_ctx[i];
+-
+-			if ((new_pipe->stream && new_pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) ||
+-					subvp_prev_use) {
+-				// If old context or new context has phantom pipes, apply
+-				// the phantom timings now. We can't change the phantom
+-				// pipe configuration safely without driver acquiring
+-				// the DMCUB lock first.
+-				dc->hwss.apply_ctx_to_hw(dc, context);
+-				break;
+-			}
+-		}
+-	}
+-
+ 	dc_dmub_update_dirty_rect(dc, surface_count, stream, srf_updates, context);
+ 
+ 	if (update_type != UPDATE_TYPE_FAST) {
+@@ -3652,6 +3636,44 @@ static void commit_planes_for_stream(struct dc *dc,
+ 					top_pipe_to_program->stream_res.tg);
+ 		}
+ 
++	/* For phantom pipe OTG enable, it has to be done after any previous pipe
++	 * that was in use has already been programmed at gotten its double buffer
++	 * update for "disable".
++	 */
++	if (update_type != UPDATE_TYPE_FAST) {
++		for (i = 0; i < dc->res_pool->pipe_count; i++) {
++			struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++			struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++
++			/* If an active, non-phantom pipe is being transitioned into a phantom
++			 * pipe, wait for the double buffer update to complete first before we do
++			 * ANY phantom pipe programming.
++			 */
++			if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM &&
++					old_pipe->stream && old_pipe->stream->mall_stream_config.type != SUBVP_PHANTOM) {
++				old_pipe->stream_res.tg->funcs->wait_for_state(
++						old_pipe->stream_res.tg,
++						CRTC_STATE_VBLANK);
++				old_pipe->stream_res.tg->funcs->wait_for_state(
++						old_pipe->stream_res.tg,
++						CRTC_STATE_VACTIVE);
++			}
++		}
++		for (i = 0; i < dc->res_pool->pipe_count; i++) {
++			struct pipe_ctx *new_pipe = &context->res_ctx.pipe_ctx[i];
++
++			if ((new_pipe->stream && new_pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) ||
++					subvp_prev_use) {
++				// If old context or new context has phantom pipes, apply
++				// the phantom timings now. We can't change the phantom
++				// pipe configuration safely without driver acquiring
++				// the DMCUB lock first.
++				dc->hwss.apply_ctx_to_hw(dc, context);
++				break;
++			}
++		}
++	}
++
+ 	if (update_type != UPDATE_TYPE_FAST)
+ 		dc->hwss.post_unlock_program_front_end(dc, context);
+ 	if (update_type != UPDATE_TYPE_FAST)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index 3dc48ec0dc01..db57b17061ae 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -1310,6 +1310,19 @@ static void dcn20_detect_pipe_changes(struct pipe_ctx *old_pipe, struct pipe_ctx
+ {
+ 	new_pipe->update_flags.raw = 0;
+ 
++	/* If non-phantom pipe is being transitioned to a phantom pipe,
++	 * set disable and return immediately. This is because the pipe
++	 * that was previously in use must be fully disabled before we
++	 * can "enable" it as a phantom pipe (since the OTG will certainly
++	 * be different). The post_unlock sequence will set the correct
++	 * update flags to enable the phantom pipe.
++	 */
++	if (old_pipe->plane_state && !old_pipe->plane_state->is_phantom &&
++			new_pipe->plane_state && new_pipe->plane_state->is_phantom) {
++		new_pipe->update_flags.bits.disable = 1;
++		return;
++	}
++
+ 	/* Exit on unchanged, unused pipe */
+ 	if (!old_pipe->plane_state && !new_pipe->plane_state)
+ 		return;
+@@ -1907,26 +1920,6 @@ void dcn20_post_unlock_program_front_end(
+ 		}
+ 	}
+ 
+-	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+-		struct pipe_ctx *old_pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+-
+-		/* If an active, non-phantom pipe is being transitioned into a phantom
+-		 * pipe, wait for the double buffer update to complete first before we do
+-		 * phantom pipe programming (HUBP_VTG_SEL updates right away so that can
+-		 * cause issues).
+-		 */
+-		if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM &&
+-				old_pipe->stream && old_pipe->stream->mall_stream_config.type != SUBVP_PHANTOM) {
+-			old_pipe->stream_res.tg->funcs->wait_for_state(
+-					old_pipe->stream_res.tg,
+-					CRTC_STATE_VBLANK);
+-			old_pipe->stream_res.tg->funcs->wait_for_state(
+-					old_pipe->stream_res.tg,
+-					CRTC_STATE_VACTIVE);
+-		}
+-	}
+-
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+ 
+@@ -1938,6 +1931,11 @@ void dcn20_post_unlock_program_front_end(
+ 			 */
+ 			while (pipe) {
+ 				if (pipe->stream && pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) {
++					/* When turning on the phantom pipe we want to run through the
++					 * entire enable sequence, so apply all the "enable" flags.
++					 */
++					if (dc->hwss.apply_update_flags_for_phantom)
++						dc->hwss.apply_update_flags_for_phantom(pipe);
+ 					if (dc->hwss.update_phantom_vp_position)
+ 						dc->hwss.update_phantom_vp_position(dc, context, pipe);
+ 					dcn20_program_pipe(dc, pipe, context);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+index 83ebe66e526e..0c5c5974d06b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+@@ -1364,6 +1364,33 @@ void dcn32_update_phantom_vp_position(struct dc *dc,
+ 	}
+ }
+ 
++/* Treat the phantom pipe as if it needs to be fully enabled.
++ * If the pipe was previously in use but not phantom, it would
++ * have been disabled earlier in the sequence so we need to run
++ * the full enable sequence.
++ */
++void dcn32_apply_update_flags_for_phantom(struct pipe_ctx *phantom_pipe)
++{
++	phantom_pipe->update_flags.raw = 0;
++	if (phantom_pipe->stream && phantom_pipe->stream->mall_stream_config.type == SUBVP_PHANTOM) {
++		if (phantom_pipe->stream && phantom_pipe->plane_state) {
++			phantom_pipe->update_flags.bits.enable = 1;
++			phantom_pipe->update_flags.bits.mpcc = 1;
++			phantom_pipe->update_flags.bits.dppclk = 1;
++			phantom_pipe->update_flags.bits.hubp_interdependent = 1;
++			phantom_pipe->update_flags.bits.hubp_rq_dlg_ttu = 1;
++			phantom_pipe->update_flags.bits.gamut_remap = 1;
++			phantom_pipe->update_flags.bits.scaler = 1;
++			phantom_pipe->update_flags.bits.viewport = 1;
++			phantom_pipe->update_flags.bits.det_size = 1;
++			if (!phantom_pipe->top_pipe && !phantom_pipe->prev_odm_pipe) {
++				phantom_pipe->update_flags.bits.odm = 1;
++				phantom_pipe->update_flags.bits.global_sync = 1;
++			}
++		}
++	}
++}
++
+ bool dcn32_dsc_pg_status(
+ 		struct dce_hwseq *hws,
+ 		unsigned int dsc_inst)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+index ac3657a5b9ea..7de36529cf99 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+@@ -92,6 +92,8 @@ void dcn32_update_phantom_vp_position(struct dc *dc,
+ 		struct dc_state *context,
+ 		struct pipe_ctx *phantom_pipe);
+ 
++void dcn32_apply_update_flags_for_phantom(struct pipe_ctx *phantom_pipe);
++
+ bool dcn32_dsc_pg_status(
+ 		struct dce_hwseq *hws,
+ 		unsigned int dsc_inst);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+index 45a949ba6f3f..dc4649458567 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+@@ -110,6 +110,7 @@ static const struct hw_sequencer_funcs dcn32_funcs = {
+ 	.update_visual_confirm_color = dcn20_update_visual_confirm_color,
+ 	.update_phantom_vp_position = dcn32_update_phantom_vp_position,
+ 	.update_dsc_pg = dcn32_update_dsc_pg,
++	.apply_update_flags_for_phantom = dcn32_apply_update_flags_for_phantom,
+ };
+ 
+ static const struct hwseq_private_funcs dcn32_private_funcs = {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index d04b68dad413..c43523f9ff6d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@ -263,6 +263,7 @@ struct hw_sequencer_funcs {
+ 	void (*update_phantom_vp_position)(struct dc *dc,
+ 			struct dc_state *context,
+ 			struct pipe_ctx *phantom_pipe);
++	void (*apply_update_flags_for_phantom)(struct pipe_ctx *phantom_pipe);
+ 
+ 	void (*commit_subvp_config)(struct dc *dc, struct dc_state *context);
+ 	void (*subvp_pipe_control_lock)(struct dc *dc,
+-- 
+2.25.1
+

@@ -1,0 +1,505 @@
+From 1f838befe317edc5d9a1cdf31f210a33082cc07a Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:30 +1000
+Subject: [PATCH 0727/2236] drm/nouveau/fifo: add new engine context tracking
+
+Channel groups have somewhat more complicated requirements than what we
+currently support.  An engine context is shared between all channels in
+a channel group, VEID/subctx support (later) brings per-VEID components,
+and we need to track an individual channel's engine context pointers.
+
+This commit adds the structures and refcounting to support the above,
+wrapping the prior implementation for the moment.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |   3 +-
+ drivers/gpu/drm/nouveau/nvkm/core/oproxy.c    |   7 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c   | 110 ++++++++++++++++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h   |  23 ++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   |  83 +++++++++++--
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.h   |  14 +++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/uchan.c  |  66 +++++++++++
+ 7 files changed, 296 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index a47667d00f3a..5a5c37480400 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -11,7 +11,6 @@ struct nvkm_fault_data;
+ struct nvkm_fifo_engn {
+ 	struct nvkm_object *object;
+ 	int refcount;
+-	int usecount;
+ };
+ 
+ struct nvkm_chan {
+@@ -21,6 +20,8 @@ struct nvkm_chan {
+ 
+ 	union { int id; int chid; }; /*FIXME: remove later */
+ 
++	struct list_head cctxs;
++
+ 	struct nvkm_fifo *fifo;
+ 	struct nvkm_object object;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/oproxy.c b/drivers/gpu/drm/nouveau/nvkm/core/oproxy.c
+index 3ffd4845d9e5..3385528da650 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/oproxy.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/oproxy.c
+@@ -47,7 +47,12 @@ nvkm_oproxy_map(struct nvkm_object *object, void *argv, u32 argc,
+ static int
+ nvkm_oproxy_unmap(struct nvkm_object *object)
+ {
+-	return nvkm_object_unmap(nvkm_oproxy(object)->object);
++	struct nvkm_oproxy *oproxy = nvkm_oproxy(object);
++
++	if (unlikely(!oproxy->object))
++		return 0;
++
++	return nvkm_object_unmap(oproxy->object);
+ }
+ 
+ static int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
+index e6ac178db8b5..ed838609f15d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
+@@ -27,6 +27,112 @@
+ 
+ #include <subdev/mmu.h>
+ 
++static void
++nvkm_cgrp_ectx_put(struct nvkm_cgrp *cgrp, struct nvkm_ectx **pectx)
++{
++	struct nvkm_ectx *ectx = *pectx;
++
++	if (ectx) {
++		struct nvkm_engn *engn = ectx->engn;
++
++		if (refcount_dec_and_test(&ectx->refs)) {
++			CGRP_TRACE(cgrp, "dtor ectx %d[%s]", engn->id, engn->engine->subdev.name);
++			list_del(&ectx->head);
++			kfree(ectx);
++		}
++
++		*pectx = NULL;
++	}
++}
++
++static int
++nvkm_cgrp_ectx_get(struct nvkm_cgrp *cgrp, struct nvkm_engn *engn, struct nvkm_ectx **pectx,
++		   struct nvkm_chan *chan, struct nvkm_client *client)
++{
++	struct nvkm_ectx *ectx;
++	int ret = 0;
++
++	/* Look for an existing context for this engine in the channel group. */
++	ectx = nvkm_list_find(ectx, &cgrp->ectxs, head, ectx->engn == engn);
++	if (ectx) {
++		refcount_inc(&ectx->refs);
++		*pectx = ectx;
++		return 0;
++	}
++
++	/* Nope - create a fresh one. */
++	CGRP_TRACE(cgrp, "ctor ectx %d[%s]", engn->id, engn->engine->subdev.name);
++	if (!(ectx = *pectx = kzalloc(sizeof(*ectx), GFP_KERNEL)))
++		return -ENOMEM;
++
++	ectx->engn = engn;
++	refcount_set(&ectx->refs, 1);
++	list_add_tail(&ectx->head, &cgrp->ectxs);
++	return ret;
++}
++
++void
++nvkm_cgrp_vctx_put(struct nvkm_cgrp *cgrp, struct nvkm_vctx **pvctx)
++{
++	struct nvkm_vctx *vctx = *pvctx;
++
++	if (vctx) {
++		struct nvkm_engn *engn = vctx->ectx->engn;
++
++		if (refcount_dec_and_test(&vctx->refs)) {
++			CGRP_TRACE(cgrp, "dtor vctx %d[%s]", engn->id, engn->engine->subdev.name);
++
++			nvkm_cgrp_ectx_put(cgrp, &vctx->ectx);
++			if (vctx->vmm) {
++				atomic_dec(&vctx->vmm->engref[engn->engine->subdev.type]);
++				nvkm_vmm_unref(&vctx->vmm);
++			}
++			list_del(&vctx->head);
++			kfree(vctx);
++		}
++
++		*pvctx = NULL;
++	}
++}
++
++int
++nvkm_cgrp_vctx_get(struct nvkm_cgrp *cgrp, struct nvkm_engn *engn, struct nvkm_chan *chan,
++		   struct nvkm_vctx **pvctx, struct nvkm_client *client)
++{
++	struct nvkm_ectx *ectx;
++	struct nvkm_vctx *vctx;
++	int ret;
++
++	/* Look for an existing sub-context for this engine+VEID in the channel group. */
++	vctx = nvkm_list_find(vctx, &cgrp->vctxs, head,
++			      vctx->ectx->engn == engn && vctx->vmm == chan->vmm);
++	if (vctx) {
++		refcount_inc(&vctx->refs);
++		*pvctx = vctx;
++		return 0;
++	}
++
++	/* Nope - create a fresh one.  But, context first. */
++	ret = nvkm_cgrp_ectx_get(cgrp, engn, &ectx, chan, client);
++	if (ret) {
++		CGRP_ERROR(cgrp, "ectx %d[%s]: %d", engn->id, engn->engine->subdev.name, ret);
++		return ret;
++	}
++
++	/* Now, create the sub-context. */
++	CGRP_TRACE(cgrp, "ctor vctx %d[%s]", engn->id, engn->engine->subdev.name);
++	if (!(vctx = *pvctx = kzalloc(sizeof(*vctx), GFP_KERNEL))) {
++		nvkm_cgrp_ectx_put(cgrp, &ectx);
++		return -ENOMEM;
++	}
++
++	vctx->ectx = ectx;
++	vctx->vmm = nvkm_vmm_ref(chan->vmm);
++	refcount_set(&vctx->refs, 1);
++	list_add_tail(&vctx->head, &cgrp->vctxs);
++	return ret;
++}
++
+ static void
+ nvkm_cgrp_del(struct kref *kref)
+ {
+@@ -36,6 +142,7 @@ nvkm_cgrp_del(struct kref *kref)
+ 	if (runl->cgid)
+ 		nvkm_chid_put(runl->cgid, cgrp->id, &cgrp->lock);
+ 
++	mutex_destroy(&cgrp->mutex);
+ 	nvkm_vmm_unref(&cgrp->vmm);
+ 	kfree(cgrp);
+ }
+@@ -80,6 +187,9 @@ nvkm_cgrp_new(struct nvkm_runl *runl, const char *name, struct nvkm_vmm *vmm, bo
+ 	cgrp->chans = NULL;
+ 	cgrp->chan_nr = 0;
+ 	spin_lock_init(&cgrp->lock);
++	INIT_LIST_HEAD(&cgrp->ectxs);
++	INIT_LIST_HEAD(&cgrp->vctxs);
++	mutex_init(&cgrp->mutex);
+ 
+ 	if (runl->cgid) {
+ 		cgrp->id = nvkm_chid_get(runl->cgid, cgrp);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+index d0510df9286a..50ba7c7ee0a8 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+@@ -3,6 +3,22 @@
+ #define __NVKM_CGRP_H__
+ #include <core/os.h>
+ struct nvkm_chan;
++struct nvkm_client;
++
++struct nvkm_vctx {
++	struct nvkm_ectx *ectx;
++	struct nvkm_vmm *vmm;
++	refcount_t refs;
++
++	struct list_head head;
++};
++
++struct nvkm_ectx {
++	struct nvkm_engn *engn;
++	refcount_t refs;
++
++	struct list_head head;
++};
+ 
+ struct nvkm_cgrp {
+ 	const struct nvkm_cgrp_func {
+@@ -19,6 +35,10 @@ struct nvkm_cgrp {
+ 
+ 	spinlock_t lock; /* protects irq handler channel (group) lookup */
+ 
++	struct list_head ectxs;
++	struct list_head vctxs;
++	struct mutex mutex;
++
+ 	struct list_head head;
+ 	struct list_head chan;
+ };
+@@ -27,6 +47,9 @@ int nvkm_cgrp_new(struct nvkm_runl *, const char *name, struct nvkm_vmm *, bool
+ 		  struct nvkm_cgrp **);
+ struct nvkm_cgrp *nvkm_cgrp_ref(struct nvkm_cgrp *);
+ void nvkm_cgrp_unref(struct nvkm_cgrp **);
++int nvkm_cgrp_vctx_get(struct nvkm_cgrp *, struct nvkm_engn *, struct nvkm_chan *,
++		       struct nvkm_vctx **, struct nvkm_client *);
++void nvkm_cgrp_vctx_put(struct nvkm_cgrp *, struct nvkm_vctx **);
+ 
+ #define CGRP_PRCLI(c,l,p,f,a...) RUNL_PRINT((c)->runl, l, p, "%04x:[%s]"f, (c)->id, (c)->name, ##a)
+ #define CGRP_PRINT(c,l,p,f,a...) RUNL_PRINT((c)->runl, l, p, "%04x:"f, (c)->id, ##a)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index bfbd5ec9a720..f250b0f9e274 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -65,9 +65,6 @@ nvkm_fifo_chan_child_fini(struct nvkm_oproxy *base, bool suspend)
+ 	const char *name = engine->subdev.name;
+ 	int ret = 0;
+ 
+-	if (--engn->usecount)
+-		return 0;
+-
+ 	if (chan->func->engine_fini) {
+ 		ret = chan->func->engine_fini(chan, engine, suspend);
+ 		if (ret) {
+@@ -98,9 +95,6 @@ nvkm_fifo_chan_child_init(struct nvkm_oproxy *base)
+ 	const char *name = engine->subdev.name;
+ 	int ret;
+ 
+-	if (engn->usecount++)
+-		return 0;
+-
+ 	if (engn->object) {
+ 		ret = nvkm_object_init(engn->object);
+ 		if (ret)
+@@ -144,8 +138,6 @@ nvkm_fifo_chan_child_del(struct nvkm_oproxy *base)
+ static const struct nvkm_oproxy_func
+ nvkm_fifo_chan_child_func = {
+ 	.dtor[0] = nvkm_fifo_chan_child_del,
+-	.init[0] = nvkm_fifo_chan_child_init,
+-	.fini[0] = nvkm_fifo_chan_child_fini,
+ };
+ 
+ int
+@@ -216,6 +208,80 @@ nvkm_fifo_chan_child_new(const struct nvkm_oclass *oclass, void *data, u32 size,
+ 	return 0;
+ }
+ 
++void
++nvkm_chan_cctx_bind(struct nvkm_chan *chan, struct nvkm_oproxy *oproxy, struct nvkm_cctx *cctx)
++{
++	/* Update context pointer. */
++	if (cctx)
++		nvkm_fifo_chan_child_init(nvkm_oproxy(oproxy->object));
++	else
++		nvkm_fifo_chan_child_fini(nvkm_oproxy(oproxy->object), false);
++}
++
++void
++nvkm_chan_cctx_put(struct nvkm_chan *chan, struct nvkm_cctx **pcctx)
++{
++	struct nvkm_cctx *cctx = *pcctx;
++
++	if (cctx) {
++		struct nvkm_engn *engn = cctx->vctx->ectx->engn;
++
++		if (refcount_dec_and_mutex_lock(&cctx->refs, &chan->cgrp->mutex)) {
++			CHAN_TRACE(chan, "dtor cctx %d[%s]", engn->id, engn->engine->subdev.name);
++			nvkm_cgrp_vctx_put(chan->cgrp, &cctx->vctx);
++			list_del(&cctx->head);
++			kfree(cctx);
++			mutex_unlock(&chan->cgrp->mutex);
++		}
++
++		*pcctx = NULL;
++	}
++}
++
++int
++nvkm_chan_cctx_get(struct nvkm_chan *chan, struct nvkm_engn *engn, struct nvkm_cctx **pcctx,
++		   struct nvkm_client *client)
++{
++	struct nvkm_cgrp *cgrp = chan->cgrp;
++	struct nvkm_vctx *vctx;
++	struct nvkm_cctx *cctx;
++	int ret;
++
++	/* Look for an existing channel context for this engine+VEID. */
++	mutex_lock(&cgrp->mutex);
++	cctx = nvkm_list_find(cctx, &chan->cctxs, head,
++			      cctx->vctx->ectx->engn == engn && cctx->vctx->vmm == chan->vmm);
++	if (cctx) {
++		refcount_inc(&cctx->refs);
++		*pcctx = cctx;
++		mutex_unlock(&chan->cgrp->mutex);
++		return 0;
++	}
++
++	/* Nope - create a fresh one.  But, sub-context first. */
++	ret = nvkm_cgrp_vctx_get(cgrp, engn, chan, &vctx, client);
++	if (ret) {
++		CHAN_ERROR(chan, "vctx %d[%s]: %d", engn->id, engn->engine->subdev.name, ret);
++		goto done;
++	}
++
++	/* Now, create the channel context - to track engine binding. */
++	CHAN_TRACE(chan, "ctor cctx %d[%s]", engn->id, engn->engine->subdev.name);
++	if (!(cctx = *pcctx = kzalloc(sizeof(*cctx), GFP_KERNEL))) {
++		nvkm_cgrp_vctx_put(cgrp, &vctx);
++		ret = -ENOMEM;
++		goto done;
++	}
++
++	cctx->vctx = vctx;
++	refcount_set(&cctx->refs, 1);
++	refcount_set(&cctx->uses, 0);
++	list_add_tail(&cctx->head, &chan->cctxs);
++done:
++	mutex_unlock(&cgrp->mutex);
++	return ret;
++}
++
+ static int
+ nvkm_fifo_chan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct nvkm_uevent *uevent)
+ {
+@@ -409,6 +475,7 @@ nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *fn,
+ 
+ 	nvkm_object_ctor(&nvkm_fifo_chan_func, oclass, &chan->object);
+ 	chan->fifo = fifo;
++	INIT_LIST_HEAD(&chan->cctxs);
+ 	INIT_LIST_HEAD(&chan->head);
+ 
+ 	/* Join channel group.
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+index 0f1added5c24..bf1c3b580def 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+@@ -3,9 +3,18 @@
+ #define __NVKM_CHAN_H__
+ #define nvkm_chan(p) container_of((p), struct nvkm_chan, object) /*FIXME: remove later */
+ #include <engine/fifo.h>
++struct nvkm_engn;
+ 
+ extern const struct nvkm_event_func nvkm_chan_event;
+ 
++struct nvkm_cctx {
++	struct nvkm_vctx *vctx;
++	refcount_t refs;
++	refcount_t uses;
++
++	struct list_head head;
++};
++
+ struct nvkm_chan_func {
+ 	void *(*dtor)(struct nvkm_fifo_chan *);
+ 	void (*init)(struct nvkm_fifo_chan *);
+@@ -26,6 +35,11 @@ int nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *, struct nvkm_fifo *,
+ 			u32 engm, int bar, u32 base, u32 user,
+ 			const struct nvkm_oclass *, struct nvkm_fifo_chan *);
+ void nvkm_chan_del(struct nvkm_chan **);
++int nvkm_chan_cctx_get(struct nvkm_chan *, struct nvkm_engn *, struct nvkm_cctx **,
++		       struct nvkm_client * /*TODO: remove need for this */);
++void nvkm_chan_cctx_put(struct nvkm_chan *, struct nvkm_cctx **);
++struct nvkm_oproxy;
++void nvkm_chan_cctx_bind(struct nvkm_chan *, struct nvkm_oproxy *, struct nvkm_cctx *);
+ 
+ #define CHAN_PRCLI(c,l,p,f,a...) CGRP_PRINT((c)->cgrp, l, p, "%04x:[%s]"f, (c)->id, (c)->name, ##a)
+ #define CHAN_PRINT(c,l,p,f,a...) CGRP_PRINT((c)->cgrp, l, p, "%04x:"f, (c)->id, ##a)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+index c4f404840806..8681ff045887 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+@@ -63,10 +63,61 @@ nvkm_uchan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct nvkm_
+ struct nvkm_uobj {
+ 	struct nvkm_oproxy oproxy;
+ 	struct nvkm_chan *chan;
++	struct nvkm_cctx *cctx;
+ };
+ 
++static int
++nvkm_uchan_object_fini_1(struct nvkm_oproxy *oproxy, bool suspend)
++{
++	struct nvkm_uobj *uobj = container_of(oproxy, typeof(*uobj), oproxy);
++	struct nvkm_chan *chan = uobj->chan;
++	struct nvkm_cctx *cctx = uobj->cctx;
++
++	/* Unbind engine context from channel, if no longer required. */
++	if (refcount_dec_and_mutex_lock(&cctx->uses, &chan->cgrp->mutex)) {
++		nvkm_chan_cctx_bind(chan, oproxy, NULL);
++		mutex_unlock(&chan->cgrp->mutex);
++	}
++
++	return 0;
++}
++
++static int
++nvkm_uchan_object_init_0(struct nvkm_oproxy *oproxy)
++{
++	struct nvkm_uobj *uobj = container_of(oproxy, typeof(*uobj), oproxy);
++	struct nvkm_chan *chan = uobj->chan;
++	struct nvkm_cctx *cctx = uobj->cctx;
++	int ret = 0;
++
++	/* Bind engine context to channel, if it hasn't been already. */
++	if (!refcount_inc_not_zero(&cctx->uses)) {
++		mutex_lock(&chan->cgrp->mutex);
++		if (!refcount_inc_not_zero(&cctx->uses)) {
++			if (ret == 0) {
++				nvkm_chan_cctx_bind(chan, oproxy, cctx);
++				refcount_set(&cctx->uses, 1);
++			}
++		}
++		mutex_unlock(&chan->cgrp->mutex);
++	}
++
++	return ret;
++}
++
++static void
++nvkm_uchan_object_dtor(struct nvkm_oproxy *oproxy)
++{
++	struct nvkm_uobj *uobj = container_of(oproxy, typeof(*uobj), oproxy);
++
++	nvkm_chan_cctx_put(uobj->chan, &uobj->cctx);
++}
++
+ static const struct nvkm_oproxy_func
+ nvkm_uchan_object = {
++	.dtor[1] = nvkm_uchan_object_dtor,
++	.init[0] = nvkm_uchan_object_init_0,
++	.fini[1] = nvkm_uchan_object_fini_1,
+ };
+ 
+ static int
+@@ -74,9 +125,18 @@ nvkm_uchan_object_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+ 		      struct nvkm_object **pobject)
+ {
+ 	struct nvkm_chan *chan = nvkm_uchan(oclass->parent)->chan;
++	struct nvkm_cgrp *cgrp = chan->cgrp;
++	struct nvkm_engn *engn;
+ 	struct nvkm_uobj *uobj;
+ 	struct nvkm_oclass _oclass;
++	int ret;
+ 
++	/* Lookup host engine state for target engine. */
++	engn = nvkm_runl_find_engn(engn, cgrp->runl, engn->engine == oclass->engine);
++	if (WARN_ON(!engn))
++		return -EINVAL;
++
++	/* Allocate SW object. */
+ 	if (!(uobj = kzalloc(sizeof(*uobj), GFP_KERNEL)))
+ 		return -ENOMEM;
+ 
+@@ -84,6 +144,12 @@ nvkm_uchan_object_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+ 	uobj->chan = chan;
+ 	*pobject = &uobj->oproxy.base;
+ 
++	/* Ref. channel context for target engine.*/
++	ret = nvkm_chan_cctx_get(chan, engn, &uobj->cctx, oclass->client);
++	if (ret)
++		return ret;
++
++	/* Allocate HW object. */
+ 	_oclass = *oclass;
+ 	_oclass.parent = &chan->object;
+ 	return nvkm_fifo_chan_child_new(&_oclass, argv, argc, &uobj->oproxy.object);
+-- 
+2.25.1
+

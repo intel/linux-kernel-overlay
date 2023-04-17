@@ -1,0 +1,502 @@
+From c73bbd062fa5adf85092114cbf5aa2100e1b5316 Mon Sep 17 00:00:00 2001
+From: Candice Li <candice.li@amd.com>
+Date: Tue, 25 Oct 2022 18:32:15 +0800
+Subject: [PATCH 0477/2236] drm/amdgpu: Optimize TA load/unload/invoke debugfs
+ interfaces
+
+1. Add a function pointer structure ta_funcs to psp context
+2. Make the interfaces generic to all TAs
+3. Leverage exisitng TA context and remove unused functions
+4. Fix return code bugs
+
+v2: Add comments for ta funcs macros and correct typo
+
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Candice Li <candice.li@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c    |  38 +---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h    |  12 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c | 217 +++++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.h |   5 +
+ 4 files changed, 168 insertions(+), 104 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 3d352efc2e6a..7850ee216c12 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -1076,42 +1076,6 @@ int psp_ta_init_shared_buf(struct psp_context *psp,
+ 				      &mem_ctx->shared_buf);
+ }
+ 
+-static void psp_prep_ta_invoke_indirect_cmd_buf(struct psp_gfx_cmd_resp *cmd,
+-				       uint32_t ta_cmd_id,
+-				       struct ta_context *context)
+-{
+-	cmd->cmd_id                         = GFX_CMD_ID_INVOKE_CMD;
+-	cmd->cmd.cmd_invoke_cmd.session_id  = context->session_id;
+-	cmd->cmd.cmd_invoke_cmd.ta_cmd_id   = ta_cmd_id;
+-
+-	cmd->cmd.cmd_invoke_cmd.buf.num_desc   = 1;
+-	cmd->cmd.cmd_invoke_cmd.buf.total_size = context->mem_context.shared_mem_size;
+-	cmd->cmd.cmd_invoke_cmd.buf.buf_desc[0].buf_size = context->mem_context.shared_mem_size;
+-	cmd->cmd.cmd_invoke_cmd.buf.buf_desc[0].buf_phy_addr_lo =
+-				     lower_32_bits(context->mem_context.shared_mc_addr);
+-	cmd->cmd.cmd_invoke_cmd.buf.buf_desc[0].buf_phy_addr_hi =
+-				     upper_32_bits(context->mem_context.shared_mc_addr);
+-}
+-
+-int psp_ta_invoke_indirect(struct psp_context *psp,
+-		  uint32_t ta_cmd_id,
+-		  struct ta_context *context)
+-{
+-	int ret;
+-	struct psp_gfx_cmd_resp *cmd = acquire_psp_cmd_buf(psp);
+-
+-	psp_prep_ta_invoke_indirect_cmd_buf(cmd, ta_cmd_id, context);
+-
+-	ret = psp_cmd_submit_buf(psp, NULL, cmd,
+-				 psp->fence_buf_mc_addr);
+-
+-	context->resp_status = cmd->resp.status;
+-
+-	release_psp_cmd_buf(psp);
+-
+-	return ret;
+-}
+-
+ static void psp_prep_ta_invoke_cmd_buf(struct psp_gfx_cmd_resp *cmd,
+ 				       uint32_t ta_cmd_id,
+ 				       uint32_t session_id)
+@@ -1554,7 +1518,7 @@ int psp_ras_terminate(struct psp_context *psp)
+ 	return ret;
+ }
+ 
+-static int psp_ras_initialize(struct psp_context *psp)
++int psp_ras_initialize(struct psp_context *psp)
+ {
+ 	int ret;
+ 	uint32_t boot_cfg = 0xFF;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 58ce3ebb446c..cbd4194a2883 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -136,6 +136,12 @@ struct psp_funcs
+ 	int (*vbflash_stat)(struct psp_context *psp);
+ };
+ 
++struct ta_funcs {
++	int (*fn_ta_initialize)(struct psp_context *psp);
++	int (*fn_ta_invoke)(struct psp_context *psp, uint32_t ta_cmd_id);
++	int (*fn_ta_terminate)(struct psp_context *psp);
++};
++
+ #define AMDGPU_XGMI_MAX_CONNECTED_NODES		64
+ struct psp_xgmi_node_info {
+ 	uint64_t				node_id;
+@@ -309,6 +315,7 @@ struct psp_context
+ 	struct psp_gfx_cmd_resp		*cmd;
+ 
+ 	const struct psp_funcs		*funcs;
++	const struct ta_funcs		*ta_funcs;
+ 
+ 	/* firmware buffer */
+ 	struct amdgpu_bo		*fw_pri_bo;
+@@ -463,9 +470,6 @@ int psp_ta_load(struct psp_context *psp, struct ta_context *context);
+ int psp_ta_invoke(struct psp_context *psp,
+ 			uint32_t ta_cmd_id,
+ 			struct ta_context *context);
+-int psp_ta_invoke_indirect(struct psp_context *psp,
+-		  uint32_t ta_cmd_id,
+-		  struct ta_context *context);
+ 
+ int psp_xgmi_initialize(struct psp_context *psp, bool set_extended_data, bool load_ta);
+ int psp_xgmi_terminate(struct psp_context *psp);
+@@ -479,7 +483,7 @@ int psp_xgmi_get_topology_info(struct psp_context *psp,
+ int psp_xgmi_set_topology_info(struct psp_context *psp,
+ 			       int number_devices,
+ 			       struct psp_xgmi_topology_info *topology);
+-
++int psp_ras_initialize(struct psp_context *psp);
+ int psp_ras_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
+ int psp_ras_enable_features(struct psp_context *psp,
+ 		union ta_ras_cmd_input *info, bool enable);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c
+index 0988e00612e5..468a67b302d4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c
+@@ -41,30 +41,46 @@ static uint32_t get_bin_version(const uint8_t *bin)
+ 	return hdr->ucode_version;
+ }
+ 
+-static void prep_ta_mem_context(struct psp_context *psp,
+-					     struct ta_context *context,
++static int prep_ta_mem_context(struct ta_mem_context *mem_context,
+ 					     uint8_t *shared_buf,
+ 					     uint32_t shared_buf_len)
+ {
+-	context->mem_context.shared_mem_size = PAGE_ALIGN(shared_buf_len);
+-	psp_ta_init_shared_buf(psp, &context->mem_context);
++	if (mem_context->shared_mem_size < shared_buf_len)
++		return -EINVAL;
++	memset(mem_context->shared_buf, 0, mem_context->shared_mem_size);
++	memcpy((void *)mem_context->shared_buf, shared_buf, shared_buf_len);
+ 
+-	memcpy((void *)context->mem_context.shared_buf, shared_buf, shared_buf_len);
++	return 0;
+ }
+ 
+ static bool is_ta_type_valid(enum ta_type_id ta_type)
+ {
+-	bool ret = false;
++	switch (ta_type) {
++	case TA_TYPE_RAS:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const struct ta_funcs ras_ta_funcs = {
++	.fn_ta_initialize = psp_ras_initialize,
++	.fn_ta_invoke    = psp_ras_invoke,
++	.fn_ta_terminate = psp_ras_terminate
++};
+ 
++static void set_ta_context_funcs(struct psp_context *psp,
++						      enum ta_type_id ta_type,
++						      struct ta_context **pcontext)
++{
+ 	switch (ta_type) {
+ 	case TA_TYPE_RAS:
+-		ret = true;
++		*pcontext = &psp->ras_context.context;
++		psp->ta_funcs = &ras_ta_funcs;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-
+-	return ret;
+ }
+ 
+ static const struct file_operations ta_load_debugfs_fops = {
+@@ -85,8 +101,7 @@ static const struct file_operations ta_invoke_debugfs_fops = {
+ 	.owner  = THIS_MODULE
+ };
+ 
+-
+-/**
++/*
+  * DOC: AMDGPU TA debugfs interfaces
+  *
+  * Three debugfs interfaces can be opened by a program to
+@@ -111,15 +126,18 @@ static const struct file_operations ta_invoke_debugfs_fops = {
+  *
+  * - For TA invoke debugfs interface:
+  *   Transmit buffer:
++ *    - TA type (4bytes)
+  *    - TA ID (4bytes)
+  *    - TA CMD ID (4bytes)
+- *    - TA shard buf length (4bytes)
++ *    - TA shard buf length
++ *      (4bytes, value not beyond TA shared memory size)
+  *    - TA shared buf
+  *   Receive buffer:
+  *    - TA shared buf
+  *
+  * - For TA unload debugfs interface:
+  *   Transmit buffer:
++ *    - TA type (4bytes)
+  *    - TA ID (4bytes)
+  */
+ 
+@@ -131,59 +149,92 @@ static ssize_t ta_if_load_debugfs_write(struct file *fp, const char *buf, size_t
+ 	uint32_t copy_pos   = 0;
+ 	int      ret        = 0;
+ 
+-	struct amdgpu_device *adev   = (struct amdgpu_device *)file_inode(fp)->i_private;
+-	struct psp_context   *psp    = &adev->psp;
+-	struct ta_context    context = {0};
++	struct amdgpu_device *adev    = (struct amdgpu_device *)file_inode(fp)->i_private;
++	struct psp_context   *psp     = &adev->psp;
++	struct ta_context    *context = NULL;
+ 
+ 	if (!buf)
+ 		return -EINVAL;
+ 
+ 	ret = copy_from_user((void *)&ta_type, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret || (!is_ta_type_valid(ta_type)))
+-		return -EINVAL;
++		return -EFAULT;
+ 
+ 	copy_pos += sizeof(uint32_t);
+ 
+ 	ret = copy_from_user((void *)&ta_bin_len, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret)
+-		return -EINVAL;
++		return -EFAULT;
+ 
+ 	copy_pos += sizeof(uint32_t);
+ 
+ 	ta_bin = kzalloc(ta_bin_len, GFP_KERNEL);
+ 	if (!ta_bin)
+-		ret = -ENOMEM;
++		return -ENOMEM;
+ 	if (copy_from_user((void *)ta_bin, &buf[copy_pos], ta_bin_len)) {
+ 		ret = -EFAULT;
+ 		goto err_free_bin;
+ 	}
+ 
+-	ret = psp_ras_terminate(psp);
+-	if (ret) {
+-		dev_err(adev->dev, "Failed to unload embedded RAS TA\n");
++	/* Set TA context and functions */
++	set_ta_context_funcs(psp, ta_type, &context);
++
++	if (!psp->ta_funcs || !psp->ta_funcs->fn_ta_terminate) {
++		dev_err(adev->dev, "Unsupported function to terminate TA\n");
++		ret = -EOPNOTSUPP;
+ 		goto err_free_bin;
+ 	}
+ 
+-	context.ta_type             = ta_type;
+-	context.ta_load_type        = GFX_CMD_ID_LOAD_TA;
+-	context.bin_desc.fw_version = get_bin_version(ta_bin);
+-	context.bin_desc.size_bytes = ta_bin_len;
+-	context.bin_desc.start_addr = ta_bin;
++	/*
++	 * Allocate TA shared buf in case shared buf was freed
++	 * due to loading TA failed before.
++	 */
++	if (!context->mem_context.shared_buf) {
++		ret = psp_ta_init_shared_buf(psp, &context->mem_context);
++		if (ret) {
++			ret = -ENOMEM;
++			goto err_free_bin;
++		}
++	}
++
++	ret = psp_fn_ta_terminate(psp);
++	if (ret || context->resp_status) {
++		dev_err(adev->dev,
++			"Failed to unload embedded TA (%d) and status (0x%X)\n",
++			ret, context->resp_status);
++		if (!ret)
++			ret = -EINVAL;
++		goto err_free_ta_shared_buf;
++	}
++
++	/* Prepare TA context for TA initialization */
++	context->ta_type                     = ta_type;
++	context->bin_desc.fw_version         = get_bin_version(ta_bin);
++	context->bin_desc.size_bytes         = ta_bin_len;
++	context->bin_desc.start_addr         = ta_bin;
+ 
+-	ret = psp_ta_load(psp, &context);
++	if (!psp->ta_funcs->fn_ta_initialize) {
++		dev_err(adev->dev, "Unsupported function to initialize TA\n");
++		ret = -EOPNOTSUPP;
++		goto err_free_ta_shared_buf;
++	}
+ 
+-	if (ret || context.resp_status) {
+-		dev_err(adev->dev, "TA load via debugfs failed (%d) status %d\n",
+-			 ret, context.resp_status);
++	ret = psp_fn_ta_initialize(psp);
++	if (ret || context->resp_status) {
++		dev_err(adev->dev, "Failed to load TA via debugfs (%d) and status (0x%X)\n",
++			ret, context->resp_status);
+ 		if (!ret)
+ 			ret = -EINVAL;
+-		goto err_free_bin;
++		goto err_free_ta_shared_buf;
+ 	}
+ 
+-	context.initialized = true;
+-	if (copy_to_user((char *)buf, (void *)&context.session_id, sizeof(uint32_t)))
++	if (copy_to_user((char *)buf, (void *)&context->session_id, sizeof(uint32_t)))
+ 		ret = -EFAULT;
+ 
++err_free_ta_shared_buf:
++	/* Only free TA shared buf when returns error code */
++	if (ret && context->mem_context.shared_buf)
++		psp_ta_free_shared_buf(&context->mem_context);
+ err_free_bin:
+ 	kfree(ta_bin);
+ 
+@@ -192,58 +243,85 @@ static ssize_t ta_if_load_debugfs_write(struct file *fp, const char *buf, size_t
+ 
+ static ssize_t ta_if_unload_debugfs_write(struct file *fp, const char *buf, size_t len, loff_t *off)
+ {
+-	uint32_t ta_id  = 0;
+-	int      ret    = 0;
++	uint32_t ta_type    = 0;
++	uint32_t ta_id      = 0;
++	uint32_t copy_pos   = 0;
++	int      ret        = 0;
+ 
+-	struct amdgpu_device *adev   = (struct amdgpu_device *)file_inode(fp)->i_private;
+-	struct psp_context   *psp    = &adev->psp;
+-	struct ta_context    context = {0};
++	struct amdgpu_device *adev    = (struct amdgpu_device *)file_inode(fp)->i_private;
++	struct psp_context   *psp     = &adev->psp;
++	struct ta_context    *context = NULL;
+ 
+ 	if (!buf)
+ 		return -EINVAL;
+ 
+-	ret = copy_from_user((void *)&ta_id, buf, sizeof(uint32_t));
++	ret = copy_from_user((void *)&ta_type, &buf[copy_pos], sizeof(uint32_t));
++	if (ret || (!is_ta_type_valid(ta_type)))
++		return -EFAULT;
++
++	copy_pos += sizeof(uint32_t);
++
++	ret = copy_from_user((void *)&ta_id, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret)
+-		return -EINVAL;
++		return -EFAULT;
+ 
+-	context.session_id = ta_id;
++	set_ta_context_funcs(psp, ta_type, &context);
++	context->session_id = ta_id;
+ 
+-	ret = psp_ta_unload(psp, &context);
+-	if (!ret)
+-		context.initialized = false;
++	if (!psp->ta_funcs || !psp->ta_funcs->fn_ta_terminate) {
++		dev_err(adev->dev, "Unsupported function to terminate TA\n");
++		return -EOPNOTSUPP;
++	}
++
++	ret = psp_fn_ta_terminate(psp);
++	if (ret || context->resp_status) {
++		dev_err(adev->dev, "Failed to unload TA via debugfs (%d) and status (0x%X)\n",
++			ret, context->resp_status);
++		if (!ret)
++			ret = -EINVAL;
++	}
++
++	if (context->mem_context.shared_buf)
++		psp_ta_free_shared_buf(&context->mem_context);
+ 
+ 	return ret;
+ }
+ 
+ static ssize_t ta_if_invoke_debugfs_write(struct file *fp, const char *buf, size_t len, loff_t *off)
+ {
++	uint32_t ta_type        = 0;
+ 	uint32_t ta_id          = 0;
+ 	uint32_t cmd_id         = 0;
+ 	uint32_t shared_buf_len = 0;
+-	uint8_t	 *shared_buf    = NULL;
++	uint8_t *shared_buf     = NULL;
+ 	uint32_t copy_pos       = 0;
+ 	int      ret            = 0;
+ 
+-	struct amdgpu_device *adev   = (struct amdgpu_device *)file_inode(fp)->i_private;
+-	struct psp_context   *psp    = &adev->psp;
+-	struct ta_context    context = {0};
++	struct amdgpu_device *adev    = (struct amdgpu_device *)file_inode(fp)->i_private;
++	struct psp_context   *psp     = &adev->psp;
++	struct ta_context    *context = NULL;
+ 
+ 	if (!buf)
+ 		return -EINVAL;
+ 
++	ret = copy_from_user((void *)&ta_type, &buf[copy_pos], sizeof(uint32_t));
++	if (ret)
++		return -EFAULT;
++	copy_pos += sizeof(uint32_t);
++
+ 	ret = copy_from_user((void *)&ta_id, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret)
+-		return -EINVAL;
++		return -EFAULT;
+ 	copy_pos += sizeof(uint32_t);
+ 
+ 	ret = copy_from_user((void *)&cmd_id, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret)
+-		return -EINVAL;
++		return -EFAULT;
+ 	copy_pos += sizeof(uint32_t);
+ 
+ 	ret = copy_from_user((void *)&shared_buf_len, &buf[copy_pos], sizeof(uint32_t));
+ 	if (ret)
+-		return -EINVAL;
++		return -EFAULT;
+ 	copy_pos += sizeof(uint32_t);
+ 
+ 	shared_buf = kzalloc(shared_buf_len, GFP_KERNEL);
+@@ -254,26 +332,39 @@ static ssize_t ta_if_invoke_debugfs_write(struct file *fp, const char *buf, size
+ 		goto err_free_shared_buf;
+ 	}
+ 
+-	context.session_id = ta_id;
++	set_ta_context_funcs(psp, ta_type, &context);
++
++	if (!context->initialized) {
++		dev_err(adev->dev, "TA is not initialized\n");
++		ret = -EINVAL;
++		goto err_free_shared_buf;
++	}
++
++	if (!psp->ta_funcs || !psp->ta_funcs->fn_ta_invoke) {
++		dev_err(adev->dev, "Unsupported function to invoke TA\n");
++		ret = -EOPNOTSUPP;
++		goto err_free_shared_buf;
++	}
+ 
+-	prep_ta_mem_context(psp, &context, shared_buf, shared_buf_len);
++	context->session_id = ta_id;
+ 
+-	ret = psp_ta_invoke_indirect(psp, cmd_id, &context);
++	ret = prep_ta_mem_context(&context->mem_context, shared_buf, shared_buf_len);
++	if (ret)
++		goto err_free_shared_buf;
+ 
+-	if (ret || context.resp_status) {
+-		dev_err(adev->dev, "TA invoke via debugfs failed (%d) status %d\n",
+-			 ret, context.resp_status);
+-		if (!ret)
++	ret = psp_fn_ta_invoke(psp, cmd_id);
++	if (ret || context->resp_status) {
++		dev_err(adev->dev, "Failed to invoke TA via debugfs (%d) and status (0x%X)\n",
++			ret, context->resp_status);
++		if (!ret) {
+ 			ret = -EINVAL;
+-		goto err_free_ta_shared_buf;
++			goto err_free_shared_buf;
++		}
+ 	}
+ 
+-	if (copy_to_user((char *)buf, context.mem_context.shared_buf, shared_buf_len))
++	if (copy_to_user((char *)buf, context->mem_context.shared_buf, shared_buf_len))
+ 		ret = -EFAULT;
+ 
+-err_free_ta_shared_buf:
+-	psp_ta_free_shared_buf(&context.mem_context);
+-
+ err_free_shared_buf:
+ 	kfree(shared_buf);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.h
+index cfc1542f63ef..14cd1c81c3e6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.h
+@@ -24,6 +24,11 @@
+ #ifndef __AMDGPU_PSP_TA_H__
+ #define __AMDGPU_PSP_TA_H__
+ 
++/* Calling set_ta_context_funcs is required before using the following macros */
++#define psp_fn_ta_initialize(psp) ((psp)->ta_funcs->fn_ta_initialize((psp)))
++#define psp_fn_ta_invoke(psp, ta_cmd_id) ((psp)->ta_funcs->fn_ta_invoke((psp), (ta_cmd_id)))
++#define psp_fn_ta_terminate(psp) ((psp)->ta_funcs->fn_ta_terminate((psp)))
++
+ void amdgpu_ta_if_debugfs_init(struct amdgpu_device *adev);
+ 
+ #endif
+-- 
+2.25.1
+

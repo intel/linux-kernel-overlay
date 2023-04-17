@@ -1,0 +1,514 @@
+From 0d7ed748c5e936766ed287c4c4cb3287513a3359 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 14 Jan 2022 16:49:44 +0100
+Subject: [PATCH 1591/2236] drm/amdgpu: use VRAM|GTT for a bunch of kernel
+ allocations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Technically all of those can use GTT as well, no need to force things
+into VRAM.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Luben Tuikov <luben.tuikov@amd.com>
+Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  5 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    |  8 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c       |  7 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c       | 24 +++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c       |  9 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       | 16 ++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c       |  7 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c       |  4 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c       | 14 +++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c      |  3 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c        | 33 +++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c         |  3 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c         |  3 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c         |  3 +-
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c         |  3 +-
+ drivers/gpu/drm/amd/amdgpu/mes_v11_0.c        |  8 +++--
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  4 ++-
+ .../amd/pm/powerplay/smumgr/smu10_smumgr.c    | 10 +++---
+ 18 files changed, 108 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 6277b06862b7..3e4b5feadab4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -756,6 +756,11 @@ struct amdgpu_mqd {
+ #define AMDGPU_PRODUCT_NAME_LEN 64
+ struct amdgpu_reset_domain;
+ 
++/*
++ * Non-zero (true) if the GPU has VRAM. Zero (false) otherwise.
++ */
++#define AMDGPU_HAS_VRAM(_adev) ((_adev)->gmc.real_vram_size)
++
+ struct amdgpu_device {
+ 	struct device			*dev;
+ 	struct pci_dev			*pdev;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 12ac79077947..9dccdc79b946 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -937,7 +937,8 @@ static int amdgpu_device_asic_init(struct amdgpu_device *adev)
+ static int amdgpu_device_vram_scratch_init(struct amdgpu_device *adev)
+ {
+ 	return amdgpu_bo_create_kernel(adev, AMDGPU_GPU_PAGE_SIZE,
+-				       PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM,
++				       PAGE_SIZE,
++				       AMDGPU_GEM_DOMAIN_VRAM,
+ 				       &adev->vram_scratch.robj,
+ 				       &adev->vram_scratch.gpu_addr,
+ 				       (void **)&adev->vram_scratch.ptr);
+@@ -2413,8 +2414,9 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 			/* right after GMC hw init, we create CSA */
+ 			if (amdgpu_mcbp) {
+ 				r = amdgpu_allocate_static_csa(adev, &adev->virt.csa_obj,
+-								AMDGPU_GEM_DOMAIN_VRAM,
+-								AMDGPU_CSA_SIZE);
++							       AMDGPU_GEM_DOMAIN_VRAM |
++							       AMDGPU_GEM_DOMAIN_GTT,
++							       AMDGPU_CSA_SIZE);
+ 				if (r) {
+ 					DRM_ERROR("allocate CSA failed %d\n", r);
+ 					goto init_failed;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 3380daf42da8..dfd8a0ccbc83 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -375,8 +375,11 @@ int amdgpu_gfx_mqd_sw_init(struct amdgpu_device *adev,
+ 		 * KIQ MQD no matter SRIOV or Bare-metal
+ 		 */
+ 		r = amdgpu_bo_create_kernel(adev, mqd_size, PAGE_SIZE,
+-					    AMDGPU_GEM_DOMAIN_VRAM, &ring->mqd_obj,
+-					    &ring->mqd_gpu_addr, &ring->mqd_ptr);
++					    AMDGPU_GEM_DOMAIN_VRAM |
++					    AMDGPU_GEM_DOMAIN_GTT,
++					    &ring->mqd_obj,
++					    &ring->mqd_gpu_addr,
++					    &ring->mqd_ptr);
+ 		if (r) {
+ 			dev_warn(adev->dev, "failed to create ring mqd ob (%d)", r);
+ 			return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 7a2fc920739b..0706afb11577 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -66,7 +66,8 @@ static int psp_ring_init(struct psp_context *psp,
+ 	/* allocate 4k Page of Local Frame Buffer memory for ring */
+ 	ring->ring_size = 0x1000;
+ 	ret = amdgpu_bo_create_kernel(adev, ring->ring_size, PAGE_SIZE,
+-				      AMDGPU_GEM_DOMAIN_VRAM,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->firmware.rbuf,
+ 				      &ring->ring_mem_mc_addr,
+ 				      (void **)&ring->ring_mem);
+@@ -797,9 +798,13 @@ static int psp_tmr_init(struct psp_context *psp)
+ 
+ 	if (!psp->tmr_bo) {
+ 		pptr = amdgpu_sriov_vf(psp->adev) ? &tmr_buf : NULL;
+-		ret = amdgpu_bo_create_kernel(psp->adev, tmr_size, PSP_TMR_ALIGNMENT,
+-					      AMDGPU_GEM_DOMAIN_VRAM,
+-					      &psp->tmr_bo, &psp->tmr_mc_addr, pptr);
++		ret = amdgpu_bo_create_kernel(psp->adev, tmr_size,
++					      PSP_TMR_ALIGNMENT,
++					      AMDGPU_HAS_VRAM(psp->adev) ?
++					      AMDGPU_GEM_DOMAIN_VRAM :
++					      AMDGPU_GEM_DOMAIN_GTT,
++					      &psp->tmr_bo, &psp->tmr_mc_addr,
++					      pptr);
+ 	}
+ 
+ 	return ret;
+@@ -1092,7 +1097,8 @@ int psp_ta_init_shared_buf(struct psp_context *psp,
+ 	* physical) for ta to host memory
+ 	*/
+ 	return amdgpu_bo_create_kernel(psp->adev, mem_ctx->shared_mem_size,
+-				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM,
++				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &mem_ctx->shared_bo,
+ 				      &mem_ctx->shared_mc_addr,
+ 				      &mem_ctx->shared_buf);
+@@ -3444,10 +3450,10 @@ static ssize_t psp_usbc_pd_fw_sysfs_write(struct device *dev,
+ 
+ 	/* LFB address which is aligned to 1MB boundary per PSP request */
+ 	ret = amdgpu_bo_create_kernel(adev, usbc_pd_fw->size, 0x100000,
+-						AMDGPU_GEM_DOMAIN_VRAM,
+-						&fw_buf_bo,
+-						&fw_pri_mc_addr,
+-						&fw_pri_cpu_addr);
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
++				      &fw_buf_bo, &fw_pri_mc_addr,
++				      &fw_pri_cpu_addr);
+ 	if (ret)
+ 		goto rel_buf;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c
+index 012b72d00e04..85fb730d9fc8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c
+@@ -93,7 +93,8 @@ int amdgpu_gfx_rlc_init_sr(struct amdgpu_device *adev, u32 dws)
+ 
+ 	/* allocate save restore block */
+ 	r = amdgpu_bo_create_reserved(adev, dws * 4, PAGE_SIZE,
+-				      AMDGPU_GEM_DOMAIN_VRAM,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.rlc.save_restore_obj,
+ 				      &adev->gfx.rlc.save_restore_gpu_addr,
+ 				      (void **)&adev->gfx.rlc.sr_ptr);
+@@ -130,7 +131,8 @@ int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev)
+ 	/* allocate clear state block */
+ 	adev->gfx.rlc.clear_state_size = dws = adev->gfx.rlc.funcs->get_csb_size(adev);
+ 	r = amdgpu_bo_create_kernel(adev, dws * 4, PAGE_SIZE,
+-				      AMDGPU_GEM_DOMAIN_VRAM,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.rlc.clear_state_obj,
+ 				      &adev->gfx.rlc.clear_state_gpu_addr,
+ 				      (void **)&adev->gfx.rlc.cs_ptr);
+@@ -156,7 +158,8 @@ int amdgpu_gfx_rlc_init_cpt(struct amdgpu_device *adev)
+ 	int r;
+ 
+ 	r = amdgpu_bo_create_reserved(adev, adev->gfx.rlc.cp_table_size,
+-				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM,
++				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.rlc.cp_table_obj,
+ 				      &adev->gfx.rlc.cp_table_gpu_addr,
+ 				      (void **)&adev->gfx.rlc.cp_table_ptr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 28a7d2ea6661..c0c0e9dd1330 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1679,10 +1679,10 @@ static int amdgpu_ttm_reserve_tmr(struct amdgpu_device *adev)
+ 		/* reserve vram for mem train according to TMR location */
+ 		amdgpu_ttm_training_data_block_init(adev);
+ 		ret = amdgpu_bo_create_kernel_at(adev,
+-					 ctx->c2p_train_data_offset,
+-					 ctx->train_data_size,
+-					 &ctx->c2p_bo,
+-					 NULL);
++						 ctx->c2p_train_data_offset,
++						 ctx->train_data_size,
++						 &ctx->c2p_bo,
++						 NULL);
+ 		if (ret) {
+ 			DRM_ERROR("alloc c2p_bo failed(%d)!\n", ret);
+ 			amdgpu_ttm_training_reserve_vram_fini(adev);
+@@ -1692,10 +1692,10 @@ static int amdgpu_ttm_reserve_tmr(struct amdgpu_device *adev)
+ 	}
+ 
+ 	ret = amdgpu_bo_create_kernel_at(adev,
+-				adev->gmc.real_vram_size - adev->mman.discovery_tmr_size,
+-				adev->mman.discovery_tmr_size,
+-				&adev->mman.discovery_memory,
+-				NULL);
++					 adev->gmc.real_vram_size - adev->mman.discovery_tmr_size,
++					 adev->mman.discovery_tmr_size,
++					 &adev->mman.discovery_memory,
++					 NULL);
+ 	if (ret) {
+ 		DRM_ERROR("alloc tmr failed(%d)!\n", ret);
+ 		amdgpu_bo_free_kernel(&adev->mman.discovery_memory, NULL, NULL);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+index e00bb654e24b..a2204ebf0caf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c
+@@ -331,8 +331,11 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
+ 		if (adev->uvd.harvest_config & (1 << j))
+ 			continue;
+ 		r = amdgpu_bo_create_kernel(adev, bo_size, PAGE_SIZE,
+-					    AMDGPU_GEM_DOMAIN_VRAM, &adev->uvd.inst[j].vcpu_bo,
+-					    &adev->uvd.inst[j].gpu_addr, &adev->uvd.inst[j].cpu_addr);
++					    AMDGPU_GEM_DOMAIN_VRAM |
++					    AMDGPU_GEM_DOMAIN_GTT,
++					    &adev->uvd.inst[j].vcpu_bo,
++					    &adev->uvd.inst[j].gpu_addr,
++					    &adev->uvd.inst[j].cpu_addr);
+ 		if (r) {
+ 			dev_err(adev->dev, "(%d) failed to allocate UVD bo\n", r);
+ 			return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index b239e874f2d5..7d93e39ae038 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -186,7 +186,9 @@ int amdgpu_vce_sw_init(struct amdgpu_device *adev, unsigned long size)
+ 				(binary_id << 8));
+ 
+ 	r = amdgpu_bo_create_kernel(adev, size, PAGE_SIZE,
+-				    AMDGPU_GEM_DOMAIN_VRAM, &adev->vce.vcpu_bo,
++				    AMDGPU_GEM_DOMAIN_VRAM |
++				    AMDGPU_GEM_DOMAIN_GTT,
++				    &adev->vce.vcpu_bo,
+ 				    &adev->vce.gpu_addr, &adev->vce.cpu_addr);
+ 	if (r) {
+ 		dev_err(adev->dev, "(%d) failed to allocate VCE bo\n", r);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index c9cee1c90339..1c5bd0769562 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -274,8 +274,11 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
+ 			continue;
+ 
+ 		r = amdgpu_bo_create_kernel(adev, bo_size, PAGE_SIZE,
+-						AMDGPU_GEM_DOMAIN_VRAM, &adev->vcn.inst[i].vcpu_bo,
+-						&adev->vcn.inst[i].gpu_addr, &adev->vcn.inst[i].cpu_addr);
++					    AMDGPU_GEM_DOMAIN_VRAM |
++					    AMDGPU_GEM_DOMAIN_GTT,
++					    &adev->vcn.inst[i].vcpu_bo,
++					    &adev->vcn.inst[i].gpu_addr,
++					    &adev->vcn.inst[i].cpu_addr);
+ 		if (r) {
+ 			dev_err(adev->dev, "(%d) failed to allocate vcn bo\n", r);
+ 			return r;
+@@ -296,8 +299,11 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
+ 
+ 		if (adev->vcn.indirect_sram) {
+ 			r = amdgpu_bo_create_kernel(adev, 64 * 2 * 4, PAGE_SIZE,
+-					AMDGPU_GEM_DOMAIN_VRAM, &adev->vcn.inst[i].dpg_sram_bo,
+-					&adev->vcn.inst[i].dpg_sram_gpu_addr, &adev->vcn.inst[i].dpg_sram_cpu_addr);
++					AMDGPU_GEM_DOMAIN_VRAM |
++					AMDGPU_GEM_DOMAIN_GTT,
++					&adev->vcn.inst[i].dpg_sram_bo,
++					&adev->vcn.inst[i].dpg_sram_gpu_addr,
++					&adev->vcn.inst[i].dpg_sram_cpu_addr);
+ 			if (r) {
+ 				dev_err(adev->dev, "VCN %d (%d) failed to allocate DPG bo\n", i, r);
+ 				return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+index 2994b9db196f..f39391e03d46 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+@@ -232,7 +232,8 @@ int amdgpu_virt_alloc_mm_table(struct amdgpu_device *adev)
+ 		return 0;
+ 
+ 	r = amdgpu_bo_create_kernel(adev, PAGE_SIZE, PAGE_SIZE,
+-				    AMDGPU_GEM_DOMAIN_VRAM,
++				    AMDGPU_GEM_DOMAIN_VRAM |
++				    AMDGPU_GEM_DOMAIN_GTT,
+ 				    &adev->virt.mm_table.bo,
+ 				    &adev->virt.mm_table.gpu_addr,
+ 				    (void *)&adev->virt.mm_table.cpu_addr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index 66eb102cd88f..631a197e5ea4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -987,10 +987,11 @@ static int gfx_v11_0_rlc_autoload_buffer_init(struct amdgpu_device *adev)
+ 	total_size = gfx_v11_0_calc_toc_total_size(adev);
+ 
+ 	r = amdgpu_bo_create_reserved(adev, total_size, 64 * 1024,
+-			AMDGPU_GEM_DOMAIN_VRAM,
+-			&adev->gfx.rlc.rlc_autoload_bo,
+-			&adev->gfx.rlc.rlc_autoload_gpu_addr,
+-			(void **)&adev->gfx.rlc.rlc_autoload_ptr);
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
++				      &adev->gfx.rlc.rlc_autoload_bo,
++				      &adev->gfx.rlc.rlc_autoload_gpu_addr,
++				      (void **)&adev->gfx.rlc.rlc_autoload_ptr);
+ 
+ 	if (r) {
+ 		dev_err(adev->dev, "(%d) failed to create fw autoload bo\n", r);
+@@ -2656,7 +2657,9 @@ static int gfx_v11_0_cp_gfx_load_pfp_microcode_rs64(struct amdgpu_device *adev)
+ 
+ 	/* 64kb align */
+ 	r = amdgpu_bo_create_reserved(adev, fw_ucode_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.pfp.pfp_fw_obj,
+ 				      &adev->gfx.pfp.pfp_fw_gpu_addr,
+ 				      (void **)&adev->gfx.pfp.pfp_fw_ptr);
+@@ -2667,7 +2670,9 @@ static int gfx_v11_0_cp_gfx_load_pfp_microcode_rs64(struct amdgpu_device *adev)
+ 	}
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_data_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.pfp.pfp_fw_data_obj,
+ 				      &adev->gfx.pfp.pfp_fw_data_gpu_addr,
+ 				      (void **)&adev->gfx.pfp.pfp_fw_data_ptr);
+@@ -2870,7 +2875,9 @@ static int gfx_v11_0_cp_gfx_load_me_microcode_rs64(struct amdgpu_device *adev)
+ 
+ 	/* 64kb align*/
+ 	r = amdgpu_bo_create_reserved(adev, fw_ucode_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.me.me_fw_obj,
+ 				      &adev->gfx.me.me_fw_gpu_addr,
+ 				      (void **)&adev->gfx.me.me_fw_ptr);
+@@ -2881,7 +2888,9 @@ static int gfx_v11_0_cp_gfx_load_me_microcode_rs64(struct amdgpu_device *adev)
+ 	}
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_data_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.me.me_fw_data_obj,
+ 				      &adev->gfx.me.me_fw_data_gpu_addr,
+ 				      (void **)&adev->gfx.me.me_fw_data_ptr);
+@@ -3387,7 +3396,9 @@ static int gfx_v11_0_cp_compute_load_microcode_rs64(struct amdgpu_device *adev)
+ 	fw_data_size = le32_to_cpu(mec_hdr->data_size_bytes);
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_ucode_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.mec.mec_fw_obj,
+ 				      &adev->gfx.mec.mec_fw_gpu_addr,
+ 				      (void **)&fw_ucode_ptr);
+@@ -3398,7 +3409,9 @@ static int gfx_v11_0_cp_compute_load_microcode_rs64(struct amdgpu_device *adev)
+ 	}
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_data_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.mec.mec_fw_data_obj,
+ 				      &adev->gfx.mec.mec_fw_data_gpu_addr,
+ 				      (void **)&fw_data_ptr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+index 204b246f0e3f..e53a2a95ac67 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+@@ -2375,7 +2375,8 @@ static int gfx_v6_0_rlc_init(struct amdgpu_device *adev)
+ 		dws = adev->gfx.rlc.clear_state_size + (256 / 4);
+ 
+ 		r = amdgpu_bo_create_reserved(adev, dws * 4, PAGE_SIZE,
+-					      AMDGPU_GEM_DOMAIN_VRAM,
++					      AMDGPU_GEM_DOMAIN_VRAM |
++					      AMDGPU_GEM_DOMAIN_GTT,
+ 					      &adev->gfx.rlc.clear_state_obj,
+ 					      &adev->gfx.rlc.clear_state_gpu_addr,
+ 					      (void **)&adev->gfx.rlc.cs_ptr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+index 0f2976507e48..d9bbb546556f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -2772,7 +2772,8 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
+ 		* GFX7_MEC_HPD_SIZE * 2;
+ 
+ 	r = amdgpu_bo_create_reserved(adev, mec_hpd_size, PAGE_SIZE,
+-				      AMDGPU_GEM_DOMAIN_VRAM,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->gfx.mec.hpd_eop_obj,
+ 				      &adev->gfx.mec.hpd_eop_gpu_addr,
+ 				      (void **)&hpd);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index d47135606e3e..70bb42ccb201 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -1340,7 +1340,8 @@ static int gfx_v8_0_mec_init(struct amdgpu_device *adev)
+ 	mec_hpd_size = adev->gfx.num_compute_rings * GFX8_MEC_HPD_SIZE;
+ 	if (mec_hpd_size) {
+ 		r = amdgpu_bo_create_reserved(adev, mec_hpd_size, PAGE_SIZE,
+-					      AMDGPU_GEM_DOMAIN_VRAM,
++					      AMDGPU_GEM_DOMAIN_VRAM |
++					      AMDGPU_GEM_DOMAIN_GTT,
+ 					      &adev->gfx.mec.hpd_eop_obj,
+ 					      &adev->gfx.mec.hpd_eop_gpu_addr,
+ 					      (void **)&hpd);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 5dde6f82a1ca..3865972869f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -1783,7 +1783,8 @@ static int gfx_v9_0_mec_init(struct amdgpu_device *adev)
+ 	mec_hpd_size = adev->gfx.num_compute_rings * GFX9_MEC_HPD_SIZE;
+ 	if (mec_hpd_size) {
+ 		r = amdgpu_bo_create_reserved(adev, mec_hpd_size, PAGE_SIZE,
+-					      AMDGPU_GEM_DOMAIN_VRAM,
++					      AMDGPU_GEM_DOMAIN_VRAM |
++					      AMDGPU_GEM_DOMAIN_GTT,
+ 					      &adev->gfx.mec.hpd_eop_obj,
+ 					      &adev->gfx.mec.hpd_eop_gpu_addr,
+ 					      (void **)&hpd);
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+index 1c4787000a5f..85a2b6207de9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+@@ -550,7 +550,9 @@ static int mes_v11_0_allocate_ucode_buffer(struct amdgpu_device *adev,
+ 	fw_size = le32_to_cpu(mes_hdr->mes_ucode_size_bytes);
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_size,
+-				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM,
++				      PAGE_SIZE,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->mes.ucode_fw_obj[pipe],
+ 				      &adev->mes.ucode_fw_gpu_addr[pipe],
+ 				      (void **)&adev->mes.ucode_fw_ptr[pipe]);
+@@ -583,7 +585,9 @@ static int mes_v11_0_allocate_ucode_data_buffer(struct amdgpu_device *adev,
+ 	fw_size = le32_to_cpu(mes_hdr->mes_ucode_data_size_bytes);
+ 
+ 	r = amdgpu_bo_create_reserved(adev, fw_size,
+-				      64 * 1024, AMDGPU_GEM_DOMAIN_VRAM,
++				      64 * 1024,
++				      AMDGPU_GEM_DOMAIN_VRAM |
++				      AMDGPU_GEM_DOMAIN_GTT,
+ 				      &adev->mes.data_fw_obj[pipe],
+ 				      &adev->mes.data_fw_gpu_addr[pipe],
+ 				      (void **)&adev->mes.data_fw_ptr[pipe]);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index a0add75d2b27..eae8bf8ac0e4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2098,7 +2098,9 @@ static int dm_dmub_sw_init(struct amdgpu_device *adev)
+ 	 * TODO: Move this into GART.
+ 	 */
+ 	r = amdgpu_bo_create_kernel(adev, region_info.fb_size, PAGE_SIZE,
+-				    AMDGPU_GEM_DOMAIN_VRAM, &adev->dm.dmub_bo,
++				    AMDGPU_GEM_DOMAIN_VRAM |
++				    AMDGPU_GEM_DOMAIN_GTT,
++				    &adev->dm.dmub_bo,
+ 				    &adev->dm.dmub_bo_gpu_addr,
+ 				    &adev->dm.dmub_bo_cpu_addr);
+ 	if (r)
+diff --git a/drivers/gpu/drm/amd/pm/powerplay/smumgr/smu10_smumgr.c b/drivers/gpu/drm/amd/pm/powerplay/smumgr/smu10_smumgr.c
+index 88a5641465dc..7eeab84d421a 100644
+--- a/drivers/gpu/drm/amd/pm/powerplay/smumgr/smu10_smumgr.c
++++ b/drivers/gpu/drm/amd/pm/powerplay/smumgr/smu10_smumgr.c
+@@ -250,9 +250,8 @@ static int smu10_smu_init(struct pp_hwmgr *hwmgr)
+ 
+ 	/* allocate space for watermarks table */
+ 	r = amdgpu_bo_create_kernel((struct amdgpu_device *)hwmgr->adev,
+-			sizeof(Watermarks_t),
+-			PAGE_SIZE,
+-			AMDGPU_GEM_DOMAIN_VRAM,
++			sizeof(Watermarks_t), PAGE_SIZE,
++			AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT,
+ 			&priv->smu_tables.entry[SMU10_WMTABLE].handle,
+ 			&priv->smu_tables.entry[SMU10_WMTABLE].mc_addr,
+ 			&priv->smu_tables.entry[SMU10_WMTABLE].table);
+@@ -266,9 +265,8 @@ static int smu10_smu_init(struct pp_hwmgr *hwmgr)
+ 
+ 	/* allocate space for watermarks table */
+ 	r = amdgpu_bo_create_kernel((struct amdgpu_device *)hwmgr->adev,
+-			sizeof(DpmClocks_t),
+-			PAGE_SIZE,
+-			AMDGPU_GEM_DOMAIN_VRAM,
++			sizeof(DpmClocks_t), PAGE_SIZE,
++			AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT,
+ 			&priv->smu_tables.entry[SMU10_CLOCKTABLE].handle,
+ 			&priv->smu_tables.entry[SMU10_CLOCKTABLE].mc_addr,
+ 			&priv->smu_tables.entry[SMU10_CLOCKTABLE].table);
+-- 
+2.25.1
+

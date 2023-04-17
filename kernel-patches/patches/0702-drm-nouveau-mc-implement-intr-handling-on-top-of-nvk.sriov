@@ -1,0 +1,1355 @@
+From 85e7514f92d5a9f1e5a06a3789e2a98f73227668 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:55 +1000
+Subject: [PATCH 0702/2236] drm/nouveau/mc: implement intr handling on top of
+ nvkm_intr
+
+- new-style handlers can now be used here too
+- decent clean-up
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/mc.h  |   6 +-
+ drivers/gpu/drm/nouveau/nvkm/core/intr.c      |  10 +-
+ .../gpu/drm/nouveau/nvkm/engine/device/base.c |  10 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/Kbuild |   1 -
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c | 113 +++-------------
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c  |  34 +++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/g98.c  |  34 +++--
+ .../gpu/drm/nouveau/nvkm/subdev/mc/ga100.c    |  28 +---
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gf100.c    |  81 ++++--------
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gk104.c    |  36 +++--
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gk20a.c    |   8 +-
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gp100.c    | 124 +++++++-----------
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gp10b.c    |  10 +-
+ .../gpu/drm/nouveau/nvkm/subdev/mc/gt215.c    |  62 +++++----
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv04.c |  64 ++++++---
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv11.c |  20 ++-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv17.c |  22 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv44.c |   6 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c |  28 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/mc/priv.h |  42 +++---
+ .../gpu/drm/nouveau/nvkm/subdev/mc/tu102.c    | 123 -----------------
+ 21 files changed, 285 insertions(+), 577 deletions(-)
+ delete mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/mc.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/mc.h
+index cb86a56e68d4..127ac545e4b2 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/mc.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/mc.h
+@@ -6,15 +6,14 @@
+ struct nvkm_mc {
+ 	const struct nvkm_mc_func *func;
+ 	struct nvkm_subdev subdev;
++
++	struct nvkm_intr intr;
+ };
+ 
+ void nvkm_mc_enable(struct nvkm_device *, enum nvkm_subdev_type, int);
+ void nvkm_mc_disable(struct nvkm_device *, enum nvkm_subdev_type, int);
+ bool nvkm_mc_enabled(struct nvkm_device *, enum nvkm_subdev_type, int);
+ void nvkm_mc_reset(struct nvkm_device *, enum nvkm_subdev_type, int);
+-void nvkm_mc_intr(struct nvkm_device *, bool *handled);
+-void nvkm_mc_intr_unarm(struct nvkm_device *);
+-void nvkm_mc_intr_rearm(struct nvkm_device *);
+ void nvkm_mc_intr_mask(struct nvkm_device *, enum nvkm_subdev_type, int, bool enable);
+ void nvkm_mc_unk260(struct nvkm_device *, u32 data);
+ 
+@@ -31,6 +30,5 @@ int gk104_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct n
+ int gk20a_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_mc **);
+ int gp100_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_mc **);
+ int gp10b_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_mc **);
+-int tu102_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_mc **);
+ int ga100_mc_new(struct nvkm_device *, enum nvkm_subdev_type, int inst, struct nvkm_mc **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/intr.c b/drivers/gpu/drm/nouveau/nvkm/core/intr.c
+index 3f3fe3d416e2..e20b7ca218c3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/intr.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/intr.c
+@@ -25,8 +25,6 @@
+ #include <subdev/pci.h>
+ #include <subdev/top.h>
+ 
+-#include <subdev/mc.h>
+-
+ static int
+ nvkm_intr_xlat(struct nvkm_subdev *subdev, struct nvkm_intr *intr,
+ 	       enum nvkm_intr_type type, int *leaf, u32 *mask)
+@@ -151,7 +149,6 @@ nvkm_intr_rearm_locked(struct nvkm_device *device)
+ 
+ 	list_for_each_entry(intr, &device->intr.intr, head)
+ 		intr->func->rearm(intr);
+-	nvkm_mc_intr_rearm(device);
+ }
+ 
+ static void
+@@ -161,7 +158,6 @@ nvkm_intr_unarm_locked(struct nvkm_device *device)
+ 
+ 	list_for_each_entry(intr, &device->intr.intr, head)
+ 		intr->func->unarm(intr);
+-	nvkm_mc_intr_unarm(device);
+ }
+ 
+ static irqreturn_t
+@@ -171,7 +167,7 @@ nvkm_intr(int irq, void *arg)
+ 	struct nvkm_intr *intr;
+ 	struct nvkm_inth *inth;
+ 	irqreturn_t ret = IRQ_NONE;
+-	bool pending = false, handled;
++	bool pending = false;
+ 	int prio, leaf;
+ 
+ 	/* Disable all top-level interrupt sources, and re-arm MSI interrupts. */
+@@ -188,10 +184,6 @@ nvkm_intr(int irq, void *arg)
+ 			pending = true;
+ 	}
+ 
+-	nvkm_mc_intr(device, &handled);
+-	if (handled)
+-		ret = IRQ_HANDLED;
+-
+ 	if (!pending)
+ 		goto done;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index a36c46aff242..587aebcda78c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -2412,7 +2412,7 @@ nv162_chipset = {
+ 	.i2c      = { 0x00000001, gm200_i2c_new },
+ 	.imem     = { 0x00000001, nv50_instmem_new },
+ 	.ltc      = { 0x00000001, gp102_ltc_new },
+-	.mc       = { 0x00000001, tu102_mc_new },
++	.mc       = { 0x00000001, gp100_mc_new },
+ 	.mmu      = { 0x00000001, tu102_mmu_new },
+ 	.pci      = { 0x00000001, gp100_pci_new },
+ 	.pmu      = { 0x00000001, gp102_pmu_new },
+@@ -2447,7 +2447,7 @@ nv164_chipset = {
+ 	.i2c      = { 0x00000001, gm200_i2c_new },
+ 	.imem     = { 0x00000001, nv50_instmem_new },
+ 	.ltc      = { 0x00000001, gp102_ltc_new },
+-	.mc       = { 0x00000001, tu102_mc_new },
++	.mc       = { 0x00000001, gp100_mc_new },
+ 	.mmu      = { 0x00000001, tu102_mmu_new },
+ 	.pci      = { 0x00000001, gp100_pci_new },
+ 	.pmu      = { 0x00000001, gp102_pmu_new },
+@@ -2482,7 +2482,7 @@ nv166_chipset = {
+ 	.i2c      = { 0x00000001, gm200_i2c_new },
+ 	.imem     = { 0x00000001, nv50_instmem_new },
+ 	.ltc      = { 0x00000001, gp102_ltc_new },
+-	.mc       = { 0x00000001, tu102_mc_new },
++	.mc       = { 0x00000001, gp100_mc_new },
+ 	.mmu      = { 0x00000001, tu102_mmu_new },
+ 	.pci      = { 0x00000001, gp100_pci_new },
+ 	.pmu      = { 0x00000001, gp102_pmu_new },
+@@ -2517,7 +2517,7 @@ nv167_chipset = {
+ 	.i2c      = { 0x00000001, gm200_i2c_new },
+ 	.imem     = { 0x00000001, nv50_instmem_new },
+ 	.ltc      = { 0x00000001, gp102_ltc_new },
+-	.mc       = { 0x00000001, tu102_mc_new },
++	.mc       = { 0x00000001, gp100_mc_new },
+ 	.mmu      = { 0x00000001, tu102_mmu_new },
+ 	.pci      = { 0x00000001, gp100_pci_new },
+ 	.pmu      = { 0x00000001, gp102_pmu_new },
+@@ -2552,7 +2552,7 @@ nv168_chipset = {
+ 	.i2c      = { 0x00000001, gm200_i2c_new },
+ 	.imem     = { 0x00000001, nv50_instmem_new },
+ 	.ltc      = { 0x00000001, gp102_ltc_new },
+-	.mc       = { 0x00000001, tu102_mc_new },
++	.mc       = { 0x00000001, gp100_mc_new },
+ 	.mmu      = { 0x00000001, tu102_mmu_new },
+ 	.pci      = { 0x00000001, gp100_pci_new },
+ 	.pmu      = { 0x00000001, gp102_pmu_new },
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/Kbuild b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/Kbuild
+index ac2b34e9ac6a..2a3255ced8b7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/Kbuild
+@@ -13,5 +13,4 @@ nvkm-y += nvkm/subdev/mc/gk104.o
+ nvkm-y += nvkm/subdev/mc/gk20a.o
+ nvkm-y += nvkm/subdev/mc/gp100.o
+ nvkm-y += nvkm/subdev/mc/gp10b.o
+-nvkm-y += nvkm/subdev/mc/tu102.o
+ nvkm-y += nvkm/subdev/mc/ga100.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
+index 21c4af3f81d5..322237e2ff80 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c
+@@ -37,84 +37,14 @@ nvkm_mc_unk260(struct nvkm_device *device, u32 data)
+ void
+ nvkm_mc_intr_mask(struct nvkm_device *device, enum nvkm_subdev_type type, int inst, bool en)
+ {
+-	struct nvkm_mc *mc = device->mc;
+-	const struct nvkm_mc_map *map;
+-	if (likely(mc) && mc->func->intr_mask) {
+-		u32 mask = nvkm_top_intr_mask(device, type, inst);
+-		for (map = mc->func->intr; !mask && map->stat; map++) {
+-			if (map->type == type && map->inst == inst)
+-				mask = map->stat;
+-		}
+-		mc->func->intr_mask(mc, mask, en ? mask : 0);
+-	}
+-}
+-
+-void
+-nvkm_mc_intr_unarm(struct nvkm_device *device)
+-{
+-	struct nvkm_mc *mc = device->mc;
+-	if (likely(mc))
+-		mc->func->intr_unarm(mc);
+-}
+-
+-void
+-nvkm_mc_intr_rearm(struct nvkm_device *device)
+-{
+-	struct nvkm_mc *mc = device->mc;
+-	if (likely(mc))
+-		mc->func->intr_rearm(mc);
+-}
+-
+-static u32
+-nvkm_mc_intr_stat(struct nvkm_mc *mc)
+-{
+-	u32 intr = mc->func->intr_stat(mc);
+-	if (WARN_ON_ONCE(intr == 0xffffffff))
+-		intr = 0; /* likely fallen off the bus */
+-	return intr;
+-}
+-
+-void
+-nvkm_mc_intr(struct nvkm_device *device, bool *handled)
+-{
+-	struct nvkm_mc *mc = device->mc;
+-	struct nvkm_top *top = device->top;
+-	struct nvkm_top_device *tdev;
+-	struct nvkm_subdev *subdev;
+-	const struct nvkm_mc_map *map;
+-	u32 stat, intr;
+-
+-	if (unlikely(!mc))
+-		return;
+-
+-	stat = intr = nvkm_mc_intr_stat(mc);
++	struct nvkm_subdev *subdev = nvkm_device_subdev(device, type, inst);
+ 
+-	if (top) {
+-		list_for_each_entry(tdev, &top->device, head) {
+-			if (tdev->intr >= 0 && (stat & BIT(tdev->intr))) {
+-				subdev = nvkm_device_subdev(device, tdev->type, tdev->inst);
+-				if (subdev) {
+-					nvkm_subdev_intr(subdev);
+-					stat &= ~BIT(tdev->intr);
+-					if (!stat)
+-						break;
+-				}
+-			}
+-		}
+-	}
+-
+-	for (map = mc->func->intr; map->stat; map++) {
+-		if (intr & map->stat) {
+-			subdev = nvkm_device_subdev(device, map->type, map->inst);
+-			if (subdev)
+-				nvkm_subdev_intr(subdev);
+-			stat &= ~map->stat;
+-		}
++	if (subdev) {
++		if (en)
++			nvkm_intr_allow(subdev, NVKM_INTR_SUBDEV);
++		else
++			nvkm_intr_block(subdev, NVKM_INTR_SUBDEV);
+ 	}
+-
+-	if (stat)
+-		nvkm_error(&mc->subdev, "intr %08x\n", stat);
+-	*handled = intr != 0;
+ }
+ 
+ static u32
+@@ -177,20 +107,12 @@ nvkm_mc_enabled(struct nvkm_device *device, enum nvkm_subdev_type type, int inst
+ }
+ 
+ 
+-static int
+-nvkm_mc_fini(struct nvkm_subdev *subdev, bool suspend)
+-{
+-	nvkm_mc_intr_unarm(subdev->device);
+-	return 0;
+-}
+-
+ static int
+ nvkm_mc_init(struct nvkm_subdev *subdev)
+ {
+ 	struct nvkm_mc *mc = nvkm_mc(subdev);
+ 	if (mc->func->init)
+ 		mc->func->init(mc);
+-	nvkm_mc_intr_rearm(subdev->device);
+ 	return 0;
+ }
+ 
+@@ -204,24 +126,27 @@ static const struct nvkm_subdev_func
+ nvkm_mc = {
+ 	.dtor = nvkm_mc_dtor,
+ 	.init = nvkm_mc_init,
+-	.fini = nvkm_mc_fini,
+ };
+ 
+-void
+-nvkm_mc_ctor(const struct nvkm_mc_func *func, struct nvkm_device *device,
+-	     enum nvkm_subdev_type type, int inst, struct nvkm_mc *mc)
+-{
+-	nvkm_subdev_ctor(&nvkm_mc, device, type, inst, &mc->subdev);
+-	mc->func = func;
+-}
+-
+ int
+ nvkm_mc_new_(const struct nvkm_mc_func *func, struct nvkm_device *device,
+ 	     enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+ {
+ 	struct nvkm_mc *mc;
++	int ret;
++
+ 	if (!(mc = *pmc = kzalloc(sizeof(*mc), GFP_KERNEL)))
+ 		return -ENOMEM;
+-	nvkm_mc_ctor(func, device, type, inst, *pmc);
++
++	nvkm_subdev_ctor(&nvkm_mc, device, type, inst, &mc->subdev);
++	mc->func = func;
++
++	if (mc->func->intr) {
++		ret = nvkm_intr_add(mc->func->intr, mc->func->intrs, &mc->subdev,
++				    mc->func->intr_nonstall ? 2 : 1, &mc->intr);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c
+index 4cfc1c984006..8a8267ecfe1d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c
+@@ -34,30 +34,28 @@ g84_mc_reset[] = {
+ 	{}
+ };
+ 
+-static const struct nvkm_mc_map
+-g84_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00020000, NVKM_ENGINE_VP },
+-	{ 0x00008000, NVKM_ENGINE_BSP },
+-	{ 0x00004000, NVKM_ENGINE_CIPHER },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000001, NVKM_ENGINE_MPEG },
+-	{ 0x0002d101, NVKM_SUBDEV_FB },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++static const struct nvkm_intr_data
++g84_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP  , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_VP    , 0, 0, 0x00020000, true },
++	{ NVKM_ENGINE_BSP   , 0, 0, 0x00008000, true },
++	{ NVKM_ENGINE_CIPHER, 0, 0, 0x00004000, true },
++	{ NVKM_ENGINE_GR    , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO  , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_MPEG  , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_FB    , 0, 0, 0x0002d101, true },
++	{ NVKM_SUBDEV_BUS   , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_GPIO  , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C   , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER , 0, 0, 0x00100000, true },
+ 	{},
+ };
+ 
+ static const struct nvkm_mc_func
+ g84_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = g84_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = g84_mc_intrs,
+ 	.reset = g84_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g98.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g98.c
+index b7e58d75d894..e099d419f1ce 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g98.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/g98.c
+@@ -34,30 +34,28 @@ g98_mc_reset[] = {
+ 	{}
+ };
+ 
+-static const struct nvkm_mc_map
+-g98_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00020000, NVKM_ENGINE_MSPDEC },
+-	{ 0x00008000, NVKM_ENGINE_MSVLD },
+-	{ 0x00004000, NVKM_ENGINE_SEC },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000001, NVKM_ENGINE_MSPPP },
+-	{ 0x0002d101, NVKM_SUBDEV_FB },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++static const struct nvkm_intr_data
++g98_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP  , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_MSPDEC, 0, 0, 0x00020000, true },
++	{ NVKM_ENGINE_MSVLD , 0, 0, 0x00008000, true },
++	{ NVKM_ENGINE_SEC   , 0, 0, 0x00004000, true },
++	{ NVKM_ENGINE_GR    , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO  , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_MSPPP , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_FB    , 0, 0, 0x0002d101, true },
++	{ NVKM_SUBDEV_BUS   , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_GPIO  , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C   , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER , 0, 0, 0x00100000, true },
+ 	{},
+ };
+ 
+ static const struct nvkm_mc_func
+ g98_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = g98_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = g98_mc_intrs,
+ 	.reset = g98_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/ga100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/ga100.c
+index ec3eedfa541a..98ccce9585eb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/ga100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/ga100.c
+@@ -21,35 +21,9 @@
+  */
+ #include "priv.h"
+ 
+-static void
+-ga100_mc_intr_unarm(struct nvkm_mc *mc)
+-{
+-}
+-
+-static void
+-ga100_mc_intr_rearm(struct nvkm_mc *mc)
+-{
+-}
+-
+-static u32
+-ga100_mc_intr_stat(struct nvkm_mc *mc)
+-{
+-	return 0;
+-}
+-
+-static void
+-ga100_mc_init(struct nvkm_mc *mc)
+-{
+-	nv50_mc_init(mc);
+-}
+-
+ static const struct nvkm_mc_func
+ ga100_mc = {
+-	.init = ga100_mc_init,
+-	.intr = gp100_mc_intr,
+-	.intr_unarm = ga100_mc_intr_unarm,
+-	.intr_rearm = ga100_mc_intr_rearm,
+-	.intr_stat = ga100_mc_intr_stat,
++	.init = nv50_mc_init,
+ 	.reset = gk104_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gf100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gf100.c
+index 3a589c6f7fad..b2846eaea34c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gf100.c
+@@ -36,63 +36,28 @@ gf100_mc_reset[] = {
+ 	{}
+ };
+ 
+-static const struct nvkm_mc_map
+-gf100_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00020000, NVKM_ENGINE_MSPDEC },
+-	{ 0x00008000, NVKM_ENGINE_MSVLD },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000040, NVKM_ENGINE_CE, 1 },
+-	{ 0x00000020, NVKM_ENGINE_CE, 0 },
+-	{ 0x00000001, NVKM_ENGINE_MSPPP },
+-	{ 0x40000000, NVKM_SUBDEV_PRIVRING },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x08000000, NVKM_SUBDEV_FB },
+-	{ 0x02000000, NVKM_SUBDEV_LTC },
+-	{ 0x01000000, NVKM_SUBDEV_PMU },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
+-	{ 0x00040000, NVKM_SUBDEV_THERM },
+-	{ 0x00002000, NVKM_SUBDEV_FB },
++static const struct nvkm_intr_data
++gf100_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP    , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_MSPDEC  , 0, 0, 0x00020000, true },
++	{ NVKM_ENGINE_MSVLD   , 0, 0, 0x00008000, true },
++	{ NVKM_ENGINE_GR      , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO    , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_CE      , 1, 0, 0x00000040, true },
++	{ NVKM_ENGINE_CE      , 0, 0, 0x00000020, true },
++	{ NVKM_ENGINE_MSPPP   , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_PRIVRING, 0, 0, 0x40000000, true },
++	{ NVKM_SUBDEV_BUS     , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_FB      , 0, 0, 0x08002000, true },
++	{ NVKM_SUBDEV_LTC     , 0, 0, 0x02000000, true },
++	{ NVKM_SUBDEV_PMU     , 0, 0, 0x01000000, true },
++	{ NVKM_SUBDEV_GPIO    , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C     , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER   , 0, 0, 0x00100000, true },
++	{ NVKM_SUBDEV_THERM   , 0, 0, 0x00040000, true },
+ 	{},
+ };
+ 
+-void
+-gf100_mc_intr_unarm(struct nvkm_mc *mc)
+-{
+-	struct nvkm_device *device = mc->subdev.device;
+-	nvkm_wr32(device, 0x000140, 0x00000000);
+-	nvkm_wr32(device, 0x000144, 0x00000000);
+-	nvkm_rd32(device, 0x000140);
+-}
+-
+-void
+-gf100_mc_intr_rearm(struct nvkm_mc *mc)
+-{
+-	struct nvkm_device *device = mc->subdev.device;
+-	nvkm_wr32(device, 0x000140, 0x00000001);
+-	nvkm_wr32(device, 0x000144, 0x00000001);
+-}
+-
+-u32
+-gf100_mc_intr_stat(struct nvkm_mc *mc)
+-{
+-	struct nvkm_device *device = mc->subdev.device;
+-	u32 intr0 = nvkm_rd32(device, 0x000100);
+-	u32 intr1 = nvkm_rd32(device, 0x000104);
+-	return intr0 | intr1;
+-}
+-
+-void
+-gf100_mc_intr_mask(struct nvkm_mc *mc, u32 mask, u32 stat)
+-{
+-	struct nvkm_device *device = mc->subdev.device;
+-	nvkm_mask(device, 0x000640, mask, stat);
+-	nvkm_mask(device, 0x000644, mask, stat);
+-}
+-
+ void
+ gf100_mc_unk260(struct nvkm_mc *mc, u32 data)
+ {
+@@ -102,11 +67,9 @@ gf100_mc_unk260(struct nvkm_mc *mc, u32 data)
+ static const struct nvkm_mc_func
+ gf100_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = gf100_mc_intr,
+-	.intr_unarm = gf100_mc_intr_unarm,
+-	.intr_rearm = gf100_mc_intr_rearm,
+-	.intr_mask = gf100_mc_intr_mask,
+-	.intr_stat = gf100_mc_intr_stat,
++	.intr = &gt215_mc_intr,
++	.intrs = gf100_mc_intrs,
++	.intr_nonstall = true,
+ 	.reset = gf100_mc_reset,
+ 	.unk260 = gf100_mc_unk260,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk104.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk104.c
+index d9b9067fa93f..edf82e4568bf 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk104.c
+@@ -30,31 +30,29 @@ gk104_mc_reset[] = {
+ 	{}
+ };
+ 
+-const struct nvkm_mc_map
+-gk104_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x40000000, NVKM_SUBDEV_PRIVRING },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x08000000, NVKM_SUBDEV_FB },
+-	{ 0x02000000, NVKM_SUBDEV_LTC },
+-	{ 0x01000000, NVKM_SUBDEV_PMU },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
+-	{ 0x00040000, NVKM_SUBDEV_THERM },
+-	{ 0x00002000, NVKM_SUBDEV_FB },
++const struct nvkm_intr_data
++gk104_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP    , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_FIFO    , 0, 0, 0x00000100, true },
++	{ NVKM_SUBDEV_PRIVRING, 0, 0, 0x40000000, true },
++	{ NVKM_SUBDEV_BUS     , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_FB      , 0, 0, 0x08002000, true },
++	{ NVKM_SUBDEV_LTC     , 0, 0, 0x02000000, true },
++	{ NVKM_SUBDEV_PMU     , 0, 0, 0x01000000, true },
++	{ NVKM_SUBDEV_GPIO    , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C     , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER   , 0, 0, 0x00100000, true },
++	{ NVKM_SUBDEV_THERM   , 0, 0, 0x00040000, true },
++	{ NVKM_SUBDEV_TOP     , 0, 0, 0xffffffff, true },
+ 	{},
+ };
+ 
+ static const struct nvkm_mc_func
+ gk104_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = gk104_mc_intr,
+-	.intr_unarm = gf100_mc_intr_unarm,
+-	.intr_rearm = gf100_mc_intr_rearm,
+-	.intr_mask = gf100_mc_intr_mask,
+-	.intr_stat = gf100_mc_intr_stat,
++	.intr = &gt215_mc_intr,
++	.intrs = gk104_mc_intrs,
++	.intr_nonstall = true,
+ 	.reset = gk104_mc_reset,
+ 	.unk260 = gf100_mc_unk260,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk20a.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk20a.c
+index 03590292749a..931985343ab5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk20a.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gk20a.c
+@@ -26,11 +26,9 @@
+ static const struct nvkm_mc_func
+ gk20a_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = gk104_mc_intr,
+-	.intr_unarm = gf100_mc_intr_unarm,
+-	.intr_rearm = gf100_mc_intr_rearm,
+-	.intr_mask = gf100_mc_intr_mask,
+-	.intr_stat = gf100_mc_intr_stat,
++	.intr = &gt215_mc_intr,
++	.intrs = gk104_mc_intrs,
++	.intr_nonstall = true,
+ 	.reset = gk104_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c
+index 5fd1a0595c33..5dfdf75af255 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c
+@@ -21,108 +21,80 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#define gp100_mc(p) container_of((p), struct gp100_mc, base)
+ #include "priv.h"
+ 
+-struct gp100_mc {
+-	struct nvkm_mc base;
+-	spinlock_t lock;
+-	bool intr;
+-	u32 mask;
++const struct nvkm_intr_data
++gp100_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP    , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_FIFO    , 0, 0, 0x00000100, true },
++	{ NVKM_SUBDEV_FAULT   , 0, 0, 0x00000200, true },
++	{ NVKM_SUBDEV_PRIVRING, 0, 0, 0x40000000, true },
++	{ NVKM_SUBDEV_BUS     , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_FB      , 0, 0, 0x08002000, true },
++	{ NVKM_SUBDEV_LTC     , 0, 0, 0x02000000, true },
++	{ NVKM_SUBDEV_PMU     , 0, 0, 0x01000000, true },
++	{ NVKM_SUBDEV_GPIO    , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C     , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER   , 0, 0, 0x00100000, true },
++	{ NVKM_SUBDEV_THERM   , 0, 0, 0x00040000, true },
++	{ NVKM_SUBDEV_TOP     , 0, 0, 0xffffffff, true },
++	{},
+ };
+ 
+ static void
+-gp100_mc_intr_update(struct gp100_mc *mc)
++gp100_mc_intr_allow(struct nvkm_intr *intr, int leaf, u32 mask)
+ {
+-	struct nvkm_device *device = mc->base.subdev.device;
+-	u32 mask = mc->intr ? mc->mask : 0, i;
+-	for (i = 0; i < 2; i++) {
+-		nvkm_wr32(device, 0x000180 + (i * 0x04), ~mask);
+-		nvkm_wr32(device, 0x000160 + (i * 0x04),  mask);
+-	}
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++
++	nvkm_wr32(mc->subdev.device, 0x000160 + (leaf * 4), mask);
+ }
+ 
+-void
+-gp100_mc_intr_unarm(struct nvkm_mc *base)
++static void
++gp100_mc_intr_block(struct nvkm_intr *intr, int leaf, u32 mask)
+ {
+-	struct gp100_mc *mc = gp100_mc(base);
+-	unsigned long flags;
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->intr = false;
+-	gp100_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++
++	nvkm_wr32(mc->subdev.device, 0x000180 + (leaf * 4), mask);
+ }
+ 
+-void
+-gp100_mc_intr_rearm(struct nvkm_mc *base)
++static void
++gp100_mc_intr_rearm(struct nvkm_intr *intr)
+ {
+-	struct gp100_mc *mc = gp100_mc(base);
+-	unsigned long flags;
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->intr = true;
+-	gp100_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
++	int i;
++
++	for (i = 0; i < intr->leaves; i++)
++		intr->func->allow(intr, i, intr->mask[i]);
+ }
+ 
+-void
+-gp100_mc_intr_mask(struct nvkm_mc *base, u32 mask, u32 intr)
++static void
++gp100_mc_intr_unarm(struct nvkm_intr *intr)
+ {
+-	struct gp100_mc *mc = gp100_mc(base);
+-	unsigned long flags;
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->mask = (mc->mask & ~mask) | intr;
+-	gp100_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
++	int i;
++
++	for (i = 0; i < intr->leaves; i++)
++		intr->func->block(intr, i, 0xffffffff);
+ }
+ 
+-const struct nvkm_mc_map
+-gp100_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000200, NVKM_SUBDEV_FAULT },
+-	{ 0x40000000, NVKM_SUBDEV_PRIVRING },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x08000000, NVKM_SUBDEV_FB },
+-	{ 0x02000000, NVKM_SUBDEV_LTC },
+-	{ 0x01000000, NVKM_SUBDEV_PMU },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
+-	{ 0x00040000, NVKM_SUBDEV_THERM },
+-	{ 0x00002000, NVKM_SUBDEV_FB },
+-	{},
++const struct nvkm_intr_func
++gp100_mc_intr = {
++	.pending = nv04_mc_intr_pending,
++	.unarm = gp100_mc_intr_unarm,
++	.rearm = gp100_mc_intr_rearm,
++	.block = gp100_mc_intr_block,
++	.allow = gp100_mc_intr_allow,
+ };
+ 
+ static const struct nvkm_mc_func
+ gp100_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = gp100_mc_intr,
+-	.intr_unarm = gp100_mc_intr_unarm,
+-	.intr_rearm = gp100_mc_intr_rearm,
+-	.intr_mask = gp100_mc_intr_mask,
+-	.intr_stat = gf100_mc_intr_stat,
++	.intr = &gp100_mc_intr,
++	.intrs = gp100_mc_intrs,
++	.intr_nonstall = true,
+ 	.reset = gk104_mc_reset,
+ };
+ 
+-int
+-gp100_mc_new_(const struct nvkm_mc_func *func, struct nvkm_device *device,
+-	      enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+-{
+-	struct gp100_mc *mc;
+-
+-	if (!(mc = kzalloc(sizeof(*mc), GFP_KERNEL)))
+-		return -ENOMEM;
+-	nvkm_mc_ctor(func, device, type, inst, &mc->base);
+-	*pmc = &mc->base;
+-
+-	spin_lock_init(&mc->lock);
+-	mc->intr = false;
+-	mc->mask = 0x7fffffff;
+-	return 0;
+-}
+-
+ int
+ gp100_mc_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+ {
+-	return gp100_mc_new_(&gp100_mc, device, type, inst, pmc);
++	return nvkm_mc_new_(&gp100_mc, device, type, inst, pmc);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp10b.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp10b.c
+index dd581d030ced..6b83c6bf308c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp10b.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp10b.c
+@@ -34,16 +34,14 @@ gp10b_mc_init(struct nvkm_mc *mc)
+ static const struct nvkm_mc_func
+ gp10b_mc = {
+ 	.init = gp10b_mc_init,
+-	.intr = gp100_mc_intr,
+-	.intr_unarm = gp100_mc_intr_unarm,
+-	.intr_rearm = gp100_mc_intr_rearm,
+-	.intr_mask = gp100_mc_intr_mask,
+-	.intr_stat = gf100_mc_intr_stat,
++	.intr = &gp100_mc_intr,
++	.intrs = gp100_mc_intrs,
++	.intr_nonstall = true,
+ 	.reset = gk104_mc_reset,
+ };
+ 
+ int
+ gp10b_mc_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+ {
+-	return gp100_mc_new_(&gp10b_mc, device, type, inst, pmc);
++	return nvkm_mc_new_(&gp10b_mc, device, type, inst, pmc);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gt215.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gt215.c
+index 1b4d43531dba..330ef92f5e50 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/gt215.c
+@@ -34,39 +34,55 @@ gt215_mc_reset[] = {
+ 	{}
+ };
+ 
+-static const struct nvkm_mc_map
+-gt215_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00400000, NVKM_ENGINE_CE, 0 },
+-	{ 0x00020000, NVKM_ENGINE_MSPDEC },
+-	{ 0x00008000, NVKM_ENGINE_MSVLD },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000001, NVKM_ENGINE_MSPPP },
+-	{ 0x00429101, NVKM_SUBDEV_FB },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
+-	{ 0x00080000, NVKM_SUBDEV_THERM },
+-	{ 0x00040000, NVKM_SUBDEV_PMU },
++static const struct nvkm_intr_data
++gt215_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP  , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_CE    , 0, 0, 0x00400000, true },
++	{ NVKM_ENGINE_MSPDEC, 0, 0, 0x00020000, true },
++	{ NVKM_ENGINE_MSVLD , 0, 0, 0x00008000, true },
++	{ NVKM_ENGINE_GR    , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO  , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_MSPPP , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_FB    , 0, 0, 0x00429101, true },
++	{ NVKM_SUBDEV_BUS   , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_GPIO  , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C   , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER , 0, 0, 0x00100000, true },
++	{ NVKM_SUBDEV_THERM , 0, 0, 0x00080000, true },
++	{ NVKM_SUBDEV_PMU   , 0, 0, 0x00040000, true },
+ 	{},
+ };
+ 
+ static void
+-gt215_mc_intr_mask(struct nvkm_mc *mc, u32 mask, u32 stat)
++gt215_mc_intr_allow(struct nvkm_intr *intr, int leaf, u32 mask)
++{
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++
++	nvkm_mask(mc->subdev.device, 0x000640 + (leaf * 4), mask, mask);
++}
++
++static void
++gt215_mc_intr_block(struct nvkm_intr *intr, int leaf, u32 mask)
+ {
+-	nvkm_mask(mc->subdev.device, 0x000640, mask, stat);
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++
++	nvkm_mask(mc->subdev.device, 0x000640 + (leaf * 4), mask, 0);
+ }
+ 
++const struct nvkm_intr_func
++gt215_mc_intr = {
++	.pending = nv04_mc_intr_pending,
++	.unarm = nv04_mc_intr_unarm,
++	.rearm = nv04_mc_intr_rearm,
++	.block = gt215_mc_intr_block,
++	.allow = gt215_mc_intr_allow,
++};
++
+ static const struct nvkm_mc_func
+ gt215_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = gt215_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_mask = gt215_mc_intr_mask,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = gt215_mc_intrs,
+ 	.reset = gt215_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv04.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv04.c
+index bc0d09bafa99..00adf6833d26 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv04.c
+@@ -30,37 +30,61 @@ nv04_mc_reset[] = {
+ 	{}
+ };
+ 
+-static const struct nvkm_mc_map
+-nv04_mc_intr[] = {
+-	{ 0x01010000, NVKM_ENGINE_DISP },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++static const struct nvkm_intr_data
++nv04_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP , 0, 0, 0x01010000, true },
++	{ NVKM_ENGINE_GR   , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO , 0, 0, 0x00000100, true },
++	{ NVKM_SUBDEV_BUS  , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_TIMER, 0, 0, 0x00100000, true },
+ 	{}
+ };
+ 
+ void
+-nv04_mc_intr_unarm(struct nvkm_mc *mc)
++nv04_mc_intr_rearm(struct nvkm_intr *intr)
+ {
+-	struct nvkm_device *device = mc->subdev.device;
+-	nvkm_wr32(device, 0x000140, 0x00000000);
+-	nvkm_rd32(device, 0x000140);
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++	int leaf;
++
++	for (leaf = 0; leaf < intr->leaves; leaf++)
++		nvkm_wr32(mc->subdev.device, 0x000140 + (leaf * 4), 0x00000001);
+ }
+ 
+ void
+-nv04_mc_intr_rearm(struct nvkm_mc *mc)
++nv04_mc_intr_unarm(struct nvkm_intr *intr)
+ {
+-	struct nvkm_device *device = mc->subdev.device;
+-	nvkm_wr32(device, 0x000140, 0x00000001);
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++	int leaf;
++
++	for (leaf = 0; leaf < intr->leaves; leaf++)
++		nvkm_wr32(mc->subdev.device, 0x000140 + (leaf * 4), 0x00000000);
++
++	nvkm_rd32(mc->subdev.device, 0x000140);
+ }
+ 
+-u32
+-nv04_mc_intr_stat(struct nvkm_mc *mc)
++bool
++nv04_mc_intr_pending(struct nvkm_intr *intr)
+ {
+-	return nvkm_rd32(mc->subdev.device, 0x000100);
++	struct nvkm_mc *mc = container_of(intr, typeof(*mc), intr);
++	bool pending = false;
++	int leaf;
++
++	for (leaf = 0; leaf < intr->leaves; leaf++) {
++		intr->stat[leaf] = nvkm_rd32(mc->subdev.device, 0x000100 + (leaf * 4));
++		if (intr->stat[leaf])
++			pending = true;
++	}
++
++	return pending;
+ }
+ 
++const struct nvkm_intr_func
++nv04_mc_intr = {
++	.pending = nv04_mc_intr_pending,
++	.unarm = nv04_mc_intr_unarm,
++	.rearm = nv04_mc_intr_rearm,
++};
++
+ void
+ nv04_mc_init(struct nvkm_mc *mc)
+ {
+@@ -72,10 +96,8 @@ nv04_mc_init(struct nvkm_mc *mc)
+ static const struct nvkm_mc_func
+ nv04_mc = {
+ 	.init = nv04_mc_init,
+-	.intr = nv04_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = nv04_mc_intrs,
+ 	.reset = nv04_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv11.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv11.c
+index ab59ca1ee068..1cef78827f57 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv11.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv11.c
+@@ -23,23 +23,21 @@
+  */
+ #include "priv.h"
+ 
+-static const struct nvkm_mc_map
+-nv11_mc_intr[] = {
+-	{ 0x03010000, NVKM_ENGINE_DISP },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++static const struct nvkm_intr_data
++nv11_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP , 0, 0, 0x03010000, true },
++	{ NVKM_ENGINE_GR   , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO , 0, 0, 0x00000100, true },
++	{ NVKM_SUBDEV_BUS  , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_TIMER, 0, 0, 0x00100000, true },
+ 	{}
+ };
+ 
+ static const struct nvkm_mc_func
+ nv11_mc = {
+ 	.init = nv04_mc_init,
+-	.intr = nv11_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = nv11_mc_intrs,
+ 	.reset = nv04_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv17.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv17.c
+index 03d756e26e57..ac70c359bce0 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv17.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv17.c
+@@ -31,24 +31,22 @@ nv17_mc_reset[] = {
+ 	{}
+ };
+ 
+-const struct nvkm_mc_map
+-nv17_mc_intr[] = {
+-	{ 0x03010000, NVKM_ENGINE_DISP },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000001, NVKM_ENGINE_MPEG },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++const struct nvkm_intr_data
++nv17_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP , 0, 0, 0x03010000, true },
++	{ NVKM_ENGINE_GR   , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_MPEG , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_BUS  , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_TIMER, 0, 0, 0x00100000, true },
+ 	{}
+ };
+ 
+ static const struct nvkm_mc_func
+ nv17_mc = {
+ 	.init = nv04_mc_init,
+-	.intr = nv17_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = nv17_mc_intrs,
+ 	.reset = nv17_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv44.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv44.c
+index 95f65766e8b0..0a054459a949 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv44.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv44.c
+@@ -40,10 +40,8 @@ nv44_mc_init(struct nvkm_mc *mc)
+ static const struct nvkm_mc_func
+ nv44_mc = {
+ 	.init = nv44_mc_init,
+-	.intr = nv17_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = nv17_mc_intrs,
+ 	.reset = nv17_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c
+index fce3613cdfa5..6a02ed754c3f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c
+@@ -23,17 +23,17 @@
+  */
+ #include "priv.h"
+ 
+-static const struct nvkm_mc_map
+-nv50_mc_intr[] = {
+-	{ 0x04000000, NVKM_ENGINE_DISP },
+-	{ 0x00001000, NVKM_ENGINE_GR },
+-	{ 0x00000100, NVKM_ENGINE_FIFO },
+-	{ 0x00000001, NVKM_ENGINE_MPEG },
+-	{ 0x00001101, NVKM_SUBDEV_FB },
+-	{ 0x10000000, NVKM_SUBDEV_BUS },
+-	{ 0x00200000, NVKM_SUBDEV_GPIO },
+-	{ 0x00200000, NVKM_SUBDEV_I2C },
+-	{ 0x00100000, NVKM_SUBDEV_TIMER },
++static const struct nvkm_intr_data
++nv50_mc_intrs[] = {
++	{ NVKM_ENGINE_DISP , 0, 0, 0x04000000, true },
++	{ NVKM_ENGINE_GR   , 0, 0, 0x00001000, true },
++	{ NVKM_ENGINE_FIFO , 0, 0, 0x00000100, true },
++	{ NVKM_ENGINE_MPEG , 0, 0, 0x00000001, true },
++	{ NVKM_SUBDEV_FB   , 0, 0, 0x00001101, true },
++	{ NVKM_SUBDEV_BUS  , 0, 0, 0x10000000, true },
++	{ NVKM_SUBDEV_GPIO , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_I2C  , 0, 0, 0x00200000, true },
++	{ NVKM_SUBDEV_TIMER, 0, 0, 0x00100000, true },
+ 	{},
+ };
+ 
+@@ -47,10 +47,8 @@ nv50_mc_init(struct nvkm_mc *mc)
+ static const struct nvkm_mc_func
+ nv50_mc = {
+ 	.init = nv50_mc_init,
+-	.intr = nv50_mc_intr,
+-	.intr_unarm = nv04_mc_intr_unarm,
+-	.intr_rearm = nv04_mc_intr_rearm,
+-	.intr_stat = nv04_mc_intr_stat,
++	.intr = &nv04_mc_intr,
++	.intrs = nv50_mc_intrs,
+ 	.reset = nv17_mc_reset,
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/priv.h b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/priv.h
+index c8bcabb98f99..3ecfe9b4fb05 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/priv.h
+@@ -4,8 +4,6 @@
+ #define nvkm_mc(p) container_of((p), struct nvkm_mc, subdev)
+ #include <subdev/mc.h>
+ 
+-void nvkm_mc_ctor(const struct nvkm_mc_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
+-		  struct nvkm_mc *);
+ int nvkm_mc_new_(const struct nvkm_mc_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
+ 		 struct nvkm_mc **);
+ 
+@@ -18,46 +16,36 @@ struct nvkm_mc_map {
+ 
+ struct nvkm_mc_func {
+ 	void (*init)(struct nvkm_mc *);
+-	const struct nvkm_mc_map *intr;
+-	/* disable reporting of interrupts to host */
+-	void (*intr_unarm)(struct nvkm_mc *);
+-	/* enable reporting of interrupts to host */
+-	void (*intr_rearm)(struct nvkm_mc *);
+-	/* (un)mask delivery of specific interrupts */
+-	void (*intr_mask)(struct nvkm_mc *, u32 mask, u32 stat);
+-	/* retrieve pending interrupt mask (NV_PMC_INTR) */
+-	u32 (*intr_stat)(struct nvkm_mc *);
++
++	const struct nvkm_intr_func *intr;
++	const struct nvkm_intr_data *intrs;
++	bool intr_nonstall;
++
+ 	const struct nvkm_mc_map *reset;
+ 	void (*unk260)(struct nvkm_mc *, u32);
+ };
+ 
+ void nv04_mc_init(struct nvkm_mc *);
+-void nv04_mc_intr_unarm(struct nvkm_mc *);
+-void nv04_mc_intr_rearm(struct nvkm_mc *);
+-u32 nv04_mc_intr_stat(struct nvkm_mc *);
++extern const struct nvkm_intr_func nv04_mc_intr;
++bool nv04_mc_intr_pending(struct nvkm_intr *);
++void nv04_mc_intr_unarm(struct nvkm_intr *);
++void nv04_mc_intr_rearm(struct nvkm_intr *);
+ extern const struct nvkm_mc_map nv04_mc_reset[];
+ 
+-extern const struct nvkm_mc_map nv17_mc_intr[];
++extern const struct nvkm_intr_data nv17_mc_intrs[];
+ extern const struct nvkm_mc_map nv17_mc_reset[];
+ 
+ void nv44_mc_init(struct nvkm_mc *);
+ 
+ void nv50_mc_init(struct nvkm_mc *);
+-void gk104_mc_init(struct nvkm_mc *);
+ 
+-void gf100_mc_intr_unarm(struct nvkm_mc *);
+-void gf100_mc_intr_rearm(struct nvkm_mc *);
+-void gf100_mc_intr_mask(struct nvkm_mc *, u32, u32);
+-u32 gf100_mc_intr_stat(struct nvkm_mc *);
++extern const struct nvkm_intr_func gt215_mc_intr;
+ void gf100_mc_unk260(struct nvkm_mc *, u32);
+-void gp100_mc_intr_unarm(struct nvkm_mc *);
+-void gp100_mc_intr_rearm(struct nvkm_mc *);
+-void gp100_mc_intr_mask(struct nvkm_mc *, u32, u32);
+-int gp100_mc_new_(const struct nvkm_mc_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
+-		  struct nvkm_mc **);
+ 
+-extern const struct nvkm_mc_map gk104_mc_intr[];
++void gk104_mc_init(struct nvkm_mc *);
++extern const struct nvkm_intr_data gk104_mc_intrs[];
+ extern const struct nvkm_mc_map gk104_mc_reset[];
+ 
+-extern const struct nvkm_mc_map gp100_mc_intr[];
++extern const struct nvkm_intr_func gp100_mc_intr;
++extern const struct nvkm_intr_data gp100_mc_intrs[];
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
+deleted file mode 100644
+index 630a9c9e7ac9..000000000000
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mc/tu102.c
++++ /dev/null
+@@ -1,123 +0,0 @@
+-/*
+- * Copyright 2018 Red Hat Inc.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- */
+-#define tu102_mc(p) container_of((p), struct tu102_mc, base)
+-#include "priv.h"
+-
+-struct tu102_mc {
+-	struct nvkm_mc base;
+-	spinlock_t lock;
+-	bool intr;
+-	u32 mask;
+-};
+-
+-static void
+-tu102_mc_intr_update(struct tu102_mc *mc)
+-{
+-	struct nvkm_device *device = mc->base.subdev.device;
+-	u32 mask = mc->intr ? mc->mask : 0, i;
+-
+-	for (i = 0; i < 2; i++) {
+-		nvkm_wr32(device, 0x000180 + (i * 0x04), ~mask);
+-		nvkm_wr32(device, 0x000160 + (i * 0x04),  mask);
+-	}
+-}
+-
+-static void
+-tu102_mc_intr_unarm(struct nvkm_mc *base)
+-{
+-	struct tu102_mc *mc = tu102_mc(base);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->intr = false;
+-	tu102_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
+-}
+-
+-static void
+-tu102_mc_intr_rearm(struct nvkm_mc *base)
+-{
+-	struct tu102_mc *mc = tu102_mc(base);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->intr = true;
+-	tu102_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
+-}
+-
+-static void
+-tu102_mc_intr_mask(struct nvkm_mc *base, u32 mask, u32 intr)
+-{
+-	struct tu102_mc *mc = tu102_mc(base);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&mc->lock, flags);
+-	mc->mask = (mc->mask & ~mask) | intr;
+-	tu102_mc_intr_update(mc);
+-	spin_unlock_irqrestore(&mc->lock, flags);
+-}
+-
+-static u32
+-tu102_mc_intr_stat(struct nvkm_mc *mc)
+-{
+-	struct nvkm_device *device = mc->subdev.device;
+-	u32 intr0 = nvkm_rd32(device, 0x000100);
+-	u32 intr1 = nvkm_rd32(device, 0x000104);
+-
+-	return intr0 | intr1;
+-}
+-
+-
+-static const struct nvkm_mc_func
+-tu102_mc = {
+-	.init = nv50_mc_init,
+-	.intr = gp100_mc_intr,
+-	.intr_unarm = tu102_mc_intr_unarm,
+-	.intr_rearm = tu102_mc_intr_rearm,
+-	.intr_mask = tu102_mc_intr_mask,
+-	.intr_stat = tu102_mc_intr_stat,
+-	.reset = gk104_mc_reset,
+-};
+-
+-static int
+-tu102_mc_new_(const struct nvkm_mc_func *func, struct nvkm_device *device,
+-	      enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+-{
+-	struct tu102_mc *mc;
+-
+-	if (!(mc = kzalloc(sizeof(*mc), GFP_KERNEL)))
+-		return -ENOMEM;
+-	nvkm_mc_ctor(func, device, type, inst, &mc->base);
+-	*pmc = &mc->base;
+-
+-	spin_lock_init(&mc->lock);
+-	mc->intr = false;
+-	mc->mask = 0x7fffffff;
+-	return 0;
+-}
+-
+-int
+-tu102_mc_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst, struct nvkm_mc **pmc)
+-{
+-	return tu102_mc_new_(&tu102_mc, device, type, inst, pmc);
+-}
+-- 
+2.25.1
+

@@ -1,0 +1,423 @@
+From 442725873b8f0186ce73a688e30a99701daaac5d Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:53 +1000
+Subject: [PATCH 0698/2236] drm/nouveau/vfn: move NV_USERMODE class from host
+
+- uses proper class IDs for Turing/Ampere
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/class.h  |  2 +
+ .../gpu/drm/nouveau/include/nvkm/subdev/vfn.h |  3 ++
+ drivers/gpu/drm/nouveau/nvif/user.c           |  4 +-
+ .../gpu/drm/nouveau/nvkm/engine/device/user.c |  2 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/Kbuild   |  3 --
+ .../gpu/drm/nouveau/nvkm/engine/fifo/ga102.c  | 20 +-------
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gv100.c  |  2 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/tu102.c  |  2 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/user.h   |  8 ----
+ .../drm/nouveau/nvkm/engine/fifo/usertu102.c  | 45 ------------------
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/Kbuild    |  1 +
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/base.c    |  4 ++
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/ga100.c   |  3 ++
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/gv100.c   |  3 ++
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/priv.h    |  8 ++++
+ .../gpu/drm/nouveau/nvkm/subdev/vfn/tu102.c   |  3 ++
+ .../fifo/usergv100.c => subdev/vfn/uvfn.c}    | 46 ++++++++++++++-----
+ 17 files changed, 67 insertions(+), 92 deletions(-)
+ delete mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/fifo/user.h
+ delete mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/fifo/usertu102.c
+ rename drivers/gpu/drm/nouveau/nvkm/{engine/fifo/usergv100.c => subdev/vfn/uvfn.c} (55%)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/class.h b/drivers/gpu/drm/nouveau/include/nvif/class.h
+index 3e9d181b5dda..a623fb67280b 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/class.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/class.h
+@@ -63,6 +63,8 @@
+ #define NV04_DISP                                     /* cl0046.h */ 0x00000046
+ 
+ #define VOLTA_USERMODE_A                                             0x0000c361
++#define TURING_USERMODE_A                                            0x0000c461
++#define AMPERE_USERMODE_A                                            0x0000c561
+ 
+ #define MAXWELL_FAULT_BUFFER_A                        /* clb069.h */ 0x0000b069
+ #define VOLTA_FAULT_BUFFER_A                          /* clb069.h */ 0x0000c369
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/vfn.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/vfn.h
+index 85c1bd36ee50..fb04d5cd34bf 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/vfn.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/vfn.h
+@@ -9,7 +9,10 @@ struct nvkm_vfn {
+ 
+ 	struct {
+ 		u32 priv;
++		u32 user;
+ 	} addr;
++
++	struct nvkm_device_oclass user;
+ };
+ 
+ int gv100_vfn_new(struct nvkm_device *, enum nvkm_subdev_type, int, struct nvkm_vfn **);
+diff --git a/drivers/gpu/drm/nouveau/nvif/user.c b/drivers/gpu/drm/nouveau/nvif/user.c
+index d89f5b67b304..b648a5e036af 100644
+--- a/drivers/gpu/drm/nouveau/nvif/user.c
++++ b/drivers/gpu/drm/nouveau/nvif/user.c
+@@ -41,7 +41,9 @@ nvif_user_ctor(struct nvif_device *device, const char *name)
+ 		int version;
+ 		const struct nvif_user_func *func;
+ 	} users[] = {
+-		{ VOLTA_USERMODE_A, -1, &nvif_userc361 },
++		{ AMPERE_USERMODE_A, -1, &nvif_userc361 },
++		{ TURING_USERMODE_A, -1, &nvif_userc361 },
++		{  VOLTA_USERMODE_A, -1, &nvif_userc361 },
+ 		{}
+ 	};
+ 	int cid, ret;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
+index 45f509c11c36..9b39ec341615 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/user.c
+@@ -342,6 +342,8 @@ nvkm_udevice_child_get(struct nvkm_object *object, int index,
+ 			sclass = &device->mmu->user;
+ 		else if (device->fault && index-- == 0)
+ 			sclass = &device->fault->user;
++		else if (device->vfn && index-- == 0)
++			sclass = &device->vfn->user;
+ 		else
+ 			return -EINVAL;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+index 5e831d347a95..0fa4df299009 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+@@ -35,6 +35,3 @@ nvkm-y += nvkm/engine/fifo/gpfifogf100.o
+ nvkm-y += nvkm/engine/fifo/gpfifogk104.o
+ nvkm-y += nvkm/engine/fifo/gpfifogv100.o
+ nvkm-y += nvkm/engine/fifo/gpfifotu102.o
+-
+-nvkm-y += nvkm/engine/fifo/usergv100.o
+-nvkm-y += nvkm/engine/fifo/usertu102.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/ga102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/ga102.c
+index c630dbd2911a..e228ca3a5203 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/ga102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/ga102.c
+@@ -22,7 +22,6 @@
+ #define ga102_fifo(p) container_of((p), struct ga102_fifo, base.engine)
+ #define ga102_chan(p) container_of((p), struct ga102_chan, object)
+ #include <engine/fifo.h>
+-#include "user.h"
+ 
+ #include <core/memory.h>
+ #include <subdev/mmu.h>
+@@ -242,33 +241,16 @@ ga102_chan_oclass = {
+ 	.ctor = ga102_chan_new,
+ };
+ 
+-static int
+-ga102_user_new(struct nvkm_device *device,
+-	       const struct nvkm_oclass *oclass, void *argv, u32 argc, struct nvkm_object **pobject)
+-{
+-	return tu102_fifo_user_new(oclass, argv, argc, pobject);
+-}
+-
+-static const struct nvkm_device_oclass
+-ga102_user_oclass = {
+-	.ctor = ga102_user_new,
+-};
+-
+ static int
+ ga102_fifo_sclass(struct nvkm_oclass *oclass, int index, const struct nvkm_device_oclass **class)
+ {
+ 	if (index == 0) {
+-		oclass->base = (struct nvkm_sclass) { -1, -1, VOLTA_USERMODE_A };
+-		*class = &ga102_user_oclass;
+-		return 0;
+-	} else
+-	if (index == 1) {
+ 		oclass->base = (struct nvkm_sclass) { 0, 0, AMPERE_CHANNEL_GPFIFO_B };
+ 		*class = &ga102_chan_oclass;
+ 		return 0;
+ 	}
+ 
+-	return 2;
++	return 1;
+ }
+ 
+ static int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+index faf0fe9f704c..f56369d59219 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+@@ -22,7 +22,6 @@
+ #include "gk104.h"
+ #include "cgrp.h"
+ #include "changk104.h"
+-#include "user.h"
+ 
+ #include <core/gpuobj.h>
+ 
+@@ -295,7 +294,6 @@ gv100_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.runlist = &gv100_fifo_runlist,
+-	.user = {{-1,-1,VOLTA_USERMODE_A      }, gv100_fifo_user_new   },
+ 	.chan = {{ 0, 0,VOLTA_CHANNEL_GPFIFO_A}, gv100_fifo_gpfifo_new },
+ 	.cgrp_force = true,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+index 260b197f81bc..b800cfc5bfd9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+@@ -22,7 +22,6 @@
+ #include "gk104.h"
+ #include "cgrp.h"
+ #include "changk104.h"
+-#include "user.h"
+ 
+ #include <core/client.h>
+ #include <core/gpuobj.h>
+@@ -110,7 +109,6 @@ tu102_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.runlist = &tu102_fifo_runlist,
+-	.user = {{-1,-1,VOLTA_USERMODE_A       }, tu102_fifo_user_new   },
+ 	.chan = {{ 0, 0,TURING_CHANNEL_GPFIFO_A}, tu102_fifo_gpfifo_new },
+ 	.cgrp_force = true,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/user.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/user.h
+deleted file mode 100644
+index 54a3a3092cc0..000000000000
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/user.h
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#ifndef __NVKM_FIFO_USER_H__
+-#define __NVKM_FIFO_USER_H__
+-#include "priv.h"
+-int gv100_fifo_user_new(const struct nvkm_oclass *, void *, u32,
+-			struct nvkm_object **);
+-int tu102_fifo_user_new(const struct nvkm_oclass *, void *, u32,
+-			struct nvkm_object **);
+-#endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/usertu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/usertu102.c
+deleted file mode 100644
+index 217268f8ccad..000000000000
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/usertu102.c
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/*
+- * Copyright 2018 Red Hat Inc.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- */
+-#include "user.h"
+-
+-static int
+-tu102_fifo_user_map(struct nvkm_object *object, void *argv, u32 argc,
+-		    enum nvkm_object_map *type, u64 *addr, u64 *size)
+-{
+-	struct nvkm_device *device = object->engine->subdev.device;
+-	*addr = 0xbb0000 + device->func->resource_addr(device, 0);
+-	*size = 0x010000;
+-	*type = NVKM_OBJECT_MAP_IO;
+-	return 0;
+-}
+-
+-static const struct nvkm_object_func
+-tu102_fifo_user = {
+-	.map = tu102_fifo_user_map,
+-};
+-
+-int
+-tu102_fifo_user_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+-		    struct nvkm_object **pobject)
+-{
+-	return nvkm_object_new_(&tu102_fifo_user, oclass, argv, argc, pobject);
+-}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/Kbuild b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/Kbuild
+index 21c975a6b206..23cd21b40a25 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/Kbuild
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: MIT
+ nvkm-y += nvkm/subdev/vfn/base.o
++nvkm-y += nvkm/subdev/vfn/uvfn.o
+ nvkm-y += nvkm/subdev/vfn/gv100.o
+ nvkm-y += nvkm/subdev/vfn/tu102.o
+ nvkm-y += nvkm/subdev/vfn/ga100.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/base.c
+index 682ca3ed725b..3aa042eec104 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/base.c
+@@ -44,5 +44,9 @@ nvkm_vfn_new_(const struct nvkm_vfn_func *func, struct nvkm_device *device,
+ 	nvkm_subdev_ctor(&nvkm_vfn, device, type, inst, &vfn->subdev);
+ 	vfn->func = func;
+ 	vfn->addr.priv = addr;
++	vfn->addr.user = vfn->addr.priv + func->user.addr;
++
++	vfn->user.ctor = nvkm_uvfn_new;
++	vfn->user.base = func->user.base;
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/ga100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/ga100.c
+index 979402dff659..626b64230fe5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/ga100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/ga100.c
+@@ -21,8 +21,11 @@
+  */
+ #include "priv.h"
+ 
++#include <nvif/class.h>
++
+ static const struct nvkm_vfn_func
+ ga100_vfn = {
++	.user = { 0x030000, 0x010000, { -1, -1, AMPERE_USERMODE_A } },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/gv100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/gv100.c
+index 83dd79bddd86..ddd39d714c4a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/gv100.c
+@@ -21,8 +21,11 @@
+  */
+ #include "priv.h"
+ 
++#include <nvif/class.h>
++
+ static const struct nvkm_vfn_func
+ gv100_vfn = {
++	.user = { 0x810000, 0x010000, { -1, -1, VOLTA_USERMODE_A } },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/priv.h b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/priv.h
+index 174817c76bf9..e6f436532392 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/priv.h
+@@ -5,8 +5,16 @@
+ #include <subdev/vfn.h>
+ 
+ struct nvkm_vfn_func {
++	struct {
++		u32 addr;
++		u32 size;
++		const struct nvkm_sclass base;
++	} user;
+ };
+ 
+ int nvkm_vfn_new_(const struct nvkm_vfn_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
+ 		  u32 addr, struct nvkm_vfn **);
++
++int nvkm_uvfn_new(struct nvkm_device *, const struct nvkm_oclass *, void *, u32,
++		  struct nvkm_object **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/tu102.c
+index 999e50f5c36b..9e1745d31fbb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/tu102.c
+@@ -21,8 +21,11 @@
+  */
+ #include "priv.h"
+ 
++#include <nvif/class.h>
++
+ static const struct nvkm_vfn_func
+ tu102_vfn = {
++	.user = { 0x030000, 0x010000, { -1, -1, TURING_USERMODE_A } },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/usergv100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/uvfn.c
+similarity index 55%
+rename from drivers/gpu/drm/nouveau/nvkm/engine/fifo/usergv100.c
+rename to drivers/gpu/drm/nouveau/nvkm/subdev/vfn/uvfn.c
+index 3dc3b8b312de..c5460a14c541 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/usergv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/vfn/uvfn.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2018 Red Hat Inc.
++ * Copyright 2021 Red Hat Inc.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the "Software"),
+@@ -19,27 +19,49 @@
+  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+-#include "user.h"
++#define nvkm_uvfn(p) container_of((p), struct nvkm_uvfn, object)
++#include "priv.h"
++
++#include <core/object.h>
++
++struct nvkm_uvfn {
++	struct nvkm_object object;
++	struct nvkm_vfn *vfn;
++};
+ 
+ static int
+-gv100_fifo_user_map(struct nvkm_object *object, void *argv, u32 argc,
+-		    enum nvkm_object_map *type, u64 *addr, u64 *size)
++nvkm_uvfn_map(struct nvkm_object *object, void *argv, u32 argc,
++	      enum nvkm_object_map *type, u64 *addr, u64 *size)
+ {
+-	struct nvkm_device *device = object->engine->subdev.device;
+-	*addr = 0x810000 + device->func->resource_addr(device, 0);
+-	*size = 0x010000;
++	struct nvkm_vfn *vfn = nvkm_uvfn(object)->vfn;
++	struct nvkm_device *device = vfn->subdev.device;
++
++	*addr = device->func->resource_addr(device, 0) + vfn->addr.user;
++	*size = vfn->func->user.size;
+ 	*type = NVKM_OBJECT_MAP_IO;
+ 	return 0;
+ }
+ 
+ static const struct nvkm_object_func
+-gv100_fifo_user = {
+-	.map = gv100_fifo_user_map,
++nvkm_uvfn = {
++	.map = nvkm_uvfn_map,
+ };
+ 
+ int
+-gv100_fifo_user_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+-		    struct nvkm_object **pobject)
++nvkm_uvfn_new(struct nvkm_device *device, const struct nvkm_oclass *oclass,
++	      void *argv, u32 argc, struct nvkm_object **pobject)
+ {
+-	return nvkm_object_new_(&gv100_fifo_user, oclass, argv, argc, pobject);
++	struct nvkm_uvfn *uvfn;
++
++	if (argc != 0)
++		return -ENOSYS;
++
++	if (!(uvfn = kzalloc(sizeof(*uvfn), GFP_KERNEL)))
++		return -ENOMEM;
++
++	nvkm_object_ctor(&nvkm_uvfn, oclass, &uvfn->object);
++	uvfn->vfn = device->vfn;
++
++	*pobject = &uvfn->object;
++	return 0;
+ }
+-- 
+2.25.1
+
