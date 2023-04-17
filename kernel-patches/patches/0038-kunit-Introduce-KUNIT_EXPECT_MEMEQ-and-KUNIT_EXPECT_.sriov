@@ -1,0 +1,256 @@
+From 6acfd58eb14626a88d42b9818fbebcd4e8eaba31 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ma=C3=ADra=20Canal?= <mairacanal@riseup.net>
+Date: Tue, 25 Oct 2022 20:10:41 -0300
+Subject: [PATCH 0038/2236] kunit: Introduce KUNIT_EXPECT_MEMEQ and
+ KUNIT_EXPECT_MEMNEQ macros
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, in order to compare memory blocks in KUnit, the KUNIT_EXPECT_EQ
+or KUNIT_EXPECT_FALSE macros are used in conjunction with the memcmp
+function, such as:
+    KUNIT_EXPECT_EQ(test, memcmp(foo, bar, size), 0);
+
+Although this usage produces correct results for the test cases, when
+the expectation fails, the error message is not very helpful,
+indicating only the return of the memcmp function.
+
+Therefore, create a new set of macros KUNIT_EXPECT_MEMEQ and
+KUNIT_EXPECT_MEMNEQ that compare memory blocks until a specified size.
+In case of expectation failure, those macros print the hex dump of the
+memory blocks, making it easier to debug test failures for memory blocks.
+
+That said, the expectation
+
+    KUNIT_EXPECT_EQ(test, memcmp(foo, bar, size), 0);
+
+would translate to the expectation
+
+    KUNIT_EXPECT_MEMEQ(test, foo, bar, size);
+
+Signed-off-by: Maíra Canal <mairacanal@riseup.net>
+Reviewed-by: Daniel Latypov <dlatypov@google.com>
+Reviewed-by: Muhammad Usama Anjum <usama.anjum@collabora.com>
+Reviewed-by: David Gow <davidgow@google.com>
+Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+---
+ include/kunit/assert.h | 33 ++++++++++++++++
+ include/kunit/test.h   | 87 ++++++++++++++++++++++++++++++++++++++++++
+ lib/kunit/assert.c     | 56 +++++++++++++++++++++++++++
+ 3 files changed, 176 insertions(+)
+
+diff --git a/include/kunit/assert.h b/include/kunit/assert.h
+index ace3de8d1ee7..e8a59487fd59 100644
+--- a/include/kunit/assert.h
++++ b/include/kunit/assert.h
+@@ -240,4 +240,37 @@ void kunit_binary_str_assert_format(const struct kunit_assert *assert,
+ 				    const struct va_format *message,
+ 				    struct string_stream *stream);
+ 
++#define KUNIT_INIT_MEM_ASSERT_STRUCT(text_, left_val, right_val, size_) {      \
++	.text = text_,							       \
++	.left_value = left_val,						       \
++	.right_value = right_val,				       	       \
++	.size = size_						       	       \
++}
++
++/**
++ * struct kunit_mem_assert - An expectation/assertion that compares two
++ *	memory blocks.
++ * @assert: The parent of this type.
++ * @text: Holds the textual representations of the operands and comparator.
++ * @left_value: The actual evaluated value of the expression in the left slot.
++ * @right_value: The actual evaluated value of the expression in the right slot.
++ * @size: Size of the memory block analysed in bytes.
++ *
++ * Represents an expectation/assertion that compares two memory blocks. For
++ * example, to expect that the first three bytes of foo is equal to the
++ * first three bytes of bar, you can use the expectation
++ * KUNIT_EXPECT_MEMEQ(test, foo, bar, 3);
++ */
++struct kunit_mem_assert {
++	struct kunit_assert assert;
++	const struct kunit_binary_assert_text *text;
++	const void *left_value;
++	const void *right_value;
++	const size_t size;
++};
++
++void kunit_mem_assert_format(const struct kunit_assert *assert,
++			     const struct va_format *message,
++			     struct string_stream *stream);
++
+ #endif /*  _KUNIT_ASSERT_H */
+diff --git a/include/kunit/test.h b/include/kunit/test.h
+index ebcdbddf8344..ef1e74d0c58a 100644
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@ -657,6 +657,39 @@ do {									       \
+ 		      ##__VA_ARGS__);					       \
+ } while (0)
+ 
++#define KUNIT_MEM_ASSERTION(test,					       \
++			    assert_type,				       \
++			    left,					       \
++			    op,						       \
++			    right,					       \
++			    size,					       \
++			    fmt,					       \
++			    ...)					       \
++do {									       \
++	const void *__left = (left);					       \
++	const void *__right = (right);					       \
++	const size_t __size = (size);					       \
++	static const struct kunit_binary_assert_text __text = {		       \
++		.operation = #op,					       \
++		.left_text = #left,					       \
++		.right_text = #right,					       \
++	};								       \
++									       \
++	if (likely(memcmp(__left, __right, __size) op 0))		       \
++		break;							       \
++									       \
++	_KUNIT_FAILED(test,						       \
++		      assert_type,					       \
++		      kunit_mem_assert,					       \
++		      kunit_mem_assert_format,				       \
++		      KUNIT_INIT_MEM_ASSERT_STRUCT(&__text,		       \
++						   __left,		       \
++						   __right,		       \
++						   __size),		       \
++		      fmt,						       \
++		      ##__VA_ARGS__);					       \
++} while (0)
++
+ #define KUNIT_PTR_NOT_ERR_OR_NULL_MSG_ASSERTION(test,			       \
+ 						assert_type,		       \
+ 						ptr,			       \
+@@ -927,6 +960,60 @@ do {									       \
+ 				   fmt,					       \
+ 				   ##__VA_ARGS__)
+ 
++/**
++ * KUNIT_EXPECT_MEMEQ() - Expects that the first @size bytes of @left and @right are equal.
++ * @test: The test context object.
++ * @left: An arbitrary expression that evaluates to the specified size.
++ * @right: An arbitrary expression that evaluates to the specified size.
++ * @size: Number of bytes compared.
++ *
++ * Sets an expectation that the values that @left and @right evaluate to are
++ * equal. This is semantically equivalent to
++ * KUNIT_EXPECT_TRUE(@test, !memcmp((@left), (@right), (@size))). See
++ * KUNIT_EXPECT_TRUE() for more information.
++ *
++ * Although this expectation works for any memory block, it is not recommended
++ * for comparing more structured data, such as structs. This expectation is
++ * recommended for comparing, for example, data arrays.
++ */
++#define KUNIT_EXPECT_MEMEQ(test, left, right, size) \
++	KUNIT_EXPECT_MEMEQ_MSG(test, left, right, size, NULL)
++
++#define KUNIT_EXPECT_MEMEQ_MSG(test, left, right, size, fmt, ...)	       \
++	KUNIT_MEM_ASSERTION(test,					       \
++			    KUNIT_EXPECTATION,				       \
++			    left, ==, right,				       \
++			    size,					       \
++			    fmt,					       \
++			    ##__VA_ARGS__)
++
++/**
++ * KUNIT_EXPECT_MEMNEQ() - Expects that the first @size bytes of @left and @right are not equal.
++ * @test: The test context object.
++ * @left: An arbitrary expression that evaluates to the specified size.
++ * @right: An arbitrary expression that evaluates to the specified size.
++ * @size: Number of bytes compared.
++ *
++ * Sets an expectation that the values that @left and @right evaluate to are
++ * not equal. This is semantically equivalent to
++ * KUNIT_EXPECT_TRUE(@test, memcmp((@left), (@right), (@size))). See
++ * KUNIT_EXPECT_TRUE() for more information.
++ *
++ * Although this expectation works for any memory block, it is not recommended
++ * for comparing more structured data, such as structs. This expectation is
++ * recommended for comparing, for example, data arrays.
++ */
++#define KUNIT_EXPECT_MEMNEQ(test, left, right, size) \
++	KUNIT_EXPECT_MEMNEQ_MSG(test, left, right, size, NULL)
++
++#define KUNIT_EXPECT_MEMNEQ_MSG(test, left, right, size, fmt, ...)	       \
++	KUNIT_MEM_ASSERTION(test,					       \
++			    KUNIT_EXPECTATION,				       \
++			    left, !=, right,				       \
++			    size,					       \
++			    fmt,					       \
++			    ##__VA_ARGS__)
++
+ /**
+  * KUNIT_EXPECT_NULL() - Expects that @ptr is null.
+  * @test: The test context object.
+diff --git a/lib/kunit/assert.c b/lib/kunit/assert.c
+index d00d6d181ee8..c346a8d7fa6e 100644
+--- a/lib/kunit/assert.c
++++ b/lib/kunit/assert.c
+@@ -204,3 +204,59 @@ void kunit_binary_str_assert_format(const struct kunit_assert *assert,
+ 	kunit_assert_print_msg(message, stream);
+ }
+ EXPORT_SYMBOL_GPL(kunit_binary_str_assert_format);
++
++/* Adds a hexdump of a buffer to a string_stream comparing it with
++ * a second buffer. The different bytes are marked with <>.
++ */
++static void kunit_assert_hexdump(struct string_stream *stream,
++				 const void *buf,
++				 const void *compared_buf,
++				 const size_t len)
++{
++	size_t i;
++	const u8 *buf1 = buf;
++	const u8 *buf2 = compared_buf;
++
++	string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT);
++
++	for (i = 0; i < len; ++i) {
++		if (!(i % 16) && i)
++			string_stream_add(stream, "\n" KUNIT_SUBSUBTEST_INDENT);
++
++		if (buf1[i] != buf2[i])
++			string_stream_add(stream, "<%02x>", buf1[i]);
++		else
++			string_stream_add(stream, " %02x ", buf1[i]);
++	}
++}
++
++void kunit_mem_assert_format(const struct kunit_assert *assert,
++			     const struct va_format *message,
++			     struct string_stream *stream)
++{
++	struct kunit_mem_assert *mem_assert;
++
++	mem_assert = container_of(assert, struct kunit_mem_assert,
++				  assert);
++
++	string_stream_add(stream,
++			  KUNIT_SUBTEST_INDENT "Expected %s %s %s, but\n",
++			  mem_assert->text->left_text,
++			  mem_assert->text->operation,
++			  mem_assert->text->right_text);
++
++	string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s ==\n",
++			  mem_assert->text->left_text);
++	kunit_assert_hexdump(stream, mem_assert->left_value,
++			     mem_assert->right_value, mem_assert->size);
++
++	string_stream_add(stream, "\n");
++
++	string_stream_add(stream, KUNIT_SUBSUBTEST_INDENT "%s ==\n",
++			  mem_assert->text->right_text);
++	kunit_assert_hexdump(stream, mem_assert->right_value,
++			     mem_assert->left_value, mem_assert->size);
++
++	kunit_assert_print_msg(message, stream);
++}
++EXPORT_SYMBOL_GPL(kunit_mem_assert_format);
+-- 
+2.25.1
+

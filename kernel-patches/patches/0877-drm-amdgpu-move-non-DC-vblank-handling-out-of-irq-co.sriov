@@ -1,0 +1,320 @@
+From 05929443ff62e0d8fd341b929fcb8b260813d686 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 19 Jul 2022 13:15:40 -0400
+Subject: [PATCH 0877/2236] drm/amdgpu: move non-DC vblank handling out of irq
+ code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Move it into the DCE code for each generation. This avoids
+confusion with the different display paths.
+
+v2: no need for a hotplug worker for vkms
+
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c | 35 +++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c     | 58 +--------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c    |  4 ++
+ drivers/gpu/drm/amd/amdgpu/dce_v10_0.c      | 13 +++++
+ drivers/gpu/drm/amd/amdgpu/dce_v11_0.c      | 13 +++++
+ drivers/gpu/drm/amd/amdgpu/dce_v6_0.c       | 14 +++++
+ drivers/gpu/drm/amd/amdgpu/dce_v8_0.c       | 14 +++++
+ 8 files changed, 95 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index d9d7d2d4dff3..3e00da9f7a29 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -44,6 +44,41 @@
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_vblank.h>
+ 
++/**
++ * amdgpu_display_hotplug_work_func - work handler for display hotplug event
++ *
++ * @work: work struct pointer
++ *
++ * This is the hotplug event work handler (all ASICs).
++ * The work gets scheduled from the IRQ handler if there
++ * was a hotplug interrupt.  It walks through the connector table
++ * and calls hotplug handler for each connector. After this, it sends
++ * a DRM hotplug event to alert userspace.
++ *
++ * This design approach is required in order to defer hotplug event handling
++ * from the IRQ handler to a work handler because hotplug handler has to use
++ * mutexes which cannot be locked in an IRQ handler (since &mutex_lock may
++ * sleep).
++ */
++void amdgpu_display_hotplug_work_func(struct work_struct *work)
++{
++	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
++						  hotplug_work);
++	struct drm_device *dev = adev_to_drm(adev);
++	struct drm_mode_config *mode_config = &dev->mode_config;
++	struct drm_connector *connector;
++	struct drm_connector_list_iter iter;
++
++	mutex_lock(&mode_config->mutex);
++	drm_connector_list_iter_begin(dev, &iter);
++	drm_for_each_connector_iter(connector, &iter)
++		amdgpu_connector_hotplug(connector);
++	drm_connector_list_iter_end(&iter);
++	mutex_unlock(&mode_config->mutex);
++	/* Just fire off a uevent and let userspace tell us what to do */
++	drm_helper_hpd_irq_event(dev);
++}
++
+ static int amdgpu_display_framebuffer_init(struct drm_device *dev,
+ 					   struct amdgpu_framebuffer *rfb,
+ 					   const struct drm_mode_fb_cmd2 *mode_cmd,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
+index 560352f7c317..9d19940f73c8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.h
+@@ -35,6 +35,7 @@
+ #define amdgpu_display_add_encoder(adev, e, s, c) (adev)->mode_info.funcs->add_encoder((adev), (e), (s), (c))
+ #define amdgpu_display_add_connector(adev, ci, sd, ct, ib, coi, h, r) (adev)->mode_info.funcs->add_connector((adev), (ci), (sd), (ct), (ib), (coi), (h), (r))
+ 
++void amdgpu_display_hotplug_work_func(struct work_struct *work);
+ void amdgpu_display_update_priority(struct amdgpu_device *adev);
+ uint32_t amdgpu_display_supported_domains(struct amdgpu_device *adev,
+ 					  uint64_t bo_flags);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index 89011bae7588..a6aef488a822 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -100,41 +100,6 @@ const char *soc15_ih_clientid_name[] = {
+ 	"MP1"
+ };
+ 
+-/**
+- * amdgpu_hotplug_work_func - work handler for display hotplug event
+- *
+- * @work: work struct pointer
+- *
+- * This is the hotplug event work handler (all ASICs).
+- * The work gets scheduled from the IRQ handler if there
+- * was a hotplug interrupt.  It walks through the connector table
+- * and calls hotplug handler for each connector. After this, it sends
+- * a DRM hotplug event to alert userspace.
+- *
+- * This design approach is required in order to defer hotplug event handling
+- * from the IRQ handler to a work handler because hotplug handler has to use
+- * mutexes which cannot be locked in an IRQ handler (since &mutex_lock may
+- * sleep).
+- */
+-static void amdgpu_hotplug_work_func(struct work_struct *work)
+-{
+-	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
+-						  hotplug_work);
+-	struct drm_device *dev = adev_to_drm(adev);
+-	struct drm_mode_config *mode_config = &dev->mode_config;
+-	struct drm_connector *connector;
+-	struct drm_connector_list_iter iter;
+-
+-	mutex_lock(&mode_config->mutex);
+-	drm_connector_list_iter_begin(dev, &iter);
+-	drm_for_each_connector_iter(connector, &iter)
+-		amdgpu_connector_hotplug(connector);
+-	drm_connector_list_iter_end(&iter);
+-	mutex_unlock(&mode_config->mutex);
+-	/* Just fire off a uevent and let userspace tell us what to do */
+-	drm_helper_hpd_irq_event(dev);
+-}
+-
+ /**
+  * amdgpu_irq_disable_all - disable *all* interrupts
+  *
+@@ -317,21 +282,6 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
+-	if (!amdgpu_device_has_dc_support(adev)) {
+-		if (!adev->enable_virtual_display)
+-			/* Disable vblank IRQs aggressively for power-saving */
+-			/* XXX: can this be enabled for DC? */
+-			adev_to_drm(adev)->vblank_disable_immediate = true;
+-
+-		r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
+-		if (r)
+-			return r;
+-
+-		/* Pre-DCE11 */
+-		INIT_WORK(&adev->hotplug_work,
+-				amdgpu_hotplug_work_func);
+-	}
+-
+ 	INIT_WORK(&adev->irq.ih1_work, amdgpu_irq_handle_ih1);
+ 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
+ 	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
+@@ -345,11 +295,8 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+ 	/* PCI devices require shared interrupts. */
+ 	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED, adev_to_drm(adev)->driver->name,
+ 			adev_to_drm(adev));
+-	if (r) {
+-		if (!amdgpu_device_has_dc_support(adev))
+-			flush_work(&adev->hotplug_work);
++	if (r)
+ 		return r;
+-	}
+ 	adev->irq.installed = true;
+ 	adev->irq.irq = irq;
+ 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;
+@@ -366,9 +313,6 @@ void amdgpu_irq_fini_hw(struct amdgpu_device *adev)
+ 		adev->irq.installed = false;
+ 		if (adev->irq.msi_enabled)
+ 			pci_free_irq_vectors(adev->pdev);
+-
+-		if (!amdgpu_device_has_dc_support(adev))
+-			flush_work(&adev->hotplug_work);
+ 	}
+ 
+ 	amdgpu_ih_ring_fini(adev, &adev->irq.ih_soft);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c
+index b9d4bcb1ce8d..53ff91fc6cf6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c
+@@ -513,6 +513,10 @@ static int amdgpu_vkms_sw_init(void *handle)
+ 			return r;
+ 	}
+ 
++	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
++	if (r)
++		return r;
++
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+ 
+ 	adev->mode_info.mode_config_initialized = true;
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+index 90f87b2d985b..248f1a4e915f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+@@ -2829,6 +2829,17 @@ static int dce_v10_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
++	/* Disable vblank IRQs aggressively for power-saving */
++	/* XXX: can this be enabled for DC? */
++	adev_to_drm(adev)->vblank_disable_immediate = true;
++
++	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
++	if (r)
++		return r;
++
++	INIT_WORK(&adev->hotplug_work,
++		  amdgpu_display_hotplug_work_func);
++
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+ 
+ 	adev->mode_info.mode_config_initialized = true;
+@@ -2891,6 +2902,8 @@ static int dce_v10_0_hw_fini(void *handle)
+ 
+ 	dce_v10_0_pageflip_interrupt_fini(adev);
+ 
++	flush_work(&adev->hotplug_work);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+index 0352de72c886..cd9c19060d89 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+@@ -2948,6 +2948,17 @@ static int dce_v11_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
++	/* Disable vblank IRQs aggressively for power-saving */
++	/* XXX: can this be enabled for DC? */
++	adev_to_drm(adev)->vblank_disable_immediate = true;
++
++	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
++	if (r)
++		return r;
++
++	INIT_WORK(&adev->hotplug_work,
++		  amdgpu_display_hotplug_work_func);
++
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+ 
+ 	adev->mode_info.mode_config_initialized = true;
+@@ -3021,6 +3032,8 @@ static int dce_v11_0_hw_fini(void *handle)
+ 
+ 	dce_v11_0_pageflip_interrupt_fini(adev);
+ 
++	flush_work(&adev->hotplug_work);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+index 07bd16e82046..76323deecc58 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+@@ -2706,6 +2706,18 @@ static int dce_v6_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
++	/* Disable vblank IRQs aggressively for power-saving */
++	/* XXX: can this be enabled for DC? */
++	adev_to_drm(adev)->vblank_disable_immediate = true;
++
++	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
++	if (r)
++		return r;
++
++	/* Pre-DCE11 */
++	INIT_WORK(&adev->hotplug_work,
++		  amdgpu_display_hotplug_work_func);
++
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+ 
+ 	return r;
+@@ -2764,6 +2776,8 @@ static int dce_v6_0_hw_fini(void *handle)
+ 
+ 	dce_v6_0_pageflip_interrupt_fini(adev);
+ 
++	flush_work(&adev->hotplug_work);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+index d73df100f2b3..01cf3ab111cb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+@@ -2730,6 +2730,18 @@ static int dce_v8_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
++	/* Disable vblank IRQs aggressively for power-saving */
++	/* XXX: can this be enabled for DC? */
++	adev_to_drm(adev)->vblank_disable_immediate = true;
++
++	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
++	if (r)
++		return r;
++
++	/* Pre-DCE11 */
++	INIT_WORK(&adev->hotplug_work,
++		  amdgpu_display_hotplug_work_func);
++
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+ 
+ 	adev->mode_info.mode_config_initialized = true;
+@@ -2790,6 +2802,8 @@ static int dce_v8_0_hw_fini(void *handle)
+ 
+ 	dce_v8_0_pageflip_interrupt_fini(adev);
+ 
++	flush_work(&adev->hotplug_work);
++
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+

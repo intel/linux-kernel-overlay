@@ -1,0 +1,189 @@
+From 6cf82df68887ceea64c05db6fc6af63562f5b1fa Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <wenjing.liu@amd.com>
+Date: Wed, 7 Dec 2022 18:51:15 -0500
+Subject: [PATCH 1603/2236] drm/amd/display: allow hpo and dio encoder
+ switching during dp retrain test
+
+[why]
+During DP2.1 LL CTS if test equipment requests to change between
+DP2.1 and DP1.4 link rates, we need to swap between HPO and DIO
+encoders by remapping encoder resource.
+
+[how]
+Add a function dc resource to update encoder resources and toggle
+dpms state for all enabled stream associated witht the link under test.
+
+Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Signed-off-by: Wenjing Liu <wenjing.liu@amd.com>
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c |  3 -
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  | 64 +++++++------------
+ .../gpu/drm/amd/display/dc/core/dc_resource.c | 39 +++++++++++
+ drivers/gpu/drm/amd/display/dc/inc/resource.h |  9 +++
+ 4 files changed, 72 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 754fc8634149..03941bbff658 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -4659,9 +4659,6 @@ void dc_link_set_preferred_training_settings(struct dc *dc,
+ 
+ 	if (link_setting != NULL) {
+ 		link->preferred_link_setting = *link_setting;
+-		if (dp_get_link_encoding_format(link_setting) == DP_128b_132b_ENCODING)
+-			/* TODO: add dc update for acquiring link res  */
+-			skip_immediate_retrain = true;
+ 	} else {
+ 		link->preferred_link_setting.lane_count = LANE_COUNT_UNKNOWN;
+ 		link->preferred_link_setting.link_rate = LINK_RATE_UNKNOWN;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index af9411ee3c74..e8a3d72a4c74 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -7276,51 +7276,35 @@ void dp_retrain_link_dp_test(struct dc_link *link,
+ 			struct dc_link_settings *link_setting,
+ 			bool skip_video_pattern)
+ {
+-	struct pipe_ctx *pipes =
+-			&link->dc->current_state->res_ctx.pipe_ctx[0];
++	struct pipe_ctx *pipe;
+ 	unsigned int i;
+-	bool do_fallback = false;
+ 
++	udelay(100);
+ 
+ 	for (i = 0; i < MAX_PIPES; i++) {
+-		if (pipes[i].stream != NULL &&
+-			!pipes[i].top_pipe && !pipes[i].prev_odm_pipe &&
+-			pipes[i].stream->link != NULL &&
+-			pipes[i].stream_res.stream_enc != NULL &&
+-			pipes[i].stream->link == link) {
+-			udelay(100);
+-
+-			link->dc->hwss.blank_stream(&pipes[i]);
+-
+-			/* disable any test pattern that might be active */
+-			dp_set_hw_test_pattern(link, &pipes[i].link_res,
+-					DP_TEST_PATTERN_VIDEO_MODE, NULL, 0);
+-
+-			dp_receiver_power_ctrl(link, false);
+-
+-			link->dc->hwss.disable_stream(&pipes[i]);
+-			if (pipes[i].stream_res.audio && !link->dc->debug.az_endpoint_mute_only)
+-				pipes[i].stream_res.audio->funcs->az_disable(pipes[i].stream_res.audio);
+-
+-			link->dc->hwss.disable_link_output(link, &pipes[i].link_res, SIGNAL_TYPE_DISPLAY_PORT);
+-
+-			if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA)
+-				do_fallback = true;
+-
+-			perform_link_training_with_retries(
+-					link_setting,
+-					skip_video_pattern,
+-					LINK_TRAINING_ATTEMPTS,
+-					&pipes[i],
+-					SIGNAL_TYPE_DISPLAY_PORT,
+-					do_fallback);
+-
+-			link->dc->hwss.enable_stream(&pipes[i]);
+-
+-			link->dc->hwss.unblank_stream(&pipes[i],
+-					link_setting);
++		pipe = &link->dc->current_state->res_ctx.pipe_ctx[i];
++		if (pipe->stream != NULL &&
++				pipe->stream->link == link &&
++				!pipe->stream->dpms_off &&
++				!pipe->top_pipe && !pipe->prev_odm_pipe) {
++			core_link_disable_stream(pipe);
++			pipe->link_config.dp_link_settings = *link_setting;
++			update_dp_encoder_resources_for_test_harness(
++					link->dc,
++					pipe->stream->ctx->dc->current_state,
++					pipe);
++		}
++	}
+ 
+-			link->dc->hwss.enable_audio_stream(&pipes[i]);
++	for (i = 0; i < MAX_PIPES; i++) {
++		pipe = &link->dc->current_state->res_ctx.pipe_ctx[i];
++		if (pipe->stream != NULL &&
++				pipe->stream->link == link &&
++				!pipe->stream->dpms_off &&
++				!pipe->top_pipe && !pipe->prev_odm_pipe) {
++			core_link_enable_stream(
++					pipe->stream->ctx->dc->current_state,
++					pipe);
+ 		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 002b7b512b09..06b5f49e0954 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -3990,3 +3990,42 @@ bool dc_resource_acquire_secondary_pipe_for_mpc_odm(
+ 
+ 	return true;
+ }
++
++enum dc_status update_dp_encoder_resources_for_test_harness(const struct dc *dc,
++		struct dc_state *context,
++		struct pipe_ctx *pipe_ctx)
++{
++	if (dp_get_link_encoding_format(&pipe_ctx->link_config.dp_link_settings) == DP_128b_132b_ENCODING) {
++		if (pipe_ctx->stream_res.hpo_dp_stream_enc == NULL) {
++			pipe_ctx->stream_res.hpo_dp_stream_enc =
++					find_first_free_match_hpo_dp_stream_enc_for_link(
++							&context->res_ctx, dc->res_pool, pipe_ctx->stream);
++
++			if (!pipe_ctx->stream_res.hpo_dp_stream_enc)
++				return DC_NO_STREAM_ENC_RESOURCE;
++
++			update_hpo_dp_stream_engine_usage(
++					&context->res_ctx, dc->res_pool,
++					pipe_ctx->stream_res.hpo_dp_stream_enc,
++					true);
++		}
++
++		if (pipe_ctx->link_res.hpo_dp_link_enc == NULL) {
++			if (!add_hpo_dp_link_enc_to_ctx(&context->res_ctx, dc->res_pool, pipe_ctx, pipe_ctx->stream))
++				return DC_NO_LINK_ENC_RESOURCE;
++		}
++	} else {
++		if (pipe_ctx->stream_res.hpo_dp_stream_enc) {
++			update_hpo_dp_stream_engine_usage(
++					&context->res_ctx, dc->res_pool,
++					pipe_ctx->stream_res.hpo_dp_stream_enc,
++					false);
++			pipe_ctx->stream_res.hpo_dp_stream_enc = NULL;
++		}
++		if (pipe_ctx->link_res.hpo_dp_link_enc)
++			remove_hpo_dp_link_enc_from_ctx(&context->res_ctx, pipe_ctx, pipe_ctx->stream);
++	}
++
++	return DC_OK;
++}
++
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/resource.h b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+index 5040836f404d..4ab029e3326d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/resource.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/resource.h
+@@ -236,4 +236,13 @@ bool dc_resource_acquire_secondary_pipe_for_mpc_odm(
+ 		struct pipe_ctx *pri_pipe,
+ 		struct pipe_ctx *sec_pipe,
+ 		bool odm);
++
++/* A test harness interface that modifies dp encoder resources in the given dc
++ * state and bypasses the need to revalidate. The interface assumes that the
++ * test harness interface is called with pre-validated link config stored in the
++ * pipe_ctx and updates dp encoder resources according to the link config.
++ */
++enum dc_status update_dp_encoder_resources_for_test_harness(const struct dc *dc,
++		struct dc_state *context,
++		struct pipe_ctx *pipe_ctx);
+ #endif /* DRIVERS_GPU_DRM_AMD_DC_DEV_DC_INC_RESOURCE_H_ */
+-- 
+2.25.1
+

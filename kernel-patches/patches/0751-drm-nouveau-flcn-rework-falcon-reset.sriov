@@ -1,0 +1,597 @@
+From e7fb372f05444e2ec40e04ea76ca330c6610e393 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:51 +1000
+Subject: [PATCH 0751/2236] drm/nouveau/flcn: rework falcon reset
+
+Mostly preparation to fit in Ampere changes, but should result in reset
+sequences a lot closer to RM's, and perhaps help out with the issues we
+sometimes see reported in this area.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/core/falcon.h    | 10 ++-
+ .../drm/nouveau/include/nvkm/engine/falcon.h  | 12 +--
+ .../gpu/drm/nouveau/nvkm/engine/gr/gf100.c    |  8 --
+ .../gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c |  6 +-
+ .../gpu/drm/nouveau/nvkm/engine/nvenc/gm107.c | 11 ---
+ .../gpu/drm/nouveau/nvkm/engine/sec2/gp102.c  | 16 ++--
+ .../gpu/drm/nouveau/nvkm/engine/sec2/tu102.c  |  7 +-
+ drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild    |  3 +
+ drivers/gpu/drm/nouveau/nvkm/falcon/base.c    | 37 +--------
+ drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c   | 83 +++++++++++++++++++
+ drivers/gpu/drm/nouveau/nvkm/falcon/gp102.c   | 32 +++++++
+ drivers/gpu/drm/nouveau/nvkm/falcon/priv.h    |  8 ++
+ drivers/gpu/drm/nouveau/nvkm/falcon/v1.c      | 43 ----------
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/gv100.c   |  6 +-
+ .../gpu/drm/nouveau/nvkm/subdev/pmu/gm200.c   | 17 +---
+ .../gpu/drm/nouveau/nvkm/subdev/pmu/gp102.c   | 29 +++++--
+ 16 files changed, 185 insertions(+), 143 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/falcon/gp102.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h b/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
+index 2db6b5d2ebc6..625ffe31eaaf 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
+@@ -5,6 +5,13 @@
+ int nvkm_falcon_ctor(const struct nvkm_falcon_func *, struct nvkm_subdev *owner,
+ 		     const char *name, u32 addr, struct nvkm_falcon *);
+ void nvkm_falcon_dtor(struct nvkm_falcon *);
++int nvkm_falcon_reset(struct nvkm_falcon *);
++
++int gm200_flcn_reset_wait_mem_scrubbing(struct nvkm_falcon *);
++int gm200_flcn_disable(struct nvkm_falcon *);
++int gm200_flcn_enable(struct nvkm_falcon *);
++
++int gp102_flcn_reset_eng(struct nvkm_falcon *);
+ 
+ void nvkm_falcon_v1_load_imem(struct nvkm_falcon *,
+ 			      void *, u32, u32, u16, u8, bool);
+@@ -15,11 +22,8 @@ int nvkm_falcon_v1_wait_for_halt(struct nvkm_falcon *, u32);
+ int nvkm_falcon_v1_clear_interrupt(struct nvkm_falcon *, u32);
+ void nvkm_falcon_v1_set_start_addr(struct nvkm_falcon *, u32 start_addr);
+ void nvkm_falcon_v1_start(struct nvkm_falcon *);
+-int nvkm_falcon_v1_enable(struct nvkm_falcon *);
+-void nvkm_falcon_v1_disable(struct nvkm_falcon *);
+ 
+ void gp102_sec2_flcn_bind_context(struct nvkm_falcon *, struct nvkm_memory *);
+-int gp102_sec2_flcn_enable(struct nvkm_falcon *);
+ 
+ #define FLCN_PRINTK(f,l,p,fmt,a...) ({                                                          \
+ 	if ((f)->owner->name != (f)->name)                                                      \
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+index 780e25fdd119..45c73893f100 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+@@ -57,6 +57,12 @@ int nvkm_falcon_new_(const struct nvkm_falcon_func *, struct nvkm_device *,
+ 		     enum nvkm_subdev_type, int inst, bool enable, u32 addr, struct nvkm_engine **);
+ 
+ struct nvkm_falcon_func {
++	int (*disable)(struct nvkm_falcon *);
++	int (*enable)(struct nvkm_falcon *);
++	bool reset_pmc;
++	int (*reset_eng)(struct nvkm_falcon *);
++	int (*reset_wait_mem_scrubbing)(struct nvkm_falcon *);
++
+ 	struct {
+ 		u32 *data;
+ 		u32  size;
+@@ -80,9 +86,6 @@ struct nvkm_falcon_func {
+ 	int (*clear_interrupt)(struct nvkm_falcon *, u32);
+ 	void (*set_start_addr)(struct nvkm_falcon *, u32 start_addr);
+ 	void (*start)(struct nvkm_falcon *);
+-	int (*enable)(struct nvkm_falcon *falcon);
+-	void (*disable)(struct nvkm_falcon *falcon);
+-	int (*reset)(struct nvkm_falcon *);
+ 
+ 	struct {
+ 		u32 head;
+@@ -122,7 +125,4 @@ void nvkm_falcon_set_start_addr(struct nvkm_falcon *, u32);
+ void nvkm_falcon_start(struct nvkm_falcon *);
+ int nvkm_falcon_wait_for_halt(struct nvkm_falcon *, u32);
+ int nvkm_falcon_clear_interrupt(struct nvkm_falcon *, u32);
+-int nvkm_falcon_enable(struct nvkm_falcon *);
+-void nvkm_falcon_disable(struct nvkm_falcon *);
+-int nvkm_falcon_reset(struct nvkm_falcon *);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
+index 68da77df856a..ee14115d669c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
+@@ -2073,17 +2073,9 @@ gf100_gr_ = {
+ 
+ static const struct nvkm_falcon_func
+ gf100_gr_flcn = {
+-	.fbif = 0x600,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+ 	.load_dmem = nvkm_falcon_v1_load_dmem,
+-	.read_dmem = nvkm_falcon_v1_read_dmem,
+-	.bind_context = nvkm_falcon_v1_bind_context,
+-	.wait_for_halt = nvkm_falcon_v1_wait_for_halt,
+-	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+-	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = nvkm_falcon_v1_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
+index 8c44ce44a6d7..d9425e9195ce 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
+@@ -23,6 +23,10 @@
+ 
+ static const struct nvkm_falcon_func
+ gm107_nvdec_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_pmc = true,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.debug = 0xd00,
+ 	.fbif = 0x600,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+@@ -33,8 +37,6 @@ gm107_nvdec_flcn = {
+ 	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+ 	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = nvkm_falcon_v1_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ };
+ 
+ static const struct nvkm_nvdec_func
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/nvenc/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/nvenc/gm107.c
+index f44d41bf2034..ad27d8b97569 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/nvenc/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/nvenc/gm107.c
+@@ -24,17 +24,6 @@
+ 
+ static const struct nvkm_falcon_func
+ gm107_nvenc_flcn = {
+-	.fbif = 0x800,
+-	.load_imem = nvkm_falcon_v1_load_imem,
+-	.load_dmem = nvkm_falcon_v1_load_dmem,
+-	.read_dmem = nvkm_falcon_v1_read_dmem,
+-	.bind_context = nvkm_falcon_v1_bind_context,
+-	.wait_for_halt = nvkm_falcon_v1_wait_for_halt,
+-	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+-	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+-	.start = nvkm_falcon_v1_start,
+-	.enable = nvkm_falcon_v1_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ };
+ 
+ static const struct nvkm_nvenc_func
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/sec2/gp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/sec2/gp102.c
+index 639ab9dfa452..ae910c9bdc0a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/sec2/gp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/sec2/gp102.c
+@@ -190,15 +190,6 @@ gp102_sec2_intr(struct nvkm_inth *inth)
+ 	return IRQ_HANDLED;
+ }
+ 
+-int
+-gp102_sec2_flcn_enable(struct nvkm_falcon *falcon)
+-{
+-	nvkm_falcon_mask(falcon, 0x3c0, 0x00000001, 0x00000001);
+-	udelay(10);
+-	nvkm_falcon_mask(falcon, 0x3c0, 0x00000001, 0x00000000);
+-	return nvkm_falcon_v1_enable(falcon);
+-}
+-
+ void
+ gp102_sec2_flcn_bind_context(struct nvkm_falcon *falcon,
+ 			     struct nvkm_memory *ctx)
+@@ -240,6 +231,11 @@ gp102_sec2_flcn_bind_context(struct nvkm_falcon *falcon,
+ 
+ static const struct nvkm_falcon_func
+ gp102_sec2_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_pmc = true,
++	.reset_eng = gp102_flcn_reset_eng,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.debug = 0x408,
+ 	.fbif = 0x600,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+@@ -251,8 +247,6 @@ gp102_sec2_flcn = {
+ 	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+ 	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = gp102_sec2_flcn_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ 	.cmdq = { 0xa00, 0xa04, 8 },
+ 	.msgq = { 0xa30, 0xa34, 8 },
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/sec2/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/sec2/tu102.c
+index 39e42be03974..0f859f323504 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/sec2/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/sec2/tu102.c
+@@ -26,6 +26,11 @@
+ 
+ static const struct nvkm_falcon_func
+ tu102_sec2_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_pmc = true,
++	.reset_eng = gp102_flcn_reset_eng,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.debug = 0x408,
+ 	.fbif = 0x600,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+@@ -37,8 +42,6 @@ tu102_sec2_flcn = {
+ 	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+ 	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = nvkm_falcon_v1_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ 	.cmdq = { 0xc00, 0xc04, 8 },
+ 	.msgq = { 0xc80, 0xc84, 8 },
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild b/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
+index d79d783904ee..f2ffca4afbe3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
+@@ -4,3 +4,6 @@ nvkm-y += nvkm/falcon/cmdq.o
+ nvkm-y += nvkm/falcon/msgq.o
+ nvkm-y += nvkm/falcon/qmgr.o
+ nvkm-y += nvkm/falcon/v1.o
++
++nvkm-y += nvkm/falcon/gm200.o
++nvkm-y += nvkm/falcon/gp102.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/base.c b/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
+index 5a5b96dad640..ed88cfb17f12 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
+@@ -85,44 +85,15 @@ nvkm_falcon_start(struct nvkm_falcon *falcon)
+ }
+ 
+ int
+-nvkm_falcon_enable(struct nvkm_falcon *falcon)
++nvkm_falcon_reset(struct nvkm_falcon *falcon)
+ {
+-	struct nvkm_device *device = falcon->owner->device;
+ 	int ret;
+ 
+-	nvkm_mc_enable(device, falcon->owner->type, falcon->owner->inst);
+-	ret = falcon->func->enable(falcon);
+-	if (ret) {
+-		nvkm_mc_disable(device, falcon->owner->type, falcon->owner->inst);
++	ret = falcon->func->disable(falcon);
++	if (WARN_ON(ret))
+ 		return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-void
+-nvkm_falcon_disable(struct nvkm_falcon *falcon)
+-{
+-	struct nvkm_device *device = falcon->owner->device;
+-
+-	/* already disabled, return or wait_idle will timeout */
+-	if (!nvkm_mc_enabled(device, falcon->owner->type, falcon->owner->inst))
+-		return;
+-
+-	falcon->func->disable(falcon);
+-
+-	nvkm_mc_disable(device, falcon->owner->type, falcon->owner->inst);
+-}
+-
+-int
+-nvkm_falcon_reset(struct nvkm_falcon *falcon)
+-{
+-	if (!falcon->func->reset) {
+-		nvkm_falcon_disable(falcon);
+-		return nvkm_falcon_enable(falcon);
+-	}
+ 
+-	return falcon->func->reset(falcon);
++	return nvkm_falcon_enable(falcon);
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c b/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
+new file mode 100644
+index 000000000000..9144bcbc7f45
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
+@@ -0,0 +1,83 @@
++/*
++ * Copyright 2022 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "priv.h"
++
++#include <subdev/mc.h>
++#include <subdev/timer.h>
++
++int
++gm200_flcn_reset_wait_mem_scrubbing(struct nvkm_falcon *falcon)
++{
++	nvkm_falcon_mask(falcon, 0x040, 0x00000000, 0x00000000);
++
++	if (nvkm_msec(falcon->owner->device, 10,
++		if (!(nvkm_falcon_rd32(falcon, 0x10c) & 0x00000006))
++			break;
++	) < 0)
++		return -ETIMEDOUT;
++
++	return 0;
++}
++
++int
++gm200_flcn_enable(struct nvkm_falcon *falcon)
++{
++	struct nvkm_device *device = falcon->owner->device;
++	int ret;
++
++	if (falcon->func->reset_eng) {
++		ret = falcon->func->reset_eng(falcon);
++		if (ret)
++			return ret;
++	}
++
++	if (falcon->func->reset_pmc)
++		nvkm_mc_enable(device, falcon->owner->type, falcon->owner->inst);
++
++	ret = falcon->func->reset_wait_mem_scrubbing(falcon);
++	if (ret)
++		return ret;
++
++	nvkm_falcon_wr32(falcon, 0x084, nvkm_rd32(device, 0x000000));
++	return 0;
++}
++
++int
++gm200_flcn_disable(struct nvkm_falcon *falcon)
++{
++	struct nvkm_device *device = falcon->owner->device;
++	int ret;
++
++	nvkm_falcon_mask(falcon, 0x048, 0x00000003, 0x00000000);
++	nvkm_falcon_wr32(falcon, 0x014, 0xffffffff);
++
++	if (falcon->func->reset_pmc)
++		nvkm_mc_disable(device, falcon->owner->type, falcon->owner->inst);
++
++	if (falcon->func->reset_eng) {
++		ret = falcon->func->reset_eng(falcon);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/gp102.c b/drivers/gpu/drm/nouveau/nvkm/falcon/gp102.c
+new file mode 100644
+index 000000000000..f49918530d0b
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/gp102.c
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2022 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "priv.h"
++
++int
++gp102_flcn_reset_eng(struct nvkm_falcon *falcon)
++{
++	nvkm_falcon_mask(falcon, 0x3c0, 0x00000001, 0x00000001);
++	udelay(10);
++	nvkm_falcon_mask(falcon, 0x3c0, 0x00000001, 0x00000000);
++
++	return falcon->func->reset_wait_mem_scrubbing(falcon);
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/priv.h b/drivers/gpu/drm/nouveau/nvkm/falcon/priv.h
+index 466188752eb0..11a24b9c8569 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/priv.h
+@@ -2,4 +2,12 @@
+ #ifndef __NVKM_FALCON_PRIV_H__
+ #define __NVKM_FALCON_PRIV_H__
+ #include <core/falcon.h>
++
++static inline int
++nvkm_falcon_enable(struct nvkm_falcon *falcon)
++{
++	if (falcon->func->enable)
++		return falcon->func->enable(falcon);
++	return 0;
++}
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c b/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c
+index b0ee4c31414c..9a9e1e6f70a6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c
+@@ -266,46 +266,3 @@ nvkm_falcon_v1_clear_interrupt(struct nvkm_falcon *falcon, u32 mask)
+ 
+ 	return 0;
+ }
+-
+-static int
+-falcon_v1_wait_idle(struct nvkm_falcon *falcon)
+-{
+-	struct nvkm_device *device = falcon->owner->device;
+-	int ret;
+-
+-	ret = nvkm_wait_msec(device, 10, falcon->addr + 0x04c, 0xffff, 0x0);
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-int
+-nvkm_falcon_v1_enable(struct nvkm_falcon *falcon)
+-{
+-	struct nvkm_device *device = falcon->owner->device;
+-	int ret;
+-
+-	ret = nvkm_wait_msec(device, 10, falcon->addr + 0x10c, 0x6, 0x0);
+-	if (ret < 0) {
+-		nvkm_error(falcon->user, "Falcon mem scrubbing timeout\n");
+-		return ret;
+-	}
+-
+-	ret = falcon_v1_wait_idle(falcon);
+-	if (ret)
+-		return ret;
+-
+-	/* enable IRQs */
+-	nvkm_falcon_wr32(falcon, 0x010, 0xff);
+-
+-	return 0;
+-}
+-
+-void
+-nvkm_falcon_v1_disable(struct nvkm_falcon *falcon)
+-{
+-	/* disable IRQs and wait for any previous code to complete */
+-	nvkm_falcon_wr32(falcon, 0x014, 0xff);
+-	falcon_v1_wait_idle(falcon);
+-}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gv100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gv100.c
+index bc1138799ce5..a247e57f7d9f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gv100.c
+@@ -23,6 +23,10 @@
+ 
+ static const struct nvkm_falcon_func
+ gv100_gsp_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_eng = gp102_flcn_reset_eng,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.fbif = 0x600,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+ 	.load_dmem = nvkm_falcon_v1_load_dmem,
+@@ -32,8 +36,6 @@ gv100_gsp_flcn = {
+ 	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+ 	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = gp102_sec2_flcn_enable,
+-	.disable = nvkm_falcon_v1_disable,
+ };
+ 
+ static const struct nvkm_gsp_func
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm200.c b/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm200.c
+index 34e8320421f5..0bd854092da9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm200.c
+@@ -23,18 +23,12 @@
+  */
+ #include "priv.h"
+ 
+-static int
+-gm200_pmu_flcn_reset(struct nvkm_falcon *falcon)
+-{
+-	struct nvkm_pmu *pmu = container_of(falcon, typeof(*pmu), falcon);
+-
+-	nvkm_falcon_wr32(falcon, 0x014, 0x0000ffff);
+-	pmu->func->reset(pmu);
+-	return nvkm_falcon_enable(falcon);
+-}
+-
+ const struct nvkm_falcon_func
+ gm200_pmu_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_pmc = true,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.debug = 0xc08,
+ 	.fbif = 0xe00,
+ 	.load_imem = nvkm_falcon_v1_load_imem,
+@@ -45,9 +39,6 @@ gm200_pmu_flcn = {
+ 	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+ 	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+ 	.start = nvkm_falcon_v1_start,
+-	.enable = nvkm_falcon_v1_enable,
+-	.disable = nvkm_falcon_v1_disable,
+-	.reset = gm200_pmu_flcn_reset,
+ 	.cmdq = { 0x4a0, 0x4b0, 4 },
+ 	.msgq = { 0x4c8, 0x4cc, 0 },
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gp102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gp102.c
+index 9fd1116ebe27..47c7412f86e8 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gp102.c
+@@ -23,18 +23,29 @@
+  */
+ #include "priv.h"
+ 
+-void
+-gp102_pmu_reset(struct nvkm_pmu *pmu)
+-{
+-	struct nvkm_device *device = pmu->subdev.device;
+-	nvkm_mask(device, 0x10a3c0, 0x00000001, 0x00000001);
+-	nvkm_mask(device, 0x10a3c0, 0x00000001, 0x00000000);
+-}
++static const struct nvkm_falcon_func
++gp102_pmu_flcn = {
++	.disable = gm200_flcn_disable,
++	.enable = gm200_flcn_enable,
++	.reset_eng = gp102_flcn_reset_eng,
++	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
++	.debug = 0xc08,
++	.fbif = 0xe00,
++	.load_imem = nvkm_falcon_v1_load_imem,
++	.load_dmem = nvkm_falcon_v1_load_dmem,
++	.read_dmem = nvkm_falcon_v1_read_dmem,
++	.bind_context = nvkm_falcon_v1_bind_context,
++	.wait_for_halt = nvkm_falcon_v1_wait_for_halt,
++	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
++	.set_start_addr = nvkm_falcon_v1_set_start_addr,
++	.start = nvkm_falcon_v1_start,
++	.cmdq = { 0x4a0, 0x4b0, 4 },
++	.msgq = { 0x4c8, 0x4cc, 0 },
++};
+ 
+ static const struct nvkm_pmu_func
+ gp102_pmu = {
+-	.flcn = &gm200_pmu_flcn,
+-	.reset = gp102_pmu_reset,
++	.flcn = &gp102_pmu_flcn,
+ };
+ 
+ static const struct nvkm_pmu_fwif
+-- 
+2.25.1
+

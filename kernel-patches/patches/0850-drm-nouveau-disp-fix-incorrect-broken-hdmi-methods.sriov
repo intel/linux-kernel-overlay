@@ -1,0 +1,133 @@
+From c6af5453c60cb0bd66f9ec9410953a5ba91dc87f Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Mon, 14 Nov 2022 15:38:01 +1000
+Subject: [PATCH 0850/2236] drm/nouveau/disp: fix incorrect/broken hdmi methods
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+These are fixes from Lyude, and were meant to have been included in the
+last round of drm-next patches.
+
+- Fix some nasty memory issues that broke Lyude's display:
+  - 0 initialize both nvif args and parsed HDMI infoframe buffers
+  - Fixed missing memset(…, 0, …) for nvif args before sending VSI
+    infoframe
+  - Fixed incorrect data pointer and size in nvkm_uoutp_mthd_infoframe()
+    (was previously pointing at the start of the nvif_outp_infoframe_args
+    struct instead of at the start of the infoframe data
+- Get rid of duplicated scdc assignments, since we only use it to write the
+  scdc registers
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+---
+ drivers/gpu/drm/nouveau/dispnv50/disp.c       | 28 ++++++++-----------
+ .../gpu/drm/nouveau/nvkm/engine/disp/uoutp.c  |  5 ++--
+ 2 files changed, 15 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index b7084c17f9c1..edcb2529b402 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -739,14 +739,14 @@ nv50_hdmi_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 	struct nouveau_drm *drm = nouveau_drm(encoder->dev);
+ 	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+ 	struct drm_hdmi_info *hdmi = &nv_connector->base.display_info.hdmi;
+-	union hdmi_infoframe infoframe;
++	union hdmi_infoframe infoframe = { 0 };
+ 	const u8 rekey = 56; /* binary driver, and tegra, constant */
+-	u8 config, scdc = 0;
++	u8 scdc = 0;
+ 	u32 max_ac_packet;
+ 	struct {
+ 		struct nvif_outp_infoframe_v0 infoframe;
+ 		u8 data[17];
+-	} args;
++	} args = { 0 };
+ 	int ret, size;
+ 
+ 	max_ac_packet  = mode->htotal - mode->hdisplay;
+@@ -757,27 +757,22 @@ nv50_hdmi_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 	if (hdmi->scdc.scrambling.supported) {
+ 		const bool high_tmds_clock_ratio = mode->clock > 340000;
+ 
+-		ret = drm_scdc_readb(nv_encoder->i2c, SCDC_TMDS_CONFIG, &config);
++		ret = drm_scdc_readb(nv_encoder->i2c, SCDC_TMDS_CONFIG, &scdc);
+ 		if (ret < 0) {
+ 			NV_ERROR(drm, "Failure to read SCDC_TMDS_CONFIG: %d\n", ret);
+ 			return;
+ 		}
+ 
+-		config &= ~(SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE);
++		scdc &= ~(SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE);
+ 		if (high_tmds_clock_ratio || hdmi->scdc.scrambling.low_rates)
+-			config |= SCDC_SCRAMBLING_ENABLE;
++			scdc |= SCDC_SCRAMBLING_ENABLE;
+ 		if (high_tmds_clock_ratio)
+-			config |= SCDC_TMDS_BIT_CLOCK_RATIO_BY_40;
++			scdc |= SCDC_TMDS_BIT_CLOCK_RATIO_BY_40;
+ 
+-		ret = drm_scdc_writeb(nv_encoder->i2c, SCDC_TMDS_CONFIG, config);
++		ret = drm_scdc_writeb(nv_encoder->i2c, SCDC_TMDS_CONFIG, scdc);
+ 		if (ret < 0)
+ 			NV_ERROR(drm, "Failure to write SCDC_TMDS_CONFIG = 0x%02x: %d\n",
+-				 config, ret);
+-
+-		if (high_tmds_clock_ratio || hdmi->scdc.scrambling.low_rates)
+-			scdc |= NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_SCRAMBLE;
+-		if (high_tmds_clock_ratio)
+-			scdc |= NVIF_OUTP_ACQUIRE_V0_TMDS_HDMI_SCDC_DIV_BY_4;
++				 scdc, ret);
+ 	}
+ 
+ 	ret = nvif_outp_acquire_tmds(&nv_encoder->outp, nv_crtc->index, true,
+@@ -793,7 +788,7 @@ nv50_hdmi_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 		drm_hdmi_avi_infoframe_quant_range(&infoframe.avi, &nv_connector->base, mode,
+ 						   HDMI_QUANTIZATION_RANGE_FULL);
+ 
+-		size = hdmi_infoframe_pack(&infoframe, args.data, 17);
++		size = hdmi_infoframe_pack(&infoframe, args.data, ARRAY_SIZE(args.data));
+ 	} else {
+ 		size = 0;
+ 	}
+@@ -801,9 +796,10 @@ nv50_hdmi_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 	nvif_outp_infoframe(&nv_encoder->outp, NVIF_OUTP_INFOFRAME_V0_AVI, &args.infoframe, size);
+ 
+ 	/* Vendor InfoFrame. */
++	memset(&args.data, 0, sizeof(args.data));
+ 	if (!drm_hdmi_vendor_infoframe_from_display_mode(&infoframe.vendor.hdmi,
+ 							 &nv_connector->base, mode))
+-		size = hdmi_infoframe_pack(&infoframe, args.data, 17);
++		size = hdmi_infoframe_pack(&infoframe, args.data, ARRAY_SIZE(args.data));
+ 	else
+ 		size = 0;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+index d10ce1e04d32..4f0ca709c85a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+@@ -104,6 +104,7 @@ nvkm_uoutp_mthd_infoframe(struct nvkm_outp *outp, void *argv, u32 argc)
+ {
+ 	struct nvkm_ior *ior = outp->ior;
+ 	union nvif_outp_infoframe_args *args = argv;
++	ssize_t size = argc - sizeof(*args);
+ 
+ 	if (argc < sizeof(args->v0) || args->v0.version != 0)
+ 		return -ENOSYS;
+@@ -112,10 +113,10 @@ nvkm_uoutp_mthd_infoframe(struct nvkm_outp *outp, void *argv, u32 argc)
+ 
+ 	switch (ior->func->hdmi ? args->v0.type : 0xff) {
+ 	case NVIF_OUTP_INFOFRAME_V0_AVI:
+-		ior->func->hdmi->infoframe_avi(ior, args->v0.head, argv, argc);
++		ior->func->hdmi->infoframe_avi(ior, args->v0.head, &args->v0.data, size);
+ 		return 0;
+ 	case NVIF_OUTP_INFOFRAME_V0_VSI:
+-		ior->func->hdmi->infoframe_vsi(ior, args->v0.head, argv, argc);
++		ior->func->hdmi->infoframe_vsi(ior, args->v0.head, &args->v0.data, size);
+ 		return 0;
+ 	default:
+ 		break;
+-- 
+2.25.1
+

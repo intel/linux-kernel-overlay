@@ -1,0 +1,586 @@
+From f420d1c759e9e315a65aabe8ae09f30f3752d70f Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 21 Apr 2021 21:09:54 -0400
+Subject: [PATCH 1117/2236] drm/amdgpu: Add notifier lock for KFD userptrs
+
+Add a per-process MMU notifier lock for processing notifiers from
+userptrs. Use that lock to properly synchronize page table updates with
+MMU notifiers.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Xiaogang Chen<Xiaogang.Chen@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h    |  13 +-
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 212 ++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c       |  12 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.h       |   3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       |  17 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h       |   6 +
+ 6 files changed, 172 insertions(+), 91 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 2b85e4b3fd3c..0040deaf8a83 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -29,6 +29,7 @@
+ #include <linux/mm.h>
+ #include <linux/kthread.h>
+ #include <linux/workqueue.h>
++#include <linux/mmu_notifier.h>
+ #include <kgd_kfd_interface.h>
+ #include <drm/ttm/ttm_execbuf_util.h>
+ #include "amdgpu_sync.h"
+@@ -65,6 +66,7 @@ struct kgd_mem {
+ 	struct mutex lock;
+ 	struct amdgpu_bo *bo;
+ 	struct dma_buf *dmabuf;
++	struct hmm_range *range;
+ 	struct list_head attachments;
+ 	/* protected by amdkfd_process_info.lock */
+ 	struct ttm_validate_buffer validate_list;
+@@ -75,7 +77,7 @@ struct kgd_mem {
+ 
+ 	uint32_t alloc_flags;
+ 
+-	atomic_t invalid;
++	uint32_t invalid;
+ 	struct amdkfd_process_info *process_info;
+ 
+ 	struct amdgpu_sync sync;
+@@ -131,7 +133,8 @@ struct amdkfd_process_info {
+ 	struct amdgpu_amdkfd_fence *eviction_fence;
+ 
+ 	/* MMU-notifier related fields */
+-	atomic_t evicted_bos;
++	struct mutex notifier_lock;
++	uint32_t evicted_bos;
+ 	struct delayed_work restore_userptr_work;
+ 	struct pid *pid;
+ 	bool block_mmu_notifications;
+@@ -180,7 +183,8 @@ int kfd_debugfs_kfd_mem_limits(struct seq_file *m, void *data);
+ bool amdkfd_fence_check_mm(struct dma_fence *f, struct mm_struct *mm);
+ struct amdgpu_amdkfd_fence *to_amdgpu_amdkfd_fence(struct dma_fence *f);
+ int amdgpu_amdkfd_remove_fence_on_pt_pd_bos(struct amdgpu_bo *bo);
+-int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem, struct mm_struct *mm);
++int amdgpu_amdkfd_evict_userptr(struct mmu_interval_notifier *mni,
++				unsigned long cur_seq, struct kgd_mem *mem);
+ #else
+ static inline
+ bool amdkfd_fence_check_mm(struct dma_fence *f, struct mm_struct *mm)
+@@ -201,7 +205,8 @@ int amdgpu_amdkfd_remove_fence_on_pt_pd_bos(struct amdgpu_bo *bo)
+ }
+ 
+ static inline
+-int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem, struct mm_struct *mm)
++int amdgpu_amdkfd_evict_userptr(struct mmu_interval_notifier *mni,
++				unsigned long cur_seq, struct kgd_mem *mem)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index c8dbdbf8593b..3b5c53712d31 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -964,7 +964,9 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
+ 		 * later stage when it is scheduled by another ioctl called by
+ 		 * CRIU master process for the target pid for restore.
+ 		 */
+-		atomic_inc(&mem->invalid);
++		mutex_lock(&process_info->notifier_lock);
++		mem->invalid++;
++		mutex_unlock(&process_info->notifier_lock);
+ 		mutex_unlock(&process_info->lock);
+ 		return 0;
+ 	}
+@@ -1301,6 +1303,7 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 			return -ENOMEM;
+ 
+ 		mutex_init(&info->lock);
++		mutex_init(&info->notifier_lock);
+ 		INIT_LIST_HEAD(&info->vm_list_head);
+ 		INIT_LIST_HEAD(&info->kfd_bo_list);
+ 		INIT_LIST_HEAD(&info->userptr_valid_list);
+@@ -1317,7 +1320,6 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 		}
+ 
+ 		info->pid = get_task_pid(current->group_leader, PIDTYPE_PID);
+-		atomic_set(&info->evicted_bos, 0);
+ 		INIT_DELAYED_WORK(&info->restore_userptr_work,
+ 				  amdgpu_amdkfd_restore_userptr_worker);
+ 
+@@ -1372,6 +1374,7 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
+ 		put_pid(info->pid);
+ create_evict_fence_fail:
+ 		mutex_destroy(&info->lock);
++		mutex_destroy(&info->notifier_lock);
+ 		kfree(info);
+ 	}
+ 	return ret;
+@@ -1513,6 +1516,7 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
+ 		cancel_delayed_work_sync(&process_info->restore_userptr_work);
+ 		put_pid(process_info->pid);
+ 		mutex_destroy(&process_info->lock);
++		mutex_destroy(&process_info->notifier_lock);
+ 		kfree(process_info);
+ 	}
+ }
+@@ -1565,7 +1569,9 @@ int amdgpu_amdkfd_criu_resume(void *p)
+ 
+ 	mutex_lock(&pinfo->lock);
+ 	pr_debug("scheduling work\n");
+-	atomic_inc(&pinfo->evicted_bos);
++	mutex_lock(&pinfo->notifier_lock);
++	pinfo->evicted_bos++;
++	mutex_unlock(&pinfo->notifier_lock);
+ 	if (!READ_ONCE(pinfo->block_mmu_notifications)) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+@@ -1790,8 +1796,13 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
+ 	list_del(&bo_list_entry->head);
+ 	mutex_unlock(&process_info->lock);
+ 
+-	/* No more MMU notifiers */
+-	amdgpu_hmm_unregister(mem->bo);
++	/* Cleanup user pages and MMU notifiers */
++	if (amdgpu_ttm_tt_get_usermm(mem->bo->tbo.ttm)) {
++		amdgpu_hmm_unregister(mem->bo);
++		mutex_lock(&process_info->notifier_lock);
++		amdgpu_ttm_tt_discard_user_pages(mem->bo->tbo.ttm, mem->range);
++		mutex_unlock(&process_info->notifier_lock);
++	}
+ 
+ 	ret = reserve_bo_and_cond_vms(mem, NULL, BO_VM_ALL, &ctx);
+ 	if (unlikely(ret))
+@@ -1881,6 +1892,16 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
+ 	 */
+ 	mutex_lock(&mem->process_info->lock);
+ 
++	/* Lock notifier lock. If we find an invalid userptr BO, we can be
++	 * sure that the MMU notifier is no longer running
++	 * concurrently and the queues are actually stopped
++	 */
++	if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm)) {
++		mutex_lock(&mem->process_info->notifier_lock);
++		is_invalid_userptr = !!mem->invalid;
++		mutex_unlock(&mem->process_info->notifier_lock);
++	}
++
+ 	mutex_lock(&mem->lock);
+ 
+ 	domain = mem->domain;
+@@ -2258,34 +2279,38 @@ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct amdgpu_device *adev,
+  *
+  * Runs in MMU notifier, may be in RECLAIM_FS context. This means it
+  * cannot do any memory allocations, and cannot take any locks that
+- * are held elsewhere while allocating memory. Therefore this is as
+- * simple as possible, using atomic counters.
++ * are held elsewhere while allocating memory.
+  *
+  * It doesn't do anything to the BO itself. The real work happens in
+  * restore, where we get updated page addresses. This function only
+  * ensures that GPU access to the BO is stopped.
+  */
+-int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem,
+-				struct mm_struct *mm)
++int amdgpu_amdkfd_evict_userptr(struct mmu_interval_notifier *mni,
++				unsigned long cur_seq, struct kgd_mem *mem)
+ {
+ 	struct amdkfd_process_info *process_info = mem->process_info;
+-	int evicted_bos;
+ 	int r = 0;
+ 
+-	/* Do not process MMU notifications until stage-4 IOCTL is received */
++	/* Do not process MMU notifications during CRIU restore until
++	 * KFD_CRIU_OP_RESUME IOCTL is received
++	 */
+ 	if (READ_ONCE(process_info->block_mmu_notifications))
+ 		return 0;
+ 
+-	atomic_inc(&mem->invalid);
+-	evicted_bos = atomic_inc_return(&process_info->evicted_bos);
+-	if (evicted_bos == 1) {
++	mutex_lock(&process_info->notifier_lock);
++	mmu_interval_set_seq(mni, cur_seq);
++
++	mem->invalid++;
++	if (++process_info->evicted_bos == 1) {
+ 		/* First eviction, stop the queues */
+-		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_USERPTR);
++		r = kgd2kfd_quiesce_mm(mni->mm,
++				       KFD_QUEUE_EVICTION_TRIGGER_USERPTR);
+ 		if (r)
+ 			pr_err("Failed to quiesce KFD\n");
+ 		schedule_delayed_work(&process_info->restore_userptr_work,
+ 			msecs_to_jiffies(AMDGPU_USERPTR_RESTORE_DELAY_MS));
+ 	}
++	mutex_unlock(&process_info->notifier_lock);
+ 
+ 	return r;
+ }
+@@ -2302,54 +2327,58 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 	struct kgd_mem *mem, *tmp_mem;
+ 	struct amdgpu_bo *bo;
+ 	struct ttm_operation_ctx ctx = { false, false };
+-	int invalid, ret;
++	uint32_t invalid;
++	int ret = 0;
+ 
+-	/* Move all invalidated BOs to the userptr_inval_list and
+-	 * release their user pages by migration to the CPU domain
+-	 */
++	mutex_lock(&process_info->notifier_lock);
++
++	/* Move all invalidated BOs to the userptr_inval_list */
+ 	list_for_each_entry_safe(mem, tmp_mem,
+ 				 &process_info->userptr_valid_list,
+-				 validate_list.head) {
+-		if (!atomic_read(&mem->invalid))
+-			continue; /* BO is still valid */
+-
+-		bo = mem->bo;
+-
+-		if (amdgpu_bo_reserve(bo, true))
+-			return -EAGAIN;
+-		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_CPU);
+-		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+-		amdgpu_bo_unreserve(bo);
+-		if (ret) {
+-			pr_err("%s: Failed to invalidate userptr BO\n",
+-			       __func__);
+-			return -EAGAIN;
+-		}
+-
+-		list_move_tail(&mem->validate_list.head,
+-			       &process_info->userptr_inval_list);
+-	}
+-
+-	if (list_empty(&process_info->userptr_inval_list))
+-		return 0; /* All evicted userptr BOs were freed */
++				 validate_list.head)
++		if (mem->invalid)
++			list_move_tail(&mem->validate_list.head,
++				       &process_info->userptr_inval_list);
+ 
+ 	/* Go through userptr_inval_list and update any invalid user_pages */
+ 	list_for_each_entry(mem, &process_info->userptr_inval_list,
+ 			    validate_list.head) {
+-		struct hmm_range *range;
+-
+-		invalid = atomic_read(&mem->invalid);
++		invalid = mem->invalid;
+ 		if (!invalid)
+ 			/* BO hasn't been invalidated since the last
+-			 * revalidation attempt. Keep its BO list.
++			 * revalidation attempt. Keep its page list.
+ 			 */
+ 			continue;
+ 
+ 		bo = mem->bo;
+ 
++		amdgpu_ttm_tt_discard_user_pages(bo->tbo.ttm, mem->range);
++		mem->range = NULL;
++
++		/* BO reservations and getting user pages (hmm_range_fault)
++		 * must happen outside the notifier lock
++		 */
++		mutex_unlock(&process_info->notifier_lock);
++
++		/* Move the BO to system (CPU) domain if necessary to unmap
++		 * and free the SG table
++		 */
++		if (bo->tbo.resource->mem_type != TTM_PL_SYSTEM) {
++			if (amdgpu_bo_reserve(bo, true))
++				return -EAGAIN;
++			amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_CPU);
++			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++			amdgpu_bo_unreserve(bo);
++			if (ret) {
++				pr_err("%s: Failed to invalidate userptr BO\n",
++				       __func__);
++				return -EAGAIN;
++			}
++		}
++
+ 		/* Get updated user pages */
+ 		ret = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages,
+-						   &range);
++						   &mem->range);
+ 		if (ret) {
+ 			pr_debug("Failed %d to get user pages\n", ret);
+ 
+@@ -2362,30 +2391,32 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 			 */
+ 			if (ret != -EFAULT)
+ 				return ret;
+-		} else {
+ 
+-			/*
+-			 * FIXME: Cannot ignore the return code, must hold
+-			 * notifier_lock
+-			 */
+-			amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, range);
++			ret = 0;
+ 		}
+ 
++		mutex_lock(&process_info->notifier_lock);
++
+ 		/* Mark the BO as valid unless it was invalidated
+ 		 * again concurrently.
+ 		 */
+-		if (atomic_cmpxchg(&mem->invalid, invalid, 0) != invalid)
+-			return -EAGAIN;
++		if (mem->invalid != invalid) {
++			ret = -EAGAIN;
++			goto unlock_out;
++		}
++		mem->invalid = 0;
+ 	}
+ 
+-	return 0;
++unlock_out:
++	mutex_unlock(&process_info->notifier_lock);
++
++	return ret;
+ }
+ 
+ /* Validate invalid userptr BOs
+  *
+- * Validates BOs on the userptr_inval_list, and moves them back to the
+- * userptr_valid_list. Also updates GPUVM page tables with new page
+- * addresses and waits for the page table updates to complete.
++ * Validates BOs on the userptr_inval_list. Also updates GPUVM page tables
++ * with new page addresses and waits for the page table updates to complete.
+  */
+ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
+ {
+@@ -2456,9 +2487,6 @@ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
+ 			}
+ 		}
+ 
+-		list_move_tail(&mem->validate_list.head,
+-			       &process_info->userptr_valid_list);
+-
+ 		/* Update mapping. If the BO was not validated
+ 		 * (because we couldn't get user pages), this will
+ 		 * clear the page table entries, which will result in
+@@ -2474,7 +2502,9 @@ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
+ 			if (ret) {
+ 				pr_err("%s: update PTE failed\n", __func__);
+ 				/* make sure this gets validated again */
+-				atomic_inc(&mem->invalid);
++				mutex_lock(&process_info->notifier_lock);
++				mem->invalid++;
++				mutex_unlock(&process_info->notifier_lock);
+ 				goto unreserve_out;
+ 			}
+ 		}
+@@ -2494,6 +2524,36 @@ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
+ 	return ret;
+ }
+ 
++/* Confirm that all user pages are valid while holding the notifier lock
++ *
++ * Moves valid BOs from the userptr_inval_list back to userptr_val_list.
++ */
++static int confirm_valid_user_pages_locked(struct amdkfd_process_info *process_info)
++{
++	struct kgd_mem *mem, *tmp_mem;
++	int ret = 0;
++
++	list_for_each_entry_safe(mem, tmp_mem,
++				 &process_info->userptr_inval_list,
++				 validate_list.head) {
++		bool valid = amdgpu_ttm_tt_get_user_pages_done(
++				mem->bo->tbo.ttm, mem->range);
++
++		mem->range = NULL;
++		if (!valid) {
++			WARN(!mem->invalid, "Invalid BO not marked invalid");
++			ret = -EAGAIN;
++			continue;
++		}
++		WARN(mem->invalid, "Valid BO is marked invalid");
++
++		list_move_tail(&mem->validate_list.head,
++			       &process_info->userptr_valid_list);
++	}
++
++	return ret;
++}
++
+ /* Worker callback to restore evicted userptr BOs
+  *
+  * Tries to update and validate all userptr BOs. If successful and no
+@@ -2508,9 +2568,11 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 			     restore_userptr_work);
+ 	struct task_struct *usertask;
+ 	struct mm_struct *mm;
+-	int evicted_bos;
++	uint32_t evicted_bos;
+ 
+-	evicted_bos = atomic_read(&process_info->evicted_bos);
++	mutex_lock(&process_info->notifier_lock);
++	evicted_bos = process_info->evicted_bos;
++	mutex_unlock(&process_info->notifier_lock);
+ 	if (!evicted_bos)
+ 		return;
+ 
+@@ -2533,9 +2595,6 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	 * and we can just restart the queues.
+ 	 */
+ 	if (!list_empty(&process_info->userptr_inval_list)) {
+-		if (atomic_read(&process_info->evicted_bos) != evicted_bos)
+-			goto unlock_out; /* Concurrent eviction, try again */
+-
+ 		if (validate_invalid_user_pages(process_info))
+ 			goto unlock_out;
+ 	}
+@@ -2544,10 +2603,17 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	 * be a first eviction that calls quiesce_mm. The eviction
+ 	 * reference counting inside KFD will handle this case.
+ 	 */
+-	if (atomic_cmpxchg(&process_info->evicted_bos, evicted_bos, 0) !=
+-	    evicted_bos)
+-		goto unlock_out;
+-	evicted_bos = 0;
++	mutex_lock(&process_info->notifier_lock);
++	if (process_info->evicted_bos != evicted_bos)
++		goto unlock_notifier_out;
++
++	if (confirm_valid_user_pages_locked(process_info)) {
++		WARN(1, "User pages unexpectedly invalid");
++		goto unlock_notifier_out;
++	}
++
++	process_info->evicted_bos = evicted_bos = 0;
++
+ 	if (kgd2kfd_resume_mm(mm)) {
+ 		pr_err("%s: Failed to resume KFD\n", __func__);
+ 		/* No recovery from this failure. Probably the CP is
+@@ -2555,6 +2621,8 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 		 */
+ 	}
+ 
++unlock_notifier_out:
++	mutex_unlock(&process_info->notifier_lock);
+ unlock_out:
+ 	mutex_unlock(&process_info->lock);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c
+index 65715cb395d8..2dadcfe43d03 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c
+@@ -105,17 +105,11 @@ static bool amdgpu_hmm_invalidate_hsa(struct mmu_interval_notifier *mni,
+ 				      unsigned long cur_seq)
+ {
+ 	struct amdgpu_bo *bo = container_of(mni, struct amdgpu_bo, notifier);
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+ 
+ 	if (!mmu_notifier_range_blockable(range))
+ 		return false;
+ 
+-	mutex_lock(&adev->notifier_lock);
+-
+-	mmu_interval_set_seq(mni, cur_seq);
+-
+-	amdgpu_amdkfd_evict_userptr(bo->kfd_bo, bo->notifier.mm);
+-	mutex_unlock(&adev->notifier_lock);
++	amdgpu_amdkfd_evict_userptr(mni, cur_seq, bo->kfd_bo);
+ 
+ 	return true;
+ }
+@@ -244,9 +238,9 @@ int amdgpu_hmm_range_get_pages(struct mmu_interval_notifier *notifier,
+ 	return r;
+ }
+ 
+-int amdgpu_hmm_range_get_pages_done(struct hmm_range *hmm_range)
++bool amdgpu_hmm_range_get_pages_done(struct hmm_range *hmm_range)
+ {
+-	int r;
++	bool r;
+ 
+ 	r = mmu_interval_read_retry(hmm_range->notifier,
+ 				    hmm_range->notifier_seq);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.h
+index 13ed94d3b01b..e2edcd010ccc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.h
+@@ -29,12 +29,13 @@
+ #include <linux/rwsem.h>
+ #include <linux/workqueue.h>
+ #include <linux/interval_tree.h>
++#include <linux/mmu_notifier.h>
+ 
+ int amdgpu_hmm_range_get_pages(struct mmu_interval_notifier *notifier,
+ 			       uint64_t start, uint64_t npages, bool readonly,
+ 			       void *owner, struct page **pages,
+ 			       struct hmm_range **phmm_range);
+-int amdgpu_hmm_range_get_pages_done(struct hmm_range *hmm_range);
++bool amdgpu_hmm_range_get_pages_done(struct hmm_range *hmm_range);
+ 
+ #if defined(CONFIG_HMM_MIRROR)
+ int amdgpu_hmm_register(struct amdgpu_bo *bo, unsigned long addr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index b4236572eae1..f0e4c7309438 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -695,8 +695,19 @@ int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages,
+ 	return r;
+ }
+ 
++/* amdgpu_ttm_tt_discard_user_pages - Discard range and pfn array allocations
++ */
++void amdgpu_ttm_tt_discard_user_pages(struct ttm_tt *ttm,
++				      struct hmm_range *range)
++{
++	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++
++	if (gtt && gtt->userptr && range)
++		amdgpu_hmm_range_get_pages_done(range);
++}
++
+ /*
+- * amdgpu_ttm_tt_userptr_range_done - stop HMM track the CPU page table change
++ * amdgpu_ttm_tt_get_user_pages_done - stop HMM track the CPU page table change
+  * Check if the pages backing this ttm range have been invalidated
+  *
+  * Returns: true if pages are still valid
+@@ -714,10 +725,6 @@ bool amdgpu_ttm_tt_get_user_pages_done(struct ttm_tt *ttm,
+ 
+ 	WARN_ONCE(!range->hmm_pfns, "No user pages to check\n");
+ 
+-	/*
+-	 * FIXME: Must always hold notifier_lock for this, and must
+-	 * not ignore the return code.
+-	 */
+ 	return !amdgpu_hmm_range_get_pages_done(range);
+ }
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index b4d8ba2789f3..e2cd5894afc9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -159,6 +159,8 @@ uint64_t amdgpu_ttm_domain_start(struct amdgpu_device *adev, uint32_t type);
+ #if IS_ENABLED(CONFIG_DRM_AMDGPU_USERPTR)
+ int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages,
+ 				 struct hmm_range **range);
++void amdgpu_ttm_tt_discard_user_pages(struct ttm_tt *ttm,
++				      struct hmm_range *range);
+ bool amdgpu_ttm_tt_get_user_pages_done(struct ttm_tt *ttm,
+ 				       struct hmm_range *range);
+ #else
+@@ -168,6 +170,10 @@ static inline int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo,
+ {
+ 	return -EPERM;
+ }
++static inline void amdgpu_ttm_tt_discard_user_pages(struct ttm_tt *ttm,
++						    struct hmm_range *range)
++{
++}
+ static inline bool amdgpu_ttm_tt_get_user_pages_done(struct ttm_tt *ttm,
+ 						     struct hmm_range *range)
+ {
+-- 
+2.25.1
+

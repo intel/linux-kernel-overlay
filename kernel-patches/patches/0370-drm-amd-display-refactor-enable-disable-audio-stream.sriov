@@ -1,0 +1,348 @@
+From cbf906b7f1655155fa7c12bd7963602af1ebe471 Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <wenjing.liu@amd.com>
+Date: Thu, 20 Oct 2022 11:46:32 -0400
+Subject: [PATCH 0370/2236] drm/amd/display: refactor enable/disable audio
+ stream hw sequence
+
+[why]
+1. As recommended by hardware team, don't enable APG when stream is not
+   enabled.
+2. Move audio stream encoder programming into link_hwss.
+
+[how]
+1. Merge dp_audio_enable into enable audio stream hw sequence.
+2. Move stream encoder programming into link hwss level to unify stream
+   encoder programming interface.
+
+Tested-by: Mark Broadworth <mark.broadworth@amd.com>
+Reviewed-by: Charlene Liu <Charlene.Liu@amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>
+Signed-off-by: Wenjing Liu <wenjing.liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/core/dc_link.c |  6 +--
+ .../gpu/drm/amd/display/dc/core/dc_link_dp.c  | 14 +-----
+ .../display/dc/dce110/dce110_hw_sequencer.c   | 50 ++++---------------
+ .../drm/amd/display/dc/dcn20/dcn20_hwseq.c    |  8 ---
+ .../gpu/drm/amd/display/dc/dcn31/dcn31_apg.c  |  2 -
+ .../gpu/drm/amd/display/dc/inc/link_hwss.h    |  2 +
+ .../drm/amd/display/dc/link/link_hwss_dio.c   | 35 +++++++++++++
+ .../drm/amd/display/dc/link/link_hwss_dio.h   |  2 +
+ .../drm/amd/display/dc/link/link_hwss_dpia.c  |  2 +
+ .../amd/display/dc/link/link_hwss_hpo_dp.c    | 15 ++++++
+ 10 files changed, 68 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link.c b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+index 40b9d2ce08e6..9ae253da90e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link.c
+@@ -4239,6 +4239,7 @@ static void fpga_dp_hpo_enable_link_and_stream(struct dc_state *state, struct pi
+ 		link_hwss->ext.set_throttled_vcp_size(pipe_ctx, avg_time_slots_per_mtp);
+ 
+ 	dc->hwss.unblank_stream(pipe_ctx, &stream->link->cur_link_settings);
++	dc->hwss.enable_audio_stream(pipe_ctx);
+ }
+ 
+ void core_link_enable_stream(
+@@ -4318,10 +4319,7 @@ void core_link_enable_stream(
+ 			/* Still enable stream features & audio on seamless boot for DP external displays */
+ 			if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT) {
+ 				enable_stream_features(pipe_ctx);
+-				if (pipe_ctx->stream_res.audio != NULL) {
+-					pipe_ctx->stream_res.stream_enc->funcs->dp_audio_enable(pipe_ctx->stream_res.stream_enc);
+-					dc->hwss.enable_audio_stream(pipe_ctx);
+-				}
++				dc->hwss.enable_audio_stream(pipe_ctx);
+ 			}
+ 
+ #if defined(CONFIG_DRM_AMD_DC_HDCP)
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index 1254d38f1778..bd4cbe02d353 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -7339,19 +7339,7 @@ void dp_retrain_link_dp_test(struct dc_link *link,
+ 			link->dc->hwss.unblank_stream(&pipes[i],
+ 					link_setting);
+ 
+-			if (pipes[i].stream_res.audio) {
+-				/* notify audio driver for
+-				 * audio modes of monitor */
+-				pipes[i].stream_res.audio->funcs->az_enable(
+-						pipes[i].stream_res.audio);
+-
+-				/* un-mute audio */
+-				/* TODO: audio should be per stream rather than
+-				 * per link */
+-				pipes[i].stream_res.stream_enc->funcs->
+-				audio_mute_control(
+-					pipes[i].stream_res.stream_enc, false);
+-			}
++			link->dc->hwss.enable_audio_stream(&pipes[i]);
+ 		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+index d260eaa1509e..a34bc631be00 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_hw_sequencer.c
+@@ -688,16 +688,6 @@ void dce110_enable_stream(struct pipe_ctx *pipe_ctx)
+ 		early_control = lane_count;
+ 
+ 	tg->funcs->set_early_control(tg, early_control);
+-
+-	/* enable audio only within mode set */
+-	if (pipe_ctx->stream_res.audio != NULL) {
+-		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-			pipe_ctx->stream_res.stream_enc->funcs->dp_audio_enable(pipe_ctx->stream_res.stream_enc);
+-	}
+-
+-
+-
+-
+ }
+ 
+ static enum bp_result link_transmitter_control(
+@@ -1081,12 +1071,14 @@ void dce110_enable_audio_stream(struct pipe_ctx *pipe_ctx)
+ 	struct dc *dc;
+ 	struct clk_mgr *clk_mgr;
+ 	unsigned int i, num_audio = 1;
++	const struct link_hwss *link_hwss;
+ 
+ 	if (!pipe_ctx->stream)
+ 		return;
+ 
+ 	dc = pipe_ctx->stream->ctx->dc;
+ 	clk_mgr = dc->clk_mgr;
++	link_hwss = get_link_hwss(pipe_ctx->stream->link, &pipe_ctx->link_res);
+ 
+ 	if (pipe_ctx->stream_res.audio && pipe_ctx->stream_res.audio->enabled == true)
+ 		return;
+@@ -1103,56 +1095,35 @@ void dce110_enable_audio_stream(struct pipe_ctx *pipe_ctx)
+ 		if (num_audio >= 1 && clk_mgr->funcs->enable_pme_wa)
+ 			/*this is the first audio. apply the PME w/a in order to wake AZ from D3*/
+ 			clk_mgr->funcs->enable_pme_wa(clk_mgr);
+-		/* un-mute audio */
+-		/* TODO: audio should be per stream rather than per link */
+-		if (is_dp_128b_132b_signal(pipe_ctx))
+-			pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->audio_mute_control(
+-					pipe_ctx->stream_res.hpo_dp_stream_enc, false);
+-		else
+-			pipe_ctx->stream_res.stream_enc->funcs->audio_mute_control(
+-					pipe_ctx->stream_res.stream_enc, false);
++
++		link_hwss->enable_audio_packet(pipe_ctx);
++
+ 		if (pipe_ctx->stream_res.audio)
+ 			pipe_ctx->stream_res.audio->enabled = true;
+ 	}
+-
+-	if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-		dp_source_sequence_trace(pipe_ctx->stream->link, DPCD_SOURCE_SEQ_AFTER_ENABLE_AUDIO_STREAM);
+ }
+ 
+ void dce110_disable_audio_stream(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc *dc;
+ 	struct clk_mgr *clk_mgr;
++	const struct link_hwss *link_hwss;
+ 
+ 	if (!pipe_ctx || !pipe_ctx->stream)
+ 		return;
+ 
+ 	dc = pipe_ctx->stream->ctx->dc;
+ 	clk_mgr = dc->clk_mgr;
++	link_hwss = get_link_hwss(pipe_ctx->stream->link, &pipe_ctx->link_res);
+ 
+ 	if (pipe_ctx->stream_res.audio && pipe_ctx->stream_res.audio->enabled == false)
+ 		return;
+ 
+-	if (is_dp_128b_132b_signal(pipe_ctx))
+-		pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->audio_mute_control(
+-				pipe_ctx->stream_res.hpo_dp_stream_enc, true);
+-	else
+-		pipe_ctx->stream_res.stream_enc->funcs->audio_mute_control(
+-				pipe_ctx->stream_res.stream_enc, true);
++	link_hwss->disable_audio_packet(pipe_ctx);
++
+ 	if (pipe_ctx->stream_res.audio) {
+ 		pipe_ctx->stream_res.audio->enabled = false;
+ 
+-		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-			if (is_dp_128b_132b_signal(pipe_ctx))
+-				pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->dp_audio_disable(
+-						pipe_ctx->stream_res.hpo_dp_stream_enc);
+-			else
+-				pipe_ctx->stream_res.stream_enc->funcs->dp_audio_disable(
+-						pipe_ctx->stream_res.stream_enc);
+-		else
+-			pipe_ctx->stream_res.stream_enc->funcs->hdmi_audio_disable(
+-					pipe_ctx->stream_res.stream_enc);
+-
+ 		if (clk_mgr->funcs->enable_pme_wa)
+ 			/*this is the first audio. apply the PME w/a in order to wake AZ from D3*/
+ 			clk_mgr->funcs->enable_pme_wa(clk_mgr);
+@@ -1163,9 +1134,6 @@ void dce110_disable_audio_stream(struct pipe_ctx *pipe_ctx)
+ 		 * stream->stream_engine_id);
+ 		 */
+ 	}
+-
+-	if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-		dp_source_sequence_trace(pipe_ctx->stream->link, DPCD_SOURCE_SEQ_AFTER_DISABLE_AUDIO_STREAM);
+ }
+ 
+ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index f348bc15a925..99efcfe13d38 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -2624,14 +2624,6 @@ void dcn20_enable_stream(struct pipe_ctx *pipe_ctx)
+ 
+ 	if (dc->hwseq->funcs.set_pixels_per_cycle)
+ 		dc->hwseq->funcs.set_pixels_per_cycle(pipe_ctx);
+-
+-	/* enable audio only within mode set */
+-	if (pipe_ctx->stream_res.audio != NULL) {
+-		if (is_dp_128b_132b_signal(pipe_ctx))
+-			pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->dp_audio_enable(pipe_ctx->stream_res.hpo_dp_stream_enc);
+-		else if (dc_is_dp_signal(pipe_ctx->stream->signal))
+-			pipe_ctx->stream_res.stream_enc->funcs->dp_audio_enable(pipe_ctx->stream_res.stream_enc);
+-	}
+ }
+ 
+ void dcn20_program_dmdata_engine(struct pipe_ctx *pipe_ctx)
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c
+index de5e18c2a3ac..2cec7131a96f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c
+@@ -134,8 +134,6 @@ static void apg31_se_audio_setup(
+ 
+ 	/* Disable forced mem power off */
+ 	REG_UPDATE(APG_MEM_PWR, APG_MEM_PWR_FORCE, 0);
+-
+-	apg31_enable(apg);
+ }
+ 
+ static void apg31_audio_mute_control(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h b/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
+index 89964c980b87..7a2c8bc280d5 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/link_hwss.h
+@@ -79,6 +79,8 @@ struct link_hwss {
+ 	void (*disable_link_output)(struct dc_link *link,
+ 			const struct link_resource *link_res,
+ 			enum signal_type signal);
++	void (*enable_audio_packet)(struct pipe_ctx *pipe_ctx);
++	void (*disable_audio_packet)(struct pipe_ctx *pipe_ctx);
+ };
+ #endif /* __DC_LINK_HWSS_H__ */
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.c b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.c
+index 4227adbc646a..fcc3ce2b8fbf 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.c
+@@ -170,11 +170,46 @@ static void update_dio_stream_allocation_table(struct dc_link *link,
+ 	link_enc->funcs->update_mst_stream_allocation_table(link_enc, table);
+ }
+ 
++void enable_dio_audio_packet(struct pipe_ctx *pipe_ctx)
++{
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
++		pipe_ctx->stream_res.stream_enc->funcs->dp_audio_enable(
++				pipe_ctx->stream_res.stream_enc);
++
++	pipe_ctx->stream_res.stream_enc->funcs->audio_mute_control(
++			pipe_ctx->stream_res.stream_enc, false);
++
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
++		dp_source_sequence_trace(pipe_ctx->stream->link,
++				DPCD_SOURCE_SEQ_AFTER_ENABLE_AUDIO_STREAM);
++}
++
++void disable_dio_audio_packet(struct pipe_ctx *pipe_ctx)
++{
++	pipe_ctx->stream_res.stream_enc->funcs->audio_mute_control(
++			pipe_ctx->stream_res.stream_enc, true);
++
++	if (pipe_ctx->stream_res.audio) {
++		if (dc_is_dp_signal(pipe_ctx->stream->signal))
++			pipe_ctx->stream_res.stream_enc->funcs->dp_audio_disable(
++					pipe_ctx->stream_res.stream_enc);
++		else
++			pipe_ctx->stream_res.stream_enc->funcs->hdmi_audio_disable(
++					pipe_ctx->stream_res.stream_enc);
++	}
++
++	if (dc_is_dp_signal(pipe_ctx->stream->signal))
++		dp_source_sequence_trace(pipe_ctx->stream->link,
++				DPCD_SOURCE_SEQ_AFTER_DISABLE_AUDIO_STREAM);
++}
++
+ static const struct link_hwss dio_link_hwss = {
+ 	.setup_stream_encoder = setup_dio_stream_encoder,
+ 	.reset_stream_encoder = reset_dio_stream_encoder,
+ 	.setup_stream_attribute = setup_dio_stream_attribute,
+ 	.disable_link_output = disable_dio_link_output,
++	.enable_audio_packet = enable_dio_audio_packet,
++	.disable_audio_packet = disable_dio_audio_packet,
+ 	.ext = {
+ 		.set_throttled_vcp_size = set_dio_throttled_vcp_size,
+ 		.enable_dp_link_output = enable_dio_dp_link_output,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.h b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.h
+index 126d37f847a1..006830376e7d 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dio.h
+@@ -50,5 +50,7 @@ void set_dio_dp_lane_settings(struct dc_link *link,
+ 		const struct link_resource *link_res,
+ 		const struct dc_link_settings *link_settings,
+ 		const struct dc_lane_settings lane_settings[LANE_COUNT_DP_MAX]);
++void enable_dio_audio_packet(struct pipe_ctx *pipe_ctx);
++void disable_dio_audio_packet(struct pipe_ctx *pipe_ctx);
+ 
+ #endif /* __LINK_HWSS_DIO_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dpia.c b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dpia.c
+index 64f7ea6a9aa3..f81949221e0d 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_hwss_dpia.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_hwss_dpia.c
+@@ -57,6 +57,8 @@ static const struct link_hwss dpia_link_hwss = {
+ 	.reset_stream_encoder = reset_dio_stream_encoder,
+ 	.setup_stream_attribute = setup_dio_stream_attribute,
+ 	.disable_link_output = disable_dio_link_output,
++	.enable_audio_packet = enable_dio_audio_packet,
++	.disable_audio_packet = disable_dio_audio_packet,
+ 	.ext = {
+ 		.set_throttled_vcp_size = set_dio_throttled_vcp_size,
+ 		.enable_dp_link_output = enable_dio_dp_link_output,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c b/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
+index 153a88381f2c..668a66832579 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_hwss_hpo_dp.c
+@@ -262,11 +262,26 @@ static void update_hpo_dp_stream_allocation_table(struct dc_link *link,
+ 			table);
+ }
+ 
++static void enable_hpo_dp_audio_packet(struct pipe_ctx *pipe_ctx)
++{
++	pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->dp_audio_enable(
++			pipe_ctx->stream_res.hpo_dp_stream_enc);
++}
++
++static void disable_hpo_dp_audio_packet(struct pipe_ctx *pipe_ctx)
++{
++	if (pipe_ctx->stream_res.audio)
++		pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->dp_audio_disable(
++				pipe_ctx->stream_res.hpo_dp_stream_enc);
++}
++
+ static const struct link_hwss hpo_dp_link_hwss = {
+ 	.setup_stream_encoder = setup_hpo_dp_stream_encoder,
+ 	.reset_stream_encoder = reset_hpo_dp_stream_encoder,
+ 	.setup_stream_attribute = setup_hpo_dp_stream_attribute,
+ 	.disable_link_output = disable_hpo_dp_link_output,
++	.enable_audio_packet = enable_hpo_dp_audio_packet,
++	.disable_audio_packet = disable_hpo_dp_audio_packet,
+ 	.ext = {
+ 		.set_throttled_vcp_size = set_hpo_dp_throttled_vcp_size,
+ 		.set_hblank_min_symbol_width = set_hpo_dp_hblank_min_symbol_width,
+-- 
+2.25.1
+

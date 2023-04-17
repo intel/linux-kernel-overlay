@@ -1,0 +1,266 @@
+From 809c64d6d4f58eeea8c3f85503bab88f4bfc67ef Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:35 +1000
+Subject: [PATCH 0678/2236] drm/nouveau/disp: move DP MST payload config method
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/dispnv50/disp.c       | 26 +++---------
+ drivers/gpu/drm/nouveau/include/nvif/cl5070.h | 18 ---------
+ drivers/gpu/drm/nouveau/include/nvif/if0012.h | 12 ++++++
+ drivers/gpu/drm/nouveau/include/nvif/outp.h   |  2 +
+ drivers/gpu/drm/nouveau/nvif/outp.c           | 21 ++++++++++
+ .../drm/nouveau/nvkm/engine/disp/rootnv50.c   | 40 -------------------
+ .../gpu/drm/nouveau/nvkm/engine/disp/uoutp.c  | 17 ++++++++
+ 7 files changed, 57 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index ca58c6b65339..67087940e304 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -884,16 +884,6 @@ nv50_msto_prepare(struct drm_atomic_state *state,
+ 	struct nv50_mstc *mstc = msto->mstc;
+ 	struct nv50_mstm *mstm = mstc->mstm;
+ 	struct drm_dp_mst_atomic_payload *payload;
+-	struct {
+-		struct nv50_disp_mthd_v1 base;
+-		struct nv50_disp_sor_dp_mst_vcpi_v0 vcpi;
+-	} args = {
+-		.base.version = 1,
+-		.base.method = NV50_DISP_MTHD_V1_SOR_DP_MST_VCPI,
+-		.base.hasht  = mstm->outp->dcb->hasht,
+-		.base.hashm  = (0xf0ff & mstm->outp->dcb->hashm) |
+-			       (0x0100 << msto->head->base.index),
+-	};
+ 
+ 	NV_ATOMIC(drm, "%s: msto prepare\n", msto->encoder.name);
+ 
+@@ -902,22 +892,16 @@ nv50_msto_prepare(struct drm_atomic_state *state,
+ 	// TODO: Figure out if we want to do a better job of handling VCPI allocation failures here?
+ 	if (msto->disabled) {
+ 		drm_dp_remove_payload(mgr, mst_state, payload);
++
++		nvif_outp_dp_mst_vcpi(&mstm->outp->outp, msto->head->base.index, 0, 0, 0, 0);
+ 	} else {
+ 		if (msto->enabled)
+ 			drm_dp_add_payload_part1(mgr, mst_state, payload);
+ 
+-		args.vcpi.start_slot = payload->vc_start_slot;
+-		args.vcpi.num_slots = payload->time_slots;
+-		args.vcpi.pbn = payload->pbn;
+-		args.vcpi.aligned_pbn = payload->time_slots * mst_state->pbn_div;
++		nvif_outp_dp_mst_vcpi(&mstm->outp->outp, msto->head->base.index,
++				      payload->vc_start_slot, payload->time_slots,
++				      payload->pbn, payload->time_slots * mst_state->pbn_div);
+ 	}
+-
+-	NV_ATOMIC(drm, "%s: %s: %02x %02x %04x %04x\n",
+-		  msto->encoder.name, msto->head->base.base.name,
+-		  args.vcpi.start_slot, args.vcpi.num_slots,
+-		  args.vcpi.pbn, args.vcpi.aligned_pbn);
+-
+-	nvif_mthd(&drm->display->disp.object, 0, &args, sizeof(args));
+ }
+ 
+ static int
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+index 15e30fbdc215..75264c89af82 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+@@ -25,22 +25,4 @@ struct nv50_disp_scanoutpos_v0 {
+ 	__u16 htotal;
+ 	__u16 hline;
+ };
+-
+-struct nv50_disp_mthd_v1 {
+-	__u8  version;
+-#define NV50_DISP_MTHD_V1_SOR_DP_MST_VCPI                                  0x26
+-	__u8  method;
+-	__u16 hasht;
+-	__u16 hashm;
+-	__u8  pad06[2];
+-};
+-
+-struct nv50_disp_sor_dp_mst_vcpi_v0 {
+-	__u8  version;
+-	__u8  pad01[1];
+-	__u8  start_slot;
+-	__u8  num_slots;
+-	__u16 pbn;
+-	__u16 aligned_pbn;
+-};
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/if0012.h b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+index 0d2e9a949d98..eb99d84eb844 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/if0012.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+@@ -17,6 +17,7 @@ union nvif_outp_args {
+ #define NVIF_OUTP_V0_HDA_ELD     0x04
+ #define NVIF_OUTP_V0_DP_AUX_PWR  0x05
+ #define NVIF_OUTP_V0_DP_RETRAIN  0x06
++#define NVIF_OUTP_V0_DP_MST_VCPI 0x07
+ 
+ union nvif_outp_load_detect_args {
+ 	struct nvif_outp_load_detect_v0 {
+@@ -106,4 +107,15 @@ union nvif_outp_dp_retrain_args {
+ 	struct nvif_outp_dp_retrain_vn {
+ 	} vn;
+ };
++
++union nvif_outp_dp_mst_vcpi_args {
++	struct nvif_outp_dp_mst_vcpi_v0 {
++		__u8  version;
++		__u8  head;
++		__u8  start_slot;
++		__u8  num_slots;
++		__u16 pbn;
++		__u16 aligned_pbn;
++	} v0;
++};
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/outp.h b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+index ea3e0a936c8a..45daadec3c0c 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/outp.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+@@ -28,4 +28,6 @@ int nvif_outp_infoframe(struct nvif_outp *, u8 type, struct nvif_outp_infoframe_
+ int nvif_outp_hda_eld(struct nvif_outp *, int head, void *data, u32 size);
+ int nvif_outp_dp_aux_pwr(struct nvif_outp *, bool enable);
+ int nvif_outp_dp_retrain(struct nvif_outp *);
++int nvif_outp_dp_mst_vcpi(struct nvif_outp *, int head,
++			  u8 start_slot, u8 num_slots, u16 pbn, u16 aligned_pbn);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvif/outp.c b/drivers/gpu/drm/nouveau/nvif/outp.c
+index 56b7c703b137..7da39f1eae9f 100644
+--- a/drivers/gpu/drm/nouveau/nvif/outp.c
++++ b/drivers/gpu/drm/nouveau/nvif/outp.c
+@@ -25,6 +25,27 @@
+ 
+ #include <nvif/class.h>
+ 
++int
++nvif_outp_dp_mst_vcpi(struct nvif_outp *outp, int head,
++		      u8 start_slot, u8 num_slots, u16 pbn, u16 aligned_pbn)
++{
++	struct nvif_outp_dp_mst_vcpi_v0 args;
++	int ret;
++
++	args.version = 0;
++	args.head = head;
++	args.start_slot = start_slot;
++	args.num_slots = num_slots;
++	args.pbn = pbn;
++	args.aligned_pbn = aligned_pbn;
++
++	ret = nvif_object_mthd(&outp->object, NVIF_OUTP_V0_DP_MST_VCPI, &args, sizeof(args));
++	NVIF_ERRON(ret, &outp->object,
++		   "[DP_MST_VCPI head:%d start_slot:%02x num_slots:%02x pbn:%04x aligned_pbn:%04x]",
++		   args.head, args.start_slot, args.num_slots, args.pbn, args.aligned_pbn);
++	return ret;
++}
++
+ int
+ nvif_outp_dp_retrain(struct nvif_outp *outp)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+index 2f42940367a0..3226faff6f38 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+@@ -37,7 +37,6 @@ nv50_disp_root_mthd_(struct nvkm_object *object, u32 mthd, void *data, u32 size)
+ {
+ 	union {
+ 		struct nv50_disp_mthd_v0 v0;
+-		struct nv50_disp_mthd_v1 v1;
+ 	} *args = data;
+ 	struct nvkm_disp *disp = nvkm_udisp(object);
+ 	struct nvkm_outp *temp, *outp = NULL;
+@@ -54,16 +53,6 @@ nv50_disp_root_mthd_(struct nvkm_object *object, u32 mthd, void *data, u32 size)
+ 			   args->v0.version, args->v0.method, args->v0.head);
+ 		mthd = args->v0.method;
+ 		hidx = args->v0.head;
+-	} else
+-	if (!(ret = nvif_unpack(ret, &data, &size, args->v1, 1, 1, true))) {
+-		nvif_ioctl(object, "disp mthd vers %d mthd %02x "
+-				   "type %04x mask %04x\n",
+-			   args->v1.version, args->v1.method,
+-			   args->v1.hasht, args->v1.hashm);
+-		mthd = args->v1.method;
+-		type = args->v1.hasht;
+-		mask = args->v1.hashm;
+-		hidx = ffs((mask >> 8) & 0x0f) - 1;
+ 	} else
+ 		return ret;
+ 
+@@ -90,34 +79,5 @@ nv50_disp_root_mthd_(struct nvkm_object *object, u32 mthd, void *data, u32 size)
+ 		break;
+ 	}
+ 
+-	switch (mthd * !!outp) {
+-	case NV50_DISP_MTHD_V1_SOR_DP_MST_VCPI: {
+-		union {
+-			struct nv50_disp_sor_dp_mst_vcpi_v0 v0;
+-		} *args = data;
+-		int ret = -ENOSYS;
+-		nvif_ioctl(object, "disp sor dp mst vcpi size %d\n", size);
+-		if (!(ret = nvif_unpack(ret, &data, &size, args->v0, 0, 0, false))) {
+-			nvif_ioctl(object, "disp sor dp mst vcpi vers %d "
+-					   "slot %02x/%02x pbn %04x/%04x\n",
+-				   args->v0.version, args->v0.start_slot,
+-				   args->v0.num_slots, args->v0.pbn,
+-				   args->v0.aligned_pbn);
+-			if (!outp->ior->func->dp->vcpi)
+-				return -ENODEV;
+-			outp->ior->func->dp->vcpi(outp->ior, hidx,
+-						 args->v0.start_slot,
+-						 args->v0.num_slots,
+-						 args->v0.pbn,
+-						 args->v0.aligned_pbn);
+-			return 0;
+-		} else
+-			return ret;
+-	}
+-		break;
+-	default:
+-		break;
+-	}
+-
+ 	return -EINVAL;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+index e12a31d428d6..d10ce1e04d32 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+@@ -27,6 +27,22 @@
+ 
+ #include <nvif/if0012.h>
+ 
++static int
++nvkm_uoutp_mthd_dp_mst_vcpi(struct nvkm_outp *outp, void *argv, u32 argc)
++{
++	struct nvkm_ior *ior = outp->ior;
++	union nvif_outp_dp_mst_vcpi_args *args = argv;
++
++	if (argc != sizeof(args->v0) || args->v0.version != 0)
++		return -ENOSYS;
++	if (!ior->func->dp || !ior->func->dp->vcpi || !nvkm_head_find(outp->disp, args->v0.head))
++		return -EINVAL;
++
++	ior->func->dp->vcpi(ior, args->v0.head, args->v0.start_slot, args->v0.num_slots,
++				 args->v0.pbn, args->v0.aligned_pbn);
++	return 0;
++}
++
+ static int
+ nvkm_uoutp_mthd_dp_retrain(struct nvkm_outp *outp, void *argv, u32 argc)
+ {
+@@ -266,6 +282,7 @@ nvkm_uoutp_mthd_acquired(struct nvkm_outp *outp, u32 mthd, void *argv, u32 argc)
+ 	case NVIF_OUTP_V0_INFOFRAME  : return nvkm_uoutp_mthd_infoframe  (outp, argv, argc);
+ 	case NVIF_OUTP_V0_HDA_ELD    : return nvkm_uoutp_mthd_hda_eld    (outp, argv, argc);
+ 	case NVIF_OUTP_V0_DP_RETRAIN : return nvkm_uoutp_mthd_dp_retrain (outp, argv, argc);
++	case NVIF_OUTP_V0_DP_MST_VCPI: return nvkm_uoutp_mthd_dp_mst_vcpi(outp, argv, argc);
+ 	default:
+ 		break;
+ 	}
+-- 
+2.25.1
+

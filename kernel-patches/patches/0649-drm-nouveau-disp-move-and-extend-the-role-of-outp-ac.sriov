@@ -1,0 +1,616 @@
+From 39ac4d4ebcc5cd668919dea329cbd7a8e9979a1c Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:46:32 +1000
+Subject: [PATCH 0649/2236] drm/nouveau/disp: move and extend the role of outp
+ acquire/release methods
+
+There are various pieces of information we pass to NVKM about the next
+modeset, which are generally used while handling supervisor interrupts.
+
+We had to start passing in some information about audio requirements a
+while back to allocate an appropriate SOR in ACQUIRE, so we may as well
+move all this type of information here for other protocols too.
+
+Certain methods will be blocked on non-acquired outputs now, preventing
+NULL pointer derefs from KMS driver bugs.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/dispnv50/crc.c        |  2 +-
+ drivers/gpu/drm/nouveau/dispnv50/disp.c       | 98 ++++++-------------
+ drivers/gpu/drm/nouveau/include/nvif/cl5070.h | 10 --
+ drivers/gpu/drm/nouveau/include/nvif/if0012.h | 32 ++++++
+ drivers/gpu/drm/nouveau/include/nvif/outp.h   | 10 ++
+ drivers/gpu/drm/nouveau/nouveau_encoder.h     |  1 -
+ drivers/gpu/drm/nouveau/nvif/outp.c           | 81 ++++++++++++++-
+ .../drm/nouveau/nvkm/engine/disp/rootnv50.c   | 18 ----
+ .../gpu/drm/nouveau/nvkm/engine/disp/uoutp.c  | 61 ++++++++++++
+ 9 files changed, 213 insertions(+), 100 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/crc.c b/drivers/gpu/drm/nouveau/dispnv50/crc.c
+index b834e8a9ae77..9c942fbd836d 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/crc.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/crc.c
+@@ -463,7 +463,7 @@ void nv50_crc_atomic_set(struct nv50_head *head,
+ 	if (!outp)
+ 		return;
+ 
+-	func->set_src(head, outp->or, nv50_crc_source_type(outp, asyh->crc.src),
++	func->set_src(head, outp->outp.or.id, nv50_crc_source_type(outp, asyh->crc.src),
+ 		      &crc->ctx[crc->ctx_idx]);
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index aa94f8e284dd..093321a93046 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -317,52 +317,6 @@ nv50_outp_dump_caps(struct nouveau_drm *drm,
+ 		 outp->base.base.name, outp->caps.dp_interlace);
+ }
+ 
+-static void
+-nv50_outp_release(struct nouveau_encoder *nv_encoder)
+-{
+-	struct nv50_disp *disp = nv50_disp(nv_encoder->base.base.dev);
+-	struct {
+-		struct nv50_disp_mthd_v1 base;
+-	} args = {
+-		.base.version = 1,
+-		.base.method = NV50_DISP_MTHD_V1_RELEASE,
+-		.base.hasht  = nv_encoder->dcb->hasht,
+-		.base.hashm  = nv_encoder->dcb->hashm,
+-	};
+-
+-	nvif_mthd(&disp->disp->object, 0, &args, sizeof(args));
+-	nv_encoder->or = -1;
+-	nv_encoder->link = 0;
+-}
+-
+-static int
+-nv50_outp_acquire(struct nouveau_encoder *nv_encoder, bool hda)
+-{
+-	struct nouveau_drm *drm = nouveau_drm(nv_encoder->base.base.dev);
+-	struct nv50_disp *disp = nv50_disp(drm->dev);
+-	struct {
+-		struct nv50_disp_mthd_v1 base;
+-		struct nv50_disp_acquire_v0 info;
+-	} args = {
+-		.base.version = 1,
+-		.base.method = NV50_DISP_MTHD_V1_ACQUIRE,
+-		.base.hasht  = nv_encoder->dcb->hasht,
+-		.base.hashm  = nv_encoder->dcb->hashm,
+-		.info.hda = hda,
+-	};
+-	int ret;
+-
+-	ret = nvif_mthd(&disp->disp->object, 0, &args, sizeof(args));
+-	if (ret) {
+-		NV_ERROR(drm, "error acquiring output path: %d\n", ret);
+-		return ret;
+-	}
+-
+-	nv_encoder->or = args.info.or;
+-	nv_encoder->link = args.info.link;
+-	return 0;
+-}
+-
+ static int
+ nv50_outp_atomic_check_view(struct drm_encoder *encoder,
+ 			    struct drm_crtc_state *crtc_state,
+@@ -489,9 +443,9 @@ nv50_dac_atomic_disable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 	struct nv50_core *core = nv50_disp(encoder->dev)->core;
+ 	const u32 ctrl = NVDEF(NV507D, DAC_SET_CONTROL, OWNER, NONE);
+ 
+-	core->func->dac->ctrl(core, nv_encoder->or, ctrl, NULL);
++	core->func->dac->ctrl(core, nv_encoder->outp.or.id, ctrl, NULL);
+ 	nv_encoder->crtc = NULL;
+-	nv50_outp_release(nv_encoder);
++	nvif_outp_release(&nv_encoder->outp);
+ }
+ 
+ static void
+@@ -516,9 +470,9 @@ nv50_dac_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 
+ 	ctrl |= NVDEF(NV507D, DAC_SET_CONTROL, PROTOCOL, RGB_CRT);
+ 
+-	nv50_outp_acquire(nv_encoder, false);
++	nvif_outp_acquire_rgb_crt(&nv_encoder->outp);
+ 
+-	core->func->dac->ctrl(core, nv_encoder->or, ctrl, asyh);
++	core->func->dac->ctrl(core, nv_encoder->outp.or.id, ctrl, asyh);
+ 	asyh->or.depth = 0;
+ 
+ 	nv_encoder->crtc = &nv_crtc->base;
+@@ -634,7 +588,7 @@ nv50_audio_component_get_eld(struct device *kdev, int port, int dev_id,
+ 		nv_connector = nouveau_connector(nv_encoder->audio.connector);
+ 		nv_crtc = nouveau_crtc(nv_encoder->crtc);
+ 
+-		if (!nv_crtc || nv_encoder->or != port || nv_crtc->index != dev_id)
++		if (!nv_crtc || nv_encoder->outp.or.id != port || nv_crtc->index != dev_id)
+ 			continue;
+ 
+ 		*enabled = nv_encoder->audio.enabled;
+@@ -724,6 +678,7 @@ nv50_audio_disable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc)
+ 	struct nouveau_drm *drm = nouveau_drm(encoder->dev);
+ 	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+ 	struct nv50_disp *disp = nv50_disp(encoder->dev);
++	struct nvif_outp *outp = &nv_encoder->outp;
+ 	struct {
+ 		struct nv50_disp_mthd_v1 base;
+ 		struct nv50_disp_sor_hda_eld_v0 eld;
+@@ -743,8 +698,7 @@ nv50_audio_disable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc)
+ 	}
+ 	mutex_unlock(&drm->audio.lock);
+ 
+-	nv50_audio_component_eld_notify(drm->audio.component, nv_encoder->or,
+-					nv_crtc->index);
++	nv50_audio_component_eld_notify(drm->audio.component, outp->or.id, nv_crtc->index);
+ }
+ 
+ static void
+@@ -755,6 +709,7 @@ nv50_audio_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 	struct nouveau_drm *drm = nouveau_drm(encoder->dev);
+ 	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+ 	struct nv50_disp *disp = nv50_disp(encoder->dev);
++	struct nvif_outp *outp = &nv_encoder->outp;
+ 	struct __packed {
+ 		struct {
+ 			struct nv50_disp_mthd_v1 mthd;
+@@ -783,8 +738,7 @@ nv50_audio_enable(struct drm_encoder *encoder, struct nouveau_crtc *nv_crtc,
+ 
+ 	mutex_unlock(&drm->audio.lock);
+ 
+-	nv50_audio_component_eld_notify(drm->audio.component, nv_encoder->or,
+-					nv_crtc->index);
++	nv50_audio_component_eld_notify(drm->audio.component, outp->or.id, nv_crtc->index);
+ }
+ 
+ /******************************************************************************
+@@ -1107,10 +1061,12 @@ nv50_msto_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 	if (WARN_ON(!mstc))
+ 		return;
+ 
+-	if (!mstm->links++)
+-		nv50_outp_acquire(mstm->outp, false /*XXX: MST audio.*/);
++	if (!mstm->links++) {
++		/*XXX: MST audio. */
++		nvif_outp_acquire_dp(&mstm->outp->outp, false);
++	}
+ 
+-	if (mstm->outp->link & 1)
++	if (mstm->outp->outp.or.link & 1)
+ 		proto = NV917D_SOR_SET_CONTROL_PROTOCOL_DP_A;
+ 	else
+ 		proto = NV917D_SOR_SET_CONTROL_PROTOCOL_DP_B;
+@@ -1405,7 +1361,7 @@ nv50_mstm_prepare(struct drm_atomic_state *state,
+ 
+ 	if (mstm->disabled) {
+ 		if (!mstm->links)
+-			nv50_outp_release(mstm->outp);
++			nvif_outp_release(&mstm->outp->outp);
+ 		mstm->disabled = false;
+ 	}
+ }
+@@ -1623,7 +1579,7 @@ nv50_sor_update(struct nouveau_encoder *nv_encoder, u8 head,
+ 		asyh->or.depth = depth;
+ 	}
+ 
+-	core->func->sor->ctrl(core, nv_encoder->or, nv_encoder->ctrl, asyh);
++	core->func->sor->ctrl(core, nv_encoder->outp.or.id, nv_encoder->ctrl, asyh);
+ }
+ 
+ /* TODO: Should we extend this to PWM-only backlights?
+@@ -1667,7 +1623,7 @@ nv50_sor_atomic_disable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 	nv_encoder->update(nv_encoder, nv_crtc->index, NULL, 0, 0);
+ 	nv50_audio_disable(encoder, nv_crtc);
+ 	nv50_hdmi_disable(&nv_encoder->base.base, nv_crtc);
+-	nv50_outp_release(nv_encoder);
++	nvif_outp_release(&nv_encoder->outp);
+ 	nv_encoder->crtc = NULL;
+ }
+ 
+@@ -1707,11 +1663,11 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 	     disp->disp->object.oclass >= GF110_DISP) &&
+ 	    drm_detect_monitor_audio(nv_connector->edid))
+ 		hda = true;
+-	nv50_outp_acquire(nv_encoder, hda);
+ 
+ 	switch (nv_encoder->dcb->type) {
+ 	case DCB_OUTPUT_TMDS:
+-		if (nv_encoder->link & 1) {
++		nvif_outp_acquire_tmds(&nv_encoder->outp, hda);
++		if (nv_encoder->outp.or.link & 1) {
+ 			proto = NV507D_SOR_SET_CONTROL_PROTOCOL_SINGLE_TMDS_A;
+ 			/* Only enable dual-link if:
+ 			 *  - Need to (i.e. rate > 165MHz)
+@@ -1758,12 +1714,14 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *sta
+ 				lvds.lvds.script |= 0x0200;
+ 		}
+ 
++		nvif_outp_acquire_lvds(&nv_encoder->outp);
+ 		nvif_mthd(&disp->disp->object, 0, &lvds, sizeof(lvds));
+ 		break;
+ 	case DCB_OUTPUT_DP:
++		nvif_outp_acquire_dp(&nv_encoder->outp, hda);
+ 		depth = nv50_dp_bpc_to_depth(asyh->or.bpc);
+ 
+-		if (nv_encoder->link & 1)
++		if (nv_encoder->outp.or.link & 1)
+ 			proto = NV887D_SOR_SET_CONTROL_PROTOCOL_DP_A;
+ 		else
+ 			proto = NV887D_SOR_SET_CONTROL_PROTOCOL_DP_B;
+@@ -1921,9 +1879,9 @@ nv50_pior_atomic_disable(struct drm_encoder *encoder, struct drm_atomic_state *s
+ 	struct nv50_core *core = nv50_disp(encoder->dev)->core;
+ 	const u32 ctrl = NVDEF(NV507D, PIOR_SET_CONTROL, OWNER, NONE);
+ 
+-	core->func->pior->ctrl(core, nv_encoder->or, ctrl, NULL);
++	core->func->pior->ctrl(core, nv_encoder->outp.or.id, ctrl, NULL);
+ 	nv_encoder->crtc = NULL;
+-	nv50_outp_release(nv_encoder);
++	nvif_outp_release(&nv_encoder->outp);
+ }
+ 
+ static void
+@@ -1944,8 +1902,6 @@ nv50_pior_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 		break;
+ 	}
+ 
+-	nv50_outp_acquire(nv_encoder, false);
+-
+ 	switch (asyh->or.bpc) {
+ 	case 10: asyh->or.depth = NV837D_PIOR_SET_CONTROL_PIXEL_DEPTH_BPP_30_444; break;
+ 	case  8: asyh->or.depth = NV837D_PIOR_SET_CONTROL_PIXEL_DEPTH_BPP_24_444; break;
+@@ -1955,15 +1911,19 @@ nv50_pior_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_state *st
+ 
+ 	switch (nv_encoder->dcb->type) {
+ 	case DCB_OUTPUT_TMDS:
++		ctrl |= NVDEF(NV507D, PIOR_SET_CONTROL, PROTOCOL, EXT_TMDS_ENC);
++		nvif_outp_acquire_tmds(&nv_encoder->outp, false);
++		break;
+ 	case DCB_OUTPUT_DP:
+ 		ctrl |= NVDEF(NV507D, PIOR_SET_CONTROL, PROTOCOL, EXT_TMDS_ENC);
++		nvif_outp_acquire_dp(&nv_encoder->outp, false);
+ 		break;
+ 	default:
+ 		BUG();
+ 		break;
+ 	}
+ 
+-	core->func->pior->ctrl(core, nv_encoder->or, ctrl, asyh);
++	core->func->pior->ctrl(core, nv_encoder->outp.or.id, ctrl, asyh);
+ 	nv_encoder->crtc = &nv_crtc->base;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+index 56affb606adf..37e669b9c4dc 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/cl5070.h
+@@ -28,8 +28,6 @@ struct nv50_disp_scanoutpos_v0 {
+ 
+ struct nv50_disp_mthd_v1 {
+ 	__u8  version;
+-#define NV50_DISP_MTHD_V1_ACQUIRE                                          0x01
+-#define NV50_DISP_MTHD_V1_RELEASE                                          0x02
+ #define NV50_DISP_MTHD_V1_SOR_HDA_ELD                                      0x21
+ #define NV50_DISP_MTHD_V1_SOR_HDMI_PWR                                     0x22
+ #define NV50_DISP_MTHD_V1_SOR_LVDS_SCRIPT                                  0x23
+@@ -41,14 +39,6 @@ struct nv50_disp_mthd_v1 {
+ 	__u8  pad06[2];
+ };
+ 
+-struct nv50_disp_acquire_v0 {
+-	__u8  version;
+-	__u8  or;
+-	__u8  link;
+-	__u8  hda;
+-	__u8  pad04[4];
+-};
+-
+ struct nv50_disp_sor_hda_eld_v0 {
+ 	__u8  version;
+ 	__u8  pad01[7];
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/if0012.h b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+index 243bd35d942f..8bc00a8c525a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/if0012.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/if0012.h
+@@ -11,6 +11,8 @@ union nvif_outp_args {
+ };
+ 
+ #define NVIF_OUTP_V0_LOAD_DETECT 0x00
++#define NVIF_OUTP_V0_ACQUIRE     0x01
++#define NVIF_OUTP_V0_RELEASE     0x02
+ 
+ union nvif_outp_load_detect_args {
+ 	struct nvif_outp_load_detect_v0 {
+@@ -20,4 +22,34 @@ union nvif_outp_load_detect_args {
+ 		__u32 data; /*TODO: move vbios loadval parsing into nvkm */
+ 	} v0;
+ };
++
++union nvif_outp_acquire_args {
++	struct nvif_outp_acquire_v0 {
++		__u8 version;
++#define NVIF_OUTP_ACQUIRE_V0_RGB_CRT 0x00
++#define NVIF_OUTP_ACQUIRE_V0_TV      0x01
++#define NVIF_OUTP_ACQUIRE_V0_TMDS    0x02
++#define NVIF_OUTP_ACQUIRE_V0_LVDS    0x03
++#define NVIF_OUTP_ACQUIRE_V0_DP      0x04
++		__u8 proto;
++		__u8 or;
++		__u8 link;
++		__u8 pad04[4];
++		union {
++			struct {
++				__u8 hda;
++				__u8 pad01[7];
++			} tmds;
++			struct {
++				__u8 hda;
++				__u8 pad01[7];
++			} dp;
++		};
++	} v0;
++};
++
++union nvif_outp_release_args {
++	struct nvif_outp_release_vn {
++	} vn;
++};
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/outp.h b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+index 0d6aa07a9184..2a45b57b1f75 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/outp.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/outp.h
+@@ -6,9 +6,19 @@ struct nvif_disp;
+ 
+ struct nvif_outp {
+ 	struct nvif_object object;
++
++	struct {
++		int id;
++		int link;
++	} or;
+ };
+ 
+ int nvif_outp_ctor(struct nvif_disp *, const char *name, int id, struct nvif_outp *);
+ void nvif_outp_dtor(struct nvif_outp *);
+ int nvif_outp_load_detect(struct nvif_outp *, u32 loadval);
++int nvif_outp_acquire_rgb_crt(struct nvif_outp *);
++int nvif_outp_acquire_tmds(struct nvif_outp *, bool hda);
++int nvif_outp_acquire_lvds(struct nvif_outp *);
++int nvif_outp_acquire_dp(struct nvif_outp *, bool hda);
++void nvif_outp_release(struct nvif_outp *);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nouveau_encoder.h b/drivers/gpu/drm/nouveau/nouveau_encoder.h
+index b72e5783a00f..b6c51fc60d13 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_encoder.h
++++ b/drivers/gpu/drm/nouveau/nouveau_encoder.h
+@@ -48,7 +48,6 @@ struct nouveau_encoder {
+ 	struct dcb_output *dcb;
+ 	struct nvif_outp outp;
+ 	int or;
+-	int link;
+ 
+ 	struct i2c_adapter *i2c;
+ 	struct nvkm_i2c_aux *aux;
+diff --git a/drivers/gpu/drm/nouveau/nvif/outp.c b/drivers/gpu/drm/nouveau/nvif/outp.c
+index 7bfe91a8d6f9..bd20f75045dc 100644
+--- a/drivers/gpu/drm/nouveau/nvif/outp.c
++++ b/drivers/gpu/drm/nouveau/nvif/outp.c
+@@ -26,6 +26,81 @@
+ #include <nvif/class.h>
+ #include <nvif/if0012.h>
+ 
++void
++nvif_outp_release(struct nvif_outp *outp)
++{
++	int ret = nvif_mthd(&outp->object, NVIF_OUTP_V0_RELEASE, NULL, 0);
++	NVIF_ERRON(ret, &outp->object, "[RELEASE]");
++	outp->or.id = -1;
++}
++
++static inline int
++nvif_outp_acquire(struct nvif_outp *outp, u8 proto, struct nvif_outp_acquire_v0 *args)
++{
++	int ret;
++
++	args->version = 0;
++	args->proto = proto;
++
++	ret = nvif_mthd(&outp->object, NVIF_OUTP_V0_ACQUIRE, args, sizeof(*args));
++	if (ret)
++		return ret;
++
++	outp->or.id = args->or;
++	outp->or.link = args->link;
++	return 0;
++}
++
++int
++nvif_outp_acquire_dp(struct nvif_outp *outp,  bool hda)
++{
++	struct nvif_outp_acquire_v0 args;
++	int ret;
++
++	args.dp.hda = hda;
++
++	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_DP, &args);
++	NVIF_ERRON(ret, &outp->object,
++		   "[ACQUIRE proto:DP hda:%d] or:%d link:%d", args.dp.hda, args.or, args.link);
++	return ret;
++}
++
++int
++nvif_outp_acquire_lvds(struct nvif_outp *outp)
++{
++	struct nvif_outp_acquire_v0 args;
++	int ret;
++
++	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_LVDS, &args);
++	NVIF_ERRON(ret, &outp->object, "[ACQUIRE proto:LVDS] or:%d link:%d", args.or, args.link);
++	return ret;
++}
++
++int
++nvif_outp_acquire_tmds(struct nvif_outp *outp, bool hda)
++{
++	struct nvif_outp_acquire_v0 args;
++	int ret;
++
++	args.tmds.hda = hda;
++
++	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_TMDS, &args);
++	NVIF_ERRON(ret, &outp->object,
++		   "[ACQUIRE proto:TMDS hda:%d] or:%d link:%d", args.tmds.hda, args.or, args.link);
++	return ret;
++}
++
++int
++nvif_outp_acquire_rgb_crt(struct nvif_outp *outp)
++{
++	struct nvif_outp_acquire_v0 args;
++	int ret;
++
++	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_RGB_CRT, &args);
++	NVIF_ERRON(ret, &outp->object, "[ACQUIRE proto:RGB_CRT] or:%d", args.or);
++	return ret;
++}
++
+ int
+ nvif_outp_load_detect(struct nvif_outp *outp, u32 loadval)
+ {
+@@ -58,5 +133,9 @@ nvif_outp_ctor(struct nvif_disp *disp, const char *name, int id, struct nvif_out
+ 	ret = nvif_object_ctor(&disp->object, name ?: "nvifOutp", id, NVIF_CLASS_OUTP,
+ 			       &args, sizeof(args), &outp->object);
+ 	NVIF_ERRON(ret, &disp->object, "[NEW outp id:%d]", id);
+-	return ret;
++	if (ret)
++		return ret;
++
++	outp->or.id = -1;
++	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+index 0af45ccd140c..341f244cddb7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+@@ -91,24 +91,6 @@ nv50_disp_root_mthd_(struct nvkm_object *object, u32 mthd, void *data, u32 size)
+ 	}
+ 
+ 	switch (mthd * !!outp) {
+-	case NV50_DISP_MTHD_V1_ACQUIRE: {
+-		union {
+-			struct nv50_disp_acquire_v0 v0;
+-		} *args = data;
+-		int ret = -ENOSYS;
+-		if (!(ret = nvif_unpack(ret, &data, &size, args->v0, 0, 0, false))) {
+-			ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, args->v0.hda);
+-			if (ret == 0) {
+-				args->v0.or = outp->ior->id;
+-				args->v0.link = outp->ior->asy.link;
+-			}
+-		}
+-		return ret;
+-	}
+-		break;
+-	case NV50_DISP_MTHD_V1_RELEASE:
+-		nvkm_outp_release(outp, NVKM_OUTP_USER);
+-		return 0;
+ 	case NV50_DISP_MTHD_V1_SOR_HDA_ELD: {
+ 		union {
+ 			struct nv50_disp_sor_hda_eld_v0 v0;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+index abedb3e86361..edbed699ade2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/uoutp.c
+@@ -25,6 +25,49 @@
+ 
+ #include <nvif/if0012.h>
+ 
++static int
++nvkm_uoutp_mthd_release(struct nvkm_outp *outp, void *argv, u32 argc)
++{
++	union nvif_outp_release_args *args = argv;
++
++	if (argc != sizeof(args->vn))
++		return -ENOSYS;
++
++	nvkm_outp_release(outp, NVKM_OUTP_USER);
++	return 0;
++}
++
++static int
++nvkm_uoutp_mthd_acquire(struct nvkm_outp *outp, void *argv, u32 argc)
++{
++	union nvif_outp_acquire_args *args = argv;
++	int ret;
++
++	if (argc != sizeof(args->v0) || args->v0.version != 0)
++		return -ENOSYS;
++
++	switch (args->v0.proto) {
++	case NVIF_OUTP_ACQUIRE_V0_RGB_CRT:
++	case NVIF_OUTP_ACQUIRE_V0_LVDS:
++		ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, false);
++		break;
++	case NVIF_OUTP_ACQUIRE_V0_TMDS:
++	case NVIF_OUTP_ACQUIRE_V0_DP:
++		ret = nvkm_outp_acquire(outp, NVKM_OUTP_USER, args->v0.dp.hda);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	if (ret)
++		return ret;
++
++	args->v0.or = outp->ior->id;
++	args->v0.link = outp->ior->asy.link;
++	return 0;
++}
++
+ static int
+ nvkm_uoutp_mthd_load_detect(struct nvkm_outp *outp, void *argv, u32 argc)
+ {
+@@ -48,11 +91,24 @@ nvkm_uoutp_mthd_load_detect(struct nvkm_outp *outp, void *argv, u32 argc)
+ 	return ret;
+ }
+ 
++static int
++nvkm_uoutp_mthd_acquired(struct nvkm_outp *outp, u32 mthd, void *argv, u32 argc)
++{
++	switch (mthd) {
++	case NVIF_OUTP_V0_RELEASE    : return nvkm_uoutp_mthd_release    (outp, argv, argc);
++	default:
++		break;
++	}
++
++	return -EINVAL;
++}
++
+ static int
+ nvkm_uoutp_mthd_noacquire(struct nvkm_outp *outp, u32 mthd, void *argv, u32 argc)
+ {
+ 	switch (mthd) {
+ 	case NVIF_OUTP_V0_LOAD_DETECT: return nvkm_uoutp_mthd_load_detect(outp, argv, argc);
++	case NVIF_OUTP_V0_ACQUIRE    : return nvkm_uoutp_mthd_acquire    (outp, argv, argc);
+ 	default:
+ 		break;
+ 	}
+@@ -73,6 +129,11 @@ nvkm_uoutp_mthd(struct nvkm_object *object, u32 mthd, void *argv, u32 argc)
+ 	if (ret <= 0)
+ 		goto done;
+ 
++	if (outp->ior)
++		ret = nvkm_uoutp_mthd_acquired(outp, mthd, argv, argc);
++	else
++		ret = -EIO;
++
+ done:
+ 	mutex_unlock(&disp->super.mutex);
+ 	return ret;
+-- 
+2.25.1
+

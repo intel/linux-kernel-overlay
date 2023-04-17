@@ -1,0 +1,837 @@
+From bb2d536b2a1c6c8de70f528519bd878964a5b322 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:51 +1000
+Subject: [PATCH 0752/2236] drm/nouveau/flcn: new code to load+boot simple HS
+ FWs (VPR scrubber)
+
+Adds the start of common interfaces to load and boot the HS binaries
+provided by NVIDIA that enable the usage of GR.
+
+ACR already handles most of this, but it's very much tied into ACR's
+init process, and there's other code that could benefit from reusing
+a lot of this stuff too (ie. VBIOS DEVINIT/PreOS, VPR scrubber).
+
+The VPR scrubber code is fairly independent, and a good first target.
+
+- adds better debug output to fw loading process, to ease bring-up/debug
+
+v2:
+- whitespace, 0->false
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/core/falcon.h    |  94 +++++++
+ .../drm/nouveau/include/nvkm/core/firmware.h  |  17 ++
+ .../drm/nouveau/include/nvkm/engine/falcon.h  |   5 +-
+ drivers/gpu/drm/nouveau/nvkm/core/firmware.c  |  42 ++++
+ .../gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c |  11 +-
+ drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild    |   1 +
+ drivers/gpu/drm/nouveau/nvkm/falcon/base.c    |  54 +++++
+ drivers/gpu/drm/nouveau/nvkm/falcon/fw.c      | 229 ++++++++++++++++++
+ drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c   | 144 +++++++++++
+ .../gpu/drm/nouveau/nvkm/subdev/fb/gp102.c    |  63 +----
+ 10 files changed, 594 insertions(+), 66 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/falcon/fw.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h b/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
+index 625ffe31eaaf..d8fd2cbd2872 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/falcon.h
+@@ -1,15 +1,44 @@
+ #ifndef __NVKM_FALCON_H__
+ #define __NVKM_FALCON_H__
++#include <core/firmware.h>
+ #include <engine/falcon.h>
+ 
++enum nvkm_falcon_mem {
++	IMEM,
++	DMEM,
++};
++
++static inline const char *
++nvkm_falcon_mem(enum nvkm_falcon_mem mem)
++{
++	switch (mem) {
++	case IMEM: return "imem";
++	case DMEM: return "dmem";
++	default:
++		WARN_ON(1);
++		return "?mem";
++	}
++}
++
++struct nvkm_falcon_func_pio {
++	int min;
++	int max;
++	void (*wr_init)(struct nvkm_falcon *, u8 port, bool sec, u32 mem_base);
++	void (*wr)(struct nvkm_falcon *, u8 port, const u8 *img, int len, u16 tag);
++};
++
+ int nvkm_falcon_ctor(const struct nvkm_falcon_func *, struct nvkm_subdev *owner,
+ 		     const char *name, u32 addr, struct nvkm_falcon *);
+ void nvkm_falcon_dtor(struct nvkm_falcon *);
+ int nvkm_falcon_reset(struct nvkm_falcon *);
++int nvkm_falcon_pio_wr(struct nvkm_falcon *, const u8 *img, u32 img_base, u8 port,
++		       enum nvkm_falcon_mem mem_type, u32 mem_base, int len, u16 tag, bool sec);
+ 
+ int gm200_flcn_reset_wait_mem_scrubbing(struct nvkm_falcon *);
+ int gm200_flcn_disable(struct nvkm_falcon *);
+ int gm200_flcn_enable(struct nvkm_falcon *);
++extern const struct nvkm_falcon_func_pio gm200_flcn_imem_pio;
++extern const struct nvkm_falcon_func_pio gm200_flcn_dmem_pio;
+ 
+ int gp102_flcn_reset_eng(struct nvkm_falcon *);
+ 
+@@ -33,6 +62,71 @@ void gp102_sec2_flcn_bind_context(struct nvkm_falcon *, struct nvkm_memory *);
+ })
+ #define FLCN_DBG(f,fmt,a...) FLCN_PRINTK((f), DEBUG, info, " "fmt"\n", ##a)
+ #define FLCN_ERR(f,fmt,a...) FLCN_PRINTK((f), ERROR, err, " "fmt"\n", ##a)
++#define FLCN_ERRON(f,c,fmt,a...) \
++	({ bool _cond = (c); _cond ? FLCN_ERR(f, fmt, ##a) : FLCN_DBG(f, fmt, ##a); _cond; })
++
++
++struct nvkm_falcon_fw {
++	const struct nvkm_falcon_fw_func {
++		int (*signature)(struct nvkm_falcon_fw *, u32 *sig_base_src);
++		int (*reset)(struct nvkm_falcon_fw *);
++		int (*load)(struct nvkm_falcon_fw *);
++		int (*boot)(struct nvkm_falcon_fw *,
++			    u32 *mbox0, u32 *mbox1, u32 mbox0_ok, u32 irqsclr);
++	} *func;
++	struct nvkm_firmware fw;
++
++	u32 sig_base_prd;
++	u32 sig_base_dbg;
++	u32 sig_base_img;
++	u32 sig_size;
++	int sig_nr;
++	u8 *sigs;
++
++	u32 nmem_base_img;
++	u32 nmem_base;
++	u32 nmem_size;
++
++	u32 imem_base_img;
++	u32 imem_base;
++	u32 imem_size;
++
++	u32 dmem_base_img;
++	u32 dmem_base;
++	u32 dmem_size;
++	u32 dmem_sign;
++
++	u32 boot_addr;
++
++	struct nvkm_falcon *falcon;
++	struct nvkm_memory *inst;
++	struct nvkm_vmm *vmm;
++};
++
++int nvkm_falcon_fw_ctor(const struct nvkm_falcon_fw_func *, const char *name, struct nvkm_device *,
++		        bool bl, const void *src, u32 len, struct nvkm_falcon *,
++			struct nvkm_falcon_fw *);
++int nvkm_falcon_fw_ctor_hs(const struct nvkm_falcon_fw_func *, const char *name,
++			   struct nvkm_subdev *, const char *bl, const char *img, int ver,
++			   struct nvkm_falcon *falcon, struct nvkm_falcon_fw *fw);
++int nvkm_falcon_fw_sign(struct nvkm_falcon_fw *, u32 sig_base_img, u32 sig_size, const u8 *sigs,
++			int sig_nr_prd, u32 sig_base_prd, int sig_nr_dbg, u32 sig_base_dbg);
++int nvkm_falcon_fw_patch(struct nvkm_falcon_fw *);
++void nvkm_falcon_fw_dtor(struct nvkm_falcon_fw *);
++int nvkm_falcon_fw_oneinit(struct nvkm_falcon_fw *, struct nvkm_falcon *, struct nvkm_vmm *,
++			   struct nvkm_memory *inst);
++int nvkm_falcon_fw_boot(struct nvkm_falcon_fw *, struct nvkm_subdev *user,
++			bool release, u32 *pmbox0, u32 *pmbox1, u32 mbox0_ok, u32 irqsclr);
++
++extern const struct nvkm_falcon_fw_func gm200_flcn_fw;
++int gm200_flcn_fw_signature(struct nvkm_falcon_fw *, u32 *);
++int gm200_flcn_fw_reset(struct nvkm_falcon_fw *);
++int gm200_flcn_fw_load(struct nvkm_falcon_fw *);
++int gm200_flcn_fw_boot(struct nvkm_falcon_fw *, u32 *, u32 *, u32, u32);
++
++#define FLCNFW_PRINTK(f,l,p,fmt,a...) FLCN_PRINTK((f)->falcon, l, p, "%s: "fmt, (f)->fw.name, ##a)
++#define FLCNFW_DBG(f,fmt,a...) FLCNFW_PRINTK((f), DEBUG, info, fmt"\n", ##a)
++#define FLCNFW_ERR(f,fmt,a...) FLCNFW_PRINTK((f), ERROR, err, fmt"\n", ##a)
+ 
+ /**
+  * struct nvfw_falcon_msg - header for all messages
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/firmware.h b/drivers/gpu/drm/nouveau/include/nvkm/core/firmware.h
+index 85bcb80f6873..8453025891a5 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/firmware.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/firmware.h
+@@ -4,6 +4,23 @@
+ #include <core/option.h>
+ #include <core/subdev.h>
+ 
++struct nvkm_firmware {
++	const struct nvkm_firmware_func {
++		enum nvkm_firmware_type {
++			NVKM_FIRMWARE_IMG_RAM,
++		} type;
++	} *func;
++	const char *name;
++	struct nvkm_device *device;
++
++	int len;
++	u8 *img;
++};
++
++int nvkm_firmware_ctor(const struct nvkm_firmware_func *, const char *name, struct nvkm_device *,
++		       const void *ptr, int len, struct nvkm_firmware *);
++void nvkm_firmware_dtor(struct nvkm_firmware *);
++
+ int nvkm_firmware_get(const struct nvkm_subdev *, const char *fwname, int ver,
+ 		      const struct firmware **);
+ void nvkm_firmware_put(const struct firmware *);
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+index 45c73893f100..ca751199379e 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/falcon.h
+@@ -63,6 +63,10 @@ struct nvkm_falcon_func {
+ 	int (*reset_eng)(struct nvkm_falcon *);
+ 	int (*reset_wait_mem_scrubbing)(struct nvkm_falcon *);
+ 
++	u32 debug;
++	const struct nvkm_falcon_func_pio *imem_pio;
++	const struct nvkm_falcon_func_pio *dmem_pio;
++
+ 	struct {
+ 		u32 *data;
+ 		u32  size;
+@@ -74,7 +78,6 @@ struct nvkm_falcon_func {
+ 	void (*init)(struct nvkm_falcon *);
+ 	void (*intr)(struct nvkm_falcon *, struct nvkm_chan *);
+ 
+-	u32 debug;
+ 	u32 fbif;
+ 
+ 	void (*load_imem)(struct nvkm_falcon *, void *, u32, u32, u16, u8, bool);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/core/firmware.c b/drivers/gpu/drm/nouveau/nvkm/core/firmware.c
+index ca1f8463cff5..aa1bf6b5a8cd 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/core/firmware.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/firmware.c
+@@ -107,3 +107,45 @@ nvkm_firmware_put(const struct firmware *fw)
+ {
+ 	release_firmware(fw);
+ }
++
++void
++nvkm_firmware_dtor(struct nvkm_firmware *fw)
++{
++	if (!fw->img)
++		return;
++
++	switch (fw->func->type) {
++	case NVKM_FIRMWARE_IMG_RAM:
++		kfree(fw->img);
++		break;
++	default:
++		WARN_ON(1);
++		break;
++	}
++
++	fw->img = NULL;
++}
++
++int
++nvkm_firmware_ctor(const struct nvkm_firmware_func *func, const char *name,
++		   struct nvkm_device *device, const void *src, int len, struct nvkm_firmware *fw)
++{
++	fw->func = func;
++	fw->name = name;
++	fw->device = device;
++
++	switch (fw->func->type) {
++	case NVKM_FIRMWARE_IMG_RAM:
++		fw->len = len;
++		fw->img = kmemdup(src, fw->len, GFP_KERNEL);
++		break;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++
++	if (!fw->img)
++		return -ENOMEM;
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
+index d9425e9195ce..5d04ded35cc3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/nvdec/gm107.c
+@@ -28,15 +28,8 @@ gm107_nvdec_flcn = {
+ 	.reset_pmc = true,
+ 	.reset_wait_mem_scrubbing = gm200_flcn_reset_wait_mem_scrubbing,
+ 	.debug = 0xd00,
+-	.fbif = 0x600,
+-	.load_imem = nvkm_falcon_v1_load_imem,
+-	.load_dmem = nvkm_falcon_v1_load_dmem,
+-	.read_dmem = nvkm_falcon_v1_read_dmem,
+-	.bind_context = nvkm_falcon_v1_bind_context,
+-	.wait_for_halt = nvkm_falcon_v1_wait_for_halt,
+-	.clear_interrupt = nvkm_falcon_v1_clear_interrupt,
+-	.set_start_addr = nvkm_falcon_v1_set_start_addr,
+-	.start = nvkm_falcon_v1_start,
++	.imem_pio = &gm200_flcn_imem_pio,
++	.dmem_pio = &gm200_flcn_dmem_pio,
+ };
+ 
+ static const struct nvkm_nvdec_func
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild b/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
+index f2ffca4afbe3..6ffde5290b87 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/Kbuild
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: MIT
+ nvkm-y += nvkm/falcon/base.o
+ nvkm-y += nvkm/falcon/cmdq.o
++nvkm-y += nvkm/falcon/fw.o
+ nvkm-y += nvkm/falcon/msgq.o
+ nvkm-y += nvkm/falcon/qmgr.o
+ nvkm-y += nvkm/falcon/v1.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/base.c b/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
+index ed88cfb17f12..c15dda020c77 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
+@@ -24,6 +24,60 @@
+ #include <subdev/mc.h>
+ #include <subdev/top.h>
+ 
++static const struct nvkm_falcon_func_pio *
++nvkm_falcon_pio(struct nvkm_falcon *falcon, enum nvkm_falcon_mem *mem_type, u32 *mem_base)
++{
++	switch (*mem_type) {
++	case IMEM:
++		return falcon->func->imem_pio;
++	case DMEM:
++		if (!falcon->func->emem_addr || *mem_base < falcon->func->emem_addr)
++			return falcon->func->dmem_pio;
++
++		*mem_base -= falcon->func->emem_addr;
++		fallthrough;
++	default:
++		return NULL;
++	}
++}
++
++int
++nvkm_falcon_pio_wr(struct nvkm_falcon *falcon, const u8 *img, u32 img_base, u8 port,
++		   enum nvkm_falcon_mem mem_type, u32 mem_base, int len, u16 tag, bool sec)
++{
++	const struct nvkm_falcon_func_pio *pio = nvkm_falcon_pio(falcon, &mem_type, &mem_base);
++	const char *type = nvkm_falcon_mem(mem_type);
++	int xfer_len;
++
++	if (WARN_ON(!pio || !pio->wr))
++		return -EINVAL;
++
++	FLCN_DBG(falcon, "%s %08x <- %08x bytes at %08x", type, mem_base, len, img_base);
++	if (WARN_ON(!len || (len & (pio->min - 1))))
++		return -EINVAL;
++
++	pio->wr_init(falcon, port, sec, mem_base);
++	do {
++		xfer_len = min(len, pio->max);
++		pio->wr(falcon, port, img, xfer_len, tag++);
++
++		if (nvkm_printk_ok(falcon->owner, falcon->user, NV_DBG_TRACE)) {
++			for (img_base = 0; img_base < xfer_len; img_base += 4, mem_base += 4) {
++				if (((img_base / 4) % 8) == 0)
++					printk(KERN_INFO "%s %08x <-", type, mem_base);
++				printk(KERN_CONT " %08x", *(u32 *)(img + img_base));
++				if ((img_base / 4) == 7 && mem_type == IMEM)
++					printk(KERN_CONT " %04x", tag - 1);
++			}
++		}
++
++		img += xfer_len;
++		len -= xfer_len;
++	} while (len);
++
++	return 0;
++}
++
+ void
+ nvkm_falcon_load_imem(struct nvkm_falcon *falcon, void *data, u32 start,
+ 		      u32 size, u16 tag, u8 port, bool secure)
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/fw.c b/drivers/gpu/drm/nouveau/nvkm/falcon/fw.c
+new file mode 100644
+index 000000000000..12a899dbec35
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/fw.c
+@@ -0,0 +1,229 @@
++/*
++ * Copyright 2022 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "priv.h"
++
++#include <core/memory.h>
++#include <subdev/mmu.h>
++
++#include <nvfw/fw.h>
++#include <nvfw/hs.h>
++
++int
++nvkm_falcon_fw_patch(struct nvkm_falcon_fw *fw)
++{
++	struct nvkm_falcon *falcon = fw->falcon;
++	u32 sig_base_src = fw->sig_base_prd;
++	u32 src, dst, len, i;
++	int idx = 0;
++
++	FLCNFW_DBG(fw, "patching sigs:%d size:%d", fw->sig_nr, fw->sig_size);
++	if (fw->func->signature) {
++		idx = fw->func->signature(fw, &sig_base_src);
++		if (idx < 0)
++			return idx;
++	}
++
++	src = idx * fw->sig_size;
++	dst = fw->sig_base_img;
++	len = fw->sig_size / 4;
++	FLCNFW_DBG(fw, "patch idx:%d src:%08x dst:%08x", idx, sig_base_src + src, dst);
++	for (i = 0; i < len; i++) {
++		u32 sig = *(u32 *)(fw->sigs + src);
++
++		if (nvkm_printk_ok(falcon->owner, falcon->user, NV_DBG_TRACE)) {
++			if (i % 8 == 0)
++				printk(KERN_INFO "sig -> %08x:", dst);
++			printk(KERN_CONT " %08x", sig);
++		}
++
++		*(u32 *)(fw->fw.img + dst) = sig;
++		src += 4;
++		dst += 4;
++	}
++
++	return 0;
++}
++
++static void
++nvkm_falcon_fw_dtor_sigs(struct nvkm_falcon_fw *fw)
++{
++	kfree(fw->sigs);
++	fw->sigs = NULL;
++}
++
++int
++nvkm_falcon_fw_boot(struct nvkm_falcon_fw *fw, struct nvkm_subdev *user,
++		    bool release, u32 *pmbox0, u32 *pmbox1, u32 mbox0_ok, u32 irqsclr)
++{
++	struct nvkm_falcon *falcon = fw->falcon;
++	int ret;
++
++	ret = nvkm_falcon_get(falcon, user);
++	if (ret)
++		return ret;
++
++	if (fw->sigs) {
++		ret = nvkm_falcon_fw_patch(fw);
++		if (ret)
++			goto done;
++
++		nvkm_falcon_fw_dtor_sigs(fw);
++	}
++
++	FLCNFW_DBG(fw, "resetting");
++	fw->func->reset(fw);
++
++	FLCNFW_DBG(fw, "loading");
++	ret = fw->func->load(fw);
++	if (ret)
++		goto done;
++
++	FLCNFW_DBG(fw, "booting");
++	ret = fw->func->boot(fw, pmbox0, pmbox1, mbox0_ok, irqsclr);
++	if (ret)
++		FLCNFW_ERR(fw, "boot failed: %d", ret);
++	else
++		FLCNFW_DBG(fw, "booted");
++
++done:
++	if (ret || release)
++		nvkm_falcon_put(falcon, user);
++	return ret;
++}
++
++int
++nvkm_falcon_fw_oneinit(struct nvkm_falcon_fw *fw, struct nvkm_falcon *falcon,
++		       struct nvkm_vmm *vmm, struct nvkm_memory *inst)
++{
++	fw->falcon = falcon;
++	fw->vmm = nvkm_vmm_ref(vmm);
++	fw->inst = nvkm_memory_ref(inst);
++	return 0;
++}
++
++void
++nvkm_falcon_fw_dtor(struct nvkm_falcon_fw *fw)
++{
++	nvkm_vmm_unref(&fw->vmm);
++	nvkm_memory_unref(&fw->inst);
++	nvkm_falcon_fw_dtor_sigs(fw);
++	nvkm_firmware_dtor(&fw->fw);
++}
++
++static const struct nvkm_firmware_func
++nvkm_falcon_fw = {
++	.type = NVKM_FIRMWARE_IMG_RAM,
++};
++
++int
++nvkm_falcon_fw_sign(struct nvkm_falcon_fw *fw, u32 sig_base_img, u32 sig_size, const u8 *sigs,
++		    int sig_nr_prd, u32 sig_base_prd, int sig_nr_dbg, u32 sig_base_dbg)
++{
++	fw->sig_base_prd = sig_base_prd;
++	fw->sig_base_dbg = sig_base_dbg;
++	fw->sig_base_img = sig_base_img;
++	fw->sig_size = sig_size;
++	fw->sig_nr = sig_nr_prd + sig_nr_dbg;
++
++	fw->sigs = kmalloc_array(fw->sig_nr, fw->sig_size, GFP_KERNEL);
++	if (!fw->sigs)
++		return -ENOMEM;
++
++	memcpy(fw->sigs, sigs + sig_base_prd, sig_nr_prd * fw->sig_size);
++	if (sig_nr_dbg)
++		memcpy(fw->sigs + sig_size, sigs + sig_base_dbg, sig_nr_dbg * fw->sig_size);
++
++	return 0;
++}
++
++int
++nvkm_falcon_fw_ctor(const struct nvkm_falcon_fw_func *func, const char *name,
++		    struct nvkm_device *device, bool dma, const void *src, u32 len,
++		    struct nvkm_falcon *falcon, struct nvkm_falcon_fw *fw)
++{
++	const struct nvkm_firmware_func *type = &nvkm_falcon_fw;
++	int ret;
++
++	fw->func = func;
++
++	ret = nvkm_firmware_ctor(type, name, device, src, len, &fw->fw);
++	if (ret)
++		return ret;
++
++	return falcon ? nvkm_falcon_fw_oneinit(fw, falcon, NULL, NULL) : 0;
++}
++
++int
++nvkm_falcon_fw_ctor_hs(const struct nvkm_falcon_fw_func *func, const char *name,
++		       struct nvkm_subdev *subdev, const char *bl, const char *img, int ver,
++		       struct nvkm_falcon *falcon, struct nvkm_falcon_fw *fw)
++{
++	const struct firmware *blob;
++	const struct nvfw_bin_hdr *hdr;
++	const struct nvfw_hs_header *hshdr;
++	const struct nvfw_hs_load_header *lhdr;
++	u32 loc, sig;
++	int ret;
++
++	ret = nvkm_firmware_load_name(subdev, img, "", ver, &blob);
++	if (ret)
++		return ret;
++
++	hdr = nvfw_bin_hdr(subdev, blob->data);
++	hshdr = nvfw_hs_header(subdev, blob->data + hdr->header_offset);
++	loc = *(u32 *)(blob->data + hshdr->patch_loc);
++	sig = *(u32 *)(blob->data + hshdr->patch_sig);
++
++	ret = nvkm_falcon_fw_ctor(func, name, subdev->device, bl != NULL,
++				  blob->data + hdr->data_offset, hdr->data_size, falcon, fw);
++	if (ret)
++		goto done;
++
++	ret = nvkm_falcon_fw_sign(fw, loc, hshdr->sig_prod_size, blob->data,
++				  1, hshdr->sig_prod_offset + sig,
++				  1, hshdr->sig_dbg_offset + sig);
++	if (ret)
++		goto done;
++
++	lhdr = nvfw_hs_load_header(subdev, blob->data + hshdr->hdr_offset);
++
++	fw->nmem_base_img = 0;
++	fw->nmem_base = lhdr->non_sec_code_off;
++	fw->nmem_size = lhdr->non_sec_code_size;
++
++	fw->imem_base_img = lhdr->apps[0];
++	fw->imem_base = ALIGN(lhdr->apps[0], 0x100);
++	fw->imem_size = lhdr->apps[lhdr->num_apps + 0];
++
++	fw->dmem_base_img = lhdr->data_dma_base;
++	fw->dmem_base = 0;
++	fw->dmem_size = lhdr->data_size;
++	fw->dmem_sign = loc - lhdr->data_dma_base;
++
++	fw->boot_addr = fw->nmem_base;
++done:
++	if (ret)
++		nvkm_falcon_fw_dtor(fw);
++
++	nvkm_firmware_put(blob);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c b/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
+index 9144bcbc7f45..014ca38b8ff3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
+@@ -24,6 +24,55 @@
+ #include <subdev/mc.h>
+ #include <subdev/timer.h>
+ 
++static void
++gm200_flcn_pio_dmem_wr(struct nvkm_falcon *falcon, u8 port, const u8 *img, int len, u16 tag)
++{
++	while (len >= 4) {
++		nvkm_falcon_wr32(falcon, 0x1c4 + (port * 8), *(u32 *)img);
++		img += 4;
++		len -= 4;
++	}
++}
++
++static void
++gm200_flcn_pio_dmem_wr_init(struct nvkm_falcon *falcon, u8 port, bool sec, u32 dmem_base)
++{
++	nvkm_falcon_wr32(falcon, 0x1c0 + (port * 8), BIT(24) | dmem_base);
++}
++
++const struct nvkm_falcon_func_pio
++gm200_flcn_dmem_pio = {
++	.min = 4,
++	.max = 0x100,
++	.wr_init = gm200_flcn_pio_dmem_wr_init,
++	.wr = gm200_flcn_pio_dmem_wr,
++};
++
++static void
++gm200_flcn_pio_imem_wr_init(struct nvkm_falcon *falcon, u8 port, bool sec, u32 imem_base)
++{
++	nvkm_falcon_wr32(falcon, 0x180 + (port * 0x10), (sec ? BIT(28) : 0) | BIT(24) | imem_base);
++}
++
++static void
++gm200_flcn_pio_imem_wr(struct nvkm_falcon *falcon, u8 port, const u8 *img, int len, u16 tag)
++{
++	nvkm_falcon_wr32(falcon, 0x188 + (port * 0x10), tag++);
++	while (len >= 4) {
++		nvkm_falcon_wr32(falcon, 0x184 + (port * 0x10), *(u32 *)img);
++		img += 4;
++		len -= 4;
++	}
++}
++
++const struct nvkm_falcon_func_pio
++gm200_flcn_imem_pio = {
++	.min = 0x100,
++	.max = 0x100,
++	.wr_init = gm200_flcn_pio_imem_wr_init,
++	.wr = gm200_flcn_pio_imem_wr,
++};
++
+ int
+ gm200_flcn_reset_wait_mem_scrubbing(struct nvkm_falcon *falcon)
+ {
+@@ -81,3 +130,98 @@ gm200_flcn_disable(struct nvkm_falcon *falcon)
+ 
+ 	return 0;
+ }
++
++int
++gm200_flcn_fw_boot(struct nvkm_falcon_fw *fw, u32 *pmbox0, u32 *pmbox1, u32 mbox0_ok, u32 irqsclr)
++{
++	struct nvkm_falcon *falcon = fw->falcon;
++	u32 mbox0, mbox1;
++	int ret = 0;
++
++	nvkm_falcon_wr32(falcon, 0x040, pmbox0 ? *pmbox0 : 0xcafebeef);
++	if (pmbox1)
++		nvkm_falcon_wr32(falcon, 0x044, *pmbox1);
++
++	nvkm_falcon_wr32(falcon, 0x104, fw->boot_addr);
++	nvkm_falcon_wr32(falcon, 0x100, 0x00000002);
++
++	if (nvkm_msec(falcon->owner->device, 2000,
++		if (nvkm_falcon_rd32(falcon, 0x100) & 0x00000010)
++			break;
++	) < 0)
++		ret = -ETIMEDOUT;
++
++	mbox0 = nvkm_falcon_rd32(falcon, 0x040);
++	mbox1 = nvkm_falcon_rd32(falcon, 0x044);
++	if (FLCN_ERRON(falcon, ret || mbox0 != mbox0_ok, "mbox %08x %08x", mbox0, mbox1))
++		ret = ret ?: -EIO;
++
++	if (irqsclr)
++		nvkm_falcon_mask(falcon, 0x004, 0xffffffff, irqsclr);
++
++	return ret;
++}
++
++int
++gm200_flcn_fw_load(struct nvkm_falcon_fw *fw)
++{
++	struct nvkm_falcon *falcon = fw->falcon;
++	int ret;
++
++	if (1) {
++		nvkm_falcon_mask(falcon, 0x624, 0x00000080, 0x00000080);
++		nvkm_falcon_wr32(falcon, 0x10c, 0x00000000);
++	}
++
++	ret = nvkm_falcon_pio_wr(falcon, fw->fw.img + fw->nmem_base_img, fw->nmem_base_img, 0,
++				 IMEM, fw->nmem_base, fw->nmem_size, fw->nmem_base >> 8, false);
++	if (ret)
++		return ret;
++
++	ret = nvkm_falcon_pio_wr(falcon, fw->fw.img + fw->imem_base_img, fw->imem_base_img, 0,
++				 IMEM, fw->imem_base, fw->imem_size, fw->imem_base >> 8, true);
++	if (ret)
++		return ret;
++
++	ret = nvkm_falcon_pio_wr(falcon, fw->fw.img + fw->dmem_base_img, fw->dmem_base_img, 0,
++				 DMEM, fw->dmem_base, fw->dmem_size, 0, false);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int
++gm200_flcn_fw_reset(struct nvkm_falcon_fw *fw)
++{
++	return nvkm_falcon_reset(fw->falcon);
++}
++
++int
++gm200_flcn_fw_signature(struct nvkm_falcon_fw *fw, u32 *sig_base_src)
++{
++	struct nvkm_falcon *falcon = fw->falcon;
++	u32 addr = falcon->func->debug;
++	int ret = 0;
++
++	if (addr) {
++		ret = nvkm_falcon_enable(falcon);
++		if (ret)
++			return ret;
++
++		if (nvkm_falcon_rd32(falcon, addr) & 0x00100000) {
++			*sig_base_src = fw->sig_base_dbg;
++			return 1;
++		}
++	}
++
++	return ret;
++}
++
++const struct nvkm_falcon_fw_func
++gm200_flcn_fw = {
++	.signature = gm200_flcn_fw_signature,
++	.reset = gm200_flcn_fw_reset,
++	.load = gm200_flcn_fw_load,
++	.boot = gm200_flcn_fw_boot,
++};
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/gp102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/gp102.c
+index 0e78b3d734a0..e15ac4b7598e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/gp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/gp102.c
+@@ -24,71 +24,22 @@
+ #include "gf100.h"
+ #include "ram.h"
+ 
+-#include <core/firmware.h>
+-#include <core/memory.h>
+-#include <nvfw/fw.h>
+-#include <nvfw/hs.h>
+ #include <engine/nvdec.h>
+ 
+ int
+ gp102_fb_vpr_scrub(struct nvkm_fb *fb)
+ {
+ 	struct nvkm_subdev *subdev = &fb->subdev;
+-	struct nvkm_device *device = subdev->device;
+-	struct nvkm_falcon *falcon = &device->nvdec[0]->falcon;
+-	struct nvkm_blob *blob = &fb->vpr_scrubber;
+-	const struct nvfw_bin_hdr *hsbin_hdr;
+-	const struct nvfw_hs_header *fw_hdr;
+-	const struct nvfw_hs_load_header *lhdr;
+-	void *scrub_data;
+-	u32 patch_loc, patch_sig;
++	struct nvkm_falcon_fw fw = {};
+ 	int ret;
+ 
+-	nvkm_falcon_get(falcon, subdev);
+-
+-	hsbin_hdr = nvfw_bin_hdr(subdev, blob->data);
+-	fw_hdr = nvfw_hs_header(subdev, blob->data + hsbin_hdr->header_offset);
+-	lhdr = nvfw_hs_load_header(subdev, blob->data + fw_hdr->hdr_offset);
+-	scrub_data = blob->data + hsbin_hdr->data_offset;
+-
+-	patch_loc = *(u32 *)(blob->data + fw_hdr->patch_loc);
+-	patch_sig = *(u32 *)(blob->data + fw_hdr->patch_sig);
+-	if (falcon->debug) {
+-		memcpy(scrub_data + patch_loc,
+-		       blob->data + fw_hdr->sig_dbg_offset + patch_sig,
+-		       fw_hdr->sig_dbg_size);
+-	} else {
+-		memcpy(scrub_data + patch_loc,
+-		       blob->data + fw_hdr->sig_prod_offset + patch_sig,
+-		       fw_hdr->sig_prod_size);
+-	}
+-
+-	nvkm_falcon_reset(falcon);
+-	nvkm_falcon_bind_context(falcon, NULL);
+-
+-	nvkm_falcon_load_imem(falcon, scrub_data, lhdr->non_sec_code_off,
+-			      lhdr->non_sec_code_size,
+-			      lhdr->non_sec_code_off >> 8, 0, false);
+-	nvkm_falcon_load_imem(falcon, scrub_data + lhdr->apps[0],
+-			      ALIGN(lhdr->apps[0], 0x100),
+-			      lhdr->apps[1],
+-			      lhdr->apps[0] >> 8, 0, true);
+-	nvkm_falcon_load_dmem(falcon, scrub_data + lhdr->data_dma_base, 0,
+-			      lhdr->data_size, 0);
+-
+-	nvkm_falcon_set_start_addr(falcon, 0x0);
+-	nvkm_falcon_start(falcon);
+-
+-	ret = nvkm_falcon_wait_for_halt(falcon, 500);
+-	if (ret < 0) {
+-		ret = -ETIMEDOUT;
+-		goto end;
+-	}
++	ret = nvkm_falcon_fw_ctor_hs(&gm200_flcn_fw, "mem-unlock", subdev, NULL,
++				     "nvdec/scrubber", 0, &subdev->device->nvdec[0]->falcon, &fw);
++	if (ret)
++		return ret;
+ 
+-	/* put nvdec in clean state - without reset it will remain in HS mode */
+-	nvkm_falcon_reset(falcon);
+-end:
+-	nvkm_falcon_put(falcon, subdev);
++	ret = nvkm_falcon_fw_boot(&fw, subdev, true, NULL, NULL, 0, 0x00000000);
++	nvkm_falcon_fw_dtor(&fw);
+ 	return ret;
+ }
+ 
+-- 
+2.25.1
+

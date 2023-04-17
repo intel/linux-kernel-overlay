@@ -1,0 +1,128 @@
+From 1c4a0e29e61afdcce10cbea6935a7d073f0cf487 Mon Sep 17 00:00:00 2001
+From: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Date: Wed, 23 Nov 2022 12:05:51 +0200
+Subject: [PATCH 1281/2236] drm/i915: Extract VESA DSC bpp alignment to
+ separate function
+
+We might to use that function separately from intel_dp_dsc_compute_config
+for DP DSC over MST case, because allocating bandwidth in that
+case can be a bit more tricky. So in order to avoid code copy-pasta
+lets extract this to separate function and reuse it for both SST
+and MST cases.
+
+v2: Removed multiple blank lines
+v3: Rename intel_dp_dsc_nearest_vesa_bpp to intel_dp_dsc_nearest_valid_bpp
+    to reflect its meaning more properly.
+    (Manasi Navare)
+
+Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221123100551.29080-1-stanislav.lisovskiy@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_dp.c     | 50 +++++++++++++--------
+ drivers/gpu/drm/i915/display/intel_dp.h     |  1 +
+ drivers/gpu/drm/i915/display/intel_dp_mst.c |  1 -
+ 3 files changed, 32 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 6a95c0f5aa4b..ecc14f978721 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -672,6 +672,36 @@ small_joiner_ram_size_bits(struct drm_i915_private *i915)
+ 		return 6144 * 8;
+ }
+ 
++u32 intel_dp_dsc_nearest_valid_bpp(struct drm_i915_private *i915, u32 bpp, u32 pipe_bpp)
++{
++	u32 bits_per_pixel = bpp;
++	int i;
++
++	/* Error out if the max bpp is less than smallest allowed valid bpp */
++	if (bits_per_pixel < valid_dsc_bpp[0]) {
++		drm_dbg_kms(&i915->drm, "Unsupported BPP %u, min %u\n",
++			    bits_per_pixel, valid_dsc_bpp[0]);
++		return 0;
++	}
++
++	/* From XE_LPD onwards we support from bpc upto uncompressed bpp-1 BPPs */
++	if (DISPLAY_VER(i915) >= 13) {
++		bits_per_pixel = min(bits_per_pixel, pipe_bpp - 1);
++	} else {
++		/* Find the nearest match in the array of known BPPs from VESA */
++		for (i = 0; i < ARRAY_SIZE(valid_dsc_bpp) - 1; i++) {
++			if (bits_per_pixel < valid_dsc_bpp[i + 1])
++				break;
++		}
++		drm_dbg_kms(&i915->drm, "Set dsc bpp from %d to VESA %d\n",
++			    bits_per_pixel, valid_dsc_bpp[i]);
++
++		bits_per_pixel = valid_dsc_bpp[i];
++	}
++
++	return bits_per_pixel;
++}
++
+ u16 intel_dp_dsc_get_output_bpp(struct drm_i915_private *i915,
+ 				u32 link_clock, u32 lane_count,
+ 				u32 mode_clock, u32 mode_hdisplay,
+@@ -680,7 +710,6 @@ u16 intel_dp_dsc_get_output_bpp(struct drm_i915_private *i915,
+ 				u32 timeslots)
+ {
+ 	u32 bits_per_pixel, max_bpp_small_joiner_ram;
+-	int i;
+ 
+ 	/*
+ 	 * Available Link Bandwidth(Kbits/sec) = (NumberOfLanes)*
+@@ -713,24 +742,7 @@ u16 intel_dp_dsc_get_output_bpp(struct drm_i915_private *i915,
+ 		bits_per_pixel = min(bits_per_pixel, max_bpp_bigjoiner);
+ 	}
+ 
+-	/* Error out if the max bpp is less than smallest allowed valid bpp */
+-	if (bits_per_pixel < valid_dsc_bpp[0]) {
+-		drm_dbg_kms(&i915->drm, "Unsupported BPP %u, min %u\n",
+-			    bits_per_pixel, valid_dsc_bpp[0]);
+-		return 0;
+-	}
+-
+-	/* From XE_LPD onwards we support from bpc upto uncompressed bpp-1 BPPs */
+-	if (DISPLAY_VER(i915) >= 13) {
+-		bits_per_pixel = min(bits_per_pixel, pipe_bpp - 1);
+-	} else {
+-		/* Find the nearest match in the array of known BPPs from VESA */
+-		for (i = 0; i < ARRAY_SIZE(valid_dsc_bpp) - 1; i++) {
+-			if (bits_per_pixel < valid_dsc_bpp[i + 1])
+-				break;
+-		}
+-		bits_per_pixel = valid_dsc_bpp[i];
+-	}
++	bits_per_pixel = intel_dp_dsc_nearest_valid_bpp(i915, bits_per_pixel, pipe_bpp);
+ 
+ 	/*
+ 	 * Compressed BPP in U6.4 format so multiply by 16, for Gen 11,
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.h b/drivers/gpu/drm/i915/display/intel_dp.h
+index c6539a6915e9..e4faccf87370 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.h
++++ b/drivers/gpu/drm/i915/display/intel_dp.h
+@@ -120,6 +120,7 @@ static inline unsigned int intel_dp_unused_lane_mask(int lane_count)
+ }
+ 
+ u32 intel_dp_mode_to_fec_clock(u32 mode_clock);
++u32 intel_dp_dsc_nearest_valid_bpp(struct drm_i915_private *i915, u32 bpp, u32 pipe_bpp);
+ 
+ void intel_ddi_update_pipe(struct intel_atomic_state *state,
+ 			   struct intel_encoder *encoder,
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 59f80af8d17d..b4f01c01dc1c 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -115,7 +115,6 @@ static int intel_dp_mst_find_vcpi_slots_for_bpp(struct intel_encoder *encoder,
+ 	return slots;
+ }
+ 
+-
+ static int intel_dp_mst_compute_link_config(struct intel_encoder *encoder,
+ 					    struct intel_crtc_state *crtc_state,
+ 					    struct drm_connector_state *conn_state,
+-- 
+2.25.1
+

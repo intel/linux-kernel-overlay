@@ -1,0 +1,121 @@
+From 7ab23256aae78ea4e6d3a336a2b3b3144eb4c147 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 29 Sep 2022 13:05:56 +0200
+Subject: [PATCH 0569/2236] drm/amdgpu: move explicit sync check into the CS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This moves the memory allocation out of the critical code path.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Luben Tuikov <luben.tuikov@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221014084641.128280-8-christian.koenig@amd.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  | 13 ++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c | 15 +++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.h |  2 +-
+ 4 files changed, 17 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 416c690ff109..2241e4b3c40d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -452,8 +452,19 @@ static int amdgpu_syncobj_lookup_and_add(struct amdgpu_cs_parser *p,
+ 	}
+ 
+ 	r = amdgpu_sync_fence(&p->gang_leader->sync, fence);
+-	dma_fence_put(fence);
++	if (r)
++		goto error;
++
++	/*
++	 * When we have an explicit dependency it might be necessary to insert a
++	 * pipeline sync to make sure that all caches etc are flushed and the
++	 * next job actually sees the results from the previous one.
++	 */
++	if (fence->context == p->gang_leader->base.entity->fence_context)
++		r = amdgpu_sync_fence(&p->gang_leader->explicit_sync, fence);
+ 
++error:
++	dma_fence_put(fence);
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+index 258cffe3c06a..774c77bb8f4e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -182,7 +182,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
+ 
+ 	need_ctx_switch = ring->current_ctx != fence_ctx;
+ 	if (ring->funcs->emit_pipeline_sync && job &&
+-	    ((tmp = amdgpu_sync_get_fence(&job->sched_sync)) ||
++	    ((tmp = amdgpu_sync_get_fence(&job->explicit_sync)) ||
+ 	     (amdgpu_sriov_vf(adev) && need_ctx_switch) ||
+ 	     amdgpu_vm_need_pipeline_sync(ring, job))) {
+ 		need_pipe_sync = true;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index aba80e8ed60d..a48be6b7919e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -107,7 +107,7 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	(*job)->vm = vm;
+ 
+ 	amdgpu_sync_create(&(*job)->sync);
+-	amdgpu_sync_create(&(*job)->sched_sync);
++	amdgpu_sync_create(&(*job)->explicit_sync);
+ 	(*job)->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
+ 	(*job)->vm_pd_addr = AMDGPU_BO_INVALID_OFFSET;
+ 
+@@ -181,7 +181,7 @@ static void amdgpu_job_free_cb(struct drm_sched_job *s_job)
+ 	drm_sched_job_cleanup(s_job);
+ 
+ 	amdgpu_sync_free(&job->sync);
+-	amdgpu_sync_free(&job->sched_sync);
++	amdgpu_sync_free(&job->explicit_sync);
+ 
+ 	/* only put the hw fence if has embedded fence */
+ 	if (!job->hw_fence.ops)
+@@ -213,7 +213,7 @@ void amdgpu_job_free(struct amdgpu_job *job)
+ 
+ 	amdgpu_job_free_resources(job);
+ 	amdgpu_sync_free(&job->sync);
+-	amdgpu_sync_free(&job->sched_sync);
++	amdgpu_sync_free(&job->explicit_sync);
+ 	if (job->gang_submit != &job->base.s_fence->scheduled)
+ 		dma_fence_put(job->gang_submit);
+ 
+@@ -260,15 +260,6 @@ amdgpu_job_dependency(struct drm_sched_job *sched_job,
+ 	int r;
+ 
+ 	fence = amdgpu_sync_get_fence(&job->sync);
+-	if (fence && drm_sched_dependency_optimized(fence, s_entity)) {
+-		r = amdgpu_sync_fence(&job->sched_sync, fence);
+-		if (r)
+-			DRM_ERROR("Error adding fence (%d)\n", r);
+-	}
+-
+-	if (!fence && job->gang_submit)
+-		fence = amdgpu_device_switch_gang(ring->adev, job->gang_submit);
+-
+ 	while (!fence && job->vm && !job->vmid) {
+ 		r = amdgpu_vmid_grab(job->vm, ring, job, &fence);
+ 		if (r)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h
+index e2ecab977d0d..ef4bdde7c918 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h
+@@ -48,7 +48,7 @@ struct amdgpu_job {
+ 	struct drm_sched_job    base;
+ 	struct amdgpu_vm	*vm;
+ 	struct amdgpu_sync	sync;
+-	struct amdgpu_sync	sched_sync;
++	struct amdgpu_sync	explicit_sync;
+ 	struct dma_fence	hw_fence;
+ 	struct dma_fence	*gang_submit;
+ 	uint32_t		preamble_status;
+-- 
+2.25.1
+

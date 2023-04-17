@@ -1,0 +1,122 @@
+From 7bb2e93fc885c19d3769b82673b16d36e541d2ec Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Wed, 2 Nov 2022 12:21:09 -0700
+Subject: [PATCH 0625/2236] drm/i915/guc: Don't deadlock busyness stats vs
+ reset
+
+The engine busyness stats has a worker function to do things like
+64bit extend the 32bit hardware counters. The GuC's reset prepare
+function flushes out this worker function to ensure no corruption
+happens during the reset. Unforunately, the worker function has an
+infinite wait for active resets to finish before doing its work. Thus
+a deadlock would occur if the worker function had actually started
+just as the reset starts.
+
+The function being used to lock the reset-in-progress mutex is called
+intel_gt_reset_trylock(). However, as noted it does not follow
+standard 'trylock' conventions and exit if already locked. So rename
+the current _trylock function to intel_gt_reset_lock_interruptible(),
+which is the behaviour it actually provides. In addition, add a new
+implementation of _trylock and call that from the busyness stats
+worker instead.
+
+v2: Rename existing trylock to interruptible rather than trying to
+preserve the existing (confusing) naming scheme (review comments from
+Tvrtko).
+
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221102192109.2492625-3-John.C.Harrison@Intel.com
+---
+ drivers/gpu/drm/i915/gem/i915_gem_mman.c       |  2 +-
+ drivers/gpu/drm/i915/gt/intel_reset.c          | 18 ++++++++++++++++--
+ drivers/gpu/drm/i915/gt/intel_reset.h          |  1 +
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c  |  4 +++-
+ 4 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index d445e2d63c9c..c7c252d4d366 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -330,7 +330,7 @@ static vm_fault_t vm_fault_gtt(struct vm_fault *vmf)
+ 	if (ret)
+ 		goto err_rpm;
+ 
+-	ret = intel_gt_reset_trylock(ggtt->vm.gt, &srcu);
++	ret = intel_gt_reset_lock_interruptible(ggtt->vm.gt, &srcu);
+ 	if (ret)
+ 		goto err_pages;
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_reset.c b/drivers/gpu/drm/i915/gt/intel_reset.c
+index c750e9ee6ed1..78dc5e493c62 100644
+--- a/drivers/gpu/drm/i915/gt/intel_reset.c
++++ b/drivers/gpu/drm/i915/gt/intel_reset.c
+@@ -1429,15 +1429,19 @@ void intel_gt_handle_error(struct intel_gt *gt,
+ 	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+ }
+ 
+-int intel_gt_reset_trylock(struct intel_gt *gt, int *srcu)
++static int _intel_gt_reset_lock(struct intel_gt *gt, int *srcu, bool retry)
+ {
+ 	might_lock(&gt->reset.backoff_srcu);
+-	might_sleep();
++	if (retry)
++		might_sleep();
+ 
+ 	rcu_read_lock();
+ 	while (test_bit(I915_RESET_BACKOFF, &gt->reset.flags)) {
+ 		rcu_read_unlock();
+ 
++		if (!retry)
++			return -EBUSY;
++
+ 		if (wait_event_interruptible(gt->reset.queue,
+ 					     !test_bit(I915_RESET_BACKOFF,
+ 						       &gt->reset.flags)))
+@@ -1451,6 +1455,16 @@ int intel_gt_reset_trylock(struct intel_gt *gt, int *srcu)
+ 	return 0;
+ }
+ 
++int intel_gt_reset_trylock(struct intel_gt *gt, int *srcu)
++{
++	return _intel_gt_reset_lock(gt, srcu, false);
++}
++
++int intel_gt_reset_lock_interruptible(struct intel_gt *gt, int *srcu)
++{
++	return _intel_gt_reset_lock(gt, srcu, true);
++}
++
+ void intel_gt_reset_unlock(struct intel_gt *gt, int tag)
+ __releases(&gt->reset.backoff_srcu)
+ {
+diff --git a/drivers/gpu/drm/i915/gt/intel_reset.h b/drivers/gpu/drm/i915/gt/intel_reset.h
+index adc734e67387..25c975b6e8fc 100644
+--- a/drivers/gpu/drm/i915/gt/intel_reset.h
++++ b/drivers/gpu/drm/i915/gt/intel_reset.h
+@@ -39,6 +39,7 @@ int __intel_engine_reset_bh(struct intel_engine_cs *engine,
+ void __i915_request_reset(struct i915_request *rq, bool guilty);
+ 
+ int __must_check intel_gt_reset_trylock(struct intel_gt *gt, int *srcu);
++int __must_check intel_gt_reset_lock_interruptible(struct intel_gt *gt, int *srcu);
+ void intel_gt_reset_unlock(struct intel_gt *gt, int tag);
+ 
+ void intel_gt_set_wedged(struct intel_gt *gt);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 77f92032a3f3..6c797c695b75 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -1401,7 +1401,9 @@ static void guc_timestamp_ping(struct work_struct *wrk)
+ 
+ 	/*
+ 	 * Synchronize with gt reset to make sure the worker does not
+-	 * corrupt the engine/guc stats.
++	 * corrupt the engine/guc stats. NB: can't actually block waiting
++	 * for a reset to complete as the reset requires flushing out
++	 * this worker thread if started. So waiting would deadlock.
+ 	 */
+ 	ret = intel_gt_reset_trylock(gt, &srcu);
+ 	if (ret)
+-- 
+2.25.1
+

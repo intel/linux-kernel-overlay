@@ -1,0 +1,232 @@
+From 24fa34c6232040f8fc1c633c41fb35e8cd72cf36 Mon Sep 17 00:00:00 2001
+From: xurui <xurui@kylinos.cn>
+Date: Fri, 23 Dec 2022 17:28:58 +0800
+Subject: [PATCH 1614/2236] drm/amdgpu: Retry DDC probing on DVI on failure if
+ we got an HPD interrupt
+
+HPD signals on DVI ports can be fired off before the pins required for
+DDC probing actually make contact, due to the pins for HPD making
+contact first. This results in a HPD signal being asserted but DDC
+probing failing, resulting in hotplugging occasionally failing.
+
+Rescheduling the hotplug work for a second when we run into an HPD
+signal with a failing DDC probe usually gives enough time for the rest
+of the connector's pins to make contact, and fixes this issue.
+
+Signed-off-by: xurui <xurui@kylinos.cn>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  2 +-
+ .../gpu/drm/amd/amdgpu/amdgpu_connectors.c    | 22 ++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h      |  1 +
+ drivers/gpu/drm/amd/amdgpu/dce_v10_0.c        |  6 ++---
+ drivers/gpu/drm/amd/amdgpu/dce_v11_0.c        |  6 ++---
+ drivers/gpu/drm/amd/amdgpu/dce_v6_0.c         |  6 ++---
+ drivers/gpu/drm/amd/amdgpu/dce_v8_0.c         |  6 ++---
+ 8 files changed, 36 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 18735268755c..164141bc8b4a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -876,7 +876,7 @@ struct amdgpu_device {
+ 	struct amdgpu_vkms_output       *amdgpu_vkms_output;
+ 	struct amdgpu_mode_info		mode_info;
+ 	/* For pre-DCE11. DCE11 and later are in "struct amdgpu_device->dm" */
+-	struct work_struct		hotplug_work;
++	struct delayed_work         hotplug_work;
+ 	struct amdgpu_irq_src		crtc_irq;
+ 	struct amdgpu_irq_src		vline0_irq;
+ 	struct amdgpu_irq_src		vupdate_irq;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_connectors.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_connectors.c
+index 2ebbc6382a06..d2abd334b1b5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_connectors.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_connectors.c
+@@ -996,13 +996,33 @@ amdgpu_connector_dvi_detect(struct drm_connector *connector, bool force)
+ 		}
+ 	}
+ 
++	if (amdgpu_connector->detected_hpd_without_ddc) {
++		force = true;
++		amdgpu_connector->detected_hpd_without_ddc = false;
++	}
++
+ 	if (!force && amdgpu_connector_check_hpd_status_unchanged(connector)) {
+ 		ret = connector->status;
+ 		goto exit;
+ 	}
+ 
+-	if (amdgpu_connector->ddc_bus)
++	if (amdgpu_connector->ddc_bus) {
+ 		dret = amdgpu_display_ddc_probe(amdgpu_connector, false);
++
++		/* Sometimes the pins required for the DDC probe on DVI
++		 * connectors don't make contact at the same time that the ones
++		 * for HPD do. If the DDC probe fails even though we had an HPD
++		 * signal, try again later
++		 */
++		if (!dret && !force &&
++		    amdgpu_display_hpd_sense(adev, amdgpu_connector->hpd.hpd)) {
++			DRM_DEBUG_KMS("hpd detected without ddc, retrying in 1 second\n");
++			amdgpu_connector->detected_hpd_without_ddc = true;
++			schedule_delayed_work(&adev->hotplug_work,
++					      msecs_to_jiffies(1000));
++			goto exit;
++		}
++	}
+ 	if (dret) {
+ 		amdgpu_connector->detected_by_load = false;
+ 		amdgpu_connector_free_edid(connector);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index b22471b3bd63..a876648e3d7a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -63,7 +63,7 @@
+ void amdgpu_display_hotplug_work_func(struct work_struct *work)
+ {
+ 	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
+-						  hotplug_work);
++						  hotplug_work.work);
+ 	struct drm_device *dev = adev_to_drm(adev);
+ 	struct drm_mode_config *mode_config = &dev->mode_config;
+ 	struct drm_connector *connector;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 8a39300b1a84..93c73faa5714 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -534,6 +534,7 @@ struct amdgpu_connector {
+ 	void *con_priv;
+ 	bool dac_load_detect;
+ 	bool detected_by_load; /* if the connection status was determined by load */
++	bool detected_hpd_without_ddc; /* if an HPD signal was detected on DVI, but ddc probing failed */
+ 	uint16_t connector_object_id;
+ 	struct amdgpu_hpd hpd;
+ 	struct amdgpu_router router;
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+index 248f1a4e915f..e85e57933cc4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v10_0.c
+@@ -2837,7 +2837,7 @@ static int dce_v10_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	INIT_WORK(&adev->hotplug_work,
++	INIT_DELAYED_WORK(&adev->hotplug_work,
+ 		  amdgpu_display_hotplug_work_func);
+ 
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+@@ -2902,7 +2902,7 @@ static int dce_v10_0_hw_fini(void *handle)
+ 
+ 	dce_v10_0_pageflip_interrupt_fini(adev);
+ 
+-	flush_work(&adev->hotplug_work);
++	flush_delayed_work(&adev->hotplug_work);
+ 
+ 	return 0;
+ }
+@@ -3302,7 +3302,7 @@ static int dce_v10_0_hpd_irq(struct amdgpu_device *adev,
+ 
+ 	if (disp_int & mask) {
+ 		dce_v10_0_hpd_int_ack(adev, hpd);
+-		schedule_work(&adev->hotplug_work);
++		schedule_delayed_work(&adev->hotplug_work, 0);
+ 		DRM_DEBUG("IH: HPD%d\n", hpd + 1);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+index cd9c19060d89..6b406bb7f3f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v11_0.c
+@@ -2956,7 +2956,7 @@ static int dce_v11_0_sw_init(void *handle)
+ 	if (r)
+ 		return r;
+ 
+-	INIT_WORK(&adev->hotplug_work,
++	INIT_DELAYED_WORK(&adev->hotplug_work,
+ 		  amdgpu_display_hotplug_work_func);
+ 
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+@@ -3032,7 +3032,7 @@ static int dce_v11_0_hw_fini(void *handle)
+ 
+ 	dce_v11_0_pageflip_interrupt_fini(adev);
+ 
+-	flush_work(&adev->hotplug_work);
++	flush_delayed_work(&adev->hotplug_work);
+ 
+ 	return 0;
+ }
+@@ -3426,7 +3426,7 @@ static int dce_v11_0_hpd_irq(struct amdgpu_device *adev,
+ 
+ 	if (disp_int & mask) {
+ 		dce_v11_0_hpd_int_ack(adev, hpd);
+-		schedule_work(&adev->hotplug_work);
++		schedule_delayed_work(&adev->hotplug_work, 0);
+ 		DRM_DEBUG("IH: HPD%d\n", hpd + 1);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+index 76323deecc58..2aa21eec0e06 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v6_0.c
+@@ -2715,7 +2715,7 @@ static int dce_v6_0_sw_init(void *handle)
+ 		return r;
+ 
+ 	/* Pre-DCE11 */
+-	INIT_WORK(&adev->hotplug_work,
++	INIT_DELAYED_WORK(&adev->hotplug_work,
+ 		  amdgpu_display_hotplug_work_func);
+ 
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+@@ -2776,7 +2776,7 @@ static int dce_v6_0_hw_fini(void *handle)
+ 
+ 	dce_v6_0_pageflip_interrupt_fini(adev);
+ 
+-	flush_work(&adev->hotplug_work);
++	flush_delayed_work(&adev->hotplug_work);
+ 
+ 	return 0;
+ }
+@@ -3103,7 +3103,7 @@ static int dce_v6_0_hpd_irq(struct amdgpu_device *adev,
+ 		tmp = RREG32(mmDC_HPD1_INT_CONTROL + hpd_offsets[hpd]);
+ 		tmp |= DC_HPD1_INT_CONTROL__DC_HPD1_INT_ACK_MASK;
+ 		WREG32(mmDC_HPD1_INT_CONTROL + hpd_offsets[hpd], tmp);
+-		schedule_work(&adev->hotplug_work);
++		schedule_delayed_work(&adev->hotplug_work, 0);
+ 		DRM_DEBUG("IH: HPD%d\n", hpd + 1);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+index 01cf3ab111cb..9da338889d36 100644
+--- a/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/dce_v8_0.c
+@@ -2739,7 +2739,7 @@ static int dce_v8_0_sw_init(void *handle)
+ 		return r;
+ 
+ 	/* Pre-DCE11 */
+-	INIT_WORK(&adev->hotplug_work,
++	INIT_DELAYED_WORK(&adev->hotplug_work,
+ 		  amdgpu_display_hotplug_work_func);
+ 
+ 	drm_kms_helper_poll_init(adev_to_drm(adev));
+@@ -2802,7 +2802,7 @@ static int dce_v8_0_hw_fini(void *handle)
+ 
+ 	dce_v8_0_pageflip_interrupt_fini(adev);
+ 
+-	flush_work(&adev->hotplug_work);
++	flush_delayed_work(&adev->hotplug_work);
+ 
+ 	return 0;
+ }
+@@ -3195,7 +3195,7 @@ static int dce_v8_0_hpd_irq(struct amdgpu_device *adev,
+ 		tmp = RREG32(mmDC_HPD1_INT_CONTROL + hpd_offsets[hpd]);
+ 		tmp |= DC_HPD1_INT_CONTROL__DC_HPD1_INT_ACK_MASK;
+ 		WREG32(mmDC_HPD1_INT_CONTROL + hpd_offsets[hpd], tmp);
+-		schedule_work(&adev->hotplug_work);
++		schedule_delayed_work(&adev->hotplug_work, 0);
+ 		DRM_DEBUG("IH: HPD%d\n", hpd + 1);
+ 	}
+ 
+-- 
+2.25.1
+

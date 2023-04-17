@@ -1,0 +1,334 @@
+From 4f1a70f62cb1860792b901c0f21ef719b8f81974 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Wed, 2 Nov 2022 20:54:48 +0300
+Subject: [PATCH 0558/2236] drm/msm: move domain allocation into
+ msm_iommu_new()
+
+After the msm_iommu instance is created, the IOMMU domain is completely
+handled inside the msm_iommu code. Move the iommu_domain_alloc() call
+into the msm_iommu_new() to simplify callers code.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Rob Clark <robdclark@gmail.com>
+Patchwork: https://patchwork.freedesktop.org/patch/509615/
+Link: https://lore.kernel.org/r/20221102175449.452283-2-dmitry.baryshkov@linaro.org
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c    | 12 +++++-------
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c    | 23 +++++++++++-----------
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c  | 25 +++++++++---------------
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h  |  2 --
+ drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.c | 19 +++++++++---------
+ drivers/gpu/drm/msm/msm_drv.c            | 18 ++++++++---------
+ drivers/gpu/drm/msm/msm_iommu.c          | 20 ++++++++++++++++---
+ drivers/gpu/drm/msm/msm_mmu.h            |  3 ++-
+ 8 files changed, 62 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 870252bef23f..f3c9600221d4 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1216,19 +1216,17 @@ static int a6xx_gmu_memory_alloc(struct a6xx_gmu *gmu, struct a6xx_gmu_bo *bo,
+ 
+ static int a6xx_gmu_memory_probe(struct a6xx_gmu *gmu)
+ {
+-	struct iommu_domain *domain;
+ 	struct msm_mmu *mmu;
+ 
+-	domain = iommu_domain_alloc(&platform_bus_type);
+-	if (!domain)
++	mmu = msm_iommu_new(gmu->dev, 0);
++	if (!mmu)
+ 		return -ENODEV;
++	if (IS_ERR(mmu))
++		return PTR_ERR(mmu);
+ 
+-	mmu = msm_iommu_new(gmu->dev, domain);
+ 	gmu->aspace = msm_gem_address_space_create(mmu, "gmu", 0x0, 0x80000000);
+-	if (IS_ERR(gmu->aspace)) {
+-		iommu_domain_free(domain);
++	if (IS_ERR(gmu->aspace))
+ 		return PTR_ERR(gmu->aspace);
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 9d7fc44c1e2a..0f5dee666de4 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1793,35 +1793,34 @@ a6xx_create_address_space(struct msm_gpu *gpu, struct platform_device *pdev)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+-	struct iommu_domain *iommu;
++	struct iommu_domain_geometry *geometry;
+ 	struct msm_mmu *mmu;
+ 	struct msm_gem_address_space *aspace;
+ 	u64 start, size;
+-
+-	iommu = iommu_domain_alloc(&platform_bus_type);
+-	if (!iommu)
+-		return NULL;
++	unsigned long quirks = 0;
+ 
+ 	/*
+ 	 * This allows GPU to set the bus attributes required to use system
+ 	 * cache on behalf of the iommu page table walker.
+ 	 */
+ 	if (!IS_ERR_OR_NULL(a6xx_gpu->htw_llc_slice))
+-		adreno_set_llc_attributes(iommu);
++		quirks |= IO_PGTABLE_QUIRK_ARM_OUTER_WBWA;
+ 
+-	mmu = msm_iommu_new(&pdev->dev, iommu);
+-	if (IS_ERR(mmu)) {
+-		iommu_domain_free(iommu);
++	mmu = msm_iommu_new(&pdev->dev, quirks);
++	if (IS_ERR_OR_NULL(mmu))
+ 		return ERR_CAST(mmu);
+-	}
++
++	geometry = msm_iommu_get_geometry(mmu);
++	if (IS_ERR(geometry))
++		return ERR_CAST(geometry);
+ 
+ 	/*
+ 	 * Use the aperture start or SZ_16M, whichever is greater. This will
+ 	 * ensure that we align with the allocated pagetable range while still
+ 	 * allowing room in the lower 32 bits for GMEM and whatnot
+ 	 */
+-	start = max_t(u64, SZ_16M, iommu->geometry.aperture_start);
+-	size = iommu->geometry.aperture_end - start + 1;
++	start = max_t(u64, SZ_16M, geometry->aperture_start);
++	size = geometry->aperture_end - start + 1;
+ 
+ 	aspace = msm_gem_address_space_create(mmu, "gpu",
+ 		start & GENMASK_ULL(48, 0), size);
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.c b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+index 2e7531d2a5d6..42a7c405fe68 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -191,37 +191,30 @@ int adreno_zap_shader_load(struct msm_gpu *gpu, u32 pasid)
+ 	return zap_shader_load_mdt(gpu, adreno_gpu->info->zapfw, pasid);
+ }
+ 
+-void adreno_set_llc_attributes(struct iommu_domain *iommu)
+-{
+-	iommu_set_pgtable_quirks(iommu, IO_PGTABLE_QUIRK_ARM_OUTER_WBWA);
+-}
+-
+ struct msm_gem_address_space *
+ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 		struct platform_device *pdev)
+ {
+-	struct iommu_domain *iommu;
++	struct iommu_domain_geometry *geometry;
+ 	struct msm_mmu *mmu;
+ 	struct msm_gem_address_space *aspace;
+ 	u64 start, size;
+ 
+-	iommu = iommu_domain_alloc(&platform_bus_type);
+-	if (!iommu)
+-		return NULL;
+-
+-	mmu = msm_iommu_new(&pdev->dev, iommu);
+-	if (IS_ERR(mmu)) {
+-		iommu_domain_free(iommu);
++	mmu = msm_iommu_new(&pdev->dev, 0);
++	if (IS_ERR_OR_NULL(mmu))
+ 		return ERR_CAST(mmu);
+-	}
++
++	geometry = msm_iommu_get_geometry(mmu);
++	if (IS_ERR(geometry))
++		return ERR_CAST(geometry);
+ 
+ 	/*
+ 	 * Use the aperture start or SZ_16M, whichever is greater. This will
+ 	 * ensure that we align with the allocated pagetable range while still
+ 	 * allowing room in the lower 32 bits for GMEM and whatnot
+ 	 */
+-	start = max_t(u64, SZ_16M, iommu->geometry.aperture_start);
+-	size = iommu->geometry.aperture_end - start + 1;
++	start = max_t(u64, SZ_16M, geometry->aperture_start);
++	size = geometry->aperture_end - start + 1;
+ 
+ 	aspace = msm_gem_address_space_create(mmu, "gpu",
+ 		start & GENMASK_ULL(48, 0), size);
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index 3d78efb066b1..ef25ac22857f 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -336,8 +336,6 @@ struct msm_gem_address_space *
+ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 		struct platform_device *pdev);
+ 
+-void adreno_set_llc_attributes(struct iommu_domain *iommu);
+-
+ int adreno_read_speedbin(struct device *dev, u32 *speedbin);
+ 
+ /*
+diff --git a/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.c b/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.c
+index 964573d26d26..9a1a0769575d 100644
+--- a/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.c
++++ b/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.c
+@@ -387,7 +387,7 @@ static int mdp4_kms_init(struct drm_device *dev)
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct mdp4_kms *mdp4_kms;
+ 	struct msm_kms *kms = NULL;
+-	struct iommu_domain *iommu;
++	struct msm_mmu *mmu;
+ 	struct msm_gem_address_space *aspace;
+ 	int irq, ret;
+ 	u32 major, minor;
+@@ -499,10 +499,15 @@ static int mdp4_kms_init(struct drm_device *dev)
+ 	mdp4_disable(mdp4_kms);
+ 	mdelay(16);
+ 
+-	iommu = iommu_domain_alloc(pdev->dev.bus);
+-	if (iommu) {
+-		struct msm_mmu *mmu = msm_iommu_new(&pdev->dev, iommu);
+-
++	mmu = msm_iommu_new(&pdev->dev, 0);
++	if (IS_ERR(mmu)) {
++		ret = PTR_ERR(mmu);
++		goto fail;
++	} else if (!mmu) {
++		DRM_DEV_INFO(dev->dev, "no iommu, fallback to phys "
++				"contig buffers for scanout\n");
++		aspace = NULL;
++	} else {
+ 		aspace  = msm_gem_address_space_create(mmu,
+ 			"mdp4", 0x1000, 0x100000000 - 0x1000);
+ 
+@@ -514,10 +519,6 @@ static int mdp4_kms_init(struct drm_device *dev)
+ 		}
+ 
+ 		kms->aspace = aspace;
+-	} else {
+-		DRM_DEV_INFO(dev->dev, "no iommu, fallback to phys "
+-				"contig buffers for scanout\n");
+-		aspace = NULL;
+ 	}
+ 
+ 	ret = modeset_init(mdp4_kms);
+diff --git a/drivers/gpu/drm/msm/msm_drv.c b/drivers/gpu/drm/msm/msm_drv.c
+index 3035067fbbc1..5737364fbb54 100644
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -277,7 +277,6 @@ static int msm_drm_uninit(struct device *dev)
+ 
+ struct msm_gem_address_space *msm_kms_init_aspace(struct drm_device *dev)
+ {
+-	struct iommu_domain *domain;
+ 	struct msm_gem_address_space *aspace;
+ 	struct msm_mmu *mmu;
+ 	struct device *mdp_dev = dev->dev;
+@@ -293,22 +292,21 @@ struct msm_gem_address_space *msm_kms_init_aspace(struct drm_device *dev)
+ 	else
+ 		iommu_dev = mdss_dev;
+ 
+-	domain = iommu_domain_alloc(iommu_dev->bus);
+-	if (!domain) {
++	mmu = msm_iommu_new(iommu_dev, 0);
++	if (IS_ERR(mmu))
++		return ERR_CAST(mmu);
++
++	if (!mmu) {
+ 		drm_info(dev, "no IOMMU, fallback to phys contig buffers for scanout\n");
+ 		return NULL;
+ 	}
+ 
+-	mmu = msm_iommu_new(iommu_dev, domain);
+-	if (IS_ERR(mmu)) {
+-		iommu_domain_free(domain);
+-		return ERR_CAST(mmu);
+-	}
+-
+ 	aspace = msm_gem_address_space_create(mmu, "mdp_kms",
+ 		0x1000, 0x100000000 - 0x1000);
+-	if (IS_ERR(aspace))
++	if (IS_ERR(aspace)) {
++		dev_err(mdp_dev, "aspace create, error %pe\n", aspace);
+ 		mmu->funcs->destroy(mmu);
++	}
+ 
+ 	return aspace;
+ }
+diff --git a/drivers/gpu/drm/msm/msm_iommu.c b/drivers/gpu/drm/msm/msm_iommu.c
+index 5577cea7c009..c2507582ecf3 100644
+--- a/drivers/gpu/drm/msm/msm_iommu.c
++++ b/drivers/gpu/drm/msm/msm_iommu.c
+@@ -186,6 +186,13 @@ int msm_iommu_pagetable_params(struct msm_mmu *mmu,
+ 	return 0;
+ }
+ 
++struct iommu_domain_geometry *msm_iommu_get_geometry(struct msm_mmu *mmu)
++{
++	struct msm_iommu *iommu = to_msm_iommu(mmu);
++
++	return &iommu->domain->geometry;
++}
++
+ static const struct msm_mmu_funcs pagetable_funcs = {
+ 		.map = msm_iommu_pagetable_map,
+ 		.unmap = msm_iommu_pagetable_unmap,
+@@ -367,17 +374,23 @@ static const struct msm_mmu_funcs funcs = {
+ 		.resume_translation = msm_iommu_resume_translation,
+ };
+ 
+-struct msm_mmu *msm_iommu_new(struct device *dev, struct iommu_domain *domain)
++struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+ {
++	struct iommu_domain *domain;
+ 	struct msm_iommu *iommu;
+ 	int ret;
+ 
++	domain = iommu_domain_alloc(dev->bus);
+ 	if (!domain)
+-		return ERR_PTR(-ENODEV);
++		return NULL;
++
++	iommu_set_pgtable_quirks(domain, quirks);
+ 
+ 	iommu = kzalloc(sizeof(*iommu), GFP_KERNEL);
+-	if (!iommu)
++	if (!iommu) {
++		iommu_domain_free(domain);
+ 		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	iommu->domain = domain;
+ 	msm_mmu_init(&iommu->base, dev, &funcs, MSM_MMU_IOMMU);
+@@ -386,6 +399,7 @@ struct msm_mmu *msm_iommu_new(struct device *dev, struct iommu_domain *domain)
+ 
+ 	ret = iommu_attach_device(iommu->domain, dev);
+ 	if (ret) {
++		iommu_domain_free(domain);
+ 		kfree(iommu);
+ 		return ERR_PTR(ret);
+ 	}
+diff --git a/drivers/gpu/drm/msm/msm_mmu.h b/drivers/gpu/drm/msm/msm_mmu.h
+index de158e1bf765..74cd81e701ff 100644
+--- a/drivers/gpu/drm/msm/msm_mmu.h
++++ b/drivers/gpu/drm/msm/msm_mmu.h
+@@ -40,7 +40,7 @@ static inline void msm_mmu_init(struct msm_mmu *mmu, struct device *dev,
+ 	mmu->type = type;
+ }
+ 
+-struct msm_mmu *msm_iommu_new(struct device *dev, struct iommu_domain *domain);
++struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks);
+ struct msm_mmu *msm_gpummu_new(struct device *dev, struct msm_gpu *gpu);
+ 
+ static inline void msm_mmu_set_fault_handler(struct msm_mmu *mmu, void *arg,
+@@ -58,5 +58,6 @@ void msm_gpummu_params(struct msm_mmu *mmu, dma_addr_t *pt_base,
+ 
+ int msm_iommu_pagetable_params(struct msm_mmu *mmu, phys_addr_t *ttbr,
+ 		int *asid);
++struct iommu_domain_geometry *msm_iommu_get_geometry(struct msm_mmu *mmu);
+ 
+ #endif /* __MSM_MMU_H__ */
+-- 
+2.25.1
+

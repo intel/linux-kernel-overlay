@@ -1,0 +1,505 @@
+From d6fad56589beb3267267dc25421a6e21fc2fd402 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:26 +1000
+Subject: [PATCH 0717/2236] drm/nouveau/fifo: add cgrp, have all channels be
+ part of one
+
+Engine context tracking will move to nvkm_cgrp in later commits, so we
+create SW-only channel groups on HW without support for them.
+
+- switches to nvkm_chid for TSG/channel ID allocation
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |  7 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/Kbuild   |  1 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   |  5 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c   | 94 +++++++++++++++++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h   | 23 ++++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   | 68 ++++++++++++--
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.h   |  5 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chid.c   | 29 ++++++
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chid.h   |  2 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv04.c   |  1 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv50.c   |  2 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.c   |  3 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/runl.h   |  9 ++
+ 13 files changed, 231 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index 1e12697beae2..62fe64dab11a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -6,7 +6,6 @@
+ #include <core/event.h>
+ struct nvkm_fault_data;
+ 
+-#define NVKM_FIFO_CHID_NR 4096
+ #define NVKM_FIFO_ENGN_NR 16
+ 
+ struct nvkm_fifo_engn {
+@@ -17,13 +16,16 @@ struct nvkm_fifo_engn {
+ 
+ struct nvkm_chan {
+ 	const struct nvkm_chan_func *func;
++	char name[64];
++	struct nvkm_cgrp *cgrp;
++
++	union { int id; int chid; }; /*FIXME: remove later */
+ 
+ 	struct nvkm_fifo *fifo;
+ 	u32 engm;
+ 	struct nvkm_object object;
+ 
+ 	struct list_head head;
+-	u16 chid;
+ 	struct nvkm_gpuobj *inst;
+ 	struct nvkm_gpuobj *push;
+ 	struct nvkm_vmm *vmm;
+@@ -43,7 +45,6 @@ struct nvkm_fifo {
+ 	struct list_head runqs;
+ 	struct list_head runls;
+ 
+-	DECLARE_BITMAP(mask, NVKM_FIFO_CHID_NR);
+ 	int nr;
+ 	struct list_head chan;
+ 	spinlock_t lock;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+index a92a88a72e59..eb82da7e7d87 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: MIT
+ nvkm-y += nvkm/engine/fifo/base.o
++nvkm-y += nvkm/engine/fifo/cgrp.o
+ nvkm-y += nvkm/engine/fifo/chan.o
+ nvkm-y += nvkm/engine/fifo/chid.o
+ nvkm-y += nvkm/engine/fifo/runl.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index 0f603d9f00cb..3e62eacc48ad 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -389,10 +389,7 @@ nvkm_fifo_ctor(const struct nvkm_fifo_func *func, struct nvkm_device *device,
+ 	INIT_LIST_HEAD(&fifo->chan);
+ 
+ 	nr = func->chid_nr(fifo);
+-	if (WARN_ON(fifo->nr > NVKM_FIFO_CHID_NR))
+-		fifo->nr = NVKM_FIFO_CHID_NR;
+-	else
+-		fifo->nr = nr;
++	fifo->nr = nr;
+ 
+ 	if (func->uevent_init) {
+ 		ret = nvkm_event_init(&nvkm_fifo_uevent_func, &fifo->engine.subdev, 1, 1,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
+new file mode 100644
+index 000000000000..e6ac178db8b5
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.c
+@@ -0,0 +1,94 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include "cgrp.h"
++#include "chan.h"
++#include "chid.h"
++#include "runl.h"
++#include "priv.h"
++
++#include <subdev/mmu.h>
++
++static void
++nvkm_cgrp_del(struct kref *kref)
++{
++	struct nvkm_cgrp *cgrp = container_of(kref, typeof(*cgrp), kref);
++	struct nvkm_runl *runl = cgrp->runl;
++
++	if (runl->cgid)
++		nvkm_chid_put(runl->cgid, cgrp->id, &cgrp->lock);
++
++	nvkm_vmm_unref(&cgrp->vmm);
++	kfree(cgrp);
++}
++
++void
++nvkm_cgrp_unref(struct nvkm_cgrp **pcgrp)
++{
++	struct nvkm_cgrp *cgrp = *pcgrp;
++
++	if (!cgrp)
++		return;
++
++	kref_put(&cgrp->kref, nvkm_cgrp_del);
++	*pcgrp = NULL;
++}
++
++struct nvkm_cgrp *
++nvkm_cgrp_ref(struct nvkm_cgrp *cgrp)
++{
++	if (cgrp)
++		kref_get(&cgrp->kref);
++
++	return cgrp;
++}
++
++int
++nvkm_cgrp_new(struct nvkm_runl *runl, const char *name, struct nvkm_vmm *vmm, bool hw,
++	      struct nvkm_cgrp **pcgrp)
++{
++	struct nvkm_cgrp *cgrp;
++
++	if (!(cgrp = *pcgrp = kmalloc(sizeof(*cgrp), GFP_KERNEL)))
++		return -ENOMEM;
++
++	cgrp->func = runl->fifo->func->cgrp.func;
++	strscpy(cgrp->name, name, sizeof(cgrp->name));
++	cgrp->runl = runl;
++	cgrp->vmm = nvkm_vmm_ref(vmm);
++	cgrp->hw = hw;
++	cgrp->id = -1;
++	kref_init(&cgrp->kref);
++	cgrp->chans = NULL;
++	cgrp->chan_nr = 0;
++	spin_lock_init(&cgrp->lock);
++
++	if (runl->cgid) {
++		cgrp->id = nvkm_chid_get(runl->cgid, cgrp);
++		if (cgrp->id < 0) {
++			RUNL_ERROR(runl, "!cgids");
++			nvkm_cgrp_unref(pcgrp);
++			return -ENOSPC;
++		}
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+index 9a677a1acf9b..d0510df9286a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+@@ -2,13 +2,34 @@
+ #ifndef __NVKM_CGRP_H__
+ #define __NVKM_CGRP_H__
+ #include <core/os.h>
++struct nvkm_chan;
+ 
+ struct nvkm_cgrp {
+ 	const struct nvkm_cgrp_func {
+ 	} *func;
++	char name[64];
++	struct nvkm_runl *runl;
++	struct nvkm_vmm *vmm;
++	bool hw;
+ 	int id;
++	struct kref kref;
++
++	struct nvkm_chan *chans;
++	int chan_nr;
++
++	spinlock_t lock; /* protects irq handler channel (group) lookup */
++
+ 	struct list_head head;
+ 	struct list_head chan;
+-	int chan_nr;
+ };
++
++int nvkm_cgrp_new(struct nvkm_runl *, const char *name, struct nvkm_vmm *, bool hw,
++		  struct nvkm_cgrp **);
++struct nvkm_cgrp *nvkm_cgrp_ref(struct nvkm_cgrp *);
++void nvkm_cgrp_unref(struct nvkm_cgrp **);
++
++#define CGRP_PRCLI(c,l,p,f,a...) RUNL_PRINT((c)->runl, l, p, "%04x:[%s]"f, (c)->id, (c)->name, ##a)
++#define CGRP_PRINT(c,l,p,f,a...) RUNL_PRINT((c)->runl, l, p, "%04x:"f, (c)->id, ##a)
++#define CGRP_ERROR(c,f,a...) CGRP_PRCLI((c), ERROR,    err, " "f"\n", ##a)
++#define CGRP_TRACE(c,f,a...) CGRP_PRINT((c), TRACE,   info, " "f"\n", ##a)
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index 464c956aaca9..e2178a8f78a7 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -22,6 +22,9 @@
+  * Authors: Ben Skeggs
+  */
+ #include "chan.h"
++#include "chid.h"
++#include "cgrp.h"
++#include "runl.h"
+ #include "priv.h"
+ 
+ #include <core/client.h>
+@@ -312,6 +315,11 @@ nvkm_chan_del(struct nvkm_chan **pchan)
+ 	if (!chan)
+ 		return;
+ 
++	if (chan->cgrp) {
++		nvkm_chid_put(chan->cgrp->runl->chid, chan->id, &chan->cgrp->lock);
++		nvkm_cgrp_unref(&chan->cgrp);
++	}
++
+ 	chan = nvkm_object_dtor(&chan->object);
+ 	kfree(chan);
+ }
+@@ -326,7 +334,6 @@ nvkm_fifo_chan_dtor(struct nvkm_object *object)
+ 
+ 	spin_lock_irqsave(&fifo->lock, flags);
+ 	if (!list_empty(&chan->head)) {
+-		__clear_bit(chan->chid, fifo->mask);
+ 		list_del(&chan->head);
+ 	}
+ 	spin_unlock_irqrestore(&fifo->lock, flags);
+@@ -363,9 +370,22 @@ nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *fn,
+ 	struct nvkm_client *client = oclass->client;
+ 	struct nvkm_device *device = fifo->engine.subdev.device;
+ 	struct nvkm_dmaobj *dmaobj;
++	struct nvkm_cgrp *cgrp = NULL;
++	struct nvkm_runl *runl;
++	struct nvkm_engn *engn = NULL;
++	struct nvkm_vmm *vmm = NULL;
+ 	unsigned long flags;
+ 	int ret;
+ 
++	nvkm_runl_foreach(runl, fifo) {
++		engn = nvkm_runl_find_engn(engn, runl, engm & BIT(engn->id));
++		if (engn)
++			break;
++	}
++
++	if (!engn)
++		return -EINVAL;
++
+ 	/*FIXME: temp kludge to ease transition, remove later */
+ 	if (!(func = kmalloc(sizeof(*func), GFP_KERNEL)))
+ 		return -ENOMEM;
+@@ -383,12 +403,38 @@ nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *fn,
+ 	func->submit_token = fn->submit_token;
+ 
+ 	chan->func = func;
++	chan->id = -1;
+ 
+ 	nvkm_object_ctor(&nvkm_fifo_chan_func, oclass, &chan->object);
+ 	chan->fifo = fifo;
+ 	chan->engm = engm;
+ 	INIT_LIST_HEAD(&chan->head);
+ 
++	/* Join channel group.
++	 *
++	 * GK110 and newer support channel groups (aka TSGs), where individual channels
++	 * share a timeslice, and, engine context(s).
++	 *
++	 * As such, engine contexts are tracked in nvkm_cgrp and we need them even when
++	 * channels aren't in an API channel group, and on HW that doesn't support TSGs.
++	 */
++	if (!cgrp) {
++		ret = nvkm_cgrp_new(runl, chan->name, vmm, fifo->func->cgrp.force, &chan->cgrp);
++		if (ret) {
++			RUNL_DEBUG(runl, "cgrp %d", ret);
++			return ret;
++		}
++
++		cgrp = chan->cgrp;
++	} else {
++		if (cgrp->runl != runl || cgrp->vmm != vmm) {
++			RUNL_DEBUG(runl, "cgrp %d %d", cgrp->runl != runl, cgrp->vmm != vmm);
++			return -EINVAL;
++		}
++
++		chan->cgrp = nvkm_cgrp_ref(cgrp);
++	}
++
+ 	/* instance memory */
+ 	ret = nvkm_gpuobj_new(device, size, align, zero, NULL, &chan->inst);
+ 	if (ret)
+@@ -422,15 +468,23 @@ nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *fn,
+ 		chan->vmm = nvkm_vmm_ref(vmm);
+ 	}
+ 
+-	/* allocate channel id */
+-	spin_lock_irqsave(&fifo->lock, flags);
+-	chan->chid = find_first_zero_bit(fifo->mask, NVKM_FIFO_CHID_NR);
+-	if (chan->chid >= NVKM_FIFO_CHID_NR) {
+-		spin_unlock_irqrestore(&fifo->lock, flags);
++	/* Allocate channel ID. */
++	if (runl->cgid) {
++		chan->id = chan->cgrp->id;
++		runl->chid->data[chan->id] = chan;
++		set_bit(chan->id, runl->chid->used);
++		goto temp_hack_until_no_chid_eq_cgid_req;
++	}
++
++	chan->id = nvkm_chid_get(runl->chid, chan);
++	if (chan->id < 0) {
++		RUNL_ERROR(runl, "!chids");
+ 		return -ENOSPC;
+ 	}
++
++temp_hack_until_no_chid_eq_cgid_req:
++	spin_lock_irqsave(&fifo->lock, flags);
+ 	list_add(&chan->head, &fifo->chan);
+-	__set_bit(chan->chid, fifo->mask);
+ 	spin_unlock_irqrestore(&fifo->lock, flags);
+ 
+ 	/* determine address of this channel's user registers */
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+index a9c0e02b6f9f..0f1added5c24 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+@@ -27,5 +27,10 @@ int nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *, struct nvkm_fifo *,
+ 			const struct nvkm_oclass *, struct nvkm_fifo_chan *);
+ void nvkm_chan_del(struct nvkm_chan **);
+ 
++#define CHAN_PRCLI(c,l,p,f,a...) CGRP_PRINT((c)->cgrp, l, p, "%04x:[%s]"f, (c)->id, (c)->name, ##a)
++#define CHAN_PRINT(c,l,p,f,a...) CGRP_PRINT((c)->cgrp, l, p, "%04x:"f, (c)->id, ##a)
++#define CHAN_ERROR(c,f,a...) CHAN_PRCLI((c), ERROR,    err, " "f"\n", ##a)
++#define CHAN_TRACE(c,f,a...) CHAN_PRINT((c), TRACE,   info, " "f"\n", ##a)
++
+ int nvkm_fifo_chan_child_new(const struct nvkm_oclass *, void *, u32, struct nvkm_object **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.c
+index 7c582bce7e24..23944d95efd5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.c
+@@ -21,6 +21,35 @@
+  */
+ #include "chid.h"
+ 
++void
++nvkm_chid_put(struct nvkm_chid *chid, int id, spinlock_t *data_lock)
++{
++	if (id >= 0) {
++		spin_lock_irq(&chid->lock);
++		spin_lock(data_lock);
++		chid->data[id] = NULL;
++		spin_unlock(data_lock);
++		clear_bit(id, chid->used);
++		spin_unlock_irq(&chid->lock);
++	}
++}
++
++int
++nvkm_chid_get(struct nvkm_chid *chid, void *data)
++{
++	int id = -1, cid;
++
++	spin_lock_irq(&chid->lock);
++	cid = find_first_zero_bit(chid->used, chid->nr);
++	if (cid < chid->nr) {
++		set_bit(cid, chid->used);
++		chid->data[cid] = data;
++		id = cid;
++	}
++	spin_unlock_irq(&chid->lock);
++	return id;
++}
++
+ static void
+ nvkm_chid_del(struct kref *kref)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.h
+index d359828dde80..2a42efb18401 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chid.h
+@@ -20,4 +20,6 @@ int nvkm_chid_new(const struct nvkm_event_func *, struct nvkm_subdev *,
+ 		  int nr, int first, int count, struct nvkm_chid **pchid);
+ struct nvkm_chid *nvkm_chid_ref(struct nvkm_chid *);
+ void nvkm_chid_unref(struct nvkm_chid **);
++int nvkm_chid_get(struct nvkm_chid *, void *data);
++void nvkm_chid_put(struct nvkm_chid *, int id, spinlock_t *data_lock);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+index ce965d6aa874..52fe9d5a5a4a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+@@ -489,7 +489,6 @@ nv04_fifo_new_(const struct nvkm_fifo_func *func, struct nvkm_device *device,
+ 	if (ret)
+ 		return ret;
+ 
+-	set_bit(nr - 1, fifo->base.mask); /* inactive channel */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+index e4a7ef5aa461..4fcf49dbfd90 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+@@ -155,8 +155,6 @@ nv50_fifo_new_(const struct nvkm_fifo_func *func, struct nvkm_device *device,
+ 	if (ret)
+ 		return ret;
+ 
+-	set_bit(0, fifo->base.mask); /* PIO channel */
+-	set_bit(127, fifo->base.mask); /* inactive channel */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+index 4d7319674128..1a15b0a9ab7c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.c
+@@ -38,6 +38,7 @@ nvkm_runl_del(struct nvkm_runl *runl)
+ 	nvkm_chid_unref(&runl->cgid);
+ 
+ 	list_del(&runl->head);
++	mutex_destroy(&runl->mutex);
+ 	kfree(runl);
+ }
+ 
+@@ -94,6 +95,8 @@ nvkm_runl_new(struct nvkm_fifo *fifo, int runi, u32 addr, int id_nr)
+ 	runl->id = runi;
+ 	runl->addr = addr;
+ 	INIT_LIST_HEAD(&runl->engns);
++	INIT_LIST_HEAD(&runl->cgrps);
++	mutex_init(&runl->mutex);
+ 	list_add_tail(&runl->head, &fifo->runls);
+ 
+ 	if (!fifo->chid) {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+index 9f27babc8caf..cb0de870a118 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/runl.h
+@@ -35,6 +35,11 @@ struct nvkm_runl {
+ 	struct nvkm_runq *runq[2];
+ 	int runq_nr;
+ 
++	struct list_head cgrps;
++	int cgrp_nr;
++	int chan_nr;
++	struct mutex mutex;
++
+ 	struct list_head head;
+ };
+ 
+@@ -44,8 +49,12 @@ struct nvkm_engn *nvkm_runl_add(struct nvkm_runl *, int engi, const struct nvkm_
+ 				enum nvkm_subdev_type, int inst);
+ void nvkm_runl_del(struct nvkm_runl *);
+ 
++#define nvkm_runl_find_engn(engn,runl,cond) nvkm_list_find(engn, &(runl)->engns, head, (cond))
++
+ #define nvkm_runl_foreach(runl,fifo) list_for_each_entry((runl), &(fifo)->runls, head)
+ #define nvkm_runl_foreach_engn(engn,runl) list_for_each_entry((engn), &(runl)->engns, head)
++#define nvkm_runl_foreach_engn_cond(engn,runl,cond) \
++	nvkm_list_foreach(engn, &(runl)->engns, head, (cond))
+ 
+ #define RUNL_PRINT(r,l,p,f,a...)                                                          \
+ 	nvkm_printk__(&(r)->fifo->engine.subdev, NV_DBG_##l, p, "%06x:"f, (r)->addr, ##a)
+-- 
+2.25.1
+

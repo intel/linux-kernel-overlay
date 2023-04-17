@@ -1,0 +1,259 @@
+From 9334acc5b725a20f370097b3c1a064e17763a50d Mon Sep 17 00:00:00 2001
+From: Junxiao Chang <junxiao.chang@intel.com>
+Date: Wed, 22 Mar 2023 17:35:39 +0800
+Subject: [PATCH 0026/2236] Revert "drm/i915/pxp: load the pxp module when we
+ have a gsc-loaded huc"
+
+This reverts commit 2e37f28d354c2812115dc1aafdbf90d7bc61a2df.
+---
+ drivers/gpu/drm/i915/Makefile                | 10 +++---
+ drivers/gpu/drm/i915/pxp/intel_pxp.c         | 32 +++++++-------------
+ drivers/gpu/drm/i915/pxp/intel_pxp.h         | 32 ++++++++++++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_irq.h     |  8 -----
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.c |  8 +----
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.h | 11 ++-----
+ drivers/gpu/drm/i915/pxp/intel_pxp_tee.c     | 10 ++----
+ 7 files changed, 54 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index d217e3855cc3..cea00aaca04b 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -310,17 +310,15 @@ i915-y += \
+ 
+ i915-y += i915_perf.o
+ 
+-# Protected execution platform (PXP) support. Base support is required for HuC
+-i915-y += \
+-	pxp/intel_pxp.o \
+-	pxp/intel_pxp_tee.o
+-
++# Protected execution platform (PXP) support
+ i915-$(CONFIG_DRM_I915_PXP) += \
++	pxp/intel_pxp.o \
+ 	pxp/intel_pxp_cmd.o \
+ 	pxp/intel_pxp_debugfs.o \
+ 	pxp/intel_pxp_irq.o \
+ 	pxp/intel_pxp_pm.o \
+-	pxp/intel_pxp_session.o
++	pxp/intel_pxp_session.o \
++	pxp/intel_pxp_tee.o
+ 
+ # Post-mortem debug and GPU hang state capture
+ i915-$(CONFIG_DRM_I915_CAPTURE_ERROR) += i915_gpu_error.o
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index 5efe61f67546..69cdaaddc4a9 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -103,15 +103,19 @@ static int create_vcs_context(struct intel_pxp *pxp)
+ 
+ static void destroy_vcs_context(struct intel_pxp *pxp)
+ {
+-	if (pxp->ce)
+-		intel_engine_destroy_pinned_context(fetch_and_zero(&pxp->ce));
++	intel_engine_destroy_pinned_context(fetch_and_zero(&pxp->ce));
+ }
+ 
+-static void pxp_init_full(struct intel_pxp *pxp)
++void intel_pxp_init(struct intel_pxp *pxp)
+ {
+ 	struct intel_gt *gt = pxp_to_gt(pxp);
+ 	int ret;
+ 
++	if (!HAS_PXP(gt->i915))
++		return;
++
++	mutex_init(&pxp->tee_mutex);
++
+ 	/*
+ 	 * we'll use the completion to check if there is a termination pending,
+ 	 * so we start it as completed and we reinit it when a termination
+@@ -120,7 +124,8 @@ static void pxp_init_full(struct intel_pxp *pxp)
+ 	init_completion(&pxp->termination);
+ 	complete_all(&pxp->termination);
+ 
+-	intel_pxp_session_management_init(pxp);
++	mutex_init(&pxp->arb_mutex);
++	INIT_WORK(&pxp->session_work, intel_pxp_session_work);
+ 
+ 	ret = create_vcs_context(pxp);
+ 	if (ret)
+@@ -138,26 +143,11 @@ static void pxp_init_full(struct intel_pxp *pxp)
+ 	destroy_vcs_context(pxp);
+ }
+ 
+-void intel_pxp_init(struct intel_pxp *pxp)
++void intel_pxp_fini(struct intel_pxp *pxp)
+ {
+-	struct intel_gt *gt = pxp_to_gt(pxp);
+-
+-	/* we rely on the mei PXP module */
+-	if (!IS_ENABLED(CONFIG_INTEL_MEI_PXP))
++	if (!intel_pxp_is_enabled(pxp))
+ 		return;
+ 
+-	/*
+-	 * If HuC is loaded by GSC but PXP is disabled, we can skip the init of
+-	 * the full PXP session/object management and just init the tee channel.
+-	 */
+-	if (HAS_PXP(gt->i915))
+-		pxp_init_full(pxp);
+-	else if (intel_huc_is_loaded_by_gsc(&gt->uc.huc) && intel_uc_uses_huc(&gt->uc))
+-		intel_pxp_tee_component_init(pxp);
+-}
+-
+-void intel_pxp_fini(struct intel_pxp *pxp)
+-{
+ 	pxp->arb_is_valid = false;
+ 
+ 	intel_pxp_tee_component_fini(pxp);
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.h b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+index 2da309088c6d..73847e535cab 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+@@ -12,6 +12,7 @@
+ struct intel_pxp;
+ struct drm_i915_gem_object;
+ 
++#ifdef CONFIG_DRM_I915_PXP
+ struct intel_gt *pxp_to_gt(const struct intel_pxp *pxp);
+ bool intel_pxp_is_enabled(const struct intel_pxp *pxp);
+ bool intel_pxp_is_active(const struct intel_pxp *pxp);
+@@ -31,5 +32,36 @@ int intel_pxp_key_check(struct intel_pxp *pxp,
+ 			bool assign);
+ 
+ void intel_pxp_invalidate(struct intel_pxp *pxp);
++#else
++static inline void intel_pxp_init(struct intel_pxp *pxp)
++{
++}
++
++static inline void intel_pxp_fini(struct intel_pxp *pxp)
++{
++}
++
++static inline int intel_pxp_start(struct intel_pxp *pxp)
++{
++	return -ENODEV;
++}
++
++static inline bool intel_pxp_is_enabled(const struct intel_pxp *pxp)
++{
++	return false;
++}
++
++static inline bool intel_pxp_is_active(const struct intel_pxp *pxp)
++{
++	return false;
++}
++
++static inline int intel_pxp_key_check(struct intel_pxp *pxp,
++				      struct drm_i915_gem_object *obj,
++				      bool assign)
++{
++	return -ENODEV;
++}
++#endif
+ 
+ #endif /* __INTEL_PXP_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_irq.h b/drivers/gpu/drm/i915/pxp/intel_pxp_irq.h
+index 8c292dc86f68..8b5793654844 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_irq.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_irq.h
+@@ -27,14 +27,6 @@ void intel_pxp_irq_handler(struct intel_pxp *pxp, u16 iir);
+ static inline void intel_pxp_irq_handler(struct intel_pxp *pxp, u16 iir)
+ {
+ }
+-
+-static inline void intel_pxp_irq_enable(struct intel_pxp *pxp)
+-{
+-}
+-
+-static inline void intel_pxp_irq_disable(struct intel_pxp *pxp)
+-{
+-}
+ #endif
+ 
+ #endif /* __INTEL_PXP_IRQ_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+index ecff0935adbf..1bb5b5249157 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+@@ -137,7 +137,7 @@ static void pxp_terminate_complete(struct intel_pxp *pxp)
+ 	complete_all(&pxp->termination);
+ }
+ 
+-static void pxp_session_work(struct work_struct *work)
++void intel_pxp_session_work(struct work_struct *work)
+ {
+ 	struct intel_pxp *pxp = container_of(work, typeof(*pxp), session_work);
+ 	struct intel_gt *gt = pxp_to_gt(pxp);
+@@ -172,9 +172,3 @@ static void pxp_session_work(struct work_struct *work)
+ 
+ 	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+ }
+-
+-void intel_pxp_session_management_init(struct intel_pxp *pxp)
+-{
+-	mutex_init(&pxp->arb_mutex);
+-	INIT_WORK(&pxp->session_work, pxp_session_work);
+-}
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+index 903ac52cffa1..ba4c9d2b94b7 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+@@ -8,13 +8,8 @@
+ 
+ #include <linux/types.h>
+ 
+-struct intel_pxp;
++struct work_struct;
++
++void intel_pxp_session_work(struct work_struct *work);
+ 
+-#ifdef CONFIG_DRM_I915_PXP
+-void intel_pxp_session_management_init(struct intel_pxp *pxp);
+-#else
+-static inline void intel_pxp_session_management_init(struct intel_pxp *pxp)
+-{
+-}
+-#endif
+ #endif /* __INTEL_PXP_SESSION_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+index 2c1fc49ecec1..4b6f5655fab5 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+@@ -97,8 +97,7 @@ static int i915_pxp_tee_component_bind(struct device *i915_kdev,
+ 		return 0;
+ 
+ 	/* the component is required to fully start the PXP HW */
+-	if (intel_pxp_is_enabled(pxp))
+-		intel_pxp_init_hw(pxp);
++	intel_pxp_init_hw(pxp);
+ 
+ 	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+ 
+@@ -112,9 +111,8 @@ static void i915_pxp_tee_component_unbind(struct device *i915_kdev,
+ 	struct intel_pxp *pxp = i915_dev_to_pxp(i915_kdev);
+ 	intel_wakeref_t wakeref;
+ 
+-	if (intel_pxp_is_enabled(pxp))
+-		with_intel_runtime_pm_if_in_use(&i915->runtime_pm, wakeref)
+-			intel_pxp_fini_hw(pxp);
++	with_intel_runtime_pm_if_in_use(&i915->runtime_pm, wakeref)
++		intel_pxp_fini_hw(pxp);
+ 
+ 	mutex_lock(&pxp->tee_mutex);
+ 	pxp->pxp_component = NULL;
+@@ -132,8 +130,6 @@ int intel_pxp_tee_component_init(struct intel_pxp *pxp)
+ 	struct intel_gt *gt = pxp_to_gt(pxp);
+ 	struct drm_i915_private *i915 = gt->i915;
+ 
+-	mutex_init(&pxp->tee_mutex);
+-
+ 	ret = component_add_typed(i915->drm.dev, &i915_pxp_tee_component_ops,
+ 				  I915_COMPONENT_PXP);
+ 	if (ret < 0) {
+-- 
+2.25.1
+

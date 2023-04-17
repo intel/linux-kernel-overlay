@@ -1,0 +1,1405 @@
+From 8763c689e5f3ce342eea936ef1e0d640fcbd627a Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Jun 2022 20:47:21 +1000
+Subject: [PATCH 0709/2236] drm/nouveau/fifo: unify handling of channel classes
+
+Adds the basic skeleton for common channel (group) interfaces.
+
+- common behaviour between <gk104 and >=gk104 impl's
+- separates priv/user channel objects
+- passthrough to existing object for now, kludges removed later
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/class.h  |   3 +
+ .../gpu/drm/nouveau/include/nvkm/core/os.h    |   4 +
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |   5 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/Kbuild   |   2 +
+ .../gpu/drm/nouveau/nvkm/engine/fifo/base.c   |  43 ++---
+ .../gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h   |  11 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.c   |  43 ++++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/chan.h   |  19 +-
+ .../drm/nouveau/nvkm/engine/fifo/dmanv04.c    |   4 -
+ .../drm/nouveau/nvkm/engine/fifo/dmanv10.c    |   4 -
+ .../drm/nouveau/nvkm/engine/fifo/dmanv17.c    |   4 -
+ .../drm/nouveau/nvkm/engine/fifo/dmanv40.c    |   4 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/g84.c    |  14 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gf100.c  |  12 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.c  |  50 +----
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk104.h  |  18 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk110.c  |  15 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk208.c  |   3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c  |   3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gm107.c  |   9 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gm200.c  |   3 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gp100.c  |   4 +-
+ .../drm/nouveau/nvkm/engine/fifo/gpfifog84.c  |   4 -
+ .../nouveau/nvkm/engine/fifo/gpfifogf100.c    |   4 -
+ .../nouveau/nvkm/engine/fifo/gpfifogk104.c    |   3 +-
+ .../nouveau/nvkm/engine/fifo/gpfifogv100.c    |   2 +-
+ .../drm/nouveau/nvkm/engine/fifo/gpfifonv50.c |   4 -
+ .../gpu/drm/nouveau/nvkm/engine/fifo/gv100.c  |  12 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv04.c   |  19 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv10.c   |  14 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv17.c   |  14 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv40.c   |  14 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/nv50.c   |  14 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/priv.h   |  34 +++-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/tu102.c  |  12 +-
+ .../gpu/drm/nouveau/nvkm/engine/fifo/uchan.c  | 174 ++++++++++++++++++
+ 36 files changed, 410 insertions(+), 191 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/class.h b/drivers/gpu/drm/nouveau/include/nvif/class.h
+index a623fb67280b..e9d9f314a744 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/class.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/class.h
+@@ -41,6 +41,7 @@
+ #define NVIF_CLASS_DISP_CHAN                         /* if0014.h */  0x80000014
+ 
+ #define NVIF_CLASS_CHAN                              /* if0020.h */  0x80000020
++#define NVIF_CLASS_CGRP                              /* if0021.h */  0x80000021
+ 
+ /* the below match nvidia-assigned (either in hw, or sw) class numbers */
+ #define NV_NULL_CLASS                                                0x00000030
+@@ -74,6 +75,8 @@
+ #define NV17_CHANNEL_DMA                              /* cl506b.h */ 0x0000176e
+ #define NV40_CHANNEL_DMA                              /* cl506b.h */ 0x0000406e
+ 
++#define KEPLER_CHANNEL_GROUP_A                        /* if0021.h */ 0x0000a06c
++
+ #define NV50_CHANNEL_GPFIFO                           /* cl506f.h */ 0x0000506f
+ #define G82_CHANNEL_GPFIFO                            /* cl826f.h */ 0x0000826f
+ #define FERMI_CHANNEL_GPFIFO                          /* cl906f.h */ 0x0000906f
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/os.h b/drivers/gpu/drm/nouveau/include/nvkm/core/os.h
+index 5a516b903fe9..e8705216ae4e 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/os.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/os.h
+@@ -35,4 +35,8 @@ nvkm_blob_dtor(struct nvkm_blob *blob)
+ 	blob->size = 0;
+ }
+ 
++/*FIXME: remove after */
++#define nvkm_fifo_chan nvkm_chan
++#define nvkm_fifo_chan_func nvkm_chan_func
++#define nvkm_fifo_cgrp nvkm_cgrp
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index 3cc7cfebfa5e..2f2059c5d4c9 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -15,8 +15,9 @@ struct nvkm_fifo_engn {
+ 	int usecount;
+ };
+ 
+-struct nvkm_fifo_chan {
+-	const struct nvkm_fifo_chan_func *func;
++struct nvkm_chan {
++	const struct nvkm_chan_func *func;
++
+ 	struct nvkm_fifo *fifo;
+ 	u32 engm;
+ 	struct nvkm_object object;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+index 8599063e8622..76d2bf1f6d8b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/Kbuild
+@@ -33,3 +33,5 @@ nvkm-y += nvkm/engine/fifo/gpfifogf100.o
+ nvkm-y += nvkm/engine/fifo/gpfifogk104.o
+ nvkm-y += nvkm/engine/fifo/gpfifogv100.o
+ nvkm-y += nvkm/engine/fifo/gpfifotu102.o
++
++nvkm-y += nvkm/engine/fifo/uchan.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+index b11a4cb18fc7..06e47728e3a4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/base.c
+@@ -155,27 +155,16 @@ nvkm_fifo_uevent(struct nvkm_fifo *fifo)
+ }
+ 
+ static int
+-nvkm_fifo_class_new_(struct nvkm_device *device,
+-		     const struct nvkm_oclass *oclass, void *data, u32 size,
+-		     struct nvkm_object **pobject)
++nvkm_fifo_class_new(struct nvkm_device *device, const struct nvkm_oclass *oclass,
++		    void *argv, u32 argc, struct nvkm_object **pobject)
+ {
+ 	struct nvkm_fifo *fifo = nvkm_fifo(oclass->engine);
+-	return fifo->func->class_new(fifo, oclass, data, size, pobject);
+-}
+ 
+-static const struct nvkm_device_oclass
+-nvkm_fifo_class_ = {
+-	.ctor = nvkm_fifo_class_new_,
+-};
++	if (oclass->engn == &fifo->func->chan.user)
++		return nvkm_uchan_new(fifo, NULL, oclass, argv, argc, pobject);
+ 
+-static int
+-nvkm_fifo_class_new(struct nvkm_device *device,
+-		    const struct nvkm_oclass *oclass, void *data, u32 size,
+-		    struct nvkm_object **pobject)
+-{
+-	const struct nvkm_fifo_chan_oclass *sclass = oclass->engn;
+-	struct nvkm_fifo *fifo = nvkm_fifo(oclass->engine);
+-	return sclass->ctor(fifo, oclass, data, size, pobject);
++	WARN_ON(1);
++	return -ENOSYS;
+ }
+ 
+ static const struct nvkm_device_oclass
+@@ -184,24 +173,20 @@ nvkm_fifo_class = {
+ };
+ 
+ static int
+-nvkm_fifo_class_get(struct nvkm_oclass *oclass, int index,
+-		    const struct nvkm_device_oclass **class)
++nvkm_fifo_class_get(struct nvkm_oclass *oclass, int index, const struct nvkm_device_oclass **class)
+ {
+ 	struct nvkm_fifo *fifo = nvkm_fifo(oclass->engine);
+-	const struct nvkm_fifo_chan_oclass *sclass;
++	const struct nvkm_fifo_func_chan *chan = &fifo->func->chan;
+ 	int c = 0;
+ 
+-	if (fifo->func->class_get) {
+-		int ret = fifo->func->class_get(fifo, index, oclass);
+-		if (ret == 0)
+-			*class = &nvkm_fifo_class_;
+-		return ret;
+-	}
++	if (fifo->func->engine_id == gk104_fifo_engine_id)
++		chan = &gk104_fifo(fifo)->func->chan;
+ 
+-	while ((sclass = fifo->func->chan[c])) {
++	/* *_CHANNEL_DMA, *_CHANNEL_GPFIFO_* */
++	if (chan->user.oclass) {
+ 		if (c++ == index) {
+-			oclass->base = sclass->base;
+-			oclass->engn = sclass;
++			oclass->base = chan->user;
++			oclass->engn = &fifo->func->chan.user;
+ 			*class = &nvkm_fifo_class;
+ 			return 0;
+ 		}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+index d0ac60b06720..9a677a1acf9b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/cgrp.h
+@@ -1,8 +1,11 @@
+-#ifndef __NVKM_FIFO_CGRP_H__
+-#define __NVKM_FIFO_CGRP_H__
+-#include "priv.h"
++/* SPDX-License-Identifier: MIT */
++#ifndef __NVKM_CGRP_H__
++#define __NVKM_CGRP_H__
++#include <core/os.h>
+ 
+-struct nvkm_fifo_cgrp {
++struct nvkm_cgrp {
++	const struct nvkm_cgrp_func {
++	} *func;
+ 	int id;
+ 	struct list_head head;
+ 	struct list_head chan;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+index 39d6b9217f8d..4d4905be4b92 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.c
+@@ -22,6 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "chan.h"
++#include "priv.h"
+ 
+ #include <core/client.h>
+ #include <core/gpuobj.h>
+@@ -140,7 +141,7 @@ nvkm_fifo_chan_child_func = {
+ 	.fini[0] = nvkm_fifo_chan_child_fini,
+ };
+ 
+-static int
++int
+ nvkm_fifo_chan_child_new(const struct nvkm_oclass *oclass, void *data, u32 size,
+ 			 struct nvkm_object **pobject)
+ {
+@@ -258,11 +259,6 @@ nvkm_fifo_chan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct n
+ 	struct nvkm_fifo_chan *chan = nvkm_fifo_chan(object);
+ 	union nvif_chan_event_args *args = argv;
+ 
+-	if (!uevent)
+-		return 0;
+-	if (argc != sizeof(args->v0) || args->v0.version != 0)
+-		return -ENOSYS;
+-
+ 	switch (args->v0.type) {
+ 	case NVIF_CHAN_EVENT_V0_NON_STALL_INTR:
+ 		return nvkm_uevent_add(uevent, &chan->fifo->uevent, 0,
+@@ -304,6 +300,18 @@ nvkm_fifo_chan_init(struct nvkm_object *object)
+ 	return 0;
+ }
+ 
++void
++nvkm_chan_del(struct nvkm_chan **pchan)
++{
++	struct nvkm_chan *chan = *pchan;
++
++	if (!chan)
++		return;
++
++	chan = nvkm_object_dtor(&chan->object);
++	kfree(chan);
++}
++
+ static void *
+ nvkm_fifo_chan_dtor(struct nvkm_object *object)
+ {
+@@ -326,6 +334,7 @@ nvkm_fifo_chan_dtor(struct nvkm_object *object)
+ 
+ 	nvkm_gpuobj_del(&chan->push);
+ 	nvkm_gpuobj_del(&chan->inst);
++	kfree(chan->func);
+ 	return data;
+ }
+ 
+@@ -340,20 +349,38 @@ nvkm_fifo_chan_func = {
+ };
+ 
+ int
+-nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *func,
++nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *fn,
+ 		    struct nvkm_fifo *fifo, u32 size, u32 align, bool zero,
+ 		    u64 hvmm, u64 push, u32 engm, int bar, u32 base,
+ 		    u32 user, const struct nvkm_oclass *oclass,
+ 		    struct nvkm_fifo_chan *chan)
+ {
++	struct nvkm_chan_func *func;
+ 	struct nvkm_client *client = oclass->client;
+ 	struct nvkm_device *device = fifo->engine.subdev.device;
+ 	struct nvkm_dmaobj *dmaobj;
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	nvkm_object_ctor(&nvkm_fifo_chan_func, oclass, &chan->object);
++	/*FIXME: temp kludge to ease transition, remove later */
++	if (!(func = kmalloc(sizeof(*func), GFP_KERNEL)))
++		return -ENOMEM;
++
++	*func = *fifo->func->chan.func;
++	func->dtor = fn->dtor;
++	func->init = fn->init;
++	func->fini = fn->fini;
++	func->engine_ctor = fn->engine_ctor;
++	func->engine_dtor = fn->engine_dtor;
++	func->engine_init = fn->engine_init;
++	func->engine_fini = fn->engine_fini;
++	func->object_ctor = fn->object_ctor;
++	func->object_dtor = fn->object_dtor;
++	func->submit_token = fn->submit_token;
++
+ 	chan->func = func;
++
++	nvkm_object_ctor(&nvkm_fifo_chan_func, oclass, &chan->object);
+ 	chan->fifo = fifo;
+ 	chan->engm = engm;
+ 	INIT_LIST_HEAD(&chan->head);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+index 8ef972134f9b..24fbe6cf70e1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/chan.h
+@@ -1,10 +1,10 @@
+ /* SPDX-License-Identifier: MIT */
+-#ifndef __NVKM_FIFO_CHAN_H__
+-#define __NVKM_FIFO_CHAN_H__
+-#define nvkm_fifo_chan(p) container_of((p), struct nvkm_fifo_chan, object)
+-#include "priv.h"
++#ifndef __NVKM_CHAN_H__
++#define __NVKM_CHAN_H__
++#define nvkm_chan(p) container_of((p), struct nvkm_chan, object) /*FIXME: remove later */
++#include <engine/fifo.h>
+ 
+-struct nvkm_fifo_chan_func {
++struct nvkm_chan_func {
+ 	void *(*dtor)(struct nvkm_fifo_chan *);
+ 	void (*init)(struct nvkm_fifo_chan *);
+ 	void (*fini)(struct nvkm_fifo_chan *);
+@@ -23,12 +23,7 @@ int nvkm_fifo_chan_ctor(const struct nvkm_fifo_chan_func *, struct nvkm_fifo *,
+ 			u32 size, u32 align, bool zero, u64 vm, u64 push,
+ 			u32 engm, int bar, u32 base, u32 user,
+ 			const struct nvkm_oclass *, struct nvkm_fifo_chan *);
++void nvkm_chan_del(struct nvkm_chan **);
+ 
+-struct nvkm_fifo_chan_oclass {
+-	int (*ctor)(struct nvkm_fifo *, const struct nvkm_oclass *,
+-		    void *data, u32 size, struct nvkm_object **);
+-	struct nvkm_sclass base;
+-};
+-
+-int gf100_fifo_chan_ntfy(struct nvkm_fifo_chan *, u32, struct nvkm_event **);
++int nvkm_fifo_chan_child_new(const struct nvkm_oclass *, void *, u32, struct nvkm_object **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv04.c
+index dbcdc5fab990..d17d8c65d169 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv04.c
+@@ -28,7 +28,6 @@
+ #include <core/ramht.h>
+ #include <subdev/instmem.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl006b.h>
+ #include <nvif/unpack.h>
+ 
+@@ -219,8 +218,5 @@ nv04_fifo_dma_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ nv04_fifo_dma_oclass = {
+-	.base.oclass = NV03_CHANNEL_DMA,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = nv04_fifo_dma_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv10.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv10.c
+index 07d80d54a07c..f45655072f9d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv10.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv10.c
+@@ -28,7 +28,6 @@
+ #include <core/gpuobj.h>
+ #include <subdev/instmem.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl006b.h>
+ #include <nvif/unpack.h>
+ 
+@@ -90,8 +89,5 @@ nv10_fifo_dma_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ nv10_fifo_dma_oclass = {
+-	.base.oclass = NV10_CHANNEL_DMA,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = nv10_fifo_dma_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv17.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv17.c
+index edd70a114218..cd3f9f84ab9c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv17.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv17.c
+@@ -28,7 +28,6 @@
+ #include <core/gpuobj.h>
+ #include <subdev/instmem.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl006b.h>
+ #include <nvif/unpack.h>
+ 
+@@ -91,8 +90,5 @@ nv17_fifo_dma_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ nv17_fifo_dma_oclass = {
+-	.base.oclass = NV17_CHANNEL_DMA,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = nv17_fifo_dma_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv40.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv40.c
+index 0411fb908457..c42c2e01d801 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv40.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/dmanv40.c
+@@ -28,7 +28,6 @@
+ #include <core/ramht.h>
+ #include <subdev/instmem.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl006b.h>
+ #include <nvif/unpack.h>
+ 
+@@ -247,8 +246,5 @@ nv40_fifo_dma_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ nv40_fifo_dma_oclass = {
+-	.base.oclass = NV40_CHANNEL_DMA,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = nv40_fifo_dma_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
+index c452388fd2a5..24732d355c83 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/g84.c
+@@ -21,9 +21,17 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "nv50.h"
+ #include "channv50.h"
+ 
++#include <nvif/class.h>
++
++const struct nvkm_chan_func
++g84_chan = {
++};
++
+ static void
+ g84_fifo_uevent_fini(struct nvkm_fifo *fifo)
+ {
+@@ -119,10 +127,8 @@ g84_fifo = {
+ 	.start = nv04_fifo_start,
+ 	.uevent_init = g84_fifo_uevent_init,
+ 	.uevent_fini = g84_fifo_uevent_fini,
+-	.chan = {
+-		&g84_fifo_gpfifo_oclass,
+-		NULL
+-	},
++	.cgrp = {{                          }, &nv04_cgrp },
++	.chan = {{ 0, 0, G82_CHANNEL_GPFIFO }, &g84_chan, .oclass = &g84_fifo_gpfifo_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+index e10c094c9a7d..25eda4fd2867 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -21,6 +21,8 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "gf100.h"
+ #include "changf100.h"
+ 
+@@ -47,6 +49,10 @@ gf100_fifo_uevent_fini(struct nvkm_fifo *fifo)
+ 	nvkm_mask(device, 0x002140, 0x80000000, 0x00000000);
+ }
+ 
++static const struct nvkm_chan_func
++gf100_chan = {
++};
++
+ void
+ gf100_fifo_runlist_commit(struct gf100_fifo *fifo)
+ {
+@@ -678,10 +684,8 @@ gf100_fifo = {
+ 	.id_engine = gf100_fifo_id_engine,
+ 	.uevent_init = gf100_fifo_uevent_init,
+ 	.uevent_fini = gf100_fifo_uevent_fini,
+-	.chan = {
+-		&gf100_fifo_gpfifo_oclass,
+-		NULL
+-	},
++	.cgrp = {{                            }, &nv04_cgrp },
++	.chan = {{ 0, 0, FERMI_CHANNEL_GPFIFO }, &gf100_chan, .oclass = &gf100_fifo_gpfifo_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+index e11b5eb8e196..1e15b88d59ae 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -21,6 +21,8 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "gk104.h"
+ #include "cgrp.h"
+ #include "changk104.h"
+@@ -36,6 +38,10 @@
+ #include <nvif/class.h>
+ #include <nvif/cl0080.h>
+ 
++static const struct nvkm_chan_func
++gk104_chan = {
++};
++
+ void
+ gk104_fifo_engine_status(struct gk104_fifo *fifo, int engn,
+ 			 struct gk104_fifo_engine_status *status)
+@@ -83,45 +89,6 @@ gk104_fifo_engine_status(struct gk104_fifo *fifo, int engn,
+ 		   status->chan == &status->next ? "*" : " ");
+ }
+ 
+-int
+-gk104_fifo_class_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+-		     void *argv, u32 argc, struct nvkm_object **pobject)
+-{
+-	struct gk104_fifo *fifo = gk104_fifo(base);
+-	if (oclass->engn == &fifo->func->chan) {
+-		const struct gk104_fifo_chan_user *user = oclass->engn;
+-		return user->ctor(fifo, oclass, argv, argc, pobject);
+-	} else
+-	if (oclass->engn == &fifo->func->user) {
+-		const struct gk104_fifo_user_user *user = oclass->engn;
+-		return user->ctor(oclass, argv, argc, pobject);
+-	}
+-	WARN_ON(1);
+-	return -EINVAL;
+-}
+-
+-int
+-gk104_fifo_class_get(struct nvkm_fifo *base, int index,
+-		     struct nvkm_oclass *oclass)
+-{
+-	struct gk104_fifo *fifo = gk104_fifo(base);
+-	int c = 0;
+-
+-	if (fifo->func->user.ctor && c++ == index) {
+-		oclass->base =  fifo->func->user.user;
+-		oclass->engn = &fifo->func->user;
+-		return 0;
+-	}
+-
+-	if (fifo->func->chan.ctor && c++ == index) {
+-		oclass->base =  fifo->func->chan.user;
+-		oclass->engn = &fifo->func->chan;
+-		return 0;
+-	}
+-
+-	return c;
+-}
+-
+ void
+ gk104_fifo_uevent_fini(struct nvkm_fifo *fifo)
+ {
+@@ -1093,8 +1060,6 @@ gk104_fifo_ = {
+ 	.uevent_init = gk104_fifo_uevent_init,
+ 	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = gk104_fifo_recover_chan,
+-	.class_get = gk104_fifo_class_get,
+-	.class_new = gk104_fifo_class_new,
+ };
+ 
+ int
+@@ -1245,7 +1210,8 @@ gk104_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gk104_fifo_runlist,
+-	.chan = {{0,0,KEPLER_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp = {{                               }, &nv04_cgrp },
++	.chan = {{ 0, 0, KEPLER_CHANNEL_GPFIFO_A }, &gk104_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+index 5eca8c757966..be426734da02 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+@@ -76,18 +76,8 @@ struct gk104_fifo_func {
+ 			       struct nvkm_memory *, int entries);
+ 	} *runlist;
+ 
+-	struct gk104_fifo_user_user {
+-		struct nvkm_sclass user;
+-		int (*ctor)(const struct nvkm_oclass *, void *, u32,
+-			    struct nvkm_object **);
+-	} user;
+-
+-	struct gk104_fifo_chan_user {
+-		struct nvkm_sclass user;
+-		int (*ctor)(struct gk104_fifo *, const struct nvkm_oclass *,
+-			    void *, u32, struct nvkm_object **);
+-	} chan;
+-	bool cgrp_force;
++	struct nvkm_fifo_func_cgrp cgrp;
++	struct nvkm_fifo_func_chan chan;
+ };
+ 
+ struct gk104_fifo_engine_status {
+@@ -121,10 +111,6 @@ int gk104_fifo_oneinit(struct nvkm_fifo *base);
+ int gk104_fifo_info(struct nvkm_fifo *base, u64 mthd, u64 *data);
+ void gk104_fifo_init(struct nvkm_fifo *base);
+ void gk104_fifo_fini(struct nvkm_fifo *base);
+-int gk104_fifo_class_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+-			 void *argv, u32 argc, struct nvkm_object **pobject);
+-int gk104_fifo_class_get(struct nvkm_fifo *base, int index,
+-			 struct nvkm_oclass *oclass);
+ void gk104_fifo_uevent_fini(struct nvkm_fifo *fifo);
+ void gk104_fifo_uevent_init(struct nvkm_fifo *fifo);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+index 047e128febd1..df9b83cf382f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk110.c
+@@ -21,14 +21,24 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "gk104.h"
+ #include "cgrp.h"
++#include "chan.h"
++
++#include "gk104.h"
+ #include "changk104.h"
+ 
+ #include <core/memory.h>
+ 
+ #include <nvif/class.h>
+ 
++const struct nvkm_chan_func
++gk110_chan = {
++};
++
++const struct nvkm_cgrp_func
++gk110_cgrp = {
++};
++
+ void
+ gk110_fifo_runlist_cgrp(struct nvkm_fifo_cgrp *cgrp,
+ 			struct nvkm_memory *memory, u32 offset)
+@@ -57,7 +67,8 @@ gk110_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gk110_fifo_runlist,
+-	.chan = {{0,0,KEPLER_CHANNEL_GPFIFO_B}, gk104_fifo_gpfifo_new },
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp },
++	.chan = {{ 0, 0, KEPLER_CHANNEL_GPFIFO_B }, &gk110_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
+index 89b9c4fa35cc..003f244f89db 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk208.c
+@@ -60,7 +60,8 @@ gk208_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gk110_fifo_runlist,
+-	.chan = {{0,0,KEPLER_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp },
++	.chan = {{ 0, 0, KEPLER_CHANNEL_GPFIFO_A }, &gk110_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
+index 48cdcf9a4a72..661c9f0cf7b9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk20a.c
+@@ -35,7 +35,8 @@ gk20a_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gk110_fifo_runlist,
+-	.chan = {{0,0,KEPLER_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp = {{                               }, &gk110_cgrp },
++	.chan = {{ 0, 0, KEPLER_CHANNEL_GPFIFO_A }, &gk110_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+index 7b4244f184d2..910d97911a98 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm107.c
+@@ -21,6 +21,8 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "priv.h"
++#include "chan.h"
+ #include "gk104.h"
+ #include "changk104.h"
+ 
+@@ -29,6 +31,10 @@
+ 
+ #include <nvif/class.h>
+ 
++const struct nvkm_chan_func
++gm107_chan = {
++};
++
+ static void
+ gm107_fifo_runlist_chan(struct gk104_fifo_chan *chan,
+ 			struct nvkm_memory *memory, u32 offset)
+@@ -109,7 +115,8 @@ gm107_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gm107_fifo_runlist,
+-	.chan = {{0,0,KEPLER_CHANNEL_GPFIFO_B}, gk104_fifo_gpfifo_new },
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp },
++	.chan = {{ 0, 0, KEPLER_CHANNEL_GPFIFO_B }, &gm107_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
+index 17836a383c76..101027536a93 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gm200.c
+@@ -57,7 +57,8 @@ gm200_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gm107_fifo_runlist,
+-	.chan = {{0,0,MAXWELL_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp = {{ 0, 0,  KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp },
++	.chan = {{ 0, 0, MAXWELL_CHANNEL_GPFIFO_A }, &gm107_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+index 7a1ac3d863ec..c52a4a0b361b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+@@ -87,8 +87,8 @@ gp100_fifo = {
+ 	.fault.hubclient = gk104_fifo_fault_hubclient,
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gm107_fifo_runlist,
+-	.chan = {{0,0,PASCAL_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
+-	.cgrp_force = true,
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp, .force = true },
++	.chan = {{ 0, 0, PASCAL_CHANNEL_GPFIFO_A }, &gm107_chan, .ctor = &gk104_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifog84.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifog84.c
+index 2121f517b1dd..3157a7633231 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifog84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifog84.c
+@@ -26,7 +26,6 @@
+ #include <core/client.h>
+ #include <core/ramht.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl826f.h>
+ #include <nvif/unpack.h>
+ 
+@@ -88,8 +87,5 @@ g84_fifo_gpfifo_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ g84_fifo_gpfifo_oclass = {
+-	.base.oclass = G82_CHANNEL_GPFIFO,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = g84_fifo_gpfifo_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogf100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogf100.c
+index 4b1f6702680a..5d6e3a7b8f1e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogf100.c
+@@ -28,7 +28,6 @@
+ #include <subdev/fb.h>
+ #include <subdev/timer.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl906f.h>
+ #include <nvif/unpack.h>
+ 
+@@ -283,8 +282,5 @@ gf100_fifo_gpfifo_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ gf100_fifo_gpfifo_oclass = {
+-	.base.oclass = FERMI_CHANNEL_GPFIFO,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = gf100_fifo_gpfifo_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
+index ea9852a5fdd8..6415e80a1fbf 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
+@@ -30,7 +30,6 @@
+ #include <subdev/mmu.h>
+ #include <subdev/timer.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cla06f.h>
+ #include <nvif/unpack.h>
+ 
+@@ -287,7 +286,7 @@ gk104_fifo_gpfifo_new_(struct gk104_fifo *fifo, u64 *runlists, u16 *chid,
+ 	/* Hack to support GPUs where even individual channels should be
+ 	 * part of a channel group.
+ 	 */
+-	if (fifo->func->cgrp_force) {
++	if (fifo->func->cgrp.force) {
+ 		if (!(chan->cgrp = kmalloc(sizeof(*chan->cgrp), GFP_KERNEL)))
+ 			return -ENOMEM;
+ 		chan->cgrp->id = chan->base.chid;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogv100.c
+index e8546fed4024..34a8e792c0e8 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogv100.c
+@@ -168,7 +168,7 @@ gv100_fifo_gpfifo_new_(const struct nvkm_fifo_chan_func *func,
+ 	/* Hack to support GPUs where even individual channels should be
+ 	 * part of a channel group.
+ 	 */
+-	if (fifo->func->cgrp_force) {
++	if (fifo->func->cgrp.force) {
+ 		if (!(chan->cgrp = kmalloc(sizeof(*chan->cgrp), GFP_KERNEL)))
+ 			return -ENOMEM;
+ 		chan->cgrp->id = chan->base.chid;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifonv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifonv50.c
+index d8f28ec1e4a8..410fc9e6c1f9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifonv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifonv50.c
+@@ -26,7 +26,6 @@
+ #include <core/client.h>
+ #include <core/ramht.h>
+ 
+-#include <nvif/class.h>
+ #include <nvif/cl506f.h>
+ #include <nvif/unpack.h>
+ 
+@@ -86,8 +85,5 @@ nv50_fifo_gpfifo_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
+ 
+ const struct nvkm_fifo_chan_oclass
+ nv50_fifo_gpfifo_oclass = {
+-	.base.oclass = NV50_CHANNEL_GPFIFO,
+-	.base.minver = 0,
+-	.base.maxver = 0,
+ 	.ctor = nv50_fifo_gpfifo_new,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+index 0be50120476f..ddca29852865 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gv100.c
+@@ -19,14 +19,20 @@
+  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+-#include "gk104.h"
++#include "chan.h"
+ #include "cgrp.h"
++
++#include "gk104.h"
+ #include "changk104.h"
+ 
+ #include <core/gpuobj.h>
+ 
+ #include <nvif/class.h>
+ 
++static const struct nvkm_chan_func
++gv100_chan = {
++};
++
+ void
+ gv100_fifo_runlist_chan(struct gk104_fifo_chan *chan,
+ 			struct nvkm_memory *memory, u32 offset)
+@@ -295,8 +301,8 @@ gv100_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.runlist = &gv100_fifo_runlist,
+-	.chan = {{ 0, 0,VOLTA_CHANNEL_GPFIFO_A}, gv100_fifo_gpfifo_new },
+-	.cgrp_force = true,
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp, .force = true },
++	.chan = {{ 0, 0,  VOLTA_CHANNEL_GPFIFO_A }, &gv100_chan, .ctor = gv100_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+index e4b4133be3a4..95a30fbf65a1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv04.c
+@@ -21,6 +21,9 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "cgrp.h"
++#include "chan.h"
++
+ #include "nv04.h"
+ #include "channv04.h"
+ #include "regsnv04.h"
+@@ -31,6 +34,8 @@
+ #include <subdev/timer.h>
+ #include <engine/sw.h>
+ 
++#include <nvif/class.h>
++
+ static const struct nv04_fifo_ramfc
+ nv04_fifo_ramfc[] = {
+ 	{ 32,  0, 0x00,  0, NV04_PFIFO_CACHE1_DMA_PUT },
+@@ -44,6 +49,14 @@ nv04_fifo_ramfc[] = {
+ 	{}
+ };
+ 
++static const struct nvkm_chan_func
++nv04_chan = {
++};
++
++const struct nvkm_cgrp_func
++nv04_cgrp = {
++};
++
+ void
+ nv04_fifo_pause(struct nvkm_fifo *base, unsigned long *pflags)
+ __acquires(fifo->base.lock)
+@@ -392,10 +405,8 @@ nv04_fifo = {
+ 	.id_engine = nv04_fifo_id_engine,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.chan = {
+-		&nv04_fifo_dma_oclass,
+-		NULL
+-	},
++	.cgrp = {{                        }, &nv04_cgrp },
++	.chan = {{ 0, 0, NV03_CHANNEL_DMA }, &nv04_chan, .oclass = &nv04_fifo_dma_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv10.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv10.c
+index 94ad6ee19297..f07304e4b8c5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv10.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv10.c
+@@ -21,10 +21,14 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "nv04.h"
+ #include "channv04.h"
+ #include "regsnv04.h"
+ 
++#include <nvif/class.h>
++
+ static const struct nv04_fifo_ramfc
+ nv10_fifo_ramfc[] = {
+ 	{ 32,  0, 0x00,  0, NV04_PFIFO_CACHE1_DMA_PUT },
+@@ -39,6 +43,10 @@ nv10_fifo_ramfc[] = {
+ 	{}
+ };
+ 
++static const struct nvkm_chan_func
++nv10_chan = {
++};
++
+ int
+ nv10_fifo_chid_nr(struct nvkm_fifo *fifo)
+ {
+@@ -54,10 +62,8 @@ nv10_fifo = {
+ 	.id_engine = nv04_fifo_id_engine,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.chan = {
+-		&nv10_fifo_dma_oclass,
+-		NULL
+-	},
++	.cgrp = {{                        }, &nv04_cgrp },
++	.chan = {{ 0, 0, NV10_CHANNEL_DMA }, &nv10_chan, .oclass = &nv10_fifo_dma_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv17.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv17.c
+index 23d320362c86..858c8ba158c9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv17.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv17.c
+@@ -21,6 +21,8 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "nv04.h"
+ #include "channv04.h"
+ #include "regsnv04.h"
+@@ -28,6 +30,8 @@
+ #include <core/ramht.h>
+ #include <subdev/instmem.h>
+ 
++#include <nvif/class.h>
++
+ static const struct nv04_fifo_ramfc
+ nv17_fifo_ramfc[] = {
+ 	{ 32,  0, 0x00,  0, NV04_PFIFO_CACHE1_DMA_PUT },
+@@ -47,6 +51,10 @@ nv17_fifo_ramfc[] = {
+ 	{}
+ };
+ 
++static const struct nvkm_chan_func
++nv17_chan = {
++};
++
+ static void
+ nv17_fifo_init(struct nvkm_fifo *base)
+ {
+@@ -86,10 +94,8 @@ nv17_fifo = {
+ 	.id_engine = nv04_fifo_id_engine,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.chan = {
+-		&nv17_fifo_dma_oclass,
+-		NULL
+-	},
++	.cgrp = {{                        }, &nv04_cgrp },
++	.chan = {{ 0, 0, NV17_CHANNEL_DMA }, &nv17_chan, .oclass = &nv17_fifo_dma_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv40.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv40.c
+index 01e75c80b4f3..30f924e3da3c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv40.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv40.c
+@@ -21,6 +21,8 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "nv04.h"
+ #include "channv04.h"
+ #include "regsnv04.h"
+@@ -29,6 +31,8 @@
+ #include <subdev/fb.h>
+ #include <subdev/instmem.h>
+ 
++#include <nvif/class.h>
++
+ static const struct nv04_fifo_ramfc
+ nv40_fifo_ramfc[] = {
+ 	{ 32,  0, 0x00,  0, NV04_PFIFO_CACHE1_DMA_PUT },
+@@ -56,6 +60,10 @@ nv40_fifo_ramfc[] = {
+ 	{}
+ };
+ 
++static const struct nvkm_chan_func
++nv40_chan = {
++};
++
+ static void
+ nv40_fifo_init(struct nvkm_fifo *base)
+ {
+@@ -117,10 +125,8 @@ nv40_fifo = {
+ 	.id_engine = nv04_fifo_id_engine,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.chan = {
+-		&nv40_fifo_dma_oclass,
+-		NULL
+-	},
++	.cgrp = {{                        }, &nv04_cgrp },
++	.chan = {{ 0, 0, NV40_CHANNEL_DMA }, &nv40_chan, .oclass = &nv40_fifo_dma_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+index 9d0cfb856401..f3f11a324591 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+@@ -21,11 +21,19 @@
+  *
+  * Authors: Ben Skeggs
+  */
++#include "chan.h"
++
+ #include "nv50.h"
+ #include "channv50.h"
+ 
+ #include <core/gpuobj.h>
+ 
++#include <nvif/class.h>
++
++static const struct nvkm_chan_func
++nv50_chan = {
++};
++
+ static void
+ nv50_fifo_runlist_update_locked(struct nv50_fifo *fifo)
+ {
+@@ -142,10 +150,8 @@ nv50_fifo = {
+ 	.id_engine = nv04_fifo_id_engine,
+ 	.pause = nv04_fifo_pause,
+ 	.start = nv04_fifo_start,
+-	.chan = {
+-		&nv50_fifo_gpfifo_oclass,
+-		NULL
+-	},
++	.cgrp = {{                           }, &nv04_cgrp },
++	.chan = {{ 0, 0, NV50_CHANNEL_GPFIFO }, &nv50_chan, .oclass = &nv50_fifo_gpfifo_oclass },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+index 66e93609c3c7..b8031c212c8b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/priv.h
+@@ -3,6 +3,8 @@
+ #define __NVKM_FIFO_PRIV_H__
+ #define nvkm_fifo(p) container_of((p), struct nvkm_fifo, engine)
+ #include <engine/fifo.h>
++struct nvkm_cgrp;
++struct gk104_fifo;
+ 
+ void nvkm_fifo_uevent(struct nvkm_fifo *);
+ void nvkm_fifo_kevent(struct nvkm_fifo *, int chid);
+@@ -30,10 +32,23 @@ struct nvkm_fifo_func {
+ 	void (*uevent_init)(struct nvkm_fifo *);
+ 	void (*uevent_fini)(struct nvkm_fifo *);
+ 	void (*recover_chan)(struct nvkm_fifo *, int chid);
+-	int (*class_get)(struct nvkm_fifo *, int index, struct nvkm_oclass *);
+-	int (*class_new)(struct nvkm_fifo *, const struct nvkm_oclass *,
+-			 void *, u32, struct nvkm_object **);
+-	const struct nvkm_fifo_chan_oclass *chan[];
++
++	struct nvkm_fifo_func_cgrp {
++		struct nvkm_sclass user;
++		const struct nvkm_cgrp_func *func;
++		bool force;
++	} cgrp;
++
++	struct nvkm_fifo_func_chan {
++		struct nvkm_sclass user;
++		const struct nvkm_chan_func *func;
++		const struct nvkm_fifo_chan_oclass {
++			int (*ctor)(struct nvkm_fifo *, const struct nvkm_oclass *,
++			void *data, u32 size, struct nvkm_object **);
++		} *oclass;
++		int (*ctor)(struct gk104_fifo *, const struct nvkm_oclass *, void *, u32,
++			    struct nvkm_object **);
++	} chan;
+ };
+ 
+ int nvkm_fifo_ctor(const struct nvkm_fifo_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
+@@ -44,16 +59,27 @@ int nv04_fifo_engine_id(struct nvkm_fifo *, struct nvkm_engine *);
+ struct nvkm_engine *nv04_fifo_id_engine(struct nvkm_fifo *, int);
+ void nv04_fifo_pause(struct nvkm_fifo *, unsigned long *);
+ void nv04_fifo_start(struct nvkm_fifo *, unsigned long *);
++extern const struct nvkm_cgrp_func nv04_cgrp;
+ 
+ int nv10_fifo_chid_nr(struct nvkm_fifo *);
+ 
+ int nv50_fifo_chid_nr(struct nvkm_fifo *);
+ 
++extern const struct nvkm_chan_func g84_chan;
++
+ void gf100_fifo_intr_fault(struct nvkm_fifo *, int);
+ 
+ int gk104_fifo_chid_nr(struct nvkm_fifo *);
+ int gk104_fifo_engine_id(struct nvkm_fifo *, struct nvkm_engine *);
+ struct nvkm_engine *gk104_fifo_id_engine(struct nvkm_fifo *, int);
+ 
++extern const struct nvkm_cgrp_func gk110_cgrp;
++extern const struct nvkm_chan_func gk110_chan;
++
++extern const struct nvkm_chan_func gm107_chan;
++
+ int gm200_fifo_chid_nr(struct nvkm_fifo *);
++
++int nvkm_uchan_new(struct nvkm_fifo *, struct nvkm_cgrp *, const struct nvkm_oclass *,
++		   void *argv, u32 argc, struct nvkm_object **);
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+index 63a3a2c0a824..db9b802bd67c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/tu102.c
+@@ -19,6 +19,8 @@
+  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
++#include "chan.h"
++
+ #include "gk104.h"
+ #include "cgrp.h"
+ #include "changk104.h"
+@@ -31,6 +33,10 @@
+ 
+ #include <nvif/class.h>
+ 
++static const struct nvkm_chan_func
++tu102_chan = {
++};
++
+ static void
+ tu102_fifo_runlist_commit(struct gk104_fifo *fifo, int runl,
+ 			  struct nvkm_memory *mem, int nr)
+@@ -440,8 +446,6 @@ tu102_fifo_ = {
+ 	.uevent_init = gk104_fifo_uevent_init,
+ 	.uevent_fini = gk104_fifo_uevent_fini,
+ 	.recover_chan = tu102_fifo_recover_chan,
+-	.class_get = gk104_fifo_class_get,
+-	.class_new = gk104_fifo_class_new,
+ };
+ 
+ static const struct gk104_fifo_func
+@@ -454,8 +458,8 @@ tu102_fifo = {
+ 	.fault.hubclient = gv100_fifo_fault_hubclient,
+ 	.fault.gpcclient = gv100_fifo_fault_gpcclient,
+ 	.runlist = &tu102_fifo_runlist,
+-	.chan = {{ 0, 0,TURING_CHANNEL_GPFIFO_A}, tu102_fifo_gpfifo_new },
+-	.cgrp_force = true,
++	.cgrp = {{ 0, 0, KEPLER_CHANNEL_GROUP_A  }, &gk110_cgrp, .force = true },
++	.chan = {{ 0, 0, TURING_CHANNEL_GPFIFO_A }, &tu102_chan, .ctor = tu102_fifo_gpfifo_new },
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+new file mode 100644
+index 000000000000..a1d93f28b634
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/uchan.c
+@@ -0,0 +1,174 @@
++/*
++ * Copyright 2021 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#define nvkm_uchan(p) container_of((p), struct nvkm_uchan, object)
++#include "cgrp.h"
++#include "chan.h"
++
++#include <core/oproxy.h>
++
++#include <nvif/if0020.h>
++
++#include "gk104.h"
++
++struct nvkm_uchan {
++	struct nvkm_object object;
++	struct nvkm_chan *chan;
++};
++
++static int
++nvkm_uchan_uevent(struct nvkm_object *object, void *argv, u32 argc, struct nvkm_uevent *uevent)
++{
++	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++	union nvif_chan_event_args *args = argv;
++
++	if (!uevent)
++		return 0;
++	if (argc != sizeof(args->v0) || args->v0.version != 0)
++		return -ENOSYS;
++
++	switch (args->v0.type) {
++	case NVIF_CHAN_EVENT_V0_NON_STALL_INTR:
++	case NVIF_CHAN_EVENT_V0_KILLED:
++		return chan->object.func->uevent(&chan->object, argv, argc, uevent);
++	default:
++		break;
++	}
++
++	return -ENOSYS;
++}
++
++struct nvkm_uobj {
++	struct nvkm_oproxy oproxy;
++	struct nvkm_chan *chan;
++};
++
++static const struct nvkm_oproxy_func
++nvkm_uchan_object = {
++};
++
++static int
++nvkm_uchan_object_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
++		      struct nvkm_object **pobject)
++{
++	struct nvkm_chan *chan = nvkm_uchan(oclass->parent)->chan;
++	struct nvkm_uobj *uobj;
++	struct nvkm_oclass _oclass;
++
++	if (!(uobj = kzalloc(sizeof(*uobj), GFP_KERNEL)))
++		return -ENOMEM;
++
++	nvkm_oproxy_ctor(&nvkm_uchan_object, oclass, &uobj->oproxy);
++	uobj->chan = chan;
++	*pobject = &uobj->oproxy.base;
++
++	_oclass = *oclass;
++	_oclass.parent = &chan->object;
++	return nvkm_fifo_chan_child_new(&_oclass, argv, argc, &uobj->oproxy.object);
++}
++
++static int
++nvkm_uchan_sclass(struct nvkm_object *object, int index, struct nvkm_oclass *oclass)
++{
++	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++	int ret;
++
++	ret = chan->object.func->sclass(&chan->object, index, oclass);
++	if (ret)
++		return ret;
++
++	oclass->ctor = nvkm_uchan_object_new;
++	return 0;
++}
++
++static int
++nvkm_uchan_map(struct nvkm_object *object, void *argv, u32 argc,
++	       enum nvkm_object_map *type, u64 *addr, u64 *size)
++{
++	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++
++	return chan->object.func->map(&chan->object, argv, argc, type, addr, size);
++}
++
++static int
++nvkm_uchan_fini(struct nvkm_object *object, bool suspend)
++{
++	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++	int ret;
++
++	ret = chan->object.func->fini(&chan->object, suspend);
++	if (ret && suspend)
++		return ret;
++
++	return 0;
++}
++
++static int
++nvkm_uchan_init(struct nvkm_object *object)
++{
++	struct nvkm_chan *chan = nvkm_uchan(object)->chan;
++
++	return chan->object.func->init(&chan->object);
++}
++
++static void *
++nvkm_uchan_dtor(struct nvkm_object *object)
++{
++	struct nvkm_uchan *uchan = nvkm_uchan(object);
++
++	nvkm_chan_del(&uchan->chan);
++	return uchan;
++}
++
++static const struct nvkm_object_func
++nvkm_uchan = {
++	.dtor = nvkm_uchan_dtor,
++	.init = nvkm_uchan_init,
++	.fini = nvkm_uchan_fini,
++	.map = nvkm_uchan_map,
++	.sclass = nvkm_uchan_sclass,
++	.uevent = nvkm_uchan_uevent,
++};
++
++int
++nvkm_uchan_new(struct nvkm_fifo *fifo, struct nvkm_cgrp *cgrp, const struct nvkm_oclass *oclass,
++	       void *argv, u32 argc, struct nvkm_object **pobject)
++{
++	struct nvkm_object *object = NULL;
++	struct nvkm_uchan *uchan;
++	int ret;
++
++	if (!(uchan = kzalloc(sizeof(*uchan), GFP_KERNEL)))
++		return -ENOMEM;
++
++	nvkm_object_ctor(&nvkm_uchan, oclass, &uchan->object);
++	*pobject = &uchan->object;
++
++	if (!fifo->func->chan.func)
++		ret = gk104_fifo(fifo)->func->chan.ctor(gk104_fifo(fifo), oclass, argv, argc, &object);
++	else
++		ret = fifo->func->chan.oclass->ctor(fifo, oclass, argv, argc, &object);
++	if (!object)
++		return ret;
++
++	uchan->chan = container_of(object, typeof(*uchan->chan), object);
++	return ret;
++}
+-- 
+2.25.1
+

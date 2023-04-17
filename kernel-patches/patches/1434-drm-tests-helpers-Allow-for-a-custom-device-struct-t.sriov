@@ -1,0 +1,193 @@
+From fd8a79465bbd05896c59c359b89055d0165b561f Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <maxime@cerno.tech>
+Date: Thu, 1 Dec 2022 16:11:41 +0100
+Subject: [PATCH 1434/2236] drm/tests: helpers: Allow for a custom device
+ struct to be allocated
+
+The current helper to allocate a DRM device doesn't allow for any
+subclassing by drivers, which is going to be troublesome as we work on
+getting some kunit testing on atomic modesetting code.
+
+Let's use a similar pattern to the other allocation helpers by providing
+the structure size and offset as arguments.
+
+Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+Link: https://lore.kernel.org/r/20221123-rpi-kunit-tests-v3-10-4615a663a84a@cerno.tech
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+---
+ .../gpu/drm/tests/drm_client_modeset_test.c   |  4 +-
+ drivers/gpu/drm/tests/drm_kunit_helpers.c     | 40 +++++--------------
+ drivers/gpu/drm/tests/drm_modes_test.c        |  5 ++-
+ drivers/gpu/drm/tests/drm_probe_helper_test.c |  5 ++-
+ include/drm/drm_kunit_helpers.h               | 32 ++++++++++++++-
+ 5 files changed, 48 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/tests/drm_client_modeset_test.c b/drivers/gpu/drm/tests/drm_client_modeset_test.c
+index 053dbc0106d9..416a279b6dae 100644
+--- a/drivers/gpu/drm/tests/drm_client_modeset_test.c
++++ b/drivers/gpu/drm/tests/drm_client_modeset_test.c
+@@ -63,7 +63,9 @@ static int drm_client_modeset_test_init(struct kunit *test)
+ 	priv->dev = drm_kunit_helper_alloc_device(test);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->dev);
+ 
+-	priv->drm = drm_kunit_helper_alloc_drm_device(test, priv->dev, DRIVER_MODESET);
++	priv->drm = __drm_kunit_helper_alloc_drm_device(test, priv->dev,
++							sizeof(*priv->drm), 0,
++							DRIVER_MODESET);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->drm);
+ 
+ 	ret = drmm_connector_init(priv->drm, &priv->connector,
+diff --git a/drivers/gpu/drm/tests/drm_kunit_helpers.c b/drivers/gpu/drm/tests/drm_kunit_helpers.c
+index 9bfd3cb9cde1..b5485ab8fbf9 100644
+--- a/drivers/gpu/drm/tests/drm_kunit_helpers.c
++++ b/drivers/gpu/drm/tests/drm_kunit_helpers.c
+@@ -11,10 +11,6 @@
+ 
+ #define KUNIT_DEVICE_NAME	"drm-kunit-mock-device"
+ 
+-struct kunit_dev {
+-	struct drm_device base;
+-};
+-
+ static const struct drm_mode_config_funcs drm_mode_config_funcs = {
+ };
+ 
+@@ -85,32 +81,14 @@ void drm_kunit_helper_free_device(struct kunit *test, struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(drm_kunit_helper_free_device);
+ 
+-/**
+- * drm_kunit_helper_alloc_drm_device - Allocates a mock DRM device for KUnit tests
+- * @test: The test context object
+- * @dev: The parent device object
+- * @features: Mocked DRM device driver features
+- *
+- * This function creates a struct &drm_driver and will create a struct
+- * &drm_device from @dev and that driver.
+- *
+- * @dev should be allocated using drm_kunit_helper_alloc_device().
+- *
+- * The driver is tied to the @test context and will get cleaned at the
+- * end of the test. The drm_device is allocated through
+- * devm_drm_dev_alloc() and will thus be freed through a device-managed
+- * resource.
+- *
+- * Returns:
+- * A pointer to the new drm_device, or an ERR_PTR() otherwise.
+- */
+ struct drm_device *
+-drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
+-				  u32 features)
++__drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
++				    size_t size, size_t offset,
++				    u32 features)
+ {
+-	struct kunit_dev *kdev;
+ 	struct drm_device *drm;
+ 	struct drm_driver *driver;
++	void *container;
+ 	int ret;
+ 
+ 	driver = kunit_kzalloc(test, sizeof(*driver), GFP_KERNEL);
+@@ -118,11 +96,11 @@ drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	driver->driver_features = features;
+-	kdev = devm_drm_dev_alloc(dev, driver, struct kunit_dev, base);
+-	if (IS_ERR(kdev))
+-		return ERR_CAST(kdev);
++	container = __devm_drm_dev_alloc(dev, driver, size, offset);
++	if (IS_ERR(container))
++		return ERR_CAST(container);
+ 
+-	drm = &kdev->base;
++	drm = container + offset;
+ 	drm->mode_config.funcs = &drm_mode_config_funcs;
+ 
+ 	ret = drmm_mode_config_init(drm);
+@@ -131,7 +109,7 @@ drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
+ 
+ 	return drm;
+ }
+-EXPORT_SYMBOL_GPL(drm_kunit_helper_alloc_drm_device);
++EXPORT_SYMBOL_GPL(__drm_kunit_helper_alloc_drm_device);
+ 
+ MODULE_AUTHOR("Maxime Ripard <maxime@cerno.tech>");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/tests/drm_modes_test.c b/drivers/gpu/drm/tests/drm_modes_test.c
+index d1e9f3c0433a..bc4aa2ce78be 100644
+--- a/drivers/gpu/drm/tests/drm_modes_test.c
++++ b/drivers/gpu/drm/tests/drm_modes_test.c
+@@ -26,8 +26,9 @@ static int drm_test_modes_init(struct kunit *test)
+ 	priv->dev = drm_kunit_helper_alloc_device(test);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->dev);
+ 
+-	priv->drm = drm_kunit_helper_alloc_drm_device(test, priv->dev,
+-						      DRIVER_MODESET);
++	priv->drm = __drm_kunit_helper_alloc_drm_device(test, priv->dev,
++							sizeof(*priv->drm), 0,
++							DRIVER_MODESET);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->drm);
+ 
+ 	test->priv = priv;
+diff --git a/drivers/gpu/drm/tests/drm_probe_helper_test.c b/drivers/gpu/drm/tests/drm_probe_helper_test.c
+index bfca61c6099d..0ee65828623e 100644
+--- a/drivers/gpu/drm/tests/drm_probe_helper_test.c
++++ b/drivers/gpu/drm/tests/drm_probe_helper_test.c
+@@ -43,8 +43,9 @@ static int drm_probe_helper_test_init(struct kunit *test)
+ 	priv->dev = drm_kunit_helper_alloc_device(test);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->dev);
+ 
+-	priv->drm = drm_kunit_helper_alloc_drm_device(test, priv->dev,
+-						      DRIVER_MODESET | DRIVER_ATOMIC);
++	priv->drm = __drm_kunit_helper_alloc_drm_device(test, priv->dev,
++							sizeof(*priv->drm), 0,
++							DRIVER_MODESET | DRIVER_ATOMIC);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->drm);
+ 
+ 	connector = &priv->connector;
+diff --git a/include/drm/drm_kunit_helpers.h b/include/drm/drm_kunit_helpers.h
+index b4277fe92c38..df99fda95e89 100644
+--- a/include/drm/drm_kunit_helpers.h
++++ b/include/drm/drm_kunit_helpers.h
+@@ -10,7 +10,35 @@ struct device *drm_kunit_helper_alloc_device(struct kunit *test);
+ void drm_kunit_helper_free_device(struct kunit *test, struct device *dev);
+ 
+ struct drm_device *
+-drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
+-				  u32 features);
++__drm_kunit_helper_alloc_drm_device(struct kunit *test, struct device *dev,
++				    size_t size, size_t offset,
++				    u32 features);
++
++/**
++ * drm_kunit_helper_alloc_drm_device - Allocates a mock DRM device for KUnit tests
++ * @_test: The test context object
++ * @_dev: The parent device object
++ * @_type: the type of the struct which contains struct &drm_device
++ * @_member: the name of the &drm_device within @_type.
++ * @_features: Mocked DRM device driver features
++ *
++ * This function creates a struct &drm_driver and will create a struct
++ * &drm_device from @_dev and that driver.
++ *
++ * @_dev should be allocated using drm_kunit_helper_alloc_device().
++ *
++ * The driver is tied to the @_test context and will get cleaned at the
++ * end of the test. The drm_device is allocated through
++ * devm_drm_dev_alloc() and will thus be freed through a device-managed
++ * resource.
++ *
++ * Returns:
++ * A pointer to the new drm_device, or an ERR_PTR() otherwise.
++ */
++#define drm_kunit_helper_alloc_drm_device(_test, _dev, _type, _member, _feat)	\
++	((_type *)__drm_kunit_helper_alloc_drm_device(_test, _dev,		\
++						      sizeof(_type),		\
++						      offsetof(_type, _member),	\
++						      _feat))
+ 
+ #endif // DRM_KUNIT_HELPERS_H_
+-- 
+2.25.1
+
