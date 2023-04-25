@@ -1,0 +1,222 @@
+From 04ad79f701a4f214adca5a22e88f683d92322481 Mon Sep 17 00:00:00 2001
+From: "Mazlan, Hazwan Arif" <hazwan.arif.mazlan@intel.com>
+Date: Mon, 10 Apr 2023 21:04:47 +0800
+Subject: [PATCH 05/22] drm/i915: Allow user to set cache at BO creation
+
+To comply with the design that buffer objects shall have immutable
+cache setting through out its life cycle, {set, get}_caching ioctl's
+are no longer supported from MTL onward. With that change caching
+policy can only be set at object creation time. The current code
+applies a default (platform dependent) cache setting for all objects.
+However this is not optimal for performance tuning. The patch extends
+the existing gem_create uAPI to let user set PAT index for the object
+at creation time.
+The new extension is platform independent, so UMD's can switch to using
+this extension for older platforms as well, while {set, get}_caching are
+still supported on these legacy paltforms for compatibility reason.
+
+v2: Rebased on top of NEX kernel
+
+Cc: Chris Wilson <chris.p.wilson@linux.intel.com>
+Cc: Matt Roper <matthew.d.roper@intel.com>
+Cc: Andi Shyti <andi.shyti@linux.intel.com>
+Signed-off-by: Fei Yang <fei.yang@intel.com>
+Rebased-by: Mazlan, Hazwan Arif <hazwan.arif.mazlan@intel.com>
+---
+ drivers/gpu/drm/i915/gem/i915_gem_create.c | 38 ++++++++++++++++++++++
+ include/uapi/drm/i915_drm.h                | 37 +++++++++++++++++++++
+ tools/include/uapi/drm/i915_drm.h          | 36 ++++++++++++++++++++
+ 3 files changed, 111 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_create.c b/drivers/gpu/drm/i915/gem/i915_gem_create.c
+index e76c9703680e..cc438b4c522e 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_create.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_create.c
+@@ -244,6 +244,7 @@ struct create_ext {
+ 	unsigned int n_placements;
+ 	unsigned int placement_mask;
+ 	unsigned long flags;
++	unsigned int pat_index;
+ };
+ 
+ static void repr_placements(char *buf, size_t size,
+@@ -393,11 +394,40 @@ static int ext_set_protected(struct i915_user_extension __user *base, void *data
+ 	return 0;
+ }
+ 
++static int ext_set_pat(struct i915_user_extension __user *base, void *data)
++{
++	struct create_ext *ext_data = data;
++	struct drm_i915_private *i915 = ext_data->i915;
++	struct drm_i915_gem_create_ext_set_pat ext;
++	unsigned int max_pat_index;
++
++	BUILD_BUG_ON(sizeof(struct drm_i915_gem_create_ext_set_pat) !=
++		     offsetofend(struct drm_i915_gem_create_ext_set_pat, rsvd));
++
++	if (copy_from_user(&ext, base, sizeof(ext)))
++		return -EFAULT;
++
++	max_pat_index = INTEL_INFO(i915)->max_pat_index;
++
++	if (ext.pat_index > max_pat_index) {
++		drm_dbg(&i915->drm, "PAT index is invalid: %u\n",
++			ext.pat_index);
++		return -EINVAL;
++	}
++
++	ext_data->pat_index = ext.pat_index;
++
++	return 0;
++}
++
+ static const i915_user_extension_fn create_extensions[] = {
+ 	[I915_GEM_CREATE_EXT_MEMORY_REGIONS] = ext_set_placements,
+ 	[I915_GEM_CREATE_EXT_PROTECTED_CONTENT] = ext_set_protected,
++	[I915_GEM_CREATE_EXT_SET_PAT] = ext_set_pat,
+ };
+ 
++#define PAT_INDEX_NOT_SET	0xffff
++
+ /**
+  * Creates a new mm object and returns a handle to it.
+  * @dev: drm device pointer
+@@ -417,6 +447,8 @@ i915_gem_create_ext_ioctl(struct drm_device *dev, void *data,
+ 	if (args->flags & ~I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS)
+ 		return -EINVAL;
+ 
++	ext_data.pat_index = PAT_INDEX_NOT_SET;
++
+ 	ret = i915_user_extensions(u64_to_user_ptr(args->extensions),
+ 				   create_extensions,
+ 				   ARRAY_SIZE(create_extensions),
+@@ -453,5 +485,11 @@ i915_gem_create_ext_ioctl(struct drm_device *dev, void *data,
+ 	if (IS_ERR(obj))
+ 		return PTR_ERR(obj);
+ 
++	if (ext_data.pat_index != PAT_INDEX_NOT_SET) {
++		i915_gem_object_set_pat_index(obj, ext_data.pat_index);
++		/* Mark pat_index is set by UMD */
++		obj->cache_level = I915_CACHE_INVAL;
++	}
++
+ 	return i915_gem_publish(obj, file, &args->size, &args->handle);
+ }
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 8df261c5ab9b..5f175f519bb8 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -3607,9 +3607,13 @@ struct drm_i915_gem_create_ext {
+ 	 *
+ 	 * For I915_GEM_CREATE_EXT_PROTECTED_CONTENT usage see
+ 	 * struct drm_i915_gem_create_ext_protected_content.
++	 *
++	 * For I915_GEM_CREATE_EXT_SET_PAT usage see
++	 * struct drm_i915_gem_create_ext_set_pat
+ 	 */
+ #define I915_GEM_CREATE_EXT_MEMORY_REGIONS 0
+ #define I915_GEM_CREATE_EXT_PROTECTED_CONTENT 1
++#define I915_GEM_CREATE_EXT_SET_PAT 2
+ 	__u64 extensions;
+ };
+ 
+@@ -3724,6 +3728,39 @@ struct drm_i915_gem_create_ext_protected_content {
+ 	__u32 flags;
+ };
+ 
++/**
++ * struct drm_i915_gem_create_ext_set_pat - The
++ * I915_GEM_CREATE_EXT_SET_PAT extension.
++ *
++ * If this extension is provided, the specified caching policy (PAT index) is
++ * applied to the buffer object.
++ *
++ * Below is an example on how to create an object with specific caching policy:
++ *
++ * .. code-block:: C
++ *
++ *      struct drm_i915_gem_create_ext_set_pat set_pat_ext = {
++ *              .base = { .name = I915_GEM_CREATE_EXT_SET_PAT },
++ *              .pat_index = 0,
++ *      };
++ *      struct drm_i915_gem_create_ext create_ext = {
++ *              .size = PAGE_SIZE,
++ *              .extensions = (uintptr_t)&set_pat_ext,
++ *      };
++ *
++ *      int err = ioctl(fd, DRM_IOCTL_I915_GEM_CREATE_EXT, &create_ext);
++ *      if (err) ...
++ */
++struct drm_i915_gem_create_ext_set_pat {
++	/** @base: Extension link. See struct i915_user_extension. */
++	struct i915_user_extension base;
++	/** @pat_index: PAT index to be set */
++	__u32 pat_index;
++	/** @rsvd: reserved for future use */
++	__u32 rsvd;
++};
++
++
+ /* ID of the protected content session managed by i915 when PXP is active */
+ #define I915_PROTECTED_CONTENT_DEFAULT_SESSION 0xf
+ 
+diff --git a/tools/include/uapi/drm/i915_drm.h b/tools/include/uapi/drm/i915_drm.h
+index 520ad2691a99..a98885be46cf 100644
+--- a/tools/include/uapi/drm/i915_drm.h
++++ b/tools/include/uapi/drm/i915_drm.h
+@@ -3597,9 +3597,13 @@ struct drm_i915_gem_create_ext {
+ 	 *
+ 	 * For I915_GEM_CREATE_EXT_PROTECTED_CONTENT usage see
+ 	 * struct drm_i915_gem_create_ext_protected_content.
++	 *
++	 * For I915_GEM_CREATE_EXT_SET_PAT usage see
++	 * struct drm_i915_gem_create_ext_set_pat
+ 	 */
+ #define I915_GEM_CREATE_EXT_MEMORY_REGIONS 0
+ #define I915_GEM_CREATE_EXT_PROTECTED_CONTENT 1
++#define I915_GEM_CREATE_EXT_SET_PAT 2
+ 	__u64 extensions;
+ };
+ 
+@@ -3714,6 +3718,38 @@ struct drm_i915_gem_create_ext_protected_content {
+ 	__u32 flags;
+ };
+ 
++/**
++ * struct drm_i915_gem_create_ext_set_pat - The
++ * I915_GEM_CREATE_EXT_SET_PAT extension.
++ *
++ * If this extension is provided, the specified caching policy (PAT index) is
++ * applied to the buffer object.
++ *
++ * Below is an example on how to create an object with specific caching policy:
++ *
++ * .. code-block:: C
++ *
++ *      struct drm_i915_gem_create_ext_set_pat set_pat_ext = {
++ *              .base = { .name = I915_GEM_CREATE_EXT_SET_PAT },
++ *              .pat_index = 0,
++ *      };
++ *      struct drm_i915_gem_create_ext create_ext = {
++ *              .size = PAGE_SIZE,
++ *              .extensions = (uintptr_t)&set_pat_ext,
++ *      };
++ *
++ *      int err = ioctl(fd, DRM_IOCTL_I915_GEM_CREATE_EXT, &create_ext);
++ *      if (err) ...
++ */
++struct drm_i915_gem_create_ext_set_pat {
++	/** @base: Extension link. See struct i915_user_extension. */
++	struct i915_user_extension base;
++	/** @pat_index: PAT index to be set */
++	__u32 pat_index;
++	/** @rsvd: reserved for future use */
++	__u32 rsvd;
++};
++
+ /* ID of the protected content session managed by i915 when PXP is active */
+ #define I915_PROTECTED_CONTENT_DEFAULT_SESSION 0xf
+ 
+-- 
+2.25.1
+

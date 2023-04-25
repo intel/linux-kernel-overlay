@@ -1,0 +1,209 @@
+From 4a1cebcb45ce11d98aca3370734fa547676cd7ba Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Thu, 2 Mar 2023 12:21:46 -0800
+Subject: [PATCH 22/22] drm/i915/huc: load HuC via non-POR GSC engine flow
+
+The initial plan for HuC on MTL was to use the same flow as DG2 (i.e.
+HuC loading and auth done via a PXP command submitted to the GSC).
+However, this has proven non-viable for MTL, so there is a fuse update
+coming to switch to a new flow (loading via DMA + auth via GSC).
+
+The plan is to deploy a PCODE update to flip the fuse on existing HW,
+but until that's ready we need to keep support for the old flow. We're
+never going to upstream this.
+
+Note that some of the code added in this path is very similar to the
+existing function to auth HuC via GSC CS. The code is intentionally
+duplicated to keep this patch as stand-alone as possible and therefore
+reduce rebase conflicts.
+
+v5: rebase on HuC POR flow. Reword commit message and clear previous
+changelog as all those changes were for code that has been dropped.
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Zawawi, Muhammad Zul Husni <muhammad.zul.husni.zawawi@intel.com>
+---
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c |  4 +-
+ drivers/gpu/drm/i915/gt/uc/intel_huc.c    | 10 ++-
+ drivers/gpu/drm/i915/gt/uc/intel_huc.h    |  1 +
+ drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c | 99 ++++++++++++++++++++++-
+ 4 files changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+index c26efbe3ecc3..df00f149a491 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+@@ -51,7 +51,9 @@ static void gsc_work(struct work_struct *work)
+ 		 * then send the HuC proxy request as part of the proxy init
+ 		 * flow.
+ 		 */
+-		if (intel_uc_uses_huc(&gt->uc))
++		if (intel_huc_is_loaded_by_gsc(&gt->uc.huc))
++			intel_huc_fw_load_and_auth_via_gsc_cs(&gt->uc.huc);
++		else
+ 			intel_huc_auth(&gt->uc.huc, INTEL_HUC_AUTH_BY_GSC);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc.c b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+index 313353448724..9c34f6318dd8 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+@@ -186,7 +186,7 @@ void intel_huc_register_gsc_notifier(struct intel_huc *huc, struct bus_type *bus
+ {
+ 	int ret;
+ 
+-	if (!intel_huc_is_loaded_by_gsc(huc))
++	if (!intel_huc_is_loaded_by_gsc(huc) || HAS_ENGINE(huc_to_gt(huc), GSC0))
+ 		return;
+ 
+ 	huc->delayed_load.nb.notifier_call = gsc_notifier;
+@@ -514,6 +514,14 @@ static bool huc_is_fully_authenticated(struct intel_huc *huc)
+ {
+ 	struct intel_uc_fw *huc_fw = &huc->fw;
+ 
++	/*
++	 * in the non-POR MTL flow, the GSC re-uses the same regs as GuC (like
++	 * on DG2). This check can be dropped once the new IFWI which supports
++	 * the POR flow has been propagated to all users.
++	 */
++	if (IS_METEORLAKE(huc_to_gt(huc)->i915) && huc->loaded_via_gsc)
++		return intel_huc_is_authenticated(huc, INTEL_HUC_AUTH_BY_GUC);
++
+ 	if (!huc_fw->is_meu_binary)
+ 		return intel_huc_is_authenticated(huc, INTEL_HUC_AUTH_BY_GUC);
+ 	else
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc.h b/drivers/gpu/drm/i915/gt/uc/intel_huc.h
+index d2a8f1fc163c..4ae90da7b54a 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc.h
+@@ -64,6 +64,7 @@ bool intel_huc_is_authenticated(struct intel_huc *huc,
+ 				enum intel_huc_authentication_type type);
+ int intel_huc_check_status(struct intel_huc *huc);
+ void intel_huc_update_auth_status(struct intel_huc *huc);
++int intel_huc_fw_load_and_auth_via_gsc_cs(struct intel_huc *huc);
+ 
+ void intel_huc_register_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
+ void intel_huc_unregister_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+index de33ea2b3112..2ddf2c69da84 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+@@ -14,6 +14,103 @@
+ #include "pxp/intel_pxp_huc.h"
+ #include "pxp/intel_pxp_cmd_interface_43.h"
+ 
++struct mtl_huc_load_msg_in {
++	struct intel_gsc_mtl_header header;
++	struct pxp43_start_huc_auth_in huc_in;
++};
++
++struct mtl_huc_load_msg_out {
++	struct intel_gsc_mtl_header header;
++	struct pxp43_huc_auth_out huc_out;
++};
++
++int intel_huc_fw_load_and_auth_via_gsc_cs(struct intel_huc *huc)
++{
++	struct intel_gt *gt = huc_to_gt(huc);
++	struct drm_i915_private *i915 = gt->i915;
++	struct drm_i915_gem_object *obj;
++	struct mtl_huc_load_msg_in *msg_in;
++	struct mtl_huc_load_msg_out *msg_out;
++	void *pkt_vaddr;
++	u64 pkt_offset;
++	int retry = 5;
++	int err = 0;
++
++	if (!huc->heci_pkt)
++		return -ENODEV;
++
++	obj = huc->heci_pkt->obj;
++	pkt_offset = i915_ggtt_offset(huc->heci_pkt);
++
++	pkt_vaddr = i915_gem_object_pin_map_unlocked(obj,
++						     i915_coherent_map_type(i915, obj, true));
++	if (IS_ERR(pkt_vaddr))
++		return PTR_ERR(pkt_vaddr);
++
++	msg_in = pkt_vaddr;
++	msg_out = pkt_vaddr + SZ_4K;
++
++	intel_gsc_uc_heci_cmd_emit_mtl_header(&msg_in->header,
++					      GSC_HECI_MEADDRESS_PXP,
++					      sizeof(*msg_in), 0);
++
++	msg_in->huc_in.header.api_version = PXP_APIVER(4, 3);
++	msg_in->huc_in.header.command_id = PXP43_CMDID_START_HUC_AUTH;
++	msg_in->huc_in.header.status = 0;
++	msg_in->huc_in.header.buffer_len = sizeof(msg_in->huc_in) -
++					   sizeof(msg_in->huc_in.header);
++	msg_in->huc_in.huc_base_address = huc->fw.dummy.start;
++
++	do {
++		err = intel_gsc_uc_heci_cmd_submit_packet(&gt->uc.gsc,
++							  pkt_offset, sizeof(*msg_in),
++							  pkt_offset + SZ_4K, SZ_4K);
++		if (err) {
++			huc_err(huc, "failed to submit GSC request to auth: %d\n", err);
++			goto out_unpin;
++		}
++
++		if (msg_out->header.flags & GSC_HECI_FLAG_MSG_PENDING) {
++			msg_in->header.gsc_message_handle = msg_out->header.gsc_message_handle;
++			err = -EBUSY;
++			msleep(50);
++		}
++	} while (--retry && err == -EBUSY);
++
++	if (err)
++		goto out_unpin;
++
++	if (msg_out->header.message_size != sizeof(*msg_out)) {
++		huc_err(huc, "invalid GSC reply length %u [expected %zu]\n",
++			msg_out->header.message_size, sizeof(*msg_out));
++		err = -EPROTO;
++		goto out_unpin;
++	}
++
++	/*
++	 * The GSC will return PXP_STATUS_OP_NOT_PERMITTED if the HuC is already
++	 * loaded. If the same error is ever returned with HuC not loaded we'll
++	 * still catch it when we check the authentication bit later.
++	 */
++	if (msg_out->huc_out.header.status != PXP_STATUS_SUCCESS &&
++	    msg_out->huc_out.header.status != PXP_STATUS_OP_NOT_PERMITTED) {
++		huc_err(huc, "load failed with GSC error = 0x%x\n",
++			msg_out->huc_out.header.status);
++		err = -EIO;
++		goto out_unpin;
++	}
++
++	/*
++	 * in the non-POR flow, the GSC re-uses the same regs as GuC (like on
++	 * DG2)
++	 */
++	err = intel_huc_wait_for_auth_complete(huc, INTEL_HUC_AUTH_BY_GUC);
++
++out_unpin:
++	i915_gem_object_unpin_map(obj);
++	return err;
++}
++
+ struct mtl_huc_auth_msg_in {
+ 	struct intel_gsc_mtl_header header;
+ 	struct pxp43_new_huc_auth_in huc_in;
+@@ -212,7 +309,7 @@ int intel_huc_fw_load_and_auth_via_gsc(struct intel_huc *huc)
+ {
+ 	int ret;
+ 
+-	if (!intel_huc_is_loaded_by_gsc(huc))
++	if (!intel_huc_is_loaded_by_gsc(huc) || HAS_ENGINE(huc_to_gt(huc), GSC0))
+ 		return -ENODEV;
+ 
+ 	if (!intel_uc_fw_is_loadable(&huc->fw))
+-- 
+2.25.1
+

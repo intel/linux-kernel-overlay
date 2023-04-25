@@ -1,0 +1,102 @@
+From 207cb8155d6ada545437e8372ed40c2e787dcb5c Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Tue, 31 Jan 2023 13:38:52 -0800
+Subject: [PATCH 13/22] drm/i915/gsc: Fix race between HW init and GSC FW load
+
+The GSC FW load is a slow process (up to 250 ms), so we defer it to a
+dedicated worker to avoid stalling the init flow for that long. However,
+we currently start this worker before the HW init is complete, so there
+is a chance that the GSC loading code submits to the HW before the
+engine initialization has completed. We can easily fix this by starting
+the thread later in the gt_resume flow.
+From this later spot, the GSC code can still race with the default
+submission code; we functionally don't care who wins the race (the GSC
+load doesn't need any state), but since the whole point of the separate
+worker is to make the main thread faster, we prefer the default
+submission code to run first. Therefore, make an exception for driver
+probe and only and start the gsc load from uc_init_late.
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Zawawi, Muhammad Zul Husni <muhammad.zul.husni.zawawi@intel.com>
+---
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c | 19 +++++++++++++++++++
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h |  1 +
+ drivers/gpu/drm/i915/gt/uc/intel_uc.c     |  5 +++--
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+index 8693c5ecc4e6..25248d9a6a66 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+@@ -185,6 +185,25 @@ void intel_gsc_uc_flush_work(struct intel_gsc_uc *gsc)
+ 	flush_work(&gsc->work);
+ }
+ 
++void intel_gsc_uc_resume(struct intel_gsc_uc *gsc)
++{
++	if (!intel_uc_fw_is_loadable(&gsc->fw))
++		return;
++
++	/*
++	 * we only want to start the GSC worker from here in the actual resume
++	 * flow and not during driver load. This is because GSC load is slow and
++	 * therefore we want to make sure that the default state init completes
++	 * first to not slow down the init thread. A separate call to
++	 * intel_gsc_uc_load_start will ensure that the GSC is loaded during
++	 * driver load.
++	 */
++	if (!gsc_uc_to_gt(gsc)->engine[GSC0]->default_state)
++		return;
++
++	intel_gsc_uc_load_start(gsc);
++}
++
+ void intel_gsc_uc_load_start(struct intel_gsc_uc *gsc)
+ {
+ 	struct intel_gt *gt = gsc_uc_to_gt(gsc);
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
+index 877177ca8ed6..647e6bd65ac6 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.h
+@@ -41,6 +41,7 @@ void intel_gsc_uc_init_early(struct intel_gsc_uc *gsc);
+ int intel_gsc_uc_init(struct intel_gsc_uc *gsc);
+ void intel_gsc_uc_fini(struct intel_gsc_uc *gsc);
+ void intel_gsc_uc_flush_work(struct intel_gsc_uc *gsc);
++void intel_gsc_uc_resume(struct intel_gsc_uc *gsc);
+ void intel_gsc_uc_load_start(struct intel_gsc_uc *gsc);
+ 
+ static inline bool intel_gsc_uc_is_supported(const struct intel_gsc_uc *gsc)
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_uc.c
+index 96208eb19051..08b46e8fd76f 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc.c
+@@ -144,6 +144,7 @@ void intel_uc_init_early(struct intel_uc *uc)
+ void intel_uc_init_late(struct intel_uc *uc)
+ {
+ 	intel_guc_init_late(&uc->guc);
++	intel_gsc_uc_load_start(&uc->gsc);
+ }
+ 
+ void intel_uc_driver_late_release(struct intel_uc *uc)
+@@ -554,8 +555,6 @@ static int __uc_init_hw(struct intel_uc *uc)
+ 		intel_rps_lower_unslice(&uc_to_gt(uc)->rps);
+ 	}
+ 
+-	intel_gsc_uc_load_start(&uc->gsc);
+-
+ 	guc_info(guc, "submission %s\n", str_enabled_disabled(intel_uc_uses_guc_submission(uc)));
+ 	guc_info(guc, "SLPC %s\n", str_enabled_disabled(intel_uc_uses_guc_slpc(uc)));
+ 
+@@ -835,6 +834,8 @@ static int __uc_resume(struct intel_uc *uc, bool enable_communication)
+ 		return err;
+ 	}
+ 
++	intel_gsc_uc_resume(&uc->gsc);
++
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+
