@@ -1,0 +1,119 @@
+From 3a2a2c367a32d5f2e7b7f30927dd56e87b8851cd Mon Sep 17 00:00:00 2001
+From: Michael Bottini <michael.a.bottini@linux.intel.com>
+Date: Thu, 19 Jan 2023 19:15:19 -0800
+Subject: [PATCH 4/5] PCI/ASPM: Add pci_enable_link_state()
+
+Add pci_enable_link_state() to allow devices to change the default BIOS
+configured states. Clears the BIOS default settings then sets the new
+states and reconfigures the link under the semaphore. Also add
+PCIE_LINK_STATE_ALL macro for convenience for callers that want to enable
+all link states.
+
+Link: https://lore.kernel.org/r/20230120031522.2304439-2-david.e.box@linux.intel.com
+Signed-off-by: Michael Bottini <michael.a.bottini@linux.intel.com>
+Signed-off-by: David E. Box <david.e.box@linux.intel.com>
+Signed-off-by: Lorenzo Pieralisi <lpieralisi@kernel.org>
+Reviewed-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+---
+ drivers/pci/pcie/aspm.c | 54 +++++++++++++++++++++++++++++++++++++++++
+ include/linux/pci.h     |  7 ++++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/drivers/pci/pcie/aspm.c b/drivers/pci/pcie/aspm.c
+index 4b4184563a92..66d7514ca111 100644
+--- a/drivers/pci/pcie/aspm.c
++++ b/drivers/pci/pcie/aspm.c
+@@ -1138,6 +1138,60 @@ int pci_disable_link_state(struct pci_dev *pdev, int state)
+ }
+ EXPORT_SYMBOL(pci_disable_link_state);
+ 
++/**
++ * pci_enable_link_state - Clear and set the default device link state so that
++ * the link may be allowed to enter the specified states. Note that if the
++ * BIOS didn't grant ASPM control to the OS, this does nothing because we can't
++ * touch the LNKCTL register. Also note that this does not enable states
++ * disabled by pci_disable_link_state(). Return 0 or a negative errno.
++ *
++ * @pdev: PCI device
++ * @state: Mask of ASPM link states to enable
++ */
++int pci_enable_link_state(struct pci_dev *pdev, int state)
++{
++	struct pcie_link_state *link = pcie_aspm_get_link(pdev);
++
++	if (!link)
++		return -EINVAL;
++	/*
++	 * A driver requested that ASPM be enabled on this device, but
++	 * if we don't have permission to manage ASPM (e.g., on ACPI
++	 * systems we have to observe the FADT ACPI_FADT_NO_ASPM bit and
++	 * the _OSC method), we can't honor that request.
++	 */
++	if (aspm_disabled) {
++		pci_warn(pdev, "can't override BIOS ASPM; OS doesn't have ASPM control\n");
++		return -EPERM;
++	}
++
++	down_read(&pci_bus_sem);
++	mutex_lock(&aspm_lock);
++	link->aspm_default = 0;
++	if (state & PCIE_LINK_STATE_L0S)
++		link->aspm_default |= ASPM_STATE_L0S;
++	if (state & PCIE_LINK_STATE_L1)
++		/* L1 PM substates require L1 */
++		link->aspm_default |= ASPM_STATE_L1 | ASPM_STATE_L1SS;
++	if (state & PCIE_LINK_STATE_L1_1)
++		link->aspm_default |= ASPM_STATE_L1_1;
++	if (state & PCIE_LINK_STATE_L1_2)
++		link->aspm_default |= ASPM_STATE_L1_2;
++	if (state & PCIE_LINK_STATE_L1_1_PCIPM)
++		link->aspm_default |= ASPM_STATE_L1_1_PCIPM;
++	if (state & PCIE_LINK_STATE_L1_2_PCIPM)
++		link->aspm_default |= ASPM_STATE_L1_2_PCIPM;
++	pcie_config_aspm_link(link, policy_to_aspm_state(link));
++
++	link->clkpm_default = (state & PCIE_LINK_STATE_CLKPM) ? 1 : 0;
++	pcie_set_clkpm(link, policy_to_clkpm_state(link));
++	mutex_unlock(&aspm_lock);
++	up_read(&pci_bus_sem);
++
++	return 0;
++}
++EXPORT_SYMBOL(pci_enable_link_state);
++
+ static int pcie_aspm_set_policy(const char *val,
+ 				const struct kernel_param *kp)
+ {
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 2bda4a4e47e8..8c35f15e6012 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1651,10 +1651,15 @@ extern bool pcie_ports_native;
+ #define PCIE_LINK_STATE_L1_2		BIT(4)
+ #define PCIE_LINK_STATE_L1_1_PCIPM	BIT(5)
+ #define PCIE_LINK_STATE_L1_2_PCIPM	BIT(6)
++#define PCIE_LINK_STATE_ALL		(PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1 |\
++					 PCIE_LINK_STATE_CLKPM | PCIE_LINK_STATE_L1_1 |\
++					 PCIE_LINK_STATE_L1_2 | PCIE_LINK_STATE_L1_1_PCIPM |\
++					 PCIE_LINK_STATE_L1_2_PCIPM)
+ 
+ #ifdef CONFIG_PCIEASPM
+ int pci_disable_link_state(struct pci_dev *pdev, int state);
+ int pci_disable_link_state_locked(struct pci_dev *pdev, int state);
++int pci_enable_link_state(struct pci_dev *pdev, int state);
+ void pcie_no_aspm(void);
+ bool pcie_aspm_support_enabled(void);
+ bool pcie_aspm_enabled(struct pci_dev *pdev);
+@@ -1663,6 +1668,8 @@ static inline int pci_disable_link_state(struct pci_dev *pdev, int state)
+ { return 0; }
+ static inline int pci_disable_link_state_locked(struct pci_dev *pdev, int state)
+ { return 0; }
++static inline int pci_enable_link_state(struct pci_dev *pdev, int state)
++{ return 0; }
+ static inline void pcie_no_aspm(void) { }
+ static inline bool pcie_aspm_support_enabled(void) { return false; }
+ static inline bool pcie_aspm_enabled(struct pci_dev *pdev) { return false; }
+-- 
+2.25.1
+
