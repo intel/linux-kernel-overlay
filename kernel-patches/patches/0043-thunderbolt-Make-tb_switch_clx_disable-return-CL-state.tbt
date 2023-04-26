@@ -1,0 +1,117 @@
+From 17858b26f3fa8fa3ed23c25d25c4960596477dc9 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Fri, 18 Nov 2022 15:42:27 +0200
+Subject: [PATCH 43/51] thunderbolt: Make tb_switch_clx_disable() return CL
+ states that were enabled
+
+This allows us to disable all CL states temporarily when running lane
+margining and then return back the previously enabled states.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/clx.c     |  8 ++++++--
+ drivers/thunderbolt/debugfs.c | 35 ++++++++++++++++++++++++-----------
+ 2 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/thunderbolt/clx.c b/drivers/thunderbolt/clx.c
+index d06e422db722..e2fc818f4e0e 100644
+--- a/drivers/thunderbolt/clx.c
++++ b/drivers/thunderbolt/clx.c
+@@ -277,6 +277,9 @@ int tb_switch_clx_enable(struct tb_switch *sw, unsigned int clx)
+ 	struct tb_port *up, *down;
+ 	int ret;
+ 
++	if (!clx)
++		return 0;
++
+ 	if (!validate_mask(clx))
+ 		return -EINVAL;
+ 
+@@ -342,7 +345,8 @@ int tb_switch_clx_enable(struct tb_switch *sw, unsigned int clx)
+  * Disables all CL states of the given router. Can be called on any
+  * router and if the states were not enabled already does nothing.
+  *
+- * Returns %0 on success or an error code on failure.
++ * Returns the CL states that were disabled or negative errno in case of
++ * failure.
+  */
+ int tb_switch_clx_disable(struct tb_switch *sw)
+ {
+@@ -370,5 +374,5 @@ int tb_switch_clx_disable(struct tb_switch *sw)
+ 	sw->clx = 0;
+ 
+ 	tb_port_dbg(up, "%s disabled\n", clx_name(clx));
+-	return 0;
++	return clx;
+ }
+diff --git a/drivers/thunderbolt/debugfs.c b/drivers/thunderbolt/debugfs.c
+index bfac9f665f70..c9ddd49138d8 100644
+--- a/drivers/thunderbolt/debugfs.c
++++ b/drivers/thunderbolt/debugfs.c
+@@ -556,8 +556,9 @@ static int margining_run_write(void *data, u64 val)
+ 	struct usb4_port *usb4 = port->usb4;
+ 	struct tb_switch *sw = port->sw;
+ 	struct tb_margining *margining;
++	struct tb_switch *down_sw;
+ 	struct tb *tb = sw->tb;
+-	int ret;
++	int ret, clx;
+ 
+ 	if (val != 1)
+ 		return -EINVAL;
+@@ -569,15 +570,24 @@ static int margining_run_write(void *data, u64 val)
+ 		goto out_rpm_put;
+ 	}
+ 
+-	/*
+-	 * CL states may interfere with lane margining so inform the user know
+-	 * and bail out.
+-	 */
+-	if (tb_port_clx_is_enabled(port, TB_CL1 | TB_CL2)) {
+-		tb_port_warn(port,
+-			     "CL states are enabled, Disable them with clx=0 and re-connect\n");
+-		ret = -EINVAL;
+-		goto out_unlock;
++	if (tb_is_upstream_port(port))
++		down_sw = sw;
++	else if (port->remote)
++		down_sw = port->remote->sw;
++	else
++		down_sw = NULL;
++
++	if (down_sw) {
++		/*
++		 * CL states may interfere with lane margining so
++		 * disable them temporarily now.
++		 */
++		ret = tb_switch_clx_disable(down_sw);
++		if (ret < 0) {
++			tb_sw_warn(down_sw, "failed to disable CL states\n");
++			goto out_unlock;
++		}
++		clx = ret;
+ 	}
+ 
+ 	margining = usb4->margining;
+@@ -589,7 +599,7 @@ static int margining_run_write(void *data, u64 val)
+ 					  margining->right_high,
+ 					  USB4_MARGIN_SW_COUNTER_CLEAR);
+ 		if (ret)
+-			goto out_unlock;
++			goto out_clx;
+ 
+ 		ret = usb4_port_sw_margin_errors(port, &margining->results[0]);
+ 	} else {
+@@ -603,6 +613,9 @@ static int margining_run_write(void *data, u64 val)
+ 					  margining->right_high, margining->results);
+ 	}
+ 
++out_clx:
++	if (down_sw)
++		tb_switch_clx_enable(down_sw, clx);
+ out_unlock:
+ 	mutex_unlock(&tb->lock);
+ out_rpm_put:
+-- 
+2.25.1
+
