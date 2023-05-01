@@ -465,7 +465,7 @@ BuildRequires: asciidoc
 %endif
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global kernel_src_repo https://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git
+%global kernel_src_repo https://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git/
 %global kernel_src_tag v5.15.96-rt61
 # END OF PROJECT SPECIFIC MACROS
 
