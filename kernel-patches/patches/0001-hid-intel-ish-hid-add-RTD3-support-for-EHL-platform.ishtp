@@ -1,0 +1,406 @@
+From 565b37d3c399ba60bb4e2aba55ab262cd0933f75 Mon Sep 17 00:00:00 2001
+From: Even Xu <even.xu@intel.com>
+Date: Mon, 17 Jan 2022 13:35:16 +0800
+Subject: [PATCH 1/9] hid: intel-ish-hid: add RTD3 support for EHL platform
+
+As EHL OSE FW switch to support runtime D3 (RTD3), so driver also
+add the RTD3 support according to finish power runtime power management.
+
+Signed-off-by: Even Xu <even.xu@intel.com>
+---
+ drivers/hid/intel-ish-hid/ipc/hw-ish-regs.h |   4 +
+ drivers/hid/intel-ish-hid/ipc/hw-ish.h      |   2 +
+ drivers/hid/intel-ish-hid/ipc/ipc.c         | 114 +++++++++++++++++++-
+ drivers/hid/intel-ish-hid/ipc/pci-ish.c     |  62 ++++++++++-
+ drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h |  10 +-
+ 5 files changed, 186 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/hid/intel-ish-hid/ipc/hw-ish-regs.h b/drivers/hid/intel-ish-hid/ipc/hw-ish-regs.h
+index 4db01bbeffe0..cfb5427fe81a 100644
+--- a/drivers/hid/intel-ish-hid/ipc/hw-ish-regs.h
++++ b/drivers/hid/intel-ish-hid/ipc/hw-ish-regs.h
+@@ -215,6 +215,10 @@
+ #define MNG_RESET_NOTIFY		3
+ #define MNG_RESET_NOTIFY_ACK		4
+ #define MNG_SYNC_FW_CLOCK		5
++#define MNG_RTD3_NOTIFY			7
++#define MNG_RTD3_NOTIFY_ACK		8
++#define MNG_D0_NOTIFY			9
++#define MNG_D0_NOTIFY_ACK		10
+ #define MNG_ILLEGAL_CMD			0xFF
+ 
+ #endif /* _ISHTP_ISH_REGS_H_ */
+diff --git a/drivers/hid/intel-ish-hid/ipc/hw-ish.h b/drivers/hid/intel-ish-hid/ipc/hw-ish.h
+index fc108f19a64c..a97f3c168d25 100644
+--- a/drivers/hid/intel-ish-hid/ipc/hw-ish.h
++++ b/drivers/hid/intel-ish-hid/ipc/hw-ish.h
+@@ -88,5 +88,7 @@ int ish_hw_start(struct ishtp_device *dev);
+ void ish_device_disable(struct ishtp_device *dev);
+ int ish_disable_dma(struct ishtp_device *dev);
+ void ish_set_host_ready(struct ishtp_device *dev);
++int ish_notify_d0(struct ishtp_device *dev);
++int ish_notify_rtd3(struct ishtp_device *dev);
+ 
+ #endif /* _ISHTP_HW_ISH_H_ */
+diff --git a/drivers/hid/intel-ish-hid/ipc/ipc.c b/drivers/hid/intel-ish-hid/ipc/ipc.c
+index a49c6affd7c4..4827c8f0136e 100644
+--- a/drivers/hid/intel-ish-hid/ipc/ipc.c
++++ b/drivers/hid/intel-ish-hid/ipc/ipc.c
+@@ -10,6 +10,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/delay.h>
+ #include <linux/jiffies.h>
++#include <linux/pm_runtime.h>
+ #include "client.h"
+ #include "hw-ish.h"
+ #include "hbm.h"
+@@ -363,7 +364,7 @@ static int write_ipc_from_queue(struct ishtp_device *dev)
+ }
+ 
+ /**
+- * write_ipc_to_queue() - write ipc msg to Tx queue
++ * _write_ipc_to_queue() - write ipc msg to Tx queue
+  * @dev: ishtp device instance
+  * @ipc_send_compl: Send complete callback
+  * @ipc_send_compl_prm:	Parameter to send in complete callback
+@@ -378,7 +379,7 @@ static int write_ipc_from_queue(struct ishtp_device *dev)
+  *
+  * Return: 0 for success else failure code
+  */
+-static int write_ipc_to_queue(struct ishtp_device *dev,
++static int _write_ipc_to_queue(struct ishtp_device *dev,
+ 	void (*ipc_send_compl)(void *), void *ipc_send_compl_prm,
+ 	unsigned char *msg, int length)
+ {
+@@ -410,6 +411,34 @@ static int write_ipc_to_queue(struct ishtp_device *dev,
+ 	return 0;
+ }
+ 
++/**
++ * write_ipc_to_queue() - wraper of _write_ipc_to_queue() which power safed
++ * @dev: ishtp device instance
++ * @ipc_send_compl: Send complete callback
++ * @ipc_send_compl_prm:	Parameter to send in complete callback
++ * @msg: Pointer to message
++ * @length: Length of message
++ *
++ * resume the device from runtime suspend if needed and then call
++ * _write_ipc_to_queue() sending messag
++ *
++ * Return: 0 for success else failure code
++ */
++static int write_ipc_to_queue(struct ishtp_device *dev,
++	void (*ipc_send_compl)(void *), void *ipc_send_compl_prm,
++	unsigned char *msg, int length)
++{
++	int ret;
++
++	pm_runtime_get_sync(dev->devc);
++	pm_runtime_mark_last_busy(dev->devc);
++	ret = _write_ipc_to_queue(dev, ipc_send_compl, ipc_send_compl_prm,
++				msg, length);
++	pm_runtime_put_autosuspend(dev->devc);
++
++	return ret;
++}
++
+ /**
+  * ipc_send_mng_msg() - Send management message
+  * @dev: ishtp device instance
+@@ -429,7 +458,7 @@ static int ipc_send_mng_msg(struct ishtp_device *dev, uint32_t msg_code,
+ 
+ 	memcpy(ipc_msg, &drbl_val, sizeof(uint32_t));
+ 	memcpy(ipc_msg + sizeof(uint32_t), msg, size);
+-	return	write_ipc_to_queue(dev, NULL, NULL, ipc_msg,
++	return	_write_ipc_to_queue(dev, NULL, NULL, ipc_msg,
+ 		sizeof(uint32_t) + size);
+ }
+ 
+@@ -584,9 +613,13 @@ static void _ish_sync_fw_clock(struct ishtp_device *dev)
+ 
+ 	prev_sync = jiffies;
+ 	usec = ktime_to_us(ktime_get_boottime());
++
+ 	ipc_send_mng_msg(dev, MNG_SYNC_FW_CLOCK, &usec, sizeof(uint64_t));
+ }
+ 
++#define POWER_NOTIFY_WAIT	0xff
++#define POWER_NOTIFY_NOT_READY	0
++
+ /**
+  * recv_ipc() - Receive and process IPC management messages
+  * @dev: ishtp device instance
+@@ -630,6 +663,20 @@ static void	recv_ipc(struct ishtp_device *dev, uint32_t doorbell_val)
+ 		dev->recvd_hw_ready = 1;
+ 		wake_up_interruptible(&dev->wait_hw_ready);
+ 		break;
++
++	case MNG_D0_NOTIFY_ACK:
++		if (dev->d0_flag == POWER_NOTIFY_WAIT) {
++			dev->d0_flag = ish_reg_read(dev, IPC_REG_ISH2HOST_MSG);
++			wake_up_interruptible(&dev->d0_wait);
++		}
++		break;
++
++	case MNG_RTD3_NOTIFY_ACK:
++		if (dev->rtd3_flag == POWER_NOTIFY_WAIT) {
++			dev->rtd3_flag = ish_reg_read(dev, IPC_REG_ISH2HOST_MSG);
++			wake_up_interruptible(&dev->rtd3_wait);
++		}
++		break;
+ 	}
+ }
+ 
+@@ -676,6 +723,7 @@ irqreturn_t ish_irq_handler(int irq, void *dev_id)
+ 		break;
+ 	case IPC_PROTOCOL_ISHTP:
+ 		ishtp_recv(dev);
++		pm_runtime_mark_last_busy(dev->devc);
+ 		break;
+ 	}
+ 
+@@ -703,6 +751,8 @@ int ish_disable_dma(struct ishtp_device *dev)
+ {
+ 	unsigned int	dma_delay;
+ 
++	pm_runtime_get_sync(dev->devc);
++
+ 	/* Clear the dma enable bit */
+ 	ish_reg_write(dev, IPC_REG_ISH_RMP2, 0);
+ 
+@@ -712,6 +762,8 @@ int ish_disable_dma(struct ishtp_device *dev)
+ 		dma_delay += 5)
+ 		mdelay(5);
+ 
++	pm_runtime_put_autosuspend(dev->devc);
++
+ 	if (dma_delay >= MAX_DMA_DELAY) {
+ 		dev_err(dev->devc,
+ 			"Wait for DMA inactive timeout\n");
+@@ -810,6 +862,8 @@ static int _ish_ipc_reset(struct ishtp_device *dev)
+ 	ipc_mng_msg.reset_id = 1;
+ 	ipc_mng_msg.reserved = 0;
+ 
++	pm_runtime_get_sync(dev->devc);
++
+ 	set_host_ready(dev);
+ 
+ 	/* Clear the incoming doorbell */
+@@ -822,6 +876,9 @@ static int _ish_ipc_reset(struct ishtp_device *dev)
+ 	/* send message */
+ 	rv = ipc_send_mng_msg(dev, MNG_RESET_NOTIFY, &ipc_mng_msg,
+ 		sizeof(struct ipc_rst_payload_type));
++
++	pm_runtime_put_autosuspend(dev->devc);
++
+ 	if (rv) {
+ 		dev_err(dev->devc, "Failed to send IPC MNG_RESET_NOTIFY\n");
+ 		return	rv;
+@@ -1014,3 +1071,54 @@ void	ish_device_disable(struct ishtp_device *dev)
+ 	dev->dev_state = ISHTP_DEV_DISABLED;
+ 	ish_clr_host_rdy(dev);
+ }
++
++/* Timeout to get ack response for D0 and RTD3 notification */
++#define WAIT_FOR_D0_RTD3_ACK_MS		1000
++
++int ish_notify_d0(struct ishtp_device *dev)
++{
++	uint32_t payload = 0;
++
++	ipc_send_mng_msg(dev, MNG_D0_NOTIFY, &payload,
++			 sizeof(uint32_t));
++
++	dev->d0_flag = POWER_NOTIFY_WAIT;
++
++	wait_event_interruptible_timeout(dev->d0_wait,
++			(dev->d0_flag != POWER_NOTIFY_WAIT),
++			msecs_to_jiffies(WAIT_FOR_D0_RTD3_ACK_MS));
++
++	if (dev->d0_flag == POWER_NOTIFY_WAIT) {
++		dev_err(dev->devc, "wait fw back to d0 timeout\n");
++		return -EBUSY;
++	} else if (dev->d0_flag == POWER_NOTIFY_NOT_READY) {
++		dev_warn(dev->devc, "fw back to d0 not ready\n");
++		return -EBUSY;
++	} else {
++		return 0;
++	}
++}
++
++int ish_notify_rtd3(struct ishtp_device *dev)
++{
++	uint32_t payload = 0;
++
++	ipc_send_mng_msg(dev, MNG_RTD3_NOTIFY, &payload,
++			 sizeof(uint32_t));
++
++	dev->rtd3_flag = POWER_NOTIFY_WAIT;
++
++	wait_event_interruptible_timeout(dev->rtd3_wait,
++			(dev->rtd3_flag != POWER_NOTIFY_WAIT),
++			msecs_to_jiffies(WAIT_FOR_D0_RTD3_ACK_MS));
++
++	if (dev->rtd3_flag == POWER_NOTIFY_WAIT) {
++		dev_err(dev->devc, "wait fw enter RTD3 timeout\n");
++		return -EBUSY;
++	} else if (dev->rtd3_flag == POWER_NOTIFY_NOT_READY) {
++		dev_warn(dev->devc, "fw enter RTD3 not ready\n");
++		return -EBUSY;
++	} else {
++		return 0;
++	}
++}
+diff --git a/drivers/hid/intel-ish-hid/ipc/pci-ish.c b/drivers/hid/intel-ish-hid/ipc/pci-ish.c
+index 7120b30ac51d..185fc5faee60 100644
+--- a/drivers/hid/intel-ish-hid/ipc/pci-ish.c
++++ b/drivers/hid/intel-ish-hid/ipc/pci-ish.c
+@@ -18,6 +18,7 @@
+ #include <linux/suspend.h>
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
++#include <linux/pm_runtime.h>
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/intel_ish.h>
+ #include "ishtp-dev.h"
+@@ -84,10 +85,14 @@ static int ish_init(struct ishtp_device *dev)
+ {
+ 	int ret;
+ 
++	/* during initializaion, runtime suspend is forbidden */
++	pm_runtime_forbid(dev->devc);
++
+ 	/* Set the state of ISH HW to start */
+ 	ret = ish_hw_start(dev);
+ 	if (ret) {
+ 		dev_err(dev->devc, "ISH: hw start failed.\n");
++		pm_runtime_allow(dev->devc);
+ 		return ret;
+ 	}
+ 
+@@ -95,9 +100,12 @@ static int ish_init(struct ishtp_device *dev)
+ 	ret = ishtp_start(dev);
+ 	if (ret) {
+ 		dev_err(dev->devc, "ISHTP: Protocol init failed.\n");
++		pm_runtime_allow(dev->devc);
+ 		return ret;
+ 	}
+ 
++	pm_runtime_allow(dev->devc);
++
+ 	return 0;
+ }
+ 
+@@ -221,6 +229,8 @@ static int ish_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	init_waitqueue_head(&ishtp->suspend_wait);
+ 	init_waitqueue_head(&ishtp->resume_wait);
++	init_waitqueue_head(&ishtp->d0_wait);
++	init_waitqueue_head(&ishtp->rtd3_wait);
+ 
+ 	/* Enable PME for EHL */
+ 	if (pdev->device == EHL_Ax_DEVICE_ID)
+@@ -230,6 +240,15 @@ static int ish_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (ret)
+ 		return ret;
+ 
++	/* enable runtime pm for EHL */
++	if (pdev->device == EHL_Ax_DEVICE_ID) {
++		pm_runtime_use_autosuspend(dev);
++		pm_runtime_set_autosuspend_delay(dev, 5000);
++		pm_runtime_allow(dev);
++		pm_runtime_mark_last_busy(dev);
++		pm_runtime_put_autosuspend(dev);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -245,6 +264,8 @@ static void ish_remove(struct pci_dev *pdev)
+ 
+ 	ishtp_bus_remove_all_clients(ishtp_dev, false);
+ 	ish_device_disable(ishtp_dev);
++
++	pm_runtime_forbid(&pdev->dev);
+ }
+ 
+ static struct device __maybe_unused *ish_resume_device;
+@@ -339,7 +360,8 @@ static int __maybe_unused ish_suspend(struct device *device)
+ 			 * Save state so PCI core will keep the device at D0,
+ 			 * the ISH would enter D0i3
+ 			 */
+-			pci_save_state(pdev);
++			if (dev->pdev->device != EHL_Ax_DEVICE_ID)
++				pci_save_state(pdev);
+ 
+ 			if (device_may_wakeup(&pdev->dev))
+ 				enable_irq_wake(pdev->irq);
+@@ -384,7 +406,43 @@ static int __maybe_unused ish_resume(struct device *device)
+ 	return 0;
+ }
+ 
+-static SIMPLE_DEV_PM_OPS(ish_pm_ops, ish_suspend, ish_resume);
++
++static int __maybe_unused ish_runtime_suspend(struct device *device)
++{
++	struct pci_dev *pdev = to_pci_dev(device);
++	struct ishtp_device *dev = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	if (dev->pdev->device == EHL_Ax_DEVICE_ID)
++		ret = ish_notify_rtd3(dev);
++
++	return ret;
++}
++
++static int __maybe_unused ish_runtime_resume(struct device *device)
++{
++	struct pci_dev *pdev = to_pci_dev(device);
++	struct ishtp_device *dev = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	if (dev->pdev->device == EHL_Ax_DEVICE_ID) {
++		pci_set_power_state(pdev, PCI_D0);
++		enable_pme_wake(pdev);
++
++		ret = ish_notify_d0(dev);
++	}
++
++	if (!ret)
++		pm_runtime_mark_last_busy(device);
++
++	return ret;
++
++}
++
++static const struct dev_pm_ops __maybe_unused ish_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(ish_suspend, ish_resume)
++	SET_RUNTIME_PM_OPS(ish_runtime_suspend, ish_runtime_resume, NULL)
++};
+ 
+ static struct pci_driver ish_driver = {
+ 	.name = KBUILD_MODNAME,
+diff --git a/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h b/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
+index 32142c7d9a04..e327ed04cbcb 100644
+--- a/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
++++ b/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
+@@ -135,7 +135,15 @@ struct ishtp_device {
+ 
+ 	/* waitq for waiting for resume response */
+ 	wait_queue_head_t resume_wait;
+-	bool resume_flag;	/*Resume is active */
++	bool resume_flag;	/* Resume is active */
++
++	/* waitq for waiting for D0_notify response */
++	wait_queue_head_t d0_wait;
++	uint32_t d0_flag;		/* D0 notify result */
++
++	/* waitq for waiting for RTD3 response */
++	wait_queue_head_t rtd3_wait;
++	uint32_t rtd3_flag;		/* RTD3 notify result */
+ 
+ 	/*
+ 	 * lock for the device, for everything that doesn't have
+-- 
+2.25.1
+

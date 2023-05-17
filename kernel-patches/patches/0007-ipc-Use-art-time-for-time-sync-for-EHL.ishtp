@@ -1,0 +1,227 @@
+From 4bce87583a3730d5d12e4afcd3dcb61dc473385c Mon Sep 17 00:00:00 2001
+From: Ye Xiang <xiang.ye@intel.com>
+Date: Thu, 26 May 2022 11:46:38 +0800
+Subject: [PATCH 7/9] ipc: Use art time for time sync for EHL
+
+On EHL, art time instead of system time is used for time sync.
+A timmer is created to send time sync message periodically, and
+a sysfs interface is added for changing the time sync period.
+
+Signed-off-by: Ye Xiang <xiang.ye@intel.com>
+---
+ drivers/hid/intel-ish-hid/ipc/hw-ish.h      |  4 +-
+ drivers/hid/intel-ish-hid/ipc/ipc.c         | 27 ++++++---
+ drivers/hid/intel-ish-hid/ipc/pci-ish.c     | 67 ++++++++++++++++++++-
+ drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h |  5 ++
+ 4 files changed, 94 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/hid/intel-ish-hid/ipc/hw-ish.h b/drivers/hid/intel-ish-hid/ipc/hw-ish.h
+index a97f3c168d25..4b5fa1a85e28 100644
+--- a/drivers/hid/intel-ish-hid/ipc/hw-ish.h
++++ b/drivers/hid/intel-ish-hid/ipc/hw-ish.h
+@@ -61,7 +61,8 @@ struct ipc_time_update_msg {
+ 
+ enum {
+ 	HOST_UTC_TIME_USEC = 0,
+-	HOST_SYSTEM_TIME_USEC = 1
++	HOST_SYSTEM_TIME_USEC = 1,
++	HOST_ART_TIME_CYCLE = 2,
+ };
+ 
+ struct ish_hw {
+@@ -90,5 +91,6 @@ int ish_disable_dma(struct ishtp_device *dev);
+ void ish_set_host_ready(struct ishtp_device *dev);
+ int ish_notify_d0(struct ishtp_device *dev);
+ int ish_notify_rtd3(struct ishtp_device *dev);
++void ish_send_time_sync(struct ishtp_device *dev);
+ 
+ #endif /* _ISHTP_HW_ISH_H_ */
+diff --git a/drivers/hid/intel-ish-hid/ipc/ipc.c b/drivers/hid/intel-ish-hid/ipc/ipc.c
+index 41f7d5decdc0..e72788289019 100644
+--- a/drivers/hid/intel-ish-hid/ipc/ipc.c
++++ b/drivers/hid/intel-ish-hid/ipc/ipc.c
+@@ -313,9 +313,15 @@ static int write_ipc_from_queue(struct ishtp_device *dev)
+ 		struct ipc_time_update_msg time_update;
+ 		struct time_sync_format ts_format;
+ 
+-		usec_system = ktime_to_us(ktime_get_boottime());
+ 		usec_utc = ktime_to_us(ktime_get_real());
+-		ts_format.ts1_source = HOST_SYSTEM_TIME_USEC;
++		if (dev->pdev->device == EHL_Ax_DEVICE_ID) {
++			usec_system = read_art();
++			ts_format.ts1_source = HOST_ART_TIME_CYCLE;
++		} else {
++			usec_system = ktime_to_us(ktime_get_boottime());
++			ts_format.ts1_source = HOST_SYSTEM_TIME_USEC;
++		}
++
+ 		ts_format.ts2_source = HOST_UTC_TIME_USEC;
+ 		ts_format.reserved = 0;
+ 
+@@ -602,6 +608,15 @@ static void fw_reset_work_fn(struct work_struct *unused)
+ 			rv);
+ }
+ 
++void ish_send_time_sync(struct ishtp_device *dev)
++{
++	uint64_t usec;
++
++	usec = ktime_to_us(ktime_get_boottime());
++	ipc_send_mng_msg(dev, MNG_SYNC_FW_CLOCK, &usec, sizeof(uint64_t));
++
++}
++
+ /**
+  * _ish_sync_fw_clock() -Sync FW clock with the OS clock
+  * @dev: ishtp device pointer
+@@ -611,15 +626,13 @@ static void fw_reset_work_fn(struct work_struct *unused)
+ static void _ish_sync_fw_clock(struct ishtp_device *dev)
+ {
+ 	static unsigned long	prev_sync;
+-	uint64_t	usec;
+ 
+-	if (prev_sync && time_before(jiffies, prev_sync + 20 * HZ))
++	if (dev->pdev->device == EHL_Ax_DEVICE_ID || (prev_sync &&
++	    time_before(jiffies, prev_sync + 20 * HZ)))
+ 		return;
+ 
+ 	prev_sync = jiffies;
+-	usec = ktime_to_us(ktime_get_boottime());
+-
+-	ipc_send_mng_msg(dev, MNG_SYNC_FW_CLOCK, &usec, sizeof(uint64_t));
++	ish_send_time_sync(dev);
+ }
+ 
+ #define POWER_NOTIFY_WAIT	0xff
+diff --git a/drivers/hid/intel-ish-hid/ipc/pci-ish.c b/drivers/hid/intel-ish-hid/ipc/pci-ish.c
+index ca1b7e5a8ed7..c8881a33c1fc 100644
+--- a/drivers/hid/intel-ish-hid/ipc/pci-ish.c
++++ b/drivers/hid/intel-ish-hid/ipc/pci-ish.c
+@@ -155,6 +155,57 @@ static void enable_pme_wake(struct pci_dev *pdev)
+ 	}
+ }
+ 
++static void time_sync_work_fn(struct work_struct *work)
++{
++	struct ishtp_device *ishtp_dev;
++
++	ishtp_dev = container_of(work, struct ishtp_device, time_sync_work.work);
++
++	pm_runtime_get_sync(ishtp_dev->devc);
++	pm_runtime_mark_last_busy(ishtp_dev->devc);
++	ish_send_time_sync(ishtp_dev);
++
++	pm_runtime_put_autosuspend(ishtp_dev->devc);
++
++	if (ishtp_dev->time_sync_period)
++		schedule_delayed_work(&ishtp_dev->time_sync_work, ishtp_dev->time_sync_period * HZ);
++}
++
++static ssize_t time_sync_period_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct ishtp_device *ishtp_dev = pci_get_drvdata(pdev);
++	unsigned long val = 0;
++	int ret;
++	int time_sync_period_pre = ishtp_dev->time_sync_period;
++
++	ret = kstrtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > ISHTP_SYNC_PERIOD_MAX)
++		return -EINVAL;
++
++	ishtp_dev->time_sync_period = val;
++
++	if (!time_sync_period_pre && ishtp_dev->time_sync_period)
++		schedule_delayed_work(&ishtp_dev->time_sync_work, 0);
++
++	return count;
++}
++
++static ssize_t time_sync_period_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct ishtp_device *ishtp_dev = pci_get_drvdata(pdev);
++
++	return sysfs_emit(buf, "%ld\n", ishtp_dev->time_sync_period);
++}
++static DEVICE_ATTR_RW(time_sync_period);
++
+ /**
+  * ish_probe() - PCI driver probe callback
+  * @pdev:	pci device
+@@ -244,6 +295,11 @@ static int ish_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		pm_runtime_allow(dev);
+ 		pm_runtime_mark_last_busy(dev);
+ 		pm_runtime_put_autosuspend(dev);
++
++		/* start a timmer to sync time with FW for EHL */
++		ishtp->time_sync_period = 0;
++		device_create_file(dev, &dev_attr_time_sync_period);
++		INIT_DELAYED_WORK(&ishtp->time_sync_work, time_sync_work_fn);
+ 	}
+ 
+ 	return 0;
+@@ -259,6 +315,10 @@ static void ish_remove(struct pci_dev *pdev)
+ {
+ 	struct ishtp_device *ishtp_dev = pci_get_drvdata(pdev);
+ 
++	if (pdev->device == EHL_Ax_DEVICE_ID) {
++		device_remove_file(&pdev->dev, &dev_attr_time_sync_period);
++		cancel_delayed_work_sync(&ishtp_dev->time_sync_work);
++	}
+ 	ishtp_bus_remove_all_clients(ishtp_dev, false);
+ 	ish_device_disable(ishtp_dev);
+ 
+@@ -318,6 +378,9 @@ static void __maybe_unused ish_resume_handler(struct work_struct *work)
+ 		 */
+ 		ish_init(dev);
+ 	}
++
++	if (pdev->device == EHL_Ax_DEVICE_ID && dev->time_sync_period)
++		schedule_delayed_work(&dev->time_sync_work, 0);
+ }
+ 
+ /**
+@@ -333,6 +396,9 @@ static int __maybe_unused ish_suspend(struct device *device)
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct ishtp_device *dev = pci_get_drvdata(pdev);
+ 
++	if (pdev->device == EHL_Ax_DEVICE_ID)
++		cancel_delayed_work_sync(&dev->time_sync_work);
++
+ 	if (dev->suspend_to_d0i3) {
+ 		/*
+ 		 * If previous suspend hasn't been asnwered then ISH is likely
+@@ -495,7 +561,6 @@ static int __maybe_unused ish_runtime_resume(struct device *device)
+ 		pm_runtime_mark_last_busy(device);
+ 
+ 	return ret;
+-
+ }
+ 
+ static const struct dev_pm_ops __maybe_unused ish_pm_ops = {
+diff --git a/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h b/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
+index 83cc6e92d785..efa60631157b 100644
+--- a/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
++++ b/drivers/hid/intel-ish-hid/ishtp/ishtp-dev.h
+@@ -183,6 +183,11 @@ struct ishtp_device {
+ 	spinlock_t rd_msg_spinlock;
+ 	struct work_struct bh_hbm_work;
+ 
++	/* time sync work */
++	#define ISHTP_SYNC_PERIOD_MAX 1024
++	unsigned long time_sync_period;
++	struct delayed_work time_sync_work;
++
+ 	/* IPC write queue */
+ 	struct list_head wr_processing_list, wr_free_list;
+ 	/* For both processing list  and free list */
+-- 
+2.25.1
+
