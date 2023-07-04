@@ -107,10 +107,10 @@ done
 if [ $KRTV ] ; then
 	cp $CUR_DIR/cmd-params $BUILD_DIR
 	cat <<- EOF > insert_script_code
-	cp cmd-params "\$tmpdir/boot/cmd-params-\$version"
+	cp cmd-params "\${pdir}/boot/cmd-params-\${KERNELRELEASE}"
 EOF
 	builddeb_path='scripts/package/builddeb'
-	insert_line_num=$(grep -n 'cp System.map "$tmpdir/boot/System.map' $builddeb_path| cut -f1 -d:)
+	insert_line_num=$(grep -n 'cp System.map "${pdir}/boot/System.map' $builddeb_path| cut -f1 -d:)
 	if [ -n "$insert_line_num" ];then
 		sed -i "${insert_line_num}r insert_script_code" $builddeb_path
 	else
