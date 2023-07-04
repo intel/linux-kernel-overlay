@@ -1,0 +1,686 @@
+From 29783f8dfda35b27df366abb2b9d380febd5c28f Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris.p.wilson@intel.com>
+Date: Tue, 21 Mar 2023 10:54:11 -0700
+Subject: [PATCH 103/128] drm/i915/gt: Move TLB invalidation to its own file
+
+Create intel_tlb.c/h files to store initial TLB invalidation logic
+and functions, overwriting any duplicate logic in other files.
+This will help keep the logic in a central location.
+
+Signed-off-by: Chris Wilson <chris.p.wilson@intel.com>
+Suggested-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile             |   1 +
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c |   5 +-
+ drivers/gpu/drm/i915/gt/intel_gt.c        | 227 +-------------------
+ drivers/gpu/drm/i915/gt/intel_gt.h        |  12 --
+ drivers/gpu/drm/i915/gt/intel_ppgtt.c     |   1 +
+ drivers/gpu/drm/i915/gt/intel_tlb.c       | 244 ++++++++++++++++++++++
+ drivers/gpu/drm/i915/gt/intel_tlb.h       |  29 +++
+ drivers/gpu/drm/i915/gt/selftest_tlb.c    |   3 +-
+ drivers/gpu/drm/i915/i915_vma.c           |   1 +
+ 9 files changed, 284 insertions(+), 239 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/gt/intel_tlb.c
+ create mode 100644 drivers/gpu/drm/i915/gt/intel_tlb.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 2b56ad755549..bede9d068b20 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -132,6 +132,7 @@ gt-y += \
+ 	gt/intel_sseu.o \
+ 	gt/intel_sseu_debugfs.o \
+ 	gt/intel_timeline.o \
++	gt/intel_tlb.o \
+ 	gt/intel_wopcm.o \
+ 	gt/intel_workarounds.o \
+ 	gt/shmem_utils.o \
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index 44712db49367..1513e7f314fc 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -7,7 +7,7 @@
+ #include <drm/drm_cache.h>
+ 
+ #include "gt/intel_gt.h"
+-#include "gt/intel_gt_pm.h"
++#include "gt/intel_tlb.h"
+ 
+ #include "i915_drv.h"
+ #include "i915_gem_object.h"
+@@ -198,7 +198,7 @@ static void flush_tlb_invalidate(struct drm_i915_gem_object *obj)
+ 	if (!obj->mm.tlb)
+ 		return;
+ 
+-	intel_gt_invalidate_tlb(gt, obj->mm.tlb);
++	intel_gt_invalidate_tlb_full(gt, obj->mm.tlb);
+ 	obj->mm.tlb = 0;
+ }
+ 
+@@ -228,7 +228,6 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
+ 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
+ 
+ 	flush_tlb_invalidate(obj);
+-
+ 	return pages;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index e2ba45019e29..8dcd19d3a478 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -13,7 +13,6 @@
+ #include "i915_perf_oa_regs.h"
+ #include "i915_reg.h"
+ #include "intel_context.h"
+-#include "intel_engine_pm.h"
+ #include "intel_engine_regs.h"
+ #include "intel_ggtt_gmch.h"
+ #include "intel_gt.h"
+@@ -34,6 +33,7 @@
+ #include "intel_rps.h"
+ #include "intel_sa_media.h"
+ #include "intel_gt_sysfs.h"
++#include "intel_tlb.h"
+ #include "intel_uncore.h"
+ #include "iov/intel_iov.h"
+ #include "iov/intel_iov_sysfs.h"
+@@ -53,8 +53,7 @@ void intel_gt_common_init_early(struct intel_gt *gt)
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_init_requests(gt);
+ 	intel_gt_init_timelines(gt);
+-	mutex_init(&gt->tlb.invalidate_lock);
+-	seqcount_mutex_init(&gt->tlb.seqno, &gt->tlb.invalidate_lock);
++	intel_gt_init_tlb(gt);
+ 	intel_gt_pm_init_early(gt);
+ 
+ 	intel_wopcm_init_early(&gt->wopcm);
+@@ -868,7 +867,7 @@ void intel_gt_driver_late_release_all(struct drm_i915_private *i915)
+ 		intel_gt_fini_requests(gt);
+ 		intel_gt_fini_reset(gt);
+ 		intel_gt_fini_timelines(gt);
+-		mutex_destroy(&gt->tlb.invalidate_lock);
++		intel_gt_fini_tlb(gt);
+ 		intel_engines_free(gt);
+ 	}
+ }
+@@ -1026,222 +1025,4 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 	drm_printf(p, "available engines: %x\n", info->engine_mask);
+ 
+ 	intel_sseu_dump(&info->sseu, p);
+-}
+-
+-struct reg_and_bit {
+-	union {
+-		i915_reg_t reg;
+-		i915_mcr_reg_t mcr_reg;
+-	};
+-	u32 bit;
+-};
+-
+-static struct reg_and_bit
+-get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
+-		const i915_reg_t *regs, const unsigned int num)
+-{
+-	const unsigned int class = engine->class;
+-	struct reg_and_bit rb = { };
+-
+-	if (gt_WARN_ON_ONCE(engine->gt, class >= num || !regs[class].reg))
+-		return rb;
+-
+-	rb.reg = regs[class];
+-	if (gen8 && class == VIDEO_DECODE_CLASS)
+-		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
+-	else
+-		rb.bit = engine->instance;
+-
+-	rb.bit = BIT(rb.bit);
+-
+-	return rb;
+-}
+-
+-/*
+- * HW architecture suggest typical invalidation time at 40us,
+- * with pessimistic cases up to 100us and a recommendation to
+- * cap at 1ms. We go a bit higher just in case.
+- */
+-#define TLB_INVAL_TIMEOUT_US 100
+-#define TLB_INVAL_TIMEOUT_MS 4
+-
+-/*
+- * On Xe_HP the TLB invalidation registers are located at the same MMIO offsets
+- * but are now considered MCR registers.  Since they exist within a GAM range,
+- * the primary instance of the register rolls up the status from each unit.
+- */
+-static int wait_for_invalidate(struct intel_gt *gt, struct reg_and_bit rb)
+-{
+-	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 50))
+-		return intel_gt_mcr_wait_for_reg(gt, rb.mcr_reg, rb.bit, 0,
+-						 TLB_INVAL_TIMEOUT_US,
+-						 TLB_INVAL_TIMEOUT_MS);
+-	else
+-		return __intel_wait_for_register_fw(gt->uncore, rb.reg, rb.bit, 0,
+-						    TLB_INVAL_TIMEOUT_US,
+-						    TLB_INVAL_TIMEOUT_MS,
+-						    NULL);
+-}
+-
+-static void mmio_invalidate_full(struct intel_gt *gt)
+-{
+-	static const i915_reg_t gen8_regs[] = {
+-		[RENDER_CLASS]			= GEN8_RTCR,
+-		[VIDEO_DECODE_CLASS]		= GEN8_M1TCR, /* , GEN8_M2TCR */
+-		[VIDEO_ENHANCEMENT_CLASS]	= GEN8_VTCR,
+-		[COPY_ENGINE_CLASS]		= GEN8_BTCR,
+-	};
+-	static const i915_reg_t gen12_regs[] = {
+-		[RENDER_CLASS]			= GEN12_GFX_TLB_INV_CR,
+-		[VIDEO_DECODE_CLASS]		= GEN12_VD_TLB_INV_CR,
+-		[VIDEO_ENHANCEMENT_CLASS]	= GEN12_VE_TLB_INV_CR,
+-		[COPY_ENGINE_CLASS]		= GEN12_BLT_TLB_INV_CR,
+-		[COMPUTE_CLASS]			= GEN12_COMPCTX_TLB_INV_CR,
+-	};
+-	static const i915_mcr_reg_t xehp_regs[] = {
+-		[RENDER_CLASS]			= XEHP_GFX_TLB_INV_CR,
+-		[VIDEO_DECODE_CLASS]		= XEHP_VD_TLB_INV_CR,
+-		[VIDEO_ENHANCEMENT_CLASS]	= XEHP_VE_TLB_INV_CR,
+-		[COPY_ENGINE_CLASS]		= XEHP_BLT_TLB_INV_CR,
+-		[COMPUTE_CLASS]			= XEHP_COMPCTX_TLB_INV_CR,
+-	};
+-	struct drm_i915_private *i915 = gt->i915;
+-	struct intel_uncore *uncore = gt->uncore;
+-	struct intel_engine_cs *engine;
+-	intel_engine_mask_t awake, tmp;
+-	enum intel_engine_id id;
+-	const i915_reg_t *regs;
+-	unsigned int num = 0;
+-	unsigned long flags;
+-
+-	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
+-		regs = NULL;
+-		num = ARRAY_SIZE(xehp_regs);
+-	} else if (GRAPHICS_VER(i915) == 12) {
+-		regs = gen12_regs;
+-		num = ARRAY_SIZE(gen12_regs);
+-	} else if (GRAPHICS_VER(i915) >= 8 && GRAPHICS_VER(i915) <= 11) {
+-		regs = gen8_regs;
+-		num = ARRAY_SIZE(gen8_regs);
+-	} else if (GRAPHICS_VER(i915) < 8) {
+-		return;
+-	}
+-
+-	if (gt_WARN_ONCE(gt, !num, "Platform does not implement TLB invalidation!"))
+-		return;
+-
+-	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
+-
+-	intel_gt_mcr_lock(gt, &flags);
+-	spin_lock(&uncore->lock); /* serialise invalidate with GT reset */
+-
+-	awake = 0;
+-	for_each_engine(engine, gt, id) {
+-		struct reg_and_bit rb;
+-
+-		if (!intel_engine_pm_is_awake(engine))
+-			continue;
+-
+-		if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
+-			u32 val = BIT(engine->instance);
+-
+-			if (engine->class == VIDEO_DECODE_CLASS ||
+-			    engine->class == VIDEO_ENHANCEMENT_CLASS ||
+-			    engine->class == COMPUTE_CLASS)
+-				val = _MASKED_BIT_ENABLE(val);
+-			intel_gt_mcr_multicast_write_fw(gt,
+-							xehp_regs[engine->class],
+-							val);
+-		} else {
+-			rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
+-			if (!i915_mmio_reg_offset(rb.reg))
+-				continue;
+-
+-			if (GRAPHICS_VER(i915) == 12 && (engine->class == VIDEO_DECODE_CLASS ||
+-			    engine->class == VIDEO_ENHANCEMENT_CLASS ||
+-			    engine->class == COMPUTE_CLASS))
+-				rb.bit = _MASKED_BIT_ENABLE(rb.bit);
+-
+-			intel_uncore_write_fw(uncore, rb.reg, rb.bit);
+-		}
+-		awake |= engine->mask;
+-	}
+-
+-	GT_TRACE(gt, "invalidated engines %08x\n", awake);
+-
+-	/* Wa_2207587034:tgl,dg1,rkl,adl-s,adl-p */
+-	if (awake &&
+-	    (IS_TIGERLAKE(i915) ||
+-	     IS_DG1(i915) ||
+-	     IS_ROCKETLAKE(i915) ||
+-	     IS_ALDERLAKE_S(i915) ||
+-	     IS_ALDERLAKE_P(i915)))
+-		intel_uncore_write_fw(uncore, GEN12_OA_TLB_INV_CR, 1);
+-
+-	spin_unlock(&uncore->lock);
+-	intel_gt_mcr_unlock(gt, flags);
+-
+-	for_each_engine_masked(engine, gt, awake, tmp) {
+-		struct reg_and_bit rb;
+-
+-		if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
+-			rb.mcr_reg = xehp_regs[engine->class];
+-			rb.bit = BIT(engine->instance);
+-		} else {
+-			rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
+-		}
+-
+-		if (wait_for_invalidate(gt, rb))
+-			gt_err_ratelimited(gt, "%s TLB invalidation did not complete in %ums!\n",
+-					   engine->name, TLB_INVAL_TIMEOUT_MS);
+-	}
+-
+-	/*
+-	 * Use delayed put since a) we mostly expect a flurry of TLB
+-	 * invalidations so it is good to avoid paying the forcewake cost and
+-	 * b) it works around a bug in Icelake which cannot cope with too rapid
+-	 * transitions.
+-	 */
+-	intel_uncore_forcewake_put_delayed(uncore, FORCEWAKE_ALL);
+-}
+-
+-static bool tlb_seqno_passed(const struct intel_gt *gt, u32 seqno)
+-{
+-	u32 cur = intel_gt_tlb_seqno(gt);
+-
+-	/* Only skip if a *full* TLB invalidate barrier has passed */
+-	return (s32)(cur - ALIGN(seqno, 2)) > 0;
+-}
+-
+-void intel_gt_invalidate_tlb(struct intel_gt *gt, u32 seqno)
+-{
+-	intel_wakeref_t wakeref;
+-
+-	if (I915_SELFTEST_ONLY(gt->awake == -ENODEV))
+-		return;
+-
+-	if (intel_gt_is_wedged(gt))
+-		return;
+-
+-	if (tlb_seqno_passed(gt, seqno))
+-		return;
+-
+-	with_intel_gt_pm_if_awake(gt, wakeref) {
+-		mutex_lock(&gt->tlb.invalidate_lock);
+-		if (tlb_seqno_passed(gt, seqno))
+-			goto unlock;
+-
+-		if (IS_SRIOV_VF(gt->i915))
+-			gt_WARN_ON_ONCE(gt, "No GUC TLB invalidation yet!");
+-		else
+-			mmio_invalidate_full(gt);
+-
+-		write_seqcount_invalidate(&gt->tlb.seqno);
+-unlock:
+-		mutex_unlock(&gt->tlb.invalidate_lock);
+-	}
+-}
+-
+-#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+-#include "selftest_tlb.c"
+-#endif
++}
+\ No newline at end of file
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.h b/drivers/gpu/drm/i915/gt/intel_gt.h
+index d2f4fbde5f9f..6549e28fa219 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@ -107,16 +107,4 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 
+ void intel_gt_watchdog_work(struct work_struct *work);
+ 
+-static inline u32 intel_gt_tlb_seqno(const struct intel_gt *gt)
+-{
+-	return seqprop_sequence(&gt->tlb.seqno);
+-}
+-
+-static inline u32 intel_gt_next_invalidate_tlb_full(const struct intel_gt *gt)
+-{
+-	return intel_gt_tlb_seqno(gt) | 1;
+-}
+-
+-void intel_gt_invalidate_tlb(struct intel_gt *gt, u32 seqno);
+-
+ #endif /* __INTEL_GT_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_ppgtt.c b/drivers/gpu/drm/i915/gt/intel_ppgtt.c
+index 7ecfa672f738..d90a7832f215 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ppgtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ppgtt.c
+@@ -9,6 +9,7 @@
+ 
+ #include "i915_trace.h"
+ #include "intel_gtt.h"
++#include "intel_tlb.h"
+ #include "gen6_ppgtt.h"
+ #include "gen8_ppgtt.h"
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_tlb.c b/drivers/gpu/drm/i915/gt/intel_tlb.c
+new file mode 100644
+index 000000000000..776ac5909a8f
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/intel_tlb.c
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2022 Intel Corporation
++ */
++
++#include "i915_drv.h"
++#include "i915_perf_oa_regs.h"
++#include "intel_engine_pm.h"
++#include "intel_gt.h"
++#include "intel_gt_mcr.h"
++#include "intel_gt_pm.h"
++#include "intel_gt_print.h"
++#include "intel_gt_regs.h"
++#include "intel_tlb.h"
++
++struct reg_and_bit {
++	union {
++		i915_reg_t reg;
++		i915_mcr_reg_t mcr_reg;
++	};
++	u32 bit;
++};
++
++static struct reg_and_bit
++get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
++		const i915_reg_t *regs, const unsigned int num)
++{
++	const unsigned int class = engine->class;
++	struct reg_and_bit rb = { };
++
++	if (gt_WARN_ON_ONCE(engine->gt, class >= num || !regs[class].reg))
++		return rb;
++
++	rb.reg = regs[class];
++	if (gen8 && class == VIDEO_DECODE_CLASS)
++		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
++	else
++		rb.bit = engine->instance;
++
++	rb.bit = BIT(rb.bit);
++
++	return rb;
++}
++
++/*
++ * HW architecture suggest typical invalidation time at 40us,
++ * with pessimistic cases up to 100us and a recommendation to
++ * cap at 1ms. We go a bit higher just in case.
++ */
++#define TLB_INVAL_TIMEOUT_US 100
++#define TLB_INVAL_TIMEOUT_MS 4
++
++/*
++ * On Xe_HP the TLB invalidation registers are located at the same MMIO offsets
++ * but are now considered MCR registers.  Since they exist within a GAM range,
++ * the primary instance of the register rolls up the status from each unit.
++ */
++static int wait_for_invalidate(struct intel_gt *gt, struct reg_and_bit rb)
++{
++	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 50))
++		return intel_gt_mcr_wait_for_reg(gt, rb.mcr_reg, rb.bit, 0,
++						 TLB_INVAL_TIMEOUT_US,
++						 TLB_INVAL_TIMEOUT_MS);
++	else
++		return __intel_wait_for_register_fw(gt->uncore, rb.reg, rb.bit, 0,
++						    TLB_INVAL_TIMEOUT_US,
++						    TLB_INVAL_TIMEOUT_MS,
++						    NULL);
++}
++
++static void mmio_invalidate_full(struct intel_gt *gt)
++{
++	static const i915_reg_t gen8_regs[] = {
++		[RENDER_CLASS]			= GEN8_RTCR,
++		[VIDEO_DECODE_CLASS]		= GEN8_M1TCR, /* , GEN8_M2TCR */
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN8_VTCR,
++		[COPY_ENGINE_CLASS]		= GEN8_BTCR,
++	};
++	static const i915_reg_t gen12_regs[] = {
++		[RENDER_CLASS]			= GEN12_GFX_TLB_INV_CR,
++		[VIDEO_DECODE_CLASS]		= GEN12_VD_TLB_INV_CR,
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN12_VE_TLB_INV_CR,
++		[COPY_ENGINE_CLASS]		= GEN12_BLT_TLB_INV_CR,
++		[COMPUTE_CLASS]			= GEN12_COMPCTX_TLB_INV_CR,
++	};
++	static const i915_mcr_reg_t xehp_regs[] = {
++		[RENDER_CLASS]			= XEHP_GFX_TLB_INV_CR,
++		[VIDEO_DECODE_CLASS]		= XEHP_VD_TLB_INV_CR,
++		[VIDEO_ENHANCEMENT_CLASS]	= XEHP_VE_TLB_INV_CR,
++		[COPY_ENGINE_CLASS]		= XEHP_BLT_TLB_INV_CR,
++		[COMPUTE_CLASS]			= XEHP_COMPCTX_TLB_INV_CR,
++	};
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	struct intel_engine_cs *engine;
++	intel_engine_mask_t awake, tmp;
++	enum intel_engine_id id;
++	const i915_reg_t *regs;
++	unsigned int num = 0;
++	unsigned long flags;
++
++	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
++		regs = NULL;
++		num = ARRAY_SIZE(xehp_regs);
++	} else if (GRAPHICS_VER(i915) == 12) {
++		regs = gen12_regs;
++		num = ARRAY_SIZE(gen12_regs);
++	} else if (GRAPHICS_VER(i915) >= 8 && GRAPHICS_VER(i915) <= 11) {
++		regs = gen8_regs;
++		num = ARRAY_SIZE(gen8_regs);
++	} else if (GRAPHICS_VER(i915) < 8) {
++		return;
++	}
++
++	if (gt_WARN_ONCE(gt, !num, "Platform does not implement TLB invalidation!"))
++		return;
++
++	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
++
++	intel_gt_mcr_lock(gt, &flags);
++	spin_lock(&uncore->lock); /* serialise invalidate with GT reset */
++
++	awake = 0;
++	for_each_engine(engine, gt, id) {
++		struct reg_and_bit rb;
++
++		if (!intel_engine_pm_is_awake(engine))
++			continue;
++
++		if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
++			u32 val = BIT(engine->instance);
++
++			if (engine->class == VIDEO_DECODE_CLASS ||
++			    engine->class == VIDEO_ENHANCEMENT_CLASS ||
++			    engine->class == COMPUTE_CLASS)
++				val = _MASKED_BIT_ENABLE(val);
++			intel_gt_mcr_multicast_write_fw(gt,
++							xehp_regs[engine->class],
++							val);
++		} else {
++			rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++			if (!i915_mmio_reg_offset(rb.reg))
++				continue;
++
++			if (GRAPHICS_VER(i915) == 12 && (engine->class == VIDEO_DECODE_CLASS ||
++			    engine->class == VIDEO_ENHANCEMENT_CLASS ||
++			    engine->class == COMPUTE_CLASS))
++				rb.bit = _MASKED_BIT_ENABLE(rb.bit);
++
++			intel_uncore_write_fw(uncore, rb.reg, rb.bit);
++		}
++		awake |= engine->mask;
++	}
++
++	GT_TRACE(gt, "invalidated engines %08x\n", awake);
++
++	/* Wa_2207587034:tgl,dg1,rkl,adl-s,adl-p */
++	if (awake &&
++	    (IS_TIGERLAKE(i915) ||
++	     IS_DG1(i915) ||
++	     IS_ROCKETLAKE(i915) ||
++	     IS_ALDERLAKE_S(i915) ||
++	     IS_ALDERLAKE_P(i915)))
++		intel_uncore_write_fw(uncore, GEN12_OA_TLB_INV_CR, 1);
++
++	spin_unlock(&uncore->lock);
++	intel_gt_mcr_unlock(gt, flags);
++
++	for_each_engine_masked(engine, gt, awake, tmp) {
++		struct reg_and_bit rb;
++
++		if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
++			rb.mcr_reg = xehp_regs[engine->class];
++			rb.bit = BIT(engine->instance);
++		} else {
++			rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++		}
++
++		if (wait_for_invalidate(gt, rb))
++			gt_err_ratelimited(gt, "%s TLB invalidation did not complete in %ums!\n",
++					   engine->name, TLB_INVAL_TIMEOUT_MS);
++	}
++
++	/*
++	 * Use delayed put since a) we mostly expect a flurry of TLB
++	 * invalidations so it is good to avoid paying the forcewake cost and
++	 * b) it works around a bug in Icelake which cannot cope with too rapid
++	 * transitions.
++	 */
++	intel_uncore_forcewake_put_delayed(uncore, FORCEWAKE_ALL);
++}
++
++static bool tlb_seqno_passed(const struct intel_gt *gt, u32 seqno)
++{
++	u32 cur = intel_gt_tlb_seqno(gt);
++
++	/* Only skip if a *full* TLB invalidate barrier has passed */
++	return (s32)(cur - ALIGN(seqno, 2)) > 0;
++}
++
++void intel_gt_invalidate_tlb_full(struct intel_gt *gt, u32 seqno)
++{
++	intel_wakeref_t wakeref;
++
++	if (I915_SELFTEST_ONLY(gt->awake == -ENODEV))
++		return;
++
++	if (intel_gt_is_wedged(gt))
++		return;
++
++	if (tlb_seqno_passed(gt, seqno))
++		return;
++
++	with_intel_gt_pm_if_awake(gt, wakeref) {
++		mutex_lock(&gt->tlb.invalidate_lock);
++		if (tlb_seqno_passed(gt, seqno))
++			goto unlock;
++
++		if (IS_SRIOV_VF(gt->i915))
++			gt_WARN_ON_ONCE(gt, "No GUC TLB invalidation yet!");
++		else
++			mmio_invalidate_full(gt);
++
++		write_seqcount_invalidate(&gt->tlb.seqno);
++unlock:
++		mutex_unlock(&gt->tlb.invalidate_lock);
++	}
++}
++
++void intel_gt_init_tlb(struct intel_gt *gt)
++{
++	mutex_init(&gt->tlb.invalidate_lock);
++	seqcount_mutex_init(&gt->tlb.seqno, &gt->tlb.invalidate_lock);
++}
++
++void intel_gt_fini_tlb(struct intel_gt *gt)
++{
++	mutex_destroy(&gt->tlb.invalidate_lock);
++}
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftest_tlb.c"
++#endif
++
+diff --git a/drivers/gpu/drm/i915/gt/intel_tlb.h b/drivers/gpu/drm/i915/gt/intel_tlb.h
+new file mode 100644
+index 000000000000..46ce25bf5afe
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/intel_tlb.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2022 Intel Corporation
++ */
++
++#ifndef INTEL_TLB_H
++#define INTEL_TLB_H
++
++#include <linux/seqlock.h>
++#include <linux/types.h>
++
++#include "intel_gt_types.h"
++
++void intel_gt_invalidate_tlb_full(struct intel_gt *gt, u32 seqno);
++
++void intel_gt_init_tlb(struct intel_gt *gt);
++void intel_gt_fini_tlb(struct intel_gt *gt);
++
++static inline u32 intel_gt_tlb_seqno(const struct intel_gt *gt)
++{
++	return seqprop_sequence(&gt->tlb.seqno);
++}
++
++static inline u32 intel_gt_next_invalidate_tlb_full(const struct intel_gt *gt)
++{
++	return intel_gt_tlb_seqno(gt) | 1;
++}
++
++#endif /* INTEL_TLB_H */
+diff --git a/drivers/gpu/drm/i915/gt/selftest_tlb.c b/drivers/gpu/drm/i915/gt/selftest_tlb.c
+index e6cac1f15d6e..143edbd903c5 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_tlb.c
++++ b/drivers/gpu/drm/i915/gt/selftest_tlb.c
+@@ -6,6 +6,7 @@
+ #include "i915_selftest.h"
+ 
+ #include "gem/i915_gem_internal.h"
++#include "gem/i915_gem_lmem.h"
+ #include "gem/i915_gem_region.h"
+ 
+ #include "gen8_engine_cs.h"
+@@ -345,7 +346,7 @@ mem_tlbinv(struct intel_gt *gt,
+ 
+ static void tlbinv_full(struct i915_address_space *vm, u64 addr, u64 length)
+ {
+-	intel_gt_invalidate_tlb(vm->gt, intel_gt_tlb_seqno(vm->gt) | 1);
++	intel_gt_invalidate_tlb_full(vm->gt, intel_gt_tlb_seqno(vm->gt) | 1);
+ }
+ 
+ static int invalidate_full(void *arg)
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index f51fd9fd4c89..f7643343e2fa 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -34,6 +34,7 @@
+ #include "gt/intel_engine_heartbeat.h"
+ #include "gt/intel_gt.h"
+ #include "gt/intel_gt_requests.h"
++#include "gt/intel_tlb.h"
+ 
+ #include "i915_drv.h"
+ #include "i915_gem_evict.h"
+-- 
+2.25.1
+

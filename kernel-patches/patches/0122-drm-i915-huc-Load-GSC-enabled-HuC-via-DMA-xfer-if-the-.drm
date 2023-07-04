@@ -1,0 +1,193 @@
+From 1d09d25cf0381c82bf9fd731cbff6414bc557906 Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Wed, 22 Mar 2023 15:49:18 -0700
+Subject: [PATCH 122/128] drm/i915/huc: Load GSC-enabled HuC via DMA xfer if
+ the fuse says so
+
+In the previous patch we extracted the offset of the legacy-style HuC
+binary located within the GSC-enabled blob, so now we can use that to
+load the HuC via DMA if the fuse is set that way.
+Note that we now need to differentiate between "GSC-enabled binary" and
+"loaded by GSC", so the former case has been renamed to "MEU binary" for
+clarity, while the latter is now based on the fuse instead of the binary
+format. This way, all the legacy load paths are automatically taken
+(including the auth by GuC) without having to implement further code
+changes.
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+---
+ drivers/gpu/drm/i915/gt/uc/intel_huc.c    | 27 ++++++++++++++---------
+ drivers/gpu/drm/i915/gt/uc/intel_huc.h    |  4 +++-
+ drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c |  4 ++--
+ drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c  | 14 ++++++------
+ drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h  |  2 +-
+ 5 files changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc.c b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+index 062ff914b274..8e7792cce650 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc.c
+@@ -298,31 +298,38 @@ void intel_huc_init_early(struct intel_huc *huc)
+ static int check_huc_loading_mode(struct intel_huc *huc)
+ {
+ 	struct intel_gt *gt = huc_to_gt(huc);
+-	bool fw_needs_gsc = intel_huc_is_loaded_by_gsc(huc);
+-	bool hw_uses_gsc = false;
++	bool fw_is_meu = huc->fw.is_meu_binary;
+ 
+ 	/*
+ 	 * The fuse for HuC load via GSC is only valid on platforms that have
+ 	 * GuC deprivilege.
+ 	 */
+ 	if (HAS_GUC_DEPRIVILEGE(gt->i915))
+-		hw_uses_gsc = intel_uncore_read(gt->uncore, GUC_SHIM_CONTROL2) &
+-			      GSC_LOADS_HUC;
++		huc->loaded_via_gsc = intel_uncore_read(gt->uncore, GUC_SHIM_CONTROL2) &
++				      GSC_LOADS_HUC;
+ 
+-	if (fw_needs_gsc != hw_uses_gsc) {
+-		huc_err(huc, "mismatch between FW (%s) and HW (%s) load modes\n",
+-			HUC_LOAD_MODE_STRING(fw_needs_gsc), HUC_LOAD_MODE_STRING(hw_uses_gsc));
++	if (huc->loaded_via_gsc && !fw_is_meu) {
++		huc_err(huc, "HW requires a MEU blob, but we found a legacy one\n");
+ 		return -ENOEXEC;
+ 	}
+ 
+-	/* make sure we can access the GSC via the mei driver if we need it */
++	/*
++	 * Newer meu blobs contain the old FW structure inside. If we found
++	 * that, we can use it to load the legacy way.
++	 */
++	if (!huc->loaded_via_gsc && fw_is_meu && !huc->fw.dma_start_offset) {
++		huc_err(huc, " HW in legacy mode, but we have an incompatible meu blob\n");
++		return -ENOEXEC;
++	}
++
++	/* make sure we can access the GSC if we need it */
+ 	if (!(IS_ENABLED(CONFIG_INTEL_MEI_PXP) && IS_ENABLED(CONFIG_INTEL_MEI_GSC)) &&
+-	    fw_needs_gsc) {
++	    !HAS_ENGINE(gt, GSC0) && huc->loaded_via_gsc) {
+ 		huc_info(huc, "can't load due to missing MEI modules\n");
+ 		return -EIO;
+ 	}
+ 
+-	huc_dbg(huc, "loaded by GSC = %s\n", str_yes_no(fw_needs_gsc));
++	huc_dbg(huc, "loaded by GSC = %s\n", str_yes_no(huc->loaded_via_gsc));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc.h b/drivers/gpu/drm/i915/gt/uc/intel_huc.h
+index 0a8f0615d181..fb2c268d9b19 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc.h
+@@ -39,6 +39,8 @@ struct intel_huc {
+ 		struct notifier_block nb;
+ 		enum intel_huc_delayed_load_status status;
+ 	} delayed_load;
++
++	bool loaded_via_gsc;
+ };
+ 
+ int intel_huc_sanitize(struct intel_huc *huc);
+@@ -74,7 +76,7 @@ static inline bool intel_huc_is_used(const struct intel_huc *huc)
+ 
+ static inline bool intel_huc_is_loaded_by_gsc(const struct intel_huc *huc)
+ {
+-	return huc->fw.loaded_via_gsc;
++	return huc->loaded_via_gsc;
+ }
+ 
+ static inline bool intel_huc_wait_required(struct intel_huc *huc)
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+index 7ae96d883fb0..3f4cd2b085da 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c
+@@ -33,8 +33,8 @@ int intel_huc_fw_get_binary_info(struct intel_uc_fw *huc_fw, const void *data)
+ 	const struct intel_gsc_cpt_directory_entry *entry;
+ 	int i;
+ 
+-	if (!huc_fw->loaded_via_gsc) {
+-		huc_err(huc, "Invalid FW type for GSC load\n");
++	if (!huc_fw->is_meu_binary) {
++		huc_err(huc, "Invalid FW type for MEU parsing\n");
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+index 59e7fc518e50..e990f721c4dc 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+@@ -195,7 +195,7 @@ struct __packed uc_fw_blob {
+ 	u8 major;
+ 	u8 minor;
+ 	u8 patch;
+-	bool loaded_via_gsc;
++	bool is_meu_binary;
+ };
+ 
+ #define UC_FW_BLOB_BASE(major_, minor_, patch_, path_) \
+@@ -204,9 +204,9 @@ struct __packed uc_fw_blob {
+ 	.patch = patch_, \
+ 	.path = path_,
+ 
+-#define UC_FW_BLOB_NEW(major_, minor_, patch_, gsc_, path_) \
++#define UC_FW_BLOB_NEW(major_, minor_, patch_, meu_, path_) \
+ 	{ UC_FW_BLOB_BASE(major_, minor_, patch_, path_) \
+-	  .legacy = false, .loaded_via_gsc = gsc_ }
++	  .legacy = false, .is_meu_binary = meu_ }
+ 
+ #define UC_FW_BLOB_OLD(major_, minor_, patch_, path_) \
+ 	{ UC_FW_BLOB_BASE(major_, minor_, patch_, path_) \
+@@ -311,7 +311,7 @@ __uc_fw_auto_select(struct drm_i915_private *i915, struct intel_uc_fw *uc_fw)
+ 		uc_fw->file_wanted.path = blob->path;
+ 		uc_fw->file_wanted.ver.major = blob->major;
+ 		uc_fw->file_wanted.ver.minor = blob->minor;
+-		uc_fw->loaded_via_gsc = blob->loaded_via_gsc;
++		uc_fw->is_meu_binary = blob->is_meu_binary;
+ 		found = true;
+ 		break;
+ 	}
+@@ -715,7 +715,7 @@ static int check_fw_header(struct intel_gt *gt,
+ 	if (uc_fw->type == INTEL_UC_FW_TYPE_GSC)
+ 		return 0;
+ 
+-	if (uc_fw->loaded_via_gsc)
++	if (uc_fw->is_meu_binary)
+ 		err = check_gsc_manifest(gt, fw, uc_fw);
+ 	else
+ 		err = check_ccs_header(gt, fw, uc_fw);
+@@ -967,7 +967,7 @@ static int uc_fw_xfer(struct intel_uc_fw *uc_fw, u32 dst_offset, u32 dma_flags)
+ 	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
+ 
+ 	/* Set the source address for the uCode */
+-	offset = uc_fw->dummy.start;
++	offset = uc_fw->dummy.start + uc_fw->dma_start_offset;
+ 	GEM_BUG_ON(upper_32_bits(offset) & 0xFFFF0000);
+ 	intel_uncore_write_fw(uncore, DMA_ADDR_0_LOW, lower_32_bits(offset));
+ 	intel_uncore_write_fw(uncore, DMA_ADDR_0_HIGH, upper_32_bits(offset));
+@@ -1206,7 +1206,7 @@ size_t intel_uc_fw_copy_rsa(struct intel_uc_fw *uc_fw, void *dst, u32 max_len)
+ {
+ 	struct intel_memory_region *mr = uc_fw->obj->mm.region;
+ 	u32 size = min_t(u32, uc_fw->rsa_size, max_len);
+-	u32 offset = sizeof(struct uc_css_header) + uc_fw->ucode_size;
++	u32 offset = uc_fw->dma_start_offset + sizeof(struct uc_css_header) + uc_fw->ucode_size;
+ 	struct sgt_iter iter;
+ 	size_t count = 0;
+ 	int idx;
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
+index 00b44e28ef53..0c08c23bd75d 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h
+@@ -116,7 +116,7 @@ struct intel_uc_fw {
+ 
+ 	u32 dma_start_offset;
+ 
+-	bool loaded_via_gsc;
++	bool is_meu_binary;
+ };
+ 
+ /*
+-- 
+2.25.1
+

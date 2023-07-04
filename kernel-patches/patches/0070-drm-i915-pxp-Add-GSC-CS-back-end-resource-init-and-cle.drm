@@ -1,0 +1,223 @@
+From 1e819cc8c5f7922c4df175e8849cc03c087d240a Mon Sep 17 00:00:00 2001
+From: Alan Previn <alan.previn.teres.alexis@intel.com>
+Date: Wed, 4 Jan 2023 21:02:56 -0800
+Subject: [PATCH 070/128] drm/i915/pxp: Add GSC-CS back-end resource init and
+ cleanup
+
+For MTL, the PXP back-end transport uses the GSC engine to submit
+HECI packets through the HW to the GSC firmware for PXP arb
+session management. This submission uses a non-priveleged
+batch buffer, a buffer for the command packet and of course
+a context targeting the GSC-CS.
+
+Thus for MTL, we need to allocate and free a set of execution
+submission resources for the management of the arbitration session.
+Lets start with the context creation first since that object and
+its usage is very straight-forward. We'll add the buffer allocation
+and freeing later when we introduce the gsccs' send-message function.
+
+Do this one time allocation of gsccs specific resources in
+a new gsccs source file with intel_pxp_gsccs_init / fini functions
+and hook them up from the PXP front-end.
+
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile              |  1 +
+ drivers/gpu/drm/i915/pxp/intel_pxp.c       | 17 ++++--
+ drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c | 65 ++++++++++++++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h | 29 ++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_types.h |  8 +++
+ 5 files changed, 116 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+ create mode 100644 drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index f6145effc795..6f9546bb2c2b 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -334,6 +334,7 @@ i915-y += \
+ i915-$(CONFIG_DRM_I915_PXP) += \
+ 	pxp/intel_pxp_cmd.o \
+ 	pxp/intel_pxp_debugfs.o \
++	pxp/intel_pxp_gsccs.o \
+ 	pxp/intel_pxp_irq.o \
+ 	pxp/intel_pxp_pm.o \
+ 	pxp/intel_pxp_session.o
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index cfc9af8b3d21..22280408156e 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -12,6 +12,7 @@
+ #include "i915_drv.h"
+ 
+ #include "intel_pxp.h"
++#include "intel_pxp_gsccs.h"
+ #include "intel_pxp_irq.h"
+ #include "intel_pxp_session.h"
+ #include "intel_pxp_tee.h"
+@@ -132,7 +133,10 @@ static void pxp_init_full(struct intel_pxp *pxp)
+ 	if (ret)
+ 		return;
+ 
+-	ret = intel_pxp_tee_component_init(pxp);
++	if (HAS_ENGINE(pxp->ctrl_gt, GSC0))
++		ret = intel_pxp_gsccs_init(pxp);
++	else
++		ret = intel_pxp_tee_component_init(pxp);
+ 	if (ret)
+ 		goto out_context;
+ 
+@@ -165,9 +169,11 @@ static struct intel_gt *find_gt_for_required_protected_content(struct drm_i915_p
+ 	/*
+ 	 * For MTL onwards, PXP-controller-GT needs to have a valid GSC engine
+ 	 * on the media GT. NOTE: if we have a media-tile with a GSC-engine,
+-	 * the VDBOX is already present so skip that check
++	 * the VDBOX is already present so skip that check. We also have to
++	 * ensure the GSC firmware is coming online
+ 	 */
+-	if (i915->media_gt && HAS_ENGINE(i915->media_gt, GSC0))
++	if (i915->media_gt && HAS_ENGINE(i915->media_gt, GSC0) &&
++	    intel_uc_fw_is_loadable(&i915->media_gt->uc.gsc.fw))
+ 		return i915->media_gt;
+ 
+ 	/*
+@@ -229,7 +235,10 @@ void intel_pxp_fini(struct drm_i915_private *i915)
+ 
+ 	i915->pxp->arb_is_valid = false;
+ 
+-	intel_pxp_tee_component_fini(i915->pxp);
++	if (HAS_ENGINE(i915->pxp->ctrl_gt, GSC0))
++		intel_pxp_gsccs_fini(i915->pxp);
++	else
++		intel_pxp_tee_component_fini(i915->pxp);
+ 
+ 	destroy_vcs_context(i915->pxp);
+ 
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+new file mode 100644
+index 000000000000..b304864902c8
+--- /dev/null
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright(c) 2023 Intel Corporation.
++ */
++
++#include "gem/i915_gem_internal.h"
++
++#include "gt/intel_context.h"
++
++#include "i915_drv.h"
++#include "intel_pxp_cmd_interface_43.h"
++#include "intel_pxp_gsccs.h"
++#include "intel_pxp_types.h"
++
++static void
++gsccs_destroy_execution_resource(struct intel_pxp *pxp)
++{
++	struct gsccs_session_resources *strm_res = &pxp->gsccs_res;
++
++	if (strm_res->ce)
++		intel_context_put(strm_res->ce);
++
++	memset(strm_res, 0, sizeof(*strm_res));
++}
++
++static int
++gsccs_allocate_execution_resource(struct intel_pxp *pxp)
++{
++	struct intel_gt *gt = pxp->ctrl_gt;
++	struct gsccs_session_resources *strm_res = &pxp->gsccs_res;
++	struct intel_engine_cs *engine = gt->engine[GSC0];
++	struct intel_context *ce;
++
++	/*
++	 * First, ensure the GSC engine is present.
++	 * NOTE: Backend would only be called with the correct gt.
++	 */
++	if (!engine)
++		return -ENODEV;
++
++	mutex_init(&pxp->tee_mutex);
++
++	/* Finally, create an intel_context to be used during the submission */
++	ce = intel_context_create(engine);
++	if (IS_ERR(ce)) {
++		drm_err(&gt->i915->drm, "Failed creating gsccs backend ctx\n");
++		return PTR_ERR(ce);
++	}
++	i915_vm_put(ce->vm);
++	ce->vm = i915_vm_get(pxp->ctrl_gt->vm);
++
++	strm_res->ce = ce;
++
++	return 0;
++}
++
++void intel_pxp_gsccs_fini(struct intel_pxp *pxp)
++{
++	gsccs_destroy_execution_resource(pxp);
++}
++
++int intel_pxp_gsccs_init(struct intel_pxp *pxp)
++{
++	return gsccs_allocate_execution_resource(pxp);
++}
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
+new file mode 100644
+index 000000000000..354ea9a8f940
+--- /dev/null
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright(c) 2022, Intel Corporation. All rights reserved.
++ */
++
++#ifndef __INTEL_PXP_GSCCS_H__
++#define __INTEL_PXP_GSCCS_H__
++
++#include <linux/types.h>
++
++struct intel_pxp;
++
++#ifdef CONFIG_DRM_I915_PXP
++void intel_pxp_gsccs_fini(struct intel_pxp *pxp);
++int intel_pxp_gsccs_init(struct intel_pxp *pxp);
++
++#else
++static inline void intel_pxp_gsccs_fini(struct intel_pxp *pxp)
++{
++}
++
++static inline int intel_pxp_gsccs_init(struct intel_pxp *pxp)
++{
++	return 0;
++}
++
++#endif
++
++#endif /*__INTEL_PXP_GSCCS_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+index 7dc5f08d1583..326bd8414407 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+@@ -26,6 +26,14 @@ struct intel_pxp {
+ 	 */
+ 	struct intel_gt *ctrl_gt;
+ 
++	/**
++	 * @gsccs_res: resources for request submission for platforms that have a GSC engine.
++	 */
++	struct gsccs_session_resources {
++		u64 host_session_handle; /* used by firmware to link commands to sessions */
++		struct intel_context *ce; /* context for gsc command submission */
++	} gsccs_res;
++
+ 	/**
+ 	 * @pxp_component: i915_pxp_component struct of the bound mei_pxp
+ 	 * module. Only set and cleared inside component bind/unbind functions,
+-- 
+2.25.1
+
