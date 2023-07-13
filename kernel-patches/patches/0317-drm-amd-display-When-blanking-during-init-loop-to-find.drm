@@ -1,0 +1,142 @@
+From f782631697b11a5362f3fd3fb0ade7a5f779d254 Mon Sep 17 00:00:00 2001
+From: Alvin Lee <Alvin.Lee2@amd.com>
+Date: Fri, 17 Feb 2023 17:54:01 -0500
+Subject: [PATCH 0317/2071] drm/amd/display: When blanking during init loop to
+ find OPP index
+
+[Description]
+For pipe harvesting cases we cannot rely on array index
+to get the correct OPP instance, we must loop through
+each instance to find the correct one.
+
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Alvin Lee <Alvin.Lee2@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.c    | 83 +++++++++++++++++++
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.h    |  4 +
+ .../gpu/drm/amd/display/dc/dcn32/dcn32_init.c |  2 +-
+ 3 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+index f712ac2e752d..77198834eb55 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+@@ -1413,3 +1413,86 @@ void dcn32_enable_phantom_streams(struct dc *dc, struct dc_state *context)
+ 		}
+ 	}
+ }
++
++/* Blank pixel data during initialization */
++void dcn32_init_blank(
++		struct dc *dc,
++		struct timing_generator *tg)
++{
++	struct dce_hwseq *hws = dc->hwseq;
++	enum dc_color_space color_space;
++	struct tg_color black_color = {0};
++	struct output_pixel_processor *opp = NULL;
++	struct output_pixel_processor *bottom_opp = NULL;
++	uint32_t num_opps, opp_id_src0, opp_id_src1;
++	uint32_t otg_active_width, otg_active_height;
++	uint32_t i;
++
++	/* program opp dpg blank color */
++	color_space = COLOR_SPACE_SRGB;
++	color_space_to_black_color(dc, color_space, &black_color);
++
++	/* get the OTG active size */
++	tg->funcs->get_otg_active_size(tg,
++			&otg_active_width,
++			&otg_active_height);
++
++	/* get the OPTC source */
++	tg->funcs->get_optc_source(tg, &num_opps, &opp_id_src0, &opp_id_src1);
++
++	if (opp_id_src0 >= dc->res_pool->res_cap->num_opp) {
++		ASSERT(false);
++		return;
++	}
++
++	for (i = 0; i < dc->res_pool->res_cap->num_opp; i++) {
++		if (dc->res_pool->opps[i] != NULL && dc->res_pool->opps[i]->inst == opp_id_src0) {
++			opp = dc->res_pool->opps[i];
++			break;
++		}
++	}
++
++	if (num_opps == 2) {
++		otg_active_width = otg_active_width / 2;
++
++		if (opp_id_src1 >= dc->res_pool->res_cap->num_opp) {
++			ASSERT(false);
++			return;
++		}
++		for (i = 0; i < dc->res_pool->res_cap->num_opp; i++) {
++			if (dc->res_pool->opps[i] != NULL && dc->res_pool->opps[i]->inst == opp_id_src1) {
++				bottom_opp = dc->res_pool->opps[i];
++				break;
++			}
++		}
++	}
++
++	if (opp && opp->funcs->opp_set_disp_pattern_generator)
++		opp->funcs->opp_set_disp_pattern_generator(
++				opp,
++				CONTROLLER_DP_TEST_PATTERN_SOLID_COLOR,
++				CONTROLLER_DP_COLOR_SPACE_UDEFINED,
++				COLOR_DEPTH_UNDEFINED,
++				&black_color,
++				otg_active_width,
++				otg_active_height,
++				0);
++
++	if (num_opps == 2) {
++		if (bottom_opp && bottom_opp->funcs->opp_set_disp_pattern_generator) {
++			bottom_opp->funcs->opp_set_disp_pattern_generator(
++					bottom_opp,
++					CONTROLLER_DP_TEST_PATTERN_SOLID_COLOR,
++					CONTROLLER_DP_COLOR_SPACE_UDEFINED,
++					COLOR_DEPTH_UNDEFINED,
++					&black_color,
++					otg_active_width,
++					otg_active_height,
++					0);
++			hws->funcs.wait_for_blank_complete(bottom_opp);
++		}
++	}
++
++	if (opp)
++		hws->funcs.wait_for_blank_complete(opp);
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+index e9e9534f3668..84c1f36c3fa6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.h
+@@ -104,4 +104,8 @@ void dcn32_update_dsc_pg(struct dc *dc,
+ 
+ void dcn32_enable_phantom_streams(struct dc *dc, struct dc_state *context);
+ 
++void dcn32_init_blank(
++		struct dc *dc,
++		struct timing_generator *tg);
++
+ #endif /* __DC_HWSS_DCN32_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+index 0694fa3a3680..dcb81662884f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_init.c
+@@ -132,7 +132,7 @@ static const struct hwseq_private_funcs dcn32_private_funcs = {
+ 	.enable_stream_gating = dcn20_enable_stream_gating,
+ 	.setup_vupdate_interrupt = dcn20_setup_vupdate_interrupt,
+ 	.did_underflow_occur = dcn10_did_underflow_occur,
+-	.init_blank = dcn20_init_blank,
++	.init_blank = dcn32_init_blank,
+ 	.disable_vga = dcn20_disable_vga,
+ 	.bios_golden_init = dcn10_bios_golden_init,
+ 	.plane_atomic_disable = dcn20_plane_atomic_disable,
+-- 
+2.25.1
+

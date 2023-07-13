@@ -1,0 +1,160 @@
+From cf5e438cd46772d9b4ef332646850ea10bdc2f3c Mon Sep 17 00:00:00 2001
+From: Zack Rusin <zackr@vmware.com>
+Date: Sat, 11 Feb 2023 00:05:14 -0500
+Subject: [PATCH 1114/2071] drm/vmwgfx: Do not drop the reference to the handle
+ too soon
+
+v3: Fix vmw_user_bo_lookup which was also dropping the gem reference
+before the kernel was done with buffer depending on userspace doing
+the right thing. Same bug, different spot.
+
+It is possible for userspace to predict the next buffer handle and
+to destroy the buffer while it's still used by the kernel. Delay
+dropping the internal reference on the buffers until kernel is done
+with them.
+
+Instead of immediately dropping the gem reference in vmw_user_bo_lookup
+and vmw_gem_object_create_with_handle let the callers decide when they're
+ready give the control back to userspace.
+
+Also fixes the second usage of vmw_gem_object_create_with_handle in
+vmwgfx_surface.c which wasn't grabbing an explicit reference
+to the gem object which could have been destroyed by the userspace
+on the owning surface at any point.
+
+Signed-off-by: Zack Rusin <zackr@vmware.com>
+Fixes: 8afa13a0583f ("drm/vmwgfx: Implement DRIVER_GEM")
+Reviewed-by: Martin Krastev <krastevm@vmware.com>
+Reviewed-by: Maaz Mombasawala <mombasawalam@vmware.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230211050514.2431155-1-zack@kde.org
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_bo.c      | 6 +++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c | 4 ++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_gem.c     | 2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c     | 2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c | 2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_shader.c  | 2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_surface.c | 2 +-
+ 7 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index 298a27b14044..82094c137855 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -500,7 +500,7 @@ static int vmw_user_bo_synccpu_release(struct drm_file *filp,
+ 		ttm_bo_put(&vmw_bo->tbo);
+ 	}
+ 
+-	drm_gem_object_put(&vmw_bo->base.base);
++	drm_gem_object_put(&vmw_bo->tbo.base);
+ 	return ret;
+ }
+ 
+@@ -541,7 +541,7 @@ int vmw_user_bo_synccpu_ioctl(struct drm_device *dev, void *data,
+ 
+ 		ret = vmw_user_bo_synccpu_grab(vbo, arg->flags);
+ 		vmw_bo_unreference(&vbo);
+-		drm_gem_object_put(&vbo->base.base);
++		drm_gem_object_put(&vbo->tbo.base);
+ 		if (unlikely(ret != 0)) {
+ 			if (ret == -ERESTARTSYS || ret == -EBUSY)
+ 				return -EBUSY;
+@@ -695,7 +695,7 @@ int vmw_dumb_create(struct drm_file *file_priv,
+ 						args->size, &args->handle,
+ 						&vbo);
+ 	/* drop reference from allocate - handle holds it now */
+-	drm_gem_object_put(&vbo->base.base);
++	drm_gem_object_put(&vbo->tbo.base);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+index 313e7b1b6c79..6b9aa2b4ef54 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -1165,7 +1165,7 @@ static int vmw_translate_mob_ptr(struct vmw_private *dev_priv,
+ 	vmw_bo_placement_set(vmw_bo, VMW_BO_DOMAIN_MOB, VMW_BO_DOMAIN_MOB);
+ 	ret = vmw_validation_add_bo(sw_context->ctx, vmw_bo);
+ 	ttm_bo_put(&vmw_bo->tbo);
+-	drm_gem_object_put(&vmw_bo->base.base);
++	drm_gem_object_put(&vmw_bo->tbo.base);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+@@ -1222,7 +1222,7 @@ static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
+ 			     VMW_BO_DOMAIN_GMR | VMW_BO_DOMAIN_VRAM);
+ 	ret = vmw_validation_add_bo(sw_context->ctx, vmw_bo);
+ 	ttm_bo_put(&vmw_bo->tbo);
+-	drm_gem_object_put(&vmw_bo->base.base);
++	drm_gem_object_put(&vmw_bo->tbo.base);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+index 68770ad15a97..c0da89e16e6f 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+@@ -160,7 +160,7 @@ int vmw_gem_object_create_ioctl(struct drm_device *dev, void *data,
+ 	rep->cur_gmr_id = handle;
+ 	rep->cur_gmr_offset = 0;
+ 	/* drop reference from allocate - handle holds it now */
+-	drm_gem_object_put(&vbo->base.base);
++	drm_gem_object_put(&vbo->tbo.base);
+ out_no_bo:
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 405e1732750c..b62207be3363 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1667,7 +1667,7 @@ static struct drm_framebuffer *vmw_kms_fb_create(struct drm_device *dev,
+ 	/* vmw_user_lookup_handle takes one ref so does new_fb */
+ 	if (bo) {
+ 		vmw_bo_unreference(&bo);
+-		drm_gem_object_put(&bo->base.base);
++		drm_gem_object_put(&bo->tbo.base);
+ 	}
+ 	if (surface)
+ 		vmw_surface_unreference(&surface);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+index 0bee7c9325b8..7e112319a23c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+@@ -452,7 +452,7 @@ int vmw_overlay_ioctl(struct drm_device *dev, void *data,
+ 	ret = vmw_overlay_update_stream(dev_priv, buf, arg, true);
+ 
+ 	vmw_bo_unreference(&buf);
+-	drm_gem_object_put(&buf->base.base);
++	drm_gem_object_put(&buf->tbo.base);
+ 
+ out_unlock:
+ 	mutex_unlock(&overlay->mutex);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+index e808a559295b..e7226db8b242 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+@@ -810,7 +810,7 @@ static int vmw_shader_define(struct drm_device *dev, struct drm_file *file_priv,
+ 				    num_output_sig, tfile, shader_handle);
+ out_bad_arg:
+ 	vmw_bo_unreference(&buffer);
+-	drm_gem_object_put(&buffer->base.base);
++	drm_gem_object_put(&buffer->tbo.base);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index 5a3a0675586a..5db403ee8261 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -686,7 +686,7 @@ static void vmw_user_surface_base_release(struct ttm_base_object **p_base)
+ 	    container_of(base, struct vmw_user_surface, prime.base);
+ 	struct vmw_resource *res = &user_srf->srf.res;
+ 
+-	if (base->shareable && res && res->guest_memory_bo)
++	if (res->guest_memory_bo)
+ 		drm_gem_object_put(&res->guest_memory_bo->tbo.base);
+ 
+ 	*p_base = NULL;
+-- 
+2.25.1
+

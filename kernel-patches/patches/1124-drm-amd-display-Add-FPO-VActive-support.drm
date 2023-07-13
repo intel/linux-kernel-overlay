@@ -1,0 +1,422 @@
+From b1ffbf7644416624524a119f188efe780059d190 Mon Sep 17 00:00:00 2001
+From: Alvin Lee <Alvin.Lee2@amd.com>
+Date: Thu, 23 Mar 2023 15:48:41 -0400
+Subject: [PATCH 1124/2071] drm/amd/display: Add FPO + VActive support
+
+[Description]
+- When determining FPO support, include FPO + VActive support
+- Support FPO + VActive if one display meets regular requirements
+  for FPO and the second display is able to switch in VACTIVE with
+  a given amount of margin
+
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Alvin Lee <Alvin.Lee2@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dc.h           |   2 +
+ drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c  |  20 +++
+ .../drm/amd/display/dc/dcn32/dcn32_resource.c |   2 +
+ .../drm/amd/display/dc/dcn32/dcn32_resource.h |   3 +
+ .../display/dc/dcn32/dcn32_resource_helpers.c | 156 ++++++++++++++++++
+ .../amd/display/dc/dcn321/dcn321_resource.c   |   2 +
+ .../drm/amd/display/dc/dml/dcn32/dcn32_fpu.c  |  81 ++++++++-
+ .../drm/amd/display/dc/dml/dcn32/dcn32_fpu.h  |   4 +
+ 8 files changed, 267 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index e363a3c88250..719727a2f939 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -875,6 +875,8 @@ struct dc_debug_options {
+ 	bool override_dispclk_programming;
+ 	bool disable_fpo_optimizations;
+ 	bool support_eDP1_5;
++	uint32_t fpo_vactive_margin_us;
++	bool disable_fpo_vactive;
+ };
+ 
+ struct gpu_info_soc_bounding_box_v1_0;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+index dd6f643254fe..a9b9490a532c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+@@ -327,6 +327,7 @@ bool dc_dmub_srv_p_state_delegate(struct dc *dc, bool should_manage_pstate, stru
+ 	int i = 0, k = 0;
+ 	int ramp_up_num_steps = 1; // TODO: Ramp is currently disabled. Reenable it.
+ 	uint8_t visual_confirm_enabled;
++	int pipe_idx = 0;
+ 
+ 	if (dc == NULL)
+ 		return false;
+@@ -339,6 +340,25 @@ bool dc_dmub_srv_p_state_delegate(struct dc *dc, bool should_manage_pstate, stru
+ 	cmd.fw_assisted_mclk_switch.config_data.fams_enabled = should_manage_pstate;
+ 	cmd.fw_assisted_mclk_switch.config_data.visual_confirm_enabled = visual_confirm_enabled;
+ 
++	if (should_manage_pstate) {
++		for (i = 0, pipe_idx = 0; i < dc->res_pool->pipe_count; i++) {
++			struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++			if (!pipe->stream)
++				continue;
++
++			/* If FAMS is being used to support P-State and there is a stream
++			 * that does not use FAMS, we are in an FPO + VActive scenario.
++			 * Assign vactive stretch margin in this case.
++			 */
++			if (!pipe->stream->fpo_in_use) {
++				cmd.fw_assisted_mclk_switch.config_data.vactive_stretch_margin_us = dc->debug.fpo_vactive_margin_us;
++				break;
++			}
++			pipe_idx++;
++		}
++	}
++
+ 	for (i = 0, k = 0; context && i < dc->res_pool->pipe_count; i++) {
+ 		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
+index 502f990346b1..99d417fa6458 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
+@@ -726,6 +726,8 @@ static const struct dc_debug_options debug_defaults_drv = {
+ 	.disable_unbounded_requesting = false,
+ 	.override_dispclk_programming = true,
+ 	.disable_fpo_optimizations = false,
++	.fpo_vactive_margin_us = 2000, // 2000us
++	.disable_fpo_vactive = true,
+ };
+ 
+ static const struct dc_debug_options debug_defaults_diags = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.h b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.h
+index 3f5e92ef0c99..3937dbc1e552 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.h
+@@ -39,6 +39,7 @@
+ #define DCN3_2_MBLK_HEIGHT_8BPE 64
+ #define DCN3_2_VMIN_DISPCLK_HZ 717000000
+ #define DCN3_2_DCFCLK_DS_INIT_KHZ 10000 // Choose 10Mhz for init DCFCLK DS freq
++#define DCN3_2_MIN_ACTIVE_SWITCH_MARGIN_FPO_US 100 // Only allow FPO + Vactive if active margin >= 100
+ 
+ #define TO_DCN32_RES_POOL(pool)\
+ 	container_of(pool, struct dcn32_resource_pool, base)
+@@ -146,6 +147,8 @@ void dcn32_restore_mall_state(struct dc *dc,
+ 		struct dc_state *context,
+ 		struct mall_temp_config *temp_config);
+ 
++struct dc_stream_state *dcn32_can_support_mclk_switch_using_fw_based_vblank_stretch(struct dc *dc, const struct dc_state *context);
++
+ bool dcn32_allow_subvp_with_active_margin(struct pipe_ctx *pipe);
+ 
+ unsigned int dcn32_calc_num_avail_chans_for_mall(struct dc *dc, int num_chans);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource_helpers.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource_helpers.c
+index 47fa51c1d3f4..eeca16faf31a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource_helpers.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource_helpers.c
+@@ -27,6 +27,7 @@
+ #include "dcn32_resource.h"
+ #include "dcn20/dcn20_resource.h"
+ #include "dml/dcn32/display_mode_vba_util_32.h"
++#include "dml/dcn32/dcn32_fpu.h"
+ 
+ static bool is_dual_plane(enum surface_pixel_format format)
+ {
+@@ -500,3 +501,158 @@ void dcn32_restore_mall_state(struct dc *dc,
+ 			pipe->plane_state->is_phantom = temp_config->is_phantom_plane[i];
+ 	}
+ }
++
++#define MAX_STRETCHED_V_BLANK 1000 // in micro-seconds (must ensure to match value in FW)
++/*
++ * Scaling factor for v_blank stretch calculations considering timing in
++ * micro-seconds and pixel clock in 100hz.
++ * Note: the parenthesis are necessary to ensure the correct order of
++ * operation where V_SCALE is used.
++ */
++#define V_SCALE (10000 / MAX_STRETCHED_V_BLANK)
++
++static int get_frame_rate_at_max_stretch_100hz(
++		struct dc_stream_state *fpo_candidate_stream,
++		uint32_t fpo_vactive_margin_us)
++{
++	struct dc_crtc_timing *timing = NULL;
++	uint32_t sec_per_100_lines;
++	uint32_t max_v_blank;
++	uint32_t curr_v_blank;
++	uint32_t v_stretch_max;
++	uint32_t stretched_frame_pix_cnt;
++	uint32_t scaled_stretched_frame_pix_cnt;
++	uint32_t scaled_refresh_rate;
++	uint32_t v_scale;
++
++	if (fpo_candidate_stream == NULL)
++		return 0;
++
++	/* check if refresh rate at least 120hz */
++	timing = &fpo_candidate_stream->timing;
++	if (timing == NULL)
++		return 0;
++
++	v_scale = 10000 / (MAX_STRETCHED_V_BLANK + fpo_vactive_margin_us);
++
++	sec_per_100_lines = timing->pix_clk_100hz / timing->h_total + 1;
++	max_v_blank = sec_per_100_lines / v_scale + 1;
++	curr_v_blank = timing->v_total - timing->v_addressable;
++	v_stretch_max = (max_v_blank > curr_v_blank) ? (max_v_blank - curr_v_blank) : (0);
++	stretched_frame_pix_cnt = (v_stretch_max + timing->v_total) * timing->h_total;
++	scaled_stretched_frame_pix_cnt = stretched_frame_pix_cnt / 10000;
++	scaled_refresh_rate = (timing->pix_clk_100hz) / scaled_stretched_frame_pix_cnt + 1;
++
++	return scaled_refresh_rate;
++
++}
++
++static bool is_refresh_rate_support_mclk_switch_using_fw_based_vblank_stretch(
++		struct dc_stream_state *fpo_candidate_stream, uint32_t fpo_vactive_margin_us)
++{
++	int refresh_rate_max_stretch_100hz;
++	int min_refresh_100hz;
++
++	if (fpo_candidate_stream == NULL)
++		return false;
++
++	refresh_rate_max_stretch_100hz = get_frame_rate_at_max_stretch_100hz(fpo_candidate_stream, fpo_vactive_margin_us);
++	min_refresh_100hz = fpo_candidate_stream->timing.min_refresh_in_uhz / 10000;
++
++	if (refresh_rate_max_stretch_100hz < min_refresh_100hz)
++		return false;
++
++	return true;
++}
++
++static int get_refresh_rate(struct dc_stream_state *fpo_candidate_stream)
++{
++	int refresh_rate = 0;
++	int h_v_total = 0;
++	struct dc_crtc_timing *timing = NULL;
++
++	if (fpo_candidate_stream == NULL)
++		return 0;
++
++	/* check if refresh rate at least 120hz */
++	timing = &fpo_candidate_stream->timing;
++	if (timing == NULL)
++		return 0;
++
++	h_v_total = timing->h_total * timing->v_total;
++	if (h_v_total == 0)
++		return 0;
++
++	refresh_rate = ((timing->pix_clk_100hz * 100) / (h_v_total)) + 1;
++	return refresh_rate;
++}
++
++/**
++ * dcn32_can_support_mclk_switch_using_fw_based_vblank_stretch - Determines if config can support FPO
++ *
++ * @param [in]: dc - current dc state
++ * @param [in]: context - new dc state
++ *
++ * Return: Pointer to FPO stream candidate if config can support FPO, otherwise NULL
++ */
++struct dc_stream_state *dcn32_can_support_mclk_switch_using_fw_based_vblank_stretch(struct dc *dc, const struct dc_state *context)
++{
++	int refresh_rate = 0;
++	const int minimum_refreshrate_supported = 120;
++	struct dc_stream_state *fpo_candidate_stream = NULL;
++	bool is_fpo_vactive = false;
++	uint32_t fpo_vactive_margin_us = 0;
++
++	if (context == NULL)
++		return NULL;
++
++	if (dc->debug.disable_fams)
++		return NULL;
++
++	if (!dc->caps.dmub_caps.mclk_sw)
++		return NULL;
++
++	if (context->bw_ctx.bw.dcn.clk.fw_based_mclk_switching_shut_down)
++		return NULL;
++
++	/* For FPO we can support up to 2 display configs if:
++	 * - first display uses FPO
++	 * - Second display switches in VACTIVE */
++	if (context->stream_count > 2)
++		return NULL;
++	else if (context->stream_count == 2) {
++		DC_FP_START();
++		dcn32_assign_fpo_vactive_candidate(dc, context, &fpo_candidate_stream);
++		DC_FP_END();
++
++		DC_FP_START();
++		is_fpo_vactive = dcn32_find_vactive_pipe(dc, context, DCN3_2_MIN_ACTIVE_SWITCH_MARGIN_FPO_US);
++		DC_FP_END();
++		if (!is_fpo_vactive || dc->debug.disable_fpo_vactive)
++			return NULL;
++	} else
++		fpo_candidate_stream = context->streams[0];
++
++	if (!fpo_candidate_stream)
++		return NULL;
++
++	if (fpo_candidate_stream->sink->edid_caps.panel_patch.disable_fams)
++		return NULL;
++
++	refresh_rate = get_refresh_rate(fpo_candidate_stream);
++	if (refresh_rate < minimum_refreshrate_supported)
++		return NULL;
++
++	fpo_vactive_margin_us = is_fpo_vactive ? dc->debug.fpo_vactive_margin_us : 0; // For now hardcode the FPO + Vactive stretch margin to be 2000us
++	if (!is_refresh_rate_support_mclk_switch_using_fw_based_vblank_stretch(fpo_candidate_stream, fpo_vactive_margin_us))
++		return NULL;
++
++	// check if freesync enabled
++	if (!fpo_candidate_stream->allow_freesync)
++		return NULL;
++
++	if (fpo_candidate_stream->vrr_active_variable)
++		return NULL;
++
++	return fpo_candidate_stream;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c b/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
+index 79664ba7e7af..7ebd14fb9698 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
+@@ -724,6 +724,8 @@ static const struct dc_debug_options debug_defaults_drv = {
+ 	.disable_unbounded_requesting = false,
+ 	.override_dispclk_programming = true,
+ 	.disable_fpo_optimizations = false,
++	.fpo_vactive_margin_us = 2000, // 2000us
++	.disable_fpo_vactive = true,
+ };
+ 
+ static const struct dc_debug_options debug_defaults_diags = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
+index c252fdf2c0e8..4548320217fc 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
+@@ -1927,6 +1927,7 @@ void dcn32_calculate_wm_and_dlg_fpu(struct dc *dc, struct dc_state *context,
+ 	unsigned int min_dram_speed_mts_margin;
+ 	bool need_fclk_lat_as_dummy = false;
+ 	bool is_subvp_p_drr = false;
++	struct dc_stream_state *fpo_candidate_stream = NULL;
+ 
+ 	dc_assert_fp_enabled();
+ 
+@@ -1968,8 +1969,11 @@ void dcn32_calculate_wm_and_dlg_fpu(struct dc *dc, struct dc_state *context,
+ 	if (!pstate_en || (!dc->debug.disable_fpo_optimizations &&
+ 			pstate_en && vlevel != 0)) {
+ 		/* only when the mclk switch can not be natural, is the fw based vblank stretch attempted */
+-		context->bw_ctx.bw.dcn.clk.fw_based_mclk_switching =
+-			dcn30_can_support_mclk_switch_using_fw_based_vblank_stretch(dc, context);
++		fpo_candidate_stream = dcn32_can_support_mclk_switch_using_fw_based_vblank_stretch(dc, context);
++		if (fpo_candidate_stream) {
++			fpo_candidate_stream->fpo_in_use = true;
++			context->bw_ctx.bw.dcn.clk.fw_based_mclk_switching = true;
++		}
+ 
+ 		if (context->bw_ctx.bw.dcn.clk.fw_based_mclk_switching) {
+ 			dummy_latency_index = dcn32_find_dummy_latency_index_for_fw_based_mclk_switch(dc,
+@@ -2161,7 +2165,13 @@ void dcn32_calculate_wm_and_dlg_fpu(struct dc *dc, struct dc_state *context,
+ 		 * DCFCLK: Min, as reported by PM FW, when available
+ 		 * UCLK: Min, as reported by PM FW, when available
+ 		 */
+-		dc->res_pool->funcs->update_soc_for_wm_a(dc, context);
++
++		/* For set A set the correct latency values (i.e. non-dummy values) unconditionally
++		 */
++		context->bw_ctx.dml.soc.dram_clock_change_latency_us = dc->clk_mgr->bw_params->wm_table.nv_entries[WM_A].dml_input.pstate_latency_us;
++		context->bw_ctx.dml.soc.sr_enter_plus_exit_time_us = dc->clk_mgr->bw_params->wm_table.nv_entries[WM_A].dml_input.sr_enter_plus_exit_time_us;
++		context->bw_ctx.dml.soc.sr_exit_time_us = dc->clk_mgr->bw_params->wm_table.nv_entries[WM_A].dml_input.sr_exit_time_us;
++
+ 		context->bw_ctx.bw.dcn.watermarks.a.urgent_ns = get_wm_urgent(&context->bw_ctx.dml, pipes, pipe_cnt) * 1000;
+ 		context->bw_ctx.bw.dcn.watermarks.a.cstate_pstate.cstate_enter_plus_exit_ns = get_wm_stutter_enter_exit(&context->bw_ctx.dml, pipes, pipe_cnt) * 1000;
+ 		context->bw_ctx.bw.dcn.watermarks.a.cstate_pstate.cstate_exit_ns = get_wm_stutter_exit(&context->bw_ctx.dml, pipes, pipe_cnt) * 1000;
+@@ -2796,3 +2806,68 @@ double dcn32_determine_max_vratio_prefetch(struct dc *dc, struct dc_state *conte
+ 	}
+ 	return max_vratio_pre;
+ }
++
++/**
++ * dcn32_assign_fpo_vactive_candidate - Assign the FPO stream candidate for FPO + VActive case
++ *
++ * This function chooses the FPO candidate stream for FPO + VActive cases (2 stream config).
++ * For FPO + VAtive cases, the assumption is that one display has ActiveMargin > 0, and the
++ * other display has ActiveMargin <= 0. This function will choose the pipe/stream that has
++ * ActiveMargin <= 0 to be the FPO stream candidate if found.
++ *
++ *
++ * @param [in]: dc - current dc state
++ * @param [in]: context - new dc state
++ * @param [out]: fpo_candidate_stream - pointer to FPO stream candidate if one is found
++ *
++ * Return: void
++ */
++void dcn32_assign_fpo_vactive_candidate(struct dc *dc, const struct dc_state *context, struct dc_stream_state **fpo_candidate_stream)
++{
++	unsigned int i, pipe_idx;
++	const struct vba_vars_st *vba = &context->bw_ctx.dml.vba;
++
++	for (i = 0, pipe_idx = 0; i < dc->res_pool->pipe_count; i++) {
++		const struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!pipe->stream)
++			continue;
++
++		if (vba->ActiveDRAMClockChangeLatencyMarginPerState[vba->VoltageLevel][vba->maxMpcComb][vba->pipe_plane[pipe_idx]] <= 0) {
++			*fpo_candidate_stream = pipe->stream;
++			break;
++		}
++		pipe_idx++;
++	}
++}
++
++/**
++ * dcn32_find_vactive_pipe - Determines if the config has a pipe that can switch in VACTIVE
++ *
++ * @param [in]: dc - current dc state
++ * @param [in]: context - new dc state
++ * @param [in]: vactive_margin_req_us - The vactive marign required for a vactive pipe to be
++ *                                      considered "found"
++ *
++ * Return: True if VACTIVE display is found, false otherwise
++ */
++bool dcn32_find_vactive_pipe(struct dc *dc, const struct dc_state *context, uint32_t vactive_margin_req_us)
++{
++	unsigned int i, pipe_idx;
++	const struct vba_vars_st *vba = &context->bw_ctx.dml.vba;
++	bool vactive_found = false;
++
++	for (i = 0, pipe_idx = 0; i < dc->res_pool->pipe_count; i++) {
++		const struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!pipe->stream)
++			continue;
++
++		if (vba->ActiveDRAMClockChangeLatencyMarginPerState[vba->VoltageLevel][vba->maxMpcComb][vba->pipe_plane[pipe_idx]] >= vactive_margin_req_us) {
++			vactive_found = true;
++			break;
++		}
++		pipe_idx++;
++	}
++	return vactive_found;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.h b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.h
+index ab010e7e840b..9a0806a0e2ef 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.h
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.h
+@@ -76,4 +76,8 @@ void dcn32_patch_dpm_table(struct clk_bw_params *bw_params);
+ void dcn32_zero_pipe_dcc_fraction(display_e2e_pipe_params_st *pipes,
+ 				  int pipe_cnt);
+ 
++void dcn32_assign_fpo_vactive_candidate(struct dc *dc, const struct dc_state *context, struct dc_stream_state **fpo_candidate_stream);
++
++bool dcn32_find_vactive_pipe(struct dc *dc, const struct dc_state *context, uint32_t vactive_margin_req);
++
+ #endif
+-- 
+2.25.1
+

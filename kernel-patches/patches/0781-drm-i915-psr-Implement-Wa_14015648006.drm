@@ -1,0 +1,130 @@
+From ebc05fafe1a91f4d59ecb9eee84fbc5af1b45485 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Wed, 29 Mar 2023 18:07:00 +0300
+Subject: [PATCH 0781/2071] drm/i915/psr: Implement Wa_14015648006
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PSR WM optimization should be disabled based on any wm level being
+disabled. Also same WA should be applied for ICL as well.
+
+Bspec: 71580
+
+v5:
+ - Set in pre plane hook and clear in post plane hook
+v4:
+ - Handle mode change in psr enable/disable
+ - Handle wm_level_disable changes separately in pre plane hook
+v3:
+ - Split patch
+v2:
+ - set/clear chicken bit in post_plane_update
+ - apply for ICL as well
+
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230329150703.432072-4-jouni.hogander@intel.com
+---
+ .../gpu/drm/i915/display/intel_display_types.h   |  1 +
+ drivers/gpu/drm/i915/display/intel_psr.c         | 16 +++++++++++++++-
+ drivers/gpu/drm/i915/display/skl_watermark.c     |  7 +++++--
+ 3 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index ab146b5b68bd..4236ad751c2c 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1157,6 +1157,7 @@ struct intel_crtc_state {
+ 	bool has_psr2;
+ 	bool enable_psr2_sel_fetch;
+ 	bool req_psr2_sdp_prior_scanline;
++	bool wm_level_disabled;
+ 	u32 dc3co_exitline;
+ 	u16 su_y_granularity;
+ 	struct drm_dp_vsc_sdp psr_vsc;
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 770f6fea5499..98f48eb10c44 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -1136,6 +1136,7 @@ static u32 wa_16013835468_bit_get(struct intel_dp *intel_dp)
+ 
+ /*
+  * Wa_16013835468
++ * Wa_14015648006
+  */
+ static void wm_optimization_wa(struct intel_dp *intel_dp,
+ 			       const struct intel_crtc_state *crtc_state)
+@@ -1143,6 +1144,11 @@ static void wm_optimization_wa(struct intel_dp *intel_dp,
+ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ 	bool set_wa_bit = false;
+ 
++	/* Wa_14015648006 */
++	if (IS_MTL_DISPLAY_STEP(dev_priv, STEP_A0, STEP_B0) ||
++	    IS_DISPLAY_VER(dev_priv, 11, 13))
++		set_wa_bit |= crtc_state->wm_level_disabled;
++
+ 	/* Wa_16013835468 */
+ 	if (DISPLAY_VER(dev_priv) == 12)
+ 		set_wa_bit |= crtc_state->hw.adjusted_mode.crtc_vblank_start !=
+@@ -1197,6 +1203,7 @@ static void intel_psr_enable_source(struct intel_dp *intel_dp,
+ 
+ 	/*
+ 	 * Wa_16013835468
++	 * Wa_14015648006
+ 	 */
+ 	wm_optimization_wa(intel_dp, crtc_state);
+ 
+@@ -1374,8 +1381,9 @@ static void intel_psr_disable_locked(struct intel_dp *intel_dp)
+ 
+ 	/*
+ 	 * Wa_16013835468
++	 * Wa_14015648006
+ 	 */
+-	if (DISPLAY_VER(dev_priv) == 12)
++	if (DISPLAY_VER(dev_priv) >= 11)
+ 		intel_de_rmw(dev_priv, GEN8_CHICKEN_DCPR_1,
+ 			     wa_16013835468_bit_get(intel_dp), 0);
+ 
+@@ -1949,6 +1957,9 @@ void intel_psr_pre_plane_update(struct intel_atomic_state *state,
+ 
+ 		if (psr->enabled && needs_to_disable)
+ 			intel_psr_disable_locked(intel_dp);
++		else if (psr->enabled && new_crtc_state->wm_level_disabled)
++			/* Wa_14015648006 */
++			wm_optimization_wa(intel_dp, new_crtc_state);
+ 
+ 		mutex_unlock(&psr->lock);
+ 	}
+@@ -1978,6 +1989,9 @@ static void _intel_psr_post_plane_update(const struct intel_atomic_state *state,
+ 
+ 		if (!psr->enabled && !keep_disabled)
+ 			intel_psr_enable_locked(intel_dp, crtc_state);
++		else if (psr->enabled && !crtc_state->wm_level_disabled)
++			/* Wa_14015648006 */
++			wm_optimization_wa(intel_dp, crtc_state);
+ 
+ 		/* Force a PSR exit when enabling CRC to avoid CRC timeouts */
+ 		if (crtc_state->crc_enabled && psr->enabled)
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index ff70225c0263..7e2e76afbf2a 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -2276,9 +2276,12 @@ static int skl_wm_check_vblank(struct intel_crtc_state *crtc_state)
+ 		return level;
+ 
+ 	/*
+-	 * FIXME PSR needs to toggle LATENCY_REPORTING_REMOVED_PIPE_*
++	 * PSR needs to toggle LATENCY_REPORTING_REMOVED_PIPE_*
+ 	 * based on whether we're limited by the vblank duration.
+-	 *
++	 */
++	crtc_state->wm_level_disabled = level < i915->display.wm.num_levels - 1;
++
++	/*
+ 	 * FIXME also related to skl+ w/a 1136 (also unimplemented as of
+ 	 * now) perhaps?
+ 	 */
+-- 
+2.25.1
+

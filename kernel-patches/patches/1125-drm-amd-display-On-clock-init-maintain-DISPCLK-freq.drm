@@ -1,0 +1,165 @@
+From d1ed841de448e59bcf9dd67cbe2b9a48fe2d090f Mon Sep 17 00:00:00 2001
+From: Alvin Lee <Alvin.Lee2@amd.com>
+Date: Fri, 24 Mar 2023 12:01:09 -0400
+Subject: [PATCH 1125/2071] drm/amd/display: On clock init, maintain DISPCLK
+ freq
+
+[Description]
+- On init if a display is connected, we need to maintain the DISPCLK
+  frequency
+- Even though DPG_EN=1, the display still requires the correct
+  timing or it could cause audio corruption (if DISPCLK freq
+  is reduced)
+- Read the current DISPCLK freq and request the same value to ensure
+  the timing is valid and unchanged
+- However, add option to do a full pipe power down (including link)
+  which will also avoid audio related issues
+	- Disabled for the time being on dcn32
+
+Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Alvin Lee <Alvin.Lee2@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c  | 18 +++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  1 +
+ .../drm/amd/display/dc/dcn32/dcn32_hwseq.c    | 26 +++++++++++++++----
+ .../drm/amd/display/dc/dcn32/dcn32_resource.c |  1 +
+ .../amd/display/dc/dcn321/dcn321_resource.c   |  1 +
+ .../gpu/drm/amd/display/dc/inc/hw/clk_mgr.h   |  3 +++
+ 6 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c
+index af108f88b112..ea753f8fa175 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c
+@@ -399,6 +399,23 @@ static void dcn32_update_clocks_update_dentist(
+ 
+ }
+ 
++static int dcn32_get_dispclk_from_dentist(struct clk_mgr *clk_mgr_base)
++{
++	struct clk_mgr_internal *clk_mgr = TO_CLK_MGR_INTERNAL(clk_mgr_base);
++	uint32_t dispclk_wdivider;
++	int disp_divider;
++
++	REG_GET(DENTIST_DISPCLK_CNTL, DENTIST_DISPCLK_WDIVIDER, &dispclk_wdivider);
++	disp_divider = dentist_get_divider_from_did(dispclk_wdivider);
++
++	/* Return DISPCLK freq in Khz */
++	if (disp_divider)
++		return (DENTIST_DIVIDER_RANGE_SCALE_FACTOR * clk_mgr->base.dentist_vco_freq_khz) / disp_divider;
++
++	return 0;
++}
++
++
+ static void dcn32_update_clocks(struct clk_mgr *clk_mgr_base,
+ 			struct dc_state *context,
+ 			bool safe_to_lower)
+@@ -852,6 +869,7 @@ static struct clk_mgr_funcs dcn32_funcs = {
+ 		.are_clock_states_equal = dcn32_are_clock_states_equal,
+ 		.enable_pme_wa = dcn32_enable_pme_wa,
+ 		.is_smu_present = dcn32_is_smu_present,
++		.get_dispclk_from_dentist = dcn32_get_dispclk_from_dentist,
+ };
+ 
+ void dcn32_clk_mgr_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 719727a2f939..f51b9c265b51 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -877,6 +877,7 @@ struct dc_debug_options {
+ 	bool support_eDP1_5;
+ 	uint32_t fpo_vactive_margin_us;
+ 	bool disable_fpo_vactive;
++	bool disable_boot_optimizations;
+ };
+ 
+ struct gpu_info_soc_bounding_box_v1_0;
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+index b3824287c224..db0974fe58ab 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_hwseq.c
+@@ -721,10 +721,19 @@ static void dcn32_initialize_min_clocks(struct dc *dc)
+ 	clocks->socclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].socclk_mhz * 1000;
+ 	clocks->dramclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].memclk_mhz * 1000;
+ 	clocks->dppclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].dppclk_mhz * 1000;
+-	clocks->dispclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].dispclk_mhz * 1000;
+-	clocks->ref_dtbclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].dtbclk_mhz * 1000;
+-	clocks->fclk_p_state_change_support = true;
+-	clocks->p_state_change_support = true;
++	if (dc->debug.disable_boot_optimizations) {
++		clocks->dispclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].dispclk_mhz * 1000;
++	} else {
++		/* Even though DPG_EN = 1 for the connected display, it still requires the
++		 * correct timing so we cannot set DISPCLK to min freq or it could cause
++		 * audio corruption. Read current DISPCLK from DENTIST and request the same
++		 * freq to ensure that the timing is valid and unchanged.
++		 */
++		clocks->dispclk_khz = dc->clk_mgr->funcs->get_dispclk_from_dentist(dc->clk_mgr);
++		clocks->ref_dtbclk_khz = dc->clk_mgr->bw_params->clk_table.entries[0].dtbclk_mhz * 1000;
++		clocks->fclk_p_state_change_support = true;
++		clocks->p_state_change_support = true;
++	}
+ 
+ 	dc->clk_mgr->funcs->update_clocks(
+ 			dc->clk_mgr,
+@@ -823,7 +832,14 @@ void dcn32_init_hw(struct dc *dc)
+ 	 * everything down.
+ 	 */
+ 	if (dcb->funcs->is_accelerated_mode(dcb) || !dc->config.seamless_boot_edp_requested) {
+-		hws->funcs.init_pipes(dc, dc->current_state);
++		/* Disable boot optimizations means power down everything including PHY, DIG,
++		 * and OTG (i.e. the boot is not optimized because we do a full power down).
++		 */
++		if (dc->hwss.enable_accelerated_mode && dc->debug.disable_boot_optimizations)
++			dc->hwss.enable_accelerated_mode(dc, dc->current_state);
++		else
++			hws->funcs.init_pipes(dc, dc->current_state);
++
+ 		if (dc->res_pool->hubbub->funcs->allow_self_refresh_control)
+ 			dc->res_pool->hubbub->funcs->allow_self_refresh_control(dc->res_pool->hubbub,
+ 					!dc->res_pool->hubbub->ctx->dc->debug.disable_stutter);
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
+index 99d417fa6458..e30d1f60695d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn32/dcn32_resource.c
+@@ -728,6 +728,7 @@ static const struct dc_debug_options debug_defaults_drv = {
+ 	.disable_fpo_optimizations = false,
+ 	.fpo_vactive_margin_us = 2000, // 2000us
+ 	.disable_fpo_vactive = true,
++	.disable_boot_optimizations = false,
+ };
+ 
+ static const struct dc_debug_options debug_defaults_diags = {
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c b/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
+index 7ebd14fb9698..e5ab7f3077c4 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn321/dcn321_resource.c
+@@ -726,6 +726,7 @@ static const struct dc_debug_options debug_defaults_drv = {
+ 	.disable_fpo_optimizations = false,
+ 	.fpo_vactive_margin_us = 2000, // 2000us
+ 	.disable_fpo_vactive = true,
++	.disable_boot_optimizations = false,
+ };
+ 
+ static const struct dc_debug_options debug_defaults_diags = {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h b/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
+index 591ab1389e3b..bef843cc32a1 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
+@@ -293,6 +293,9 @@ struct clk_mgr_funcs {
+ 
+ 	/* Get SMU present */
+ 	bool (*is_smu_present)(struct clk_mgr *clk_mgr);
++
++	int (*get_dispclk_from_dentist)(struct clk_mgr *clk_mgr_base);
++
+ };
+ 
+ struct clk_mgr {
+-- 
+2.25.1
+

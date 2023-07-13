@@ -1,0 +1,142 @@
+From cdc4bf3ec3b8759f439911f7356857de95a72e03 Mon Sep 17 00:00:00 2001
+From: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Date: Mon, 2 Jan 2023 16:18:31 +0530
+Subject: [PATCH 0569/2071] drm/msm/a6xx: Use genpd notifier to ensure cx-gdsc
+ collapse
+
+As per the recommended recovery sequence of adreno gpu, cx gdsc should
+collapse at hardware before it is turned back ON. This helps to clear
+out the stale states in hardware before it is reinitialized. Use the
+genpd notifier along with the newly introduced
+dev_pm_genpd_synced_poweroff() api to ensure that cx gdsc has collapsed
+before we turn it back ON.
+
+Signed-off-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/516472/
+Link: https://lore.kernel.org/r/20230102161757.v5.5.I9e10545c6a448d5eb1b734839b871d1b3146dac3@changeid
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/Kconfig           |  1 +
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 15 +++++++++++++++
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h |  6 ++++++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c | 11 +++++++++++
+ 4 files changed, 33 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index 949b18a29a55..1c417ba53b5b 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -28,6 +28,7 @@ config DRM_MSM
+ 	select SYNC_FILE
+ 	select PM_OPP
+ 	select NVMEM
++	select PM_GENERIC_DOMAINS
+ 	help
+ 	  DRM/KMS driver for MSM/snapdragon.
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index a3676dc634f0..ba6b8ea27c71 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1510,6 +1510,17 @@ void a6xx_gmu_remove(struct a6xx_gpu *a6xx_gpu)
+ 	gmu->initialized = false;
+ }
+ 
++static int cxpd_notifier_cb(struct notifier_block *nb,
++			unsigned long action, void *data)
++{
++	struct a6xx_gmu *gmu = container_of(nb, struct a6xx_gmu, pd_nb);
++
++	if (action == GENPD_NOTIFY_OFF)
++		complete_all(&gmu->pd_gate);
++
++	return 0;
++}
++
+ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ {
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+@@ -1643,6 +1654,10 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 		goto detach_cxpd;
+ 	}
+ 
++	init_completion(&gmu->pd_gate);
++	complete_all(&gmu->pd_gate);
++	gmu->pd_nb.notifier_call = cxpd_notifier_cb;
++
+ 	/*
+ 	 * Get a link to the GX power domain to reset the GPU in case of GMU
+ 	 * crash
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 5a42dd4dd31f..0bc3eb443fec 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -4,8 +4,10 @@
+ #ifndef _A6XX_GMU_H_
+ #define _A6XX_GMU_H_
+ 
++#include <linux/completion.h>
+ #include <linux/iopoll.h>
+ #include <linux/interrupt.h>
++#include <linux/notifier.h>
+ #include "msm_drv.h"
+ #include "a6xx_hfi.h"
+ 
+@@ -90,6 +92,10 @@ struct a6xx_gmu {
+ 	bool initialized;
+ 	bool hung;
+ 	bool legacy; /* a618 or a630 */
++
++	/* For power domain callback */
++	struct notifier_block pd_nb;
++	struct completion pd_gate;
+ };
+ 
+ static inline u32 gmu_read(struct a6xx_gmu *gmu, u32 offset)
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 4e85ef0f581a..eb442a780a7e 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/devfreq.h>
++#include <linux/pm_domain.h>
+ #include <linux/soc/qcom/llcc-qcom.h>
+ 
+ #define GPU_PAS_ID 13
+@@ -1258,6 +1259,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+ 	int i, active_submits;
+ 
+ 	adreno_dump_info(gpu);
+@@ -1296,6 +1298,10 @@ static void a6xx_recover(struct msm_gpu *gpu)
+ 	 */
+ 	gpu->active_submits = 0;
+ 
++	reinit_completion(&gmu->pd_gate);
++	dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
++	dev_pm_genpd_synced_poweroff(gmu->cxpd);
++
+ 	/* Drop the rpm refcount from active submits */
+ 	if (active_submits)
+ 		pm_runtime_put(&gpu->pdev->dev);
+@@ -1303,6 +1309,11 @@ static void a6xx_recover(struct msm_gpu *gpu)
+ 	/* And the final one from recover worker */
+ 	pm_runtime_put_sync(&gpu->pdev->dev);
+ 
++	if (!wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
++		DRM_DEV_ERROR(&gpu->pdev->dev, "cx gdsc didn't collapse\n");
++
++	dev_pm_genpd_remove_notifier(gmu->cxpd);
++
+ 	pm_runtime_use_autosuspend(&gpu->pdev->dev);
+ 
+ 	if (active_submits)
+-- 
+2.25.1
+

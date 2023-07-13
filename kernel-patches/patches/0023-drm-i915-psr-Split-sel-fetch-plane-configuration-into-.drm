@@ -1,0 +1,193 @@
+From 5482e08987a35d585743e8c62db931a3173778df Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Mon, 30 Jan 2023 10:06:51 +0200
+Subject: [PATCH 0023/2071] drm/i915/psr: Split sel fetch plane configuration
+ into arm and noarm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SEL_FETCH_CTL registers are armed immediately when plane is disabled.
+SEL_FETCH_* instances of plane configuration are used when doing
+selective update and normal plane register instances for full updates.
+Currently all SEL_FETCH_* registers are written as a part of noarm
+plane configuration. If noarm and arm plane configuration are not
+happening within same vblank we may end up having plane as a part of
+selective update before it's PLANE_SURF register is written.
+
+Fix this by splitting plane selective fetch configuration into arm and
+noarm versions and call them accordingly. Write SEL_FETCH_CTL in arm
+version.
+
+v3:
+ - add arm suffix into intel_psr2_disable_plane_sel_fetch
+v2:
+ - drop color_plane parameter from arm part
+ - dev_priv -> i915 in arm part
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: José Roberto de Souza <jose.souza@intel.com>
+Cc: Mika Kahola <mika.kahola@intel.com>
+Cc: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Cc: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Cc: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Reviewed-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230130080651.3796929-1-jouni.hogander@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_cursor.c   |  5 ++-
+ drivers/gpu/drm/i915/display/intel_psr.c      | 38 ++++++++++++-------
+ drivers/gpu/drm/i915/display/intel_psr.h      | 16 +++++---
+ .../drm/i915/display/skl_universal_plane.c    |  6 ++-
+ 4 files changed, 42 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_cursor.c b/drivers/gpu/drm/i915/display/intel_cursor.c
+index d190fa0d393b..c3173c0c2068 100644
+--- a/drivers/gpu/drm/i915/display/intel_cursor.c
++++ b/drivers/gpu/drm/i915/display/intel_cursor.c
+@@ -532,9 +532,10 @@ static void i9xx_cursor_update_arm(struct intel_plane *plane,
+ 		skl_write_cursor_wm(plane, crtc_state);
+ 
+ 	if (plane_state)
+-		intel_psr2_program_plane_sel_fetch(plane, crtc_state, plane_state, 0);
++		intel_psr2_program_plane_sel_fetch_arm(plane, crtc_state,
++						       plane_state);
+ 	else
+-		intel_psr2_disable_plane_sel_fetch(plane, crtc_state);
++		intel_psr2_disable_plane_sel_fetch_arm(plane, crtc_state);
+ 
+ 	if (plane->cursor.base != base ||
+ 	    plane->cursor.size != fbc_ctl ||
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 9f1a0bebae24..fe3f15e92e37 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -1591,8 +1591,8 @@ static void psr_force_hw_tracking_exit(struct intel_dp *intel_dp)
+ 	intel_de_write(dev_priv, CURSURFLIVE(intel_dp->psr.pipe), 0);
+ }
+ 
+-void intel_psr2_disable_plane_sel_fetch(struct intel_plane *plane,
+-					const struct intel_crtc_state *crtc_state)
++void intel_psr2_disable_plane_sel_fetch_arm(struct intel_plane *plane,
++					    const struct intel_crtc_state *crtc_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 	enum pipe pipe = plane->pipe;
+@@ -1603,10 +1603,28 @@ void intel_psr2_disable_plane_sel_fetch(struct intel_plane *plane,
+ 	intel_de_write_fw(dev_priv, PLANE_SEL_FETCH_CTL(pipe, plane->id), 0);
+ }
+ 
+-void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+-					const struct intel_crtc_state *crtc_state,
+-					const struct intel_plane_state *plane_state,
+-					int color_plane)
++void intel_psr2_program_plane_sel_fetch_arm(struct intel_plane *plane,
++					    const struct intel_crtc_state *crtc_state,
++					    const struct intel_plane_state *plane_state)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	enum pipe pipe = plane->pipe;
++
++	if (!crtc_state->enable_psr2_sel_fetch)
++		return;
++
++	if (plane->id == PLANE_CURSOR)
++		intel_de_write_fw(i915, PLANE_SEL_FETCH_CTL(pipe, plane->id),
++				  plane_state->ctl);
++	else
++		intel_de_write_fw(i915, PLANE_SEL_FETCH_CTL(pipe, plane->id),
++				  PLANE_SEL_FETCH_CTL_ENABLE);
++}
++
++void intel_psr2_program_plane_sel_fetch_noarm(struct intel_plane *plane,
++					      const struct intel_crtc_state *crtc_state,
++					      const struct intel_plane_state *plane_state,
++					      int color_plane)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ 	enum pipe pipe = plane->pipe;
+@@ -1617,11 +1635,8 @@ void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+ 	if (!crtc_state->enable_psr2_sel_fetch)
+ 		return;
+ 
+-	if (plane->id == PLANE_CURSOR) {
+-		intel_de_write_fw(dev_priv, PLANE_SEL_FETCH_CTL(pipe, plane->id),
+-				  plane_state->ctl);
++	if (plane->id == PLANE_CURSOR)
+ 		return;
+-	}
+ 
+ 	clip = &plane_state->psr2_sel_fetch_area;
+ 
+@@ -1649,9 +1664,6 @@ void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+ 	val = (drm_rect_height(clip) - 1) << 16;
+ 	val |= (drm_rect_width(&plane_state->uapi.src) >> 16) - 1;
+ 	intel_de_write_fw(dev_priv, PLANE_SEL_FETCH_SIZE(pipe, plane->id), val);
+-
+-	intel_de_write_fw(dev_priv, PLANE_SEL_FETCH_CTL(pipe, plane->id),
+-			  PLANE_SEL_FETCH_CTL_ENABLE);
+ }
+ 
+ void intel_psr2_program_trans_man_trk_ctl(const struct intel_crtc_state *crtc_state)
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.h b/drivers/gpu/drm/i915/display/intel_psr.h
+index 2ac3a46cccc5..7a38a9e7fa5b 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@ -46,12 +46,16 @@ bool intel_psr_enabled(struct intel_dp *intel_dp);
+ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 				struct intel_crtc *crtc);
+ void intel_psr2_program_trans_man_trk_ctl(const struct intel_crtc_state *crtc_state);
+-void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+-					const struct intel_crtc_state *crtc_state,
+-					const struct intel_plane_state *plane_state,
+-					int color_plane);
+-void intel_psr2_disable_plane_sel_fetch(struct intel_plane *plane,
+-					const struct intel_crtc_state *crtc_state);
++void intel_psr2_program_plane_sel_fetch_noarm(struct intel_plane *plane,
++					      const struct intel_crtc_state *crtc_state,
++					      const struct intel_plane_state *plane_state,
++					      int color_plane);
++void intel_psr2_program_plane_sel_fetch_arm(struct intel_plane *plane,
++					    const struct intel_crtc_state *crtc_state,
++					    const struct intel_plane_state *plane_state);
++
++void intel_psr2_disable_plane_sel_fetch_arm(struct intel_plane *plane,
++					    const struct intel_crtc_state *crtc_state);
+ void intel_psr_pause(struct intel_dp *intel_dp);
+ void intel_psr_resume(struct intel_dp *intel_dp);
+ 
+diff --git a/drivers/gpu/drm/i915/display/skl_universal_plane.c b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+index 9b172a1e90de..40b2801bc0a8 100644
+--- a/drivers/gpu/drm/i915/display/skl_universal_plane.c
++++ b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+@@ -642,7 +642,7 @@ icl_plane_disable_arm(struct intel_plane *plane,
+ 
+ 	skl_write_plane_wm(plane, crtc_state);
+ 
+-	intel_psr2_disable_plane_sel_fetch(plane, crtc_state);
++	intel_psr2_disable_plane_sel_fetch_arm(plane, crtc_state);
+ 	intel_de_write_fw(dev_priv, PLANE_CTL(pipe, plane_id), 0);
+ 	intel_de_write_fw(dev_priv, PLANE_SURF(pipe, plane_id), 0);
+ }
+@@ -1260,7 +1260,7 @@ icl_plane_update_noarm(struct intel_plane *plane,
+ 	if (plane_state->force_black)
+ 		icl_plane_csc_load_black(plane);
+ 
+-	intel_psr2_program_plane_sel_fetch(plane, crtc_state, plane_state, color_plane);
++	intel_psr2_program_plane_sel_fetch_noarm(plane, crtc_state, plane_state, color_plane);
+ }
+ 
+ static void
+@@ -1287,6 +1287,8 @@ icl_plane_update_arm(struct intel_plane *plane,
+ 	if (plane_state->scaler_id >= 0)
+ 		skl_program_plane_scaler(plane, crtc_state, plane_state);
+ 
++	intel_psr2_program_plane_sel_fetch_arm(plane, crtc_state, plane_state);
++
+ 	/*
+ 	 * The control register self-arms if the plane was previously
+ 	 * disabled. Try to make the plane enable atomic by writing
+-- 
+2.25.1
+

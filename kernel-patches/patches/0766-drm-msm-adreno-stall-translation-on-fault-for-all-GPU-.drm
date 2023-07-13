@@ -1,0 +1,147 @@
+From 8c575124176cae9450c010d875880ba3798538a4 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Tue, 14 Feb 2023 15:35:02 +0300
+Subject: [PATCH 0766/2071] drm/msm/adreno: stall translation on fault for all
+ GPU families
+
+The commit e25e92e08e32 ("drm/msm: devcoredump iommu fault support")
+enabled SMMU stalling to collect GPU state, but only for a6xx. It tied
+enabling the stall with tha per-instance pagetables creation.
+
+Since that commit SoCs with a5xx also gained support for
+adreno-smmu-priv. Move stalling into generic code and add corresponding
+resume_translation calls.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/522720/
+Link: https://lore.kernel.org/r/20230214123504.3729522-2-dmitry.baryshkov@linaro.org
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c   |  2 ++
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c |  2 +-
+ drivers/gpu/drm/msm/msm_iommu.c         | 38 ++++++++++++++++++-------
+ drivers/gpu/drm/msm/msm_mmu.h           |  1 +
+ 4 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+index d6c1c3ab19a3..1da3e47fbeef 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1103,6 +1103,8 @@ static int a5xx_fault_handler(void *arg, unsigned long iova, int flags, void *da
+ 			gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(6)),
+ 			gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(7)));
+ 
++	gpu->aspace->mmu->funcs->resume_translation(gpu->aspace->mmu);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.c b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+index 2f70d0c3624e..adbfe7319c77 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -208,7 +208,7 @@ adreno_iommu_create_address_space(struct msm_gpu *gpu,
+ 	struct msm_gem_address_space *aspace;
+ 	u64 start, size;
+ 
+-	mmu = msm_iommu_new(&pdev->dev, quirks);
++	mmu = msm_iommu_gpu_new(&pdev->dev, gpu, quirks);
+ 	if (IS_ERR_OR_NULL(mmu))
+ 		return ERR_CAST(mmu);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_iommu.c b/drivers/gpu/drm/msm/msm_iommu.c
+index c2507582ecf3..418e1e06cdde 100644
+--- a/drivers/gpu/drm/msm/msm_iommu.c
++++ b/drivers/gpu/drm/msm/msm_iommu.c
+@@ -237,13 +237,6 @@ struct msm_mmu *msm_iommu_pagetable_create(struct msm_mmu *parent)
+ 	if (!ttbr1_cfg)
+ 		return ERR_PTR(-ENODEV);
+ 
+-	/*
+-	 * Defer setting the fault handler until we have a valid adreno_smmu
+-	 * to avoid accidentially installing a GPU specific fault handler for
+-	 * the display's iommu
+-	 */
+-	iommu_set_fault_handler(iommu->domain, msm_fault_handler, iommu);
+-
+ 	pagetable = kzalloc(sizeof(*pagetable), GFP_KERNEL);
+ 	if (!pagetable)
+ 		return ERR_PTR(-ENOMEM);
+@@ -271,9 +264,6 @@ struct msm_mmu *msm_iommu_pagetable_create(struct msm_mmu *parent)
+ 	 * the arm-smmu driver as a trigger to set up TTBR0
+ 	 */
+ 	if (atomic_inc_return(&iommu->pagetables) == 1) {
+-		/* Enable stall on iommu fault: */
+-		adreno_smmu->set_stall(adreno_smmu->cookie, true);
+-
+ 		ret = adreno_smmu->set_ttbr0_cfg(adreno_smmu->cookie, &ttbr0_cfg);
+ 		if (ret) {
+ 			free_io_pgtable_ops(pagetable->pgtbl_ops);
+@@ -302,6 +292,7 @@ static int msm_fault_handler(struct iommu_domain *domain, struct device *dev,
+ 		unsigned long iova, int flags, void *arg)
+ {
+ 	struct msm_iommu *iommu = arg;
++	struct msm_mmu *mmu = &iommu->base;
+ 	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(iommu->base.dev);
+ 	struct adreno_smmu_fault_info info, *ptr = NULL;
+ 
+@@ -314,6 +305,10 @@ static int msm_fault_handler(struct iommu_domain *domain, struct device *dev,
+ 		return iommu->base.handler(iommu->base.arg, iova, flags, ptr);
+ 
+ 	pr_warn_ratelimited("*** fault: iova=%16lx, flags=%d\n", iova, flags);
++
++	if (mmu->funcs->resume_translation)
++		mmu->funcs->resume_translation(mmu);
++
+ 	return 0;
+ }
+ 
+@@ -321,7 +316,8 @@ static void msm_iommu_resume_translation(struct msm_mmu *mmu)
+ {
+ 	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(mmu->dev);
+ 
+-	adreno_smmu->resume_translation(adreno_smmu->cookie, true);
++	if (adreno_smmu->resume_translation)
++		adreno_smmu->resume_translation(adreno_smmu->cookie, true);
+ }
+ 
+ static void msm_iommu_detach(struct msm_mmu *mmu)
+@@ -406,3 +402,23 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+ 
+ 	return &iommu->base;
+ }
++
++struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks)
++{
++	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(dev);
++	struct msm_iommu *iommu;
++	struct msm_mmu *mmu;
++
++	mmu = msm_iommu_new(dev, quirks);
++	if (IS_ERR(mmu))
++		return mmu;
++
++	iommu = to_msm_iommu(mmu);
++	iommu_set_fault_handler(iommu->domain, msm_fault_handler, iommu);
++
++	/* Enable stall on iommu fault: */
++	if (adreno_smmu->set_stall)
++		adreno_smmu->set_stall(adreno_smmu->cookie, true);
++
++	return mmu;
++}
+diff --git a/drivers/gpu/drm/msm/msm_mmu.h b/drivers/gpu/drm/msm/msm_mmu.h
+index 74cd81e701ff..eb72d3645c1d 100644
+--- a/drivers/gpu/drm/msm/msm_mmu.h
++++ b/drivers/gpu/drm/msm/msm_mmu.h
+@@ -41,6 +41,7 @@ static inline void msm_mmu_init(struct msm_mmu *mmu, struct device *dev,
+ }
+ 
+ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks);
++struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks);
+ struct msm_mmu *msm_gpummu_new(struct device *dev, struct msm_gpu *gpu);
+ 
+ static inline void msm_mmu_set_fault_handler(struct msm_mmu *mmu, void *arg,
+-- 
+2.25.1
+
