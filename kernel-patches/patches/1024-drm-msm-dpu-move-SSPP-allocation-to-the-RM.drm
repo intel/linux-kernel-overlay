@@ -1,0 +1,156 @@
+From 472438501daf7ba1b47241ffea15bbcb9808d098 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Thu, 16 Mar 2023 19:16:23 +0300
+Subject: [PATCH 1024/2071] drm/msm/dpu: move SSPP allocation to the RM
+
+Follow the example of all other hw blocks and initialize SSPP blocks in
+Resource Manager.
+
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Tested-by: Abhinav Kumar <quic_abhinavk@quicinc.com> # sc7280
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/527313/
+Link: https://lore.kernel.org/r/20230316161653.4106395-3-dmitry.baryshkov@linaro.org
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c | 17 ++++-------------
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c    | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h    | 12 ++++++++++++
+ 3 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index faf56f599a9e..229f6f3146c5 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -1276,8 +1276,6 @@ static void dpu_plane_destroy(struct drm_plane *plane)
+ 		/* this will destroy the states as well */
+ 		drm_plane_cleanup(plane);
+ 
+-		dpu_hw_sspp_destroy(pdpu->pipe_hw);
+-
+ 		kfree(pdpu);
+ 	}
+ }
+@@ -1483,14 +1481,10 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
+ 	pdpu->pipe = pipe;
+ 
+ 	/* initialize underlying h/w driver */
+-	pdpu->pipe_hw = dpu_hw_sspp_init(pipe, kms->mmio, kms->catalog);
+-	if (IS_ERR(pdpu->pipe_hw)) {
+-		DPU_ERROR("[%u]SSPP init failed\n", pipe);
+-		ret = PTR_ERR(pdpu->pipe_hw);
++	pdpu->pipe_hw = dpu_rm_get_sspp(&kms->rm, pipe);
++	if (!pdpu->pipe_hw || !pdpu->pipe_hw->cap || !pdpu->pipe_hw->cap->sblk) {
++		DPU_ERROR("[%u]SSPP is invalid\n", pipe);
+ 		goto clean_plane;
+-	} else if (!pdpu->pipe_hw->cap || !pdpu->pipe_hw->cap->sblk) {
+-		DPU_ERROR("[%u]SSPP init returned invalid cfg\n", pipe);
+-		goto clean_sspp;
+ 	}
+ 
+ 	format_list = pdpu->pipe_hw->cap->sblk->format_list;
+@@ -1500,7 +1494,7 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
+ 				format_list, num_formats,
+ 				supported_format_modifiers, type, NULL);
+ 	if (ret)
+-		goto clean_sspp;
++		goto clean_plane;
+ 
+ 	pdpu->catalog = kms->catalog;
+ 
+@@ -1533,9 +1527,6 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
+ 					pipe, plane->base.id);
+ 	return plane;
+ 
+-clean_sspp:
+-	if (pdpu && pdpu->pipe_hw)
+-		dpu_hw_sspp_destroy(pdpu->pipe_hw);
+ clean_plane:
+ 	kfree(pdpu);
+ 	return ERR_PTR(ret);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index 66c1b70d244f..f4dda88a73f7 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -8,6 +8,7 @@
+ #include "dpu_hw_lm.h"
+ #include "dpu_hw_ctl.h"
+ #include "dpu_hw_pingpong.h"
++#include "dpu_hw_sspp.h"
+ #include "dpu_hw_intf.h"
+ #include "dpu_hw_wb.h"
+ #include "dpu_hw_dspp.h"
+@@ -91,6 +92,9 @@ int dpu_rm_destroy(struct dpu_rm *rm)
+ 	for (i = 0; i < ARRAY_SIZE(rm->hw_wb); i++)
+ 		dpu_hw_wb_destroy(rm->hw_wb[i]);
+ 
++	for (i = 0; i < ARRAY_SIZE(rm->hw_sspp); i++)
++		dpu_hw_sspp_destroy(rm->hw_sspp[i]);
++
+ 	return 0;
+ }
+ 
+@@ -255,6 +259,24 @@ int dpu_rm_init(struct dpu_rm *rm,
+ 		rm->dsc_blks[dsc->id - DSC_0] = &hw->base;
+ 	}
+ 
++	for (i = 0; i < cat->sspp_count; i++) {
++		struct dpu_hw_sspp *hw;
++		const struct dpu_sspp_cfg *sspp = &cat->sspp[i];
++
++		if (sspp->id < SSPP_NONE || sspp->id >= SSPP_MAX) {
++			DPU_ERROR("skip intf %d with invalid id\n", sspp->id);
++			continue;
++		}
++
++		hw = dpu_hw_sspp_init(sspp->id, mmio, cat);
++		if (IS_ERR(hw)) {
++			rc = PTR_ERR(hw);
++			DPU_ERROR("failed sspp object creation: err %d\n", rc);
++			goto fail;
++		}
++		rm->hw_sspp[sspp->id - SSPP_NONE] = hw;
++	}
++
+ 	return 0;
+ 
+ fail:
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
+index 59de72b381f9..d62c2edb2460 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
+@@ -21,6 +21,7 @@ struct dpu_global_state;
+  * @hw_intf: array of intf hardware resources
+  * @hw_wb: array of wb hardware resources
+  * @dspp_blks: array of dspp hardware resources
++ * @hw_sspp: array of sspp hardware resources
+  */
+ struct dpu_rm {
+ 	struct dpu_hw_blk *pingpong_blks[PINGPONG_MAX - PINGPONG_0];
+@@ -31,6 +32,7 @@ struct dpu_rm {
+ 	struct dpu_hw_blk *dspp_blks[DSPP_MAX - DSPP_0];
+ 	struct dpu_hw_blk *merge_3d_blks[MERGE_3D_MAX - MERGE_3D_0];
+ 	struct dpu_hw_blk *dsc_blks[DSC_MAX - DSC_0];
++	struct dpu_hw_sspp *hw_sspp[SSPP_MAX - SSPP_NONE];
+ };
+ 
+ /**
+@@ -108,5 +110,15 @@ static inline struct dpu_hw_wb *dpu_rm_get_wb(struct dpu_rm *rm, enum dpu_wb wb_
+ 	return rm->hw_wb[wb_idx - WB_0];
+ }
+ 
++/**
++ * dpu_rm_get_sspp - Return a struct dpu_hw_sspp instance given it's index.
++ * @rm: DPU Resource Manager handle
++ * @sspp_idx: SSPP index
++ */
++static inline struct dpu_hw_sspp *dpu_rm_get_sspp(struct dpu_rm *rm, enum dpu_sspp sspp_idx)
++{
++	return rm->hw_sspp[sspp_idx - SSPP_NONE];
++}
++
+ #endif /* __DPU_RM_H__ */
+ 
+-- 
+2.25.1
+

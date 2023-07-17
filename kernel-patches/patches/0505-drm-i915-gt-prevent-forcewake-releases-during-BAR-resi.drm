@@ -1,0 +1,72 @@
+From 3c257a5090b9657d797b6d44608ad53d03199fdf Mon Sep 17 00:00:00 2001
+From: Andrzej Hajda <andrzej.hajda@intel.com>
+Date: Wed, 8 Mar 2023 14:36:24 +0100
+Subject: [PATCH 0505/2071] drm/i915/gt: prevent forcewake releases during BAR
+ resize
+
+Tests on DG2 machines show that releasing forcewakes during BAR resize
+results later in forcewake ack timeouts. Since forcewakes can be realeased
+asynchronously the simplest way to prevent it is to get all forcewakes
+for duration of BAR resizing.
+
+v2: hold rpm as well during resizing (Rodrigo)
+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/6530
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/7853
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Nirmoy Das <nirmoy.das@intel.com>
+Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+Signed-off-by: Andrzej Hajda <andrzej.hajda@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230308133624.2131582-1-andrzej.hajda@intel.com
+---
+ drivers/gpu/drm/i915/gt/intel_region_lmem.c | 25 +++++++++++++++------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_region_lmem.c b/drivers/gpu/drm/i915/gt/intel_region_lmem.c
+index 89fdfc67f8d1..2a3217e2890f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_region_lmem.c
++++ b/drivers/gpu/drm/i915/gt/intel_region_lmem.c
+@@ -54,6 +54,7 @@ static void i915_resize_lmem_bar(struct drm_i915_private *i915, resource_size_t
+ 	struct resource *root_res;
+ 	resource_size_t rebar_size;
+ 	resource_size_t current_size;
++	intel_wakeref_t wakeref;
+ 	u32 pci_cmd;
+ 	int i;
+ 
+@@ -102,15 +103,25 @@ static void i915_resize_lmem_bar(struct drm_i915_private *i915, resource_size_t
+ 		return;
+ 	}
+ 
+-	/* First disable PCI memory decoding references */
+-	pci_read_config_dword(pdev, PCI_COMMAND, &pci_cmd);
+-	pci_write_config_dword(pdev, PCI_COMMAND,
+-			       pci_cmd & ~PCI_COMMAND_MEMORY);
++	/*
++	 * Releasing forcewake during BAR resizing results in later forcewake
++	 * ack timeouts and former can happen any time - it is asynchronous.
++	 * Grabbing all forcewakes prevents it.
++	 */
++	with_intel_runtime_pm(i915->uncore.rpm, wakeref) {
++		intel_uncore_forcewake_get(&i915->uncore, FORCEWAKE_ALL);
+ 
+-	_resize_bar(i915, GEN12_LMEM_BAR, rebar_size);
++		/* First disable PCI memory decoding references */
++		pci_read_config_dword(pdev, PCI_COMMAND, &pci_cmd);
++		pci_write_config_dword(pdev, PCI_COMMAND,
++				       pci_cmd & ~PCI_COMMAND_MEMORY);
+ 
+-	pci_assign_unassigned_bus_resources(pdev->bus);
+-	pci_write_config_dword(pdev, PCI_COMMAND, pci_cmd);
++		_resize_bar(i915, GEN12_LMEM_BAR, rebar_size);
++
++		pci_assign_unassigned_bus_resources(pdev->bus);
++		pci_write_config_dword(pdev, PCI_COMMAND, pci_cmd);
++		intel_uncore_forcewake_put(&i915->uncore, FORCEWAKE_ALL);
++	}
+ }
+ #else
+ static void i915_resize_lmem_bar(struct drm_i915_private *i915, resource_size_t lmem_size) {}
+-- 
+2.25.1
+

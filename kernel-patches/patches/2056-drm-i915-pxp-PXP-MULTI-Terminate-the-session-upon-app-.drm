@@ -1,0 +1,121 @@
+From bce8646aaf2d58537fa0bc0a0ca9f0cc442219e2 Mon Sep 17 00:00:00 2001
+From: "Huang, Sean Z" <sean.z.huang@intel.com>
+Date: Wed, 9 Dec 2020 22:45:02 -0800
+Subject: [PATCH 2056/2071] drm/i915/pxp:[PXP-MULTI] Terminate the session upon
+ app crash
+
+PXP should terminate the hardware session and cleanup the software
+state gracefully when the application has established the
+protection session, but doesn't close the session correctly due to
+some cases like application crash.
+
+Signed-off-by: Huang, Sean Z <sean.z.huang@intel.com>
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+---
+ drivers/gpu/drm/i915/i915_driver.c           |  1 +
+ drivers/gpu/drm/i915/pxp/intel_pxp.c         | 15 ++++++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp.h         |  1 +
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.c | 21 ++++++++++++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.h |  2 ++
+ 5 files changed, 40 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 3209bce52a19..14bbcab04fb9 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -963,6 +963,7 @@ static void i915_driver_postclose(struct drm_device *dev, struct drm_file *file)
+ 
+ 	/* Catch up with all the deferred frees from "this" client */
+ 	i915_gem_flush_free_objects(to_i915(dev));
++	intel_pxp_close(to_i915(dev)->pxp, file);
+ }
+ 
+ static void intel_suspend_encoders(struct drm_i915_private *dev_priv)
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index 375fca1f017c..9bd9c4e65bd4 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -663,7 +663,22 @@ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmf
+ 	return ret;
+ }
+ 
++void intel_pxp_close(struct intel_pxp *pxp, struct drm_file *drmfile)
++{
++	if (!intel_pxp_is_enabled(pxp) || !drmfile)
++		return;
++
++	mutex_lock(&pxp->session_mutex);
++	intel_pxp_file_close(pxp, drmfile);
++	mutex_unlock(&pxp->session_mutex);
++}
++
+ #else
++
++void intel_pxp_close(struct intel_pxp *pxp, struct drm_file *drmfile)
++{
++}
++
+ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile)
+ {
+ 	return -ENODEV;
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.h b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+index 3203cbac452e..32019d8d6fd5 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+@@ -40,5 +40,6 @@ int intel_pxp_key_check(struct intel_pxp *pxp,
+ 
+ void intel_pxp_invalidate(struct intel_pxp *pxp);
+ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile);
++void intel_pxp_close(struct intel_pxp *pxp, struct drm_file *drmfile);
+ 
+ #endif /* __INTEL_PXP_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+index ad1e0ceef270..421d561701fe 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+@@ -300,6 +300,27 @@ int intel_pxp_sm_ioctl_mark_session_in_play(struct intel_pxp *pxp,
+ 	return 0;
+ }
+ 
++void intel_pxp_file_close(struct intel_pxp *pxp, struct drm_file *drmfile)
++{
++	int idx, ret;
++
++	lockdep_assert_held(&pxp->session_mutex);
++
++	for_each_set_bit(idx, pxp->reserved_sessions, INTEL_PXP_MAX_HWDRM_SESSIONS) {
++		if (pxp->hwdrm_sessions[idx]->drmfile == drmfile) {
++			ret = intel_pxp_terminate_session(pxp, idx);
++			if (ret)
++				drm_err(&pxp->ctrl_gt->i915->drm,
++					"failed to correctly close PXP session %u\n",
++					idx);
++
++			free_session_entry(pxp, idx);
++		}
++	}
++
++	return;
++}
++
+ static int pxp_create_arb_session(struct intel_pxp *pxp)
+ {
+ 	struct intel_gt *gt = pxp->ctrl_gt;
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+index 9d34094864c4..fa91b7103842 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+@@ -30,6 +30,8 @@ int intel_pxp_sm_ioctl_terminate_session(struct intel_pxp *pxp,
+ int intel_pxp_sm_ioctl_query_pxp_tag(struct intel_pxp *pxp,
+ 				     u32 *session_is_alive, u32 *pxp_tag);
+ 
++void intel_pxp_file_close(struct intel_pxp *pxp, struct drm_file *drmfile);
++
+ bool intel_pxp_session_is_in_play(struct intel_pxp *pxp, u32 id);
+ 
+ #else
+-- 
+2.25.1
+

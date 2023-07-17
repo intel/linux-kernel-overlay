@@ -1,0 +1,108 @@
+From cd574415e6d24aecc3cac8401b7bf6a43d745bd0 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 23 Mar 2023 16:20:33 +0200
+Subject: [PATCH 0895/2071] drm/i915: Disable DPLLs before disconnecting the TC
+ PHY
+
+Bspec requires disabling the DPLLs on TC ports before disconnecting the
+port's PHY. Add a post_pll_disable encoder hook and move the call to
+disconnect the port's PHY from the post_disable hook to the new hook.
+
+Reviewed-by: Mika Kahola <mika.kahola@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230323142035.1432621-28-imre.deak@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c     | 15 ++++++++++++---
+ drivers/gpu/drm/i915/display/intel_display.c |  2 ++
+ drivers/gpu/drm/i915/display/intel_dp_mst.c  | 15 +++++++++++++++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index dac3ec8fbbc1..62bd4196dc46 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -2720,9 +2720,6 @@ static void intel_ddi_post_disable(struct intel_atomic_state *state,
+ 				   const struct drm_connector_state *old_conn_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+-	struct intel_digital_port *dig_port = enc_to_dig_port(encoder);
+-	enum phy phy = intel_port_to_phy(dev_priv, encoder->port);
+-	bool is_tc_port = intel_phy_is_tc(dev_priv, phy);
+ 	struct intel_crtc *slave_crtc;
+ 
+ 	if (!intel_crtc_has_type(old_crtc_state, INTEL_OUTPUT_DP_MST)) {
+@@ -2772,6 +2769,17 @@ static void intel_ddi_post_disable(struct intel_atomic_state *state,
+ 	else
+ 		intel_ddi_post_disable_dp(state, encoder, old_crtc_state,
+ 					  old_conn_state);
++}
++
++static void intel_ddi_post_pll_disable(struct intel_atomic_state *state,
++				       struct intel_encoder *encoder,
++				       const struct intel_crtc_state *old_crtc_state,
++				       const struct drm_connector_state *old_conn_state)
++{
++	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
++	struct intel_digital_port *dig_port = enc_to_dig_port(encoder);
++	enum phy phy = intel_port_to_phy(i915, encoder->port);
++	bool is_tc_port = intel_phy_is_tc(i915, phy);
+ 
+ 	main_link_aux_power_domain_put(dig_port, old_crtc_state);
+ 
+@@ -4398,6 +4406,7 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port)
+ 	encoder->pre_pll_enable = intel_ddi_pre_pll_enable;
+ 	encoder->pre_enable = intel_ddi_pre_enable;
+ 	encoder->disable = intel_disable_ddi;
++	encoder->post_pll_disable = intel_ddi_post_pll_disable;
+ 	encoder->post_disable = intel_ddi_post_disable;
+ 	encoder->update_pipe = intel_ddi_update_pipe;
+ 	encoder->get_hw_state = intel_ddi_get_hw_state;
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 1ed584d04c10..ca0db2332ded 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1927,6 +1927,8 @@ static void hsw_crtc_disable(struct intel_atomic_state *state,
+ 
+ 	intel_disable_shared_dpll(old_crtc_state);
+ 
++	intel_encoders_post_pll_disable(state, crtc);
++
+ 	intel_dmc_disable_pipe(i915, crtc->pipe);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index c3e8db943e9c..fe01fdf36cfd 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -623,6 +623,20 @@ static void intel_mst_post_disable_dp(struct intel_atomic_state *state,
+ 		    intel_dp->active_mst_links);
+ }
+ 
++static void intel_mst_post_pll_disable_dp(struct intel_atomic_state *state,
++					  struct intel_encoder *encoder,
++					  const struct intel_crtc_state *old_crtc_state,
++					  const struct drm_connector_state *old_conn_state)
++{
++	struct intel_dp_mst_encoder *intel_mst = enc_to_mst(encoder);
++	struct intel_digital_port *dig_port = intel_mst->primary;
++	struct intel_dp *intel_dp = &dig_port->dp;
++
++	if (intel_dp->active_mst_links == 0 &&
++	    dig_port->base.post_pll_disable)
++		dig_port->base.post_pll_disable(state, encoder, old_crtc_state, old_conn_state);
++}
++
+ static void intel_mst_pre_pll_enable_dp(struct intel_atomic_state *state,
+ 					struct intel_encoder *encoder,
+ 					const struct intel_crtc_state *pipe_config,
+@@ -1146,6 +1160,7 @@ intel_dp_create_fake_mst_encoder(struct intel_digital_port *dig_port, enum pipe
+ 	intel_encoder->compute_config_late = intel_dp_mst_compute_config_late;
+ 	intel_encoder->disable = intel_mst_disable_dp;
+ 	intel_encoder->post_disable = intel_mst_post_disable_dp;
++	intel_encoder->post_pll_disable = intel_mst_post_pll_disable_dp;
+ 	intel_encoder->update_pipe = intel_ddi_update_pipe;
+ 	intel_encoder->pre_pll_enable = intel_mst_pre_pll_enable_dp;
+ 	intel_encoder->pre_enable = intel_mst_pre_enable_dp;
+-- 
+2.25.1
+
