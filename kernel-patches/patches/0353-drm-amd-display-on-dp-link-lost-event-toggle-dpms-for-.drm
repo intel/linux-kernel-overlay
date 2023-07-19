@@ -1,0 +1,341 @@
+From 4b7c72924d55c0f5c5d39f86656be9ae08534d28 Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <wenjing.liu@amd.com>
+Date: Fri, 27 Jan 2023 19:16:05 -0500
+Subject: [PATCH 0353/2351] drm/amd/display: on dp link lost event toggle dpms
+ for master pipe only
+
+[why]
+We mistakenly toggle dpms state for non master pipe when handling
+link lost. A non master pipe doesn't connect to a backend. So it is
+toggling dpms for non master is undefined and caused NULL pointer
+dereference.
+
+[how]
+Add helper functions to find an array of active master pipes for current
+link and only toggle DPMS for active master pipes connected to the link.
+Add assert in case we get called to program dpms with non master pipe.
+
+Reviewed-by: Alvin Lee <Alvin.Lee2@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Wenjing Liu <wenjing.liu@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../display/dc/link/accessories/link_dp_cts.c | 42 +++++------
+ .../drm/amd/display/dc/link/link_detection.c  | 31 +--------
+ .../gpu/drm/amd/display/dc/link/link_dpms.c   | 69 ++++++++++++++++++-
+ .../gpu/drm/amd/display/dc/link/link_dpms.h   |  5 ++
+ .../dc/link/protocols/link_dp_irq_handler.c   | 46 +++++--------
+ 5 files changed, 108 insertions(+), 85 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c b/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c
+index 769b782a9b841..ee290ec247de5 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c
++++ b/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c
+@@ -27,6 +27,7 @@
+ #include "link/protocols/link_dp_training.h"
+ #include "link/protocols/link_dp_phy.h"
+ #include "link/protocols/link_dp_training_fixed_vs_pe_retimer.h"
++#include "link/link_dpms.h"
+ #include "resource.h"
+ #include "dm_helpers.h"
+ #include "dc_dmub_srv.h"
+@@ -77,37 +78,26 @@ void dp_retrain_link_dp_test(struct dc_link *link,
+ 			struct dc_link_settings *link_setting,
+ 			bool skip_video_pattern)
+ {
+-	struct pipe_ctx *pipe;
+-	unsigned int i;
++	struct pipe_ctx *pipes[MAX_PIPES];
++	struct dc_state *state = link->dc->current_state;
++	uint8_t count;
++	int i;
+ 
+ 	udelay(100);
+ 
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe->stream != NULL &&
+-				pipe->stream->link == link &&
+-				!pipe->stream->dpms_off &&
+-				!pipe->top_pipe && !pipe->prev_odm_pipe) {
+-			link_set_dpms_off(pipe);
+-			pipe->link_config.dp_link_settings = *link_setting;
+-			update_dp_encoder_resources_for_test_harness(
+-					link->dc,
+-					pipe->stream->ctx->dc->current_state,
+-					pipe);
+-		}
+-	}
++	link_get_master_pipes_with_dpms_on(link, state, &count, pipes);
+ 
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe->stream != NULL &&
+-				pipe->stream->link == link &&
+-				!pipe->stream->dpms_off &&
+-				!pipe->top_pipe && !pipe->prev_odm_pipe) {
+-			link_set_dpms_on(
+-					pipe->stream->ctx->dc->current_state,
+-					pipe);
+-		}
++	for (i = 0; i < count; i++) {
++		link_set_dpms_off(pipes[i]);
++		pipes[i]->link_config.dp_link_settings = *link_setting;
++		update_dp_encoder_resources_for_test_harness(
++				link->dc,
++				state,
++				pipes[i]);
+ 	}
++
++	for (i = count-1; i >= 0; i--)
++		link_set_dpms_on(state, pipes[i]);
+ }
+ 
+ static void dp_test_send_link_training(struct dc_link *link)
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index 63e75c392031c..001a4ac9bfcf1 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -30,6 +30,7 @@
+  * directly from connected receivers.
+  */
+ 
++#include "link_dpms.h"
+ #include "link_detection.h"
+ #include "link_hwss.h"
+ #include "protocols/link_edp_panel_control.h"
+@@ -755,34 +756,6 @@ static void restore_phy_clocks_for_destructive_link_verification(const struct dc
+ 	clk_mgr_optimize_pwr_state(dc, dc->clk_mgr);
+ }
+ 
+-static void set_all_streams_dpms_off_for_link(struct dc_link *link)
+-{
+-	int i;
+-	struct pipe_ctx *pipe_ctx;
+-	struct dc_stream_update stream_update;
+-	bool dpms_off = true;
+-	struct link_resource link_res = {0};
+-
+-	memset(&stream_update, 0, sizeof(stream_update));
+-	stream_update.dpms_off = &dpms_off;
+-
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe_ctx = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx && pipe_ctx->stream && !pipe_ctx->stream->dpms_off &&
+-				pipe_ctx->stream->link == link && !pipe_ctx->prev_odm_pipe) {
+-			stream_update.stream = pipe_ctx->stream;
+-			dc_commit_updates_for_stream(link->ctx->dc, NULL, 0,
+-					pipe_ctx->stream, &stream_update,
+-					link->ctx->dc->current_state);
+-		}
+-	}
+-
+-	/* link can be also enabled by vbios. In this case it is not recorded
+-	 * in pipe_ctx. Disable link phy here to make sure it is completely off
+-	 */
+-	dp_disable_link_phy(link, &link_res, link->connector_signal);
+-}
+-
+ static void verify_link_capability_destructive(struct dc_link *link,
+ 		struct dc_sink *sink,
+ 		enum dc_detect_reason reason)
+@@ -796,7 +769,7 @@ static void verify_link_capability_destructive(struct dc_link *link,
+ 	if (dc_is_dp_signal(link->local_sink->sink_signal)) {
+ 		struct dc_link_settings known_limit_link_setting =
+ 				dp_get_max_link_cap(link);
+-		set_all_streams_dpms_off_for_link(link);
++		link_set_all_streams_dpms_off_for_link(link);
+ 		dp_verify_link_cap_with_retries(
+ 				link, &known_limit_link_setting,
+ 				LINK_TRAINING_MAX_VERIFY_RETRY);
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 618fd552cb3d3..026683ce24a43 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -140,12 +140,76 @@ void link_blank_dp_stream(struct dc_link *link, bool hw_init)
+ 	}
+ }
+ 
++void link_set_all_streams_dpms_off_for_link(struct dc_link *link)
++{
++	struct pipe_ctx *pipes[MAX_PIPES];
++	struct dc_state *state = link->dc->current_state;
++	uint8_t count;
++	int i;
++	struct dc_stream_update stream_update;
++	bool dpms_off = true;
++	struct link_resource link_res = {0};
++
++	memset(&stream_update, 0, sizeof(stream_update));
++	stream_update.dpms_off = &dpms_off;
++
++	link_get_master_pipes_with_dpms_on(link, state, &count, pipes);
++
++	for (i = 0; i < count; i++) {
++		stream_update.stream = pipes[i]->stream;
++		dc_commit_updates_for_stream(link->ctx->dc, NULL, 0,
++				pipes[i]->stream, &stream_update,
++				state);
++	}
++
++	/* link can be also enabled by vbios. In this case it is not recorded
++	 * in pipe_ctx. Disable link phy here to make sure it is completely off
++	 */
++	dp_disable_link_phy(link, &link_res, link->connector_signal);
++}
++
+ void link_resume(struct dc_link *link)
+ {
+ 	if (link->connector_signal != SIGNAL_TYPE_VIRTUAL)
+ 		program_hpd_filter(link);
+ }
+ 
++/* This function returns true if the pipe is used to feed video signal directly
++ * to the link.
++ */
++static bool is_master_pipe_for_link(const struct dc_link *link,
++		const struct pipe_ctx *pipe)
++{
++	return (pipe->stream &&
++			pipe->stream->link &&
++			pipe->stream->link == link &&
++			pipe->top_pipe == NULL &&
++			pipe->prev_odm_pipe == NULL);
++}
++
++/*
++ * This function finds all master pipes feeding to a given link with dpms set to
++ * on in given dc state.
++ */
++void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
++		struct dc_state *state,
++		uint8_t *count,
++		struct pipe_ctx *pipes[MAX_PIPES])
++{
++	int i;
++	struct pipe_ctx *pipe = NULL;
++
++	*count = 0;
++	for (i = 0; i < MAX_PIPES; i++) {
++		pipe = &state->res_ctx.pipe_ctx[i];
++
++		if (is_master_pipe_for_link(link, pipe) &&
++				pipe->stream->dpms_off == false) {
++			pipes[(*count)++] = pipe;
++		}
++	}
++}
++
+ static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
+ 		enum engine_id eng_id,
+ 		struct ext_hdmi_settings *settings)
+@@ -2176,6 +2240,8 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
+ 	struct dc_link *link = stream->sink->link;
+ 	struct vpg *vpg = pipe_ctx->stream_res.stream_enc->vpg;
+ 
++	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
++
+ 	if (link_is_dp_128b_132b_signal(pipe_ctx))
+ 		vpg = pipe_ctx->stream_res.hpo_dp_stream_enc->vpg;
+ 
+@@ -2280,6 +2346,8 @@ void link_set_dpms_on(
+ 	struct vpg *vpg = pipe_ctx->stream_res.stream_enc->vpg;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
+ 
++	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
++
+ 	if (link_is_dp_128b_132b_signal(pipe_ctx))
+ 		vpg = pipe_ctx->stream_res.hpo_dp_stream_enc->vpg;
+ 
+@@ -2463,4 +2531,3 @@ void link_set_dpms_on(
+ 		set_avmute(pipe_ctx, false);
+ 	}
+ }
+-
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+index 7ce0124ed7d11..33d312dabdb8b 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+@@ -32,4 +32,9 @@ bool link_set_dsc_pps_packet(struct pipe_ctx *pipe_ctx,
+ struct fixed31_32 link_calculate_sst_avg_time_slots_per_mtp(
+ 		const struct dc_stream_state *stream,
+ 		const struct dc_link *link);
++void link_set_all_streams_dpms_off_for_link(struct dc_link *link);
++void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
++		struct dc_state *state,
++		uint8_t *count,
++		struct pipe_ctx *pipes[MAX_PIPES]);
+ #endif /* __DC_LINK_DPMS_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+index eff23b7b324a3..9d80427520cf4 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+@@ -34,6 +34,7 @@
+ #include "link_dp_training.h"
+ #include "link_dp_capability.h"
+ #include "link/accessories/link_dp_trace.h"
++#include "link/link_dpms.h"
+ #include "dm_helpers.h"
+ 
+ #define DC_LOGGER_INIT(logger)
+@@ -175,40 +176,27 @@ static bool handle_hpd_irq_psr_sink(struct dc_link *link)
+ 
+ void dc_link_dp_handle_link_loss(struct dc_link *link)
+ {
++	struct pipe_ctx *pipes[MAX_PIPES];
++	struct dc_state *state = link->dc->current_state;
++	uint8_t count;
+ 	int i;
+-	struct pipe_ctx *pipe_ctx;
+ 
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe_ctx = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx && pipe_ctx->stream && pipe_ctx->stream->link == link)
+-			break;
+-	}
++	link_get_master_pipes_with_dpms_on(link, state, &count, pipes);
+ 
+-	if (pipe_ctx == NULL || pipe_ctx->stream == NULL)
+-		return;
++	for (i = 0; i < count; i++)
++		link_set_dpms_off(pipes[i]);
+ 
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe_ctx = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx && pipe_ctx->stream && !pipe_ctx->stream->dpms_off &&
+-				pipe_ctx->stream->link == link && !pipe_ctx->prev_odm_pipe)
+-			link_set_dpms_off(pipe_ctx);
+-	}
+-
+-	for (i = 0; i < MAX_PIPES; i++) {
+-		pipe_ctx = &link->dc->current_state->res_ctx.pipe_ctx[i];
+-		if (pipe_ctx && pipe_ctx->stream && !pipe_ctx->stream->dpms_off
+-				&& pipe_ctx->stream->link == link && !pipe_ctx->prev_odm_pipe) {
+-			// Always use max settings here for DP 1.4a LL Compliance CTS
+-			if (link->is_automated) {
+-				pipe_ctx->link_config.dp_link_settings.lane_count =
+-						link->verified_link_cap.lane_count;
+-				pipe_ctx->link_config.dp_link_settings.link_rate =
+-						link->verified_link_cap.link_rate;
+-				pipe_ctx->link_config.dp_link_settings.link_spread =
+-						link->verified_link_cap.link_spread;
+-			}
+-			link_set_dpms_on(link->dc->current_state, pipe_ctx);
++	for (i = count - 1; i >= 0; i--) {
++		// Always use max settings here for DP 1.4a LL Compliance CTS
++		if (link->is_automated) {
++			pipes[i]->link_config.dp_link_settings.lane_count =
++					link->verified_link_cap.lane_count;
++			pipes[i]->link_config.dp_link_settings.link_rate =
++					link->verified_link_cap.link_rate;
++			pipes[i]->link_config.dp_link_settings.link_spread =
++					link->verified_link_cap.link_spread;
+ 		}
++		link_set_dpms_on(link->dc->current_state, pipes[i]);
+ 	}
+ }
+ 
+-- 
+2.25.1
+

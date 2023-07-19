@@ -1,0 +1,126 @@
+From 398b29ea5e0baedc33b8a9ece0493227e791329b Mon Sep 17 00:00:00 2001
+From: Candice Li <candice.li@amd.com>
+Date: Fri, 24 Feb 2023 17:26:33 +0800
+Subject: [PATCH 0436/2351] drm/amdgpu: Support umc node harvest config on umc
+ v8_10
+
+Don't need to query error count and error address on harvest umc nodes.
+v2: Fix code bug, use active_mask instead of harvsest_config
+    and remove unnecessary argument in LOOP macro.
+v3: Leave adev->gmc.num_umc unchanged.
+
+Signed-off-by: Candice Li <candice.li@amd.com>
+Reviewed-by: Tao Zhou <tao.zhou1@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c | 10 +++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_umc.h       |  7 +++++--
+ drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c        |  1 -
+ drivers/gpu/drm/amd/amdgpu/umc_v8_10.h        |  4 ++--
+ 4 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
+index b719852daa071..1a3cb53d2e0d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
+@@ -543,6 +543,7 @@ static void amdgpu_discovery_read_from_harvest_table(struct amdgpu_device *adev,
+ 	struct harvest_table *harvest_info;
+ 	u16 offset;
+ 	int i;
++	uint32_t umc_harvest_config = 0;
+ 
+ 	bhdr = (struct binary_header *)adev->mman.discovery_bin;
+ 	offset = le16_to_cpu(bhdr->table_list[HARVEST_INFO].offset);
+@@ -570,12 +571,17 @@ static void amdgpu_discovery_read_from_harvest_table(struct amdgpu_device *adev,
+ 			adev->harvest_ip_mask |= AMD_HARVEST_IP_DMU_MASK;
+ 			break;
+ 		case UMC_HWID:
++			umc_harvest_config |=
++				1 << (le16_to_cpu(harvest_info->list[i].number_instance));
+ 			(*umc_harvest_count)++;
+ 			break;
+ 		default:
+ 			break;
+ 		}
+ 	}
++
++	adev->umc.active_mask = ((1 << adev->umc.node_inst_num) - 1) &
++				~umc_harvest_config;
+ }
+ 
+ /* ================================================== */
+@@ -1156,8 +1162,10 @@ static int amdgpu_discovery_reg_base_init(struct amdgpu_device *adev)
+ 						AMDGPU_MAX_SDMA_INSTANCES);
+ 			}
+ 
+-			if (le16_to_cpu(ip->hw_id) == UMC_HWID)
++			if (le16_to_cpu(ip->hw_id) == UMC_HWID) {
+ 				adev->gmc.num_umc++;
++				adev->umc.node_inst_num++;
++			}
+ 
+ 			for (k = 0; k < num_base_address; k++) {
+ 				/*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.h
+index f2bf979af5883..36e19336f3b34 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.h
+@@ -42,7 +42,7 @@
+ #define LOOP_UMC_INST_AND_CH(umc_inst, ch_inst) LOOP_UMC_INST((umc_inst)) LOOP_UMC_CH_INST((ch_inst))
+ 
+ #define LOOP_UMC_NODE_INST(node_inst) \
+-		for ((node_inst) = 0; (node_inst) < adev->umc.node_inst_num; (node_inst)++)
++		for_each_set_bit((node_inst), &(adev->umc.active_mask), adev->umc.node_inst_num)
+ 
+ #define LOOP_UMC_EACH_NODE_INST_AND_CH(node_inst, umc_inst, ch_inst) \
+ 		LOOP_UMC_NODE_INST((node_inst)) LOOP_UMC_INST_AND_CH((umc_inst), (ch_inst))
+@@ -69,7 +69,7 @@ struct amdgpu_umc {
+ 	/* number of umc instance with memory map register access */
+ 	uint32_t umc_inst_num;
+ 
+-	/*number of umc node instance with memory map register access*/
++	/* Total number of umc node instance including harvest one */
+ 	uint32_t node_inst_num;
+ 
+ 	/* UMC regiser per channel offset */
+@@ -82,6 +82,9 @@ struct amdgpu_umc {
+ 
+ 	const struct amdgpu_umc_funcs *funcs;
+ 	struct amdgpu_umc_ras *ras;
++
++	/* active mask for umc node instance */
++	unsigned long active_mask;
+ };
+ 
+ int amdgpu_umc_ras_late_init(struct amdgpu_device *adev, struct ras_common_if *ras_block);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+index da6640af2aeb5..14ca327b602c4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+@@ -586,7 +586,6 @@ static void gmc_v11_0_set_umc_funcs(struct amdgpu_device *adev)
+ 	case IP_VERSION(8, 10, 0):
+ 		adev->umc.channel_inst_num = UMC_V8_10_CHANNEL_INSTANCE_NUM;
+ 		adev->umc.umc_inst_num = UMC_V8_10_UMC_INSTANCE_NUM;
+-		adev->umc.node_inst_num = adev->gmc.num_umc;
+ 		adev->umc.max_ras_err_cnt_per_query = UMC_V8_10_TOTAL_CHANNEL_NUM(adev);
+ 		adev->umc.channel_offs = UMC_V8_10_PER_CHANNEL_OFFSET;
+ 		adev->umc.retire_unit = UMC_V8_10_NA_COL_2BITS_POWER_OF_2_NUM;
+diff --git a/drivers/gpu/drm/amd/amdgpu/umc_v8_10.h b/drivers/gpu/drm/amd/amdgpu/umc_v8_10.h
+index 25eaf4af5fcf4..c6dfd433fec7b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/umc_v8_10.h
++++ b/drivers/gpu/drm/amd/amdgpu/umc_v8_10.h
+@@ -31,9 +31,9 @@
+ /* number of umc instance with memory map register access */
+ #define UMC_V8_10_UMC_INSTANCE_NUM		2
+ 
+-/* Total channel instances for all umc nodes */
++/* Total channel instances for all available umc nodes */
+ #define UMC_V8_10_TOTAL_CHANNEL_NUM(adev) \
+-	(UMC_V8_10_CHANNEL_INSTANCE_NUM * UMC_V8_10_UMC_INSTANCE_NUM * (adev)->umc.node_inst_num)
++	(UMC_V8_10_CHANNEL_INSTANCE_NUM * UMC_V8_10_UMC_INSTANCE_NUM * (adev)->gmc.num_umc)
+ 
+ /* UMC regiser per channel offset */
+ #define UMC_V8_10_PER_CHANNEL_OFFSET	0x400
+-- 
+2.25.1
+

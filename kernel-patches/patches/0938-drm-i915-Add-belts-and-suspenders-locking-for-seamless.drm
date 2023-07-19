@@ -1,0 +1,87 @@
+From 1101ce7fe2b17fb875223aac97a15675801d3cb0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Sat, 11 Mar 2023 01:58:26 +0200
+Subject: [PATCH 0938/2351] drm/i915: Add belts and suspenders locking for
+ seamless M/N changes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add some (probably overkill) locking to protect the vblank
+timestamping constants updates during seamless M/N fastsets.
+
+As everything should be naturally aligned I think the individual
+pieces should probably end up updating atomically enough. So this
+is only really meant to guarantee everyone sees a consistent whole.
+
+All the drm_vblank.c usage is covered by vblank_time_lock,
+and uncore.lock will take care of __intel_get_crtc_scanline()
+that can also be called from outside the core vblank functionality.
+
+Currently only crtc_clock and framedur_ns can change, but in
+the future might fastset also across eg. vtotal/vblank_end
+changes, so let's just grab the locks across the whole thing.
+
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230310235828.17439-2-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 24 +++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 9464bb97ebbd6..37fe774963dff 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -5914,6 +5914,8 @@ void intel_crtc_update_active_timings(const struct intel_crtc_state *crtc_state)
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct drm_display_mode adjusted_mode;
++	int vmax_vblank_start = 0;
++	unsigned long irqflags;
+ 
+ 	drm_mode_init(&adjusted_mode, &crtc_state->hw.adjusted_mode);
+ 
+@@ -5921,11 +5923,28 @@ void intel_crtc_update_active_timings(const struct intel_crtc_state *crtc_state)
+ 		adjusted_mode.crtc_vtotal = crtc_state->vrr.vmax;
+ 		adjusted_mode.crtc_vblank_end = crtc_state->vrr.vmax;
+ 		adjusted_mode.crtc_vblank_start = intel_vrr_vmin_vblank_start(crtc_state);
+-		crtc->vmax_vblank_start = intel_vrr_vmax_vblank_start(crtc_state);
++		vmax_vblank_start = intel_vrr_vmax_vblank_start(crtc_state);
+ 	}
+ 
++	/*
++	 * Belts and suspenders locking to guarantee everyone sees 100%
++	 * consistent state during fastset seamless refresh rate changes.
++	 *
++	 * vblank_time_lock takes care of all drm_vblank.c stuff, and
++	 * uncore.lock takes care of __intel_get_crtc_scanline() which
++	 * may get called elsewhere as well.
++	 *
++	 * TODO maybe just protect everything (including
++	 * __intel_get_crtc_scanline()) with vblank_time_lock?
++	 * Need to audit everything to make sure it's safe.
++	 */
++	spin_lock_irqsave(&dev_priv->drm.vblank_time_lock, irqflags);
++	spin_lock(&dev_priv->uncore.lock);
++
+ 	drm_calc_timestamping_constants(&crtc->base, &adjusted_mode);
+ 
++	crtc->vmax_vblank_start = vmax_vblank_start;
++
+ 	crtc->mode_flags = crtc_state->mode_flags;
+ 
+ 	/*
+@@ -5969,6 +5988,9 @@ void intel_crtc_update_active_timings(const struct intel_crtc_state *crtc_state)
+ 	} else {
+ 		crtc->scanline_offset = 1;
+ 	}
++
++	spin_unlock(&dev_priv->uncore.lock);
++	spin_unlock_irqrestore(&dev_priv->drm.vblank_time_lock, irqflags);
+ }
+ 
+ /*
+-- 
+2.25.1
+

@@ -1,0 +1,109 @@
+From 3d8951861c9aabc678ca3ae865881022880fce48 Mon Sep 17 00:00:00 2001
+From: Tao Zhou <tao.zhou1@amd.com>
+Date: Fri, 10 Feb 2023 16:33:58 +0800
+Subject: [PATCH 0412/2351] drm/amdgpu: exclude duplicate pages from UMC RAS UE
+ count
+
+If a UMC bad page is reserved but not freed by an application, the
+application may trigger uncorrectable error repeatly by accessing the page.
+
+v2: add specific function to do the check.
+v3: remove duplicate pages, calculate new added bad page number.
+v4: reuse save_bad_pages to calculate new added bad page number.
+
+Signed-off-by: Tao Zhou <tao.zhou1@amd.com>
+Reviewed-by: Stanley.Yang <Stanley.Yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c | 16 +++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c |  4 ++--
+ 3 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 6e543558386da..5c02c6c9f7732 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -176,7 +176,7 @@ static int amdgpu_reserve_page_direct(struct amdgpu_device *adev, uint64_t addre
+ 	if (amdgpu_bad_page_threshold != 0) {
+ 		amdgpu_ras_add_bad_pages(adev, err_data.err_addr,
+ 					 err_data.err_addr_cnt);
+-		amdgpu_ras_save_bad_pages(adev);
++		amdgpu_ras_save_bad_pages(adev, NULL);
+ 	}
+ 
+ 	dev_warn(adev->dev, "WARNING: THIS IS ONLY FOR TEST PURPOSES AND WILL CORRUPT RAS EEPROM\n");
+@@ -2084,22 +2084,32 @@ int amdgpu_ras_add_bad_pages(struct amdgpu_device *adev,
+ /*
+  * write error record array to eeprom, the function should be
+  * protected by recovery_lock
++ * new_cnt: new added UE count, excluding reserved bad pages, can be NULL
+  */
+-int amdgpu_ras_save_bad_pages(struct amdgpu_device *adev)
++int amdgpu_ras_save_bad_pages(struct amdgpu_device *adev,
++		unsigned long *new_cnt)
+ {
+ 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
+ 	struct ras_err_handler_data *data;
+ 	struct amdgpu_ras_eeprom_control *control;
+ 	int save_count;
+ 
+-	if (!con || !con->eh_data)
++	if (!con || !con->eh_data) {
++		if (new_cnt)
++			*new_cnt = 0;
++
+ 		return 0;
++	}
+ 
+ 	mutex_lock(&con->recovery_lock);
+ 	control = &con->eeprom_control;
+ 	data = con->eh_data;
+ 	save_count = data->count - control->ras_num_recs;
+ 	mutex_unlock(&con->recovery_lock);
++
++	if (new_cnt)
++		*new_cnt = save_count / adev->umc.retire_unit;
++
+ 	/* only new entries are saved */
+ 	if (save_count > 0) {
+ 		if (amdgpu_ras_eeprom_append(control,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+index f2ad999993f66..ef38f4c93df0a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+@@ -547,7 +547,8 @@ int amdgpu_ras_query_error_count(struct amdgpu_device *adev,
+ int amdgpu_ras_add_bad_pages(struct amdgpu_device *adev,
+ 		struct eeprom_table_record *bps, int pages);
+ 
+-int amdgpu_ras_save_bad_pages(struct amdgpu_device *adev);
++int amdgpu_ras_save_bad_pages(struct amdgpu_device *adev,
++		unsigned long *new_cnt);
+ 
+ static inline enum ta_ras_block
+ amdgpu_ras_block_to_ta(enum amdgpu_ras_block block) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+index 1c7fcb4f23808..1b8574bc4463d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+@@ -68,7 +68,7 @@ int amdgpu_umc_page_retirement_mca(struct amdgpu_device *adev,
+ 	if (amdgpu_bad_page_threshold != 0) {
+ 		amdgpu_ras_add_bad_pages(adev, err_data.err_addr,
+ 						err_data.err_addr_cnt);
+-		amdgpu_ras_save_bad_pages(adev);
++		amdgpu_ras_save_bad_pages(adev, NULL);
+ 	}
+ 
+ out:
+@@ -147,7 +147,7 @@ static int amdgpu_umc_do_page_retirement(struct amdgpu_device *adev,
+ 			err_data->err_addr_cnt) {
+ 			amdgpu_ras_add_bad_pages(adev, err_data->err_addr,
+ 						err_data->err_addr_cnt);
+-			amdgpu_ras_save_bad_pages(adev);
++			amdgpu_ras_save_bad_pages(adev, &(err_data->ue_count));
+ 
+ 			amdgpu_dpm_send_hbm_bad_pages_num(adev, con->eeprom_control.ras_num_recs);
+ 
+-- 
+2.25.1
+

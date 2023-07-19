@@ -1,0 +1,250 @@
+From 682ee24b9c8cf961fee8d747ad66fbb23162dc2e Mon Sep 17 00:00:00 2001
+From: Kun Liu <Kun.Liu2@amd.com>
+Date: Tue, 21 Feb 2023 16:31:18 +0800
+Subject: [PATCH 0624/2351] drm/amdgpu: added a sysfs interface for thermal
+ throttling
+
+added a sysfs interface for thermal throttling, then userspace
+can get/update thermal limit
+
+Signed-off-by: Kun Liu <Kun.Liu2@amd.com>
+Reviewed-by: Evan Quan <evan.quan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |  2 +
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c           | 28 +++++++
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c            | 77 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h       |  3 +
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 24 ++++++
+ drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h | 12 +++
+ 6 files changed, 146 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 75f18791cdb9c..94058b6c3b8bc 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -331,6 +331,8 @@ struct amd_pm_funcs {
+ 	int (*get_mclk_od)(void *handle);
+ 	int (*set_mclk_od)(void *handle, uint32_t value);
+ 	int (*read_sensor)(void *handle, int idx, void *value, int *size);
++	int (*get_apu_thermal_limit)(void *handle, uint32_t *limit);
++	int (*set_apu_thermal_limit)(void *handle, uint32_t limit);
+ 	enum amd_dpm_forced_level (*get_performance_level)(void *handle);
+ 	enum amd_pm_state_type (*get_current_power_state)(void *handle);
+ 	int (*get_fan_speed_rpm)(void *handle, uint32_t *rpm);
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index bdacc0a7b61d5..078aaaa531628 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -458,6 +458,34 @@ int amdgpu_dpm_read_sensor(struct amdgpu_device *adev, enum amd_pp_sensors senso
+ 	return ret;
+ }
+ 
++int amdgpu_dpm_get_apu_thermal_limit(struct amdgpu_device *adev, uint32_t *limit)
++{
++	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
++	int ret = -EINVAL;
++
++	if (pp_funcs && pp_funcs->get_apu_thermal_limit) {
++		mutex_lock(&adev->pm.mutex);
++		ret = pp_funcs->get_apu_thermal_limit(adev->powerplay.pp_handle, limit);
++		mutex_unlock(&adev->pm.mutex);
++	}
++
++	return ret;
++}
++
++int amdgpu_dpm_set_apu_thermal_limit(struct amdgpu_device *adev, uint32_t limit)
++{
++	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
++	int ret = -EINVAL;
++
++	if (pp_funcs && pp_funcs->set_apu_thermal_limit) {
++		mutex_lock(&adev->pm.mutex);
++		ret = pp_funcs->set_apu_thermal_limit(adev->powerplay.pp_handle, limit);
++		mutex_unlock(&adev->pm.mutex);
++	}
++
++	return ret;
++}
++
+ void amdgpu_dpm_compute_clocks(struct amdgpu_device *adev)
+ {
+ 	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index 5da7236ca203f..f7eacf29a1256 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -1683,6 +1683,82 @@ static ssize_t amdgpu_set_thermal_throttling_logging(struct device *dev,
+ 	return count;
+ }
+ 
++/**
++ * DOC: apu_thermal_cap
++ *
++ * The amdgpu driver provides a sysfs API for retrieving/updating thermal
++ * limit temperature in millidegrees Celsius
++ *
++ * Reading back the file shows you core limit value
++ *
++ * Writing an integer to the file, sets a new thermal limit. The value
++ * should be between 0 and 100. If the value is less than 0 or greater
++ * than 100, then the write request will be ignored.
++ */
++static ssize_t amdgpu_get_apu_thermal_cap(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	int ret, size;
++	u32 limit;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	ret = pm_runtime_get_sync(ddev->dev);
++	if (ret < 0) {
++		pm_runtime_put_autosuspend(ddev->dev);
++		return ret;
++	}
++
++	ret = amdgpu_dpm_get_apu_thermal_limit(adev, &limit);
++	if (!ret)
++		size = sysfs_emit(buf, "%u\n", limit);
++	else
++		size = sysfs_emit(buf, "failed to get thermal limit\n");
++
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
++
++	return size;
++}
++
++static ssize_t amdgpu_set_apu_thermal_cap(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf,
++					 size_t count)
++{
++	int ret;
++	u32 value;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	ret = kstrtou32(buf, 10, &value);
++	if (ret)
++		return ret;
++
++	if (value < 0 || value > 100) {
++		dev_err(dev, "Invalid argument !\n");
++		return -EINVAL;
++	}
++
++	ret = pm_runtime_get_sync(ddev->dev);
++	if (ret < 0) {
++		pm_runtime_put_autosuspend(ddev->dev);
++		return ret;
++	}
++
++	ret = amdgpu_dpm_set_apu_thermal_limit(adev, value);
++	if (ret) {
++		dev_err(dev, "failed to update thermal limit\n");
++		return ret;
++	}
++
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
++
++	return count;
++}
++
+ /**
+  * DOC: gpu_metrics
+  *
+@@ -1935,6 +2011,7 @@ static struct amdgpu_device_attr amdgpu_device_attrs[] = {
+ 	AMDGPU_DEVICE_ATTR_RW(pp_features,				ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+ 	AMDGPU_DEVICE_ATTR_RO(unique_id,				ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+ 	AMDGPU_DEVICE_ATTR_RW(thermal_throttling_logging,		ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
++	AMDGPU_DEVICE_ATTR_RW(apu_thermal_cap,				ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+ 	AMDGPU_DEVICE_ATTR_RO(gpu_metrics,				ATTR_FLAG_BASIC|ATTR_FLAG_ONEVF),
+ 	AMDGPU_DEVICE_ATTR_RO(smartshift_apu_power,			ATTR_FLAG_BASIC,
+ 			      .attr_update = ss_power_attr_update),
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+index 16addceca68ff..d178f3f440816 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+@@ -369,6 +369,9 @@ struct amdgpu_pm {
+ int amdgpu_dpm_read_sensor(struct amdgpu_device *adev, enum amd_pp_sensors sensor,
+ 			   void *data, uint32_t *size);
+ 
++int amdgpu_dpm_get_apu_thermal_limit(struct amdgpu_device *adev, uint32_t *limit);
++int amdgpu_dpm_set_apu_thermal_limit(struct amdgpu_device *adev, uint32_t limit);
++
+ int amdgpu_dpm_set_powergating_by_smu(struct amdgpu_device *adev,
+ 				      uint32_t block_type, bool gate);
+ 
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 485c054b681f6..91ccfaa24ed2f 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -2566,6 +2566,28 @@ static int smu_read_sensor(void *handle,
+ 	return ret;
+ }
+ 
++static int smu_get_apu_thermal_limit(void *handle, uint32_t *limit)
++{
++	int ret = -EINVAL;
++	struct smu_context *smu = handle;
++
++	if (smu->ppt_funcs && smu->ppt_funcs->get_apu_thermal_limit)
++		ret = smu->ppt_funcs->get_apu_thermal_limit(smu, limit);
++
++	return ret;
++}
++
++static int smu_set_apu_thermal_limit(void *handle, uint32_t limit)
++{
++	int ret = -EINVAL;
++	struct smu_context *smu = handle;
++
++	if (smu->ppt_funcs && smu->ppt_funcs->set_apu_thermal_limit)
++		ret = smu->ppt_funcs->set_apu_thermal_limit(smu, limit);
++
++	return ret;
++}
++
+ static int smu_get_power_profile_mode(void *handle, char *buf)
+ {
+ 	struct smu_context *smu = handle;
+@@ -3067,6 +3089,8 @@ static const struct amd_pm_funcs swsmu_pm_funcs = {
+ 	.emit_clock_levels       = smu_emit_ppclk_levels,
+ 	.force_performance_level = smu_force_performance_level,
+ 	.read_sensor             = smu_read_sensor,
++	.get_apu_thermal_limit       = smu_get_apu_thermal_limit,
++	.set_apu_thermal_limit       = smu_set_apu_thermal_limit,
+ 	.get_performance_level   = smu_get_performance_level,
+ 	.get_current_power_state = smu_get_current_power_state,
+ 	.get_fan_speed_rpm       = smu_get_fan_speed_rpm,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+index 2a03d85bf4e2d..09469c750a96b 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+@@ -721,6 +721,18 @@ struct pptable_funcs {
+ 	int (*read_sensor)(struct smu_context *smu, enum amd_pp_sensors sensor,
+ 			   void *data, uint32_t *size);
+ 
++	/**
++	 * @get_apu_thermal_limit: get apu core limit from smu
++	 * &limit: current limit temperature in millidegrees Celsius
++	 */
++	int (*get_apu_thermal_limit)(struct smu_context *smu, uint32_t *limit);
++
++	/**
++	 * @set_apu_thermal_limit: update all controllers with new limit
++	 * &limit: limit temperature to be setted, in millidegrees Celsius
++	 */
++	int (*set_apu_thermal_limit)(struct smu_context *smu, uint32_t limit);
++
+ 	/**
+ 	 * @pre_display_config_changed: Prepare GPU for a display configuration
+ 	 *                              change.
+-- 
+2.25.1
+

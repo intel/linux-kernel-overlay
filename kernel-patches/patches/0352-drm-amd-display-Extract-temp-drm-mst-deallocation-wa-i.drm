@@ -1,0 +1,204 @@
+From 1c67c5e747fa4e5c9fa415c1db9347497e706945 Mon Sep 17 00:00:00 2001
+From: Wenjing Liu <wenjing.liu@amd.com>
+Date: Thu, 26 Jan 2023 15:51:14 -0500
+Subject: [PATCH 0352/2351] drm/amd/display: Extract temp drm mst deallocation
+ wa into its own function
+
+[why]
+A recent change was made to implement temporary workaround due DRM
+update in MST interfaces. The workaround is added into our generic
+deallocation MST sequence.
+
+This ticket is to extract this temporary workaround into its own function so
+it is differentiated from our generic sequence.
+
+Reviewed-by: Jerry Zuo <Jerry.Zuo@amd.com>
+Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+Signed-off-by: Wenjing Liu <wenjing.liu@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 17 ++++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  1 +
+ .../gpu/drm/amd/display/dc/link/link_dpms.c   | 95 ++++++++++++++++---
+ 3 files changed, 102 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 43c06fe2ca82e..ea70f5e162637 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -1688,6 +1688,23 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	/* TODO: Remove after DP2 receiver gets proper support of Cable ID feature */
+ 	adev->dm.dc->debug.ignore_cable_id = true;
+ 
++	/* TODO: There is a new drm mst change where the freedom of
++	 * vc_next_start_slot update is revoked/moved into drm, instead of in
++	 * driver. This forces us to make sure to get vc_next_start_slot updated
++	 * in drm function each time without considering if mst_state is active
++	 * or not. Otherwise, next time hotplug will give wrong start_slot
++	 * number. We are implementing a temporary solution to even notify drm
++	 * mst deallocation when link is no longer of MST type when uncommitting
++	 * the stream so we will have more time to work on a proper solution.
++	 * Ideally when dm_helpers_dp_mst_stop_top_mgr message is triggered, we
++	 * should notify drm to do a complete "reset" of its states and stop
++	 * calling further drm mst functions when link is no longer of an MST
++	 * type. This could happen when we unplug an MST hubs/displays. When
++	 * uncommit stream comes later after unplug, we should just reset
++	 * hardware states only.
++	 */
++	adev->dm.dc->debug.temp_mst_deallocation_sequence = true;
++
+ 	if (adev->dm.dc->caps.dp_hdmi21_pcon_support)
+ 		DRM_INFO("DP-HDMI FRL PCON supported\n");
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index cb7e5b16d9be5..a7df4d4e7749f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -875,6 +875,7 @@ struct dc_debug_options {
+ 	unsigned int min_prefetch_in_strobe_ns;
+ 	bool disable_unbounded_requesting;
+ 	bool dig_fifo_off_in_blank;
++	bool temp_mst_deallocation_sequence;
+ };
+ 
+ struct gpu_info_soc_bounding_box_v1_0;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index aa119a90cc565..618fd552cb3d3 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -1185,7 +1185,8 @@ static void remove_stream_from_alloc_table(
+ 	}
+ }
+ 
+-static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
++static enum dc_status deallocate_mst_payload_with_temp_drm_wa(
++		struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc_stream_state *stream = pipe_ctx->stream;
+ 	struct dc_link *link = stream->link;
+@@ -1194,11 +1195,90 @@ static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
+ 	int i;
+ 	bool mst_mode = (link->type == dc_connection_mst_branch);
+ 	/* adjust for drm changes*/
+-	bool update_drm_mst_state = true;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
+ 	const struct dc_link_settings empty_link_settings = {0};
+ 	DC_LOGGER_INIT(link->ctx->logger);
+ 
++	if (link_hwss->ext.set_throttled_vcp_size)
++		link_hwss->ext.set_throttled_vcp_size(pipe_ctx, avg_time_slots_per_mtp);
++	if (link_hwss->ext.set_hblank_min_symbol_width)
++		link_hwss->ext.set_hblank_min_symbol_width(pipe_ctx,
++				&empty_link_settings,
++				avg_time_slots_per_mtp);
++
++	if (dm_helpers_dp_mst_write_payload_allocation_table(
++			stream->ctx,
++			stream,
++			&proposed_table,
++			false))
++		update_mst_stream_alloc_table(
++				link,
++				pipe_ctx->stream_res.stream_enc,
++				pipe_ctx->stream_res.hpo_dp_stream_enc,
++				&proposed_table);
++	else
++		DC_LOG_WARNING("Failed to update"
++				"MST allocation table for"
++				"pipe idx:%d\n",
++				pipe_ctx->pipe_idx);
++
++	DC_LOG_MST("%s"
++			"stream_count: %d: ",
++			__func__,
++			link->mst_stream_alloc_table.stream_count);
++
++	for (i = 0; i < MAX_CONTROLLER_NUM; i++) {
++		DC_LOG_MST("stream_enc[%d]: %p      "
++		"stream[%d].hpo_dp_stream_enc: %p      "
++		"stream[%d].vcp_id: %d      "
++		"stream[%d].slot_count: %d\n",
++		i,
++		(void *) link->mst_stream_alloc_table.stream_allocations[i].stream_enc,
++		i,
++		(void *) link->mst_stream_alloc_table.stream_allocations[i].hpo_dp_stream_enc,
++		i,
++		link->mst_stream_alloc_table.stream_allocations[i].vcp_id,
++		i,
++		link->mst_stream_alloc_table.stream_allocations[i].slot_count);
++	}
++
++	if (link_hwss->ext.update_stream_allocation_table == NULL ||
++			link_dp_get_encoding_format(&link->cur_link_settings) == DP_UNKNOWN_ENCODING) {
++		DC_LOG_DEBUG("Unknown encoding format\n");
++		return DC_ERROR_UNEXPECTED;
++	}
++
++	link_hwss->ext.update_stream_allocation_table(link, &pipe_ctx->link_res,
++			&link->mst_stream_alloc_table);
++
++	if (mst_mode) {
++		dm_helpers_dp_mst_poll_for_allocation_change_trigger(
++			stream->ctx,
++			stream);
++	}
++
++	dm_helpers_dp_mst_send_payload_allocation(
++			stream->ctx,
++			stream,
++			false);
++
++	return DC_OK;
++}
++
++static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
++{
++	struct dc_stream_state *stream = pipe_ctx->stream;
++	struct dc_link *link = stream->link;
++	struct dc_dp_mst_stream_allocation_table proposed_table = {0};
++	struct fixed31_32 avg_time_slots_per_mtp = dc_fixpt_from_int(0);
++	int i;
++	bool mst_mode = (link->type == dc_connection_mst_branch);
++	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
++	const struct dc_link_settings empty_link_settings = {0};
++	DC_LOGGER_INIT(link->ctx->logger);
++
++	if (link->dc->debug.temp_mst_deallocation_sequence)
++		return deallocate_mst_payload_with_temp_drm_wa(pipe_ctx);
+ 
+ 	/* deallocate_mst_payload is called before disable link. When mode or
+ 	 * disable/enable monitor, new stream is created which is not in link
+@@ -1215,7 +1295,7 @@ static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
+ 				&empty_link_settings,
+ 				avg_time_slots_per_mtp);
+ 
+-	if (mst_mode || update_drm_mst_state) {
++	if (mst_mode) {
+ 		/* when link is in mst mode, reply on mst manager to remove
+ 		 * payload
+ 		 */
+@@ -1277,19 +1357,12 @@ static enum dc_status deallocate_mst_payload(struct pipe_ctx *pipe_ctx)
+ 			stream->ctx,
+ 			stream);
+ 
+-		if (!update_drm_mst_state)
+-			dm_helpers_dp_mst_send_payload_allocation(
++		dm_helpers_dp_mst_send_payload_allocation(
+ 				stream->ctx,
+ 				stream,
+ 				false);
+ 	}
+ 
+-	if (update_drm_mst_state)
+-		dm_helpers_dp_mst_send_payload_allocation(
+-			stream->ctx,
+-			stream,
+-			false);
+-
+ 	return DC_OK;
+ }
+ 
+-- 
+2.25.1
+

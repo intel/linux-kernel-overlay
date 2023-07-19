@@ -1,0 +1,99 @@
+From 607886d640962b15a0885a2dbb5fe17536009aa9 Mon Sep 17 00:00:00 2001
+From: Mukul Joshi <mukul.joshi@amd.com>
+Date: Tue, 11 Apr 2023 16:32:38 -0400
+Subject: [PATCH 1526/2351] drm/amdgpu: Rework retry fault removal
+
+Rework retry fault removal from the software filter by
+storing an expired timestamp for a fault that is being removed.
+When a new fault comes, and it matches an entry in the sw filter,
+it will be added as a new fault only when its timestamp is greater
+than the timestamp expiry of the fault in the sw filter.
+This helps in avoiding stale faults being added back into the
+filter and preventing legitimate faults from being handled.
+
+Suggested-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Mukul Joshi <mukul.joshi@amd.com>
+Reviewed-by: Philip Yang <Philip.Yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 36 ++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |  1 +
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 2168e3f170dda..48ab678199219 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -395,8 +395,21 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
+ 	while (fault->timestamp >= stamp) {
+ 		uint64_t tmp;
+ 
+-		if (atomic64_read(&fault->key) == key)
+-			return true;
++		if (atomic64_read(&fault->key) == key) {
++			/*
++			 * if we get a fault which is already present in
++			 * the fault_ring and the timestamp of
++			 * the fault is after the expired timestamp,
++			 * then this is a new fault that needs to be added
++			 * into the fault ring.
++			 */
++			if (fault->timestamp_expiry != 0 &&
++			    amdgpu_ih_ts_after(fault->timestamp_expiry,
++					       timestamp))
++				break;
++			else
++				return true;
++		}
+ 
+ 		tmp = fault->timestamp;
+ 		fault = &gmc->fault_ring[fault->next];
+@@ -432,15 +445,32 @@ void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
+ {
+ 	struct amdgpu_gmc *gmc = &adev->gmc;
+ 	uint64_t key = amdgpu_gmc_fault_key(addr, pasid);
++	struct amdgpu_ih_ring *ih;
+ 	struct amdgpu_gmc_fault *fault;
++	uint32_t last_wptr;
++	uint64_t last_ts;
+ 	uint32_t hash;
+ 	uint64_t tmp;
+ 
++	ih = adev->irq.retry_cam_enabled ? &adev->irq.ih_soft : &adev->irq.ih1;
++	/* Get the WPTR of the last entry in IH ring */
++	last_wptr = amdgpu_ih_get_wptr(adev, ih);
++	/* Order wptr with ring data. */
++	rmb();
++	/* Get the timetamp of the last entry in IH ring */
++	last_ts = amdgpu_ih_decode_iv_ts(adev, ih, last_wptr, -1);
++
+ 	hash = hash_64(key, AMDGPU_GMC_FAULT_HASH_ORDER);
+ 	fault = &gmc->fault_ring[gmc->fault_hash[hash].idx];
+ 	do {
+-		if (atomic64_cmpxchg(&fault->key, key, 0) == key)
++		if (atomic64_read(&fault->key) == key) {
++			/*
++			 * Update the timestamp when this fault
++			 * expired.
++			 */
++			fault->timestamp_expiry = last_ts;
+ 			break;
++		}
+ 
+ 		tmp = fault->timestamp;
+ 		fault = &gmc->fault_ring[fault->next];
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 232523e3e2708..6d105d7fb98bb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -70,6 +70,7 @@ struct amdgpu_gmc_fault {
+ 	uint64_t	timestamp:48;
+ 	uint64_t	next:AMDGPU_GMC_FAULT_RING_ORDER;
+ 	atomic64_t	key;
++	uint64_t	timestamp_expiry:48;
+ };
+ 
+ /*
+-- 
+2.25.1
+

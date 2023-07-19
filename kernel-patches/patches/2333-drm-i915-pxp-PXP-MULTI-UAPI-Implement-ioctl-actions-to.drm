@@ -1,0 +1,926 @@
+From aa985f9124e10e039949254e342d60a4e90968ca Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Wed, 28 Apr 2021 10:08:54 -0700
+Subject: [PATCH 2333/2351] drm/i915/pxp:[PXP-MULTI-UAPI] Implement ioctl
+ actions to manage a user session
+
+This patch allows a user to reserve and manage a PXP session. Creating
+a session requires a 3-way handshake between i915, userspace and CSME/GSC
+firmware, which follows these steps:
+
+1 - user reserves a session ID with i915.
+2 - user starts the session with CSME/GSC.
+3 - user notifies i915 that the session has been started.
+
+Destroyng a session requires a submission to the HW, which is performed
+by i915 upon receiving the ioctl call from the user.
+
+All sessions are terminated and the relevand IDs released when a
+termination interrupt is received.
+
+v2: check against drm_file when setting session in play (Alan)
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Acked-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Acked-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/i915/i915_driver.c           |   1 +
+ drivers/gpu/drm/i915/i915_drv.h              |   8 +
+ drivers/gpu/drm/i915/pxp/intel_pxp.c         | 120 ++++++++-
+ drivers/gpu/drm/i915/pxp/intel_pxp.h         |   4 +
+ drivers/gpu/drm/i915/pxp/intel_pxp_cmd.c     |   8 +-
+ drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h     |   8 +-
+ drivers/gpu/drm/i915/pxp/intel_pxp_pm.c      |   2 +-
+ drivers/gpu/drm/i915/pxp/intel_pxp_regs.h    |   4 +
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.c | 250 ++++++++++++++++++-
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.h |  48 ++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_types.h   |  39 ++-
+ include/uapi/drm/i915_drm.h                  |   2 +
+ include/uapi/drm/i915_drm_prelim.h           |  76 ++++++
+ 13 files changed, 539 insertions(+), 31 deletions(-)
+ create mode 100644 include/uapi/drm/i915_drm_prelim.h
+
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 0ad0c5885ec27..3209bce52a19f 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -1787,6 +1787,7 @@ static const struct drm_ioctl_desc i915_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(I915_QUERY, i915_query_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_VM_CREATE, i915_gem_vm_create_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(I915_GEM_VM_DESTROY, i915_gem_vm_destroy_ioctl, DRM_RENDER_ALLOW),
++	PRELIM_DRM_IOCTL_DEF_DRV(I915_PXP_OPS, i915_pxp_ops_ioctl, DRM_RENDER_ALLOW),
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 50f3ed7ee0790..ac487e0577687 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -389,6 +389,14 @@ static inline struct intel_gt *to_gt(struct drm_i915_private *i915)
+ 	return &i915->gt0;
+ }
+ 
++#define PRELIM_DRM_IOCTL_DEF_DRV(ioctl, _func, _flags)			\
++	[DRM_IOCTL_NR(PRELIM_DRM_IOCTL_##ioctl) - DRM_COMMAND_BASE] = {	\
++		.cmd = PRELIM_DRM_IOCTL_##ioctl,			\
++		.func = _func,						\
++		.flags = _flags,					\
++		.name = #ioctl						\
++	}
++
+ /* Simple iterator over all initialised engines */
+ #define for_each_engine(engine__, gt__, id__) \
+ 	for ((id__) = 0; \
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index bb2e15329f346..e25d62a8d3063 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -59,7 +59,7 @@ bool intel_pxp_is_enabled(const struct intel_pxp *pxp)
+ 
+ bool intel_pxp_is_active(const struct intel_pxp *pxp)
+ {
+-	return IS_ENABLED(CONFIG_DRM_I915_PXP) && pxp && pxp->arb_is_valid;
++	return IS_ENABLED(CONFIG_DRM_I915_PXP) && pxp && pxp->arb_session.is_valid;
+ }
+ 
+ static void kcr_pxp_set_status(const struct intel_pxp *pxp, bool enable)
+@@ -138,7 +138,7 @@ static void pxp_init_full(struct intel_pxp *pxp)
+ 
+ 	ret = create_vcs_context(pxp);
+ 	if (ret)
+-		return;
++		goto out_session;
+ 
+ 	if (HAS_ENGINE(pxp->ctrl_gt, GSC0))
+ 		ret = intel_pxp_gsccs_init(pxp);
+@@ -153,6 +153,8 @@ static void pxp_init_full(struct intel_pxp *pxp)
+ 
+ out_context:
+ 	destroy_vcs_context(pxp);
++out_session:
++	intel_pxp_session_management_fini(pxp);
+ }
+ 
+ static struct intel_gt *find_gt_for_required_teelink(struct drm_i915_private *i915)
+@@ -243,7 +245,7 @@ void intel_pxp_fini(struct drm_i915_private *i915)
+ 	if (!i915->pxp)
+ 		return;
+ 
+-	i915->pxp->arb_is_valid = false;
++	i915->pxp->arb_session.is_valid = false;
+ 
+ 	if (HAS_ENGINE(i915->pxp->ctrl_gt, GSC0))
+ 		intel_pxp_gsccs_fini(i915->pxp);
+@@ -252,13 +254,15 @@ void intel_pxp_fini(struct drm_i915_private *i915)
+ 
+ 	destroy_vcs_context(i915->pxp);
+ 
++	intel_pxp_session_management_fini(i915->pxp);
++
+ 	kfree(i915->pxp);
+ 	i915->pxp = NULL;
+ }
+ 
+ void intel_pxp_mark_termination_in_progress(struct intel_pxp *pxp)
+ {
+-	pxp->arb_is_valid = false;
++	pxp->arb_session.is_valid = false;
+ 	reinit_completion(&pxp->termination);
+ }
+ 
+@@ -301,7 +305,7 @@ static int __pxp_global_teardown_final(struct intel_pxp *pxp)
+ {
+ 	int timeout;
+ 
+-	if (!pxp->arb_is_valid)
++	if (!pxp->arb_session.is_valid)
+ 		return 0;
+ 	/*
+ 	 * To ensure synchronous and coherent session teardown completion
+@@ -322,7 +326,7 @@ static int __pxp_global_teardown_restart(struct intel_pxp *pxp)
+ {
+ 	int timeout;
+ 
+-	if (pxp->arb_is_valid)
++	if (pxp->arb_session.is_valid)
+ 		return 0;
+ 	/*
+ 	 * The arb-session is currently inactive and we are doing a reset and restart
+@@ -402,7 +406,7 @@ int intel_pxp_start(struct intel_pxp *pxp)
+ 	/* make sure the compiler doesn't optimize the double access */
+ 	barrier();
+ 
+-	if (!pxp->arb_is_valid)
++	if (!pxp->arb_session.is_valid)
+ 		ret = -EIO;
+ 
+ unlock:
+@@ -500,3 +504,105 @@ void intel_pxp_invalidate(struct intel_pxp *pxp)
+ 	}
+ 	spin_unlock_irq(&i915->gem.contexts.lock);
+ }
++
++#ifdef CONFIG_DRM_I915_PXP
++static int pxp_set_session_status(struct intel_pxp *pxp,
++				  struct prelim_drm_i915_pxp_ops *pxp_ops,
++				  struct drm_file *drmfile)
++{
++	struct prelim_drm_i915_pxp_set_session_status_params params;
++	struct prelim_drm_i915_pxp_set_session_status_params __user *uparams =
++		u64_to_user_ptr(pxp_ops->params);
++	int ret = 0;
++
++	if (copy_from_user(&params, uparams, sizeof(params)) != 0)
++		return -EFAULT;
++
++	switch (params.req_session_state) {
++	case PRELIM_DRM_I915_PXP_REQ_SESSION_ID_INIT:
++		ret = intel_pxp_sm_ioctl_reserve_session(pxp, drmfile,
++							 params.session_mode,
++							 &params.pxp_tag);
++		break;
++	case PRELIM_DRM_I915_PXP_REQ_SESSION_IN_PLAY:
++		ret = intel_pxp_sm_ioctl_mark_session_in_play(pxp, drmfile,
++							      params.pxp_tag);
++		break;
++	case PRELIM_DRM_I915_PXP_REQ_SESSION_TERMINATE:
++		ret = intel_pxp_sm_ioctl_terminate_session(pxp, drmfile,
++							   params.pxp_tag);
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++	if (ret >= 0) {
++		pxp_ops->status = ret;
++
++		if (copy_to_user(uparams, &params, sizeof(params)))
++			ret = -EFAULT;
++		else
++			ret = 0;
++	}
++
++	return ret;
++}
++
++int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile)
++{
++	int ret = 0;
++	struct prelim_drm_i915_pxp_ops *pxp_ops = data;
++	struct drm_i915_private *i915 = to_i915(dev);
++	struct intel_pxp *pxp = i915->pxp;
++	intel_wakeref_t wakeref;
++
++	if (!intel_pxp_is_enabled(pxp))
++		return -ENODEV;
++
++	/* At the moment, we only support multi-session on pre-MTL */
++	if (HAS_ENGINE(pxp->ctrl_gt, GSC0))
++		return -ENODEV;
++
++	wakeref = intel_runtime_pm_get_if_in_use(&i915->runtime_pm);
++	if (!wakeref) {
++		drm_dbg(&i915->drm, "pxp ioctl blocked due to state in suspend\n");
++		pxp_ops->status = PRELIM_DRM_I915_PXP_OP_STATUS_SESSION_NOT_AVAILABLE;
++		return 0;
++	}
++
++	if (!intel_pxp_is_active(pxp)) {
++		ret = intel_pxp_start(pxp);
++		if (ret)
++			goto out_pm;
++	}
++
++	mutex_lock(&pxp->session_mutex);
++
++	if (pxp->hw_state_invalidated) {
++		drm_dbg(&i915->drm, "pxp ioctl retry required due to state attacked\n");
++		pxp_ops->status = PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
++		goto out_unlock;
++	}
++
++	switch (pxp_ops->action) {
++	case PRELIM_DRM_I915_PXP_ACTION_SET_SESSION_STATUS:
++		ret = pxp_set_session_status(pxp, pxp_ops, drmfile);
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++out_unlock:
++	mutex_unlock(&pxp->session_mutex);
++out_pm:
++	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
++
++	return ret;
++}
++
++#else
++int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile)
++{
++	return -ENODEV;
++}
++#endif
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.h b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+index 17254c3f1267a..3203cbac452ec 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+@@ -9,6 +9,9 @@
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ 
++struct drm_device;
++struct drm_file;
++
+ struct drm_i915_gem_object;
+ struct drm_i915_private;
+ struct intel_pxp;
+@@ -36,5 +39,6 @@ int intel_pxp_key_check(struct intel_pxp *pxp,
+ 			bool assign);
+ 
+ void intel_pxp_invalidate(struct intel_pxp *pxp);
++int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile);
+ 
+ #endif /* __INTEL_PXP_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.c b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.c
+index 0eee51c4a772c..8fee979deec47 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.c
+@@ -94,11 +94,12 @@ static void pxp_request_commit(struct i915_request *rq)
+ 	mutex_unlock(&tl->mutex);
+ }
+ 
+-int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
++int intel_pxp_terminate_sessions(struct intel_pxp *pxp, long mask)
+ {
+ 	struct i915_request *rq;
+ 	struct intel_context *ce = pxp->ce;
+ 	u32 *cs;
++	int idx;
+ 	int err = 0;
+ 
+ 	if (!intel_pxp_is_enabled(pxp))
+@@ -114,13 +115,14 @@ int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
+ 			goto out_rq;
+ 	}
+ 
+-	cs = intel_ring_begin(rq, SESSION_TERMINATION_LEN(1) + WAIT_LEN);
++	cs = intel_ring_begin(rq, SESSION_TERMINATION_LEN(hweight32(mask)) + WAIT_LEN);
+ 	if (IS_ERR(cs)) {
+ 		err = PTR_ERR(cs);
+ 		goto out_rq;
+ 	}
+ 
+-	cs = pxp_emit_session_termination(cs, id);
++	for_each_set_bit(idx, &mask, INTEL_PXP_MAX_HWDRM_SESSIONS)
++		cs = pxp_emit_session_termination(cs, idx);
+ 	cs = pxp_emit_wait(cs);
+ 
+ 	intel_ring_advance(rq, cs);
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
+index 6d62995435783..8c35bd5cb5782 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
+@@ -6,10 +6,16 @@
+ #ifndef __INTEL_PXP_CMD_H__
+ #define __INTEL_PXP_CMD_H__
+ 
++#include <linux/bits.h>
+ #include <linux/types.h>
+ 
+ struct intel_pxp;
+ 
+-int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 idx);
++int intel_pxp_terminate_sessions(struct intel_pxp *pxp, long mask);
++
++static inline int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
++{
++	return intel_pxp_terminate_sessions(pxp, BIT(id));
++}
+ 
+ #endif /* __INTEL_PXP_CMD_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_pm.c b/drivers/gpu/drm/i915/pxp/intel_pxp_pm.c
+index 1a04067f61fc7..cd92fefbd4123 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_pm.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_pm.c
+@@ -56,7 +56,7 @@ void intel_pxp_runtime_suspend(struct intel_pxp *pxp)
+ 	if (!intel_pxp_is_enabled(pxp))
+ 		return;
+ 
+-	pxp->arb_is_valid = false;
++	pxp->arb_session.is_valid = false;
+ 
+ 	intel_pxp_fini_hw(pxp);
+ 
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_regs.h b/drivers/gpu/drm/i915/pxp/intel_pxp_regs.h
+index a9e7e6efa4c79..9e5fcf156f479 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_regs.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_regs.h
+@@ -24,4 +24,8 @@
+ /* PXP global terminate register for session termination */
+ #define KCR_GLOBAL_TERMINATE(base) _MMIO((base) + 0xf8)
+ 
++/* KCR status registers */
++#define KCR_STATUS_1(base)   _MMIO((base) + 0xf4)
++#define KCR_STATUS_1_ATTACK_MASK 0x80000000
++
+ #endif /* __INTEL_PXP_REGS_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+index 0a3e66b0265e8..2a10b5b4dc99f 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+@@ -13,9 +13,7 @@
+ #include "intel_pxp_types.h"
+ #include "intel_pxp_regs.h"
+ 
+-#define ARB_SESSION I915_PROTECTED_CONTENT_DEFAULT_SESSION /* shorter define */
+-
+-static bool intel_pxp_session_is_in_play(struct intel_pxp *pxp, u32 id)
++bool intel_pxp_session_is_in_play(struct intel_pxp *pxp, u32 id)
+ {
+ 	struct intel_uncore *uncore = pxp->ctrl_gt->uncore;
+ 	intel_wakeref_t wakeref;
+@@ -51,12 +49,198 @@ static int pxp_wait_for_session_state(struct intel_pxp *pxp, u32 id, bool in_pla
+ 	return ret;
+ }
+ 
++/**
++ * is_hwdrm_session_attacked - To check if hwdrm active sessions are attacked.
++ * @pxp: pointer pxp struct
++ *
++ * Return: true if hardware sessions is attacked, false otherwise.
++ */
++static bool is_hwdrm_session_attacked(struct intel_pxp *pxp)
++{
++	u32 regval = 0;
++	intel_wakeref_t wakeref;
++	struct intel_uncore *uncore = pxp->ctrl_gt->uncore;
++
++	if (pxp->hw_state_invalidated)
++		return true;
++
++	with_intel_runtime_pm(uncore->rpm, wakeref)
++		regval = intel_uncore_read(uncore, KCR_STATUS_1(pxp->kcr_base));
++
++	return regval & KCR_STATUS_1_ATTACK_MASK;
++}
++
++static void __init_session_entry(struct intel_pxp_session *session,
++				 struct drm_file *drmfile,
++				 int protection_mode, int session_index)
++{
++	session->protection_mode = protection_mode;
++	session->index = session_index;
++	session->is_valid = false;
++	session->drmfile = drmfile;
++}
++
++/**
++ * create_session_entry - Create a new session entry with provided info.
++ * @pxp: pointer to pxp struct
++ * @drmfile: pointer to drm_file
++ * @session_index: Numeric session identifier.
++ *
++ * Return: status. 0 means creation is successful.
++ */
++static int create_session_entry(struct intel_pxp *pxp, struct drm_file *drmfile,
++				int protection_mode, int session_index)
++{
++	struct intel_pxp_session *session = NULL;
++
++	if (pxp->hwdrm_sessions[session_index])
++		return -EEXIST;
++
++	session = kzalloc(sizeof(*session), GFP_KERNEL);
++	if (!session)
++		return -ENOMEM;
++
++	__init_session_entry(session, drmfile, protection_mode, session_index);
++
++	pxp->hwdrm_sessions[session_index] = session;
++	set_bit(session_index, pxp->reserved_sessions);
++
++	return 0;
++}
++
++static void free_session_entry(struct intel_pxp *pxp, int session_index)
++{
++	if (!pxp->hwdrm_sessions[session_index])
++		return;
++
++	clear_bit(session_index, pxp->reserved_sessions);
++	kfree(fetch_and_zero(&pxp->hwdrm_sessions[session_index]));
++}
++
++static void pxp_init_arb_session(struct intel_pxp *pxp)
++{
++	__init_session_entry(&pxp->arb_session, NULL, PRELIM_DRM_I915_PXP_MODE_HM, ARB_SESSION);
++	pxp->hwdrm_sessions[ARB_SESSION] = &pxp->arb_session;
++	set_bit(ARB_SESSION, pxp->reserved_sessions);
++}
++
++static void pxp_fini_arb_session(struct intel_pxp *pxp)
++{
++	pxp->hwdrm_sessions[ARB_SESSION] = NULL;
++	clear_bit(ARB_SESSION, pxp->reserved_sessions);
++}
++
++/**
++ * intel_pxp_sm_ioctl_reserve_session - To reserve an available protected session.
++ * @pxp: pointer to pxp struct
++ * @drmfile: pointer to drm_file.
++ * @pxp_tag: Numeric session identifier returned back to caller.
++ *
++ * Return: status. 0 means reserve is successful.
++ */
++int intel_pxp_sm_ioctl_reserve_session(struct intel_pxp *pxp, struct drm_file *drmfile,
++				       int protection_mode, u32 *pxp_tag)
++{
++	int ret;
++	int idx = 0;
++
++	if (!drmfile || !pxp_tag)
++		return -EINVAL;
++
++	lockdep_assert_held(&pxp->session_mutex);
++
++	/* check if sessions are under attack. if so, don't allow creation */
++	if (is_hwdrm_session_attacked(pxp))
++		return -EPERM;
++
++	if (protection_mode < PRELIM_DRM_I915_PXP_MODE_LM ||
++	    protection_mode > PRELIM_DRM_I915_PXP_MODE_SM)
++		return -EINVAL;
++
++	idx = find_first_zero_bit(pxp->reserved_sessions,
++				  INTEL_PXP_MAX_HWDRM_SESSIONS);
++	if (idx >= INTEL_PXP_MAX_HWDRM_SESSIONS)
++		return PRELIM_DRM_I915_PXP_OP_STATUS_SESSION_NOT_AVAILABLE;
++
++	ret = pxp_wait_for_session_state(pxp, idx, false);
++	if (ret)
++		return PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
++
++	ret = create_session_entry(pxp, drmfile,
++				   protection_mode, idx);
++	*pxp_tag = idx;
++
++	return ret;
++}
++
++/**
++ * intel_pxp_sm_ioctl_terminate_session - To terminate an active HW session and free its entry.
++ * @pxp: pointer to pxp struct.
++ * @drmfile: drm_file of the app issuing the termination
++ * @session_id: Session identifier of the session, containing type and index info
++ *
++ * Return: 0 means terminate is successful, or didn't find the desired session.
++ */
++int intel_pxp_sm_ioctl_terminate_session(struct intel_pxp *pxp,
++					 struct drm_file *drmfile,
++					 int session_id)
++{
++	int ret;
++
++	lockdep_assert_held(&pxp->session_mutex);
++
++	if (session_id >= INTEL_PXP_MAX_HWDRM_SESSIONS)
++		return -EINVAL;
++
++	if (!pxp->hwdrm_sessions[session_id])
++		return 0;
++
++	if (pxp->hwdrm_sessions[session_id]->drmfile != drmfile)
++		return -EPERM;
++
++	ret = intel_pxp_terminate_session(pxp, session_id);
++	if (ret)
++		return ret;
++
++	free_session_entry(pxp, session_id);
++
++	return 0;
++}
++
++/**
++ * intel_pxp_sm_ioctl_mark_session_in_play - Put an reserved session to "in_play" state
++ * @pxp: pointer to pxp struct
++ * @drmfile: drm_file of the app marking the session as in play
++ * @session_id: Session identifier of the session, containing type and index info
++ *
++ * Return: status. 0 means update is successful.
++ */
++int intel_pxp_sm_ioctl_mark_session_in_play(struct intel_pxp *pxp,
++					    struct drm_file *drmfile,
++					    u32 session_id)
++{
++	lockdep_assert_held(&pxp->session_mutex);
++
++	if (session_id >= INTEL_PXP_MAX_HWDRM_SESSIONS)
++		return -EINVAL;
++
++	if (!pxp->hwdrm_sessions[session_id])
++		return -EINVAL;
++
++	if (pxp->hwdrm_sessions[session_id]->drmfile != drmfile)
++		return -EPERM;
++
++	pxp->hwdrm_sessions[session_id]->is_valid = true;
++
++	return 0;
++}
++
+ static int pxp_create_arb_session(struct intel_pxp *pxp)
+ {
+ 	struct intel_gt *gt = pxp->ctrl_gt;
+ 	int ret;
+ 
+-	pxp->arb_is_valid = false;
++	pxp->arb_session.is_valid = false;
+ 
+ 	if (intel_pxp_session_is_in_play(pxp, ARB_SESSION)) {
+ 		drm_err(&gt->i915->drm, "arb session already in play at creation time\n");
+@@ -82,30 +266,65 @@ static int pxp_create_arb_session(struct intel_pxp *pxp)
+ 	if (!++pxp->key_instance)
+ 		++pxp->key_instance;
+ 
+-	pxp->arb_is_valid = true;
++	pxp->arb_session.is_valid = true;
++
++	return 0;
++}
++
++static int pxp_terminate_all_sessions(struct intel_pxp *pxp)
++{
++	int ret;
++	u32 idx;
++	long mask = 0;
++
++	if (!intel_pxp_is_enabled(pxp))
++		return 0;
++
++	lockdep_assert_held(&pxp->session_mutex);
++
++	for_each_set_bit(idx, pxp->reserved_sessions, INTEL_PXP_MAX_HWDRM_SESSIONS) {
++		pxp->hwdrm_sessions[idx]->is_valid = false;
++		mask |= BIT(idx);
++	}
++
++	if (mask) {
++		ret = intel_pxp_terminate_sessions(pxp, mask);
++		if (ret)
++			return ret;
++	}
++
++	for_each_set_bit(idx, pxp->reserved_sessions, INTEL_PXP_MAX_HWDRM_SESSIONS) {
++		/* we don't want to free the arb session! */
++		if (idx == ARB_SESSION)
++			continue;
++
++		free_session_entry(pxp, idx);
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int pxp_terminate_arb_session_and_global(struct intel_pxp *pxp)
++static int pxp_terminate_all_sessions_and_global(struct intel_pxp *pxp)
+ {
+ 	int ret;
+ 	struct intel_gt *gt = pxp->ctrl_gt;
+ 
+ 	/* must mark termination in progress calling this function */
+-	GEM_WARN_ON(pxp->arb_is_valid);
++	GEM_WARN_ON(pxp->arb_session.is_valid);
++
++	mutex_lock(&pxp->session_mutex);
+ 
+ 	/* terminate the hw sessions */
+-	ret = intel_pxp_terminate_session(pxp, ARB_SESSION);
++	ret = pxp_terminate_all_sessions(pxp);
+ 	if (ret) {
+ 		drm_err(&gt->i915->drm, "Failed to submit session termination\n");
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	ret = pxp_wait_for_session_state(pxp, ARB_SESSION, false);
+ 	if (ret) {
+ 		drm_err(&gt->i915->drm, "Session state did not clear\n");
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	intel_uncore_write(gt->uncore, KCR_GLOBAL_TERMINATE(pxp->kcr_base), 1);
+@@ -115,6 +334,8 @@ static int pxp_terminate_arb_session_and_global(struct intel_pxp *pxp)
+ 	else
+ 		intel_pxp_tee_end_arb_fw_session(pxp, ARB_SESSION);
+ 
++out:
++	mutex_unlock(&pxp->session_mutex);
+ 	return ret;
+ }
+ 
+@@ -129,7 +350,7 @@ void intel_pxp_terminate(struct intel_pxp *pxp, bool post_invalidation_needs_res
+ 	 * it to complete. PXP will be marked as non-active until the next
+ 	 * termination is issued.
+ 	 */
+-	ret = pxp_terminate_arb_session_and_global(pxp);
++	ret = pxp_terminate_all_sessions_and_global(pxp);
+ 	if (ret)
+ 		complete_all(&pxp->termination);
+ }
+@@ -179,8 +400,15 @@ static void pxp_session_work(struct work_struct *work)
+ 	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+ }
+ 
++void intel_pxp_session_management_fini(struct intel_pxp *pxp)
++{
++	pxp_fini_arb_session(pxp);
++}
++
+ void intel_pxp_session_management_init(struct intel_pxp *pxp)
+ {
+ 	mutex_init(&pxp->arb_mutex);
+ 	INIT_WORK(&pxp->session_work, pxp_session_work);
++	mutex_init(&pxp->session_mutex);
++	pxp_init_arb_session(pxp);
+ }
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+index ba5788127109f..7097b54b64338 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.h
+@@ -8,18 +8,66 @@
+ 
+ #include <linux/types.h>
+ 
++struct drm_file;
+ struct intel_pxp;
++struct work_struct;
++
++#define ARB_SESSION I915_PROTECTED_CONTENT_DEFAULT_SESSION /* shorter define */
+ 
+ #ifdef CONFIG_DRM_I915_PXP
++void intel_pxp_session_management_fini(struct intel_pxp *pxp);
+ void intel_pxp_session_management_init(struct intel_pxp *pxp);
+ void intel_pxp_terminate(struct intel_pxp *pxp, bool post_invalidation_needs_restart);
++int intel_pxp_sm_ioctl_reserve_session(struct intel_pxp *pxp, struct drm_file *drmfile,
++				       int protection_mode, u32 *pxp_tag);
++int intel_pxp_sm_ioctl_mark_session_in_play(struct intel_pxp *pxp,
++					    struct drm_file *drmfile,
++					    u32 session_id);
++int intel_pxp_sm_ioctl_terminate_session(struct intel_pxp *pxp,
++					 struct drm_file *drmfile,
++					 int session_id);
++
++bool intel_pxp_session_is_in_play(struct intel_pxp *pxp, u32 id);
++
+ #else
+ static inline void intel_pxp_session_management_init(struct intel_pxp *pxp)
+ {
+ }
+ 
++static inline void intel_pxp_session_management_fini(struct intel_pxp *pxp)
++{
++}
++
+ static inline void intel_pxp_terminate(struct intel_pxp *pxp, bool post_invalidation_needs_restart)
+ {
+ }
++
++static inline int intel_pxp_sm_ioctl_reserve_session(struct intel_pxp *pxp,
++						     struct drm_file *drmfile,
++						     int protection_mode,
++						     u32 *pxp_tag)
++{
++	return 0;
++}
++
++static inline int intel_pxp_sm_ioctl_mark_session_in_play(struct intel_pxp *pxp,
++							  struct drm_file *drmfile,
++							  u32 session_id)
++{
++	return 0;
++}
++
++static inline int intel_pxp_sm_ioctl_terminate_session(struct intel_pxp *pxp,
++						       struct drm_file *drmfile,
++						       int session_id)
++{
++	return 0;
++}
++
++static inline bool intel_pxp_session_is_in_play(struct intel_pxp *pxp, u32 id)
++{
++	return false;
++}
+ #endif
++
+ #endif /* __INTEL_PXP_SESSION_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+index 1a8765866b8b6..e19e97cf174d5 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+@@ -11,10 +11,34 @@
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+ 
++struct drm_i915_private;
++
+ struct intel_context;
+ struct intel_gt;
+ struct i915_pxp_component;
+-struct drm_i915_private;
++struct i915_vma;
++
++#define INTEL_PXP_MAX_HWDRM_SESSIONS 16
++
++struct intel_pxp_session {
++	/** @index: Numeric identifier for this protected session */
++	int index;
++	/** @protection_type: type of protection requested */
++	int protection_type;
++	/** @protection_mode: mode of protection requested */
++	int protection_mode;
++	/** @drmfile: pointer to drm_file, which is allocated on device file open() call */
++	struct drm_file *drmfile;
++
++	/**
++	 * @is_valid: indicates whether the session has been established
++	 *            in the HW root of trust. Note that, after a teardown, the
++	 *            session can still be considered in play on the HW even if
++	 *            the keys are gone, so we can't rely on the HW state of the
++	 *            session to know if it's valid.
++	 */
++	bool is_valid;
++};
+ 
+ /**
+  * struct intel_pxp - pxp state
+@@ -68,13 +92,6 @@ struct intel_pxp {
+ 
+ 	/** @arb_mutex: protects arb session start */
+ 	struct mutex arb_mutex;
+-	/**
+-	 * @arb_is_valid: tracks arb session status.
+-	 * After a teardown, the arb session can still be in play on the HW
+-	 * even if the keys are gone, so we can't rely on the HW state of the
+-	 * session to know if it's valid and need to track the status in SW.
+-	 */
+-	bool arb_is_valid;
+ 
+ 	/**
+ 	 * @key_instance: tracks which key instance we're on, so we can use it
+@@ -108,6 +125,12 @@ struct intel_pxp {
+ 	 */
+ 	struct completion termination;
+ 
++	/** @session_mutex: protects hwdrm_sesions, and reserved_sessions. */
++	struct mutex session_mutex;
++	DECLARE_BITMAP(reserved_sessions, INTEL_PXP_MAX_HWDRM_SESSIONS);
++	struct intel_pxp_session *hwdrm_sessions[INTEL_PXP_MAX_HWDRM_SESSIONS];
++	struct intel_pxp_session arb_session;
++
+ 	/** @session_work: worker that manages session events. */
+ 	struct work_struct session_work;
+ 	/** @session_events: pending session events, protected with gt->irq_lock. */
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 7000e5910a1d7..90abce535d79e 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -3838,6 +3838,8 @@ struct drm_i915_gem_create_ext_set_pat {
+ 	__u32 rsvd;
+ };
+ 
++#include "i915_drm_prelim.h"
++
+ /* ID of the protected content session managed by i915 when PXP is active */
+ #define I915_PROTECTED_CONTENT_DEFAULT_SESSION 0xf
+ 
+diff --git a/include/uapi/drm/i915_drm_prelim.h b/include/uapi/drm/i915_drm_prelim.h
+new file mode 100644
+index 0000000000000..951d0a1fb5cdf
+--- /dev/null
++++ b/include/uapi/drm/i915_drm_prelim.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2021 Intel Corporation
++ */
++
++#ifndef __I915_DRM_PRELIM_H__
++#define __I915_DRM_PRELIM_H__
++
++#include "drm.h"
++
++/*
++ * Modifications to structs/values defined here are subject to
++ * backwards-compatibility constraints.
++ *
++ * Internal/downstream declarations must be added here, not to
++ * i915_drm.h. The values in i915_drm_prelim.h must also be kept
++ * synchronized with values in i915_drm.h.
++ */
++
++/* PRELIM ioctl numbers go down from 0x5f */
++#define PRELIM_DRM_I915_PXP_OPS		0x52
++/* NOTE: PXP_OPS PRELIM ioctl code 0x52 maintains compatibility with DII-server products */
++
++#define PRELIM_DRM_IOCTL_I915_PXP_OPS	DRM_IOWR(DRM_COMMAND_BASE + PRELIM_DRM_I915_PXP_OPS, \
++						 struct prelim_drm_i915_pxp_ops)
++
++/* End PRELIM ioctl's */
++
++/*
++ * struct pxp_set_session_status_params - Params to reserved, set or destroy
++ * the session from the PXP state machine.
++ */
++struct prelim_drm_i915_pxp_set_session_status_params {
++	__u32 pxp_tag; /* in/out, session identifier tag */
++	__u32 session_type; /* in, session type */
++	__u32 session_mode; /* in, session mode */
++#define PRELIM_DRM_I915_PXP_MODE_LM 0
++#define PRELIM_DRM_I915_PXP_MODE_HM 1
++#define PRELIM_DRM_I915_PXP_MODE_SM 2
++
++	__u32 req_session_state; /* in, new session state */
++	/* Request KMD to allocate session id and move it to INIT */
++#define PRELIM_DRM_I915_PXP_REQ_SESSION_ID_INIT 0
++	/* Inform KMD that UMD has completed the initialization */
++#define PRELIM_DRM_I915_PXP_REQ_SESSION_IN_PLAY 1
++	/* Request KMD to terminate the session */
++#define PRELIM_DRM_I915_PXP_REQ_SESSION_TERMINATE 2
++} __attribute__((packed));
++
++/*
++ * DRM_I915_PXP_OPS -
++ *
++ * PXP is an i915 componment, that helps user space to establish the hardware
++ * protected session and manage the status of each alive software session,
++ * as well as the life cycle of each session.
++ *
++ * This ioctl is to allow user space driver to create, set, and destroy each
++ * session. It also provides the communication chanel to TEE (Trusted
++ * Execution Environment) for the protected hardware session creation.
++ */
++
++struct prelim_drm_i915_pxp_ops {
++	__u32 action; /* in - specified action of this operation */
++#define PRELIM_DRM_I915_PXP_ACTION_SET_SESSION_STATUS 0
++
++	__u32 status; /* out - status output for this operation */
++#define PRELIM_DRM_I915_PXP_OP_STATUS_SUCCESS 0
++#define PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED 1
++#define PRELIM_DRM_I915_PXP_OP_STATUS_SESSION_NOT_AVAILABLE 2
++#define PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_UNKNOWN 3
++
++	__u64 params; /* in/out - pointer to data matching the action */
++} __attribute__((packed));
++
++#endif /* __I915_DRM_PRELIM_H__ */
++
+-- 
+2.25.1
+

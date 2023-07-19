@@ -1,0 +1,114 @@
+From 12b3ecd20fbe0f35d38e495be066c74cb466656f Mon Sep 17 00:00:00 2001
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Thu, 1 Dec 2022 18:48:45 +0100
+Subject: [PATCH 0307/2351] drm/etnaviv: split fence lock
+
+The fence lock currently protects two distinct things. It protects the fence
+IDR from concurrent inserts and removes and also keeps drm_sched_job_arm and
+drm_sched_entity_push_job in one atomic section to guarantee the fence seqno
+monotonicity. Split the lock into those two functions.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c |  4 ++--
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c        |  3 ++-
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h        |  3 ++-
+ drivers/gpu/drm/etnaviv/etnaviv_sched.c      | 11 +++++++----
+ 4 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+index 1491159d0d209..a602c167b6015 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+@@ -394,9 +394,9 @@ static void submit_cleanup(struct kref *kref)
+ 
+ 	if (submit->out_fence) {
+ 		/* first remove from IDR, so fence can not be found anymore */
+-		mutex_lock(&submit->gpu->fence_lock);
++		mutex_lock(&submit->gpu->idr_lock);
+ 		idr_remove(&submit->gpu->fence_idr, submit->out_fence_id);
+-		mutex_unlock(&submit->gpu->fence_lock);
++		mutex_unlock(&submit->gpu->idr_lock);
+ 		dma_fence_put(submit->out_fence);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+index 415f622c49e51..7bb193b6f1fb1 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -1830,7 +1830,8 @@ static int etnaviv_gpu_platform_probe(struct platform_device *pdev)
+ 
+ 	gpu->dev = &pdev->dev;
+ 	mutex_init(&gpu->lock);
+-	mutex_init(&gpu->fence_lock);
++	mutex_init(&gpu->sched_lock);
++	mutex_init(&gpu->idr_lock);
+ 
+ 	/* Map registers: */
+ 	gpu->mmio = devm_platform_ioremap_resource(pdev, 0);
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+index 2ed5f731a66ce..b8686541cb8e8 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -103,6 +103,7 @@ struct etnaviv_gpu {
+ 	struct etnaviv_chip_identity identity;
+ 	enum etnaviv_sec_mode sec_mode;
+ 	struct workqueue_struct *wq;
++	struct mutex sched_lock;
+ 	struct drm_gpu_scheduler sched;
+ 	bool initialized;
+ 	bool fe_running;
+@@ -120,7 +121,7 @@ struct etnaviv_gpu {
+ 	u32 idle_mask;
+ 
+ 	/* Fencing support */
+-	struct mutex fence_lock;
++	struct mutex idr_lock;
+ 	struct idr fence_idr;
+ 	u32 next_fence;
+ 	u32 completed_fence;
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_sched.c b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+index d29f467eee138..916e117658b22 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_sched.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+@@ -97,21 +97,24 @@ static const struct drm_sched_backend_ops etnaviv_sched_ops = {
+ 
+ int etnaviv_sched_push_job(struct etnaviv_gem_submit *submit)
+ {
++	struct etnaviv_gpu *gpu = submit->gpu;
+ 	int ret = 0;
+ 
+ 	/*
+-	 * Hold the fence lock across the whole operation to avoid jobs being
++	 * Hold the sched lock across the whole operation to avoid jobs being
+ 	 * pushed out of order with regard to their sched fence seqnos as
+ 	 * allocated in drm_sched_job_arm.
+ 	 */
+-	mutex_lock(&submit->gpu->fence_lock);
++	mutex_lock(&gpu->sched_lock);
+ 
+ 	drm_sched_job_arm(&submit->sched_job);
+ 
+ 	submit->out_fence = dma_fence_get(&submit->sched_job.s_fence->finished);
+-	submit->out_fence_id = idr_alloc_cyclic(&submit->gpu->fence_idr,
++	mutex_lock(&gpu->idr_lock);
++	submit->out_fence_id = idr_alloc_cyclic(&gpu->fence_idr,
+ 						submit->out_fence, 0,
+ 						INT_MAX, GFP_KERNEL);
++	mutex_unlock(&gpu->idr_lock);
+ 	if (submit->out_fence_id < 0) {
+ 		drm_sched_job_cleanup(&submit->sched_job);
+ 		ret = -ENOMEM;
+@@ -124,7 +127,7 @@ int etnaviv_sched_push_job(struct etnaviv_gem_submit *submit)
+ 	drm_sched_entity_push_job(&submit->sched_job);
+ 
+ out_unlock:
+-	mutex_unlock(&submit->gpu->fence_lock);
++	mutex_unlock(&gpu->sched_lock);
+ 
+ 	return ret;
+ }
+-- 
+2.25.1
+

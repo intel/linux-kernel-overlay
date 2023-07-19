@@ -1,0 +1,125 @@
+From a51f9f462d31fadb96a4d3ee13311d4048c5388d Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 20 Mar 2023 07:43:31 -0700
+Subject: [PATCH 1118/2351] drm/msm/gem: Avoid obj lock in job_run()
+
+Now that everything that controls which LRU an obj lives in *except* the
+backing pages is protected by the LRU lock, add a special path to unpin
+in the job_run() path, where we are assured that we already have backing
+pages and will not be racing against eviction (because the GEM object's
+dma_resv contains the fence that will be signaled when the submit/job
+completes).
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Patchwork: https://patchwork.freedesktop.org/patch/527845/
+Link: https://lore.kernel.org/r/20230320144356.803762-10-robdclark@gmail.com
+---
+ drivers/gpu/drm/msm/msm_gem.c        | 44 +++++++++++++++++++++++-----
+ drivers/gpu/drm/msm/msm_gem.h        |  1 +
+ drivers/gpu/drm/msm/msm_ringbuffer.c |  4 +--
+ 3 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index d0ac3e704b664..9628e8d8dd02f 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -61,18 +61,14 @@ static void sync_for_cpu(struct msm_gem_object *msm_obj)
+ 	dma_unmap_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
+ }
+ 
+-static void update_lru_locked(struct drm_gem_object *obj)
++static void update_lru_active(struct drm_gem_object *obj)
+ {
+ 	struct msm_drm_private *priv = obj->dev->dev_private;
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+ 
+-	msm_gem_assert_locked(&msm_obj->base);
+-
+-	if (!msm_obj->pages) {
+-		GEM_WARN_ON(msm_obj->pin_count);
++	GEM_WARN_ON(!msm_obj->pages);
+ 
+-		drm_gem_lru_move_tail_locked(&priv->lru.unbacked, obj);
+-	} else if (msm_obj->pin_count) {
++	if (msm_obj->pin_count) {
+ 		drm_gem_lru_move_tail_locked(&priv->lru.pinned, obj);
+ 	} else if (msm_obj->madv == MSM_MADV_WILLNEED) {
+ 		drm_gem_lru_move_tail_locked(&priv->lru.willneed, obj);
+@@ -83,6 +79,22 @@ static void update_lru_locked(struct drm_gem_object *obj)
+ 	}
+ }
+ 
++static void update_lru_locked(struct drm_gem_object *obj)
++{
++	struct msm_drm_private *priv = obj->dev->dev_private;
++	struct msm_gem_object *msm_obj = to_msm_bo(obj);
++
++	msm_gem_assert_locked(&msm_obj->base);
++
++	if (!msm_obj->pages) {
++		GEM_WARN_ON(msm_obj->pin_count);
++
++		drm_gem_lru_move_tail_locked(&priv->lru.unbacked, obj);
++	} else {
++		update_lru_active(obj);
++	}
++}
++
+ static void update_lru(struct drm_gem_object *obj)
+ {
+ 	struct msm_drm_private *priv = obj->dev->dev_private;
+@@ -489,6 +501,24 @@ void msm_gem_unpin_locked(struct drm_gem_object *obj)
+ 	mutex_unlock(&priv->lru.lock);
+ }
+ 
++/* Special unpin path for use in fence-signaling path, avoiding the need
++ * to hold the obj lock by only depending on things that a protected by
++ * the LRU lock.  In particular we know that that we already have backing
++ * and and that the object's dma_resv has the fence for the current
++ * submit/job which will prevent us racing against page eviction.
++ */
++void msm_gem_unpin_active(struct drm_gem_object *obj)
++{
++	struct msm_drm_private *priv = obj->dev->dev_private;
++	struct msm_gem_object *msm_obj = to_msm_bo(obj);
++
++	mutex_lock(&priv->lru.lock);
++	msm_obj->pin_count--;
++	GEM_WARN_ON(msm_obj->pin_count < 0);
++	update_lru_active(obj);
++	mutex_unlock(&priv->lru.lock);
++}
++
+ struct msm_gem_vma *msm_gem_get_vma_locked(struct drm_gem_object *obj,
+ 					   struct msm_gem_address_space *aspace)
+ {
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index 0057e8e8fa135..2bd6846c83a98 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -128,6 +128,7 @@ struct msm_gem_object {
+ uint64_t msm_gem_mmap_offset(struct drm_gem_object *obj);
+ int msm_gem_pin_vma_locked(struct drm_gem_object *obj, struct msm_gem_vma *vma);
+ void msm_gem_unpin_locked(struct drm_gem_object *obj);
++void msm_gem_unpin_active(struct drm_gem_object *obj);
+ struct msm_gem_vma *msm_gem_get_vma_locked(struct drm_gem_object *obj,
+ 					   struct msm_gem_address_space *aspace);
+ int msm_gem_get_iova(struct drm_gem_object *obj,
+diff --git a/drivers/gpu/drm/msm/msm_ringbuffer.c b/drivers/gpu/drm/msm/msm_ringbuffer.c
+index 31b4fbf96c360..b601991844093 100644
+--- a/drivers/gpu/drm/msm/msm_ringbuffer.c
++++ b/drivers/gpu/drm/msm/msm_ringbuffer.c
+@@ -24,9 +24,7 @@ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
+ 		struct drm_gem_object *obj = &submit->bos[i].obj->base;
+ 
+ 		msm_gem_vma_unpin_fenced(submit->bos[i].vma, fctx);
+-		msm_gem_lock(obj);
+-		msm_gem_unpin_locked(obj);
+-		msm_gem_unlock(obj);
++		msm_gem_unpin_active(obj);
+ 		submit->bos[i].flags &= ~(BO_VMA_PINNED | BO_OBJ_PINNED);
+ 	}
+ 
+-- 
+2.25.1
+
