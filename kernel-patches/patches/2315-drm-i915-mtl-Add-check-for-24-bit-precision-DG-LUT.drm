@@ -1,0 +1,135 @@
+From 4e761df3a6c289aaf395dc1ec3ed3592301a3408 Mon Sep 17 00:00:00 2001
+From: "Borah, Chaitanya Kumar" <chaitanya.kumar.borah@intel.com>
+Date: Tue, 18 Apr 2023 18:38:54 +0530
+Subject: [PATCH 2315/2351] drm/i915/mtl: Add check for 24 bit precision DG LUT
+
+There are two scenarios when 24 bit degamma lut will be configured
+correctly.
+
+1. New user space must select "extended degamma" as degamma mode,
+set advance degamma client capability flag.
+
+2. Legacy user space sends lut values without setting advance
+degamma client capability and without selecting a degamma mode
+
+Any other combinations should lead to error. The patch adds checks
+for these conditions
+
+v2: Add a way to reset degamma to default mode. This might not be of
+    much use in production SW but covers scenarios where IGTs can be
+    run in any order
+
+v3: Change logic for extended degamma check (Bhanu)
+
+v4: Allow "no degamma" with and without advance_degamma_mode_active
+    capability (Bhanu)
+
+Signed-off-by: Borah, Chaitanya Kumar <chaitanya.kumar.borah@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_color.c | 65 +++++++++++++++++++---
+ 1 file changed, 58 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_color.c b/drivers/gpu/drm/i915/display/intel_color.c
+index 6c5eb7f8be0bc..9a58d7972ff4c 100644
+--- a/drivers/gpu/drm/i915/display/intel_color.c
++++ b/drivers/gpu/drm/i915/display/intel_color.c
+@@ -2190,14 +2190,21 @@ static int _check_luts(const struct intel_crtc_state *crtc_state,
+ 	degamma_length = intel_degamma_lut_size(crtc_state);
+ 	gamma_length = intel_gamma_lut_size(crtc_state);
+ 
+-	if (check_lut_size(degamma_lut, degamma_length) ||
+-	    check_lut_size(gamma_lut, gamma_length))
+-		return -EINVAL;
+-
+-	if (drm_color_lut_check(degamma_lut, degamma_tests) ||
++	if (check_lut_size(gamma_lut, gamma_length) ||
+ 	    drm_color_lut_check(gamma_lut, gamma_tests))
+ 		return -EINVAL;
+ 
++	/* If extended degamma property set*/
++	if (crtc_state->uapi.advance_degamma_mode_active) {
++		if (check_lut_ext_size(degamma_lut, degamma_length) ||
++		    drm_color_lut_ext_check(degamma_lut, degamma_tests))
++			return -EINVAL;
++	} else {
++		if (check_lut_size(degamma_lut, degamma_length) ||
++		    drm_color_lut_check(degamma_lut, degamma_tests))
++			return -EINVAL;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2208,6 +2215,26 @@ static int check_luts(const struct intel_crtc_state *crtc_state)
+ 			   intel_gamma_lut_tests(crtc_state));
+ }
+ 
++static int mtl_check_degamma_lut(const struct intel_crtc_state *crtc_state)
++{
++	const struct drm_property_blob *degamma_lut_blob = crtc_state->hw.gamma_lut;
++
++	if (!degamma_lut_blob)
++		return 0;
++
++	if (crtc_state->uapi.degamma_mode_type == DEGAMMA_MODE_24BIT &&
++	    crtc_state->uapi.advance_degamma_mode_active)
++		return 0;
++
++	/* 16 bit LUT value usecase */
++	if (crtc_state->uapi.degamma_mode_type == 0)
++		return 0;
++
++	DRM_ERROR("%s check failed\n", __func__);
++
++	return -EINVAL;
++}
++
+ static u32 i9xx_gamma_mode(struct intel_crtc_state *crtc_state)
+ {
+ 	if (!crtc_state->gamma_enable ||
+@@ -2826,7 +2853,8 @@ static int icl_color_check(struct intel_crtc_state *crtc_state)
+ {
+ 	struct drm_device *dev = crtc_state->uapi.crtc->dev;
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct drm_property *property = crtc_state->uapi.crtc->gamma_mode_property;
++	struct drm_property *gamma_mode_property = crtc_state->uapi.crtc->gamma_mode_property;
++	struct drm_property *degamma_mode_property = crtc_state->uapi.crtc->degamma_mode_property;
+ 	struct drm_property_enum *prop_enum;
+ 	u32 index = 0;
+ 	int ret;
+@@ -2835,8 +2863,31 @@ static int icl_color_check(struct intel_crtc_state *crtc_state)
+ 	if (ret)
+ 		return ret;
+ 
++	if (DISPLAY_VER(dev_priv) >= 14) {
++		list_for_each_entry(prop_enum, &degamma_mode_property->enum_list, head) {
++			if (prop_enum->value == crtc_state->uapi.degamma_mode) {
++				if (!strcmp(prop_enum->name,
++					    "extended degamma")) {
++					crtc_state->uapi.degamma_mode_type =
++						DEGAMMA_MODE_24BIT;
++					drm_dbg_kms(dev,
++						    "extended degamma enabled\n");
++				} else {
++					crtc_state->uapi.degamma_mode_type = 0;
++					drm_dbg_kms(dev,
++						    "extended degamma disabled\n");
++				}
++				break;
++			}
++		}
++
++		ret = mtl_check_degamma_lut(crtc_state);
++		if (ret)
++			return ret;
++	}
++
+ 	if (DISPLAY_VER(dev_priv) >= 13) {
+-		list_for_each_entry(prop_enum, &property->enum_list, head) {
++		list_for_each_entry(prop_enum, &gamma_mode_property->enum_list, head) {
+ 			if (prop_enum->value == crtc_state->uapi.gamma_mode) {
+ 				if (!strcmp(prop_enum->name,
+ 					    "logarithmic gamma")) {
+-- 
+2.25.1
+

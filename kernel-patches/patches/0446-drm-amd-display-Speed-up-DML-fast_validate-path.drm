@@ -1,0 +1,275 @@
+From 564bb7ec7eae3cd0d1b7ec3eb37bce4b62be772b Mon Sep 17 00:00:00 2001
+From: Ilya Bakoulin <Ilya.Bakoulin@amd.com>
+Date: Thu, 24 Nov 2022 13:58:49 -0500
+Subject: [PATCH 0446/2351] drm/amd/display: Speed up DML fast_validate path
+
+[Why]
+Iterating over every voltage state when we need to validate thousands of
+configurations all at once (i.e. display hotplug) can take a significant
+amount of time.
+
+[How]
+Check just the highest voltage state when fast_validate is true to
+verify whether the configuration can work at all, then do a proper
+validation including all voltage states later when fast_validate is false.
+
+Reviewed-by: Nevenko Stupar <Nevenko.Stupar@amd.com>
+Acked-by: Alan Liu <HaoPing.Liu@amd.com>
+Signed-off-by: Ilya Bakoulin <Ilya.Bakoulin@amd.com>
+Signed-off-by: Dillon Varone <Dillon.Varone@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  2 +-
+ .../amd/display/amdgpu_dm/amdgpu_dm_helpers.c |  2 +-
+ .../drm/amd/display/dc/dml/dcn32/dcn32_fpu.c  |  7 +++
+ .../dc/dml/dcn32/display_mode_vba_32.c        | 47 +++++++++++--------
+ .../drm/amd/display/dc/dml/display_mode_lib.h |  1 +
+ 5 files changed, 38 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 2914953866468..ec4d4e625be97 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2835,7 +2835,7 @@ static int dm_resume(void *handle)
+ 		 * this is the case when traversing through already created
+ 		 * MST connectors, should be skipped
+ 		 */
+-		if (aconnector && aconnector->mst_port)
++		if (aconnector->dc_link->type == dc_connection_mst_branch)
+ 			continue;
+ 
+ 		mutex_lock(&aconnector->hpd_lock);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index 87516d721e374..efd025d8961e6 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -238,7 +238,7 @@ bool dm_helpers_dp_mst_write_payload_allocation_table(
+ 	mst_state = to_drm_dp_mst_topology_state(mst_mgr->base.state);
+ 
+ 	/* It's OK for this to fail */
+-	new_payload = drm_atomic_get_mst_payload_state(mst_state, aconnector->port);
++	new_payload = drm_atomic_get_mst_payload_state(mst_state, aconnector->mst_output_port);
+ 
+ 	if (enable) {
+ 		target_payload = new_payload;
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
+index cfea586c5db99..273213091c2f2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c
+@@ -1645,8 +1645,15 @@ bool dcn32_internal_validate_bw(struct dc *dc,
+ 		context->bw_ctx.dml.soc.allow_for_pstate_or_stutter_in_vblank_final =
+ 			dm_prefetch_support_none;
+ 
++		context->bw_ctx.dml.validate_max_state = fast_validate;
+ 		vlevel = dml_get_voltage_level(&context->bw_ctx.dml, pipes, pipe_cnt);
+ 
++		/* Last attempt with Prefetch mode 2 (dm_prefetch_support_stutter == 3) */
++		if (vlevel == context->bw_ctx.dml.soc.num_states) {
++			context->bw_ctx.dml.soc.allow_for_pstate_or_stutter_in_vblank_final =
++				dm_prefetch_support_stutter;
++			vlevel = dml_get_voltage_level(&context->bw_ctx.dml, pipes, pipe_cnt);
++		}
+ 		context->bw_ctx.dml.validate_max_state = false;
+ 
+ 		if (vlevel < context->bw_ctx.dml.soc.num_states) {
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c b/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c
+index 907ea76bcc0b1..b04f7bec653bd 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c
+@@ -1646,9 +1646,14 @@ static void DISPCLKDPPCLKDCFCLKDeepSleepPrefetchParametersWatermarksAndPerforman
+ static void mode_support_configuration(struct vba_vars_st *v,
+ 				  struct display_mode_lib *mode_lib)
+ {
+-	int i, j;
++	int i, j, start_state;
+ 
+-	for (i = v->soc.num_states - 1; i >= 0; i--) {
++	if (mode_lib->validate_max_state)
++		start_state = v->soc.num_states - 1;
++	else
++		start_state = 0;
++
++	for (i = v->soc.num_states - 1; i >= start_state; i--) {
+ 		for (j = 0; j < 2; j++) {
+ 			if (mode_lib->vba.ScaleRatioAndTapsSupport == true
+ 				&& mode_lib->vba.SourceFormatPixelAndScanSupport == true
+@@ -1717,7 +1722,7 @@ static void mode_support_configuration(struct vba_vars_st *v,
+ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_lib)
+ {
+ 	struct vba_vars_st *v = &mode_lib->vba;
+-	int i, j;
++	int i, j, start_state;
+ 	unsigned int k, m;
+ 	unsigned int MaximumMPCCombine;
+ 	unsigned int NumberOfNonCombinedSurfaceOfMaximumBandwidth;
+@@ -1730,6 +1735,10 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ #endif
+ 
+ 	/*MODE SUPPORT, VOLTAGE STATE AND SOC CONFIGURATION*/
++	if (mode_lib->validate_max_state)
++		start_state = v->soc.num_states - 1;
++	else
++		start_state = 0;
+ 
+ 	/*Scale Ratio, taps Support Check*/
+ 
+@@ -2019,7 +2028,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 	mode_lib->vba.MPCCombineMethodIncompatible = v->dummy_vars.dml32_ModeSupportAndSystemConfigurationFull.MPCCombineMethodAsNeededForPStateChangeAndVoltage
+ 			&& v->dummy_vars.dml32_ModeSupportAndSystemConfigurationFull.MPCCombineMethodAsPossible;
+ 
+-	for (i = 0; i < v->soc.num_states; i++) {
++	for (i = start_state; i < v->soc.num_states; i++) {
+ 		for (j = 0; j < 2; j++) {
+ 			mode_lib->vba.TotalNumberOfActiveDPP[i][j] = 0;
+ 			mode_lib->vba.TotalAvailablePipesSupport[i][j] = true;
+@@ -2296,7 +2305,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 		}
+ 	}
+ 
+-	for (i = 0; i < v->soc.num_states; ++i) {
++	for (i = start_state; i < v->soc.num_states; ++i) {
+ 		mode_lib->vba.ExceededMultistreamSlots[i] = false;
+ 		for (k = 0; k < mode_lib->vba.NumberOfActiveSurfaces; ++k) {
+ 			if (mode_lib->vba.OutputMultistreamEn[k] == true && mode_lib->vba.OutputMultistreamId[k] == k) {
+@@ -2395,7 +2404,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 		}
+ 	}
+ 
+-	for (i = 0; i < v->soc.num_states; ++i) {
++	for (i = start_state; i < v->soc.num_states; ++i) {
+ 		mode_lib->vba.DTBCLKRequiredMoreThanSupported[i] = false;
+ 		for (k = 0; k < mode_lib->vba.NumberOfActiveSurfaces; ++k) {
+ 			if (mode_lib->vba.BlendingAndTiming[k] == k
+@@ -2412,7 +2421,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 		}
+ 	}
+ 
+-	for (i = 0; i < v->soc.num_states; ++i) {
++	for (i = start_state; i < v->soc.num_states; ++i) {
+ 		mode_lib->vba.ODMCombine2To1SupportCheckOK[i] = true;
+ 		mode_lib->vba.ODMCombine4To1SupportCheckOK[i] = true;
+ 		for (k = 0; k < mode_lib->vba.NumberOfActiveSurfaces; ++k) {
+@@ -2430,7 +2439,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 		}
+ 	}
+ 
+-	for (i = 0; i < v->soc.num_states; i++) {
++	for (i = start_state; i < v->soc.num_states; i++) {
+ 		mode_lib->vba.DSCCLKRequiredMoreThanSupported[i] = false;
+ 		for (k = 0; k <= mode_lib->vba.NumberOfActiveSurfaces - 1; k++) {
+ 			if (mode_lib->vba.BlendingAndTiming[k] == k) {
+@@ -2467,7 +2476,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 	/* Check DSC Unit and Slices Support */
+ 	v->dummy_vars.dml32_ModeSupportAndSystemConfigurationFull.TotalDSCUnitsRequired = 0;
+ 
+-	for (i = 0; i < v->soc.num_states; ++i) {
++	for (i = start_state; i < v->soc.num_states; ++i) {
+ 		mode_lib->vba.NotEnoughDSCUnits[i] = false;
+ 		mode_lib->vba.NotEnoughDSCSlices[i] = false;
+ 		v->dummy_vars.dml32_ModeSupportAndSystemConfigurationFull.TotalDSCUnitsRequired = 0;
+@@ -2502,7 +2511,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 	}
+ 
+ 	/*DSC Delay per state*/
+-	for (i = 0; i < v->soc.num_states; ++i) {
++	for (i = start_state; i < v->soc.num_states; ++i) {
+ 		for (k = 0; k < mode_lib->vba.NumberOfActiveSurfaces; ++k) {
+ 			mode_lib->vba.DSCDelayPerState[i][k] = dml32_DSCDelayRequirement(
+ 					mode_lib->vba.RequiresDSC[i][k], mode_lib->vba.ODMCombineEnablePerState[i][k],
+@@ -2529,7 +2538,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 
+ 	//Calculate Swath, DET Configuration, DCFCLKDeepSleep
+ 	//
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 			for (k = 0; k < mode_lib->vba.NumberOfActiveSurfaces; ++k) {
+ 				mode_lib->vba.RequiredDPPCLKThisState[k] = mode_lib->vba.RequiredDPPCLK[i][j][k];
+@@ -2667,7 +2676,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 			mode_lib->vba.SurfaceSizeInMALL,
+ 			&mode_lib->vba.ExceededMALLSize);
+ 
+-	for (i = 0; i < v->soc.num_states; i++) {
++	for (i = start_state; i < v->soc.num_states; i++) {
+ 		for (j = 0; j < 2; j++) {
+ 			for (k = 0; k <= mode_lib->vba.NumberOfActiveSurfaces - 1; k++) {
+ 				mode_lib->vba.swath_width_luma_ub_this_state[k] =
+@@ -2894,7 +2903,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 	}
+ 
+ 	//Calculate Return BW
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 			for (k = 0; k <= mode_lib->vba.NumberOfActiveSurfaces - 1; k++) {
+ 				if (mode_lib->vba.BlendingAndTiming[k] == k) {
+@@ -2973,7 +2982,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 			&mode_lib->vba.MinPrefetchMode,
+ 			&mode_lib->vba.MaxPrefetchMode);
+ 
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j)
+ 			mode_lib->vba.DCFCLKState[i][j] = mode_lib->vba.DCFCLKPerState[i];
+ 	}
+@@ -3095,7 +3104,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 				mode_lib->vba.DCFCLKState);
+ 	} // UseMinimumRequiredDCFCLK == true
+ 
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 			mode_lib->vba.ReturnBWPerState[i][j] = dml32_get_return_bw_mbps(&mode_lib->vba.soc, i,
+ 					mode_lib->vba.HostVMEnable, mode_lib->vba.DCFCLKState[i][j],
+@@ -3104,7 +3113,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 	}
+ 
+ 	//Re-ordering Buffer Support Check
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 			if ((mode_lib->vba.ROBBufferSizeInKByte - mode_lib->vba.PixelChunkSizeInKByte) * 1024
+ 					/ mode_lib->vba.ReturnBWPerState[i][j]
+@@ -3126,7 +3135,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 				+ mode_lib->vba.ReadBandwidthChroma[k];
+ 	}
+ 
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 			mode_lib->vba.MaxTotalVerticalActiveAvailableBandwidth[i][j] =
+ 				dml_min3(mode_lib->vba.ReturnBusWidth * mode_lib->vba.DCFCLKState[i][j]
+@@ -3150,7 +3159,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 
+ 	/* Prefetch Check */
+ 
+-	for (i = 0; i < (int) v->soc.num_states; ++i) {
++	for (i = start_state; i < (int) v->soc.num_states; ++i) {
+ 		for (j = 0; j <= 1; ++j) {
+ 
+ 			mode_lib->vba.TimeCalc = 24 / mode_lib->vba.ProjectedDCFCLKDeepSleep[i][j];
+@@ -3670,7 +3679,7 @@ void dml32_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_l
+ 
+ 	MaximumMPCCombine = 0;
+ 
+-	for (i = v->soc.num_states; i >= 0; i--) {
++	for (i = v->soc.num_states; i >= start_state; i--) {
+ 		if (i == v->soc.num_states || mode_lib->vba.ModeSupport[i][0] == true ||
+ 				mode_lib->vba.ModeSupport[i][1] == true) {
+ 			mode_lib->vba.VoltageLevel = i;
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.h b/drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.h
+index 3d643d50c3eb5..a9d49ef58fb59 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.h
++++ b/drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.h
+@@ -91,6 +91,7 @@ struct display_mode_lib {
+ 	struct dal_logger *logger;
+ 	struct dml_funcs funcs;
+ 	struct _vcs_dpi_display_e2e_pipe_params_st dml_pipe_state[6];
++	bool validate_max_state;
+ };
+ 
+ void dml_init_instance(struct display_mode_lib *lib,
+-- 
+2.25.1
+

@@ -1,0 +1,103 @@
+From 84961753b411e05403eccb4d671e687f362f0b53 Mon Sep 17 00:00:00 2001
+From: Alan Liu <haoping.liu@amd.com>
+Date: Tue, 2 May 2023 17:54:50 +0800
+Subject: [PATCH 1606/2351] drm/amd/display: Fix warning in disabling vblank
+ irq
+
+[Why]
+During gpu-reset, we toggle vblank irq by calling dc_interrupt_set()
+instead of amdgpu_irq_get/put() because we don't want to change the irq
+source's refcount. However, we see the warning when vblank irq is enabled
+by dc_interrupt_set() during gpu-reset but disabled by amdgpu_irq_put()
+after gpu-reset.
+
+[How]
+Only in dm_gpureset_toggle_interrupts() we toggle vblank interrupts by
+calling dc_interrupt_set(). Apart from this we call dm_set_vblank()
+which uses amdgpu_irq_get/put() to operate vblank irq.
+
+Reviewed-by: Bhawanpreet Lakha <bhawanpreet.lakha@amd.com>
+Acked-by: Tom Chung <chiahsuan.chung@amd.com>
+Signed-off-by: Alan Liu <haoping.liu@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 21 ++++++++++++-------
+ .../amd/display/amdgpu_dm/amdgpu_dm_crtc.c    | 16 +++-----------
+ 2 files changed, 16 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index ea953d9876f8c..2e323b82de880 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2469,20 +2469,25 @@ static void dm_gpureset_toggle_interrupts(struct amdgpu_device *adev,
+ 		if (acrtc && state->stream_status[i].plane_count != 0) {
+ 			irq_source = IRQ_TYPE_PFLIP + acrtc->otg_inst;
+ 			rc = dc_interrupt_set(adev->dm.dc, irq_source, enable) ? 0 : -EBUSY;
+-			DRM_DEBUG_VBL("crtc %d - vupdate irq %sabling: r=%d\n",
+-				      acrtc->crtc_id, enable ? "en" : "dis", rc);
+ 			if (rc)
+ 				DRM_WARN("Failed to %s pflip interrupts\n",
+ 					 enable ? "enable" : "disable");
+ 
+ 			if (enable) {
+-				rc = amdgpu_dm_crtc_enable_vblank(&acrtc->base);
+-				if (rc)
+-					DRM_WARN("Failed to enable vblank interrupts\n");
+-			} else {
+-				amdgpu_dm_crtc_disable_vblank(&acrtc->base);
+-			}
++				if (amdgpu_dm_crtc_vrr_active(to_dm_crtc_state(acrtc->base.state)))
++					rc = amdgpu_dm_crtc_set_vupdate_irq(&acrtc->base, true);
++			} else
++				rc = amdgpu_dm_crtc_set_vupdate_irq(&acrtc->base, false);
+ 
++			if (rc)
++				DRM_WARN("Failed to %sable vupdate interrupt\n", enable ? "en" : "dis");
++
++			irq_source = IRQ_TYPE_VBLANK + acrtc->otg_inst;
++			/* During gpu-reset we disable and then enable vblank irq, so
++			 * don't use amdgpu_irq_get/put() to avoid refcount change.
++			 */
++			if (!dc_interrupt_set(adev->dm.dc, irq_source, enable))
++				DRM_WARN("Failed to %sable vblank interrupt\n", enable ? "en" : "dis");
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
+index e3762e806617c..440fc0869a34b 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
+@@ -146,7 +146,6 @@ static void vblank_control_worker(struct work_struct *work)
+ 
+ static inline int dm_set_vblank(struct drm_crtc *crtc, bool enable)
+ {
+-	enum dc_irq_source irq_source;
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 	struct amdgpu_device *adev = drm_to_adev(crtc->dev);
+ 	struct dm_crtc_state *acrtc_state = to_dm_crtc_state(crtc->state);
+@@ -169,18 +168,9 @@ static inline int dm_set_vblank(struct drm_crtc *crtc, bool enable)
+ 	if (rc)
+ 		return rc;
+ 
+-	if (amdgpu_in_reset(adev)) {
+-		irq_source = IRQ_TYPE_VBLANK + acrtc->otg_inst;
+-		/* During gpu-reset we disable and then enable vblank irq, so
+-		 * don't use amdgpu_irq_get/put() to avoid refcount change.
+-		 */
+-		if (!dc_interrupt_set(adev->dm.dc, irq_source, enable))
+-			rc = -EBUSY;
+-	} else {
+-		rc = (enable)
+-			? amdgpu_irq_get(adev, &adev->crtc_irq, acrtc->crtc_id)
+-			: amdgpu_irq_put(adev, &adev->crtc_irq, acrtc->crtc_id);
+-	}
++	rc = (enable)
++		? amdgpu_irq_get(adev, &adev->crtc_irq, acrtc->crtc_id)
++		: amdgpu_irq_put(adev, &adev->crtc_irq, acrtc->crtc_id);
+ 
+ 	if (rc)
+ 		return rc;
+-- 
+2.25.1
+

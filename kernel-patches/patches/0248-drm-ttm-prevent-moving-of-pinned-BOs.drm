@@ -1,0 +1,162 @@
+From 2e3f8c1b4349c415d9f0d5aad8dace85cdae6136 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 13 Dec 2022 10:07:36 +0100
+Subject: [PATCH 0248/2351] drm/ttm: prevent moving of pinned BOs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We have checks for this in the individual drivers move callback, but
+it's probably better to generally forbid that on a higher level.
+
+Also stops exporting ttm_resource_compat() since that's not necessary
+any more after removing the extra checks in vmwgfx.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230124125726.13323-4-christian.koenig@amd.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c |  4 ----
+ drivers/gpu/drm/nouveau/nouveau_bo.c    |  3 ---
+ drivers/gpu/drm/radeon/radeon_ttm.c     |  4 ----
+ drivers/gpu/drm/ttm/ttm_bo.c            | 20 ++++++++++++--------
+ drivers/gpu/drm/ttm/ttm_resource.c      |  1 -
+ drivers/gpu/drm/vmwgfx/vmwgfx_bo.c      | 19 ++-----------------
+ 6 files changed, 14 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index c5ef7f7bdc15c..2cd081cbf7062 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -466,11 +466,7 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 			return r;
+ 	}
+ 
+-	/* Can't move a pinned BO */
+ 	abo = ttm_to_amdgpu_bo(bo);
+-	if (WARN_ON_ONCE(abo->tbo.pin_count > 0))
+-		return -EINVAL;
+-
+ 	adev = amdgpu_ttm_adev(bo->bdev);
+ 
+ 	if (!old_mem || (old_mem->mem_type == TTM_PL_SYSTEM &&
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 288eebc70a67f..c2ec91cc845d5 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1015,9 +1015,6 @@ nouveau_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	if (ret)
+ 		goto out_ntfy;
+ 
+-	if (nvbo->bo.pin_count)
+-		NV_WARN(drm, "Moving pinned object %p!\n", nvbo);
+-
+ 	if (drm->client.device.info.family < NV_DEVICE_INFO_V0_TESLA) {
+ 		ret = nouveau_bo_vm_bind(bo, new_reg, &new_tile);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 1e8e287e113c6..67075c85f8477 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -211,11 +211,7 @@ static int radeon_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	if (r)
+ 		return r;
+ 
+-	/* Can't move a pinned BO */
+ 	rbo = container_of(bo, struct radeon_bo, tbo);
+-	if (WARN_ON_ONCE(rbo->tbo.pin_count > 0))
+-		return -EINVAL;
+-
+ 	rdev = radeon_get_rdev(bo->bdev);
+ 	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
+ 		ttm_bo_move_null(bo, new_mem);
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index bb0c21c8caac7..33471e363ff4d 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -894,14 +894,18 @@ int ttm_bo_validate(struct ttm_buffer_object *bo,
+ 	if (!placement->num_placement && !placement->num_busy_placement)
+ 		return ttm_bo_pipeline_gutting(bo);
+ 
+-	/*
+-	 * Check whether we need to move buffer.
+-	 */
+-	if (!bo->resource || !ttm_resource_compat(bo->resource, placement)) {
+-		ret = ttm_bo_move_buffer(bo, placement, ctx);
+-		if (ret)
+-			return ret;
+-	}
++	/* Check whether we need to move buffer. */
++	if (bo->resource && ttm_resource_compat(bo->resource, placement))
++		return 0;
++
++	/* Moving of pinned BOs is forbidden */
++	if (bo->pin_count)
++		return -EINVAL;
++
++	ret = ttm_bo_move_buffer(bo, placement, ctx);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * We might need to add a TTM.
+ 	 */
+diff --git a/drivers/gpu/drm/ttm/ttm_resource.c b/drivers/gpu/drm/ttm/ttm_resource.c
+index b8a826a24fb2c..7333f7a87a2fb 100644
+--- a/drivers/gpu/drm/ttm/ttm_resource.c
++++ b/drivers/gpu/drm/ttm/ttm_resource.c
+@@ -361,7 +361,6 @@ bool ttm_resource_compat(struct ttm_resource *res,
+ 
+ 	return false;
+ }
+-EXPORT_SYMBOL(ttm_resource_compat);
+ 
+ void ttm_resource_set_bo(struct ttm_resource *res,
+ 			 struct ttm_buffer_object *bo)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index 4dcf2eb7aa801..5c5d3efb662af 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -87,12 +87,7 @@ int vmw_bo_pin_in_placement(struct vmw_private *dev_priv,
+ 	if (unlikely(ret != 0))
+ 		goto err;
+ 
+-	if (buf->base.pin_count > 0)
+-		ret = ttm_resource_compat(bo->resource, placement)
+-			? 0 : -EINVAL;
+-	else
+-		ret = ttm_bo_validate(bo, placement, &ctx);
+-
++	ret = ttm_bo_validate(bo, placement, &ctx);
+ 	if (!ret)
+ 		vmw_bo_pin_reserved(buf, true);
+ 
+@@ -128,12 +123,6 @@ int vmw_bo_pin_in_vram_or_gmr(struct vmw_private *dev_priv,
+ 	if (unlikely(ret != 0))
+ 		goto err;
+ 
+-	if (buf->base.pin_count > 0) {
+-		ret = ttm_resource_compat(bo->resource, &vmw_vram_gmr_placement)
+-			? 0 : -EINVAL;
+-		goto out_unreserve;
+-	}
+-
+ 	ret = ttm_bo_validate(bo, &vmw_vram_gmr_placement, &ctx);
+ 	if (likely(ret == 0) || ret == -ERESTARTSYS)
+ 		goto out_unreserve;
+@@ -218,11 +207,7 @@ int vmw_bo_pin_in_start_of_vram(struct vmw_private *dev_priv,
+ 		(void) ttm_bo_validate(bo, &vmw_sys_placement, &ctx);
+ 	}
+ 
+-	if (buf->base.pin_count > 0)
+-		ret = ttm_resource_compat(bo->resource, &placement)
+-			? 0 : -EINVAL;
+-	else
+-		ret = ttm_bo_validate(bo, &placement, &ctx);
++	ret = ttm_bo_validate(bo, &placement, &ctx);
+ 
+ 	/* For some reason we didn't end up at the start of vram */
+ 	WARN_ON(ret == 0 && bo->resource->start != 0);
+-- 
+2.25.1
+

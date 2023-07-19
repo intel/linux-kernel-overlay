@@ -1,0 +1,161 @@
+From 4dd99ee729d6b6a5528734a1f438843736c383b6 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 20 Mar 2023 07:43:26 -0700
+Subject: [PATCH 1113/2351] drm/msm: Decouple vma tracking from obj lock
+
+We need to use the inuse count to track that a BO is pinned until
+we have the hw_fence.  But we want to remove the obj lock from the
+job_run() path as this could deadlock against reclaim/shrinker
+(because it is blocking the hw_fence from eventually being signaled).
+So split that tracking out into a per-vma lock with narrower scope.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Patchwork: https://patchwork.freedesktop.org/patch/527839/
+Link: https://lore.kernel.org/r/20230320144356.803762-5-robdclark@gmail.com
+---
+ drivers/gpu/drm/msm/msm_gem.h        |  1 +
+ drivers/gpu/drm/msm/msm_gem_vma.c    | 44 ++++++++++++++++++++++++----
+ drivers/gpu/drm/msm/msm_ringbuffer.c |  2 +-
+ 3 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem.h b/drivers/gpu/drm/msm/msm_gem.h
+index d3219c5230347..1929f09c5b0dc 100644
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -59,6 +59,7 @@ struct msm_fence_context;
+ 
+ struct msm_gem_vma {
+ 	struct drm_mm_node node;
++	spinlock_t lock;
+ 	uint64_t iova;
+ 	struct msm_gem_address_space *aspace;
+ 	struct list_head list;    /* node in msm_gem_object::vmas */
+diff --git a/drivers/gpu/drm/msm/msm_gem_vma.c b/drivers/gpu/drm/msm/msm_gem_vma.c
+index 2827679dc39af..98287ed999608 100644
+--- a/drivers/gpu/drm/msm/msm_gem_vma.c
++++ b/drivers/gpu/drm/msm/msm_gem_vma.c
+@@ -40,19 +40,28 @@ msm_gem_address_space_get(struct msm_gem_address_space *aspace)
+ 
+ bool msm_gem_vma_inuse(struct msm_gem_vma *vma)
+ {
++	bool ret = true;
++
++	spin_lock(&vma->lock);
++
+ 	if (vma->inuse > 0)
+-		return true;
++		goto out;
+ 
+ 	while (vma->fence_mask) {
+ 		unsigned idx = ffs(vma->fence_mask) - 1;
+ 
+ 		if (!msm_fence_completed(vma->fctx[idx], vma->fence[idx]))
+-			return true;
++			goto out;
+ 
+ 		vma->fence_mask &= ~BIT(idx);
+ 	}
+ 
+-	return false;
++	ret = false;
++
++out:
++	spin_unlock(&vma->lock);
++
++	return ret;
+ }
+ 
+ /* Actually unmap memory for the vma */
+@@ -73,8 +82,7 @@ void msm_gem_vma_purge(struct msm_gem_vma *vma)
+ 	vma->mapped = false;
+ }
+ 
+-/* Remove reference counts for the mapping */
+-void msm_gem_vma_unpin(struct msm_gem_vma *vma)
++static void vma_unpin_locked(struct msm_gem_vma *vma)
+ {
+ 	if (GEM_WARN_ON(!vma->inuse))
+ 		return;
+@@ -82,13 +90,23 @@ void msm_gem_vma_unpin(struct msm_gem_vma *vma)
+ 		vma->inuse--;
+ }
+ 
++/* Remove reference counts for the mapping */
++void msm_gem_vma_unpin(struct msm_gem_vma *vma)
++{
++	spin_lock(&vma->lock);
++	vma_unpin_locked(vma);
++	spin_unlock(&vma->lock);
++}
++
+ /* Replace pin reference with fence: */
+ void msm_gem_vma_unpin_fenced(struct msm_gem_vma *vma, struct msm_fence_context *fctx)
+ {
++	spin_lock(&vma->lock);
+ 	vma->fctx[fctx->index] = fctx;
+ 	vma->fence[fctx->index] = fctx->last_fence;
+ 	vma->fence_mask |= BIT(fctx->index);
+-	msm_gem_vma_unpin(vma);
++	vma_unpin_locked(vma);
++	spin_unlock(&vma->lock);
+ }
+ 
+ /* Map and pin vma: */
+@@ -103,7 +121,9 @@ msm_gem_vma_map(struct msm_gem_vma *vma, int prot,
+ 		return -EINVAL;
+ 
+ 	/* Increase the usage counter */
++	spin_lock(&vma->lock);
+ 	vma->inuse++;
++	spin_unlock(&vma->lock);
+ 
+ 	if (vma->mapped)
+ 		return 0;
+@@ -113,11 +133,22 @@ msm_gem_vma_map(struct msm_gem_vma *vma, int prot,
+ 	if (!aspace)
+ 		return 0;
+ 
++	/*
++	 * NOTE: iommu/io-pgtable can allocate pages, so we cannot hold
++	 * a lock across map/unmap which is also used in the job_run()
++	 * path, as this can cause deadlock in job_run() vs shrinker/
++	 * reclaim.
++	 *
++	 * Revisit this if we can come up with a scheme to pre-alloc pages
++	 * for the pgtable in map/unmap ops.
++	 */
+ 	ret = aspace->mmu->funcs->map(aspace->mmu, vma->iova, sgt, size, prot);
+ 
+ 	if (ret) {
+ 		vma->mapped = false;
++		spin_lock(&vma->lock);
+ 		vma->inuse--;
++		spin_unlock(&vma->lock);
+ 	}
+ 
+ 	return ret;
+@@ -148,6 +179,7 @@ struct msm_gem_vma *msm_gem_vma_new(struct msm_gem_address_space *aspace)
+ 	if (!vma)
+ 		return NULL;
+ 
++	spin_lock_init(&vma->lock);
+ 	vma->aspace = aspace;
+ 
+ 	return vma;
+diff --git a/drivers/gpu/drm/msm/msm_ringbuffer.c b/drivers/gpu/drm/msm/msm_ringbuffer.c
+index 44a22b2837304..31b4fbf96c360 100644
+--- a/drivers/gpu/drm/msm/msm_ringbuffer.c
++++ b/drivers/gpu/drm/msm/msm_ringbuffer.c
+@@ -23,8 +23,8 @@ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
+ 	for (i = 0; i < submit->nr_bos; i++) {
+ 		struct drm_gem_object *obj = &submit->bos[i].obj->base;
+ 
+-		msm_gem_lock(obj);
+ 		msm_gem_vma_unpin_fenced(submit->bos[i].vma, fctx);
++		msm_gem_lock(obj);
+ 		msm_gem_unpin_locked(obj);
+ 		msm_gem_unlock(obj);
+ 		submit->bos[i].flags &= ~(BO_VMA_PINNED | BO_OBJ_PINNED);
+-- 
+2.25.1
+

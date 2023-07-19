@@ -1,0 +1,120 @@
+From 13437c27e28ba39666a5c97b9e47bb2c95d2b810 Mon Sep 17 00:00:00 2001
+From: Vinod Polimera <quic_vpolimer@quicinc.com>
+Date: Thu, 2 Mar 2023 22:03:15 +0530
+Subject: [PATCH 0817/2351] drm/msm/disp/dpu: add PSR support for eDP interface
+ in dpu driver
+
+Enable PSR on eDP interface using drm self-refresh librabry.
+This patch uses a trigger from self-refresh library to enter/exit
+into PSR, when there are no updates from framework.
+
+Signed-off-by: Kalyan Thota <quic_kalyant@quicinc.com>
+Signed-off-by: Vinod Polimera <quic_vpolimer@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/524739/
+Link: https://lore.kernel.org/r/1677774797-31063-13-git-send-email-quic_vpolimer@quicinc.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c    | 13 ++++++++++++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 14 ++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c     |  2 +-
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index f29a339a37050..60e59844766ab 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -21,6 +21,7 @@
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_rect.h>
+ #include <drm/drm_vblank.h>
++#include <drm/drm_self_refresh_helper.h>
+ 
+ #include "dpu_kms.h"
+ #include "dpu_hw_lm.h"
+@@ -1021,6 +1022,9 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
+ 
+ 	DRM_DEBUG_KMS("crtc%d\n", crtc->base.id);
+ 
++	if (old_crtc_state->self_refresh_active)
++		return;
++
+ 	/* Disable/save vblank irq handling */
+ 	drm_crtc_vblank_off(crtc);
+ 
+@@ -1577,7 +1581,7 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
+ {
+ 	struct drm_crtc *crtc = NULL;
+ 	struct dpu_crtc *dpu_crtc = NULL;
+-	int i;
++	int i, ret;
+ 
+ 	dpu_crtc = kzalloc(sizeof(*dpu_crtc), GFP_KERNEL);
+ 	if (!dpu_crtc)
+@@ -1614,6 +1618,13 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
+ 	/* initialize event handling */
+ 	spin_lock_init(&dpu_crtc->event_lock);
+ 
++	ret = drm_self_refresh_helper_init(crtc);
++	if (ret) {
++		DPU_ERROR("Failed to initialize %s with self-refresh helpers %d\n",
++			crtc->name, ret);
++		return ERR_PTR(ret);
++	}
++
+ 	DRM_DEBUG_KMS("%s: successfully initialized crtc\n", dpu_crtc->name);
+ 	return crtc;
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 01b750913f084..450abb14ac2fd 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -12,6 +12,7 @@
+ #include <linux/kthread.h>
+ #include <linux/seq_file.h>
+ 
++#include <drm/drm_atomic.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_probe_helper.h>
+@@ -1212,11 +1213,24 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
+ 					struct drm_atomic_state *state)
+ {
+ 	struct dpu_encoder_virt *dpu_enc = NULL;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *old_state = NULL;
+ 	int i = 0;
+ 
+ 	dpu_enc = to_dpu_encoder_virt(drm_enc);
+ 	DPU_DEBUG_ENC(dpu_enc, "\n");
+ 
++	crtc = drm_atomic_get_old_crtc_for_encoder(state, drm_enc);
++	if (crtc)
++		old_state = drm_atomic_get_old_crtc_state(state, crtc);
++
++	/*
++	 * The encoder is already disabled if self refresh mode was set earlier,
++	 * in the old_state for the corresponding crtc.
++	 */
++	if (old_state && old_state->self_refresh_active)
++		return;
++
+ 	mutex_lock(&dpu_enc->enc_lock);
+ 	dpu_enc->enabled = false;
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index a683bd9b5a04b..681dd2e0c7e89 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -491,7 +491,7 @@ static void dpu_kms_wait_for_commit_done(struct msm_kms *kms,
+ 		return;
+ 	}
+ 
+-	if (!crtc->state->active) {
++	if (!drm_atomic_crtc_effectively_active(crtc->state)) {
+ 		DPU_DEBUG("[crtc:%d] not active\n", crtc->base.id);
+ 		return;
+ 	}
+-- 
+2.25.1
+

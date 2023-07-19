@@ -1,0 +1,140 @@
+From 8dae6d7723045fe9f784e29ed10378cb0aab1d91 Mon Sep 17 00:00:00 2001
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Thu, 1 Dec 2022 18:48:46 +0100
+Subject: [PATCH 0308/2351] drm/etnaviv: convert user fence tracking to XArray
+
+This simplifies the driver code a bit, as XArray already provides
+internal locking. IDRs are implemented using XArrays anyways, so
+this drops one level of unneeded abstraction.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ drivers/gpu/drm/etnaviv/etnaviv_drv.h        |  1 +
+ drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c |  9 +++++----
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c        |  7 +++----
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h        |  4 ++--
+ drivers/gpu/drm/etnaviv/etnaviv_sched.c      | 13 +++++--------
+ 5 files changed, 16 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_drv.h b/drivers/gpu/drm/etnaviv/etnaviv_drv.h
+index 2bb4c25565dcb..0b311af04f1da 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_drv.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_drv.h
+@@ -12,6 +12,7 @@
+ #include <linux/sizes.h>
+ #include <linux/time64.h>
+ #include <linux/types.h>
++#include <linux/xarray.h>
+ 
+ #include <drm/drm_drv.h>
+ #include <drm/drm_gem.h>
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+index a602c167b6015..45403ea38906c 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+@@ -393,10 +393,11 @@ static void submit_cleanup(struct kref *kref)
+ 	wake_up_all(&submit->gpu->fence_event);
+ 
+ 	if (submit->out_fence) {
+-		/* first remove from IDR, so fence can not be found anymore */
+-		mutex_lock(&submit->gpu->idr_lock);
+-		idr_remove(&submit->gpu->fence_idr, submit->out_fence_id);
+-		mutex_unlock(&submit->gpu->idr_lock);
++		/*
++		 * Remove from user fence array before dropping the reference,
++		 * so fence can not be found in lookup anymore.
++		 */
++		xa_erase(&submit->gpu->user_fences, submit->out_fence_id);
+ 		dma_fence_put(submit->out_fence);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+index 7bb193b6f1fb1..5f14effc963e3 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -1244,7 +1244,7 @@ int etnaviv_gpu_wait_fence_interruptible(struct etnaviv_gpu *gpu,
+ 	 * pretends we didn't find a fence in that case.
+ 	 */
+ 	rcu_read_lock();
+-	fence = idr_find(&gpu->fence_idr, id);
++	fence = xa_load(&gpu->user_fences, id);
+ 	if (fence)
+ 		fence = dma_fence_get_rcu(fence);
+ 	rcu_read_unlock();
+@@ -1744,7 +1744,7 @@ static int etnaviv_gpu_bind(struct device *dev, struct device *master,
+ 
+ 	gpu->drm = drm;
+ 	gpu->fence_context = dma_fence_context_alloc(1);
+-	idr_init(&gpu->fence_idr);
++	xa_init_flags(&gpu->user_fences, XA_FLAGS_ALLOC);
+ 	spin_lock_init(&gpu->fence_spinlock);
+ 
+ 	INIT_WORK(&gpu->sync_point_work, sync_point_worker);
+@@ -1798,7 +1798,7 @@ static void etnaviv_gpu_unbind(struct device *dev, struct device *master,
+ 	}
+ 
+ 	gpu->drm = NULL;
+-	idr_destroy(&gpu->fence_idr);
++	xa_destroy(&gpu->user_fences);
+ 
+ 	if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+ 		thermal_cooling_device_unregister(gpu->cooling);
+@@ -1831,7 +1831,6 @@ static int etnaviv_gpu_platform_probe(struct platform_device *pdev)
+ 	gpu->dev = &pdev->dev;
+ 	mutex_init(&gpu->lock);
+ 	mutex_init(&gpu->sched_lock);
+-	mutex_init(&gpu->idr_lock);
+ 
+ 	/* Map registers: */
+ 	gpu->mmio = devm_platform_ioremap_resource(pdev, 0);
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+index b8686541cb8e8..98c6f9c320fcc 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -121,8 +121,8 @@ struct etnaviv_gpu {
+ 	u32 idle_mask;
+ 
+ 	/* Fencing support */
+-	struct mutex idr_lock;
+-	struct idr fence_idr;
++	struct xarray user_fences;
++	u32 next_user_fence;
+ 	u32 next_fence;
+ 	u32 completed_fence;
+ 	wait_queue_head_t fence_event;
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_sched.c b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+index 916e117658b22..1ae87dfd19c40 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_sched.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+@@ -98,7 +98,7 @@ static const struct drm_sched_backend_ops etnaviv_sched_ops = {
+ int etnaviv_sched_push_job(struct etnaviv_gem_submit *submit)
+ {
+ 	struct etnaviv_gpu *gpu = submit->gpu;
+-	int ret = 0;
++	int ret;
+ 
+ 	/*
+ 	 * Hold the sched lock across the whole operation to avoid jobs being
+@@ -110,14 +110,11 @@ int etnaviv_sched_push_job(struct etnaviv_gem_submit *submit)
+ 	drm_sched_job_arm(&submit->sched_job);
+ 
+ 	submit->out_fence = dma_fence_get(&submit->sched_job.s_fence->finished);
+-	mutex_lock(&gpu->idr_lock);
+-	submit->out_fence_id = idr_alloc_cyclic(&gpu->fence_idr,
+-						submit->out_fence, 0,
+-						INT_MAX, GFP_KERNEL);
+-	mutex_unlock(&gpu->idr_lock);
+-	if (submit->out_fence_id < 0) {
++	ret = xa_alloc_cyclic(&gpu->user_fences, &submit->out_fence_id,
++			      submit->out_fence, xa_limit_32b,
++			      &gpu->next_user_fence, GFP_KERNEL);
++	if (ret < 0) {
+ 		drm_sched_job_cleanup(&submit->sched_job);
+-		ret = -ENOMEM;
+ 		goto out_unlock;
+ 	}
+ 
+-- 
+2.25.1
+

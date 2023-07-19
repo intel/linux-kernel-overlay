@@ -1,0 +1,100 @@
+From e559ce2720b38d10f6ef93bcb86f8509db147dea Mon Sep 17 00:00:00 2001
+From: Daniel Miess <Daniel.Miess@amd.com>
+Date: Tue, 17 Jan 2023 15:23:06 -0500
+Subject: [PATCH 0294/2351] drm/amd/display: Correct bw_params population
+
+[Why]
+Underflow observed during P010 video playback on
+dcn314 due to incorrectly populated bw_params
+
+[How]
+Populate fclk, memclk and voltage in bw_params with
+values from max pstate rather than min pstate
+
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+Acked-by: Alex Hung <alex.hung@amd.com>
+Signed-off-by: Daniel Miess <Daniel.Miess@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../dc/clk_mgr/dcn314/dcn314_clk_mgr.c        | 31 +++++++++++++------
+ 1 file changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c
+index 89df7244b2728..f5276bacfa4e3 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c
+@@ -572,10 +572,11 @@ static void dcn314_clk_mgr_helper_populate_bw_params(struct clk_mgr_internal *cl
+ {
+ 	struct clk_bw_params *bw_params = clk_mgr->base.bw_params;
+ 	struct clk_limit_table_entry def_max = bw_params->clk_table.entries[bw_params->clk_table.num_entries - 1];
+-	uint32_t max_pstate = 0,  max_fclk = 0,  min_pstate = 0, max_dispclk = 0, max_dppclk = 0;
++	uint32_t max_pstate = 0, max_fclk = 0, max_dispclk = 0, max_dppclk = 0;
++	uint32_t min_pstate = 0, min_fclk = clock_table->DfPstateTable[0].FClk;
+ 	int i;
+ 
+-	/* Find highest valid fclk pstate */
++	/* Find highest and lowest valid fclk pstate */
+ 	for (i = 0; i < clock_table->NumDfPstatesEnabled; i++) {
+ 		if (is_valid_clock_value(clock_table->DfPstateTable[i].FClk) &&
+ 		    clock_table->DfPstateTable[i].FClk > max_fclk) {
+@@ -584,6 +585,14 @@ static void dcn314_clk_mgr_helper_populate_bw_params(struct clk_mgr_internal *cl
+ 		}
+ 	}
+ 
++	for (i = 0; i < clock_table->NumDfPstatesEnabled; i++) {
++		if (is_valid_clock_value(clock_table->DfPstateTable[i].FClk) &&
++		    clock_table->DfPstateTable[i].FClk < min_fclk) {
++			min_fclk = clock_table->DfPstateTable[i].FClk;
++			min_pstate = i;
++		}
++	}
++
+ 	/* We expect the table to contain at least one valid fclk entry. */
+ 	ASSERT(is_valid_clock_value(max_fclk));
+ 
+@@ -599,15 +608,17 @@ static void dcn314_clk_mgr_helper_populate_bw_params(struct clk_mgr_internal *cl
+ 
+ 	/* Base the clock table on dcfclk, need at least one entry regardless of pmfw table */
+ 	for (i = 0; i < clock_table->NumDcfClkLevelsEnabled; i++) {
+-		uint32_t min_fclk = clock_table->DfPstateTable[0].FClk;
++		uint32_t max_level_fclk = clock_table->DfPstateTable[0].FClk;
++		uint32_t max_level_pstate = 0;
+ 		int j;
+ 
++		/* Look for the maximum supported FCLK for the current voltage. */
+ 		for (j = 1; j < clock_table->NumDfPstatesEnabled; j++) {
+ 			if (is_valid_clock_value(clock_table->DfPstateTable[j].FClk) &&
+-			    clock_table->DfPstateTable[j].FClk < min_fclk &&
++			    clock_table->DfPstateTable[j].FClk > max_level_fclk &&
+ 			    clock_table->DfPstateTable[j].Voltage <= clock_table->SocVoltage[i]) {
+-				min_fclk = clock_table->DfPstateTable[j].FClk;
+-				min_pstate = j;
++				max_level_fclk = clock_table->DfPstateTable[j].FClk;
++				max_level_pstate = j;
+ 			}
+ 		}
+ 
+@@ -621,15 +632,15 @@ static void dcn314_clk_mgr_helper_populate_bw_params(struct clk_mgr_internal *cl
+ 		bw_params->clk_table.entries[i].dtbclk_mhz = bw_params->clk_table.entries[j].dtbclk_mhz;
+ 
+ 		/* Now update clocks we do read */
+-		bw_params->clk_table.entries[i].fclk_mhz = min_fclk;
+-		bw_params->clk_table.entries[i].memclk_mhz = clock_table->DfPstateTable[min_pstate].MemClk;
+-		bw_params->clk_table.entries[i].voltage = clock_table->DfPstateTable[min_pstate].Voltage;
++		bw_params->clk_table.entries[i].fclk_mhz = max_level_fclk;
++		bw_params->clk_table.entries[i].memclk_mhz = clock_table->DfPstateTable[max_level_pstate].MemClk;
++		bw_params->clk_table.entries[i].voltage = clock_table->DfPstateTable[max_level_pstate].Voltage;
+ 		bw_params->clk_table.entries[i].dcfclk_mhz = clock_table->DcfClocks[i];
+ 		bw_params->clk_table.entries[i].socclk_mhz = clock_table->SocClocks[i];
+ 		bw_params->clk_table.entries[i].dispclk_mhz = max_dispclk;
+ 		bw_params->clk_table.entries[i].dppclk_mhz = max_dppclk;
+ 		bw_params->clk_table.entries[i].wck_ratio = convert_wck_ratio(
+-			clock_table->DfPstateTable[min_pstate].WckRatio);
++			clock_table->DfPstateTable[max_level_pstate].WckRatio);
+ 	}
+ 
+ 	/* Make sure to include at least one entry at highest pstate */
+-- 
+2.25.1
+

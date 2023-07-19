@@ -1,0 +1,164 @@
+From 5847ae3cbe9f303f20672bfcdaf234538d3a8235 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 3 Sep 2021 11:47:52 -0700
+Subject: [PATCH 0474/2351] dma-buf/dma-fence: Add deadline awareness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a way to hint to the fence signaler of an upcoming deadline, such as
+vblank, which the fence waiter would prefer not to miss.  This is to aid
+the fence signaler in making power management decisions, like boosting
+frequency as the deadline approaches and awareness of missing deadlines
+so that can be factored in to the frequency scaling.
+
+v2: Drop dma_fence::deadline and related logic to filter duplicate
+    deadlines, to avoid increasing dma_fence size.  The fence-context
+    implementation will need similar logic to track deadlines of all
+    the fences on the same timeline.  [ckoenig]
+v3: Clarify locking wrt. set_deadline callback
+v4: Clarify in docs comment that this is a hint
+v5: Drop DMA_FENCE_FLAG_HAS_DEADLINE_BIT.
+v6: More docs
+v7: Fix typo, clarify past deadlines
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Acked-by: Pekka Paalanen <pekka.paalanen@collabora.com>
+Reviewed-by: Bagas Sanjaya <bagasdotme@gmail.com>
+---
+ Documentation/driver-api/dma-buf.rst |  6 +++
+ drivers/dma-buf/dma-fence.c          | 59 ++++++++++++++++++++++++++++
+ include/linux/dma-fence.h            | 22 +++++++++++
+ 3 files changed, 87 insertions(+)
+
+diff --git a/Documentation/driver-api/dma-buf.rst b/Documentation/driver-api/dma-buf.rst
+index 36a76cbe90954..c010ad76f001a 100644
+--- a/Documentation/driver-api/dma-buf.rst
++++ b/Documentation/driver-api/dma-buf.rst
+@@ -158,6 +158,12 @@ DMA Fence Signalling Annotations
+ .. kernel-doc:: drivers/dma-buf/dma-fence.c
+    :doc: fence signalling annotation
+ 
++DMA Fence Deadline Hints
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. kernel-doc:: drivers/dma-buf/dma-fence.c
++   :doc: deadline hints
++
+ DMA Fences Functions Reference
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/drivers/dma-buf/dma-fence.c b/drivers/dma-buf/dma-fence.c
+index 0de0482cd36e2..f177c56269bb0 100644
+--- a/drivers/dma-buf/dma-fence.c
++++ b/drivers/dma-buf/dma-fence.c
+@@ -912,6 +912,65 @@ dma_fence_wait_any_timeout(struct dma_fence **fences, uint32_t count,
+ }
+ EXPORT_SYMBOL(dma_fence_wait_any_timeout);
+ 
++/**
++ * DOC: deadline hints
++ *
++ * In an ideal world, it would be possible to pipeline a workload sufficiently
++ * that a utilization based device frequency governor could arrive at a minimum
++ * frequency that meets the requirements of the use-case, in order to minimize
++ * power consumption.  But in the real world there are many workloads which
++ * defy this ideal.  For example, but not limited to:
++ *
++ * * Workloads that ping-pong between device and CPU, with alternating periods
++ *   of CPU waiting for device, and device waiting on CPU.  This can result in
++ *   devfreq and cpufreq seeing idle time in their respective domains and in
++ *   result reduce frequency.
++ *
++ * * Workloads that interact with a periodic time based deadline, such as double
++ *   buffered GPU rendering vs vblank sync'd page flipping.  In this scenario,
++ *   missing a vblank deadline results in an *increase* in idle time on the GPU
++ *   (since it has to wait an additional vblank period), sending a signal to
++ *   the GPU's devfreq to reduce frequency, when in fact the opposite is what is
++ *   needed.
++ *
++ * To this end, deadline hint(s) can be set on a &dma_fence via &dma_fence_set_deadline.
++ * The deadline hint provides a way for the waiting driver, or userspace, to
++ * convey an appropriate sense of urgency to the signaling driver.
++ *
++ * A deadline hint is given in absolute ktime (CLOCK_MONOTONIC for userspace
++ * facing APIs).  The time could either be some point in the future (such as
++ * the vblank based deadline for page-flipping, or the start of a compositor's
++ * composition cycle), or the current time to indicate an immediate deadline
++ * hint (Ie. forward progress cannot be made until this fence is signaled).
++ *
++ * Multiple deadlines may be set on a given fence, even in parallel.  See the
++ * documentation for &dma_fence_ops.set_deadline.
++ *
++ * The deadline hint is just that, a hint.  The driver that created the fence
++ * may react by increasing frequency, making different scheduling choices, etc.
++ * Or doing nothing at all.
++ */
++
++/**
++ * dma_fence_set_deadline - set desired fence-wait deadline hint
++ * @fence:    the fence that is to be waited on
++ * @deadline: the time by which the waiter hopes for the fence to be
++ *            signaled
++ *
++ * Give the fence signaler a hint about an upcoming deadline, such as
++ * vblank, by which point the waiter would prefer the fence to be
++ * signaled by.  This is intended to give feedback to the fence signaler
++ * to aid in power management decisions, such as boosting GPU frequency
++ * if a periodic vblank deadline is approaching but the fence is not
++ * yet signaled..
++ */
++void dma_fence_set_deadline(struct dma_fence *fence, ktime_t deadline)
++{
++	if (fence->ops->set_deadline && !dma_fence_is_signaled(fence))
++		fence->ops->set_deadline(fence, deadline);
++}
++EXPORT_SYMBOL(dma_fence_set_deadline);
++
+ /**
+  * dma_fence_describe - Dump fence describtion into seq_file
+  * @fence: the 6fence to describe
+diff --git a/include/linux/dma-fence.h b/include/linux/dma-fence.h
+index 775cdc0b4f249..d54b595a0fe0f 100644
+--- a/include/linux/dma-fence.h
++++ b/include/linux/dma-fence.h
+@@ -257,6 +257,26 @@ struct dma_fence_ops {
+ 	 */
+ 	void (*timeline_value_str)(struct dma_fence *fence,
+ 				   char *str, int size);
++
++	/**
++	 * @set_deadline:
++	 *
++	 * Callback to allow a fence waiter to inform the fence signaler of
++	 * an upcoming deadline, such as vblank, by which point the waiter
++	 * would prefer the fence to be signaled by.  This is intended to
++	 * give feedback to the fence signaler to aid in power management
++	 * decisions, such as boosting GPU frequency.
++	 *
++	 * This is called without &dma_fence.lock held, it can be called
++	 * multiple times and from any context.  Locking is up to the callee
++	 * if it has some state to manage.  If multiple deadlines are set,
++	 * the expectation is to track the soonest one.  If the deadline is
++	 * before the current time, it should be interpreted as an immediate
++	 * deadline.
++	 *
++	 * This callback is optional.
++	 */
++	void (*set_deadline)(struct dma_fence *fence, ktime_t deadline);
+ };
+ 
+ void dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+@@ -583,6 +603,8 @@ static inline signed long dma_fence_wait(struct dma_fence *fence, bool intr)
+ 	return ret < 0 ? ret : 0;
+ }
+ 
++void dma_fence_set_deadline(struct dma_fence *fence, ktime_t deadline);
++
+ struct dma_fence *dma_fence_get_stub(void);
+ struct dma_fence *dma_fence_allocate_private_stub(void);
+ u64 dma_fence_context_alloc(unsigned num);
+-- 
+2.25.1
+

@@ -1,0 +1,124 @@
+From b3b83884dbbc28fd39b7aae7a9e7f6dffb6a27ed Mon Sep 17 00:00:00 2001
+From: Chen Meng J <meng.j.chen@intel.com>
+Date: Wed, 12 Jul 2023 14:20:02 +0800
+Subject: [PATCH 03/43] media: intel-ipu6: Virtual Channel project doesn't
+ check link
+
+Change Description:
+Virtual Channel project doesn't check link validation.
+
+Signed-off-by: Hongju Wang <hongju.wang@intel.com>
+Signed-off-by: Chen Meng J <meng.j.chen@intel.com>
+---
+ .../media/pci/intel/ipu-isys-csi2-be-soc.c    |  1 -
+ drivers/media/pci/intel/ipu-isys-csi2.c       | 27 +++++++++----------
+ drivers/media/pci/intel/ipu-isys-queue.c      |  9 -------
+ drivers/media/pci/intel/ipu-isys-video.c      |  6 ++++-
+ 4 files changed, 18 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2-be-soc.c b/drivers/media/pci/intel/ipu-isys-csi2-be-soc.c
+index 887bf8fa70e5..764c91896a31 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2-be-soc.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2-be-soc.c
+@@ -170,7 +170,6 @@ static struct v4l2_subdev_ops csi2_be_soc_sd_ops = {
+ };
+ 
+ static struct media_entity_operations csi2_be_soc_entity_ops = {
+-	.link_validate = v4l2_subdev_link_validate,
+ };
+ 
+ static void csi2_be_soc_set_ffmt(struct v4l2_subdev *sd,
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.c b/drivers/media/pci/intel/ipu-isys-csi2.c
+index 7ebf15a8c8b6..d6e3f2ee342e 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2.c
+@@ -277,6 +277,9 @@ static int csi2_link_validate(struct media_link *link)
+ 	struct media_pipeline *media_pipe;
+ 	struct ipu_isys_csi2 *csi2;
+ 	struct ipu_isys_pipeline *ip;
++	struct v4l2_subdev *source_sd;
++	struct v4l2_subdev *sink_sd;
++
+ 	int rval;
+ 
+ 	if (!link->sink->entity || !link->source->entity)
+@@ -291,21 +294,17 @@ static int csi2_link_validate(struct media_link *link)
+ 	csi2->receiver_errors = 0;
+ 	ip->csi2 = csi2;
+ 	ipu_isys_video_add_capture_done(ip, csi2_capture_done);
++	source_sd = media_entity_to_v4l2_subdev(link->source->entity);
++	sink_sd = media_entity_to_v4l2_subdev(link->sink->entity);
++	if (!source_sd)
++		return -ENODEV;
+ 
+-	rval = v4l2_subdev_link_validate(link);
+-	if (rval)
+-		return rval;
+-
+-	if (!v4l2_ctrl_g_ctrl(csi2->store_csi2_header)) {
+-		struct media_pad *remote_pad =
+-		    media_pad_remote_pad_first(&csi2->asd.pad[CSI2_PAD_SOURCE]);
+-
+-		if (remote_pad &&
+-		    is_media_entity_v4l2_subdev(remote_pad->entity)) {
+-			dev_err(&csi2->isys->adev->dev,
+-				"CSI2 BE requires CSI2 headers.\n");
+-			return -EINVAL;
+-		}
++	if (strncmp(source_sd->name, IPU_ISYS_ENTITY_PREFIX,
++		    strlen(IPU_ISYS_ENTITY_PREFIX)) != 0) {
++		ip->external = link->source;
++		ip->source = to_ipu_isys_subdev(sink_sd)->source;
++		dev_dbg(&csi2->isys->adev->dev, "%s: using source %d\n",
++			sink_sd->entity.name, ip->source);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/media/pci/intel/ipu-isys-queue.c b/drivers/media/pci/intel/ipu-isys-queue.c
+index 19bfa8bfcf2c..094858f6650c 100644
+--- a/drivers/media/pci/intel/ipu-isys-queue.c
++++ b/drivers/media/pci/intel/ipu-isys-queue.c
+@@ -751,14 +751,6 @@ static int __start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	mutex_unlock(&av->isys->stream_mutex);
+ 
+-	rval = aq->link_fmt_validate(aq);
+-	if (rval) {
+-		dev_err(&av->isys->adev->dev,
+-			"%s: link format validation failed (%d)\n",
+-			av->vdev.name, rval);
+-		goto out_unprepare_streaming;
+-	}
+-
+ 	ip = to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+ 	pipe_av = container_of(ip, struct ipu_isys_video, ip);
+ 	if (pipe_av != av) {
+@@ -814,7 +806,6 @@ static int __start_streaming(struct vb2_queue *q, unsigned int count)
+ 		mutex_lock(&av->mutex);
+ 	}
+ 
+-out_unprepare_streaming:
+ 	mutex_lock(&av->isys->stream_mutex);
+ 	if (first)
+ 		ipu_isys_video_prepare_streaming(av, 0);
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index f0072e65838e..4004630ab894 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -930,8 +930,12 @@ static int ipu_isys_query_sensor_info(struct media_pad *source_pad,
+ 			(pad_id - NR_OF_CSI2_BE_SOC_SINK_PADS)) {
+ 			ip->vc = ip->asv[qm.index].vc;
+ 			flag = true;
+-			pr_info("The current entityvc:id:%d\n", ip->vc);
++			pr_info("The current entity vc:id:%d\n", ip->vc);
+ 		}
++		dev_dbg(source_pad->entity->graph_obj.mdev->dev,
++			"dentity vc:%d, dt:%x, substream:%d\n",
++			ip->vc, ip->asv[qm.index].dt,
++			ip->asv[qm.index].substream);
+ 	}
+ 
+ 	if (flag)
+-- 
+2.25.1
+

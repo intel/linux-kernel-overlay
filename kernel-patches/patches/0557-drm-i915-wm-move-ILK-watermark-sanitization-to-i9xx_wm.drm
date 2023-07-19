@@ -1,0 +1,349 @@
+From 1135795dd109ea38c1a341c6ea16721e84ec2a19 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Wed, 15 Feb 2023 16:19:06 +0200
+Subject: [PATCH 0557/2351] drm/i915/wm: move ILK watermark sanitization to
+ i9xx_wm.[ch]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Move sanitize_watermarks() to i9xx_wm.[ch] and rename as
+ilk_wm_sanitize(). The slightly unfortunate downside is having to expose
+intel_atomic_check() from intel_display.c, but this declutters
+intel_display.c nicely.
+
+v2:
+- Move to i9xx_wm.[ch] instead of intel_wm.[ch] (Ville)
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230215141910.433043-1-jani.nikula@intel.com
+---
+ drivers/gpu/drm/i915/display/i9xx_wm.c       | 119 ++++++++++++++++++
+ drivers/gpu/drm/i915/display/i9xx_wm.h       |   1 +
+ drivers/gpu/drm/i915/display/intel_display.c | 124 +------------------
+ drivers/gpu/drm/i915/display/intel_display.h |   2 +
+ 4 files changed, 125 insertions(+), 121 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_wm.c b/drivers/gpu/drm/i915/display/i9xx_wm.c
+index dfdd40991871c..f76ac64ebd714 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_wm.c
++++ b/drivers/gpu/drm/i915/display/i9xx_wm.c
+@@ -5,6 +5,7 @@
+ 
+ #include "i915_drv.h"
+ #include "i9xx_wm.h"
++#include "intel_atomic.h"
+ #include "intel_display.h"
+ #include "intel_display_trace.h"
+ #include "intel_mchbar_regs.h"
+@@ -3380,6 +3381,124 @@ static void ilk_pipe_wm_get_hw_state(struct intel_crtc *crtc)
+ 	crtc->wm.active.ilk = *active;
+ }
+ 
++static int ilk_sanitize_watermarks_add_affected(struct drm_atomic_state *state)
++{
++	struct drm_plane *plane;
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(state->dev, crtc) {
++		struct intel_crtc_state *crtc_state;
++
++		crtc_state = intel_atomic_get_crtc_state(state, crtc);
++		if (IS_ERR(crtc_state))
++			return PTR_ERR(crtc_state);
++
++		if (crtc_state->hw.active) {
++			/*
++			 * Preserve the inherited flag to avoid
++			 * taking the full modeset path.
++			 */
++			crtc_state->inherited = true;
++		}
++	}
++
++	drm_for_each_plane(plane, state->dev) {
++		struct drm_plane_state *plane_state;
++
++		plane_state = drm_atomic_get_plane_state(state, plane);
++		if (IS_ERR(plane_state))
++			return PTR_ERR(plane_state);
++	}
++
++	return 0;
++}
++
++/*
++ * Calculate what we think the watermarks should be for the state we've read
++ * out of the hardware and then immediately program those watermarks so that
++ * we ensure the hardware settings match our internal state.
++ *
++ * We can calculate what we think WM's should be by creating a duplicate of the
++ * current state (which was constructed during hardware readout) and running it
++ * through the atomic check code to calculate new watermark values in the
++ * state object.
++ */
++void ilk_wm_sanitize(struct drm_i915_private *dev_priv)
++{
++	struct drm_atomic_state *state;
++	struct intel_atomic_state *intel_state;
++	struct intel_crtc *crtc;
++	struct intel_crtc_state *crtc_state;
++	struct drm_modeset_acquire_ctx ctx;
++	int ret;
++	int i;
++
++	/* Only supported on platforms that use atomic watermark design */
++	if (!dev_priv->display.funcs.wm->optimize_watermarks)
++		return;
++
++	state = drm_atomic_state_alloc(&dev_priv->drm);
++	if (drm_WARN_ON(&dev_priv->drm, !state))
++		return;
++
++	intel_state = to_intel_atomic_state(state);
++
++	drm_modeset_acquire_init(&ctx, 0);
++
++retry:
++	state->acquire_ctx = &ctx;
++
++	/*
++	 * Hardware readout is the only time we don't want to calculate
++	 * intermediate watermarks (since we don't trust the current
++	 * watermarks).
++	 */
++	if (!HAS_GMCH(dev_priv))
++		intel_state->skip_intermediate_wm = true;
++
++	ret = ilk_sanitize_watermarks_add_affected(state);
++	if (ret)
++		goto fail;
++
++	ret = intel_atomic_check(&dev_priv->drm, state);
++	if (ret)
++		goto fail;
++
++	/* Write calculated watermark values back */
++	for_each_new_intel_crtc_in_state(intel_state, crtc, crtc_state, i) {
++		crtc_state->wm.need_postvbl_update = true;
++		intel_optimize_watermarks(intel_state, crtc);
++
++		to_intel_crtc_state(crtc->base.state)->wm = crtc_state->wm;
++	}
++
++fail:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++
++	/*
++	 * If we fail here, it means that the hardware appears to be
++	 * programmed in a way that shouldn't be possible, given our
++	 * understanding of watermark requirements.  This might mean a
++	 * mistake in the hardware readout code or a mistake in the
++	 * watermark calculations for a given platform.  Raise a WARN
++	 * so that this is noticeable.
++	 *
++	 * If this actually happens, we'll have to just leave the
++	 * BIOS-programmed watermarks untouched and hope for the best.
++	 */
++	drm_WARN(&dev_priv->drm, ret,
++		 "Could not determine valid watermarks for inherited state\n");
++
++	drm_atomic_state_put(state);
++
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++}
++
+ #define _FW_WM(value, plane) \
+ 	(((value) & DSPFW_ ## plane ## _MASK) >> DSPFW_ ## plane ## _SHIFT)
+ #define _FW_WM_VLV(value, plane) \
+diff --git a/drivers/gpu/drm/i915/display/i9xx_wm.h b/drivers/gpu/drm/i915/display/i9xx_wm.h
+index 133a3234dea5e..a7875cbcd05aa 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_wm.h
++++ b/drivers/gpu/drm/i915/display/i9xx_wm.h
+@@ -14,6 +14,7 @@ struct intel_plane_state;
+ 
+ int ilk_wm_max_level(const struct drm_i915_private *i915);
+ bool ilk_disable_lp_wm(struct drm_i915_private *i915);
++void ilk_wm_sanitize(struct drm_i915_private *i915);
+ bool intel_set_memory_cxsr(struct drm_i915_private *i915, bool enable);
+ void i9xx_wm_init(struct drm_i915_private *i915);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index ffde4a7887710..2481f5970e201 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6610,8 +6610,8 @@ static int intel_bigjoiner_add_affected_crtcs(struct intel_atomic_state *state)
+  * @dev: drm device
+  * @_state: state to validate
+  */
+-static int intel_atomic_check(struct drm_device *dev,
+-			      struct drm_atomic_state *_state)
++int intel_atomic_check(struct drm_device *dev,
++		       struct drm_atomic_state *_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct intel_atomic_state *state = to_intel_atomic_state(_state);
+@@ -8293,124 +8293,6 @@ void intel_modeset_init_hw(struct drm_i915_private *i915)
+ 	cdclk_state->logical = cdclk_state->actual = i915->display.cdclk.hw;
+ }
+ 
+-static int sanitize_watermarks_add_affected(struct drm_atomic_state *state)
+-{
+-	struct drm_plane *plane;
+-	struct intel_crtc *crtc;
+-
+-	for_each_intel_crtc(state->dev, crtc) {
+-		struct intel_crtc_state *crtc_state;
+-
+-		crtc_state = intel_atomic_get_crtc_state(state, crtc);
+-		if (IS_ERR(crtc_state))
+-			return PTR_ERR(crtc_state);
+-
+-		if (crtc_state->hw.active) {
+-			/*
+-			 * Preserve the inherited flag to avoid
+-			 * taking the full modeset path.
+-			 */
+-			crtc_state->inherited = true;
+-		}
+-	}
+-
+-	drm_for_each_plane(plane, state->dev) {
+-		struct drm_plane_state *plane_state;
+-
+-		plane_state = drm_atomic_get_plane_state(state, plane);
+-		if (IS_ERR(plane_state))
+-			return PTR_ERR(plane_state);
+-	}
+-
+-	return 0;
+-}
+-
+-/*
+- * Calculate what we think the watermarks should be for the state we've read
+- * out of the hardware and then immediately program those watermarks so that
+- * we ensure the hardware settings match our internal state.
+- *
+- * We can calculate what we think WM's should be by creating a duplicate of the
+- * current state (which was constructed during hardware readout) and running it
+- * through the atomic check code to calculate new watermark values in the
+- * state object.
+- */
+-static void sanitize_watermarks(struct drm_i915_private *dev_priv)
+-{
+-	struct drm_atomic_state *state;
+-	struct intel_atomic_state *intel_state;
+-	struct intel_crtc *crtc;
+-	struct intel_crtc_state *crtc_state;
+-	struct drm_modeset_acquire_ctx ctx;
+-	int ret;
+-	int i;
+-
+-	/* Only supported on platforms that use atomic watermark design */
+-	if (!dev_priv->display.funcs.wm->optimize_watermarks)
+-		return;
+-
+-	state = drm_atomic_state_alloc(&dev_priv->drm);
+-	if (drm_WARN_ON(&dev_priv->drm, !state))
+-		return;
+-
+-	intel_state = to_intel_atomic_state(state);
+-
+-	drm_modeset_acquire_init(&ctx, 0);
+-
+-retry:
+-	state->acquire_ctx = &ctx;
+-
+-	/*
+-	 * Hardware readout is the only time we don't want to calculate
+-	 * intermediate watermarks (since we don't trust the current
+-	 * watermarks).
+-	 */
+-	if (!HAS_GMCH(dev_priv))
+-		intel_state->skip_intermediate_wm = true;
+-
+-	ret = sanitize_watermarks_add_affected(state);
+-	if (ret)
+-		goto fail;
+-
+-	ret = intel_atomic_check(&dev_priv->drm, state);
+-	if (ret)
+-		goto fail;
+-
+-	/* Write calculated watermark values back */
+-	for_each_new_intel_crtc_in_state(intel_state, crtc, crtc_state, i) {
+-		crtc_state->wm.need_postvbl_update = true;
+-		intel_optimize_watermarks(intel_state, crtc);
+-
+-		to_intel_crtc_state(crtc->base.state)->wm = crtc_state->wm;
+-	}
+-
+-fail:
+-	if (ret == -EDEADLK) {
+-		drm_atomic_state_clear(state);
+-		drm_modeset_backoff(&ctx);
+-		goto retry;
+-	}
+-
+-	/*
+-	 * If we fail here, it means that the hardware appears to be
+-	 * programmed in a way that shouldn't be possible, given our
+-	 * understanding of watermark requirements.  This might mean a
+-	 * mistake in the hardware readout code or a mistake in the
+-	 * watermark calculations for a given platform.  Raise a WARN
+-	 * so that this is noticeable.
+-	 *
+-	 * If this actually happens, we'll have to just leave the
+-	 * BIOS-programmed watermarks untouched and hope for the best.
+-	 */
+-	drm_WARN(&dev_priv->drm, ret,
+-		 "Could not determine valid watermarks for inherited state\n");
+-
+-	drm_atomic_state_put(state);
+-
+-	drm_modeset_drop_locks(&ctx);
+-	drm_modeset_acquire_fini(&ctx);
+-}
+-
+ static int intel_initial_commit(struct drm_device *dev)
+ {
+ 	struct drm_atomic_state *state = NULL;
+@@ -8692,7 +8574,7 @@ int intel_modeset_init_nogem(struct drm_i915_private *i915)
+ 	 * since the watermark calculation done here will use pstate->fb.
+ 	 */
+ 	if (!HAS_GMCH(i915))
+-		sanitize_watermarks(i915);
++		ilk_wm_sanitize(i915);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_display.h b/drivers/gpu/drm/i915/display/intel_display.h
+index cb6f520cc575f..ed852f62721d1 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -32,6 +32,7 @@
+ 
+ enum drm_scaling_filter;
+ struct dpll;
++struct drm_atomic_state;
+ struct drm_connector;
+ struct drm_device;
+ struct drm_display_mode;
+@@ -394,6 +395,7 @@ enum phy_fia {
+ 			     ((connector) = to_intel_connector((__state)->base.connectors[__i].ptr), \
+ 			     (new_connector_state) = to_intel_digital_connector_state((__state)->base.connectors[__i].new_state), 1))
+ 
++int intel_atomic_check(struct drm_device *dev, struct drm_atomic_state *state);
+ int intel_atomic_add_affected_planes(struct intel_atomic_state *state,
+ 				     struct intel_crtc *crtc);
+ u8 intel_calc_active_pipes(struct intel_atomic_state *state,
+-- 
+2.25.1
+
