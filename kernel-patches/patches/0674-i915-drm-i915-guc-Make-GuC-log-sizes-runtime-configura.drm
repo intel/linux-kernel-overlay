@@ -1,0 +1,120 @@
+From 6ef7540f41b754c7b62a21e0cc3001b0600c94fc Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 17 Jun 2022 08:47:09 -0700
+Subject: [PATCH 674/704] i915: drm/i915/guc: Make GuC log sizes runtime
+ configurable
+
+The GuC log buffer sizes had to be configured statically at compile
+time. This can be quite troublesome when needing to get larger logs
+out of a released driver. So add a boot time module parameter override.
+
+Unfortunately, it is apparently absolutely forbidden to add module
+parameters upstream. So this change must stay as an internal only
+patch.
+
+Working.
+
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+---
+ drivers/gpu/drm/i915/gt/uc/intel_guc_log.c | 31 +++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_params.c         | 12 +++++++++
+ drivers/gpu/drm/i915/i915_params.h         |  3 +++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_log.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_log.c
+index 55bc8b55fbc0..6ab97713a16b 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_log.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_log.c
+@@ -37,9 +37,28 @@ struct guc_log_section {
+ 	const char *name;
+ };
+ 
++static s32 scale_log_param(struct intel_guc_log *log, const struct guc_log_section *section,
++			   s32 param)
++{
++	/* -1 means default */
++	if (param < 0)
++		return section->default_val;
++
++	/* Check for 32-bit overflow */
++	if (overflows_type(param * (s64) SZ_1M, param)) {
++		gt_err(guc_to_gt(log_to_guc(log)), "Size too large for GuC %s log: %dMB!",
++			section->name, param);
++		return section->default_val;
++	}
++
++	/* Param units are 1MB */
++	return param * SZ_1M;
++}
++
+ static void _guc_log_init_sizes(struct intel_guc_log *log)
+ {
+ 	struct intel_guc *guc = log_to_guc(log);
++	struct drm_i915_private *i915 = guc_to_gt(guc)->i915;
+ 	static const struct guc_log_section sections[GUC_LOG_SECTIONS_LIMIT] = {
+ 		{
+ 			GUC_LOG_CRASH_MASK >> GUC_LOG_CRASH_SHIFT,
+@@ -60,14 +79,20 @@ static void _guc_log_init_sizes(struct intel_guc_log *log)
+ 			"capture",
+ 		}
+ 	};
++	s32 params[GUC_LOG_SECTIONS_LIMIT] = {
++		i915->params.guc_log_size_crash,
++		i915->params.guc_log_size_debug,
++		i915->params.guc_log_size_capture,
++	};
+ 	int i;
+ 
+ 	for (i = 0; i < GUC_LOG_SECTIONS_LIMIT; i++)
+-		log->sizes[i].bytes = sections[i].default_val;
++		log->sizes[i].bytes = scale_log_param(log, sections + i, params[i]);
+ 
+ 	/* If debug size > 1MB then bump default crash size to keep the same units */
+-	if (log->sizes[GUC_LOG_SECTIONS_DEBUG].bytes >= SZ_1M &&
+-	    GUC_LOG_DEFAULT_CRASH_BUFFER_SIZE < SZ_1M)
++	if ((log->sizes[GUC_LOG_SECTIONS_DEBUG].bytes >= SZ_1M) &&
++	    (i915->params.guc_log_size_crash == -1) &&
++	    (GUC_LOG_DEFAULT_CRASH_BUFFER_SIZE < SZ_1M))
+ 		log->sizes[GUC_LOG_SECTIONS_CRASH].bytes = SZ_1M;
+ 
+ 	/* Prepare the GuC API structure fields: */
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index 0a171b57fd8f..a1f2247943d0 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -189,6 +189,18 @@ i915_param_named(guc_log_level, int, 0400,
+ 	"GuC firmware logging level. Requires GuC to be loaded. "
+ 	"(-1=auto [default], 0=disable, 1..4=enable with verbosity min..max)");
+ 
++i915_param_named(guc_log_size_crash, int, 0400,
++	"GuC firmware logging buffer size for crash dumps (in MB)"
++	"(-1=auto [default], NB: max = 4, other restrictions apply)");
++
++i915_param_named(guc_log_size_debug, int, 0400,
++	"GuC firmware logging buffer size for debug logs (in MB)"
++	"(-1=auto [default], NB: max = 16, other restrictions apply)");
++
++i915_param_named(guc_log_size_capture, int, 0400,
++	"GuC error capture register dump buffer size (in MB)"
++	"(-1=auto [default], NB: max = 4, other restrictions apply)");
++
+ i915_param_named_unsafe(guc_firmware_path, charp, 0400,
+ 	"GuC firmware path to use instead of the default one");
+ 
+diff --git a/drivers/gpu/drm/i915/i915_params.h b/drivers/gpu/drm/i915/i915_params.h
+index 68abf0ad6c00..3ebb259cfe60 100644
+--- a/drivers/gpu/drm/i915/i915_params.h
++++ b/drivers/gpu/drm/i915/i915_params.h
+@@ -63,6 +63,9 @@ struct drm_printer;
+ 	param(int, invert_brightness, 0, 0600) \
+ 	param(int, enable_guc, -1, 0400) \
+ 	param(int, guc_log_level, -1, 0400) \
++	param(int, guc_log_size_crash, -1, 0400) \
++	param(int, guc_log_size_debug, -1, 0400) \
++	param(int, guc_log_size_capture, -1, 0400) \
+ 	param(char *, guc_firmware_path, NULL, 0400) \
+ 	param(char *, huc_firmware_path, NULL, 0400) \
+ 	param(char *, dmc_firmware_path, NULL, 0400) \
+-- 
+2.25.1
+

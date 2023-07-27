@@ -1,0 +1,142 @@
+From b230a8e68098ff86ff0d216282a503907d80be1c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Piotr=20Pi=C3=B3rkowski?= <piotr.piorkowski@intel.com>
+Date: Tue, 10 May 2022 22:44:46 +0200
+Subject: [PATCH 703/704] i915: drm/i915/iov: Fix suspend/hibernate when VFs
+ are enabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We take a GT PM wakeref while we are enabling the VFs .
+During the transition to the S3/S4 state, the driver expects
+GT PM to be idle.
+However in case when we had VFs enabled, not all wakrefs were returned
+which caused the hang.
+Let's put GT PM wakrefe during suspend when we have enabled VFs
+
+Signed-off-by: Piotr Piórkowski <piotr.piorkowski@intel.com>
+Signed-off-by: Zawawi, Muhammad Zul Husni <muhammad.zul.husni.zawawi@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_gt_pm.c   |  3 +++
+ drivers/gpu/drm/i915/gt/iov/intel_iov.c | 33 +++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gt/iov/intel_iov.h |  6 +++++
+ drivers/gpu/drm/i915/i915_sriov.c       |  5 ++--
+ 4 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_pm.c b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+index 5a942af0a14e..a7524ae38fa6 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+@@ -21,6 +21,7 @@
+ #include "intel_rps.h"
+ #include "intel_wakeref.h"
+ #include "pxp/intel_pxp_pm.h"
++#include "iov/intel_iov.h"
+ 
+ #define I915_GT_SUSPEND_IDLE_TIMEOUT (HZ / 2)
+ 
+@@ -306,6 +307,8 @@ static void wait_for_suspend(struct intel_gt *gt)
+ 
+ void intel_gt_suspend_prepare(struct intel_gt *gt)
+ {
++	intel_iov_suspend(&gt->iov);
++
+ 	user_forcewake(gt, true);
+ 	wait_for_suspend(gt);
+ }
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov.c b/drivers/gpu/drm/i915/gt/iov/intel_iov.c
+index b9a1cdf312f3..1185abff50fe 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov.c
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov.c
+@@ -11,6 +11,7 @@
+ #include "intel_iov_service.h"
+ #include "intel_iov_state.h"
+ #include "intel_iov_utils.h"
++#include "gt/intel_gt_pm.h"
+ 
+ #include "i915_reg.h"
+ 
+@@ -299,3 +300,35 @@ int intel_iov_init_late(struct intel_iov *iov)
+ 
+ 	return 0;
+ }
++
++void intel_iov_pf_get_pm_vfs(struct intel_iov *iov)
++{
++	GEM_BUG_ON(!intel_iov_is_pf(iov));
++
++	intel_gt_pm_get(iov_to_gt(iov));
++}
++
++void intel_iov_pf_put_pm_vfs(struct intel_iov *iov)
++{
++	GEM_BUG_ON(!intel_iov_is_pf(iov));
++
++	intel_gt_pm_put(iov_to_gt(iov));
++}
++
++void intel_iov_suspend(struct intel_iov *iov)
++{
++	if (!intel_iov_is_pf(iov))
++		return;
++
++	if (pci_num_vf(to_pci_dev(iov_to_i915(iov)->drm.dev)) != 0)
++		intel_iov_pf_put_pm_vfs(iov);
++}
++
++void intel_iov_resume(struct intel_iov *iov)
++{
++	if (!intel_iov_is_pf(iov))
++		return;
++
++	if (pci_num_vf(to_pci_dev(iov_to_i915(iov)->drm.dev)) != 0)
++		intel_iov_pf_get_pm_vfs(iov);
++}
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov.h b/drivers/gpu/drm/i915/gt/iov/intel_iov.h
+index 3cc5d18f470c..7547fa24ea5c 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov.h
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov.h
+@@ -21,4 +21,10 @@ int intel_iov_init_hw(struct intel_iov *iov);
+ void intel_iov_fini_hw(struct intel_iov *iov);
+ int intel_iov_init_late(struct intel_iov *iov);
+ 
++void intel_iov_pf_get_pm_vfs(struct intel_iov *iov);
++void intel_iov_pf_put_pm_vfs(struct intel_iov *iov);
++
++void intel_iov_suspend(struct intel_iov *iov);
++void intel_iov_resume(struct intel_iov *iov);
++
+ #endif /* __INTEL_IOV_H__ */
+diff --git a/drivers/gpu/drm/i915/i915_sriov.c b/drivers/gpu/drm/i915/i915_sriov.c
+index 742cdbda07ab..21e1a2f8b6e6 100644
+--- a/drivers/gpu/drm/i915/i915_sriov.c
++++ b/drivers/gpu/drm/i915/i915_sriov.c
+@@ -12,6 +12,7 @@
+ 
+ #include "gt/intel_gt.h"
+ #include "gt/intel_gt_pm.h"
++#include "gt/iov/intel_iov.h"
+ #include "gt/iov/intel_iov_provisioning.h"
+ #include "gt/iov/intel_iov_service.h"
+ #include "gt/iov/intel_iov_state.h"
+@@ -443,7 +444,7 @@ int i915_sriov_pf_enable_vfs(struct drm_i915_private *i915, int num_vfs)
+ 
+ 	/* hold the reference to runtime pm as long as VFs are enabled */
+ 	for_each_gt(gt, i915, id)
+-		intel_gt_pm_get(gt);
++		intel_iov_pf_get_pm_vfs(&gt->iov);
+ 
+ 	for_each_gt(gt, i915, id) {
+ 		err = intel_iov_provisioning_verify(&gt->iov, num_vfs);
+@@ -486,7 +487,7 @@ int i915_sriov_pf_enable_vfs(struct drm_i915_private *i915, int num_vfs)
+ fail_pm:
+ 	for_each_gt(gt, i915, id) {
+ 		intel_iov_provisioning_auto(&gt->iov, 0);
+-		intel_gt_pm_put(gt);
++		intel_iov_pf_put_pm_vfs(&gt->iov);
+ 	}
+ fail:
+ 	drm_err(&i915->drm, "Failed to enable %u VFs (%pe)\n",
+-- 
+2.25.1
+
