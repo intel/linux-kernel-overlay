@@ -1,0 +1,194 @@
+From 8d8b8b5394b588fe4f8a70b42f099ca4ab3d1f2d Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Tue, 4 Apr 2023 13:41:21 +0300
+Subject: [PATCH 55/85] ASoC: SOF: Intel: hda-mlink: add helpers to set link
+ SYNC frequency
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+These helpers configure the ratio between the base clock and the
+hardware signal used for link synchronization.
+
+The SYNCPRD is written before the first sublink is powered-up. The
+SYNCPU bit is set, but it will only be cleared after the link is
+powered-up, hence the implementation with a set/wait pattern.
+
+These helpers are currently only needed by SoundWire support, where
+the lock is taken at a higher level, so only the _unlocked versions
+are exposed for now.
+
+Note that the _wait_bit() implementation is similar to previous
+helpers in drivers/soundwire, but with sleep duration and timeout
+aligned with hardware recommendations. If desired, this helper could
+be modified in a second step with e.g. readl_poll_timeout().
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Rander Wang <rander.wang@intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20230404104127.5629-13-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ include/sound/hda-mlink.h       | 27 ++++++++++
+ sound/soc/sof/intel/hda-mlink.c | 90 +++++++++++++++++++++++++++++++++
+ 2 files changed, 117 insertions(+)
+
+diff --git a/include/sound/hda-mlink.h b/include/sound/hda-mlink.h
+index 872652209a47..80af2a3996d7 100644
+--- a/include/sound/hda-mlink.h
++++ b/include/sound/hda-mlink.h
+@@ -17,6 +17,12 @@ int hdac_bus_eml_get_count(struct hdac_bus *bus, bool alt, int elid);
+ void hdac_bus_eml_enable_interrupt(struct hdac_bus *bus, bool alt, int elid, bool enable);
+ bool hdac_bus_eml_check_interrupt(struct hdac_bus *bus, bool alt, int elid);
+ 
++int hdac_bus_eml_set_syncprd_unlocked(struct hdac_bus *bus, bool alt, int elid, u32 syncprd);
++int hdac_bus_eml_sdw_set_syncprd_unlocked(struct hdac_bus *bus, u32 syncprd);
++
++int hdac_bus_eml_wait_syncpu_unlocked(struct hdac_bus *bus, bool alt, int elid);
++int hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus);
++
+ int hdac_bus_eml_power_up(struct hdac_bus *bus, bool alt, int elid, int sublink);
+ int hdac_bus_eml_power_up_unlocked(struct hdac_bus *bus, bool alt, int elid, int sublink);
+ 
+@@ -47,6 +53,27 @@ hdac_bus_eml_enable_interrupt(struct hdac_bus *bus, bool alt, int elid, bool ena
+ static inline bool
+ hdac_bus_eml_check_interrupt(struct hdac_bus *bus, bool alt, int elid) { return false; }
+ 
++static inline int
++hdac_bus_eml_set_syncprd_unlocked(struct hdac_bus *bus, bool alt, int elid, u32 syncprd)
++{
++	return 0;
++}
++
++static inline int
++hdac_bus_eml_sdw_set_syncprd_unlocked(struct hdac_bus *bus, u32 syncprd)
++{
++	return 0;
++}
++
++static inline int
++hdac_bus_eml_wait_syncpu_unlocked(struct hdac_bus *bus, bool alt, int elid)
++{
++	return 0;
++}
++
++static inline int
++hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus) { return 0; }
++
+ static inline int
+ hdac_bus_eml_power_up(struct hdac_bus *bus, bool alt, int elid, int sublink)
+ {
+diff --git a/sound/soc/sof/intel/hda-mlink.c b/sound/soc/sof/intel/hda-mlink.c
+index ff1543189b50..695768c3f4aa 100644
+--- a/sound/soc/sof/intel/hda-mlink.c
++++ b/sound/soc/sof/intel/hda-mlink.c
+@@ -253,6 +253,46 @@ static bool hdaml_link_check_interrupt(u32 __iomem *lctl)
+ 	return val & AZX_ML_LCTL_INTSTS;
+ }
+ 
++static int hdaml_wait_bit(void __iomem *base, int offset, u32 mask, u32 target)
++{
++	int timeout = HDAML_POLL_DELAY_RETRY;
++	u32 reg_read;
++
++	do {
++		reg_read = readl(base + offset);
++		if ((reg_read & mask) == target)
++			return 0;
++
++		timeout--;
++		usleep_range(HDAML_POLL_DELAY_MIN_US,
++			     HDAML_POLL_DELAY_MIN_US + HDAML_POLL_DELAY_SLACK_US);
++	} while (timeout != 0);
++
++	return -EAGAIN;
++}
++
++static void hdaml_link_set_syncprd(u32 __iomem *lsync, u32 syncprd)
++{
++	u32 val;
++
++	val = readl(lsync);
++	val &= ~AZX_REG_ML_LSYNC_SYNCPRD;
++	val |= (syncprd & AZX_REG_ML_LSYNC_SYNCPRD);
++
++	/*
++	 * set SYNCPU but do not wait. The bit is cleared by hardware when
++	 * the link becomes active.
++	 */
++	val |= AZX_REG_ML_LSYNC_SYNCPU;
++
++	writel(val, lsync);
++}
++
++static int hdaml_link_wait_syncpu(u32 __iomem *lsync)
++{
++	return hdaml_wait_bit(lsync, 0, AZX_REG_ML_LSYNC_SYNCPU, 0);
++}
++
+ /* END HDAML section */
+ 
+ static int hda_ml_alloc_h2link(struct hdac_bus *bus, int index)
+@@ -402,6 +442,56 @@ bool hdac_bus_eml_check_interrupt(struct hdac_bus *bus, bool alt, int elid)
+ }
+ EXPORT_SYMBOL_NS(hdac_bus_eml_check_interrupt, SND_SOC_SOF_HDA_MLINK);
+ 
++int hdac_bus_eml_set_syncprd_unlocked(struct hdac_bus *bus, bool alt, int elid, u32 syncprd)
++{
++	struct hdac_ext2_link *h2link;
++	struct hdac_ext_link *hlink;
++
++	h2link = find_ext2_link(bus, alt, elid);
++	if (!h2link)
++		return 0;
++
++	if (!h2link->lss)
++		return 0;
++
++	hlink = &h2link->hext_link;
++
++	hdaml_link_set_syncprd(hlink->ml_addr + AZX_REG_ML_LSYNC, syncprd);
++
++	return 0;
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_set_syncprd_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++int hdac_bus_eml_sdw_set_syncprd_unlocked(struct hdac_bus *bus, u32 syncprd)
++{
++	return hdac_bus_eml_set_syncprd_unlocked(bus, true, AZX_REG_ML_LEPTR_ID_SDW, syncprd);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sdw_set_syncprd_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++int hdac_bus_eml_wait_syncpu_unlocked(struct hdac_bus *bus, bool alt, int elid)
++{
++	struct hdac_ext2_link *h2link;
++	struct hdac_ext_link *hlink;
++
++	h2link = find_ext2_link(bus, alt, elid);
++	if (!h2link)
++		return 0;
++
++	if (!h2link->lss)
++		return 0;
++
++	hlink = &h2link->hext_link;
++
++	return hdaml_link_wait_syncpu(hlink->ml_addr + AZX_REG_ML_LSYNC);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_wait_syncpu_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++int hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus)
++{
++	return hdac_bus_eml_wait_syncpu_unlocked(bus, true, AZX_REG_ML_LEPTR_ID_SDW);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sdw_wait_syncpu_unlocked, SND_SOC_SOF_HDA_MLINK);
++
+ static int hdac_bus_eml_power_up_base(struct hdac_bus *bus, bool alt, int elid, int sublink,
+ 				      bool eml_lock)
+ {
+-- 
+2.25.1
+

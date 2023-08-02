@@ -1,0 +1,162 @@
+From 389686949374fc04b6a85cf099fd21ca4e7d7d24 Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Tue, 4 Apr 2023 13:41:22 +0300
+Subject: [PATCH 58/85] ASoC: SOF: Intel: hda-mlink: add helpers for
+ sync_arm/sync_go
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The multi-link synchronization uses the same concept and registers,
+but moved to the HDAudio extended links.
+
+Add helpers for sync_arm and sync_go which are the basic for the bus
+reset, bank switch and clock stop.
+
+Since SoundWire is the only user of those helpers, only expose the
+_unlocked versions for now.
+
+Note that SYNCGO is a write-only bit, so no error can be reported. We
+still return 0 for compatibility with the SoundWire stream management
+headers.
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Rander Wang <rander.wang@intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20230404104127.5629-14-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ include/sound/hda-mlink.h       | 18 +++++++++
+ sound/soc/sof/intel/hda-mlink.c | 70 +++++++++++++++++++++++++++++++++
+ 2 files changed, 88 insertions(+)
+
+diff --git a/include/sound/hda-mlink.h b/include/sound/hda-mlink.h
+index 80af2a3996d7..234af269495e 100644
+--- a/include/sound/hda-mlink.h
++++ b/include/sound/hda-mlink.h
+@@ -23,6 +23,12 @@ int hdac_bus_eml_sdw_set_syncprd_unlocked(struct hdac_bus *bus, u32 syncprd);
+ int hdac_bus_eml_wait_syncpu_unlocked(struct hdac_bus *bus, bool alt, int elid);
+ int hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus);
+ 
++void hdac_bus_eml_sync_arm_unlocked(struct hdac_bus *bus, bool alt, int elid, int sublink);
++void hdac_bus_eml_sdw_sync_arm_unlocked(struct hdac_bus *bus, int sublink);
++
++int hdac_bus_eml_sync_go_unlocked(struct hdac_bus *bus, bool alt, int elid);
++int hdac_bus_eml_sdw_sync_go_unlocked(struct hdac_bus *bus);
++
+ int hdac_bus_eml_power_up(struct hdac_bus *bus, bool alt, int elid, int sublink);
+ int hdac_bus_eml_power_up_unlocked(struct hdac_bus *bus, bool alt, int elid, int sublink);
+ 
+@@ -74,6 +80,18 @@ hdac_bus_eml_wait_syncpu_unlocked(struct hdac_bus *bus, bool alt, int elid)
+ static inline int
+ hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus) { return 0; }
+ 
++static inline void
++hdac_bus_eml_sync_arm_unlocked(struct hdac_bus *bus, bool alt, int elid, int sublink) { }
++
++static inline void
++hdac_bus_eml_sdw_sync_arm_unlocked(struct hdac_bus *bus, int sublink) { }
++
++static inline int
++hdac_bus_eml_sync_go_unlocked(struct hdac_bus *bus, bool alt, int elid) { return 0; }
++
++static inline int
++hdac_bus_eml_sdw_sync_go_unlocked(struct hdac_bus *bus) { return 0; }
++
+ static inline int
+ hdac_bus_eml_power_up(struct hdac_bus *bus, bool alt, int elid, int sublink)
+ {
+diff --git a/sound/soc/sof/intel/hda-mlink.c b/sound/soc/sof/intel/hda-mlink.c
+index 695768c3f4aa..f583ca2783bb 100644
+--- a/sound/soc/sof/intel/hda-mlink.c
++++ b/sound/soc/sof/intel/hda-mlink.c
+@@ -293,6 +293,26 @@ static int hdaml_link_wait_syncpu(u32 __iomem *lsync)
+ 	return hdaml_wait_bit(lsync, 0, AZX_REG_ML_LSYNC_SYNCPU, 0);
+ }
+ 
++static void hdaml_link_sync_arm(u32 __iomem *lsync, int sublink)
++{
++	u32 val;
++
++	val = readl(lsync);
++	val |= (AZX_REG_ML_LSYNC_CMDSYNC << sublink);
++
++	writel(val, lsync);
++}
++
++static void hdaml_link_sync_go(u32 __iomem *lsync)
++{
++	u32 val;
++
++	val = readl(lsync);
++	val |= AZX_REG_ML_LSYNC_SYNCGO;
++
++	writel(val, lsync);
++}
++
+ /* END HDAML section */
+ 
+ static int hda_ml_alloc_h2link(struct hdac_bus *bus, int index)
+@@ -492,6 +512,56 @@ int hdac_bus_eml_sdw_wait_syncpu_unlocked(struct hdac_bus *bus)
+ }
+ EXPORT_SYMBOL_NS(hdac_bus_eml_sdw_wait_syncpu_unlocked, SND_SOC_SOF_HDA_MLINK);
+ 
++void hdac_bus_eml_sync_arm_unlocked(struct hdac_bus *bus, bool alt, int elid, int sublink)
++{
++	struct hdac_ext2_link *h2link;
++	struct hdac_ext_link *hlink;
++
++	h2link = find_ext2_link(bus, alt, elid);
++	if (!h2link)
++		return;
++
++	if (!h2link->lss)
++		return;
++
++	hlink = &h2link->hext_link;
++
++	hdaml_link_sync_arm(hlink->ml_addr + AZX_REG_ML_LSYNC, sublink);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sync_arm_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++void hdac_bus_eml_sdw_sync_arm_unlocked(struct hdac_bus *bus, int sublink)
++{
++	hdac_bus_eml_sync_arm_unlocked(bus, true, AZX_REG_ML_LEPTR_ID_SDW, sublink);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sdw_sync_arm_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++int hdac_bus_eml_sync_go_unlocked(struct hdac_bus *bus, bool alt, int elid)
++{
++	struct hdac_ext2_link *h2link;
++	struct hdac_ext_link *hlink;
++
++	h2link = find_ext2_link(bus, alt, elid);
++	if (!h2link)
++		return 0;
++
++	if (!h2link->lss)
++		return 0;
++
++	hlink = &h2link->hext_link;
++
++	hdaml_link_sync_go(hlink->ml_addr + AZX_REG_ML_LSYNC);
++
++	return 0;
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sync_go_unlocked, SND_SOC_SOF_HDA_MLINK);
++
++int hdac_bus_eml_sdw_sync_go_unlocked(struct hdac_bus *bus)
++{
++	return hdac_bus_eml_sync_go_unlocked(bus, true, AZX_REG_ML_LEPTR_ID_SDW);
++}
++EXPORT_SYMBOL_NS(hdac_bus_eml_sdw_sync_go_unlocked, SND_SOC_SOF_HDA_MLINK);
++
+ static int hdac_bus_eml_power_up_base(struct hdac_bus *bus, bool alt, int elid, int sublink,
+ 				      bool eml_lock)
+ {
+-- 
+2.25.1
+

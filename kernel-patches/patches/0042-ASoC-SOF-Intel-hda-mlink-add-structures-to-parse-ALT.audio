@@ -1,0 +1,327 @@
+From 319f60e64ffb19d69587524c07a8d8fb6bd09aaf Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Tue, 4 Apr 2023 13:41:15 +0300
+Subject: [PATCH 42/85] ASoC: SOF: Intel: hda-mlink: add structures to parse
+ ALT links
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extend hdac_ext_link to store information needed for ALT
+links. Follow-up patches will include more functional patches for
+power-up and down.
+
+Note that this patch suggests the use of an 'eml_lock' to serialize
+access to shared registers. SoundWire-specific sequence require the
+lock to be taken at a higher level, as a result the helpers added in
+follow-up patches will provide 'unlocked' versions when needed.
+
+Also note that the low-level sequences with the 'hdaml_' prefix are
+taken directly from the hardware specifications - naming conventions
+included. The code will be split in two, with locking and linked-list
+management handled separately to avoid mixing required hardware setup
+and Linux-based resource management.
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Rander Wang <rander.wang@intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20230404104127.5629-7-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ include/sound/hda-mlink.h       |   4 +-
+ sound/soc/sof/intel/hda-mlink.c | 223 +++++++++++++++++++++++++++++++-
+ sound/soc/sof/intel/hda.c       |   2 +-
+ 3 files changed, 220 insertions(+), 9 deletions(-)
+
+diff --git a/include/sound/hda-mlink.h b/include/sound/hda-mlink.h
+index beef5f509e47..8048bf01c133 100644
+--- a/include/sound/hda-mlink.h
++++ b/include/sound/hda-mlink.h
+@@ -10,7 +10,7 @@ struct hdac_bus;
+ 
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_MLINK)
+ 
+-int hda_bus_ml_get_capabilities(struct hdac_bus *bus);
++int hda_bus_ml_init(struct hdac_bus *bus);
+ void hda_bus_ml_free(struct hdac_bus *bus);
+ void hda_bus_ml_put_all(struct hdac_bus *bus);
+ void hda_bus_ml_reset_losidv(struct hdac_bus *bus);
+@@ -20,7 +20,7 @@ int hda_bus_ml_suspend(struct hdac_bus *bus);
+ #else
+ 
+ static inline int
+-hda_bus_ml_get_capabilities(struct hdac_bus *bus) { return 0; }
++hda_bus_ml_init(struct hdac_bus *bus) { return 0; }
+ 
+ static inline void hda_bus_ml_free(struct hdac_bus *bus) { }
+ static inline void hda_bus_ml_put_all(struct hdac_bus *bus) { }
+diff --git a/sound/soc/sof/intel/hda-mlink.c b/sound/soc/sof/intel/hda-mlink.c
+index 1a91467d6fd0..32699cffc89f 100644
+--- a/sound/soc/sof/intel/hda-mlink.c
++++ b/sound/soc/sof/intel/hda-mlink.c
+@@ -14,21 +14,229 @@
+ #include <sound/hda_register.h>
+ #include <sound/hda-mlink.h>
+ 
++#include <linux/bitfield.h>
+ #include <linux/module.h>
+ 
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_MLINK)
+ 
+-int hda_bus_ml_get_capabilities(struct hdac_bus *bus)
++/**
++ * struct hdac_ext2_link - HDAudio extended+alternate link
++ *
++ * @hext_link:		hdac_ext_link
++ * @alt:		flag set for alternate extended links
++ * @intc:		boolean for interrupt capable
++ * @ofls:		boolean for offload support
++ * @lss:		boolean for link synchronization capabilities
++ * @slcount:		sublink count
++ * @elid:		extended link ID (AZX_REG_ML_LEPTR_ID_ defines)
++ * @elver:		extended link version
++ * @leptr:		extended link pointer
++ * @eml_lock:		mutual exclusion to access shared registers e.g. CPA/SPA bits
++ * in LCTL register
++ * @base_ptr:		pointer to shim/ip/shim_vs space
++ * @instance_offset:	offset between each of @slcount instances managed by link
++ * @shim_offset:	offset to SHIM register base
++ * @ip_offset:		offset to IP register base
++ * @shim_vs_offset:	offset to vendor-specific (VS) SHIM base
++ */
++struct hdac_ext2_link {
++	struct hdac_ext_link hext_link;
++
++	/* read directly from LCAP register */
++	bool alt;
++	bool intc;
++	bool ofls;
++	bool lss;
++	int slcount;
++	int elid;
++	int elver;
++	u32 leptr;
++
++	struct mutex eml_lock; /* prevent concurrent access to e.g. CPA/SPA */
++
++	/* internal values computed from LCAP contents */
++	void __iomem *base_ptr;
++	u32 instance_offset;
++	u32 shim_offset;
++	u32 ip_offset;
++	u32 shim_vs_offset;
++};
++
++#define hdac_ext_link_to_ext2(h) container_of(h, struct hdac_ext2_link, hext_link)
++
++#define AZX_REG_SDW_INSTANCE_OFFSET			0x8000
++#define AZX_REG_SDW_SHIM_OFFSET				0x0
++#define AZX_REG_SDW_IP_OFFSET				0x100
++#define AZX_REG_SDW_VS_SHIM_OFFSET			0x6000
++
++/* only one instance supported */
++#define AZX_REG_INTEL_DMIC_SHIM_OFFSET			0x0
++#define AZX_REG_INTEL_DMIC_IP_OFFSET			0x100
++#define AZX_REG_INTEL_DMIC_VS_SHIM_OFFSET		0x6000
++
++#define AZX_REG_INTEL_SSP_INSTANCE_OFFSET		0x1000
++#define AZX_REG_INTEL_SSP_SHIM_OFFSET			0x0
++#define AZX_REG_INTEL_SSP_IP_OFFSET			0x100
++#define AZX_REG_INTEL_SSP_VS_SHIM_OFFSET		0xC00
++
++/* only one instance supported */
++#define AZX_REG_INTEL_UAOL_SHIM_OFFSET			0x0
++#define AZX_REG_INTEL_UAOL_IP_OFFSET			0x100
++#define AZX_REG_INTEL_UAOL_VS_SHIM_OFFSET		0xC00
++
++/* HDAML section - this part follows sequences in the hardware specification,
++ * including naming conventions and the use of the hdaml_ prefix.
++ * The code is intentionally minimal with limited dependencies on frameworks or
++ * helpers. Locking and scanning lists is handled at a higher level
++ */
++
++static int hdaml_lnk_enum(struct device *dev, struct hdac_ext2_link *h2link,
++			  void __iomem *ml_addr, int link_idx)
+ {
+-	if (bus->mlcap)
+-		return snd_hdac_ext_bus_get_ml_capabilities(bus);
++	struct hdac_ext_link *hlink = &h2link->hext_link;
++	u32 base_offset;
++
++	hlink->lcaps  = readl(ml_addr + AZX_REG_ML_LCAP);
++
++	h2link->alt = FIELD_GET(AZX_ML_HDA_LCAP_ALT, hlink->lcaps);
++
++	/* handle alternate extensions */
++	if (!h2link->alt) {
++		h2link->slcount = 1;
++
++		/*
++		 * LSDIID is initialized by hardware for HDaudio link,
++		 * it needs to be setup by software for alternate links
++		 */
++		hlink->lsdiid = readw(ml_addr + AZX_REG_ML_LSDIID);
++
++		dev_dbg(dev, "Link %d: HDAudio - lsdiid=%d\n",
++			link_idx, hlink->lsdiid);
++
++		return 0;
++	}
++
++	h2link->intc = FIELD_GET(AZX_ML_HDA_LCAP_INTC, hlink->lcaps);
++	h2link->ofls = FIELD_GET(AZX_ML_HDA_LCAP_OFLS, hlink->lcaps);
++	h2link->lss = FIELD_GET(AZX_ML_HDA_LCAP_LSS, hlink->lcaps);
++
++	/* read slcount (increment due to zero-based hardware representation */
++	h2link->slcount = FIELD_GET(AZX_ML_HDA_LCAP_SLCOUNT, hlink->lcaps) + 1;
++	dev_dbg(dev, "Link %d: HDAudio extended - sublink count %d\n",
++		link_idx, h2link->slcount);
++
++	/* find IP ID and offsets */
++	h2link->leptr = readl(hlink->ml_addr + AZX_REG_ML_LEPTR);
++
++	h2link->elid = FIELD_GET(AZX_REG_ML_LEPTR_ID, h2link->leptr);
++
++	base_offset = FIELD_GET(AZX_REG_ML_LEPTR_PTR, h2link->leptr);
++	h2link->base_ptr = hlink->ml_addr + base_offset;
++
++	switch (h2link->elid) {
++	case AZX_REG_ML_LEPTR_ID_SDW:
++		h2link->shim_offset = AZX_REG_SDW_SHIM_OFFSET;
++		h2link->ip_offset = AZX_REG_SDW_IP_OFFSET;
++		h2link->shim_vs_offset = AZX_REG_SDW_VS_SHIM_OFFSET;
++		dev_dbg(dev, "Link %d: HDAudio extended - SoundWire alternate link, leptr.ptr %#x\n",
++			link_idx, base_offset);
++		break;
++	case AZX_REG_ML_LEPTR_ID_INTEL_DMIC:
++		h2link->shim_offset = AZX_REG_INTEL_DMIC_SHIM_OFFSET;
++		h2link->ip_offset = AZX_REG_INTEL_DMIC_IP_OFFSET;
++		h2link->shim_vs_offset = AZX_REG_INTEL_DMIC_VS_SHIM_OFFSET;
++		dev_dbg(dev, "Link %d: HDAudio extended - INTEL DMIC alternate link, leptr.ptr %#x\n",
++			link_idx, base_offset);
++		break;
++	case AZX_REG_ML_LEPTR_ID_INTEL_SSP:
++		h2link->shim_offset = AZX_REG_INTEL_SSP_SHIM_OFFSET;
++		h2link->ip_offset = AZX_REG_INTEL_SSP_IP_OFFSET;
++		h2link->shim_vs_offset = AZX_REG_INTEL_SSP_VS_SHIM_OFFSET;
++		dev_dbg(dev, "Link %d: HDAudio extended - INTEL SSP alternate link, leptr.ptr %#x\n",
++			link_idx, base_offset);
++		break;
++	case AZX_REG_ML_LEPTR_ID_INTEL_UAOL:
++		h2link->shim_offset = AZX_REG_INTEL_UAOL_SHIM_OFFSET;
++		h2link->ip_offset = AZX_REG_INTEL_UAOL_IP_OFFSET;
++		h2link->shim_vs_offset = AZX_REG_INTEL_UAOL_VS_SHIM_OFFSET;
++		dev_dbg(dev, "Link %d: HDAudio extended - INTEL UAOL alternate link, leptr.ptr %#x\n",
++			link_idx, base_offset);
++		break;
++	default:
++		dev_err(dev, "Link %d: HDAudio extended - Unsupported alternate link, leptr.id=%#02x value\n",
++			link_idx, h2link->elid);
++		return -EINVAL;
++	}
+ 	return 0;
+ }
+-EXPORT_SYMBOL_NS(hda_bus_ml_get_capabilities, SND_SOC_SOF_HDA_MLINK);
+ 
+-void hda_bus_ml_free(struct hdac_bus *bus)
++/* END HDAML section */
++
++static int hda_ml_alloc_h2link(struct hdac_bus *bus, int index)
+ {
++	struct hdac_ext2_link *h2link;
+ 	struct hdac_ext_link *hlink;
++	int ret;
++
++	h2link  = kzalloc(sizeof(*h2link), GFP_KERNEL);
++	if (!h2link)
++		return -ENOMEM;
++
++	/* basic initialization */
++	hlink = &h2link->hext_link;
++
++	hlink->index = index;
++	hlink->bus = bus;
++	hlink->ml_addr = bus->mlcap + AZX_ML_BASE + (AZX_ML_INTERVAL * index);
++
++	ret = hdaml_lnk_enum(bus->dev, h2link, hlink->ml_addr, index);
++	if (ret < 0) {
++		kfree(h2link);
++		return ret;
++	}
++
++	mutex_init(&h2link->eml_lock);
++
++	list_add_tail(&hlink->list, &bus->hlink_list);
++
++	/*
++	 * HDaudio regular links are powered-on by default, the
++	 * refcount needs to be initialized.
++	 */
++	if (!h2link->alt)
++		hlink->ref_count = 1;
++
++	return 0;
++}
++
++int hda_bus_ml_init(struct hdac_bus *bus)
++{
++	u32 link_count;
++	int ret;
++	int i;
++
++	if (!bus->mlcap)
++		return 0;
++
++	link_count = readl(bus->mlcap + AZX_REG_ML_MLCD) + 1;
++
++	dev_dbg(bus->dev, "HDAudio Multi-Link count: %d\n", link_count);
++
++	for (i = 0; i < link_count; i++) {
++		ret = hda_ml_alloc_h2link(bus, i);
++		if (ret < 0) {
++			hda_bus_ml_free(bus);
++			return ret;
++		}
++	}
++	return 0;
++}
++EXPORT_SYMBOL_NS(hda_bus_ml_init, SND_SOC_SOF_HDA_MLINK);
++
++void hda_bus_ml_free(struct hdac_bus *bus)
++{
++	struct hdac_ext_link *hlink, *_h;
++	struct hdac_ext2_link *h2link;
+ 
+ 	if (!bus->mlcap)
+ 		return;
+@@ -36,7 +244,10 @@ void hda_bus_ml_free(struct hdac_bus *bus)
+ 	while (!list_empty(&bus->hlink_list)) {
+ 		hlink = list_first_entry(&bus->hlink_list, struct hdac_ext_link, list);
+ 		list_del(&hlink->list);
+-		kfree(hlink);
++		h2link = hdac_ext_link_to_ext2(hlink);
++
++		mutex_destroy(&h2link->eml_lock);
++		kfree(h2link);
+ 	}
+ }
+ EXPORT_SYMBOL_NS(hda_bus_ml_free, SND_SOC_SOF_HDA_MLINK);
+diff --git a/sound/soc/sof/intel/hda.c b/sound/soc/sof/intel/hda.c
+index 72c820422b2c..b89d94d13ce5 100644
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@ -960,7 +960,7 @@ static int hda_init_caps(struct snd_sof_dev *sdev)
+ 		return ret;
+ 	}
+ 
+-	hda_bus_ml_get_capabilities(bus);
++	hda_bus_ml_init(bus);
+ 
+ 	/* scan SoundWire capabilities exposed by DSDT */
+ 	ret = hda_sdw_acpi_scan(sdev);
+-- 
+2.25.1
+

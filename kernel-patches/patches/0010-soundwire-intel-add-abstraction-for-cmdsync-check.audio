@@ -1,0 +1,126 @@
+From 9f94892eca499122294cf740331d3edda2b9fa4e Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Tue, 14 Mar 2023 09:54:03 +0800
+Subject: [PATCH 10/85] soundwire: intel: add abstraction for cmdsync check
+
+If we add one more callback, we can have common bank switch sequences
+between old and new hardware: the only difference is where the CMDSYNC
+register is located.
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Rander Wang <rander.wang@intel.com>
+Signed-off-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20230314015410.487311-10-yung-chuan.liao@linux.intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+---
+ drivers/soundwire/intel.c           | 24 +++++++++++++-----------
+ drivers/soundwire/intel.h           |  7 +++++++
+ include/linux/soundwire/sdw_intel.h |  3 +++
+ 3 files changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/soundwire/intel.c b/drivers/soundwire/intel.c
+index 77d698908595..1131ecb4b5e7 100644
+--- a/drivers/soundwire/intel.c
++++ b/drivers/soundwire/intel.c
+@@ -325,6 +325,15 @@ static void intel_shim_wake(struct sdw_intel *sdw, bool wake_enable)
+ 	mutex_unlock(sdw->link_res->shim_lock);
+ }
+ 
++static bool intel_check_cmdsync_unlocked(struct sdw_intel *sdw)
++{
++	void __iomem *shim = sdw->link_res->shim;
++	int sync_reg;
++
++	sync_reg = intel_readl(shim, SDW_SHIM_SYNC);
++	return !!(sync_reg & SDW_SHIM_SYNC_CMDSYNC_MASK);
++}
++
+ static int intel_link_power_up(struct sdw_intel *sdw)
+ {
+ 	unsigned int link_id = sdw->instance;
+@@ -695,8 +704,7 @@ static int intel_post_bank_switch(struct sdw_intel *sdw)
+ {
+ 	struct sdw_cdns *cdns = &sdw->cdns;
+ 	struct sdw_bus *bus = &cdns->bus;
+-	void __iomem *shim = sdw->link_res->shim;
+-	int sync_reg, ret;
++	int ret = 0;
+ 
+ 	/* Write to register only for multi-link */
+ 	if (!bus->multi_link)
+@@ -704,9 +712,6 @@ static int intel_post_bank_switch(struct sdw_intel *sdw)
+ 
+ 	mutex_lock(sdw->link_res->shim_lock);
+ 
+-	/* Read SYNC register */
+-	sync_reg = intel_readl(shim, SDW_SHIM_SYNC);
+-
+ 	/*
+ 	 * post_bank_switch() ops is called from the bus in loop for
+ 	 * all the Masters in the steam with the expectation that
+@@ -715,13 +720,9 @@ static int intel_post_bank_switch(struct sdw_intel *sdw)
+ 	 *
+ 	 * So, set the SYNCGO bit only if CMDSYNC bit is set for any Master.
+ 	 */
+-	if (!(sync_reg & SDW_SHIM_SYNC_CMDSYNC_MASK)) {
+-		ret = 0;
+-		goto unlock;
+-	}
++	if (sdw_intel_sync_check_cmdsync_unlocked(sdw))
++		ret = sdw_intel_sync_go_unlocked(sdw);
+ 
+-	ret = sdw_intel_sync_go_unlocked(sdw);
+-unlock:
+ 	mutex_unlock(sdw->link_res->shim_lock);
+ 
+ 	if (ret < 0)
+@@ -1147,6 +1148,7 @@ const struct sdw_intel_hw_ops sdw_intel_cnl_hw_ops = {
+ 	.sync_arm = intel_shim_sync_arm,
+ 	.sync_go_unlocked = intel_shim_sync_go_unlocked,
+ 	.sync_go = intel_shim_sync_go,
++	.sync_check_cmdsync_unlocked = intel_check_cmdsync_unlocked,
+ };
+ EXPORT_SYMBOL_NS(sdw_intel_cnl_hw_ops, SOUNDWIRE_INTEL);
+ 
+diff --git a/drivers/soundwire/intel.h b/drivers/soundwire/intel.h
+index abd1a500defa..7a69cf755954 100644
+--- a/drivers/soundwire/intel.h
++++ b/drivers/soundwire/intel.h
+@@ -187,6 +187,13 @@ static inline int sdw_intel_sync_go(struct sdw_intel *sdw)
+ 	return -ENOTSUPP;
+ }
+ 
++static inline bool sdw_intel_sync_check_cmdsync_unlocked(struct sdw_intel *sdw)
++{
++	if (SDW_INTEL_CHECK_OPS(sdw, sync_check_cmdsync_unlocked))
++		return SDW_INTEL_OPS(sdw, sync_check_cmdsync_unlocked)(sdw);
++	return false;
++}
++
+ /* common bus management */
+ int intel_start_bus(struct sdw_intel *sdw);
+ int intel_start_bus_after_reset(struct sdw_intel *sdw);
+diff --git a/include/linux/soundwire/sdw_intel.h b/include/linux/soundwire/sdw_intel.h
+index 06fa30929ebd..207701aeeb47 100644
+--- a/include/linux/soundwire/sdw_intel.h
++++ b/include/linux/soundwire/sdw_intel.h
+@@ -313,6 +313,8 @@ struct sdw_intel;
+  * @sync_go_unlocked: helper for multi-link synchronization -
+  * shim_lock is assumed to be locked at higher level
+  * @sync_go: helper for multi-link synchronization
++ * @sync_check_cmdsync_unlocked: helper for multi-link synchronization
++ * and bank switch - shim_lock is assumed to be locked at higher level
+  */
+ struct sdw_intel_hw_ops {
+ 	void (*debugfs_init)(struct sdw_intel *sdw);
+@@ -338,6 +340,7 @@ struct sdw_intel_hw_ops {
+ 	void (*sync_arm)(struct sdw_intel *sdw);
+ 	int (*sync_go_unlocked)(struct sdw_intel *sdw);
+ 	int (*sync_go)(struct sdw_intel *sdw);
++	bool (*sync_check_cmdsync_unlocked)(struct sdw_intel *sdw);
+ };
+ 
+ extern const struct sdw_intel_hw_ops sdw_intel_cnl_hw_ops;
+-- 
+2.25.1
+
