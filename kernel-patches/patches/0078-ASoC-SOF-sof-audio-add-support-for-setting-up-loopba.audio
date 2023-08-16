@@ -1,0 +1,116 @@
+From 16ee84396a72cfd28e4eae0ad4daa26132224ce8 Mon Sep 17 00:00:00 2001
+From: Chao Song <chao.song@linux.intel.com>
+Date: Mon, 13 Mar 2023 12:13:02 +0200
+Subject: [PATCH 78/79] ASoC: SOF: sof-audio: add support for setting up
+ loopback routes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+During route setup, playback stream routes are setup by going through
+sink path, capture stream routes are set up by going through source path.
+This is not sufficient to handle loopback cases between pipelines
+configured with different directions, e.g. a sidetone or an amplifier
+feedback connected to a speaker protection module. So, add the logic to
+handle such routes between widgets that aren't in the list of DAPM widgets
+associated with the same PCM.
+
+Link: https://github.com/thesofproject/linux/issues/4042
+
+Suggested-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Signed-off-by: Chao Song <chao.song@linux.intel.com>
+Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230313101302.20950-1-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/sof-audio.c | 61 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/sof/sof-audio.c b/sound/soc/sof/sof-audio.c
+index 0d164a04057f..1cbda595c518 100644
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@ -280,9 +280,11 @@ int sof_route_setup(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *wsourc
+ static int sof_setup_pipeline_connections(struct snd_sof_dev *sdev,
+ 					  struct snd_soc_dapm_widget_list *list, int dir)
+ {
++	const struct sof_ipc_tplg_ops *tplg_ops = sof_ipc_get_ops(sdev, tplg);
+ 	struct snd_soc_dapm_widget *widget;
++	struct snd_sof_route *sroute;
+ 	struct snd_soc_dapm_path *p;
+-	int ret;
++	int ret = 0;
+ 	int i;
+ 
+ 	/*
+@@ -325,6 +327,63 @@ static int sof_setup_pipeline_connections(struct snd_sof_dev *sdev,
+ 		}
+ 	}
+ 
++	/*
++	 * The above loop handles connections between widgets that belong to the DAPM widget list.
++	 * This is not sufficient to handle loopback cases between pipelines configured with
++	 * different directions, e.g. a sidetone or an amplifier feedback connected to a speaker
++	 * protection module.
++	 */
++	list_for_each_entry(sroute, &sdev->route_list, list) {
++		bool src_widget_in_dapm_list, sink_widget_in_dapm_list;
++		struct snd_sof_widget *swidget;
++
++		if (sroute->setup)
++			continue;
++
++		src_widget_in_dapm_list = widget_in_list(list, sroute->src_widget->widget);
++		sink_widget_in_dapm_list = widget_in_list(list, sroute->sink_widget->widget);
++
++		/*
++		 * if both source and sink are in the DAPM list, the route must already have been
++		 * set up above. And if neither are in the DAPM list, the route shouldn't be
++		 * handled now.
++		 */
++		if (src_widget_in_dapm_list == sink_widget_in_dapm_list)
++			continue;
++
++		/*
++		 * At this point either the source widget or the sink widget is in the DAPM list
++		 * with a route that might need to be set up. Check the use_count of the widget
++		 * that is not in the DAPM list to confirm if it is in use currently before setting
++		 * up the route.
++		 */
++		if (src_widget_in_dapm_list)
++			swidget = sroute->sink_widget;
++		else
++			swidget = sroute->src_widget;
++
++		mutex_lock(&swidget->setup_mutex);
++		if (!swidget->use_count) {
++			mutex_unlock(&swidget->setup_mutex);
++			continue;
++		}
++
++		if (tplg_ops && tplg_ops->route_setup) {
++			/*
++			 * this route will get freed when either the source widget or the sink
++			 * widget is freed during hw_free
++			 */
++			ret = tplg_ops->route_setup(sdev, sroute);
++			if (!ret)
++				sroute->setup = true;
++		}
++
++		mutex_unlock(&swidget->setup_mutex);
++
++		if (ret < 0)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+

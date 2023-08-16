@@ -1,0 +1,129 @@
+From 911f7adcea0fad05a3953a5e174585e0a4df85cc Mon Sep 17 00:00:00 2001
+From: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Date: Wed, 22 Mar 2023 11:43:46 +0200
+Subject: [PATCH 29/79] ASoC: SOF: pcm: Improve the pcm trigger sequence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The recommended sequence for triggering the host DMA is to first program
+the DMA in the FW before setting the RUN bit to start the stream in the
+host. With IPC3, this sequence is honored because the FW programs the
+DMA when the HW_PARAMS IPC is sent during PCM hw_params and then the host
+sets the RUN bit during sof_pcm_trigger(). But with IPC4,
+sof_pcm_trigger() sends the SET_PIPELINE_STATE IPC to program the DMA in
+the FW after the DMA RUN bit is set.
+
+In order to minimize the impact for IPC3, introduce a new flag as part
+of struct sof_ipc_pcm_ops, ipc_first_on_start, which will be set for IPC4
+only. With this flag set, the SET_PIPELINE_STATE IPC will be sent before
+the DMA RUN bit is set by the host during the START/PAUSE_RELEASE
+triggers.
+
+Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230322094346.6019-4-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/ipc4-pcm.c  |  3 ++-
+ sound/soc/sof/pcm.c       | 26 ++++++++++++++++++++------
+ sound/soc/sof/sof-audio.h |  3 +++
+ 3 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/sound/soc/sof/ipc4-pcm.c b/sound/soc/sof/ipc4-pcm.c
+index 701da5ee4e4e..60b6877a5da5 100644
+--- a/sound/soc/sof/ipc4-pcm.c
++++ b/sound/soc/sof/ipc4-pcm.c
+@@ -671,5 +671,6 @@ const struct sof_ipc_pcm_ops ipc4_pcm_ops = {
+ 	.dai_link_fixup = sof_ipc4_pcm_dai_link_fixup,
+ 	.pcm_setup = sof_ipc4_pcm_setup,
+ 	.pcm_free = sof_ipc4_pcm_free,
+-	.delay = sof_ipc4_pcm_delay
++	.delay = sof_ipc4_pcm_delay,
++	.ipc_first_on_start = true
+ };
+diff --git a/sound/soc/sof/pcm.c b/sound/soc/sof/pcm.c
+index f75b161125fa..d9b4633bba7a 100644
+--- a/sound/soc/sof/pcm.c
++++ b/sound/soc/sof/pcm.c
+@@ -301,6 +301,8 @@ static int sof_pcm_trigger(struct snd_soc_component *component,
+ 		ipc_first = true;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		if (pcm_ops && pcm_ops->ipc_first_on_start)
++			ipc_first = true;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_START:
+ 		if (spcm->stream[substream->stream].suspend_ignored) {
+@@ -312,6 +314,9 @@ static int sof_pcm_trigger(struct snd_soc_component *component,
+ 			spcm->stream[substream->stream].suspend_ignored = false;
+ 			return 0;
+ 		}
++
++		if (pcm_ops && pcm_ops->ipc_first_on_start)
++			ipc_first = true;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 		if (sdev->system_suspend_target == SOF_SUSPEND_S0IX &&
+@@ -336,19 +341,28 @@ static int sof_pcm_trigger(struct snd_soc_component *component,
+ 		return -EINVAL;
+ 	}
+ 
+-	/*
+-	 * DMA and IPC sequence is different for start and stop. Need to send
+-	 * STOP IPC before stop DMA
+-	 */
+ 	if (!ipc_first)
+ 		snd_sof_pcm_platform_trigger(sdev, substream, cmd);
+ 
+ 	if (pcm_ops && pcm_ops->trigger)
+ 		ret = pcm_ops->trigger(component, substream, cmd);
+ 
+-	/* need to STOP DMA even if trigger IPC failed */
+-	if (ipc_first)
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++	case SNDRV_PCM_TRIGGER_START:
++		/* invoke platform trigger to start DMA only if pcm_ops is successful */
++		if (ipc_first && !ret)
++			snd_sof_pcm_platform_trigger(sdev, substream, cmd);
++		break;
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++	case SNDRV_PCM_TRIGGER_STOP:
++		/* invoke platform trigger to stop DMA even if pcm_ops failed */
+ 		snd_sof_pcm_platform_trigger(sdev, substream, cmd);
++		break;
++	default:
++		break;
++	}
+ 
+ 	/* free PCM if reset_hw_params is set and the STOP IPC is successful */
+ 	if (!ret && reset_hw_params)
+diff --git a/sound/soc/sof/sof-audio.h b/sound/soc/sof/sof-audio.h
+index 81685e778ad6..6c64376858b3 100644
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@ -106,6 +106,8 @@ struct snd_sof_dai_config_data {
+  * @delay: Function pointer for pcm delay calculation
+  * @reset_hw_params_during_stop: Flag indicating whether the hw_params should be reset during the
+  *				 STOP pcm trigger
++ * @ipc_first_on_start: Send IPC before invoking platform trigger during
++ *				START/PAUSE_RELEASE triggers
+  */
+ struct sof_ipc_pcm_ops {
+ 	int (*hw_params)(struct snd_soc_component *component, struct snd_pcm_substream *substream,
+@@ -120,6 +122,7 @@ struct sof_ipc_pcm_ops {
+ 	snd_pcm_sframes_t (*delay)(struct snd_soc_component *component,
+ 				   struct snd_pcm_substream *substream);
+ 	bool reset_hw_params_during_stop;
++	bool ipc_first_on_start;
+ };
+ 
+ /**
+-- 
+2.25.1
+

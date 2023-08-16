@@ -1,0 +1,158 @@
+From db3f761b31e71308e89b412b8f23aa350bcee44f Mon Sep 17 00:00:00 2001
+From: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Date: Thu, 20 Apr 2023 14:41:37 +0300
+Subject: [PATCH 33/79] ASoC: SOF: pcm: Add an option to skip platform trigger
+ during stop
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In the case of IPC4, a pipeline is only paused during STOP/PAUSE/SUSPEND
+triggers and the FW keeps the host DMA running when a pipeline is
+paused. The start/stop tests iterate through STOP/START triggers without
+involving a hw_free. This means that the pipeline state will only toggle
+between PAUSED (during the STOP trigger) and RUNNING (during the START
+trigger). So this test should be treated in the same way as a
+PAUSE_PUSH/PAUSE_RELEASE test and the DMA should be kept running when
+toggling the pipeline states between PAUSED and RUNNING.
+
+Since there is no way to tell if a STOP trigger will be followed by hw_free
+or not, this patch proposes to always skip DMA stop during the STOP trigger
+and handle it later during hw_free. Introduce a new flag in struct
+sof_ipc_pcm_ops, delayed_platform_trigger, that will be used to ensure that
+the host DMA will not be stopped during the STOP/PAUSE/RELEASE triggers
+and set it for IPC4. The platform_trigger call to stop the DMA will be
+invoked during PCM hw_free instead when the pipeline is reset.
+
+Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230420114137.27613-3-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/ipc4-pcm.c  |  3 ++-
+ sound/soc/sof/pcm.c       | 23 +++++++++++++++--------
+ sound/soc/sof/sof-audio.c | 22 ++++++++++++++--------
+ sound/soc/sof/sof-audio.h |  6 ++++++
+ 4 files changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/sound/soc/sof/ipc4-pcm.c b/sound/soc/sof/ipc4-pcm.c
+index 60b6877a5da5..2cfcb120d462 100644
+--- a/sound/soc/sof/ipc4-pcm.c
++++ b/sound/soc/sof/ipc4-pcm.c
+@@ -672,5 +672,6 @@ const struct sof_ipc_pcm_ops ipc4_pcm_ops = {
+ 	.pcm_setup = sof_ipc4_pcm_setup,
+ 	.pcm_free = sof_ipc4_pcm_free,
+ 	.delay = sof_ipc4_pcm_delay,
+-	.ipc_first_on_start = true
++	.ipc_first_on_start = true,
++	.platform_stop_during_hw_free = true,
+ };
+diff --git a/sound/soc/sof/pcm.c b/sound/soc/sof/pcm.c
+index 127b68caf9e1..567db32173a8 100644
+--- a/sound/soc/sof/pcm.c
++++ b/sound/soc/sof/pcm.c
+@@ -211,16 +211,22 @@ static int sof_pcm_hw_free(struct snd_soc_component *component,
+ 	dev_dbg(component->dev, "pcm: free stream %d dir %d\n",
+ 		spcm->pcm.pcm_id, substream->stream);
+ 
+-	/* free PCM in the DSP */
+-	if (pcm_ops && pcm_ops->hw_free && spcm->prepared[substream->stream]) {
+-		ret = pcm_ops->hw_free(component, substream);
+-		if (ret < 0)
+-			err = ret;
++	if (spcm->prepared[substream->stream]) {
++		/* stop DMA first if needed */
++		if (pcm_ops && pcm_ops->platform_stop_during_hw_free)
++			snd_sof_pcm_platform_trigger(sdev, substream, SNDRV_PCM_TRIGGER_STOP);
++
++		/* free PCM in the DSP */
++		if (pcm_ops && pcm_ops->hw_free) {
++			ret = pcm_ops->hw_free(component, substream);
++			if (ret < 0)
++				err = ret;
++		}
+ 
+ 		spcm->prepared[substream->stream] = false;
+ 	}
+ 
+-	/* stop DMA */
++	/* reset DMA */
+ 	ret = snd_sof_pcm_platform_hw_free(sdev, substream);
+ 	if (ret < 0) {
+ 		dev_err(component->dev, "error: platform hw free failed\n");
+@@ -362,8 +368,9 @@ static int sof_pcm_trigger(struct snd_soc_component *component,
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 	case SNDRV_PCM_TRIGGER_STOP:
+-		/* invoke platform trigger to stop DMA even if pcm_ops failed */
+-		snd_sof_pcm_platform_trigger(sdev, substream, cmd);
++		/* invoke platform trigger to stop DMA even if pcm_ops isn't set or if it failed */
++		if (!pcm_ops || (pcm_ops && !pcm_ops->platform_stop_during_hw_free))
++			snd_sof_pcm_platform_trigger(sdev, substream, cmd);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/sound/soc/sof/sof-audio.c b/sound/soc/sof/sof-audio.c
+index 650d90cad7b0..0d164a04057f 100644
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@ -746,16 +746,22 @@ int sof_pcm_stream_free(struct snd_sof_dev *sdev, struct snd_pcm_substream *subs
+ 	const struct sof_ipc_pcm_ops *pcm_ops = sof_ipc_get_ops(sdev, pcm);
+ 	int ret;
+ 
+-	/* Send PCM_FREE IPC to reset pipeline */
+-	if (pcm_ops && pcm_ops->hw_free && spcm->prepared[substream->stream]) {
+-		ret = pcm_ops->hw_free(sdev->component, substream);
+-		if (ret < 0)
+-			return ret;
+-	}
++	if (spcm->prepared[substream->stream]) {
++		/* stop DMA first if needed */
++		if (pcm_ops && pcm_ops->platform_stop_during_hw_free)
++			snd_sof_pcm_platform_trigger(sdev, substream, SNDRV_PCM_TRIGGER_STOP);
++
++		/* Send PCM_FREE IPC to reset pipeline */
++		if (pcm_ops && pcm_ops->hw_free) {
++			ret = pcm_ops->hw_free(sdev->component, substream);
++			if (ret < 0)
++				return ret;
++		}
+ 
+-	spcm->prepared[substream->stream] = false;
++		spcm->prepared[substream->stream] = false;
++	}
+ 
+-	/* stop the DMA */
++	/* reset the DMA */
+ 	ret = snd_sof_pcm_platform_hw_free(sdev, substream);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/sound/soc/sof/sof-audio.h b/sound/soc/sof/sof-audio.h
+index 6c64376858b3..a090a9eb4828 100644
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@ -108,6 +108,11 @@ struct snd_sof_dai_config_data {
+  *				 STOP pcm trigger
+  * @ipc_first_on_start: Send IPC before invoking platform trigger during
+  *				START/PAUSE_RELEASE triggers
++ * @platform_stop_during_hw_free: Invoke the platform trigger during hw_free. This is needed for
++ *				  IPC4 where a pipeline is only paused during stop/pause/suspend
++ *				  triggers. The FW keeps the host DMA running in this case and
++ *				  therefore the host must do the same and should stop the DMA during
++ *				  hw_free.
+  */
+ struct sof_ipc_pcm_ops {
+ 	int (*hw_params)(struct snd_soc_component *component, struct snd_pcm_substream *substream,
+@@ -123,6 +128,7 @@ struct sof_ipc_pcm_ops {
+ 				   struct snd_pcm_substream *substream);
+ 	bool reset_hw_params_during_stop;
+ 	bool ipc_first_on_start;
++	bool platform_stop_during_hw_free;
+ };
+ 
+ /**
+-- 
+2.25.1
+

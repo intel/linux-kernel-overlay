@@ -1,0 +1,225 @@
+From 2f2305c09c9160645b474dbb1e5b8f5fe27d2a6e Mon Sep 17 00:00:00 2001
+From: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Date: Thu, 16 Mar 2023 16:14:57 +0200
+Subject: [PATCH 42/79] ASoC: SOF: ipc4-pcm: support multiple configs for BE
+ DAIs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend DAIs may support multiple audio formats. Modify pipeline
+setup to select a suitable configuration based on topology and
+frontend DAI runtime configuration.
+
+For sampling rate, if one of the BE DAI configurations has
+a sampling rate matching that of FE DAI, configure BE DAI to
+this rate.
+
+For sample format, the current code hardcodes DAI copier sample format
+to 32bit for both playback and capture pipelines. This is not always
+desired, so lift the limitation and set the sample format based on
+topology definitions for the copiers. For capture pipelines, we want to
+set the BE DAI pipeline format based on topology instead of using the FE
+DAI format. This covers the common use-case where BE DAI outputs data at
+a higher sample precision and sample width is reduced later in the
+pipeline. Instead of hardcoding to 32bit, use the BE DAI copier output
+format defined in topology.
+
+Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230316141458.13940-2-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/ipc4-pcm.c      | 66 +++++++++++++++++++++++++++----
+ sound/soc/sof/ipc4-topology.c | 74 +++++++++++++++++++++++++++++++----
+ 2 files changed, 125 insertions(+), 15 deletions(-)
+
+diff --git a/sound/soc/sof/ipc4-pcm.c b/sound/soc/sof/ipc4-pcm.c
+index 2cfcb120d462..5bf44cb7a953 100644
+--- a/sound/soc/sof/ipc4-pcm.c
++++ b/sound/soc/sof/ipc4-pcm.c
+@@ -362,15 +362,68 @@ static void ipc4_ssp_dai_config_pcm_params_match(struct snd_sof_dev *sdev, const
+ 	}
+ }
+ 
++/*
++ * Fixup DAI link parameters for sampling rate based on
++ * DAI copier configuration.
++ */
++static int sof_ipc4_pcm_dai_link_fixup_rate(struct snd_sof_dev *sdev,
++					    struct snd_pcm_hw_params *params,
++					    struct sof_ipc4_copier *ipc4_copier)
++{
++	struct sof_ipc4_pin_format *pin_fmts = ipc4_copier->available_fmt.input_pin_fmts;
++	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
++	int num_input_formats = ipc4_copier->available_fmt.num_input_formats;
++	unsigned int fe_rate = params_rate(params);
++	bool fe_be_rate_match = false;
++	bool single_be_rate = true;
++	unsigned int be_rate;
++	int i;
++
++	/*
++	 * Copier does not change sampling rate, so we
++	 * need to only consider the input pin information.
++	 */
++	for (i = 0; i < num_input_formats; i++) {
++		unsigned int val = pin_fmts[i].audio_fmt.sampling_frequency;
++
++		if (i == 0)
++			be_rate = val;
++		else if (val != be_rate)
++			single_be_rate = false;
++
++		if (val == fe_rate) {
++			fe_be_rate_match = true;
++			break;
++		}
++	}
++
++	/*
++	 * If rate is different than FE rate, topology must
++	 * contain an SRC. But we do require topology to
++	 * define a single rate in the DAI copier config in
++	 * this case (FE rate may be variable).
++	 */
++	if (!fe_be_rate_match) {
++		if (!single_be_rate) {
++			dev_err(sdev->dev, "Unable to select sampling rate for DAI link\n");
++			return -EINVAL;
++		}
++
++		rate->min = be_rate;
++		rate->max = rate->min;
++	}
++
++	return 0;
++}
++
+ static int sof_ipc4_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd,
+ 				       struct snd_pcm_hw_params *params)
+ {
+ 	struct snd_soc_component *component = snd_soc_rtdcom_lookup(rtd, SOF_AUDIO_PCM_DRV_NAME);
+ 	struct snd_sof_dai *dai = snd_sof_find_dai(component, rtd->dai_link->name);
+-	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+-	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+ 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(component);
+ 	struct sof_ipc4_copier *ipc4_copier;
++	int ret;
+ 
+ 	if (!dai) {
+ 		dev_err(component->dev, "%s: No DAI found with name %s\n", __func__,
+@@ -385,12 +438,9 @@ static int sof_ipc4_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd,
+ 		return -EINVAL;
+ 	}
+ 
+-	/* always set BE format to 32-bits for both playback and capture */
+-	snd_mask_none(fmt);
+-	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
+-
+-	rate->min = ipc4_copier->available_fmt.input_pin_fmts->audio_fmt.sampling_frequency;
+-	rate->max = rate->min;
++	ret = sof_ipc4_pcm_dai_link_fixup_rate(sdev, params, ipc4_copier);
++	if (ret)
++		return ret;
+ 
+ 	switch (ipc4_copier->dai_type) {
+ 	case SOF_DAI_INTEL_SSP:
+diff --git a/sound/soc/sof/ipc4-topology.c b/sound/soc/sof/ipc4-topology.c
+index 81c99d1b76d4..bb6de642ceb8 100644
+--- a/sound/soc/sof/ipc4-topology.c
++++ b/sound/soc/sof/ipc4-topology.c
+@@ -1220,6 +1220,69 @@ static int snd_sof_get_nhlt_endpoint_data(struct snd_sof_dev *sdev, struct snd_s
+ }
+ #endif
+ 
++static int ipc4_set_fmt_mask(struct snd_mask *fmt, unsigned int bit_depth)
++{
++	switch (bit_depth) {
++	case 16:
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
++		break;
++	case 24:
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
++		break;
++	case 32:
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int ipc4_copier_set_capture_fmt(struct snd_sof_dev *sdev,
++				       struct snd_pcm_hw_params *pipeline_params,
++				       struct snd_pcm_hw_params *fe_params,
++				       struct sof_ipc4_available_audio_format *available_fmt)
++{
++	struct sof_ipc4_audio_format *audio_fmt;
++	unsigned int sample_valid_bits;
++	bool multiple_formats = false;
++	bool fe_format_match = false;
++	struct snd_mask *fmt;
++	int i;
++
++	for (i = 0; i < available_fmt->num_output_formats; i++) {
++		unsigned int val;
++
++		audio_fmt = &available_fmt->output_pin_fmts[i].audio_fmt;
++		val = SOF_IPC4_AUDIO_FORMAT_CFG_V_BIT_DEPTH(audio_fmt->fmt_cfg);
++
++		if (i == 0)
++			sample_valid_bits = val;
++		else if (sample_valid_bits != val)
++			multiple_formats = true;
++
++		if (snd_pcm_format_width(params_format(fe_params)) == val)
++			fe_format_match = true;
++	}
++
++	fmt = hw_param_mask(pipeline_params, SNDRV_PCM_HW_PARAM_FORMAT);
++	snd_mask_none(fmt);
++
++	if (multiple_formats) {
++		if (fe_format_match) {
++			/* multiple formats defined and one matches FE */
++			snd_mask_set_format(fmt, params_format(fe_params));
++			return 0;
++		}
++
++		dev_err(sdev->dev, "Multiple audio formats for single dai_out not supported\n");
++		return -EINVAL;
++	}
++
++	return ipc4_set_fmt_mask(fmt, sample_valid_bits);
++}
++
+ static int
+ sof_ipc4_prepare_copier_module(struct snd_sof_widget *swidget,
+ 			       struct snd_pcm_hw_params *fe_params,
+@@ -1303,13 +1366,10 @@ sof_ipc4_prepare_copier_module(struct snd_sof_widget *swidget,
+ 			format_list_to_search = available_fmt->output_pin_fmts;
+ 			format_list_count = available_fmt->num_output_formats;
+ 
+-			/*
+-			 * modify the input params for the dai copier as it only supports
+-			 * 32-bit always
+-			 */
+-			fmt = hw_param_mask(pipeline_params, SNDRV_PCM_HW_PARAM_FORMAT);
+-			snd_mask_none(fmt);
+-			snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
++			ret = ipc4_copier_set_capture_fmt(sdev, pipeline_params, fe_params,
++							  available_fmt);
++			if (ret < 0)
++				return ret;
+ 		} else {
+ 			format_list_to_search = available_fmt->input_pin_fmts;
+ 			format_list_count = available_fmt->num_input_formats;
+-- 
+2.25.1
+

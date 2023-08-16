@@ -1,0 +1,369 @@
+From c3b4916748ba82ccee272681b068976327b2f1cb Mon Sep 17 00:00:00 2001
+From: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Date: Mon, 13 Mar 2023 14:48:49 +0200
+Subject: [PATCH 04/79] ASoC: SOF: ipc4-topology: Do not parse the
+ DMA_BUFFER_SIZE token
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Do not parse the SOF_TKN_CAVS_AUDIO_FORMAT_DMA_BUFFER_SIZE token as the
+dma_buffer_size can be derived from the input/output buffer size and the
+type of widget during copier prepare. For the deep buffer case,
+introduce a new token that will be used to get the deep buffer DMA size
+for the host copier from topology.
+
+Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Rander Wang <rander.wang@intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230313124856.8140-5-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ include/uapi/sound/sof/tokens.h |   1 +
+ sound/soc/sof/ipc4-topology.c   | 112 ++++++++++++++------------------
+ sound/soc/sof/ipc4-topology.h   |   5 +-
+ sound/soc/sof/sof-audio.h       |   2 +-
+ sound/soc/sof/topology.c        |   1 -
+ 5 files changed, 52 insertions(+), 69 deletions(-)
+
+diff --git a/include/uapi/sound/sof/tokens.h b/include/uapi/sound/sof/tokens.h
+index 0b5110427132..9e91e2640dd4 100644
+--- a/include/uapi/sound/sof/tokens.h
++++ b/include/uapi/sound/sof/tokens.h
+@@ -197,6 +197,7 @@
+ 
+ /* COPIER */
+ #define SOF_TKN_INTEL_COPIER_NODE_TYPE		1980
++#define SOF_TKN_INTEL_COPIER_DEEP_BUFFER_DMA_MS	1981
+ 
+ /* ACP I2S */
+ #define SOF_TKN_AMD_ACPI2S_RATE			1700
+diff --git a/sound/soc/sof/ipc4-topology.c b/sound/soc/sof/ipc4-topology.c
+index 1f1985a663c7..3d918b857194 100644
+--- a/sound/soc/sof/ipc4-topology.c
++++ b/sound/soc/sof/ipc4-topology.c
+@@ -76,8 +76,8 @@ static const struct sof_topology_token ipc4_out_audio_format_tokens[] = {
+ 		offsetof(struct sof_ipc4_audio_format, fmt_cfg)},
+ };
+ 
+-static const struct sof_topology_token ipc4_copier_gateway_cfg_tokens[] = {
+-	{SOF_TKN_CAVS_AUDIO_FORMAT_DMA_BUFFER_SIZE, SND_SOC_TPLG_TUPLE_TYPE_WORD, get_token_u32, 0},
++static const struct sof_topology_token ipc4_copier_deep_buffer_tokens[] = {
++	{SOF_TKN_INTEL_COPIER_DEEP_BUFFER_DMA_MS, SND_SOC_TPLG_TUPLE_TYPE_WORD, get_token_u32, 0},
+ };
+ 
+ static const struct sof_topology_token ipc4_copier_tokens[] = {
+@@ -134,8 +134,8 @@ static const struct sof_token_info ipc4_token_list[SOF_TOKEN_COUNT] = {
+ 	[SOF_AUDIO_FORMAT_BUFFER_SIZE_TOKENS] = {"IPC4 Audio format buffer size tokens",
+ 		ipc4_audio_format_buffer_size_tokens,
+ 		ARRAY_SIZE(ipc4_audio_format_buffer_size_tokens)},
+-	[SOF_COPIER_GATEWAY_CFG_TOKENS] = {"IPC4 Copier gateway config tokens",
+-		ipc4_copier_gateway_cfg_tokens, ARRAY_SIZE(ipc4_copier_gateway_cfg_tokens)},
++	[SOF_COPIER_DEEP_BUFFER_TOKENS] = {"IPC4 Copier deep buffer tokens",
++		ipc4_copier_deep_buffer_tokens, ARRAY_SIZE(ipc4_copier_deep_buffer_tokens)},
+ 	[SOF_COPIER_TOKENS] = {"IPC4 Copier tokens", ipc4_copier_tokens,
+ 		ARRAY_SIZE(ipc4_copier_tokens)},
+ 	[SOF_AUDIO_FMT_NUM_TOKENS] = {"IPC4 Audio format number tokens",
+@@ -344,7 +344,7 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 	struct snd_soc_component *scomp = swidget->scomp;
+ 	struct sof_ipc4_copier *ipc4_copier;
+ 	int node_type = 0;
+-	int ret, i;
++	int ret;
+ 
+ 	ipc4_copier = kzalloc(sizeof(*ipc4_copier), GFP_KERNEL);
+ 	if (!ipc4_copier)
+@@ -359,13 +359,6 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 	if (ret)
+ 		goto free_copier;
+ 
+-	available_fmt->dma_buffer_size = kcalloc(available_fmt->audio_fmt_num, sizeof(u32),
+-						 GFP_KERNEL);
+-	if (!available_fmt->dma_buffer_size) {
+-		ret = -ENOMEM;
+-		goto free_available_fmt;
+-	}
+-
+ 	/*
+ 	 * This callback is used by host copier and module-to-module copier,
+ 	 * and only host copier needs to set gtw_cfg.
+@@ -373,21 +366,6 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 	if (!WIDGET_IS_AIF(swidget->id))
+ 		goto skip_gtw_cfg;
+ 
+-	ret = sof_update_ipc_object(scomp, available_fmt->dma_buffer_size,
+-				    SOF_COPIER_GATEWAY_CFG_TOKENS, swidget->tuples,
+-				    swidget->num_tuples, sizeof(u32),
+-				    available_fmt->audio_fmt_num);
+-	if (ret) {
+-		dev_err(scomp->dev, "Failed to parse dma buffer size in audio format for %s\n",
+-			swidget->widget->name);
+-		goto err;
+-	}
+-
+-	dev_dbg(scomp->dev, "dma buffer size:\n");
+-	for (i = 0; i < available_fmt->audio_fmt_num; i++)
+-		dev_dbg(scomp->dev, "%d: %u\n", i,
+-			available_fmt->dma_buffer_size[i]);
+-
+ 	ret = sof_update_ipc_object(scomp, &node_type,
+ 				    SOF_COPIER_TOKENS, swidget->tuples,
+ 				    swidget->num_tuples, sizeof(node_type), 1);
+@@ -395,7 +373,7 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 	if (ret) {
+ 		dev_err(scomp->dev, "parse host copier node type token failed %d\n",
+ 			ret);
+-		goto err;
++		goto free_available_fmt;
+ 	}
+ 	dev_dbg(scomp->dev, "host copier '%s' node_type %u\n", swidget->widget->name, node_type);
+ 
+@@ -403,7 +381,7 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 	ipc4_copier->gtw_attr = kzalloc(sizeof(*ipc4_copier->gtw_attr), GFP_KERNEL);
+ 	if (!ipc4_copier->gtw_attr) {
+ 		ret = -ENOMEM;
+-		goto err;
++		goto free_available_fmt;
+ 	}
+ 
+ 	ipc4_copier->copier_config = (uint32_t *)ipc4_copier->gtw_attr;
+@@ -434,8 +412,6 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
+ 
+ free_gtw_attr:
+ 	kfree(ipc4_copier->gtw_attr);
+-err:
+-	kfree(available_fmt->dma_buffer_size);
+ free_available_fmt:
+ 	sof_ipc4_free_audio_fmt(available_fmt);
+ free_copier:
+@@ -453,7 +429,6 @@ static void sof_ipc4_widget_free_comp_pcm(struct snd_sof_widget *swidget)
+ 		return;
+ 
+ 	available_fmt = &ipc4_copier->available_fmt;
+-	kfree(available_fmt->dma_buffer_size);
+ 	kfree(available_fmt->base_config);
+ 	kfree(available_fmt->out_audio_fmt);
+ 	kfree(ipc4_copier->gtw_attr);
+@@ -468,7 +443,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 	struct snd_sof_dai *dai = swidget->private;
+ 	struct sof_ipc4_copier *ipc4_copier;
+ 	int node_type = 0;
+-	int ret, i;
++	int ret;
+ 
+ 	ipc4_copier = kzalloc(sizeof(*ipc4_copier), GFP_KERNEL);
+ 	if (!ipc4_copier)
+@@ -482,33 +457,12 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 	if (ret)
+ 		goto free_copier;
+ 
+-	available_fmt->dma_buffer_size = kcalloc(available_fmt->audio_fmt_num, sizeof(u32),
+-						 GFP_KERNEL);
+-	if (!available_fmt->dma_buffer_size) {
+-		ret = -ENOMEM;
+-		goto free_available_fmt;
+-	}
+-
+-	ret = sof_update_ipc_object(scomp, available_fmt->dma_buffer_size,
+-				    SOF_COPIER_GATEWAY_CFG_TOKENS, swidget->tuples,
+-				    swidget->num_tuples, sizeof(u32),
+-				    available_fmt->audio_fmt_num);
+-	if (ret) {
+-		dev_err(scomp->dev, "Failed to parse dma buffer size in audio format for %s\n",
+-			swidget->widget->name);
+-		goto err;
+-	}
+-
+-	for (i = 0; i < available_fmt->audio_fmt_num; i++)
+-		dev_dbg(scomp->dev, "%d: dma buffer size: %u\n", i,
+-			available_fmt->dma_buffer_size[i]);
+-
+ 	ret = sof_update_ipc_object(scomp, &node_type,
+ 				    SOF_COPIER_TOKENS, swidget->tuples,
+ 				    swidget->num_tuples, sizeof(node_type), 1);
+ 	if (ret) {
+ 		dev_err(scomp->dev, "parse dai node type failed %d\n", ret);
+-		goto err;
++		goto free_available_fmt;
+ 	}
+ 
+ 	ret = sof_update_ipc_object(scomp, ipc4_copier,
+@@ -516,7 +470,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 				    swidget->num_tuples, sizeof(u32), 1);
+ 	if (ret) {
+ 		dev_err(scomp->dev, "parse dai copier node token failed %d\n", ret);
+-		goto err;
++		goto free_available_fmt;
+ 	}
+ 
+ 	dev_dbg(scomp->dev, "dai %s node_type %u dai_type %u dai_index %d\n", swidget->widget->name,
+@@ -534,7 +488,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 		blob = kzalloc(sizeof(*blob), GFP_KERNEL);
+ 		if (!blob) {
+ 			ret = -ENOMEM;
+-			goto err;
++			goto free_available_fmt;
+ 		}
+ 
+ 		list_for_each_entry(w, &sdev->widget_list, list) {
+@@ -563,7 +517,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 		ipc4_copier->gtw_attr = kzalloc(sizeof(*ipc4_copier->gtw_attr), GFP_KERNEL);
+ 		if (!ipc4_copier->gtw_attr) {
+ 			ret = -ENOMEM;
+-			goto err;
++			goto free_available_fmt;
+ 		}
+ 
+ 		ipc4_copier->copier_config = (uint32_t *)ipc4_copier->gtw_attr;
+@@ -584,8 +538,6 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
+ 
+ free_copier_config:
+ 	kfree(ipc4_copier->copier_config);
+-err:
+-	kfree(available_fmt->dma_buffer_size);
+ free_available_fmt:
+ 	sof_ipc4_free_audio_fmt(available_fmt);
+ free_copier:
+@@ -613,7 +565,6 @@ static void sof_ipc4_widget_free_comp_dai(struct snd_sof_widget *swidget)
+ 	ipc4_copier = dai->private;
+ 	available_fmt = &ipc4_copier->available_fmt;
+ 
+-	kfree(available_fmt->dma_buffer_size);
+ 	kfree(available_fmt->base_config);
+ 	kfree(available_fmt->out_audio_fmt);
+ 	if (ipc4_copier->dai_type != SOF_DAI_INTEL_SSP &&
+@@ -1143,6 +1094,7 @@ sof_ipc4_prepare_copier_module(struct snd_sof_widget *swidget,
+ 	int *ipc_config_size;
+ 	u32 **data;
+ 	int ipc_size, ret;
++	u32 deep_buffer_dma_ms = 0;
+ 
+ 	dev_dbg(sdev->dev, "copier %s, type %d", swidget->widget->name, swidget->id);
+ 
+@@ -1154,6 +1106,16 @@ sof_ipc4_prepare_copier_module(struct snd_sof_widget *swidget,
+ 		struct snd_sof_widget *pipe_widget;
+ 		struct sof_ipc4_pipeline *pipeline;
+ 
++		/* parse the deep buffer dma size */
++		ret = sof_update_ipc_object(scomp, &deep_buffer_dma_ms,
++					    SOF_COPIER_DEEP_BUFFER_TOKENS, swidget->tuples,
++					    swidget->num_tuples, sizeof(u32), 1);
++		if (ret) {
++			dev_err(scomp->dev, "Failed to parse deep buffer dma size for %s\n",
++				swidget->widget->name);
++			return ret;
++		}
++
+ 		pipe_widget = swidget->spipe->pipe_widget;
+ 		pipeline = pipe_widget->private;
+ 		ipc4_copier = (struct sof_ipc4_copier *)swidget->private;
+@@ -1344,8 +1306,29 @@ sof_ipc4_prepare_copier_module(struct snd_sof_widget *swidget,
+ 		return -EINVAL;
+ 	}
+ 
+-	/* set the gateway dma_buffer_size using the matched ID returned above */
+-	copier_data->gtw_cfg.dma_buffer_size = available_fmt->dma_buffer_size[ret];
++	/*
++	 * Set the gateway dma_buffer_size to 2ms buffer size to meet the FW expectation. In the
++	 * deep buffer case, set the dma_buffer_size depending on the deep_buffer_dma_ms set
++	 * in topology.
++	 */
++	switch (swidget->id) {
++	case snd_soc_dapm_dai_in:
++		copier_data->gtw_cfg.dma_buffer_size =
++			SOF_IPC4_MIN_DMA_BUFFER_SIZE * copier_data->base_config.ibs;
++		break;
++	case snd_soc_dapm_aif_in:
++			copier_data->gtw_cfg.dma_buffer_size =
++				max((u32)SOF_IPC4_MIN_DMA_BUFFER_SIZE, deep_buffer_dma_ms) *
++					copier_data->base_config.ibs;
++		break;
++	case snd_soc_dapm_dai_out:
++	case snd_soc_dapm_aif_out:
++		copier_data->gtw_cfg.dma_buffer_size =
++			SOF_IPC4_MIN_DMA_BUFFER_SIZE * copier_data->base_config.obs;
++		break;
++	default:
++		break;
++	}
+ 
+ 	data = &ipc4_copier->copier_config;
+ 	ipc_config_size = &ipc4_copier->ipc_config_size;
+@@ -2157,7 +2140,7 @@ static enum sof_tokens common_copier_token_list[] = {
+ 	SOF_AUDIO_FORMAT_BUFFER_SIZE_TOKENS,
+ 	SOF_IN_AUDIO_FORMAT_TOKENS,
+ 	SOF_OUT_AUDIO_FORMAT_TOKENS,
+-	SOF_COPIER_GATEWAY_CFG_TOKENS,
++	SOF_COPIER_DEEP_BUFFER_TOKENS,
+ 	SOF_COPIER_TOKENS,
+ 	SOF_COMP_EXT_TOKENS,
+ };
+@@ -2173,7 +2156,6 @@ static enum sof_tokens dai_token_list[] = {
+ 	SOF_AUDIO_FORMAT_BUFFER_SIZE_TOKENS,
+ 	SOF_IN_AUDIO_FORMAT_TOKENS,
+ 	SOF_OUT_AUDIO_FORMAT_TOKENS,
+-	SOF_COPIER_GATEWAY_CFG_TOKENS,
+ 	SOF_COPIER_TOKENS,
+ 	SOF_DAI_TOKENS,
+ 	SOF_COMP_EXT_TOKENS,
+diff --git a/sound/soc/sof/ipc4-topology.h b/sound/soc/sof/ipc4-topology.h
+index 9170133e9564..35b1a57bb971 100644
+--- a/sound/soc/sof/ipc4-topology.h
++++ b/sound/soc/sof/ipc4-topology.h
+@@ -55,6 +55,9 @@
+ 
+ #define SOF_IPC4_INVALID_NODE_ID	0xffffffff
+ 
++/* FW requires minimum 2ms DMA buffer size */
++#define SOF_IPC4_MIN_DMA_BUFFER_SIZE	2
++
+ /*
+  * The base of multi-gateways. Multi-gateways addressing starts from
+  * ALH_MULTI_GTW_BASE and there are ALH_MULTI_GTW_COUNT multi-sources
+@@ -146,7 +149,6 @@ struct ipc4_pipeline_set_state_data {
+  * @out_audio_fmt: Available output audio format
+  * @input_audio_fmts: Available input audio formats
+  * @ref_audio_fmt: Reference audio format to match runtime audio format
+- * @dma_buffer_size: Available Gateway DMA buffer size (in bytes)
+  * @audio_fmt_num: Number of available audio formats
+  */
+ struct sof_ipc4_available_audio_format {
+@@ -154,7 +156,6 @@ struct sof_ipc4_available_audio_format {
+ 	struct sof_ipc4_audio_format *out_audio_fmt;
+ 	struct sof_ipc4_audio_format *input_audio_fmts;
+ 	struct sof_ipc4_audio_format *ref_audio_fmt;
+-	u32 *dma_buffer_size;
+ 	int audio_fmt_num;
+ };
+ 
+diff --git a/sound/soc/sof/sof-audio.h b/sound/soc/sof/sof-audio.h
+index a1c4d3f34153..4504f9efdc50 100644
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@ -257,7 +257,7 @@ enum sof_tokens {
+ 	SOF_IN_AUDIO_FORMAT_TOKENS,
+ 	SOF_OUT_AUDIO_FORMAT_TOKENS,
+ 	SOF_AUDIO_FORMAT_BUFFER_SIZE_TOKENS,
+-	SOF_COPIER_GATEWAY_CFG_TOKENS,
++	SOF_COPIER_DEEP_BUFFER_TOKENS,
+ 	SOF_COPIER_TOKENS,
+ 	SOF_AUDIO_FMT_NUM_TOKENS,
+ 	SOF_COPIER_FORMAT_TOKENS,
+diff --git a/sound/soc/sof/topology.c b/sound/soc/sof/topology.c
+index 9f84b4c362c3..2d76ab13b3d1 100644
+--- a/sound/soc/sof/topology.c
++++ b/sound/soc/sof/topology.c
+@@ -1232,7 +1232,6 @@ static int sof_widget_parse_tokens(struct snd_soc_component *scomp, struct snd_s
+ 			continue;
+ 		case SOF_IN_AUDIO_FORMAT_TOKENS:
+ 		case SOF_OUT_AUDIO_FORMAT_TOKENS:
+-		case SOF_COPIER_GATEWAY_CFG_TOKENS:
+ 		case SOF_AUDIO_FORMAT_BUFFER_SIZE_TOKENS:
+ 			num_sets = sof_get_token_value(SOF_TKN_COMP_NUM_AUDIO_FORMATS,
+ 						       swidget->tuples, swidget->num_tuples);
+-- 
+2.25.1
+
