@@ -1,0 +1,1142 @@
+From bcf6f14318c852a7319cf3ebeb0978432e314c0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Piotr=20Pi=C3=B3rkowski?= <piotr.piorkowski@intel.com>
+Date: Fri, 21 Jul 2023 23:25:01 +0200
+Subject: [PATCH] drm/i915/gt/iov: Add MTL WA for update VF GGTT via VF2PF
+ relay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since direct access to the GGTT from VFs is unstable, MTL VFs will not
+have access to GGTT BAR and all updates to the GGTT must go through PF.
+The series adds functionality that, with the use of the VF2PF relay
+(based on MMIO as well as CTB), allows the VF to update its GGTT through PF.
+
+Signed-off-by: Piotr Piórkowski <piotr.piorkowski@intel.com>
+---
+ drivers/gpu/drm/i915/Makefile                 |   1 +
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          |  80 ++++++-
+ .../gpu/drm/i915/gt/iov/abi/iov_actions_abi.h |  93 ++++++++
+ .../i915/gt/iov/abi/iov_actions_mmio_abi.h    |  70 +++---
+ drivers/gpu/drm/i915/gt/iov/intel_iov.c       |   9 +
+ drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.c  | 147 ++++++++++++
+ drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.h  |  21 ++
+ drivers/gpu/drm/i915/gt/iov/intel_iov_query.c | 118 ++++++++++
+ drivers/gpu/drm/i915/gt/iov/intel_iov_query.h |   1 +
+ .../gpu/drm/i915/gt/iov/intel_iov_service.c   | 219 ++++++++++++++----
+ drivers/gpu/drm/i915/gt/iov/intel_iov_types.h |  22 ++
+ .../iov/selftests/selftest_live_iov_relay.c   |   6 +-
+ .../iov/selftests/selftest_mock_iov_relay.c   |   2 +-
+ .../drm/i915/gt/uc/abi/guc_actions_pf_abi.h   |   8 +-
+ .../drm/i915/gt/uc/abi/guc_actions_vf_abi.h   |   8 +-
+ 15 files changed, 716 insertions(+), 89 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.c
+ create mode 100644 drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 34ebd0b05316..f4e11d8a4306 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -224,6 +224,7 @@ iov-y += \
+ 	gt/iov/intel_iov.o \
+ 	gt/iov/intel_iov_debugfs.o \
+ 	gt/iov/intel_iov_event.o \
++	gt/iov/intel_iov_ggtt.o \
+ 	gt/iov/intel_iov_memirq.o \
+ 	gt/iov/intel_iov_provisioning.o \
+ 	gt/iov/intel_iov_query.o \
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index c8298cb6fcc7..aad337299302 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -16,6 +16,8 @@
+ #include "gem/i915_gem_lmem.h"
+ 
+ #include "iov/intel_iov.h"
++#include "iov/intel_iov_ggtt.h"
++#include "iov/intel_iov_utils.h"
+ 
+ #include "intel_ggtt_gmch.h"
+ #include "intel_gt.h"
+@@ -1208,6 +1210,71 @@ static int gen6_gmch_probe(struct i915_ggtt *ggtt)
+ 	return ggtt_probe_common(ggtt, size);
+ }
+ 
++static void ggtt_insert_page_vf_relay_wa(struct i915_address_space *vm, dma_addr_t addr, u64 offset,
++					 unsigned int pat_index, u32 flags)
++{
++	struct intel_iov *iov = &vm->gt->iov;
++	struct i915_ggtt *ggtt = i915_vm_to_ggtt(vm);
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	mutex_lock(&iov->vf.ptes_buffer.lock);
++
++	intel_iov_ggtt_vf_update_pte(iov, offset, ggtt->vm.pte_encode(addr, pat_index, flags));
++	intel_iov_ggtt_vf_flush_ptes(iov);
++
++	mutex_unlock(&iov->vf.ptes_buffer.lock);
++
++	ggtt->invalidate(ggtt);
++}
++
++static void ggtt_insert_entries_vf_relay_wa(struct i915_address_space *vm,
++					    struct i915_vma_resource *vma_res,
++					    unsigned int pat_index, u32 flags)
++{
++	struct i915_ggtt *ggtt = i915_vm_to_ggtt(vm);
++	struct intel_iov *iov = &vm->gt->iov;
++	const gen8_pte_t pte_encode = ggtt->vm.pte_encode(0, pat_index, flags);
++	u64 gte;
++	u64 end;
++	struct sgt_iter iter;
++	dma_addr_t addr;
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	gte = vma_res->start - vma_res->guard;
++	end = gte + vma_res->guard;
++
++	mutex_lock(&iov->vf.ptes_buffer.lock);
++
++	while (gte < end) {
++		intel_iov_ggtt_vf_update_pte(iov, gte, vm->scratch[0]->encode);
++		gte += I915_GTT_PAGE_SIZE;
++	}
++	end += vma_res->node_size + vma_res->guard;
++
++	for_each_sgt_daddr(addr, iter, vma_res->bi.pages) {
++		intel_iov_ggtt_vf_update_pte(iov, gte, pte_encode | addr);
++		gte += I915_GTT_PAGE_SIZE;
++	}
++	GEM_BUG_ON(gte > end);
++
++	/* Fill the allocated but "unused" space beyond the end of the buffer */
++	while (gte < end) {
++		intel_iov_ggtt_vf_update_pte(iov, gte, vm->scratch[0]->encode);
++		gte += I915_GTT_PAGE_SIZE;
++	}
++
++	/*
++	 * We want to flush the TLBs only after we're certain all the PTE
++	 * updates have finished.
++	 */
++	intel_iov_ggtt_vf_flush_ptes(iov);
++	mutex_unlock(&iov->vf.ptes_buffer.lock);
++
++	ggtt->invalidate(ggtt);
++}
++
+ static int gen12vf_ggtt_probe(struct i915_ggtt *ggtt)
+ {
+ 	struct drm_i915_private *i915 = ggtt->vm.i915;
+@@ -1226,10 +1293,19 @@ static int gen12vf_ggtt_probe(struct i915_ggtt *ggtt)
+ 	/* can't use roundup_pow_of_two(GUC_GGTT_TOP); */
+ 	ggtt->vm.total = 1ULL << (ilog2(GUC_GGTT_TOP - 1) + 1);
+ 	ggtt->vm.cleanup = gen6_gmch_remove;
+-	ggtt->vm.insert_page = gen8_ggtt_insert_page;
+ 	ggtt->vm.clear_range = nop_clear_range;
+ 
+-	ggtt->vm.insert_entries = gen8_ggtt_insert_entries;
++	/* Wa_22018453856 */
++	if (IS_METEORLAKE(i915)) {
++		IOV_DEBUG(&ggtt->vm.gt->iov,
++			  "VF update GGTT via VF2PF relay WA is enbaled!\n");
++		ggtt->vm.insert_page = ggtt_insert_page_vf_relay_wa;
++		ggtt->vm.insert_entries = ggtt_insert_entries_vf_relay_wa;
++
++	} else {
++		ggtt->vm.insert_page = gen8_ggtt_insert_page;
++		ggtt->vm.insert_entries = gen8_ggtt_insert_entries;
++	}
+ 
+ 	/* can't use guc_ggtt_invalidate() */
+ 	ggtt->invalidate = gen12vf_ggtt_invalidate;
+diff --git a/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_abi.h b/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_abi.h
+index 05d34438e507..fa105ffe6f37 100644
+--- a/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_abi.h
++++ b/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_abi.h
+@@ -118,4 +118,97 @@
+ #define VF2PF_QUERY_RUNTIME_RESPONSE_DATAn_REG_OFFSETx	GUC_HXG_RESPONSE_MSG_n_DATAn
+ #define VF2PF_QUERY_RUNTIME_RESPONSE_DATAn_REG_VALUEx	GUC_HXG_RESPONSE_MSG_n_DATAn
+ 
++/**
++ * DOC: VF2PF_UPDATE_GGTT32
++ *
++ * This `IOV Message`_ is used to request the PF to update the GGTT mapping
++ * using the PTE provided by the VF.
++ * If more than one PTE should be mapped, then the next PTEs are generated by
++ * the PF based on first or last PTE (depending on the MODE) or based onu
++ * subsequent provided PTEs.
++ *
++ *  +---+-------+--------------------------------------------------------------+
++ *  |   | Bits  | Description                                                  |
++ *  +===+=======+==============================================================+
++ *  | 0 |    31 | ORIGIN = GUC_HXG_ORIGIN_HOST_                                |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   | 30:28 | TYPE = GUC_HXG_TYPE_REQUEST_                                 |
++ *  |   |       | TYPE = GUC_HXG_TYPE_FAST_REQUEST_ (only if FLAGS = 0)        |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   | 27:16 | DATA0 = MBZ                                                  |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   |  15:0 | ACTION = _`VF2PF_UPDATE_GGTT32` = 0x0102                     |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 1 | 31:12 | **OFFSET** - relative offset within VF's GGTT region         |
++ *  |   |       | 0x00000 = VF GGTT BEGIN                                      |
++ *  |   |       | 0x00001 = VF GGTT BEGIN + 4K                                 |
++ *  |   |       | 0x00002 = VF GGTT BEGIN + 8K                                 |
++ *  |   |       | 0x00003 = ...                                                |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   | 11:10 | **MODE** = PTE copy mode                                     |
++ *  |   |       |                                                              |
++ *  |   |       | Controls where additional PTEs are inserted (either after    |
++ *  |   |       | first PTE0 or last PTEn) and how new PTEs are prepared       |
++ *  |   |       | (either as exact copy of PTE0/PTEn or altered PTE0/PTEn with |
++ *  |   |       | GPA` updated by 4K for consecutive GPA allocations).         |
++ *  |   |       | Applicable only when %NUM_COPIES is non-zero!                |
++ *  |   |       |                                                              |
++ *  |   |       | 0 = **DUPLICATE** = duplicate PTE0                           |
++ *  |   |       | 1 = **REPLICATE** = replicate PTE0 using GPA`                |
++ *  |   |       | 2 = **DUPLICATE_LAST** = duplicate PTEn                      |
++ *  |   |       | 3 = **REPLICATE_LAST** = replicate PTEn using GPA`           |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   |   9:0 | **NUM_COPIES** = number of PTEs to copy                      |
++ *  |   |       |                                                              |
++ *  |   |       | Allows to update additional GGTT pages using existing PTE.   |
++ *  |   |       | New PTEs are prepared according to the %MODE.                |
++ *  |   |       |                                                              |
++ *  |   |       | 0 = no copies                                                |
++ *  |   |       | ...                                                          |
++ *  |   |       | N = update additional N pages                                |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 2 |  31:0 | **PTE_LO** - lower 32 bits of GGTT PTE0                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 3 |  31:0 | **PTE_HI** - upper 32 bits of GGTT PTE0                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 4 |  31:0 | **PTE_LO** - lower 32 bits of GGTT PTE1                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 5 |  31:0 | **PTE_HI** - upper 32 bits of GGTT PTE1                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  :   :       :                                                              :
++ *  +---+-------+--------------------------------------------------------------+
++ *  |n-1|  31:0 | **PTE_LO** - lower 32 bits of GGTT PTEn                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | n |  31:0 | **PTE_HI** - upper 32 bits of GGTT PTEn                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *
++ *  +---+-------+--------------------------------------------------------------+
++ *  |   | Bits  | Description                                                  |
++ *  +===+=======+==============================================================+
++ *  | 0 |    31 | ORIGIN = GUC_HXG_ORIGIN_HOST_                                |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   | 30:28 | TYPE = GUC_HXG_TYPE_RESPONSE_SUCCESS_                        |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   |  27:0 | **NUM_PTES** - number of PTEs entries updated                |
++ *  +---+-------+--------------------------------------------------------------+
++ */
++
++#define IOV_ACTION_VF2PF_UPDATE_GGTT32			0x102
++
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_MIN_LEN		4u
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_MAX_LEN		VF2GUC_RELAY_TO_PF_REQUEST_MSG_MAX_LEN
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_0_MBZ		GUC_HXG_REQUEST_MSG_0_DATA0
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_OFFSET	(0xfffff << 12)
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE		(0x3 << 10)
++#define   VF2PF_UPDATE_GGTT32_MODE_DUPLICATE		0u
++#define   VF2PF_UPDATE_GGTT32_MODE_REPLICATE		1u
++#define   VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST	2u
++#define   VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST	3u
++#define VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES	(0x3ff << 0)
++#define VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_LO	GUC_HXG_REQUEST_MSG_n_DATAn
++#define VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_HI	GUC_HXG_REQUEST_MSG_n_DATAn
++#define   VF2PF_UPDATE_GGTT_MAX_PTES			((VF2GUC_RELAY_TO_PF_REQUEST_MSG_NUM_RELAY_DATA - 1) / 2)
++
++#define VF2PF_UPDATE_GGTT32_RESPONSE_MSG_LEN		1u
++#define VF2PF_UPDATE_GGTT32_RESPONSE_MSG_0_NUM_PTES	GUC_HXG_RESPONSE_MSG_0_DATA0
+ #endif /* _ABI_IOV_ACTIONS_ABI_H_ */
+diff --git a/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_mmio_abi.h b/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_mmio_abi.h
+index e61b7d484de3..0e21204786dc 100644
+--- a/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_mmio_abi.h
++++ b/drivers/gpu/drm/i915/gt/iov/abi/iov_actions_mmio_abi.h
+@@ -74,17 +74,10 @@
+ /**
+  * DOC: VF2PF_MMIO_UPDATE_GGTT
+  *
+- * PF will update VF's GGTT mapping using PTE provided by the VF.
+- * If more than one PTE should be mapped, then new PTE(n) is generated by the PF
+- * based on PTE(0) and all other flags are the same.
+- *
+- * Example:
+- * pfn' = FIELD_GET(ADDR_MASK, PTE)
+- * pte' = PTE & ~(VFID_MASK | ADDR_MASK)
+- *
+- * GSM[VF GGTT BEGIN + OFFSET] = encode(pte', pfn', VFID)
+- * GSM[VF GGTT BEGIN + OFFSET + 4K] = encode(pte', pfn' + 4K, VFID)
+- * ...
++ * This VF2PF MMIO message is used to request the PF to update the GGTT mapping
++ * using the PTE provided by the VF
++ * If more than one PTE should be mapped, then the next PTEs are generated based
++ * on provided PTE.
+  *
+  *  +---+-------+--------------------------------------------------------------+
+  *  |   | Bits  | Description                                                  |
+@@ -99,22 +92,37 @@
+  *  |   +-------+--------------------------------------------------------------+
+  *  |   |  15:0 | ACTION = GUC_ACTION_VF2GUC_MMIO_RELAY_SERVICE_               |
+  *  +---+-------+--------------------------------------------------------------+
+- *  | 1 | 31:12 | **OFFSET** - PTE offset in VF's GGTT region                  |
+- *  |   |       | 0 = VF GGTT BEGIN                                            |
+- *  |   |       | 1 = VF GGTT BEGIN + 4K                                       |
+- *  |   |       | 2 = VF GGTT BEGIN + 8K                                       |
+- *  |   |       | 3 = ...                                                      |
+- *  |   +-------+--------------------------------------------------------------+
+- *  |   |  11:0 | **TBD**                                                      |
+- *  |   +-------+--------------------------------------------------------------+
+- *  |   |   3:0 | **NUM_PTES** - number of PTE to update                       |
+- *  |   |       | 0 = 1 PTE/page                                               |
+- *  |   |       | 1 = 2 PTE/pages                                              |
+- *  |   |       | 2 = ...                                                      |
+- *  +---+-------+--------------------------------------------------------------+
+- *  | 2 |  31:0 | **PTE_LO** - lower 32 bits of GGTT PTE                       |
+- *  +---+-------+--------------------------------------------------------------+
+- *  | 3 |  31:0 | **PTE_HI** - higher 32 bits of GGTT PTE                      |
++ *  | 1 | 31:12 | **OFFSET** - relative offset within VF's GGTT region         |
++ *  |   |       | 0x00000 = VF GGTT BEGIN                                      |
++ *  |   |       | 0x00001 = VF GGTT BEGIN + 4K                                 |
++ *  |   |       | 0x00002 = VF GGTT BEGIN + 8K                                 |
++ *  |   |       | 0x00003 = ...                                                |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   | 11:10 | **MODE** = PTE copy mode                                     |
++ *  |   |       |                                                              |
++ *  |   |       | Controls where additional PTEs are inserted (either after    |
++ *  |   |       | first PTE0 or last PTEn) and how new PTEs are prepared       |
++ *  |   |       | (either as exact copy of PTE0/PTEn or altered PTE0/PTEn with |
++ *  |   |       | GPA` updated by 4K for consecutive GPA allocations).         |
++ *  |   |       | Applicable only when %NUM_COPIES is non-zero!                |
++ *  |   |       |                                                              |
++ *  |   |       | 0 = **DUPLICATE** = duplicate PTE0                           |
++ *  |   |       | 1 = **REPLICATE** = replicate PTE0 using GPA`                |
++ *  |   |       | 2 = **DUPLICATE_LAST** = duplicate PTEn                      |
++ *  |   |       | 3 = **REPLICATE_LAST** = replicate PTEn using GPA`           |
++ *  |   +-------+--------------------------------------------------------------+
++ *  |   |   9:0 | **NUM_COPIES** = number of PTEs to copy                      |
++ *  |   |       |                                                              |
++ *  |   |       | Allows to update additional GGTT pages using existing PTE.   |
++ *  |   |       | New PTEs are prepared according to the %MODE.                |
++ *  |   |       |                                                              |
++ *  |   |       | 0 = no copies                                                |
++ *  |   |       | ...                                                          |
++ *  |   |       | N = update additional N pages                                |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 2 |  31:0 | **PTE_LO** - lower 32 bits of GGTT PTE0                      |
++ *  +---+-------+--------------------------------------------------------------+
++ *  | 3 |  31:0 | **PTE_HI** - upper 32 bits of GGTT PTE0                      |
+  *  +---+-------+--------------------------------------------------------------+
+  *
+  *  +---+-------+--------------------------------------------------------------+
+@@ -134,9 +142,15 @@
+ 
+ #define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_LEN		4u
+ #define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_OFFSET	(0xfffff << 12)
+-#define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_PTES	(0xf << 0)
++#define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE	(0x3 << 10)
++#define   MMIO_UPDATE_GGTT_MODE_DUPLICATE		0u
++#define   MMIO_UPDATE_GGTT_MODE_REPLICATE		1u
++#define   MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST		2u
++#define   MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST		3u
++#define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES	(0x3ff << 0)
+ #define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_2_PTE_LO	GUC_HXG_REQUEST_MSG_n_DATAn
+ #define VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_3_PTE_HI	GUC_HXG_REQUEST_MSG_n_DATAn
++#define   MMIO_UPDATE_GGTT_MAX_PTES			1u
+ 
+ #define VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_LEN		1u
+ #define VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_1_NUM_PTES	(0xffffff << 0)
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov.c b/drivers/gpu/drm/i915/gt/iov/intel_iov.c
+index 1185abff50fe..ad7e61b6e9e9 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov.c
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "intel_iov.h"
++#include "intel_iov_ggtt.h"
+ #include "intel_iov_memirq.h"
+ #include "intel_iov_provisioning.h"
+ #include "intel_iov_query.h"
+@@ -27,6 +28,8 @@ void intel_iov_init_early(struct intel_iov *iov)
+ 		intel_iov_provisioning_init_early(iov);
+ 		intel_iov_service_init_early(iov);
+ 		intel_iov_state_init_early(iov);
++	} else if (intel_iov_is_vf(iov)) {
++		intel_iov_ggtt_vf_init_early(iov);
+ 	}
+ 
+ 	intel_iov_relay_init_early(&iov->relay);
+@@ -44,6 +47,8 @@ void intel_iov_release(struct intel_iov *iov)
+ 		intel_iov_state_release(iov);
+ 		intel_iov_service_release(iov);
+ 		intel_iov_provisioning_release(iov);
++	} else if (intel_iov_is_vf(iov)) {
++		intel_iov_ggtt_vf_release(iov);
+ 	}
+ }
+ 
+@@ -109,6 +114,10 @@ int intel_iov_init(struct intel_iov *iov)
+ 		intel_iov_provisioning_init(iov);
+ 
+ 	if (intel_iov_is_vf(iov)) {
++		err = intel_iov_query_bootstrap(iov);
++		if (unlikely(err))
++			return err;
++
+ 		vf_tweak_guc_submission(iov);
+ 
+ 		err = intel_iov_memirq_init(iov);
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.c b/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.c
+new file mode 100644
+index 000000000000..63d57aca2598
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2023 Intel Corporation
++ */
++
++#include "abi/iov_actions_mmio_abi.h"
++#include "intel_iov_ggtt.h"
++#include "intel_iov_types.h"
++#include "intel_iov_query.h"
++#include "intel_iov_utils.h"
++
++void intel_iov_ggtt_vf_init_early(struct intel_iov *iov)
++{
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	mutex_init(&iov->vf.ptes_buffer.lock);
++}
++
++void intel_iov_ggtt_vf_release(struct intel_iov *iov)
++{
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	mutex_destroy(&iov->vf.ptes_buffer.lock);
++}
++
++static bool is_next_ggtt_offset(struct intel_iov *iov, u32 offset)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++
++	return (offset - (buffer->num_copies + buffer->count) == buffer->offset);
++}
++
++static bool is_pte_duplicatable(struct intel_iov *iov, gen8_pte_t pte)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++
++	return (buffer->ptes[buffer->count - 1] == pte);
++}
++
++static bool is_pte_replicable(struct intel_iov *iov, gen8_pte_t pte)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++
++	u64 new_gfn = FIELD_GET(GEN12_GGTT_PTE_ADDR_MASK, pte);
++	u64 buffer_gfn = FIELD_GET(GEN12_GGTT_PTE_ADDR_MASK, buffer->ptes[buffer->count - 1]);
++	u64 new_flags = FIELD_GET(MTL_GGTT_PTE_PAT_MASK, pte);
++	u64 buffer_flags = FIELD_GET(MTL_GGTT_PTE_PAT_MASK, buffer->ptes[buffer->count - 1]);
++
++	return (new_flags == buffer_flags && new_gfn - (buffer->num_copies + 1) == buffer_gfn);
++}
++
++int intel_iov_ggtt_vf_update_pte(struct intel_iov *iov, u32 offset, gen8_pte_t pte)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++	u8 max_copies = FIELD_MAX(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES);
++	u8 max_ptes = MMIO_UPDATE_GGTT_MAX_PTES;
++	u32 pte_offset = (offset >> PAGE_SHIFT) - (iov->vf.config.ggtt_base >> PAGE_SHIFT);
++
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE != VF2PF_UPDATE_GGTT32_MODE_DUPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE != VF2PF_UPDATE_GGTT32_MODE_REPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST);
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	if (intel_guc_ct_enabled(&iov_to_guc(iov)->ct))
++		max_ptes = VF2PF_UPDATE_GGTT_MAX_PTES;
++
++	if (!buffer->count) {
++		buffer->offset = pte_offset;
++		buffer->ptes[buffer->count++] = pte;
++		buffer->count = 1;
++		buffer->num_copies = 0;
++		/**
++		 * If num_copies is equal to 0, then the value
++		 * of the MODE field is no matter.
++		 * Let's set MODE as invalid so that we can check later
++		 * if this field is set as expected.
++		 */
++		buffer->mode = VF_RELAY_UPDATE_GGTT_MODE_INVALID;
++	} else if (!is_next_ggtt_offset(iov, pte_offset) || buffer->num_copies == max_copies) {
++		goto flush;
++	} else if (!buffer->num_copies) {
++		if (is_pte_duplicatable(iov, pte)) {
++			buffer->mode = (buffer->count == 1) ? MMIO_UPDATE_GGTT_MODE_DUPLICATE :
++							      MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST;
++			buffer->num_copies++;
++		} else if (is_pte_replicable(iov, pte)) {
++			buffer->mode = (buffer->count == 1) ? MMIO_UPDATE_GGTT_MODE_REPLICATE :
++							      MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST;
++			buffer->num_copies++;
++		} else {
++			if (buffer->count == max_ptes)
++				goto flush;
++
++			buffer->ptes[buffer->count++] = pte;
++		}
++	} else if (buffer->count == 1 &&
++		   buffer->mode == MMIO_UPDATE_GGTT_MODE_DUPLICATE &&
++		   is_pte_duplicatable(iov, pte)) {
++		buffer->num_copies++;
++	} else if (buffer->count == 1 &&
++		   buffer->mode == MMIO_UPDATE_GGTT_MODE_REPLICATE &&
++		   is_pte_replicable(iov, pte)) {
++		buffer->num_copies++;
++	} else if (buffer->mode == MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST &&
++		   is_pte_duplicatable(iov, pte)) {
++		buffer->num_copies++;
++	} else if (buffer->mode == MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST &&
++		 is_pte_replicable(iov, pte)) {
++		buffer->num_copies++;
++	/*
++	 * If we operate in a mode that is not *_LAST
++	 * (according to the ABI below the value of 2), then we
++	 * have a chance to add some more PTEs to our request before
++	 * send.
++	 */
++	} else if (buffer->mode < 2 && buffer->count != max_ptes) {
++		buffer->ptes[buffer->count++] = pte;
++	} else {
++		goto flush;
++	}
++
++	return 0;
++flush:
++	intel_iov_ggtt_vf_flush_ptes(iov);
++	intel_iov_ggtt_vf_update_pte(iov, offset, pte);
++	return 0;
++}
++
++int intel_iov_ggtt_vf_flush_ptes(struct intel_iov *iov)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++	int err;
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++
++	if (!buffer->count)
++		return 0;
++
++	intel_iov_query_update_ggtt_ptes(iov);
++	buffer->count = 0;
++
++	return err;
++}
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.h b/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.h
+new file mode 100644
+index 000000000000..c5bc99493dae
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_ggtt.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2023 Intel Corporation
++ */
++
++#ifndef __INTEL_IOV_GGTT_H__
++#define __INTEL_IOV_GGTT_H__
++
++#include <linux/types.h>
++
++#include "gt/intel_gtt.h"
++#include "abi/iov_actions_mmio_abi.h"
++
++struct intel_iov;
++void intel_iov_ggtt_vf_init_early(struct intel_iov *iov);
++void intel_iov_ggtt_vf_release(struct intel_iov *iov);
++
++int intel_iov_ggtt_vf_update_pte(struct intel_iov *iov, u32 offset, gen8_pte_t pte);
++int intel_iov_ggtt_vf_flush_ptes(struct intel_iov *iov);
++
++#endif /* __INTEL_IOV_GGTT_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_query.c b/drivers/gpu/drm/i915/gt/iov/intel_iov_query.c
+index caf347148f54..d6849c0866d2 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov_query.c
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_query.c
+@@ -544,6 +544,124 @@ static int vf_handshake_with_pf_mmio(struct intel_iov *iov)
+ 	return -ECONNREFUSED;
+ }
+ 
++static int intel_iov_query_update_ggtt_pte_mmio(struct intel_iov *iov, u32 pte_offset, u8 mode,
++						u16 num_copies, gen8_pte_t pte)
++{
++	u32 request[VF2GUC_MMIO_RELAY_SERVICE_REQUEST_MSG_MAX_LEN] = {
++		mmio_relay_header(IOV_OPCODE_VF2PF_MMIO_UPDATE_GGTT, 0xF),
++		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE, mode) |
++		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES, num_copies) |
++		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_OFFSET, pte_offset),
++		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_2_PTE_LO, lower_32_bits(pte)),
++		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_3_PTE_HI, upper_32_bits(pte)),
++	};
++	u32 response[VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_LEN];
++	u16 expected = (num_copies) ? num_copies + 1 : 1;
++	u16 updated;
++	int ret;
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++	GEM_BUG_ON(FIELD_MAX(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE) < mode);
++	GEM_BUG_ON(FIELD_MAX(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES) < num_copies);
++
++	ret = guc_send_mmio_relay(iov_to_guc(iov), request, ARRAY_SIZE(request),
++				  response, ARRAY_SIZE(response));
++	if (unlikely(ret < 0))
++		return ret;
++
++	updated = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_1_NUM_PTES, response[0]);
++	WARN_ON(updated != expected);
++	return updated;
++}
++
++static int intel_iov_query_update_ggtt_pte_relay(struct intel_iov *iov, u32 pte_offset, u8 mode,
++						 u16 num_copies, gen8_pte_t *ptes, u16 count)
++{
++	struct drm_i915_private *i915 = iov_to_i915(iov);
++	u32 request[VF2PF_UPDATE_GGTT32_REQUEST_MSG_MAX_LEN];
++	u32 response[VF2PF_UPDATE_GGTT32_RESPONSE_MSG_LEN];
++	u16 expected =  num_copies + count;
++	u16 updated;
++	int i;
++	int ret;
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++	GEM_BUG_ON(FIELD_MAX(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE) < mode);
++	GEM_BUG_ON(FIELD_MAX(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES) < num_copies);
++	assert_rpm_wakelock_held(&i915->runtime_pm);
++
++	request[0] = FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
++		     FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_REQUEST) |
++		     FIELD_PREP(GUC_HXG_REQUEST_MSG_0_ACTION, IOV_ACTION_VF2PF_UPDATE_GGTT32);
++
++	request[1] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE, mode) |
++		     FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES, num_copies) |
++		     FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_OFFSET, pte_offset);
++
++	for (i = 0; i < count; i++) {
++		request[i * 2 + 2] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_LO,
++						lower_32_bits(ptes[i]));
++		request[i * 2 + 3] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_HI,
++						upper_32_bits(ptes[i]));
++	}
++
++	ret = intel_iov_relay_send_to_pf(&iov->relay,
++					 request, count * 2 + 2,
++					 response, ARRAY_SIZE(response));
++	if (unlikely(ret < 0))
++		return ret;
++
++	updated = FIELD_GET(VF2PF_UPDATE_GGTT32_RESPONSE_MSG_0_NUM_PTES, response[0]);
++	WARN_ON(updated != expected);
++	return updated;
++}
++
++/**
++ * intel_iov_query_update_ggtt_ptes - Send buffered PTEs to PF to update GGTT
++ * @iov: the IOV struct
++ *
++ * This function is for VF use only.
++ *
++ * Return: Number of successfully updated PTEs on success or a negative error code on failure.
++ */
++int intel_iov_query_update_ggtt_ptes(struct intel_iov *iov)
++{
++	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
++	int ret;
++
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE != VF2PF_UPDATE_GGTT32_MODE_DUPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE != VF2PF_UPDATE_GGTT32_MODE_REPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST);
++
++	GEM_BUG_ON(!intel_iov_is_vf(iov));
++	GEM_BUG_ON(buffer->mode == VF_RELAY_UPDATE_GGTT_MODE_INVALID && buffer->num_copies);
++
++	/*
++	 * If we don't have any PTEs to REPLICATE or DUPLICATE,
++	 * let's zero out the mode to be ABI compliant.
++	 * In this case, the value of the MODE field is irrelevant
++	 * to the operation of the ABI, as long as it has a value
++	 * within the allowed range
++	 */
++	if (buffer->mode == VF_RELAY_UPDATE_GGTT_MODE_INVALID && !buffer->num_copies)
++		buffer->mode = 0;
++
++	if (!intel_guc_ct_enabled(&iov_to_guc(iov)->ct))
++		ret = intel_iov_query_update_ggtt_pte_mmio(iov, buffer->offset, buffer->mode,
++							   buffer->num_copies, buffer->ptes[0]);
++	else
++		ret = intel_iov_query_update_ggtt_pte_relay(iov, buffer->offset, buffer->mode,
++							    buffer->num_copies, buffer->ptes,
++							    buffer->count);
++	if (unlikely(ret < 0))
++		IOV_ERROR(iov, "Failed to update VFs PTE by PF (%pe)\n", ERR_PTR(ret));
++
++	return ret;
++}
++
+ static int vf_get_runtime_info_mmio(struct intel_iov *iov)
+ {
+ 	u32 request[VF2GUC_MMIO_RELAY_SERVICE_REQUEST_MSG_MAX_LEN];
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_query.h b/drivers/gpu/drm/i915/gt/iov/intel_iov_query.h
+index f4737adf0155..58fb1f01b193 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov_query.h
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_query.h
+@@ -15,6 +15,7 @@ int intel_iov_query_bootstrap(struct intel_iov *iov);
+ int intel_iov_query_config(struct intel_iov *iov);
+ int intel_iov_query_version(struct intel_iov *iov);
+ int intel_iov_query_runtime(struct intel_iov *iov, bool early);
++int intel_iov_query_update_ggtt_ptes(struct intel_iov *iov);
+ void intel_iov_query_fini(struct intel_iov *iov);
+ 
+ void intel_iov_query_print_config(struct intel_iov *iov, struct drm_printer *p);
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c b/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
+index f57c1aac51ce..57e930b36fd6 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_service.c
+@@ -337,6 +337,150 @@ static int pf_reply_runtime_query(struct intel_iov *iov, u32 origin,
+ 					   response, 2 + 2 * chunk);
+ }
+ 
++static gen8_pte_t preapare_pte(u16 vfid, gen8_pte_t source_pte, bool ignore_addr)
++{
++	gen8_pte_t pte = (source_pte & MTL_GGTT_PTE_PAT_MASK) | i915_ggtt_prepare_vf_pte(vfid);
++
++	if (!ignore_addr)
++		pte |= (source_pte & GEN12_GGTT_PTE_ADDR_MASK);
++
++	return pte;
++}
++
++static void duplicate_and_set_pte(struct intel_iov *iov, gen8_pte_t pte, u16 vfid,
++				  gen8_pte_t __iomem *addr, u16 count)
++{
++	pte = preapare_pte(vfid, pte, false);
++
++	while (count--)
++		writeq(pte, addr++);
++}
++
++static void replicate_and_set_pte(struct intel_iov *iov, gen8_pte_t pte, u16 vfid,
++				  gen8_pte_t __iomem **addr, u16 count)
++{
++	u64 pfn = FIELD_GET(GEN12_GGTT_PTE_ADDR_MASK, pte);
++
++	pte = preapare_pte(vfid, pte, true);
++
++	while (count--)
++		writeq(pte | FIELD_PREP(GEN12_GGTT_PTE_ADDR_MASK, pfn++), (*addr)++);
++}
++
++static int pf_update_vf_ggtt(struct intel_iov *iov, u32 vfid, u32 pte_offset, u8 mode,
++			     u16 num_copies, gen8_pte_t *ptes, u16 count)
++{
++	struct i915_ggtt *ggtt = iov_to_gt(iov)->ggtt;
++	gen8_pte_t __iomem *gtt_entries = ggtt->gsm;
++	struct drm_mm_node *node = &iov->pf.provisioning.configs[vfid].ggtt_region;
++	u64 ggtt_addr = node->start + pte_offset * I915_GTT_PAGE_SIZE_4K;
++	u64 ggtt_addr_end = ggtt_addr + count * I915_GTT_PAGE_SIZE_4K - 1;
++	u64 vf_ggtt_end = node->start + node->size - 1;
++	u16 updated;
++
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE != VF2PF_UPDATE_GGTT32_MODE_DUPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE != VF2PF_UPDATE_GGTT32_MODE_REPLICATE);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST);
++	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST !=
++		     VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST);
++
++	if (!count)
++		return -EINVAL;
++
++	if (ggtt_addr_end > vf_ggtt_end)
++		return -ERANGE;
++
++	gtt_entries += (node->start >> PAGE_SHIFT) + pte_offset;
++
++	updated = (num_copies) ? num_copies + (count) : count;
++
++	/*
++	 * To simplify the code, always let at least one PTE be updated by
++	 * a function to duplicate or replicate.
++	 */
++	num_copies++;
++	count--;
++
++	switch (mode) {
++	case MMIO_UPDATE_GGTT_MODE_DUPLICATE:
++		duplicate_and_set_pte(iov, *(ptes++), vfid, gtt_entries++, num_copies);
++
++		while (count--)
++			writeq(preapare_pte(vfid, *(ptes++), false), gtt_entries++);
++		break;
++	case MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST:
++		while (count--)
++			writeq(preapare_pte(vfid, *(ptes++), false), gtt_entries++);
++
++		duplicate_and_set_pte(iov, *(ptes), vfid, gtt_entries, num_copies);
++		break;
++	case MMIO_UPDATE_GGTT_MODE_REPLICATE:
++		replicate_and_set_pte(iov, *(ptes++), vfid, &gtt_entries, num_copies);
++
++		while (count--)
++			writeq(preapare_pte(vfid, *(ptes++), false), gtt_entries++);
++		break;
++
++	case MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST:
++		while (count--)
++			writeq(preapare_pte(vfid, *(ptes++), false), gtt_entries++);
++
++		replicate_and_set_pte(iov, *(ptes), vfid, &gtt_entries, num_copies);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	IOV_DEBUG(iov, "PF updated GGTT for %d PTE(s) from VF%u\n", updated, vfid);
++
++	return updated;
++}
++
++static int pf_reply_update_ggtt(struct intel_iov *iov, u32 origin,
++				u32 relay_id, const u32 *msg, u32 len)
++{
++	u32 response[VF2PF_UPDATE_GGTT32_RESPONSE_MSG_LEN];
++	u16 num_copies;
++	u8 mode;
++	u32 pte_offset;
++	u16 count;
++	gen8_pte_t ptes[VF2PF_UPDATE_GGTT_MAX_PTES];
++	int ret;
++	int i;
++
++	if (!IS_METEORLAKE(iov_to_i915(iov)))
++		return -EOPNOTSUPP;
++
++	if (unlikely(!msg[0]))
++		return -EPROTO;
++
++	num_copies = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES, msg[1]);
++	mode = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE, msg[1]);
++	pte_offset = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_OFFSET, msg[1]);
++	count = (len - 2) / 2;
++
++	if (count > VF2PF_UPDATE_GGTT_MAX_PTES)
++		return -EMSGSIZE;
++
++	for (i = 0; i < count; i++) {
++		u32 pte_lo = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_LO, msg[i * 2 + 2]);
++		u32 pte_hi = FIELD_GET(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_HI, msg[i * 2 + 3]);
++
++		ptes[i] = make_u64(pte_hi, pte_lo);
++	}
++	ret = pf_update_vf_ggtt(iov, origin, pte_offset, mode, num_copies, ptes, (len - 2) / 2);
++	if (ret < 0)
++		return ret;
++
++	response[0] = FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
++		      FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_RESPONSE_SUCCESS) |
++		      FIELD_PREP(VF2PF_UPDATE_GGTT32_RESPONSE_MSG_0_NUM_PTES, (u16)ret);
++
++	return intel_iov_relay_reply_to_vf(&iov->relay, origin, relay_id,
++					   response, ARRAY_SIZE(response));
++}
++
+ /**
+  * intel_iov_service_process_msg - Service request message from VF.
+  * @iov: the IOV struct
+@@ -374,6 +518,9 @@ int intel_iov_service_process_msg(struct intel_iov *iov, u32 origin,
+ 	case IOV_ACTION_VF2PF_QUERY_RUNTIME:
+ 		err = pf_reply_runtime_query(iov, origin, relay_id, msg, len);
+ 		break;
++	case IOV_ACTION_VF2PF_UPDATE_GGTT32:
++		err = pf_reply_update_ggtt(iov, origin, relay_id, msg, len);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -458,74 +605,52 @@ static int reply_mmio_relay_handshake(struct intel_iov *iov,
+ 	return send_mmio_relay_reply(iov, vfid, magic, data);
+ }
+ 
+-static int __i915_reg_cmp(const void *a, const void *b)
+-{
+-	return i915_mmio_reg_offset(*(const i915_reg_t *)a) -
+-	       i915_mmio_reg_offset(*(const i915_reg_t *)b);
+-}
+-
+-static int lookup_reg_index(struct intel_iov *iov, u32 offset)
+-{
+-	i915_reg_t key = _MMIO(offset);
+-	i915_reg_t *found = bsearch(&key, iov->pf.service.runtime.regs,
+-				    iov->pf.service.runtime.size, sizeof(key),
+-				    __i915_reg_cmp);
+-
+-	return found ? found - iov->pf.service.runtime.regs : -ENODATA;
+-}
+-
+ static int reply_mmio_relay_update_ggtt(struct intel_iov *iov, u32 vfid, u32 magic, const u32 *msg)
+ {
+-	struct i915_ggtt *ggtt = iov_to_gt(iov)->ggtt;
+-	gen8_pte_t __iomem *gtt_entries = ggtt->gsm;
+-	struct drm_mm_node *node = &iov->pf.provisioning.configs[vfid].ggtt_region;
+-	gen8_pte_t pte = i915_ggtt_prepare_vf_pte(vfid);
+-	u64 vf_ggtt_end = node->start + node->size - 1;
+ 	u32 data[PF2GUC_MMIO_RELAY_SUCCESS_REQUEST_MSG_NUM_DATA + 1] = { };
+-	u64 pfn;
+-	u16 pte_num;
++	u16 num_copies;
++	u8 mode;
+ 	u32 pte_lo, pte_hi;
+ 	u32 pte_offset;
+-	gen8_pte_t rq_pte;
+-	u64 ggtt_addr;
+-	u64 ggtt_addr_end;
+-	int i;
++	gen8_pte_t pte;
++	int ret;
+ 
+ 	if (!IS_METEORLAKE(iov_to_i915(iov)))
+ 		return -EOPNOTSUPP;
+ 
+ 	if (unlikely(!msg[0]))
+ 		return -EPROTO;
+-	if (unlikely(!msg[1]))
+-		return -EINVAL;
+ 
+-	pte_num = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_PTES, msg[1]);
++	num_copies = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES, msg[1]);
++	mode = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE, msg[1]);
+ 	pte_offset = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_OFFSET, msg[1]);
+ 	pte_lo = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_2_PTE_LO, msg[2]);
+ 	pte_hi = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_3_PTE_HI, msg[3]);
+ 
+-	ggtt_addr = node->start + pte_offset * I915_GTT_PAGE_SIZE_4K;
+-	ggtt_addr_end = ggtt_addr + pte_num * I915_GTT_PAGE_SIZE_4K - 1;
+-
+-	if (ggtt_addr_end > vf_ggtt_end)
+-		return -ERANGE;
++	pte = make_u64(pte_hi, pte_lo);
+ 
+-	rq_pte = make_u64(pte_hi, pte_lo);
+-	pfn = FIELD_GET(GEN12_GGTT_PTE_ADDR_MASK, rq_pte);
++	ret = pf_update_vf_ggtt(iov, vfid, pte_offset, mode, num_copies, &pte, 1);
++	if (ret < 0)
++		return ret;
++	data[0] = FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_1_NUM_PTES, (u16)ret);
+ 
+-	pte |= rq_pte & MTL_GGTT_PTE_PAT_MASK;
+-
+-	gtt_entries += (node->start >> PAGE_SHIFT) + pte_offset;
+-
+-	for (i = 0; i < pte_num; i++) {
+-		u64 pfn_masked = FIELD_PREP(GEN12_GGTT_PTE_ADDR_MASK, pfn + i);
++	return send_mmio_relay_reply(iov, vfid, magic, data);
++}
+ 
+-		writeq(pte | pfn_masked, gtt_entries++);
+-	}
++static int __i915_reg_cmp(const void *a, const void *b)
++{
++	return i915_mmio_reg_offset(*(const i915_reg_t *)a) -
++	       i915_mmio_reg_offset(*(const i915_reg_t *)b);
++}
+ 
+-	data[0] = FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_1_NUM_PTES, pte_num);
++static int lookup_reg_index(struct intel_iov *iov, u32 offset)
++{
++	i915_reg_t key = _MMIO(offset);
++	i915_reg_t *found = bsearch(&key, iov->pf.service.runtime.regs,
++				    iov->pf.service.runtime.size, sizeof(key),
++				    __i915_reg_cmp);
+ 
+-	return send_mmio_relay_reply(iov, vfid, magic, data);
++	return found ? found - iov->pf.service.runtime.regs : -ENODATA;
+ }
+ 
+ static int reply_mmio_relay_get_reg(struct intel_iov *iov,
+diff --git a/drivers/gpu/drm/i915/gt/iov/intel_iov_types.h b/drivers/gpu/drm/i915/gt/iov/intel_iov_types.h
+index 8be6f3db1e13..a452e55149fc 100644
+--- a/drivers/gpu/drm/i915/gt/iov/intel_iov_types.h
++++ b/drivers/gpu/drm/i915/gt/iov/intel_iov_types.h
+@@ -9,6 +9,8 @@
+ #include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ #include <drm/drm_mm.h>
++#include "abi/iov_actions_abi.h"
++#include "gt/intel_gtt.h"
+ #include "i915_reg.h"
+ #include "i915_selftest.h"
+ #include "intel_wakeref.h"
+@@ -176,6 +178,25 @@ struct intel_iov_vf_runtime {
+ 	} *regs;
+ };
+ 
++/**
++ * struct intel_iov_vf_ggtt_ptes - Placeholder for the VF PTEs data.
++ * @ptes: an array of buffered GGTT PTEs awaiting update by PF.
++ * @count: count of the buffered PTEs in the array.
++ * @offset: GGTT offset for the first PTE from the array.
++ * @num_copies: number of copies of the first or last PTE (depending on mode).
++ * @mode: mode of generating PTEs on PF.
++ * @lock: protects PTEs data
++ */
++struct intel_iov_vf_ggtt_ptes {
++	gen8_pte_t ptes[VF2PF_UPDATE_GGTT_MAX_PTES];
++	u16 count;
++	u32 offset;
++	u16 num_copies;
++	u8 mode;
++#define VF_RELAY_UPDATE_GGTT_MODE_INVALID	U8_MAX
++	struct mutex lock;
++};
++
+ /**
+  * struct intel_iov_memirq - IOV interrupts data.
+  * @obj: GEM object with memory interrupt data.
+@@ -256,6 +277,7 @@ struct intel_iov {
+ 		struct {
+ 			struct intel_iov_vf_config config;
+ 			struct intel_iov_vf_runtime runtime;
++			struct intel_iov_vf_ggtt_ptes ptes_buffer;
+ 			struct drm_mm_node ggtt_balloon[2];
+ 			struct intel_iov_memirq irq;
+ 		} vf;
+diff --git a/drivers/gpu/drm/i915/gt/iov/selftests/selftest_live_iov_relay.c b/drivers/gpu/drm/i915/gt/iov/selftests/selftest_live_iov_relay.c
+index b3ef7dcedf53..ed379069f5b8 100644
+--- a/drivers/gpu/drm/i915/gt/iov/selftests/selftest_live_iov_relay.c
++++ b/drivers/gpu/drm/i915/gt/iov/selftests/selftest_live_iov_relay.c
+@@ -351,7 +351,7 @@ static int pf_loopback_one_way_to_vf(void *arg)
+ static int pf_full_loopback_to_vf(void *arg)
+ {
+ 	struct intel_iov *iov = arg;
+-	u32 msg[PF2GUC_RELAY_TO_VF_REQUEST_MSG_NUM_RELAY_DATA] = {
++	u32 msg[] = {
+ 		MSG_IOV_SELFTEST_RELAY(SELFTEST_RELAY_OPCODE_NOP),
+ 		FIELD_PREP(GUC_HXG_REQUEST_MSG_n_DATAn, SELFTEST_RELAY_DATA),
+ 		/* ... */
+@@ -389,7 +389,7 @@ static int pf_full_loopback_to_vf(void *arg)
+ static int pf_loopback_one_way_to_pf(void *arg)
+ {
+ 	struct intel_iov *iov = arg;
+-	u32 msg[VF2GUC_RELAY_TO_PF_REQUEST_MSG_NUM_RELAY_DATA] = {
++	u32 msg[] = {
+ 		MSG_IOV_SELFTEST_RELAY_EVENT(SELFTEST_RELAY_OPCODE_NOP),
+ 		FIELD_PREP(GUC_HXG_REQUEST_MSG_n_DATAn, SELFTEST_RELAY_DATA),
+ 		/* ... */
+@@ -440,7 +440,7 @@ static int pf_loopback_one_way_to_pf(void *arg)
+ 
+ static int relay_request_to_pf(struct intel_iov *iov)
+ {
+-	u32 msg[VF2GUC_RELAY_TO_PF_REQUEST_MSG_NUM_RELAY_DATA] = {
++	u32 msg[] = {
+ 		MSG_IOV_SELFTEST_RELAY(SELFTEST_RELAY_OPCODE_NOP),
+ 		FIELD_PREP(GUC_HXG_REQUEST_MSG_n_DATAn, SELFTEST_RELAY_DATA),
+ 		/* ... */
+diff --git a/drivers/gpu/drm/i915/gt/iov/selftests/selftest_mock_iov_relay.c b/drivers/gpu/drm/i915/gt/iov/selftests/selftest_mock_iov_relay.c
+index 91b8083d9f18..a3e4dfa7e477 100644
+--- a/drivers/gpu/drm/i915/gt/iov/selftests/selftest_mock_iov_relay.c
++++ b/drivers/gpu/drm/i915/gt/iov/selftests/selftest_mock_iov_relay.c
+@@ -405,7 +405,7 @@ static int mock_prepares_pf2guc(void *arg)
+ {
+ 	struct intel_iov *iov = arg;
+ 	u32 vfid = VFID(1);
+-	u32 msg[PF2GUC_RELAY_TO_VF_REQUEST_MSG_NUM_RELAY_DATA] = {
++	u32 msg[] = {
+ 		FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
+ 		FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_EVENT) |
+ 		FIELD_PREP(GUC_HXG_REQUEST_MSG_0_ACTION, IOV_ACTION_SELFTEST_RELAY),
+diff --git a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_pf_abi.h b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_pf_abi.h
+index c38a1e247525..5fd90e5f09fb 100644
+--- a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_pf_abi.h
++++ b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_pf_abi.h
+@@ -143,13 +143,13 @@
+ #define GUC_ACTION_GUC2PF_RELAY_FROM_VF			0x5100
+ 
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_MIN_LEN		(GUC_HXG_EVENT_MSG_MIN_LEN + 2u)
+-#define GUC2PF_RELAY_FROM_VF_EVENT_MSG_MAX_LEN		(GUC2PF_RELAY_FROM_VF_EVENT_MSG_MIN_LEN + 60u)
++#define GUC2PF_RELAY_FROM_VF_EVENT_MSG_MAX_LEN		(GUC_CTB_HXG_MSG_MAX_LEN - GUC_CTB_MSG_MIN_LEN - 3u)
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_0_MBZ		GUC_HXG_EVENT_MSG_0_DATA0
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_1_VFID		GUC_HXG_EVENT_MSG_n_DATAn
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_2_RELAY_ID	GUC_HXG_EVENT_MSG_n_DATAn
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_3_RELAY_DATA1	GUC_HXG_EVENT_MSG_n_DATAn
+ #define GUC2PF_RELAY_FROM_VF_EVENT_MSG_n_RELAY_DATAx	GUC_HXG_EVENT_MSG_n_DATAn
+-#define GUC2PF_RELAY_FROM_VF_EVENT_MSG_NUM_RELAY_DATA	60u
++#define GUC2PF_RELAY_FROM_VF_EVENT_MSG_NUM_RELAY_DATA	(GUC2PF_RELAY_FROM_VF_EVENT_MSG_MAX_LEN - GUC2PF_RELAY_FROM_VF_EVENT_MSG_MIN_LEN)
+ 
+ /**
+  * DOC: PF2GUC_RELAY_TO_VF
+@@ -184,13 +184,13 @@
+ #define GUC_ACTION_PF2GUC_RELAY_TO_VF			0x5101
+ 
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_MIN_LEN		(GUC_HXG_REQUEST_MSG_MIN_LEN + 2u)
+-#define PF2GUC_RELAY_TO_VF_REQUEST_MSG_MAX_LEN		(PF2GUC_RELAY_TO_VF_REQUEST_MSG_MIN_LEN + 60u)
++#define PF2GUC_RELAY_TO_VF_REQUEST_MSG_MAX_LEN		(GUC_CTB_HXG_MSG_MAX_LEN - GUC_CTB_MSG_MIN_LEN - 3u)
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_0_MBZ		GUC_HXG_REQUEST_MSG_0_DATA0
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_1_VFID		GUC_HXG_REQUEST_MSG_n_DATAn
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_2_RELAY_ID	GUC_HXG_REQUEST_MSG_n_DATAn
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_3_RELAY_DATA1	GUC_HXG_REQUEST_MSG_n_DATAn
+ #define PF2GUC_RELAY_TO_VF_REQUEST_MSG_n_RELAY_DATAx	GUC_HXG_REQUEST_MSG_n_DATAn
+-#define PF2GUC_RELAY_TO_VF_REQUEST_MSG_NUM_RELAY_DATA	60u
++#define PF2GUC_RELAY_TO_VF_REQUEST_MSG_NUM_RELAY_DATA	(PF2GUC_RELAY_TO_VF_REQUEST_MSG_MAX_LEN - PF2GUC_RELAY_TO_VF_REQUEST_MSG_MIN_LEN)
+ 
+ /**
+  * DOC: GUC2PF_MMIO_RELAY_SERVICE
+diff --git a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_vf_abi.h b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_vf_abi.h
+index 34492462a7bb..297bb34cf272 100644
+--- a/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_vf_abi.h
++++ b/drivers/gpu/drm/i915/gt/uc/abi/guc_actions_vf_abi.h
+@@ -196,11 +196,11 @@
+ #define GUC_ACTION_VF2GUC_RELAY_TO_PF			0x5103
+ 
+ #define VF2GUC_RELAY_TO_PF_REQUEST_MSG_MIN_LEN		(GUC_HXG_REQUEST_MSG_MIN_LEN + 1u)
+-#define VF2GUC_RELAY_TO_PF_REQUEST_MSG_MAX_LEN		(VF2GUC_RELAY_TO_PF_REQUEST_MSG_MIN_LEN + 60u)
++#define VF2GUC_RELAY_TO_PF_REQUEST_MSG_MAX_LEN		(GUC_CTB_HXG_MSG_MAX_LEN - GUC_CTB_MSG_MIN_LEN - 3u)
+ #define VF2GUC_RELAY_TO_PF_REQUEST_MSG_0_MBZ		GUC_HXG_REQUEST_MSG_0_DATA0
+ #define VF2GUC_RELAY_TO_PF_REQUEST_MSG_1_RELAY_ID	GUC_HXG_REQUEST_MSG_n_DATAn
+ #define VF2GUC_RELAY_TO_PF_REQUEST_MSG_n_RELAY_DATAx	GUC_HXG_REQUEST_MSG_n_DATAn
+-#define VF2GUC_RELAY_TO_PF_REQUEST_MSG_NUM_RELAY_DATA	60u
++#define VF2GUC_RELAY_TO_PF_REQUEST_MSG_NUM_RELAY_DATA	(VF2GUC_RELAY_TO_PF_REQUEST_MSG_MAX_LEN - VF2GUC_RELAY_TO_PF_REQUEST_MSG_MIN_LEN)
+ 
+ /**
+  * DOC: GUC2VF_RELAY_FROM_PF
+@@ -233,11 +233,11 @@
+ #define GUC_ACTION_GUC2VF_RELAY_FROM_PF			0x5102
+ 
+ #define GUC2VF_RELAY_FROM_PF_EVENT_MSG_MIN_LEN		(GUC_HXG_EVENT_MSG_MIN_LEN + 1u)
+-#define GUC2VF_RELAY_FROM_PF_EVENT_MSG_MAX_LEN		(GUC2VF_RELAY_FROM_PF_EVENT_MSG_MIN_LEN + 60u)
++#define GUC2VF_RELAY_FROM_PF_EVENT_MSG_MAX_LEN		(GUC_CTB_HXG_MSG_MAX_LEN - GUC_CTB_MSG_MIN_LEN - 3u)
+ #define GUC2VF_RELAY_FROM_PF_EVENT_MSG_0_MBZ		GUC_HXG_EVENT_MSG_0_DATA0
+ #define GUC2VF_RELAY_FROM_PF_EVENT_MSG_1_RELAY_ID	GUC_HXG_EVENT_MSG_n_DATAn
+ #define GUC2VF_RELAY_FROM_PF_EVENT_MSG_n_RELAY_DATAx	GUC_HXG_EVENT_MSG_n_DATAn
+-#define GUC2VF_RELAY_FROM_PF_EVENT_MSG_NUM_RELAY_DATA	60u
++#define GUC2VF_RELAY_FROM_PF_EVENT_MSG_NUM_RELAY_DATA	(GUC2VF_RELAY_FROM_PF_EVENT_MSG_MAX_LEN - GUC2VF_RELAY_FROM_PF_EVENT_MSG_MIN_LEN)
+ 
+ /**
+  * DOC: VF2GUC_MMIO_RELAY_SERVICE
+-- 
+2.25.1
+
