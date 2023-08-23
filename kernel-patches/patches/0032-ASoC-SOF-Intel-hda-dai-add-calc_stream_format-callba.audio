@@ -1,0 +1,159 @@
+From abf868c8ffc31c32cd4fdc2d2f122a0dd405cce8 Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Fri, 2 Jun 2023 15:56:14 -0500
+Subject: [PATCH 32/38] ASoC: SOF: Intel: hda-dai: add calc_stream_format
+ callback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The existing code for HDAudio DAIs cannot be extended to other types
+of DAIs, specific programming sequences need to be abstracted away.
+
+This patch hides the stream format setup which is currently completely
+related to the HDaudio codec setup - not something that will work for
+other types of DAIs.
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20230602205620.310879-4-pierre-louis.bossart@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/intel/hda-dai-ops.c | 27 +++++++++++++++++++++++++++
+ sound/soc/sof/intel/hda-dai.c     | 16 +++-------------
+ sound/soc/sof/intel/hda.h         |  5 +++++
+ 3 files changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/sound/soc/sof/intel/hda-dai-ops.c b/sound/soc/sof/intel/hda-dai-ops.c
+index 2e9a0f071b8e..e0915da46a70 100644
+--- a/sound/soc/sof/intel/hda-dai-ops.c
++++ b/sound/soc/sof/intel/hda-dai-ops.c
+@@ -186,6 +186,29 @@ static void hda_codec_dai_set_stream(struct snd_sof_dev *sdev,
+ 	snd_soc_dai_set_stream(codec_dai, hstream, substream->stream);
+ }
+ 
++static unsigned int hda_calc_stream_format(struct snd_sof_dev *sdev,
++					   struct snd_pcm_substream *substream,
++					   struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
++	struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
++	unsigned int link_bps;
++	unsigned int format_val;
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		link_bps = codec_dai->driver->playback.sig_bits;
++	else
++		link_bps = codec_dai->driver->capture.sig_bits;
++
++	format_val = snd_hdac_calc_stream_format(params_rate(params), params_channels(params),
++						 params_format(params), link_bps, 0);
++
++	dev_dbg(sdev->dev, "format_val=%#x, rate=%d, ch=%d, format=%d\n", format_val,
++		params_rate(params), params_channels(params), params_format(params));
++
++	return format_val;
++}
++
+ static int hda_ipc4_pre_trigger(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
+ 				struct snd_pcm_substream *substream, int cmd)
+ {
+@@ -320,6 +343,7 @@ static const struct hda_dai_widget_dma_ops hda_ipc4_dma_ops = {
+ 	.trigger = hda_trigger,
+ 	.post_trigger = hda_ipc4_post_trigger,
+ 	.codec_dai_set_stream = hda_codec_dai_set_stream,
++	.calc_stream_format = hda_calc_stream_format,
+ };
+ 
+ static const struct hda_dai_widget_dma_ops hda_ipc4_chain_dma_ops = {
+@@ -330,6 +354,7 @@ static const struct hda_dai_widget_dma_ops hda_ipc4_chain_dma_ops = {
+ 	.reset_hext_stream = hda_reset_hext_stream,
+ 	.trigger = hda_trigger,
+ 	.codec_dai_set_stream = hda_codec_dai_set_stream,
++	.calc_stream_format = hda_calc_stream_format,
+ };
+ 
+ static int hda_ipc3_post_trigger(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
+@@ -364,6 +389,7 @@ static const struct hda_dai_widget_dma_ops hda_ipc3_dma_ops = {
+ 	.trigger = hda_trigger,
+ 	.post_trigger = hda_ipc3_post_trigger,
+ 	.codec_dai_set_stream = hda_codec_dai_set_stream,
++	.calc_stream_format = hda_calc_stream_format,
+ };
+ 
+ static struct hdac_ext_stream *
+@@ -391,6 +417,7 @@ static const struct hda_dai_widget_dma_ops hda_dspless_dma_ops = {
+ 	.get_hext_stream = hda_dspless_get_hext_stream,
+ 	.setup_hext_stream = hda_dspless_setup_hext_stream,
+ 	.codec_dai_set_stream = hda_codec_dai_set_stream,
++	.calc_stream_format = hda_calc_stream_format,
+ };
+ 
+ #endif
+diff --git a/sound/soc/sof/intel/hda-dai.c b/sound/soc/sof/intel/hda-dai.c
+index ea2dd5a44202..046cc198e7cb 100644
+--- a/sound/soc/sof/intel/hda-dai.c
++++ b/sound/soc/sof/intel/hda-dai.c
+@@ -159,8 +159,6 @@ static int hda_link_dma_hw_params(struct snd_pcm_substream *substream,
+ 	struct hdac_ext_link *hlink;
+ 	struct snd_sof_dev *sdev;
+ 	struct hdac_bus *bus;
+-	unsigned int format_val;
+-	unsigned int link_bps;
+ 	int stream_tag;
+ 
+ 	if (!ops) {
+@@ -192,22 +190,14 @@ static int hda_link_dma_hw_params(struct snd_pcm_substream *substream,
+ 	if (ops->codec_dai_set_stream)
+ 		ops->codec_dai_set_stream(sdev, substream, hstream);
+ 
+-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+-		link_bps = codec_dai->driver->playback.sig_bits;
+-	else
+-		link_bps = codec_dai->driver->capture.sig_bits;
+-
+ 	if (ops->reset_hext_stream)
+ 		ops->reset_hext_stream(sdev, hext_stream);
+ 
+-	format_val = snd_hdac_calc_stream_format(params_rate(params), params_channels(params),
+-						 params_format(params), link_bps, 0);
+-
+-	dev_dbg(bus->dev, "format_val=%#x, rate=%d, ch=%d, format=%d\n", format_val,
+-		params_rate(params), params_channels(params), params_format(params));
++	if (ops->calc_stream_format && ops->setup_hext_stream) {
++		unsigned int format_val = ops->calc_stream_format(sdev, substream, params);
+ 
+-	if (ops->setup_hext_stream)
+ 		ops->setup_hext_stream(sdev, hext_stream, format_val);
++	}
+ 
+ 	hext_stream->link_prepared = 1;
+ 
+diff --git a/sound/soc/sof/intel/hda.h b/sound/soc/sof/intel/hda.h
+index 8ee8038de3a5..84c4f3a7bed9 100644
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@ -924,6 +924,8 @@ int hda_dsp_ipc4_load_library(struct snd_sof_dev *sdev,
+  * @trigger: Function pointer for DAI DMA trigger actions
+  * @post_trigger: Function pointer for DAI DMA post-trigger actions
+  * @codec_dai_set_stream: Function pointer to set codec-side stream information
++ * @calc_stream_format: Function pointer to determine stream format from hw_params and
++ * for HDaudio codec DAI from the .sig bits
+  */
+ struct hda_dai_widget_dma_ops {
+ 	struct hdac_ext_stream *(*get_hext_stream)(struct snd_sof_dev *sdev,
+@@ -946,6 +948,9 @@ struct hda_dai_widget_dma_ops {
+ 	void (*codec_dai_set_stream)(struct snd_sof_dev *sdev,
+ 				     struct snd_pcm_substream *substream,
+ 				     struct hdac_stream *hstream);
++	unsigned int (*calc_stream_format)(struct snd_sof_dev *sdev,
++					   struct snd_pcm_substream *substream,
++					   struct snd_pcm_hw_params *params);
+ };
+ 
+ const struct hda_dai_widget_dma_ops *
+-- 
+2.25.1
+

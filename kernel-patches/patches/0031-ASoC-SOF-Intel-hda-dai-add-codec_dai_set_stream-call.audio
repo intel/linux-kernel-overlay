@@ -1,0 +1,149 @@
+From 3add54910e21ee077c25e457ef0b4fce1e5edecb Mon Sep 17 00:00:00 2001
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Date: Fri, 2 Jun 2023 15:56:13 -0500
+Subject: [PATCH 31/38] ASoC: SOF: Intel: hda-dai: add codec_dai_set_stream
+ callback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The existing code for HDAudio DAIs cannot be extended to other types
+of DAIs, specific programming sequences need to be abstracted
+away. Start here with hiding the stream_tag needed by the HDAudio
+codec_dai.
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20230602205620.310879-3-pierre-louis.bossart@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sof/intel/hda-dai-ops.c | 51 ++++++++++++++++++++++++++++++-
+ sound/soc/sof/intel/hda-dai.c     |  3 +-
+ sound/soc/sof/intel/hda.h         |  4 +++
+ 3 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/sof/intel/hda-dai-ops.c b/sound/soc/sof/intel/hda-dai-ops.c
+index 2fab570a4daf..2e9a0f071b8e 100644
+--- a/sound/soc/sof/intel/hda-dai-ops.c
++++ b/sound/soc/sof/intel/hda-dai-ops.c
+@@ -175,6 +175,17 @@ static void hda_reset_hext_stream(struct snd_sof_dev *sdev, struct hdac_ext_stre
+ 	snd_hdac_ext_stream_reset(hext_stream);
+ }
+ 
++static void hda_codec_dai_set_stream(struct snd_sof_dev *sdev,
++				     struct snd_pcm_substream *substream,
++				     struct hdac_stream *hstream)
++{
++	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
++	struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
++
++	/* set the hdac_stream in the codec dai */
++	snd_soc_dai_set_stream(codec_dai, hstream, substream->stream);
++}
++
+ static int hda_ipc4_pre_trigger(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
+ 				struct snd_pcm_substream *substream, int cmd)
+ {
+@@ -307,15 +318,52 @@ static const struct hda_dai_widget_dma_ops hda_ipc4_dma_ops = {
+ 	.reset_hext_stream = hda_reset_hext_stream,
+ 	.pre_trigger = hda_ipc4_pre_trigger,
+ 	.trigger = hda_trigger,
+-	.post_trigger = hda_ipc4_post_trigger
++	.post_trigger = hda_ipc4_post_trigger,
++	.codec_dai_set_stream = hda_codec_dai_set_stream,
++};
++
++static const struct hda_dai_widget_dma_ops hda_ipc4_chain_dma_ops = {
++	.get_hext_stream = hda_get_hext_stream,
++	.assign_hext_stream = hda_assign_hext_stream,
++	.release_hext_stream = hda_release_hext_stream,
++	.setup_hext_stream = hda_setup_hext_stream,
++	.reset_hext_stream = hda_reset_hext_stream,
++	.trigger = hda_trigger,
++	.codec_dai_set_stream = hda_codec_dai_set_stream,
+ };
+ 
++static int hda_ipc3_post_trigger(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
++				 struct snd_pcm_substream *substream, int cmd)
++{
++	struct snd_soc_dapm_widget *w = snd_soc_dai_get_widget(cpu_dai, substream->stream);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_STOP:
++	{
++		struct snd_sof_dai_config_data data = { 0 };
++
++		data.dai_data = DMA_CHAN_INVALID;
++		return hda_dai_config(w, SOF_DAI_CONFIG_FLAGS_HW_FREE, &data);
++	}
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		return hda_dai_config(w, SOF_DAI_CONFIG_FLAGS_PAUSE, NULL);
++	default:
++		break;
++	}
++
++	return 0;
++}
++
+ static const struct hda_dai_widget_dma_ops hda_ipc3_dma_ops = {
+ 	.get_hext_stream = hda_get_hext_stream,
+ 	.assign_hext_stream = hda_assign_hext_stream,
+ 	.release_hext_stream = hda_release_hext_stream,
+ 	.setup_hext_stream = hda_setup_hext_stream,
+ 	.reset_hext_stream = hda_reset_hext_stream,
++	.trigger = hda_trigger,
++	.post_trigger = hda_ipc3_post_trigger,
++	.codec_dai_set_stream = hda_codec_dai_set_stream,
+ };
+ 
+ static struct hdac_ext_stream *
+@@ -342,6 +390,7 @@ static void hda_dspless_setup_hext_stream(struct snd_sof_dev *sdev,
+ static const struct hda_dai_widget_dma_ops hda_dspless_dma_ops = {
+ 	.get_hext_stream = hda_dspless_get_hext_stream,
+ 	.setup_hext_stream = hda_dspless_setup_hext_stream,
++	.codec_dai_set_stream = hda_codec_dai_set_stream,
+ };
+ 
+ #endif
+diff --git a/sound/soc/sof/intel/hda-dai.c b/sound/soc/sof/intel/hda-dai.c
+index 93534459e222..ea2dd5a44202 100644
+--- a/sound/soc/sof/intel/hda-dai.c
++++ b/sound/soc/sof/intel/hda-dai.c
+@@ -189,7 +189,8 @@ static int hda_link_dma_hw_params(struct snd_pcm_substream *substream,
+ 		snd_hdac_ext_bus_link_set_stream_id(hlink, stream_tag);
+ 
+ 	/* set the hdac_stream in the codec dai */
+-	snd_soc_dai_set_stream(codec_dai, hdac_stream(hext_stream), substream->stream);
++	if (ops->codec_dai_set_stream)
++		ops->codec_dai_set_stream(sdev, substream, hstream);
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+ 		link_bps = codec_dai->driver->playback.sig_bits;
+diff --git a/sound/soc/sof/intel/hda.h b/sound/soc/sof/intel/hda.h
+index d15abb234493..8ee8038de3a5 100644
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@ -923,6 +923,7 @@ int hda_dsp_ipc4_load_library(struct snd_sof_dev *sdev,
+  * @pre_trigger: Function pointer for DAI DMA pre-trigger actions
+  * @trigger: Function pointer for DAI DMA trigger actions
+  * @post_trigger: Function pointer for DAI DMA post-trigger actions
++ * @codec_dai_set_stream: Function pointer to set codec-side stream information
+  */
+ struct hda_dai_widget_dma_ops {
+ 	struct hdac_ext_stream *(*get_hext_stream)(struct snd_sof_dev *sdev,
+@@ -942,6 +943,9 @@ struct hda_dai_widget_dma_ops {
+ 		       struct snd_pcm_substream *substream, int cmd);
+ 	int (*post_trigger)(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
+ 			    struct snd_pcm_substream *substream, int cmd);
++	void (*codec_dai_set_stream)(struct snd_sof_dev *sdev,
++				     struct snd_pcm_substream *substream,
++				     struct hdac_stream *hstream);
+ };
+ 
+ const struct hda_dai_widget_dma_ops *
+-- 
+2.25.1
+
