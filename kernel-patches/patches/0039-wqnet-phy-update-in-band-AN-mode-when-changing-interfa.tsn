@@ -1,0 +1,138 @@
+From 4746f684428c42be3f179013fc80435465d23745 Mon Sep 17 00:00:00 2001
+From: Lai Peter Jun Ann <jun.ann.lai@intel.com>
+Date: Mon, 15 May 2023 15:08:44 +0800
+Subject: [PATCH 39/47] wqnet: phy: update in-band AN mode when changing
+ interface by PHY driver
+
+Add cur_link_an_mode into phy_device struct for PHY drivers to
+communicate the in-band AN mode setting with phylink framework.
+
+As there is a mechanism in PHY drivers to switch the PHY interface
+between SGMII and 2500BaseX according to link speed. In this case,
+the in-band AN mode should be switching based on the PHY interface
+as well, if the PHY interface has been changed/updated by PHY driver.
+
+For e.g., disable in-band AN in 2500BaseX mode, or enable in-band AN
+back for SGMII mode (10/100/1000Mbps).
+
+Signed-off-by: Tan, Tee Min <tee.min.tan@intel.com>
+Signed-off-by: Choong Yong Liang <yong.liang.choong@linux.intel.com>
+Signed-off-by: Lai Peter Jun Ann <jun.ann.lai@intel.com>
+---
+ drivers/net/phy/marvell10g.c | 6 ++++++
+ drivers/net/phy/mxl-gpy.c    | 5 +++++
+ drivers/net/phy/phylink.c    | 5 +++++
+ include/linux/phy.h          | 4 ++++
+ 4 files changed, 20 insertions(+)
+
+diff --git a/drivers/net/phy/marvell10g.c b/drivers/net/phy/marvell10g.c
+index d4bb90d76881..a9df19278618 100644
+--- a/drivers/net/phy/marvell10g.c
++++ b/drivers/net/phy/marvell10g.c
+@@ -30,6 +30,7 @@
+ #include <linux/phy.h>
+ #include <linux/sfp.h>
+ #include <linux/netdevice.h>
++#include <linux/phylink.h>
+ 
+ #define MV_PHY_ALASKA_NBT_QUIRK_MASK	0xfffffffe
+ #define MV_PHY_ALASKA_NBT_QUIRK_REV	(MARVELL_PHY_ID_88X3310 | 0xa)
+@@ -946,6 +947,9 @@ static void mv3310_update_interface(struct phy_device *phydev)
+ 	 * xaui / rxaui modes according to the speed.
+ 	 * Florian suggests setting phydev->interface to communicate this to the
+ 	 * MAC. Only do this if we are already in one of the above modes.
++	 * In-band Auto-negotiation is not supported in 2500BASE-X.
++	 * Setting phydev->cur_link_an_mode to communicate this to the
++	 * phylink framework.
+ 	 */
+ 	switch (phydev->speed) {
+ 	case SPEED_10000:
+@@ -956,11 +960,13 @@ static void mv3310_update_interface(struct phy_device *phydev)
+ 		break;
+ 	case SPEED_2500:
+ 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
++		phydev->cur_link_an_mode = MLO_AN_PHY;
+ 		break;
+ 	case SPEED_1000:
+ 	case SPEED_100:
+ 	case SPEED_10:
+ 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
++		phydev->cur_link_an_mode = MLO_AN_INBAND;
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/net/phy/mxl-gpy.c b/drivers/net/phy/mxl-gpy.c
+index 4e5f601da714..c46977573bcc 100644
+--- a/drivers/net/phy/mxl-gpy.c
++++ b/drivers/net/phy/mxl-gpy.c
+@@ -14,6 +14,7 @@
+ #include <linux/polynomial.h>
+ #include <linux/property.h>
+ #include <linux/netdevice.h>
++#include <linux/phylink.h>
+ 
+ /* PHY ID */
+ #define PHY_ID_GPYx15B_MASK	0xFFFFFFFC
+@@ -517,10 +518,13 @@ static int gpy_update_interface(struct phy_device *phydev)
+ 
+ 	/* Automatically switch SERDES interface between SGMII and 2500-BaseX
+ 	 * according to speed. Disable ANEG in 2500-BaseX mode.
++	 * Setting phydev->cur_link_an_mode to communicate this to the
++	 * phylink framework.
+ 	 */
+ 	switch (phydev->speed) {
+ 	case SPEED_2500:
+ 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
++		phydev->cur_link_an_mode = MLO_AN_PHY;
+ 		ret = phy_modify_mmd(phydev, MDIO_MMD_VEND1, VSPEC1_SGMII_CTRL,
+ 				     VSPEC1_SGMII_CTRL_ANEN, 0);
+ 		if (ret < 0) {
+@@ -534,6 +538,7 @@ static int gpy_update_interface(struct phy_device *phydev)
+ 	case SPEED_100:
+ 	case SPEED_10:
+ 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
++		phydev->cur_link_an_mode = MLO_AN_INBAND;
+ 		if (gpy_sgmii_aneg_en(phydev))
+ 			break;
+ 		/* Enable and restart SGMII ANEG for 10/100/1000Mbps link speed
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index d0aaa5cad853..1bf970ecfcd0 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -1677,6 +1677,9 @@ static void phylink_phy_change(struct phy_device *phydev, bool up)
+ 		pl->phy_state.pause |= MLO_PAUSE_RX;
+ 	pl->phy_state.interface = phydev->interface;
+ 	pl->phy_state.link = up;
++	/* Update current link AN mode if phy driver has changed it */
++	if (pl->cur_link_an_mode != phydev->cur_link_an_mode)
++		pl->cur_link_an_mode = phydev->cur_link_an_mode;
+ 	mutex_unlock(&pl->state_mutex);
+ 
+ 	phylink_run_resolve(pl);
+@@ -1781,6 +1784,8 @@ static int phylink_bringup_phy(struct phylink *pl, struct phy_device *phy,
+ 	if (pl->config->mac_managed_pm)
+ 		phy->mac_managed_pm = true;
+ 
++	pl->phydev->cur_link_an_mode = pl->cur_link_an_mode;
++
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index 5dc2c7ef1521..c053179eb4ef 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -756,6 +756,10 @@ struct phy_device {
+ 	/* MACsec management functions */
+ 	const struct macsec_ops *macsec_ops;
+ #endif
++	/* Use phydev->cur_link_an_mode to communicate the in-band
++	 * AN mode setting with phylink framework.
++	 */
++	u8 cur_link_an_mode;
+ };
+ 
+ /* Generic phy_device::dev_flags */
+-- 
+2.25.1
+
