@@ -1,0 +1,250 @@
+From d5c78673e35c08989280ef6a5717ee34b3dba2a2 Mon Sep 17 00:00:00 2001
+From: Uma Shankar <uma.shankar@intel.com>
+Date: Tue, 18 Apr 2023 18:38:19 +0530
+Subject: [PATCH 083/184] drm: Add gamma mode property
+
+Add a gamma mode property to enable various kind of
+gamma modes supported by platforms like: Interpolated, Split,
+Multi Segmented, Logarithmic etc. Userspace can get this property
+and should be able to get the platform capabilities wrt various
+gamma modes possible and the possible ranges.
+
+It can select one of the modes exposed as blob_id as an
+enum and set the respective mode.
+
+It can then create the LUT and send it to driver using
+already available GAMMA_LUT property as blob.
+
+Note: This is based on design by Ville and is being carried forward
+based on his original idea.
+
+v2: Fixed a variable state assignment (Bhanu)
+v3: Create property for every crtc (Bhanu)
+
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Bhanuprakash Modem <bhanuprakash.modem@intel.com>
+---
+ drivers/gpu/drm/drm_atomic_uapi.c |  5 +++
+ drivers/gpu/drm/drm_color_mgmt.c  | 75 +++++++++++++++++++++++++++++++
+ include/drm/drm_color_mgmt.h      |  8 ++++
+ include/drm/drm_crtc.h            | 14 ++++++
+ include/uapi/drm/drm_mode.h       | 43 ++++++++++++++++++
+ 5 files changed, 145 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index d867e7f9f2cd..02f8cbbdb124 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -438,6 +438,9 @@ static int drm_atomic_crtc_set_property(struct drm_crtc *crtc,
+ 					&replaced);
+ 		state->color_mgmt_changed |= replaced;
+ 		return ret;
++	} else if (property == crtc->gamma_mode_property) {
++		state->gamma_mode = val;
++		state->color_mgmt_changed |= true;
+ 	} else if (property == config->prop_out_fence_ptr) {
+ 		s32 __user *fence_ptr = u64_to_user_ptr(val);
+ 
+@@ -477,6 +480,8 @@ drm_atomic_crtc_get_property(struct drm_crtc *crtc,
+ 		*val = (state->mode_blob) ? state->mode_blob->base.id : 0;
+ 	else if (property == config->prop_vrr_enabled)
+ 		*val = state->vrr_enabled;
++	else if (property == crtc->gamma_mode_property)
++		*val = state->gamma_mode;
+ 	else if (property == config->degamma_lut_property)
+ 		*val = (state->degamma_lut) ? state->degamma_lut->base.id : 0;
+ 	else if (property == config->ctm_property)
+diff --git a/drivers/gpu/drm/drm_color_mgmt.c b/drivers/gpu/drm/drm_color_mgmt.c
+index d021497841b8..2bf7a4c9f6e3 100644
+--- a/drivers/gpu/drm/drm_color_mgmt.c
++++ b/drivers/gpu/drm/drm_color_mgmt.c
+@@ -191,6 +191,81 @@ void drm_crtc_enable_color_mgmt(struct drm_crtc *crtc,
+ }
+ EXPORT_SYMBOL(drm_crtc_enable_color_mgmt);
+ 
++void drm_crtc_attach_gamma_mode_property(struct drm_crtc *crtc)
++{
++	if (!crtc->gamma_mode_property)
++		return;
++
++	drm_object_attach_property(&crtc->base,
++				   crtc->gamma_mode_property, 0);
++}
++EXPORT_SYMBOL(drm_crtc_attach_gamma_mode_property);
++
++int drm_color_create_gamma_mode_property(struct drm_crtc *crtc,
++					 int num_values)
++{
++	struct drm_property *prop;
++
++	prop = drm_property_create(crtc->dev,
++				   DRM_MODE_PROP_ENUM,
++				   "GAMMA_MODE", num_values);
++	if (!prop)
++		return -ENOMEM;
++
++	crtc->gamma_mode_property = prop;
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_color_create_gamma_mode_property);
++
++int drm_color_add_gamma_mode_range(struct drm_crtc *crtc,
++				   const char *name,
++				   const struct drm_color_lut_range *ranges,
++				   size_t length)
++{
++	struct drm_property_blob *blob;
++	struct drm_property *prop;
++	int num_ranges = length / sizeof(ranges[0]);
++	int i, ret, num_types_0;
++
++	prop = crtc->gamma_mode_property;
++	if (!prop)
++		return -EINVAL;
++
++	if (length == 0 && name)
++		return drm_property_add_enum(prop, 0, name);
++
++	if (WARN_ON(length == 0 || length % sizeof(ranges[0]) != 0))
++		return -EINVAL;
++
++	num_types_0 = hweight8(ranges[0].flags & (DRM_MODE_LUT_GAMMA |
++			       DRM_MODE_LUT_DEGAMMA));
++	if (num_types_0 == 0)
++		return -EINVAL;
++
++	for (i = 1; i < num_ranges; i++) {
++		int num_types = hweight8(ranges[i].flags & (DRM_MODE_LUT_GAMMA |
++					 DRM_MODE_LUT_DEGAMMA));
++
++		/* either all ranges have DEGAMMA|GAMMA or none have it */
++		if (num_types_0 != num_types)
++			return -EINVAL;
++	}
++
++	blob = drm_property_create_blob(crtc->dev, length, ranges);
++	if (IS_ERR(blob))
++		return PTR_ERR(blob);
++
++	ret = drm_property_add_enum(prop, blob->base.id, name);
++	if (ret) {
++		drm_property_blob_put(blob);
++		return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_color_add_gamma_mode_range);
++
+ /**
+  * drm_mode_crtc_set_gamma_size - set the gamma table size
+  * @crtc: CRTC to set the gamma table size for
+diff --git a/include/drm/drm_color_mgmt.h b/include/drm/drm_color_mgmt.h
+index 81c298488b0c..db68f42f6d12 100644
+--- a/include/drm/drm_color_mgmt.h
++++ b/include/drm/drm_color_mgmt.h
+@@ -74,6 +74,14 @@ static inline int drm_color_lut_size(const struct drm_property_blob *blob)
+ 	return blob->length / sizeof(struct drm_color_lut);
+ }
+ 
++int drm_color_create_gamma_mode_property(struct drm_crtc *crtc,
++					 int num_values);
++void drm_crtc_attach_gamma_mode_property(struct drm_crtc *crtc);
++int drm_color_add_gamma_mode_range(struct drm_crtc *crtc,
++				   const char *name,
++				   const struct drm_color_lut_range *ranges,
++				   size_t length);
++
+ enum drm_color_encoding {
+ 	DRM_COLOR_YCBCR_BT601,
+ 	DRM_COLOR_YCBCR_BT709,
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 8e1cbc75143e..2e0d19faf934 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -249,6 +249,13 @@ struct drm_crtc_state {
+ 	 */
+ 	struct drm_property_blob *mode_blob;
+ 
++	/**
++	 * @gamma_mode: This is a blob_id and exposes the platform capabilities
++	 * wrt to various gamma modes and the respective lut ranges. This also
++	 * helps user select a gamma mode amongst the supported ones.
++	 */
++	u32 gamma_mode;
++
+ 	/**
+ 	 * @degamma_lut:
+ 	 *
+@@ -1093,6 +1100,13 @@ struct drm_crtc {
+ 	 */
+ 	struct drm_property *scaling_filter_property;
+ 
++	/**
++	 * @gamma_mode_property: Optional CRTC property to enumerate and
++	 * select the mode of the crtc gamma/degmama LUTs. This also exposes
++	 * the lut ranges of the various supported gamma modes to userspace.
++	 */
++	struct drm_property *gamma_mode_property;
++
+ 	/**
+ 	 * @state:
+ 	 *
+diff --git a/include/uapi/drm/drm_mode.h b/include/uapi/drm/drm_mode.h
+index 43691058d28f..01b95c34e171 100644
+--- a/include/uapi/drm/drm_mode.h
++++ b/include/uapi/drm/drm_mode.h
+@@ -940,6 +940,49 @@ struct hdr_output_metadata {
+ 	};
+ };
+ 
++/*
++ * DRM_MODE_LUT_GAMMA|DRM_MODE_LUT_DEGAMMA is legal and means the LUT
++ * can be used for either purpose, but not simultaneously. To expose
++ * modes that support gamma and degamma simultaneously the gamma mode
++ * must declare distinct DRM_MODE_LUT_GAMMA and DRM_MODE_LUT_DEGAMMA
++ * ranges.
++ */
++/* LUT is for gamma (after CTM) */
++#define DRM_MODE_LUT_GAMMA BIT(0)
++/* LUT is for degamma (before CTM) */
++#define DRM_MODE_LUT_DEGAMMA BIT(1)
++/* linearly interpolate between the points */
++#define DRM_MODE_LUT_INTERPOLATE BIT(2)
++/*
++ * the last value of the previous range is the
++ * first value of the current range.
++ */
++#define DRM_MODE_LUT_REUSE_LAST BIT(3)
++/* the curve must be non-decreasing */
++#define DRM_MODE_LUT_NON_DECREASING BIT(4)
++/* the curve is reflected across origin for negative inputs */
++#define DRM_MODE_LUT_REFLECT_NEGATIVE BIT(5)
++/* the same curve (red) is used for blue and green channels as well */
++#define DRM_MODE_LUT_SINGLE_CHANNEL BIT(6)
++
++struct drm_color_lut_range {
++	/* DRM_MODE_LUT_* */
++	__u32 flags;
++	/* number of points on the curve */
++	__u16 count;
++	/* input/output bits per component */
++	__u8 input_bpc, output_bpc;
++	/* input start/end values */
++	__s32 start, end;
++	/* output min/max values */
++	__s32 min, max;
++};
++
++enum lut_type {
++	LUT_TYPE_DEGAMMA = 0,
++	LUT_TYPE_GAMMA = 1,
++};
++
+ /**
+  * DRM_MODE_PAGE_FLIP_EVENT
+  *
+-- 
+2.25.1
+

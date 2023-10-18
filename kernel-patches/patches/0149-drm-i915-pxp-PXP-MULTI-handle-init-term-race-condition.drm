@@ -1,0 +1,89 @@
+From 9b6ce8b6b6b3e62e63d2bb4e32ca7cd2056595a3 Mon Sep 17 00:00:00 2001
+From: Juston Li <juston.li@intel.com>
+Date: Thu, 30 Sep 2021 14:05:35 -0700
+Subject: [PATCH 149/184] drm/i915/pxp:[PXP-MULTI] handle init/term race
+ condition
+
+If the PXP TEE message to initialize a session is interrupted by a
+signal, instead of waiting for the response to confirm the session has
+been initialized the driver exits immediately. The message however was
+still sent and the session ends up being created later.
+
+Normally upon app crash, intel_pxp_file_close() will cleanup and
+terminate any associated sessions.
+In this case however, a race condition occurs since the terminate is
+called after the signal but before the session has finished initializing
+so the terminate does nothing and afterwards the session is created
+without the driver knowing.
+Eg. SW thinks the sessions is free but HW session is initialized
+
+To fix this, if we find a session where the SW and HW state don't align,
+attempt to terminate the session before trying to reserve it again.
+
+Signed-off-by: Juston Li <juston.li@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+---
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.c | 24 ++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+index e50f831516cf..d78e2b4b5401 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+@@ -204,8 +204,16 @@ int intel_pxp_sm_ioctl_reserve_session(struct intel_pxp *pxp, struct drm_file *d
+ 		return PRELIM_DRM_I915_PXP_OP_STATUS_SESSION_NOT_AVAILABLE;
+ 
+ 	ret = pxp_wait_for_session_state(pxp, idx, false);
+-	if (ret)
+-		return PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
++	if (ret) {
++		/* force termination of old reservation */
++		ret = intel_pxp_terminate_session(pxp, idx);
++		if (ret)
++			return PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
++		/* wait again for HW state */
++		ret = pxp_wait_for_session_state(pxp, idx, false);
++		if (ret)
++			return PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
++	}
+ 
+ 	ret = create_session_entry(pxp, drmfile,
+ 				   protection_mode, idx);
+@@ -378,7 +386,7 @@ int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
+ 	return ret;
+ }
+ 
+-static int pxp_terminate_all_sessions(struct intel_pxp *pxp)
++static int pxp_terminate_all_sessions(struct intel_pxp *pxp, u32 active_hw_slots)
+ {
+ 	int ret;
+ 	u32 idx;
+@@ -393,6 +401,14 @@ static int pxp_terminate_all_sessions(struct intel_pxp *pxp)
+ 		pxp->hwdrm_sessions[idx]->is_valid = false;
+ 		mask |= BIT(idx);
+ 	}
++	/*
++	 * if a user-space (multi-session client) reserved a session but
++	 * timed out on pxp_wait_for_session_state, its possible that SW
++	 * state of pxp->reserved_sessions maybe out of sync with HW.
++	 * So lets combine active_hw_slots in for termination which would
++	 * normally match pxp->reserved_sessions
++	 */
++	mask |= active_hw_slots;
+ 
+ 	if (mask) {
+ 		ret = intel_pxp_terminate_sessions(pxp, mask);
+@@ -425,7 +441,7 @@ static int pxp_terminate_all_sessions_and_global(struct intel_pxp *pxp)
+ 	active_sip_slots = intel_uncore_read(gt->uncore, KCR_SIP(pxp->kcr_base));
+ 
+ 	/* terminate the hw sessions */
+-	ret = pxp_terminate_all_sessions(pxp);
++	ret = pxp_terminate_all_sessions(pxp, active_sip_slots);
+ 	if (ret) {
+ 		drm_err(&gt->i915->drm, "Failed to submit session termination\n");
+ 		goto out;
+-- 
+2.25.1
+

@@ -1,0 +1,196 @@
+From 0c3098e69e9d0bc6d0da49d015ed664389d45a03 Mon Sep 17 00:00:00 2001
+From: Nirmoy Das <nirmoy.das@intel.com>
+Date: Wed, 30 Aug 2023 16:30:34 +0200
+Subject: [PATCH 129/184] drm/i915: Create a kernel context for GGTT updates
+
+Create a separate kernel context if a platform requires
+GGTT updates using MI_UPDATE_GTT blitter command.
+
+Subsequent patch will introduce methods to update
+GGTT using this bind context and MI_UPDATE_GTT blitter
+command.
+
+Signed-off-by: Nirmoy Das <nirmoy.das@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_engine.h       |  2 ++
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c    | 33 +++++++++++++++++++-
+ drivers/gpu/drm/i915/gt/intel_engine_types.h |  3 ++
+ drivers/gpu/drm/i915/gt/intel_gt.c           | 18 +++++++++++
+ drivers/gpu/drm/i915/gt/intel_gt.h           |  2 ++
+ drivers/gpu/drm/i915/gt/intel_gtt.c          |  4 +++
+ drivers/gpu/drm/i915/gt/intel_gtt.h          |  2 ++
+ 7 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine.h b/drivers/gpu/drm/i915/gt/intel_engine.h
+index b58c30ac8ef0..40269e4c1e31 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine.h
+@@ -170,6 +170,8 @@ intel_write_status_page(struct intel_engine_cs *engine, int reg, u32 value)
+ #define I915_GEM_HWS_SEQNO		0x40
+ #define I915_GEM_HWS_SEQNO_ADDR		(I915_GEM_HWS_SEQNO * sizeof(u32))
+ #define I915_GEM_HWS_MIGRATE		(0x42 * sizeof(u32))
++#define I915_GEM_HWS_GGTT_BIND		0x46
++#define I915_GEM_HWS_GGTT_BIND_ADDR	(I915_GEM_HWS_GGTT_BIND * sizeof(u32))
+ #define I915_GEM_HWS_PXP		0x60
+ #define I915_GEM_HWS_PXP_ADDR		(I915_GEM_HWS_PXP * sizeof(u32))
+ #define I915_GEM_HWS_GSC		0x62
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index 0d095337b350..6229dbc71df7 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -1418,6 +1418,20 @@ void intel_engine_destroy_pinned_context(struct intel_context *ce)
+ 	intel_context_put(ce);
+ }
+ 
++static struct intel_context *
++create_ggtt_bind_context(struct intel_engine_cs *engine)
++{
++	static struct lock_class_key kernel;
++
++	/*
++	 * MI_UPDATE_GTT can insert up to 511 PTE entries and there could be multiple
++	 * bind requets at a time so get a bigger ring.
++	 */
++	return intel_engine_create_pinned_context(engine, engine->gt->vm, SZ_512K,
++						  I915_GEM_HWS_GGTT_BIND_ADDR,
++						  &kernel, "ggtt_bind_context");
++}
++
+ static struct intel_context *
+ create_kernel_context(struct intel_engine_cs *engine)
+ {
+@@ -1441,7 +1455,7 @@ create_kernel_context(struct intel_engine_cs *engine)
+  */
+ static int engine_init_common(struct intel_engine_cs *engine)
+ {
+-	struct intel_context *ce;
++	struct intel_context *ce, *bce = NULL;
+ 	int ret;
+ 
+ 	engine->set_default_submission(engine);
+@@ -1457,6 +1471,17 @@ static int engine_init_common(struct intel_engine_cs *engine)
+ 	ce = create_kernel_context(engine);
+ 	if (IS_ERR(ce))
+ 		return PTR_ERR(ce);
++	/*
++	 * Create a separate pinned context for GGTT update with blitter engine
++	 * if a platform require such service. MI_UPDATE_GTT works on other
++	 * engines as well but BCS should be less busy engine so pick that for
++	 * GGTT updates.
++	 */
++	if (i915_ggtt_require_binder(engine->i915) && engine->id == BCS0) {
++		bce = create_ggtt_bind_context(engine);
++		if (IS_ERR(bce))
++			return PTR_ERR(bce);
++	}
+ 
+ 	ret = measure_breadcrumb_dw(ce);
+ 	if (ret < 0)
+@@ -1464,11 +1489,14 @@ static int engine_init_common(struct intel_engine_cs *engine)
+ 
+ 	engine->emit_fini_breadcrumb_dw = ret;
+ 	engine->kernel_context = ce;
++	engine->bind_context = bce;
+ 
+ 	return 0;
+ 
+ err_context:
+ 	intel_engine_destroy_pinned_context(ce);
++	if (bce)
++		intel_engine_destroy_pinned_context(ce);
+ 	return ret;
+ }
+ 
+@@ -1536,6 +1564,9 @@ void intel_engine_cleanup_common(struct intel_engine_cs *engine)
+ 
+ 	if (engine->kernel_context)
+ 		intel_engine_destroy_pinned_context(engine->kernel_context);
++	if (engine->bind_context)
++		intel_engine_destroy_pinned_context(engine->bind_context);
++
+ 
+ 	GEM_BUG_ON(!llist_empty(&engine->barrier_tasks));
+ 	cleanup_status_page(engine);
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_types.h b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+index e99a6fa03d45..90edf32f0645 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_engine_types.h
+@@ -415,6 +415,9 @@ struct intel_engine_cs {
+ 	struct llist_head barrier_tasks;
+ 
+ 	struct intel_context *kernel_context; /* pinned */
++	struct intel_context *bind_context; /* pinned, only for BCS0 */
++	/* mark the bind context's availability status */
++	bool bind_context_ready;
+ 
+ 	/**
+ 	 * pinned_contexts_list: List of pinned contexts. This list is only
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 7c34a4df9868..69aac537160d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -1004,6 +1004,24 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 	intel_sseu_dump(&info->sseu, p);
+ }
+ 
++void intel_gt_bind_context_set_ready(struct intel_gt *gt, bool ready)
++{
++	struct intel_engine_cs *engine = gt->engine[BCS0];
++
++	if (engine && engine->bind_context)
++		engine->bind_context_ready = ready;
++}
++
++bool intel_gt_is_bind_context_ready(struct intel_gt *gt)
++{
++	struct intel_engine_cs *engine = gt->engine[BCS0];
++
++	if (engine)
++		return engine->bind_context_ready;
++
++	return false;
++}
++
+ /*
+  * HW architecture suggest typical invalidation time at 40us,
+  * with pessimistic cases up to 100us and a recommendation to
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.h b/drivers/gpu/drm/i915/gt/intel_gt.h
+index 4cf1fc098dcb..691c0280d89f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@ -188,4 +188,6 @@ static inline u32 intel_gt_next_invalidate_tlb_full(const struct intel_gt *gt)
+ 
+ void intel_gt_invalidate_tlb(struct intel_gt *gt, u32 seqno);
+ 
++void intel_gt_bind_context_set_ready(struct intel_gt *gt, bool ready);
++bool intel_gt_is_bind_context_ready(struct intel_gt *gt);
+ #endif /* __INTEL_GT_H__ */
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.c b/drivers/gpu/drm/i915/gt/intel_gtt.c
+index 48f3a30dbc99..ab2ecc7ff114 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.c
+@@ -21,6 +21,10 @@
+ #include "intel_gt_regs.h"
+ #include "intel_gtt.h"
+ 
++bool i915_ggtt_require_binder(struct drm_i915_private *i915)
++{
++	return false;
++}
+ 
+ static bool intel_ggtt_update_needs_vtd_wa(struct drm_i915_private *i915)
+ {
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index 4d6296cdbcfd..bb7e8d48a060 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -688,4 +688,6 @@ static inline struct sgt_dma {
+ 	return (struct sgt_dma){ sg, addr, addr + sg_dma_len(sg) };
+ }
+ 
++bool i915_ggtt_require_binder(struct drm_i915_private *i915);
++
+ #endif
+-- 
+2.25.1
+
