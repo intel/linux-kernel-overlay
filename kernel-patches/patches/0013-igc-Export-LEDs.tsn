@@ -1,0 +1,258 @@
+From 5792becd41e6e49fd313830e98dcd03cb50d1153 Mon Sep 17 00:00:00 2001
+From: Kurt Kanzenbach <kurt@linutronix.de>
+Date: Sun, 27 Jun 2021 23:18:17 +0800
+Subject: [PATCH 13/28] igc: Export LEDs
+
+Each i225 has three LEDs. Export them via the LED class framework.
+
+Signed-off-by: Kurt Kanzenbach <kurt@linutronix.de>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Dvora Fuxbrumer <dvorax.fuxbrumer@linux.intel.com>
+Signed-off-by: Muhammad Husaini Zulkifli <muhammad.husaini.zulkifli@intel.com>
+Signed-off-by: Aravindhan Gunasekaran <aravindhan.gunasekaran@intel.com>
+---
+ drivers/net/ethernet/intel/Kconfig           |   1 +
+ drivers/net/ethernet/intel/igc/igc.h         |  11 ++
+ drivers/net/ethernet/intel/igc/igc_defines.h |  10 ++
+ drivers/net/ethernet/intel/igc/igc_main.c    | 132 +++++++++++++++++++
+ drivers/net/ethernet/intel/igc/igc_regs.h    |   3 +
+ 5 files changed, 157 insertions(+)
+
+diff --git a/drivers/net/ethernet/intel/Kconfig b/drivers/net/ethernet/intel/Kconfig
+index 9bc0a9519899..2f8eb13ba950 100644
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@ -344,6 +344,7 @@ config IGC
+ 	default n
+ 	depends on PCI
+ 	depends on PTP_1588_CLOCK_OPTIONAL
++	depends on LEDS_CLASS
+ 	help
+ 	  This driver supports Intel(R) Ethernet Controller I225-LM/I225-V
+ 	  family of adapters.
+diff --git a/drivers/net/ethernet/intel/igc/igc.h b/drivers/net/ethernet/intel/igc/igc.h
+index 960baab77cf3..9d0f1590101e 100644
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@ -15,6 +15,8 @@
+ #include <linux/net_tstamp.h>
+ #include <linux/bitfield.h>
+ #include <linux/hrtimer.h>
++#include <linux/leds.h>
++#include <linux/timekeeping.h>
+ 
+ #include "igc_hw.h"
+ 
+@@ -286,8 +288,17 @@ struct igc_adapter {
+ 	unsigned int fp_verify_cnt;
+ 	enum frame_preemption_state fp_tx_state;
+ 	bool fp_disable_verify;
++
++	/* LEDs */
++	struct mutex led_mutex;
++	struct led_classdev led0;
++	struct led_classdev led1;
++	struct led_classdev led2;
+ };
+ 
++#define led_to_igc(ldev, led)	\
++	container_of(ldev, struct igc_adapter, led)
++
+ void igc_up(struct igc_adapter *adapter);
+ void igc_down(struct igc_adapter *adapter);
+ int igc_open(struct net_device *netdev);
+diff --git a/drivers/net/ethernet/intel/igc/igc_defines.h b/drivers/net/ethernet/intel/igc/igc_defines.h
+index dd1f7eb9a3f7..6a9d89f34c95 100644
+--- a/drivers/net/ethernet/intel/igc/igc_defines.h
++++ b/drivers/net/ethernet/intel/igc/igc_defines.h
+@@ -141,6 +141,16 @@
+ #define IGC_CTRL_SDP0_DIR	0x00400000  /* SDP0 Data direction */
+ #define IGC_CTRL_SDP1_DIR	0x00800000  /* SDP1 Data direction */
+ 
++/* LED Control */
++#define IGC_LEDCTL_LED0_MODE_SHIFT	0
++#define IGC_LEDCTL_LED0_MODE_MASK	GENMASK(3, 0)
++#define IGC_LEDCTL_LED1_MODE_SHIFT	8
++#define IGC_LEDCTL_LED1_MODE_MASK	GENMASK(11, 8)
++#define IGC_LEDCTL_LED2_MODE_SHIFT	16
++#define IGC_LEDCTL_LED2_MODE_MASK	GENMASK(19, 16)
++
++#define IGC_CONNSW_AUTOSENSE_EN		0x1
++
+ /* As per the EAS the maximum supported size is 9.5KB (9728 bytes) */
+ #define MAX_JUMBO_FRAME_SIZE	0x2600
+ 
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index 19a22e582384..4cad520eeb82 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -6916,6 +6916,134 @@ static enum hrtimer_restart igc_qbv_scheduling_timer(struct hrtimer *timer)
+ 	return HRTIMER_NORESTART;
+ }
+ 
++static void igc_select_led(struct igc_adapter *adapter, int led,
++			   u32 *mask, u32 *shift)
++{
++	switch (led) {
++	case 0:
++		*mask  = IGC_LEDCTL_LED0_MODE_MASK;
++		*shift = IGC_LEDCTL_LED0_MODE_SHIFT;
++		break;
++	case 1:
++		*mask  = IGC_LEDCTL_LED1_MODE_MASK;
++		*shift = IGC_LEDCTL_LED1_MODE_SHIFT;
++		break;
++	case 2:
++		*mask  = IGC_LEDCTL_LED2_MODE_MASK;
++		*shift = IGC_LEDCTL_LED2_MODE_SHIFT;
++		break;
++	default:
++		*mask = *shift = 0;
++		dev_err(&adapter->pdev->dev, "Unknown led %d selected!", led);
++	}
++}
++
++static void igc_led_set(struct igc_adapter *adapter, int led, u16 brightness)
++{
++	struct igc_hw *hw = &adapter->hw;
++	u32 shift, mask, ledctl;
++
++	igc_select_led(adapter, led, &mask, &shift);
++
++	mutex_lock(&adapter->led_mutex);
++	ledctl = rd32(IGC_LEDCTL);
++	ledctl &= ~mask;
++	ledctl |= brightness << shift;
++	wr32(IGC_LEDCTL, ledctl);
++	mutex_unlock(&adapter->led_mutex);
++}
++
++static enum led_brightness igc_led_get(struct igc_adapter *adapter, int led)
++{
++	struct igc_hw *hw = &adapter->hw;
++	u32 shift, mask, ledctl;
++
++	igc_select_led(adapter, led, &mask, &shift);
++
++	mutex_lock(&adapter->led_mutex);
++	ledctl = rd32(IGC_LEDCTL);
++	mutex_unlock(&adapter->led_mutex);
++
++	return (ledctl & mask) >> shift;
++}
++
++static void igc_led0_set(struct led_classdev *ldev, enum led_brightness b)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led0);
++
++	igc_led_set(adapter, 0, b);
++}
++
++static enum led_brightness igc_led0_get(struct led_classdev *ldev)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led0);
++
++	return igc_led_get(adapter, 0);
++}
++
++static void igc_led1_set(struct led_classdev *ldev, enum led_brightness b)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led1);
++
++	igc_led_set(adapter, 1, b);
++}
++
++static enum led_brightness igc_led1_get(struct led_classdev *ldev)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led1);
++
++	return igc_led_get(adapter, 1);
++}
++
++static void igc_led2_set(struct led_classdev *ldev, enum led_brightness b)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led2);
++
++	igc_led_set(adapter, 2, b);
++}
++
++static enum led_brightness igc_led2_get(struct led_classdev *ldev)
++{
++	struct igc_adapter *adapter = led_to_igc(ldev, led2);
++
++	return igc_led_get(adapter, 2);
++}
++
++static int igc_led_setup(struct igc_adapter *adapter)
++{
++	/* Setup */
++	mutex_init(&adapter->led_mutex);
++
++	adapter->led0.name	     = "igc_led0";
++	adapter->led0.max_brightness = 15;
++	adapter->led0.brightness_set = igc_led0_set;
++	adapter->led0.brightness_get = igc_led0_get;
++
++	adapter->led1.name	     = "igc_led1";
++	adapter->led1.max_brightness = 15;
++	adapter->led1.brightness_set = igc_led1_set;
++	adapter->led1.brightness_get = igc_led1_get;
++
++	adapter->led2.name	     = "igc_led2";
++	adapter->led2.max_brightness = 15;
++	adapter->led2.brightness_set = igc_led2_set;
++	adapter->led2.brightness_get = igc_led2_get;
++
++	/* Register leds */
++	led_classdev_register(&adapter->pdev->dev, &adapter->led0);
++	led_classdev_register(&adapter->pdev->dev, &adapter->led1);
++	led_classdev_register(&adapter->pdev->dev, &adapter->led2);
++
++	return 0;
++}
++
++static void igc_led_destroy(struct igc_adapter *adapter)
++{
++	led_classdev_unregister(&adapter->led0);
++	led_classdev_unregister(&adapter->led1);
++	led_classdev_unregister(&adapter->led2);
++}
++
+ /**
+  * igc_probe - Device Initialization Routine
+  * @pdev: PCI device information struct
+@@ -7158,6 +7286,8 @@ static int igc_probe(struct pci_dev *pdev,
+ 
+ 	pm_runtime_put_noidle(&pdev->dev);
+ 
++	igc_led_setup(adapter);
++
+ 	return 0;
+ 
+ err_register:
+@@ -7201,6 +7331,8 @@ static void igc_remove(struct pci_dev *pdev)
+ 	pci_disable_ptm(pdev);
+ 	pci_clear_master(pdev);
+ 
++	igc_led_destroy(adapter);
++
+ 	set_bit(__IGC_DOWN, &adapter->state);
+ 
+ 	del_timer_sync(&adapter->watchdog_timer);
+diff --git a/drivers/net/ethernet/intel/igc/igc_regs.h b/drivers/net/ethernet/intel/igc/igc_regs.h
+index 03092aa9a90a..f17753dcbf0a 100644
+--- a/drivers/net/ethernet/intel/igc/igc_regs.h
++++ b/drivers/net/ethernet/intel/igc/igc_regs.h
+@@ -10,6 +10,9 @@
+ #define IGC_EECD		0x00010  /* EEPROM/Flash Control - RW */
+ #define IGC_CTRL_EXT		0x00018  /* Extended Device Control - RW */
+ #define IGC_MDIC		0x00020  /* MDI Control - RW */
++#define IGC_LEDCTL		0x00E00	 /* LED Control - RW */
++#define IGC_MDICNFG		0x00E04  /* MDC/MDIO Configuration - RW */
++#define IGC_MDICNFG		0x00E04  /* MDC/MDIO Configuration - RW */
+ #define IGC_CONNSW		0x00034  /* Copper/Fiber switch control - RW */
+ #define IGC_VET			0x00038  /* VLAN Ether Type - RW */
+ #define IGC_I225_PHPM		0x00E14  /* I225 PHY Power Management */
+-- 
+2.25.1
+
