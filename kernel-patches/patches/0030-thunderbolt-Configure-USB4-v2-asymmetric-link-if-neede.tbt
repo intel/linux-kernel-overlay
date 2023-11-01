@@ -1,0 +1,572 @@
+From d1f8c3458f52fae056beae86b528e5010fca8071 Mon Sep 17 00:00:00 2001
+From: Gil Fine <gil.fine@linux.intel.com>
+Date: Thu, 10 Aug 2023 22:37:16 +0300
+Subject: [PATCH 30/35] thunderbolt: Configure USB4 v2 asymmetric link if
+ needed and bandwidth allows
+
+USB4 v2 spec defines a Gen 4 link that can operate as an asymmetric.
+When the link is asymmetric, the USB4 port on one side of the link
+operates with three TX lanes and one RX lane, while the USB4 port on the
+opposite side of the link operates with three RX lanes and one TX lane.
+Using asymmetric link we can get much more bandwidth from one direction
+and that allows us to support the new Ultra High Bit Rate DisplayPort
+modes (up to 77.37 Gb/s).
+
+Add the basic logic for changing Gen 4 links to asymmetric and back
+following the below rules:
+
+  1) The default threshold is 45 Gb/s (asym_threshold)
+  2) Only DisplayPort bandwidth is considered when deciding whether a
+     link is transitioned to asymmetric or not
+  3) If bandwidth on a link is >= asym_threshold transition the link to
+     asymmetric
+  4) If bandwidth on a link < asym_threshold transition the link to
+     symmetric
+  5) If a device router with symmetric preference (or does not support
+     asymmetric link) is connected, transition all the links above it to
+     symmetric if bandwidth allows.
+
+Signed-off-by: Gil Fine <gil.fine@linux.intel.com>
+Co-developed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/tb.c | 383 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 360 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index a5db5ba71fd9..774f949081c1 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -16,8 +16,31 @@
+ #include "tb_regs.h"
+ #include "tunnel.h"
+ 
+-#define TB_TIMEOUT	100	/* ms */
+-#define MAX_GROUPS	7	/* max Group_ID is 7 */
++#define TB_TIMEOUT		100	/* ms */
++
++/*
++ * Minimum bandwidth (in Mb/s) that is needed in the single transmitter/receiver
++ * direction. This is 40G - 10% guard band bandwidth.
++ */
++#define TB_ASYM_MIN		(40000 * 90 / 100)
++
++/*
++ * Threshold bandwidth (in Mb/s) that is used to switch the links to
++ * asymmetric and back. This is selected as 45G which means when the
++ * request is higher than this, we switch the link to asymmetric, and
++ * when it is less than this we switch it back. The 45G is selected so
++ * that we still have 27G (of the total 72G) for bulk PCIe traffic when
++ * switching back to symmetric.
++ */
++#define TB_ASYM_THRESHOLD	45000
++
++#define MAX_GROUPS		7	/* max Group_ID is 7 */
++
++static unsigned int asym_threshold = TB_ASYM_THRESHOLD;
++module_param_named(asym_threshold, asym_threshold, uint, 0444);
++MODULE_PARM_DESC(asym_threshold,
++		"threshold (Mb/s) when to Gen 4 switch link symmetry. 0 disables. (default: "
++		__MODULE_STRING(TB_ASYM_THRESHOLD) ")");
+ 
+ /**
+  * struct tb_cm - Simple Thunderbolt connection manager
+@@ -573,12 +596,14 @@ static struct tb_tunnel *tb_find_first_usb3_tunnel(struct tb *tb,
+ }
+ 
+ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+-	struct tb_port *dst_port, int *available_up, int *available_down)
++	struct tb_port *dst_port, int *available_up, int *available_down,
++	int *consumed_up, int *consumed_down)
+ {
+ 	int usb3_consumed_up, usb3_consumed_down, ret;
+ 	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_tunnel *tunnel;
+ 	struct tb_port *port;
++	bool downstream;
+ 
+ 	tb_dbg(tb, "calculating available bandwidth between %llx:%u <-> %llx:%u\n",
+ 	       tb_route(src_port->sw), src_port->port, tb_route(dst_port->sw),
+@@ -599,10 +624,18 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 	/* Maximum possible bandwidth asymmetric Gen 4 link is 120 Gb/s */
+ 	*available_up = *available_down = 120000;
+ 
++	if (consumed_up)
++		*consumed_up = 0;
++	if (consumed_down)
++		*consumed_down = 0;
++
++	downstream = tb_port_path_direction_downstream(src_port, dst_port);
++
+ 	/* Find the minimum available bandwidth over all links */
+ 	tb_for_each_port_on_path(src_port, dst_port, port) {
+ 		int link_speed, link_width, up_bw, down_bw;
+ 		int pci_reserved_up, pci_reserved_down;
++		int tot_consumed_up, tot_consumed_down;
+ 
+ 		if (!tb_port_is_null(port))
+ 			continue;
+@@ -621,8 +654,25 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 				up_bw = link_speed * 1 * 1000;
+ 				down_bw = link_speed * 3 * 1000;
+ 			} else {
+-				up_bw = link_speed * port->sw->link_width * 1000;
+-				down_bw = up_bw;
++				/*
++				 * The link is symmetric at the moment
++				 * but we can switch it to asymmetric as
++				 * needed. Report this bandwidth as
++				 * available (even though it is not yet
++				 * enabled).
++				 */
++				if (!downstream &&
++				    tb_port_width_supported(port, TB_LINK_WIDTH_ASYM_TX)) {
++					up_bw = link_speed * 3 * 1000;
++					down_bw = link_speed * 1 * 1000;
++				} else if (downstream &&
++					   tb_port_width_supported(port, TB_LINK_WIDTH_ASYM_RX)) {
++					up_bw = link_speed * 1 * 1000;
++					down_bw = link_speed * 3 * 1000;
++				} else {
++					up_bw = link_speed * port->sw->link_width * 1000;
++					down_bw = up_bw;
++				}
+ 			}
+ 		} else {
+ 			link_speed = tb_port_get_link_speed(port);
+@@ -640,8 +690,25 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 				up_bw = link_speed * 3 * 1000;
+ 				down_bw = link_speed * 1 * 1000;
+ 			} else {
+-				up_bw = link_speed * link_width * 1000;
+-				down_bw = up_bw;
++				/*
++				 * The link is symmetric at the moment
++				 * but we can switch it to asymmetric as
++				 * needed. Report this bandwidth as
++				 * available (even though it is not yet
++				 * enabled).
++				 */
++				if (downstream &&
++				    tb_port_width_supported(port, TB_LINK_WIDTH_ASYM_TX)) {
++					up_bw = link_speed * 1 * 1000;
++					down_bw = link_speed * 3 * 1000;
++				} else if (!downstream &&
++					   tb_port_width_supported(port, TB_LINK_WIDTH_ASYM_RX)) {
++					up_bw = link_speed * 3 * 1000;
++					down_bw = link_speed * 1 * 1000;
++				} else {
++					up_bw = link_speed * link_width * 1000;
++					down_bw = up_bw;
++				}
+ 			}
+ 		}
+ 
+@@ -652,6 +719,8 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 		tb_port_dbg(port, "link total bandwidth %d/%d Mb/s\n", up_bw,
+ 			    down_bw);
+ 
++		tot_consumed_up = tot_consumed_down = 0;
++
+ 		/*
+ 		 * Find all DP tunnels that cross the port and reduce
+ 		 * their consumed bandwidth from the available.
+@@ -694,7 +763,9 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 		 * crosses the port.
+ 		 */
+ 		up_bw -= usb3_consumed_up;
++		tot_consumed_up += usb3_consumed_up;
+ 		down_bw -= usb3_consumed_down;
++		tot_consumed_down += usb3_consumed_down;
+ 
+ 		/*
+ 		 * If there is anything reserved for PCIe bulk traffic
+@@ -703,13 +774,20 @@ static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 		if (tb_tunnel_reserved_pci(port, &pci_reserved_up,
+ 					   &pci_reserved_down)) {
+ 			up_bw -= pci_reserved_up;
++			tot_consumed_up += pci_reserved_up;
+ 			down_bw -= pci_reserved_down;
++			tot_consumed_down += pci_reserved_down;
+ 		}
+ 
+ 		if (up_bw < *available_up)
+ 			*available_up = up_bw;
+ 		if (down_bw < *available_down)
+ 			*available_down = down_bw;
++
++		if (consumed_up && tot_consumed_up > *consumed_up)
++			*consumed_up = tot_consumed_up;
++		if (consumed_down && tot_consumed_down > *consumed_down)
++			*consumed_down = tot_consumed_down;
+ 	}
+ 
+ 	if (*available_up < 0)
+@@ -747,7 +825,7 @@ static void tb_reclaim_usb3_bandwidth(struct tb *tb, struct tb_port *src_port,
+ 	 * That determines the whole USB3 bandwidth for this branch.
+ 	 */
+ 	ret = tb_available_bandwidth(tb, tunnel->src_port, tunnel->dst_port,
+-				     &available_up, &available_down);
++				     &available_up, &available_down, NULL, NULL);
+ 	if (ret) {
+ 		tb_warn(tb, "failed to calculate available bandwidth\n");
+ 		return;
+@@ -806,7 +884,7 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
+ 	}
+ 
+ 	ret = tb_available_bandwidth(tb, down, up, &available_up,
+-				     &available_down);
++				     &available_down, NULL, NULL);
+ 	if (ret)
+ 		goto err_reclaim;
+ 
+@@ -867,6 +945,250 @@ static int tb_create_usb3_tunnels(struct tb_switch *sw)
+ 	return 0;
+ }
+ 
++static bool tb_link_width_supported_on_path(struct tb_port *src_port,
++					    struct tb_port *dst_port,
++					    enum tb_link_width width)
++{
++	struct tb_port *up;
++
++	tb_for_each_upstream_port_on_path(src_port, dst_port, up) {
++		enum tb_link_width tmp = width;
++
++		/*
++		 * Operate on the upstream port of the router so below
++		 * we swap the width accordingly if needed.
++		 */
++		if (tb_port_path_direction_downstream(src_port, dst_port)) {
++			if (width == TB_LINK_WIDTH_ASYM_TX)
++				tmp = TB_LINK_WIDTH_ASYM_RX;
++		} else {
++			if (width == TB_LINK_WIDTH_ASYM_RX)
++				tmp = TB_LINK_WIDTH_ASYM_TX;
++		}
++
++		if (!tb_port_width_supported(up, tmp))
++			return false;
++	}
++
++	return true;
++}
++
++static int tb_set_link_width_on_path(struct tb_port *src_port,
++				     struct tb_port *dst_port,
++				     enum tb_link_width width,
++				     int required_up,
++				     int required_down)
++{
++	int ret, clx, required_bw;
++	struct tb_switch *sw;
++	struct tb_port *up;
++	bool downstream;
++
++	/*
++	 * Find the "first depth" router and disable CL states (we only
++	 * enable them for the first depth for now, see tb_enable_clx()).
++	 */
++	downstream = tb_port_path_direction_downstream(src_port, dst_port);
++	if (downstream) {
++		sw = dst_port->sw;
++		required_bw = required_down;
++	} else {
++		sw = src_port->sw;
++		required_bw = required_up;
++	}
++
++	ret = tb_switch_clx_disable(sw);
++	if (ret < 0) {
++		tb_sw_warn(sw, "failed to disable CL states\n");
++		return ret;
++	}
++	clx = ret;
++
++	ret = 0;
++	tb_for_each_upstream_port_on_path(src_port, dst_port, up) {
++		enum tb_link_width new_width;
++
++		/* Don't bother if the router is already unplugged */
++		if (up->sw->is_unplugged)
++			continue;
++
++		/*
++		 * Operate on the upstream port of the router so below
++		 * we swap the width accordingly if needed.
++		 */
++		if (downstream && width == TB_LINK_WIDTH_ASYM_TX)
++			new_width = TB_LINK_WIDTH_ASYM_RX;
++		else if (!downstream && width == TB_LINK_WIDTH_ASYM_RX)
++			new_width = TB_LINK_WIDTH_ASYM_TX;
++		else
++			new_width = width;
++
++		/* Is the transition of this link even needed? */
++		if (required_bw < asym_threshold) {
++			/*
++			 * If we are switching from asymmetric to symmetric, and
++			 * the required bandwidth is under the threshold, and
++			 * the router preference is asymmetric we leave the link
++			 * asymmetric.
++			 */
++			if (width == TB_LINK_WIDTH_DUAL &&
++			    up->sw->link_width > TB_LINK_WIDTH_DUAL &&
++			    up->sw->preferred_link_width == up->sw->link_width)
++				continue;
++
++			/*
++			 * If we are switching from symmetric to asymmetric, and
++			 * the required bandwidth is under the threshold, and
++			 * the router preference is symmetric we leave the link
++			 * symmetric.
++			 */
++			if (width > TB_LINK_WIDTH_DUAL &&
++			    up->sw->link_width == TB_LINK_WIDTH_DUAL &&
++			    up->sw->preferred_link_width == up->sw->link_width)
++				continue;
++		}
++
++		ret = tb_switch_set_link_width(up->sw, new_width);
++		if (ret) {
++			tb_sw_warn(up->sw, "failed to set link width\n");
++			break;
++		}
++	}
++
++	/* Re-enable CL states */
++	tb_switch_clx_enable(sw, clx);
++
++	return ret;
++}
++
++/* Returns 1 if the link symmetry was changed, 0 if not */
++static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
++			     struct tb_port *dst_port, int requested_up,
++			     int requested_down)
++{
++	int ret, available_up, available_down, consumed_up, consumed_down;
++
++	if (!asym_threshold)
++		return 0;
++
++	/* Need to be supported across the links */
++	if (!tb_link_width_supported_on_path(src_port, dst_port,
++					     TB_LINK_WIDTH_ASYM_TX))
++		return 0;
++
++	ret = tb_available_bandwidth(tb, src_port, dst_port, &available_up,
++				     &available_down, &consumed_up, &consumed_down);
++	if (ret)
++		return ret;
++
++	tb_port_dbg(src_port, "bandwidth requested %d/%d Mb/s, consumed %d/%d\n",
++		    requested_up, requested_down, consumed_up, consumed_down);
++
++	if (tb_port_path_direction_downstream(src_port, dst_port)) {
++		/*
++		 * Downstream so make sure upstream is within the 36G
++		 * (40G - guard band 10%), and the requested is above
++		 * what the threshold is.
++		 */
++		if (consumed_up + requested_up >= TB_ASYM_MIN)
++			return -ENOBUFS;
++		if (consumed_down + requested_down < asym_threshold)
++			return 0;
++	} else {
++		/* Upstream, the opposite of above */
++		if (consumed_down + requested_down >= TB_ASYM_MIN)
++			return -ENOBUFS;
++		if (consumed_up + requested_up < asym_threshold)
++			return 0;
++	}
++
++	tb_port_dbg(src_port, "configuring asymmetric link\n");
++
++	/* Asymmetric link is needed and possible so switch it now */
++	ret = tb_set_link_width_on_path(src_port, dst_port, TB_LINK_WIDTH_ASYM_TX,
++					consumed_up + requested_up,
++					consumed_down + requested_down);
++	return ret ?: 1;
++}
++
++/* Returns 1 if the link symmetry was changed, 0 if not */
++static int tb_configure_sym(struct tb *tb, struct tb_port *src_port,
++			    struct tb_port *dst_port)
++{
++	int ret, available_up, available_down, consumed_up, consumed_down;
++
++	if (!asym_threshold)
++		return 0;
++
++	ret = tb_available_bandwidth(tb, src_port, dst_port, &available_up,
++				     &available_down, &consumed_up, &consumed_down);
++	if (ret)
++		return ret;
++
++	tb_port_dbg(src_port, "bandwidth consumed %d/%d\n", consumed_up,
++		    consumed_down);
++
++	if (tb_port_path_direction_downstream(src_port, dst_port)) {
++		/*
++		 * Downstream so we want the consumed_down to be < threshold.
++		 * Upstream traffic should be less than 36G (40G - guard
++		 * band 10%) as the link was configured asymmetric
++		 * already.
++		 */
++		if (consumed_down >= asym_threshold)
++			return 0;
++	} else {
++		/* Upstream, the opposite of above */
++		if (consumed_up >= asym_threshold)
++			return 0;
++	}
++
++	tb_port_dbg(src_port, "configuring symmetric link\n");
++
++	/* It is OK to configure the link to symmetric now */
++	ret = tb_set_link_width_on_path(src_port, dst_port, TB_LINK_WIDTH_DUAL,
++					consumed_up, consumed_down);
++	return ret ?: 1;
++}
++
++static void tb_configure_link(struct tb_port *down, struct tb_port *up,
++			      struct tb_switch *sw)
++{
++	struct tb *tb = sw->tb;
++
++	/* Link the routers using both links if available */
++	down->remote = up;
++	up->remote = down;
++	if (down->dual_link_port && up->dual_link_port) {
++		down->dual_link_port->remote = up->dual_link_port;
++		up->dual_link_port->remote = down->dual_link_port;
++	}
++
++	/*
++	 * Enable lane bonding if the link is currently two single lane
++	 * links.
++	 */
++	if (sw->link_width < TB_LINK_WIDTH_DUAL)
++		tb_switch_set_link_width(sw, TB_LINK_WIDTH_DUAL);
++
++	/*
++	 * Device router with symmetric preference (or does not support
++	 * asymmetric link) is connected deeper in the hierarchy, we
++	 * transition the links above into symmetric if bandwidth
++	 * allows.
++	 */
++	if (tb_switch_depth(sw) > 1 &&
++	    sw->preferred_link_width == TB_LINK_WIDTH_DUAL) {
++		struct tb_port *host_port;
++
++		host_port = tb_port_at(tb_route(sw), tb->root_switch);
++		tb_configure_sym(tb, host_port, up);
++	}
++
++	/* Set the link configured */
++	tb_switch_configure_link(sw);
++}
++
+ static void tb_scan_port(struct tb_port *port);
+ 
+ /*
+@@ -975,19 +1297,9 @@ static void tb_scan_port(struct tb_port *port)
+ 		goto out_rpm_put;
+ 	}
+ 
+-	/* Link the switches using both links if available */
+ 	upstream_port = tb_upstream_port(sw);
+-	port->remote = upstream_port;
+-	upstream_port->remote = port;
+-	if (port->dual_link_port && upstream_port->dual_link_port) {
+-		port->dual_link_port->remote = upstream_port->dual_link_port;
+-		upstream_port->dual_link_port->remote = port->dual_link_port;
+-	}
++	tb_configure_link(port, upstream_port, sw);
+ 
+-	/* Enable lane bonding if supported */
+-	tb_switch_set_link_width(sw, TB_LINK_WIDTH_DUAL);
+-	/* Set the link configured */
+-	tb_switch_configure_link(sw);
+ 	/*
+ 	 * CL0s and CL1 are enabled and supported together.
+ 	 * Silently ignore CLx enabling in case CLx is not supported.
+@@ -1051,6 +1363,11 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
+ 		 * deallocated properly.
+ 		 */
+ 		tb_switch_dealloc_dp_resource(src_port->sw, src_port);
++		/*
++		 * If bandwidth on a link is < asym_threshold
++		 * transition the link to symmetric.
++		 */
++		tb_configure_sym(tb, src_port, dst_port);
+ 		/* Now we can allow the domain to runtime suspend again */
+ 		pm_runtime_mark_last_busy(&dst_port->sw->dev);
+ 		pm_runtime_put_autosuspend(&dst_port->sw->dev);
+@@ -1208,7 +1525,7 @@ tb_recalc_estimated_bandwidth_for_group(struct tb_bandwidth_group *group)
+ 
+ 		out = tunnel->dst_port;
+ 		ret = tb_available_bandwidth(tb, in, out, &estimated_up,
+-					     &estimated_down);
++					     &estimated_down, NULL, NULL);
+ 		if (ret) {
+ 			tb_port_warn(in,
+ 				"failed to re-calculate estimated bandwidth\n");
+@@ -1375,7 +1692,8 @@ static bool tb_tunnel_one_dp(struct tb *tb)
+ 		goto err_detach_group;
+ 	}
+ 
+-	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down);
++	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down,
++				     NULL, NULL);
+ 	if (ret)
+ 		goto err_reclaim_usb;
+ 
+@@ -1856,6 +2174,11 @@ static int tb_alloc_dp_bandwidth(struct tb_tunnel *tunnel, int *requested_up,
+ 
+ 	if ((*requested_up >= 0 && requested_up_corrected <= allocated_up) ||
+ 	    (*requested_down >= 0 && requested_down_corrected <= allocated_down)) {
++		/*
++		 * If bandwidth on a link is < asym_threshold transition
++		 * the link to symmetric.
++		 */
++		tb_configure_sym(tb, in, out);
+ 		/*
+ 		 * If requested bandwidth is less or equal than what is
+ 		 * currently allocated to that tunnel we simply change
+@@ -1881,7 +2204,8 @@ static int tb_alloc_dp_bandwidth(struct tb_tunnel *tunnel, int *requested_up,
+ 	 * are also in the same group but we use the same function here
+ 	 * that we use with the normal bandwidth allocation).
+ 	 */
+-	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down);
++	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down,
++				     NULL, NULL);
+ 	if (ret)
+ 		goto reclaim;
+ 
+@@ -1890,8 +2214,21 @@ static int tb_alloc_dp_bandwidth(struct tb_tunnel *tunnel, int *requested_up,
+ 
+ 	if ((*requested_up >= 0 && available_up >= requested_up_corrected) ||
+ 	    (*requested_down >= 0 && available_down >= requested_down_corrected)) {
++		/*
++		 * If bandwidth on a link is >= asym_threshold
++		 * transition the link to asymmetric.
++		 */
++		ret = tb_configure_asym(tb, in, out, *requested_up,
++					*requested_down);
++		if (ret < 0)
++			return ret;
++
+ 		ret = tb_tunnel_alloc_bandwidth(tunnel, requested_up,
+ 						requested_down);
++		if (ret) {
++			tb_port_warn(in, "failed to allocate bandwidth\n");
++			tb_configure_sym(tb, in, out);
++		}
+ 	} else {
+ 		ret = -ENOBUFS;
+ 	}
+-- 
+2.25.1
+
