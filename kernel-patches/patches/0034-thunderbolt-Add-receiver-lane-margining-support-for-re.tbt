@@ -1,0 +1,430 @@
+From 63d5d452c4afbc1cdc41a7842a9874509ee19fa4 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 21 Mar 2023 11:40:49 +0200
+Subject: [PATCH 34/35] thunderbolt: Add receiver lane margining support for
+ retimers
+
+Retimers support lane margining as well so make this available through
+debugfs in the same way as we do for the USB4 ports. When this is
+enabled we also expose retimers on the other side of the cable because
+typically margining is implemented only on direction towards the cable.
+However, for the retimers on the other side of the cable we do not allow
+NVM upgrade to avoid confusing the existing userspace (the same retimer
+may now appear twice with different name) and is probably not a good
+idea anyway.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/Kconfig   | 11 +++--
+ drivers/thunderbolt/debugfs.c | 92 +++++++++++++++++++++++++----------
+ drivers/thunderbolt/retimer.c | 39 +++++++++------
+ drivers/thunderbolt/sb_regs.h |  1 +
+ drivers/thunderbolt/tb.h      |  5 ++
+ drivers/thunderbolt/usb4.c    | 24 +++++++++
+ 6 files changed, 125 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index 448fd2ec8f6e..279de1ba4487 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -28,14 +28,15 @@ config USB4_DEBUGFS_WRITE
+ 	  this for production systems or distro kernels.
+ 
+ config USB4_DEBUGFS_MARGINING
+-	bool "Expose receiver lane margining operations under USB4 ports (DANGEROUS)"
++	bool "Expose receiver lane margining operations under USB4 ports and retimers (DANGEROUS)"
+ 	depends on DEBUG_FS
+ 	depends on USB4_DEBUGFS_WRITE
+ 	help
+-	  Enables hardware and software based receiver lane margining support
+-	  under each USB4 port. Used for electrical quality and robustness
+-	  validation during manufacturing. Should not be enabled by distro
+-	  kernels.
++	  Enables hardware and software based receiver lane margining
++	  support under each USB4 port and retimer, including retimers
++	  on the other side of the cable. Used for electrical quality
++	  and robustness validation during manufacturing. Should not be
++	  enabled by distro kernels.
+ 
+ config USB4_KUNIT_TEST
+ 	bool "KUnit tests" if !KUNIT_ALL_TESTS
+diff --git a/drivers/thunderbolt/debugfs.c b/drivers/thunderbolt/debugfs.c
+index 0ef6d7dee6de..17572928e331 100644
+--- a/drivers/thunderbolt/debugfs.c
++++ b/drivers/thunderbolt/debugfs.c
+@@ -358,6 +358,9 @@ static ssize_t retimer_sb_regs_write(struct file *file,
+ /**
+  * struct tb_margining - Lane margining support
+  * @port: USB4 port through which the margining operations are run
++ * @target: Sideband target
++ * @index: Retimer index if taget is %USB4_SB_TARGET_RETIMER
++ * @dev: Pointer to the device that is the target (USB4 port or retimer)
+  * @caps: Port lane margining capabilities
+  * @results: Last lane margining results
+  * @lanes: %0, %1 or %7 (all)
+@@ -375,6 +378,9 @@ static ssize_t retimer_sb_regs_write(struct file *file,
+  */
+ struct tb_margining {
+ 	struct tb_port *port;
++	enum usb4_sb_target target;
++	u8 index;
++	struct device *dev;
+ 	u32 caps[2];
+ 	u32 results[2];
+ 	unsigned int lanes;
+@@ -714,6 +720,7 @@ static int margining_run_write(void *data, u64 val)
+ {
+ 	struct tb_margining *margining = data;
+ 	struct tb_port *port = margining->port;
++	struct device *dev = margining->dev;
+ 	struct tb_switch *sw = port->sw;
+ 	struct tb_switch *down_sw;
+ 	struct tb *tb = sw->tb;
+@@ -722,7 +729,7 @@ static int margining_run_write(void *data, u64 val)
+ 	if (val != 1)
+ 		return -EINVAL;
+ 
+-	pm_runtime_get_sync(&sw->dev);
++	pm_runtime_get_sync(dev);
+ 
+ 	if (mutex_lock_interruptible(&tb->lock)) {
+ 		ret = -ERESTARTSYS;
+@@ -750,24 +757,29 @@ static int margining_run_write(void *data, u64 val)
+ 	}
+ 
+ 	if (margining->software) {
+-		tb_port_dbg(port, "running software %s lane margining for lanes %u\n",
+-			    margining->time ? "time" : "voltage", margining->lanes);
+-		ret = usb4_port_sw_margin(port, USB4_SB_TARGET_ROUTER, 0,
++		tb_port_dbg(port,
++			    "running software %s lane margining for %s lanes %u\n",
++			    margining->time ? "time" : "voltage", dev_name(dev),
++			    margining->lanes);
++		ret = usb4_port_sw_margin(port, margining->target, margining->index,
+ 					  margining->lanes, margining->time,
+ 					  margining->right_high,
+ 					  USB4_MARGIN_SW_COUNTER_CLEAR);
+ 		if (ret)
+ 			goto out_clx;
+ 
+-		ret = usb4_port_sw_margin_errors(port, USB4_SB_TARGET_ROUTER, 0,
++		ret = usb4_port_sw_margin_errors(port, margining->target,
++						 margining->index,
+ 						 &margining->results[0]);
+ 	} else {
+-		tb_port_dbg(port, "running hardware %s lane margining for lanes %u\n",
+-			    margining->time ? "time" : "voltage", margining->lanes);
++		tb_port_dbg(port,
++			    "running hardware %s lane margining for %s lanes %u\n",
++			    margining->time ? "time" : "voltage", dev_name(dev),
++			    margining->lanes);
+ 		/* Clear the results */
+ 		margining->results[0] = 0;
+ 		margining->results[1] = 0;
+-		ret = usb4_port_hw_margin(port, USB4_SB_TARGET_ROUTER, 0,
++		ret = usb4_port_hw_margin(port, margining->target, margining->index,
+ 					  margining->lanes, margining->ber_level,
+ 					  margining->time, margining->right_high,
+ 					  margining->results);
+@@ -779,8 +791,8 @@ static int margining_run_write(void *data, u64 val)
+ out_unlock:
+ 	mutex_unlock(&tb->lock);
+ out_rpm_put:
+-	pm_runtime_mark_last_busy(&sw->dev);
+-	pm_runtime_put_autosuspend(&sw->dev);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
+ 
+ 	return ret;
+ }
+@@ -1022,33 +1034,29 @@ static int margining_margin_show(struct seq_file *s, void *not_used)
+ }
+ DEBUGFS_ATTR_RW(margining_margin);
+ 
+-static void margining_port_init(struct tb_port *port)
++static struct tb_margining *margining_alloc(struct tb_port *port,
++					    struct device *dev,
++					    enum usb4_sb_target target,
++					    u8 index, struct dentry *parent)
+ {
+ 	struct tb_margining *margining;
+-	struct dentry *dir, *parent;
+-	struct usb4_port *usb4;
+-	char dir_name[10];
++	struct dentry *dir;
+ 	unsigned int val;
+ 	int ret;
+ 
+-	usb4 = port->usb4;
+-	if (!usb4)
+-		return;
+-
+-	snprintf(dir_name, sizeof(dir_name), "port%d", port->port);
+-	parent = debugfs_lookup(dir_name, port->sw->debugfs_dir);
+-
+ 	margining = kzalloc(sizeof(*margining), GFP_KERNEL);
+ 	if (!margining)
+-		return;
++		return NULL;
+ 
+ 	margining->port = port;
++	margining->target = target;
++	margining->index = index;
++	margining->dev = dev;
+ 
+-	ret = usb4_port_margining_caps(port, USB4_SB_TARGET_ROUTER, 0,
+-				       margining->caps);
++	ret = usb4_port_margining_caps(port, target, index, margining->caps);
+ 	if (ret) {
+ 		kfree(margining);
+-		return;
++		return NULL;
+ 	}
+ 
+ 	/* Set the initial mode */
+@@ -1101,8 +1109,22 @@ static void margining_port_init(struct tb_port *port)
+ 	    (supports_time(margining) && independent_time_margins(margining)))
+ 		debugfs_create_file("margin", 0600, dir, margining,
+ 				    &margining_margin_fops);
++	return margining;
++}
+ 
+-	usb4->margining = margining;
++static void margining_port_init(struct tb_port *port)
++{
++	struct dentry *parent;
++	char dir_name[10];
++
++	if (!port->usb4)
++		return;
++
++	snprintf(dir_name, sizeof(dir_name), "port%d", port->port);
++	parent = debugfs_lookup(dir_name, port->sw->debugfs_dir);
++	port->usb4->margining = margining_alloc(port, &port->usb4->dev,
++						USB4_SB_TARGET_ROUTER, 0,
++						parent);
+ }
+ 
+ static void margining_port_remove(struct tb_port *port)
+@@ -1176,11 +1198,27 @@ static void margining_xdomain_remove(struct tb_xdomain *xd)
+ 	downstream = tb_port_at(xd->route, parent_sw);
+ 	margining_port_remove(downstream);
+ }
++
++static void margining_retimer_init(struct tb_retimer *rt)
++{
++	rt->margining = margining_alloc(rt->port, &rt->dev,
++					USB4_SB_TARGET_RETIMER, rt->index,
++					rt->debugfs_dir);
++}
++
++static void margining_retimer_remove(struct tb_retimer *rt)
++{
++	debugfs_remove_recursive(debugfs_lookup("margining", rt->debugfs_dir));
++	kfree(rt->margining);
++	rt->margining = NULL;
++}
+ #else
+ static inline void margining_switch_init(struct tb_switch *sw) { }
+ static inline void margining_switch_remove(struct tb_switch *sw) { }
+ static inline void margining_xdomain_init(struct tb_xdomain *xd) { }
+ static inline void margining_xdomain_remove(struct tb_xdomain *xd) { }
++static inline void margining_retimer_init(struct tb_retimer *rt) { }
++static inline void margining_retimer_remove(struct tb_retimer *rt) { }
+ #endif
+ 
+ static int port_clear_all_counters(struct tb_port *port)
+@@ -1837,6 +1875,7 @@ void tb_retimer_debugfs_init(struct tb_retimer *rt)
+ 					     tb_debugfs_root);
+ 	debugfs_create_file("sb_regs", DEBUGFS_MODE, rt->debugfs_dir, rt,
+ 			    &retimer_sb_regs_fops);
++	margining_retimer_init(rt);
+ }
+ 
+ /**
+@@ -1847,6 +1886,7 @@ void tb_retimer_debugfs_init(struct tb_retimer *rt)
+  */
+ void tb_retimer_debugfs_remove(struct tb_retimer *rt)
+ {
++	margining_retimer_remove(rt);
+ 	debugfs_remove_recursive(rt->debugfs_dir);
+ 	rt->debugfs_dir = NULL;
+ }
+diff --git a/drivers/thunderbolt/retimer.c b/drivers/thunderbolt/retimer.c
+index f2c315c168dd..9665de41d5d9 100644
+--- a/drivers/thunderbolt/retimer.c
++++ b/drivers/thunderbolt/retimer.c
+@@ -14,7 +14,11 @@
+ #include "sb_regs.h"
+ #include "tb.h"
+ 
++#if IS_ENABLED(CONFIG_USB4_DEBUGFS_MARGINING)
+ #define TB_MAX_RETIMER_INDEX	6
++#else
++#define TB_MAX_RETIMER_INDEX	2
++#endif
+ 
+ /**
+  * tb_retimer_nvm_read() - Read contents of retimer NVM
+@@ -315,6 +319,8 @@ static ssize_t nvm_version_show(struct device *dev,
+ 
+ 	if (!rt->nvm)
+ 		ret = -EAGAIN;
++	else if (rt->no_nvm_upgrade)
++		ret = -EOPNOTSUPP;
+ 	else
+ 		ret = sysfs_emit(buf, "%x.%x\n", rt->nvm->major, rt->nvm->minor);
+ 
+@@ -362,7 +368,8 @@ struct device_type tb_retimer_type = {
+ 	.release = tb_retimer_release,
+ };
+ 
+-static int tb_retimer_add(struct tb_port *port, u8 index, u32 auth_status)
++static int tb_retimer_add(struct tb_port *port, u8 index, u32 auth_status,
++			  bool on_board)
+ {
+ 	struct tb_retimer *rt;
+ 	u32 vendor, device;
+@@ -384,13 +391,6 @@ static int tb_retimer_add(struct tb_port *port, u8 index, u32 auth_status)
+ 		return ret;
+ 	}
+ 
+-	/*
+-	 * Check that it supports NVM operations. If not then don't add
+-	 * the device at all.
+-	 */
+-	ret = usb4_port_retimer_nvm_sector_size(port, index);
+-	if (ret < 0)
+-		return ret;
+ 
+ 	rt = kzalloc(sizeof(*rt), GFP_KERNEL);
+ 	if (!rt)
+@@ -403,6 +403,13 @@ static int tb_retimer_add(struct tb_port *port, u8 index, u32 auth_status)
+ 	rt->port = port;
+ 	rt->tb = port->sw->tb;
+ 
++	/*
++	 * Only support NVM upgrade for on-board retimers. The retimers
++	 * on the other side of the connection.
++	 */
++	if (!on_board || usb4_port_retimer_nvm_sector_size(port, index) <= 0)
++		rt->no_nvm_upgrade = true;
++
+ 	rt->dev.parent = &port->usb4->dev;
+ 	rt->dev.bus = &tb_bus_type;
+ 	rt->dev.type = &tb_retimer_type;
+@@ -518,26 +525,26 @@ int tb_retimer_scan(struct tb_port *port, bool add)
+ 			break;
+ 	}
+ 
+-	tb_retimer_unset_inbound_sbtx(port);
+-
+-	if (!last_idx)
+-		return 0;
+-
+-	/* Add on-board retimers if they do not exist already */
++	/* Add retimers if they do not exist already */
+ 	ret = 0;
+-	for (i = 1; i <= last_idx; i++) {
++	for (i = 1; i <= TB_MAX_RETIMER_INDEX; i++) {
+ 		struct tb_retimer *rt;
+ 
++		/* Skip cable retimers */
++		if (usb4_port_retimer_is_cable(port, i))
++			continue;
++
+ 		rt = tb_port_find_retimer(port, i);
+ 		if (rt) {
+ 			put_device(&rt->dev);
+ 		} else if (add) {
+-			ret = tb_retimer_add(port, i, status[i]);
++			ret = tb_retimer_add(port, i, status[i], i <= last_idx);
+ 			if (ret && ret != -EOPNOTSUPP)
+ 				break;
+ 		}
+ 	}
+ 
++	tb_retimer_unset_inbound_sbtx(port);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/thunderbolt/sb_regs.h b/drivers/thunderbolt/sb_regs.h
+index d2fbb1cdcf3e..87a02aa60bcd 100644
+--- a/drivers/thunderbolt/sb_regs.h
++++ b/drivers/thunderbolt/sb_regs.h
+@@ -22,6 +22,7 @@ enum usb4_sb_opcode {
+ 	USB4_SB_OPCODE_SET_INBOUND_SBTX = 0x5055534c,		/* "LSUP" */
+ 	USB4_SB_OPCODE_UNSET_INBOUND_SBTX = 0x50555355,		/* "USUP" */
+ 	USB4_SB_OPCODE_QUERY_LAST_RETIMER = 0x5453414c,		/* "LAST" */
++	USB4_SB_OPCODE_QUERY_CABLE_RETIMER = 0x524c4243,	/* "CBLR" */
+ 	USB4_SB_OPCODE_GET_NVM_SECTOR_SIZE = 0x53534e47,	/* "GNSS" */
+ 	USB4_SB_OPCODE_NVM_SET_OFFSET = 0x53504f42,		/* "BOPS" */
+ 	USB4_SB_OPCODE_NVM_BLOCK_WRITE = 0x574b4c42,		/* "BLKW" */
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 6c333f38888f..cb553772dfcb 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -319,6 +319,7 @@ struct usb4_port {
+  * @no_nvm_upgrade: Prevent NVM upgrade of this retimer
+  * @auth_status: Status of last NVM authentication
+  * @debugfs_dir: Pointer to the debugfs structure
++ * @margining: Pointer to margining structure if enabled
+  */
+ struct tb_retimer {
+ 	struct device dev;
+@@ -331,6 +332,9 @@ struct tb_retimer {
+ 	bool no_nvm_upgrade;
+ 	u32 auth_status;
+ 	struct dentry *debugfs_dir;
++#ifdef CONFIG_USB4_DEBUGFS_MARGINING
++	struct tb_margining *margining;
++#endif
+ };
+ 
+ /**
+@@ -1331,6 +1335,7 @@ int usb4_port_sw_margin_errors(struct tb_port *port, enum usb4_sb_target target,
+ int usb4_port_retimer_set_inbound_sbtx(struct tb_port *port, u8 index);
+ int usb4_port_retimer_unset_inbound_sbtx(struct tb_port *port, u8 index);
+ int usb4_port_retimer_is_last(struct tb_port *port, u8 index);
++int usb4_port_retimer_is_cable(struct tb_port *port, u8 index);
+ int usb4_port_retimer_nvm_sector_size(struct tb_port *port, u8 index);
+ int usb4_port_retimer_nvm_set_offset(struct tb_port *port, u8 index,
+ 				     unsigned int address);
+diff --git a/drivers/thunderbolt/usb4.c b/drivers/thunderbolt/usb4.c
+index 48e80d63b1dc..686bea9fa5f4 100644
+--- a/drivers/thunderbolt/usb4.c
++++ b/drivers/thunderbolt/usb4.c
+@@ -1783,6 +1783,30 @@ int usb4_port_retimer_is_last(struct tb_port *port, u8 index)
+ 	return ret ? ret : metadata & 1;
+ }
+ 
++/**
++ * usb4_port_retimer_is_cable() - Is the retimer cable retimer
++ * @port: USB4 port
++ * @index: Retimer index
++ *
++ * If the retimer at @index is last cable retimer this function returns
++ * %1 and %0 if it is on-board retimer. In case a retimer is not present
++ * at @index returns %-ENODEV. Otherwise returns negative errno.
++ */
++int usb4_port_retimer_is_cable(struct tb_port *port, u8 index)
++{
++	u32 metadata;
++	int ret;
++
++	ret = usb4_port_retimer_op(port, index, USB4_SB_OPCODE_QUERY_CABLE_RETIMER,
++				   500);
++	if (ret)
++		return ret;
++
++	ret = usb4_port_sb_read(port, USB4_SB_TARGET_RETIMER, index,
++				USB4_SB_METADATA, &metadata, sizeof(metadata));
++	return ret ? ret : metadata & 1;
++}
++
+ /**
+  * usb4_port_retimer_nvm_sector_size() - Read retimer NVM sector size
+  * @port: USB4 port
+-- 
+2.25.1
+
