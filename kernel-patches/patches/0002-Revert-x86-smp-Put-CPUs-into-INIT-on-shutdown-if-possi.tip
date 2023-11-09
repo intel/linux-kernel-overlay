@@ -1,0 +1,140 @@
+From 3f3c1f618214400cb2568058fd899e2f8bcd6737 Mon Sep 17 00:00:00 2001
+From: Lili Li <lili.li@intel.com>
+Date: Fri, 3 Nov 2023 13:17:52 +0800
+Subject: [PATCH 2/2] Revert "x86/smp: Put CPUs into INIT on shutdown if
+ possible"
+
+This reverts commit 45e34c8af58f23db4474e2bfe79183efec09a18b.
+---
+ arch/x86/include/asm/smp.h |  2 --
+ arch/x86/kernel/smp.c      | 39 +++++++-------------------------------
+ arch/x86/kernel/smpboot.c  | 19 -------------------
+ 3 files changed, 7 insertions(+), 53 deletions(-)
+
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index 600cf25dbfc6..744a4cd5ac8c 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -134,8 +134,6 @@ void native_send_call_func_ipi(const struct cpumask *mask);
+ void native_send_call_func_single_ipi(int cpu);
+ void x86_idle_thread_init(unsigned int cpu, struct task_struct *idle);
+ 
+-bool smp_park_other_cpus_in_init(void);
+-
+ void smp_store_boot_cpu_info(void);
+ void smp_store_cpu_info(int id);
+ 
+diff --git a/arch/x86/kernel/smp.c b/arch/x86/kernel/smp.c
+index 7eb18ca7bd45..cc8ef9bfcb52 100644
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -131,7 +131,7 @@ static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
+ }
+ 
+ /*
+- * Disable virtualization, APIC etc. and park the CPU in a HLT loop
++ * this function calls the 'stop' function on all other CPUs in the system.
+  */
+ DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
+ {
+@@ -172,17 +172,13 @@ static void native_stop_other_cpus(int wait)
+ 	 * 2) Wait for all other CPUs to report that they reached the
+ 	 *    HLT loop in stop_this_cpu()
+ 	 *
+-	 * 3) If the system uses INIT/STARTUP for CPU bringup, then
+-	 *    send all present CPUs an INIT vector, which brings them
+-	 *    completely out of the way.
++	 * 3) If #2 timed out send an NMI to the CPUs which did not
++	 *    yet report
+ 	 *
+-	 * 4) If #3 is not possible and #2 timed out send an NMI to the
+-	 *    CPUs which did not yet report
+-	 *
+-	 * 5) Wait for all other CPUs to report that they reached the
++	 * 4) Wait for all other CPUs to report that they reached the
+ 	 *    HLT loop in stop_this_cpu()
+ 	 *
+-	 * #4 can obviously race against a CPU reaching the HLT loop late.
++	 * #3 can obviously race against a CPU reaching the HLT loop late.
+ 	 * That CPU will have reported already and the "have all CPUs
+ 	 * reached HLT" condition will be true despite the fact that the
+ 	 * other CPU is still handling the NMI. Again, there is no
+@@ -198,7 +194,7 @@ static void native_stop_other_cpus(int wait)
+ 		/*
+ 		 * Don't wait longer than a second for IPI completion. The
+ 		 * wait request is not checked here because that would
+-		 * prevent an NMI/INIT shutdown in case that not all
++		 * prevent an NMI shutdown attempt in case that not all
+ 		 * CPUs reach shutdown state.
+ 		 */
+ 		timeout = USEC_PER_SEC;
+@@ -206,27 +202,7 @@ static void native_stop_other_cpus(int wait)
+ 			udelay(1);
+ 	}
+ 
+-	/*
+-	 * Park all other CPUs in INIT including "offline" CPUs, if
+-	 * possible. That's a safe place where they can't resume execution
+-	 * of HLT and then execute the HLT loop from overwritten text or
+-	 * page tables.
+-	 *
+-	 * The only downside is a broadcast MCE, but up to the point where
+-	 * the kexec() kernel brought all APs online again an MCE will just
+-	 * make HLT resume and handle the MCE. The machine crashes and burns
+-	 * due to overwritten text, page tables and data. So there is a
+-	 * choice between fire and frying pan. The result is pretty much
+-	 * the same. Chose frying pan until x86 provides a sane mechanism
+-	 * to park a CPU.
+-	 */
+-	if (smp_park_other_cpus_in_init())
+-		goto done;
+-
+-	/*
+-	 * If park with INIT was not possible and the REBOOT_VECTOR didn't
+-	 * take all secondary CPUs offline, try with the NMI.
+-	 */
++	/* if the REBOOT_VECTOR didn't work, try with the NMI */
+ 	if (!cpumask_empty(&cpus_stop_mask)) {
+ 		/*
+ 		 * If NMI IPI is enabled, try to register the stop handler
+@@ -249,7 +225,6 @@ static void native_stop_other_cpus(int wait)
+ 			udelay(1);
+ 	}
+ 
+-done:
+ 	local_irq_save(flags);
+ 	disable_local_APIC();
+ 	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index ed2d51960a7d..b58350569189 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -1340,25 +1340,6 @@ void arch_thaw_secondary_cpus_end(void)
+ 	cache_aps_init();
+ }
+ 
+-bool smp_park_other_cpus_in_init(void)
+-{
+-	unsigned int cpu, this_cpu = smp_processor_id();
+-	unsigned int apicid;
+-
+-	if (apic->wakeup_secondary_cpu_64 || apic->wakeup_secondary_cpu)
+-		return false;
+-
+-	for_each_present_cpu(cpu) {
+-		if (cpu == this_cpu)
+-			continue;
+-		apicid = apic->cpu_present_to_apicid(cpu);
+-		if (apicid == BAD_APICID)
+-			continue;
+-		send_init_sequence(apicid);
+-	}
+-	return true;
+-}
+-
+ /*
+  * Early setup to make printk work.
+  */
+-- 
+2.25.1
+
