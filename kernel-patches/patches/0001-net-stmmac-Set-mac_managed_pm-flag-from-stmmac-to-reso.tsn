@@ -1,0 +1,117 @@
+From c3d407c5c0b92fff9f27e2d6656c854a990f8f14 Mon Sep 17 00:00:00 2001
+From: Choong Yong Liang <yong.liang.choong@intel.com>
+Date: Fri, 15 Dec 2023 09:09:21 +0800
+Subject: [PATCH] net: stmmac: Set mac_managed_pm flag from stmmac to resolve
+ race condition
+
+When WoL is set to 'g' (e.g., using the command
+'ethtool -s enp0s30f4 wol g'), waking up from hibernation will result
+in the error messages 'PM: failed to quiesce: error -16' and
+'PM: hibernation: Failed to load image, recovering.'
+
+During 'hibernation_restore()', it will eventually call the
+'mdio_bus_phy_suspend()' function, and the function will check the
+'mac_managed_pm' flag. If the flag is disabled, it will proceed to the
+'phy_suspend()' function and return a -16 error.
+
+For 'stmmac', the 'mac_managed_pm' flag is always set to 'true' for the
+'phylink', and 'phylink' will set the 'mac_managed_pm' flag for the 'phy'
+during 'phylink_bringup_phy()'. The process of setting the 'mac_managed_pm'
+flag from 'stmmac' -> 'phylink' -> 'phy' takes a while to complete.
+
+During wake-up from hibernation, there is a race condition that depends on
+whether 'mac_managed_pm' was set for the 'phy' first or 'phy_suspend()'
+function is called first.
+
+To address the race condition, 'stmmac' directly setting the
+'mac_managed_pm' during 'stmmac_dvr_probe()' will resolve the issue.
+
+Fixes: f151c147b3af ("net: stmmac: Enable mac_managed_pm phylink config")
+Signed-off-by: Choong Yong Liang <yong.liang.choong@intel.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 40 +++++++++++++------
+ 1 file changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index e79cdbda5ba5..47df30d43145 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -1156,6 +1156,24 @@ static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
+ 	}
+ }
+ 
++static int stmmac_get_phydev(struct stmmac_priv *priv, struct phy_device **phydev)
++{
++	int addr = priv->plat->phy_addr;
++
++	if (addr < 0) {
++		netdev_err(priv->dev, "no phy found\n");
++		return -ENODEV;
++	}
++
++	*phydev = mdiobus_get_phy(priv->mii, addr);
++	if (!*phydev) {
++		netdev_err(priv->dev, "no phy at addr %d\n", addr);
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
+ /**
+  * stmmac_init_phy - PHY initialization
+  * @dev: net device structure
+@@ -1187,19 +1205,10 @@ static int stmmac_init_phy(struct net_device *dev)
+ 	 * manually parse it
+ 	 */
+ 	if (!phy_fwnode || IS_ERR(phy_fwnode)) {
+-		int addr = priv->plat->phy_addr;
+ 		struct phy_device *phydev;
+-
+-		if (addr < 0) {
+-			netdev_err(priv->dev, "no phy found\n");
+-			return -ENODEV;
+-		}
+-
+-		phydev = mdiobus_get_phy(priv->mii, addr);
+-		if (!phydev) {
+-			netdev_err(priv->dev, "no phy at addr %d\n", addr);
+-			return -ENODEV;
+-		}
++		ret = stmmac_get_phydev(priv, &phydev);
++		if (ret)
++			return ret;
+ 
+ 		ret = phylink_connect_phy(priv->phylink, phydev);
+ 	} else {
+@@ -1273,7 +1282,6 @@ static int stmmac_phy_setup(struct stmmac_priv *priv)
+ 	if (priv->plat->tx_queues_to_use > 1)
+ 		priv->phylink_config.mac_capabilities &=
+ 			~(MAC_10HD | MAC_100HD | MAC_1000HD);
+-	priv->phylink_config.mac_managed_pm = true;
+ 
+ 	/* In the case where kernel driver has no access to modify the clock
+ 	 * rate after it is increased by 2.5 times in the BIOS to support 2.5G
+@@ -7299,6 +7307,7 @@ int stmmac_dvr_probe(struct device *device,
+ {
+ 	struct net_device *ndev = NULL;
+ 	struct stmmac_priv *priv;
++	struct phy_device *phydev;
+ 	u32 rxq;
+ 	int i, ret = 0;
+ 
+@@ -7550,6 +7559,11 @@ int stmmac_dvr_probe(struct device *device,
+ 			goto error_xpcs_setup;
+ 	}
+ 
++	ret = stmmac_get_phydev(priv, &phydev);
++	if (ret)
++		return ret;
++	phydev->mac_managed_pm = true;
++
+ 	ret = stmmac_phy_setup(priv);
+ 	if (ret) {
+ 		netdev_err(ndev, "failed to setup phy (%d)\n", ret);
+-- 
+2.25.1
+
