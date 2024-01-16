@@ -1,0 +1,241 @@
+From 0f4366354317df16742fb82b0ea34404320ecb3a Mon Sep 17 00:00:00 2001
+From: Alan Previn <alan.previn.teres.alexis@intel.com>
+Date: Fri, 10 Feb 2023 00:00:26 -0800
+Subject: [PATCH 293/333] drm/i915/pxp/mtl:[PXP-MULTI-UAPI] Implement ioctl for
+ host_session_handle
+
+Implement PXP_OPS ioctl action for grabbing the user-space client's
+host_session_handle. User space process uses this handle when
+communicating with the GSC firmware. Kernel driver will
+have to send a session cleanup with GSC firmware when the
+file handle is closed.
+
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+---
+ drivers/gpu/drm/i915/pxp/intel_pxp.c       | 77 +++++++++++++++++++---
+ drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c | 26 +++++++-
+ drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h |  2 +
+ include/uapi/drm/i915_drm_prelim.h         | 33 ++++++++++
+ 4 files changed, 127 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.c b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+index 583049d4eb63..64ab58540b6e 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.c
+@@ -693,6 +693,60 @@ static int pxp_query_tag(struct intel_pxp *pxp, struct prelim_drm_i915_pxp_ops *
+ 	return ret;
+ }
+ 
++static int
++pxp_process_host_session_handle_request(struct intel_pxp *pxp,
++					struct prelim_drm_i915_pxp_ops *pxp_ops,
++					struct drm_file *drmfile)
++{
++	struct prelim_drm_i915_pxp_host_session_handle_request params;
++	struct prelim_drm_i915_pxp_host_session_handle_request __user *uparams =
++		u64_to_user_ptr(pxp_ops->params);
++	int ret = 0;
++
++	if (copy_from_user(&params, uparams, sizeof(params)) != 0)
++		return -EFAULT;
++
++	if (params.request_type != PRELIM_DRM_I915_PXP_GET_HOST_SESSION_HANDLE) {
++		ret = PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_INVALID;
++		goto error_out;
++	}
++
++	/* legacy hw doesn't use this - user space shouldn't be requesting this */
++	if (!HAS_ENGINE(pxp->ctrl_gt, GSC0)) {
++		ret = PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_INVALID;
++		goto error_out;
++	}
++
++	intel_pxp_gsccs_get_client_host_session_handle(pxp, drmfile,
++						       &params.host_session_handle);
++	if (!params.host_session_handle) {
++		ret = PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_UNKNOWN;
++		drm_warn(&pxp->ctrl_gt->i915->drm, "Host Session Handle allocated 0x0\n");
++	}
++
++error_out:
++	if (ret >= 0) {
++		pxp_ops->status = ret;
++
++		if (copy_to_user(uparams, &params, sizeof(params)))
++			ret = -EFAULT;
++		else
++			ret = 0;
++	}
++
++	return ret;
++}
++
++static bool pxp_action_needs_arb_session(u32 action)
++{
++	switch (action) {
++	case PRELIM_DRM_I915_PXP_ACTION_HOST_SESSION_HANDLE_REQ:
++		return false;
++	}
++
++	return true;
++}
++
+ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmfile)
+ {
+ 	int ret = 0;
+@@ -711,16 +765,18 @@ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmf
+ 		return 0;
+ 	}
+ 
+-	if (pxp->hw_state_invalidated) {
+-		drm_dbg(&i915->drm, "pxp ioctl retry required due to state attacked\n");
+-		pxp_ops->status = PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
+-		goto out_pm;
+-	}
+-
+-	if (!intel_pxp_is_active(pxp)) {
+-		ret = intel_pxp_start(pxp);
+-		if (ret)
++	if (pxp_action_needs_arb_session(pxp_ops->action)) {
++		if (pxp->hw_state_invalidated) {
++			drm_dbg(&i915->drm, "pxp ioctl retry required due to state attacked\n");
++			pxp_ops->status = PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED;
+ 			goto out_pm;
++		}
++
++		if (!intel_pxp_is_active(pxp)) {
++			ret = intel_pxp_start(pxp);
++			if (ret)
++				goto out_pm;
++		}
+ 	}
+ 
+ 	mutex_lock(&pxp->session_mutex);
+@@ -743,6 +799,9 @@ int i915_pxp_ops_ioctl(struct drm_device *dev, void *data, struct drm_file *drmf
+ 	case PRELIM_DRM_I915_PXP_ACTION_QUERY_PXP_TAG:
+ 		ret = pxp_query_tag(pxp, pxp_ops);
+ 		break;
++	case PRELIM_DRM_I915_PXP_ACTION_HOST_SESSION_HANDLE_REQ:
++		ret = pxp_process_host_session_handle_request(pxp, pxp_ops, drmfile);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+index 0c37f1d2381b..18b96fe6f5c8 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.c
+@@ -200,8 +200,12 @@ gsccs_send_message(struct intel_pxp *pxp,
+ 	if (!exec_res) {
+ 		drm_err(&i915->drm, "gsc send_message with invalid exec_resource\n");
+ 		return -ENODEV;
+-	} else if (exec_res == &pxp->gsccs_res) {
+-		/* kernel submissions need population of gsc-mtl-header */
++	} else if (exec_res == &pxp->gsccs_res || (!msg_in && !msg_out)) {
++		/*
++		 * kernel submissions need population of gsc-mtl-header and
++		 * only kernel does host_session_cleanup (on behalf of client
++		 * exec_res) identified by the empty packet.
++		 */
+ 		insert_header_size = sizeof(*header);
+ 	}
+ 
+@@ -459,6 +463,24 @@ gsccs_cleanup_fw_host_session_handle(struct intel_pxp *pxp,
+ 			ret);
+ }
+ 
++int
++intel_pxp_gsccs_get_client_host_session_handle(struct intel_pxp *pxp, struct drm_file *drmfile,
++					       u64 *handle)
++{
++	struct gsccs_client_ctx *n;
++
++	if (!drmfile)
++		return -EINVAL;
++
++	n = gsccs_find_client_execution_resource(pxp, drmfile);
++	if (!n)
++		return -EINVAL;
++
++	*handle = n->exec.host_session_handle;
++
++	return 0;
++}
++
+ static void
+ gsccs_destroy_execution_resource(struct intel_pxp *pxp, struct gsccs_session_resources *exec_res)
+ {
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
+index 0b2accaaf806..644c4bf0ad67 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_gsccs.h
+@@ -35,6 +35,8 @@ intel_pxp_gsccs_client_io_msg(struct intel_pxp *pxp, struct drm_file *drmfile,
+ 			      u32 *msg_out_len);
+ 
+ void intel_pxp_gsccs_end_fw_sessions(struct intel_pxp *pxp, u32 sessions_mask);
++int intel_pxp_gsccs_get_client_host_session_handle(struct intel_pxp *pxp, struct drm_file *drmfile,
++						   u64 *handle);
+ 
+ #else
+ static inline void intel_pxp_gsccs_fini(struct intel_pxp *pxp)
+diff --git a/include/uapi/drm/i915_drm_prelim.h b/include/uapi/drm/i915_drm_prelim.h
+index 3d4933635070..35dab1c365c5 100644
+--- a/include/uapi/drm/i915_drm_prelim.h
++++ b/include/uapi/drm/i915_drm_prelim.h
+@@ -85,6 +85,37 @@ struct prelim_drm_i915_pxp_query_tag {
+ #define PRELIM_DRM_I915_PXP_TAG_SESSION_SM		(0x1 << 19)
+ } __attribute__((packed));
+ 
++/*
++ * struct pxp_host_session_handle_params
++ * Used with PXP_OPS: PRELIM_DRM_I915_PXP_ACTION_HOST_SESSION_HANDLE
++ * Contains params to get a host-session-handle that the user-space
++ * process uses for all communication with the GSC-FW via the PXP_OPS:
++ * PRELIM_DRM_I915_PXP_ACTION_TEE_IO_MESSAGE.
++ *
++ * - Each user space process is provided a single host_session_handle.
++ *   A user space process that repeats a request for a host_session_handle
++ *   will be successfully serviced but returned the same host_session_handle
++ *   that was generated (a random number) on the first request.
++ * - When the user space process exits, the kernel driver will send a cleanup
++ *   cmd to the gsc firmware. There is no need (and no mechanism) for the user
++ *   space process to explicitly request to release it's host_session_handle.
++ * - The host_session_handle remains valid through any suspend/resume cycles
++ *   and through PXP hw-session-slot teardowns (essentially they are
++ *   decoupled from the hw session-slots)
++ *
++ * Return values via prelim_drm_i915_pxp_ops.status:
++ *    - PRELIM_DRM_I915_PXP_OP_STATUS_SUCCESS
++ *    - PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_INVALID
++ *      (if 'request' type is not valid or if device has no GSC engine)
++ *    - PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_UNKNOWN
++ *      (if other subsystem failed to generate random no.)
++ */
++struct prelim_drm_i915_pxp_host_session_handle_request {
++	__u32 request_type; /* in - type of request for host-session-handle operation */
++#define PRELIM_DRM_I915_PXP_GET_HOST_SESSION_HANDLE     1
++	__u64 host_session_handle; /* out - returned host_session_handle */
++} __attribute__((packed));
++
+ /*
+  * DRM_I915_PXP_OPS -
+  *
+@@ -102,12 +133,14 @@ struct prelim_drm_i915_pxp_ops {
+ #define PRELIM_DRM_I915_PXP_ACTION_SET_SESSION_STATUS 0
+ #define PRELIM_DRM_I915_PXP_ACTION_TEE_IO_MESSAGE 1
+ #define PRELIM_DRM_I915_PXP_ACTION_QUERY_PXP_TAG 2
++#define PRELIM_DRM_I915_PXP_ACTION_HOST_SESSION_HANDLE_REQ 3
+ 
+ 	__u32 status; /* out - status output for this operation */
+ #define PRELIM_DRM_I915_PXP_OP_STATUS_SUCCESS 0
+ #define PRELIM_DRM_I915_PXP_OP_STATUS_RETRY_REQUIRED 1
+ #define PRELIM_DRM_I915_PXP_OP_STATUS_SESSION_NOT_AVAILABLE 2
+ #define PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_UNKNOWN 3
++#define PRELIM_DRM_I915_PXP_OP_STATUS_ERROR_INVALID 4
+ 
+ 	__u64 params; /* in/out - pointer to data matching the action */
+ } __attribute__((packed));
+-- 
+2.42.0
+

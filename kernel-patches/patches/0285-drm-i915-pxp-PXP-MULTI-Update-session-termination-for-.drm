@@ -1,0 +1,148 @@
+From 6a5427cc69ab5c9107b6e0091afad9f7d3bedb48 Mon Sep 17 00:00:00 2001
+From: Alan Previn <alan.previn.teres.alexis@intel.com>
+Date: Thu, 12 Jan 2023 22:35:38 -0800
+Subject: [PATCH 285/333] drm/i915/pxp:[PXP-MULTI] Update session termination
+ for multi-session
+
+Update global session termination sequence from invalidating only
+the ARB_SESSION's stream-key to invalidating all active session's keys.
+
+Also, update termination of individual multi-session to include sending
+the stream-key invalidation to fw after sending the CRYPTO_KEY_EXCHANGE
+instruction to VDBOX.
+
+Only updates ADL/TGL code paths for now.
+
+   v2: - Ensure that session termination is only allowed for ARB session
+         on MTL until we add multi-session management for support for MTL
+
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+---
+ drivers/gpu/drm/i915/pxp/intel_pxp.h         |  2 +-
+ drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h     |  6 +----
+ drivers/gpu/drm/i915/pxp/intel_pxp_session.c | 26 ++++++++++++++++++--
+ drivers/gpu/drm/i915/pxp/intel_pxp_tee.c     | 12 ++++++++-
+ 4 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp.h b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+index 12d4f90f75e5..5845c2c1a9d9 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp.h
+@@ -27,7 +27,7 @@ void intel_pxp_init_hw(struct intel_pxp *pxp);
+ void intel_pxp_fini_hw(struct intel_pxp *pxp);
+ 
+ void intel_pxp_mark_termination_in_progress(struct intel_pxp *pxp);
+-void intel_pxp_tee_end_arb_fw_session(struct intel_pxp *pxp, u32 arb_session_id);
++void intel_pxp_tee_end_fw_sessions(struct intel_pxp *pxp, u32 sessions_mask);
+ 
+ int intel_pxp_get_readiness_status(struct intel_pxp *pxp, int timeout_ms);
+ int intel_pxp_get_backend_timeout_ms(struct intel_pxp *pxp);
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
+index 8c35bd5cb578..067a00a5dc63 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_cmd.h
+@@ -12,10 +12,6 @@
+ struct intel_pxp;
+ 
+ int intel_pxp_terminate_sessions(struct intel_pxp *pxp, long mask);
+-
+-static inline int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
+-{
+-	return intel_pxp_terminate_sessions(pxp, BIT(id));
+-}
++int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id);
+ 
+ #endif /* __INTEL_PXP_CMD_H__ */
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+index f2e3de367758..32574bb351d4 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_session.c
+@@ -360,6 +360,24 @@ static int pxp_create_arb_session(struct intel_pxp *pxp)
+ 	return 0;
+ }
+ 
++int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
++{
++	int ret;
++
++	ret = intel_pxp_terminate_sessions(pxp, BIT(id));
++	if (ret)
++		return ret;
++
++	ret = pxp_wait_for_session_state(pxp, id, false);
++	if (ret)
++		drm_dbg(&pxp->ctrl_gt->i915->drm, "Session state-%d did not clear\n", id);
++
++	if (!HAS_ENGINE(pxp->ctrl_gt, GSC0))
++		intel_pxp_tee_end_fw_sessions(pxp, BIT(id));
++
++	return ret;
++}
++
+ static int pxp_terminate_all_sessions(struct intel_pxp *pxp)
+ {
+ 	int ret;
+@@ -397,12 +415,15 @@ static int pxp_terminate_all_sessions_and_global(struct intel_pxp *pxp)
+ {
+ 	int ret;
+ 	struct intel_gt *gt = pxp->ctrl_gt;
++	u32 active_sip_slots;
+ 
+ 	/* must mark termination in progress calling this function */
+ 	GEM_WARN_ON(pxp->arb_session.is_valid);
+ 
+ 	mutex_lock(&pxp->session_mutex);
+ 
++	active_sip_slots = intel_uncore_read(gt->uncore, KCR_SIP(pxp->kcr_base));
++
+ 	/* terminate the hw sessions */
+ 	ret = pxp_terminate_all_sessions(pxp);
+ 	if (ret) {
+@@ -418,10 +439,11 @@ static int pxp_terminate_all_sessions_and_global(struct intel_pxp *pxp)
+ 
+ 	intel_uncore_write(gt->uncore, KCR_GLOBAL_TERMINATE(pxp->kcr_base), 1);
+ 
+-	if (HAS_ENGINE(gt, GSC0))
++	/* muti-session support not yet enabled for GSCCS */
++	if (HAS_ENGINE(gt, GSC0) && (active_sip_slots & BIT(ARB_SESSION)))
+ 		intel_pxp_gsccs_end_arb_fw_session(pxp, ARB_SESSION);
+ 	else
+-		intel_pxp_tee_end_arb_fw_session(pxp, ARB_SESSION);
++		intel_pxp_tee_end_fw_sessions(pxp, active_sip_slots);
+ 
+ out:
+ 	mutex_unlock(&pxp->session_mutex);
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+index 5f62a0b3b900..30c067dfd56c 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+@@ -362,7 +362,7 @@ int intel_pxp_tee_cmd_create_arb_session(struct intel_pxp *pxp,
+ 	return ret;
+ }
+ 
+-void intel_pxp_tee_end_arb_fw_session(struct intel_pxp *pxp, u32 session_id)
++static void intel_pxp_tee_end_one_fw_session(struct intel_pxp *pxp, u32 session_id)
+ {
+ 	struct drm_i915_private *i915 = pxp->ctrl_gt->i915;
+ 	struct pxp42_inv_stream_key_in msg_in = {0};
+@@ -408,6 +408,16 @@ void intel_pxp_tee_end_arb_fw_session(struct intel_pxp *pxp, u32 session_id)
+ 	}
+ }
+ 
++void intel_pxp_tee_end_fw_sessions(struct intel_pxp *pxp, u32 sessions_mask)
++{
++	int n;
++
++	for (n = 0; n < INTEL_PXP_MAX_HWDRM_SESSIONS; ++n) {
++		if (sessions_mask & (1 << n))
++			intel_pxp_tee_end_one_fw_session(pxp, n);
++	}
++}
++
+ static bool tee_ioctl_buffer_size_valid(u32 size)
+ {
+ 	return size > 0 && size <= SZ_64K;
+-- 
+2.42.0
+
