@@ -1,0 +1,87 @@
+From 7dcb3b603486df850e4d68a12d9438124a0e6c3c Mon Sep 17 00:00:00 2001
+From: Juston Li <juston.li@intel.com>
+Date: Thu, 30 Sep 2021 10:22:03 -0700
+Subject: [PATCH 288/333] drm/i915/pxp:[PXP-MULTI] handle interrupted PXP TEE
+ messages
+
+If a signal occurs during PXP TEE messages, MEI PXP exits and doesn't
+wait for the response. The send still went through though and a response
+will come causing the next PXP TEE message to send its own message but
+then receive the response from the previously interrupted message and we
+end up with all subsequent messages getting out of sync.
+
+Flag whenever a message is interrupted so on the next message we can
+drop that message before starting a new send/recv.
+
+Signed-off-by: Juston Li <juston.li@intel.com>
+Reviewed-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Signed-off-by: Alan Previn <alan.previn.teres.alexis@intel.com>
+Acked-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+---
+ drivers/gpu/drm/i915/pxp/intel_pxp_tee.c   | 16 ++++++++++++++++
+ drivers/gpu/drm/i915/pxp/intel_pxp_types.h |  7 +++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+index 30c067dfd56c..28c95c1287d9 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_tee.c
+@@ -60,6 +60,7 @@ static int intel_pxp_tee_io_message(struct intel_pxp *pxp,
+ {
+ 	struct drm_i915_private *i915 = pxp->ctrl_gt->i915;
+ 	struct i915_pxp_component *pxp_component = pxp->pxp_component;
++	u8 tmp_drop_buf[64];
+ 	int ret = 0;
+ 
+ 	mutex_lock(&pxp->tee_mutex);
+@@ -73,14 +74,29 @@ static int intel_pxp_tee_io_message(struct intel_pxp *pxp,
+ 		goto unlock;
+ 	}
+ 
++	if (pxp->mei_pxp_last_msg_interrupted) {
++		/* read and drop data from the previous iteration */
++		ret = pxp_component->ops->recv(pxp_component->tee_dev, &tmp_drop_buf, 64);
++		if (ret == -EINTR)
++			goto unlock;
++
++		pxp->mei_pxp_last_msg_interrupted = false;
++	}
++
+ 	ret = pxp_component->ops->send(pxp_component->tee_dev, msg_in, msg_in_size);
+ 	if (ret) {
++		/* flag on next msg to drop interrupted msg */
++		if (ret == -EINTR)
++			pxp->mei_pxp_last_msg_interrupted = true;
+ 		drm_err(&i915->drm, "Failed to send PXP TEE message\n");
+ 		goto unlock;
+ 	}
+ 
+ 	ret = pxp_component->ops->recv(pxp_component->tee_dev, msg_out, msg_out_max_size);
+ 	if (ret < 0) {
++		/* flag on next msg to drop interrupted msg */
++		if (ret == -EINTR)
++			pxp->mei_pxp_last_msg_interrupted = true;
+ 		drm_err(&i915->drm, "Failed to receive PXP TEE message\n");
+ 		goto unlock;
+ 	}
+diff --git a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+index a813ca9e937f..62ab575c1805 100644
+--- a/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
++++ b/drivers/gpu/drm/i915/pxp/intel_pxp_types.h
+@@ -92,6 +92,13 @@ struct intel_pxp {
+ 	 * @dev_link: Enforce module relationship for power management ordering.
+ 	 */
+ 	struct device_link *dev_link;
++	/**
++	 * @mei_pxp_last_msg_interrupted: To catch and drop stale responses
++	 * from previuosly interrupted send-msg to mei before issuing new
++	 * send-recv.
++	 */
++	bool mei_pxp_last_msg_interrupted;
++
+ 	/**
+ 	 * @pxp_component_added: track if the pxp component has been added.
+ 	 * Set and cleared in tee init and fini functions respectively.
+-- 
+2.42.0
+

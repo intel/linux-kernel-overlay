@@ -1,0 +1,147 @@
+From 5bddb14b4c331155694b26405c713de7a28b686b Mon Sep 17 00:00:00 2001
+From: Uma Shankar <uma.shankar@intel.com>
+Date: Tue, 18 Apr 2023 18:38:29 +0530
+Subject: [PATCH 236/333] drm: Add Plane Degamma Lut property
+
+Add Plane Degamma Lut as a blob property. User will calculate
+the lut values, create the blob and send it to driver using
+this property. Lut calculation will be based on the gamma mode
+chosen out of the gamma mode exposed.
+
+Signed-off-by: Uma Shankar <uma.shankar@intel.com>
+---
+ drivers/gpu/drm/drm_atomic_state_helper.c |  4 ++++
+ drivers/gpu/drm/drm_atomic_uapi.c         | 10 ++++++++++
+ drivers/gpu/drm/drm_color_mgmt.c          | 19 +++++++++++++++++++
+ include/drm/drm_plane.h                   | 14 ++++++++++++++
+ 4 files changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic_state_helper.c b/drivers/gpu/drm/drm_atomic_state_helper.c
+index 3abba70b5927..4f20ffa98c33 100644
+--- a/drivers/gpu/drm/drm_atomic_state_helper.c
++++ b/drivers/gpu/drm/drm_atomic_state_helper.c
+@@ -339,6 +339,9 @@ void __drm_atomic_helper_plane_duplicate_state(struct drm_plane *plane,
+ 	state->commit = NULL;
+ 	state->fb_damage_clips = NULL;
+ 
++	if (state->degamma_lut)
++		drm_property_blob_get(state->degamma_lut);
++
+ 	state->color_mgmt_changed = false;
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_plane_duplicate_state);
+@@ -386,6 +389,7 @@ void __drm_atomic_helper_plane_destroy_state(struct drm_plane_state *state)
+ 		drm_crtc_commit_put(state->commit);
+ 
+ 	drm_property_blob_put(state->fb_damage_clips);
++	drm_property_blob_put(state->degamma_lut);
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_plane_destroy_state);
+ 
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index 055daf1c94c5..36dd4a0e5452 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -587,6 +587,13 @@ static int drm_atomic_plane_set_property(struct drm_plane *plane,
+ 		state->color_range = val;
+ 	} else if (property == plane->degamma_mode_property) {
+ 		state->degamma_mode = val;
++	} else if (property == plane->degamma_lut_property) {
++		ret = drm_atomic_replace_property_blob_from_id(dev,
++					&state->degamma_lut,
++					val, -1, sizeof(struct drm_color_lut_ext),
++					&replaced);
++		state->color_mgmt_changed |= replaced;
++		return ret;
+ 	} else if (property == config->prop_fb_damage_clips) {
+ 		ret = drm_atomic_replace_property_blob_from_id(dev,
+ 					&state->fb_damage_clips,
+@@ -655,6 +662,9 @@ drm_atomic_plane_get_property(struct drm_plane *plane,
+ 		*val = state->color_range;
+ 	} else if (property == plane->degamma_mode_property) {
+ 		*val = state->degamma_mode;
++	} else if (property == plane->degamma_lut_property) {
++		*val = (state->degamma_lut) ?
++			state->degamma_lut->base.id : 0;
+ 	} else if (property == config->prop_fb_damage_clips) {
+ 		*val = (state->fb_damage_clips) ?
+ 			state->fb_damage_clips->base.id : 0;
+diff --git a/drivers/gpu/drm/drm_color_mgmt.c b/drivers/gpu/drm/drm_color_mgmt.c
+index af8df7f7feff..aaad7578be4e 100644
+--- a/drivers/gpu/drm/drm_color_mgmt.c
++++ b/drivers/gpu/drm/drm_color_mgmt.c
+@@ -675,6 +675,12 @@ EXPORT_SYMBOL(drm_plane_create_color_properties);
+  *     to query and get the plane degamma color caps and choose the
+  *     appropriate degamma mode and create lut values accordingly
+  *
++ * degamma_lut_property:
++ *	Blob property which allows a userspace to provide LUT values
++ *	to apply degamma curve using the h/w plane degamma processing
++ *	engine, thereby making the content as linear for further color
++ *	processing.
++ *
+  */
+ int drm_plane_create_color_mgmt_properties(struct drm_device *dev,
+ 					   struct drm_plane *plane,
+@@ -689,6 +695,13 @@ int drm_plane_create_color_mgmt_properties(struct drm_device *dev,
+ 
+ 	plane->degamma_mode_property = prop;
+ 
++	prop = drm_property_create(dev, DRM_MODE_PROP_BLOB,
++				   "PLANE_DEGAMMA_LUT", 0);
++	if (!prop)
++		return -ENOMEM;
++
++	plane->degamma_lut_property = prop;
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(drm_plane_create_color_mgmt_properties);
+@@ -700,6 +713,12 @@ void drm_plane_attach_degamma_properties(struct drm_plane *plane)
+ 
+ 	drm_object_attach_property(&plane->base,
+ 				   plane->degamma_mode_property, 0);
++
++	if (!plane->degamma_lut_property)
++		return;
++
++	drm_object_attach_property(&plane->base,
++				   plane->degamma_lut_property, 0);
+ }
+ EXPORT_SYMBOL(drm_plane_attach_degamma_properties);
+ 
+diff --git a/include/drm/drm_plane.h b/include/drm/drm_plane.h
+index cc3d075324fd..a18261fe44c1 100644
+--- a/include/drm/drm_plane.h
++++ b/include/drm/drm_plane.h
+@@ -245,6 +245,14 @@ struct drm_plane_state {
+ 	 */
+ 	u32 degamma_mode;
+ 
++	/* @degamma_lut:
++	 *
++	 * Lookup table for converting framebuffer pixel data before apply the
++	 * color conversion matrix @ctm. See drm_plane_enable_color_mgmt(). The
++	 * blob (if not NULL) is an array of &struct drm_color_lut_ext.
++	 */
++	struct drm_property_blob *degamma_lut;
++
+ 	u8 color_mgmt_changed : 1;
+ };
+ 
+@@ -763,6 +771,12 @@ struct drm_plane {
+ 	 * used to convert the framebuffer's colors to linear gamma.
+ 	 */
+ 	struct drm_property *degamma_mode_property;
++
++	/**
++	 * @degamma_lut_property: Optional Plane property to set the LUT
++	 * used to convert the framebuffer's colors to linear gamma.
++	 */
++	struct drm_property *degamma_lut_property;
+ };
+ 
+ #define obj_to_plane(x) container_of(x, struct drm_plane, base)
+-- 
+2.42.0
+

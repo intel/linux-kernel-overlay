@@ -1,0 +1,255 @@
+From d9c9a2400a7bdd601f97d99eb264804930a39ac0 Mon Sep 17 00:00:00 2001
+From: "Gan, Yi Fang" <yi.fang.gan@intel.com>
+Date: Tue, 21 Nov 2023 13:38:42 +0800
+Subject: [PATCH 01/35] net: stmmac: Add support for HW-accelerated VLAN
+ stripping
+
+Current implementation supports driver level VLAN tag stripping only.
+The features is always on if CONFIG_VLAN_8021Q is enabled in kernel
+config and is not user configurable.
+
+This patch add support to MAC level VLAN tag stripping and can be
+configured through ethtool. If the rx-vlan-offload is off, the VLAN tag
+will be stripped by driver. If the rx-vlan-offload is on, the VLAN tag
+will be stripped by MAC.
+
+Command: ethtool -K <interface> rx-vlan-offload off | on
+
+Signed-off-by: Lai Peter Jun Ann <jun.ann.lai@intel.com>
+Signed-off-by: Gan, Yi Fang <yi.fang.gan@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/stmicro/stmmac/common.h  |  1 +
+ .../net/ethernet/stmicro/stmmac/dwmac4_core.c | 35 +++++++++++++++++++
+ .../ethernet/stmicro/stmmac/dwmac4_descs.c    | 13 +++++++
+ drivers/net/ethernet/stmicro/stmmac/hwif.h    | 15 ++++++++
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 28 +++++++++++++--
+ 5 files changed, 90 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 1e996c29043d..4a37f5c4072c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -580,6 +580,7 @@ struct mac_device_info {
+ 	u32 vlan_filter[32];
+ 	bool vlan_fail_q_en;
+ 	u8 vlan_fail_q;
++	bool hw_vlan_en;
+ };
+ 
+ struct stmmac_rx_routing {
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c b/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
+index c6ff1fa0e04d..5f35faf90963 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
+@@ -1134,6 +1134,35 @@ static int dwmac4_config_l4_filter(struct mac_device_info *hw, u32 filter_no,
+ 	return 0;
+ }
+ 
++static void dwmac4_rx_hw_vlan(struct mac_device_info *hw,
++			      struct dma_desc *rx_desc, struct sk_buff *skb)
++{
++	if (hw->desc->get_rx_vlan_valid(rx_desc)) {
++		u16 vid = hw->desc->get_rx_vlan_tci(rx_desc);
++
++		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
++	}
++}
++
++static void dwmac4_set_hw_vlan_mode(struct mac_device_info *hw)
++{
++	void __iomem *ioaddr = hw->pcsr;
++	u32 value = readl(ioaddr + GMAC_VLAN_TAG);
++
++	value &= ~GMAC_VLAN_TAG_CTRL_EVLS_MASK;
++
++	if (hw->hw_vlan_en)
++		/* Always strip VLAN on Receive */
++		value |= GMAC_VLAN_TAG_STRIP_ALL;
++	else
++		/* Do not strip VLAN on Receive */
++		value |= GMAC_VLAN_TAG_STRIP_NONE;
++
++	/* Enable outer VLAN Tag in Rx DMA descriptor */
++	value |= GMAC_VLAN_TAG_CTRL_EVLRXS;
++	writel(value, ioaddr + GMAC_VLAN_TAG);
++}
++
+ const struct stmmac_ops dwmac4_ops = {
+ 	.core_init = dwmac4_core_init,
+ 	.phylink_get_caps = dwmac4_phylink_get_caps,
+@@ -1175,6 +1204,8 @@ const struct stmmac_ops dwmac4_ops = {
+ 	.add_hw_vlan_rx_fltr = dwmac4_add_hw_vlan_rx_fltr,
+ 	.del_hw_vlan_rx_fltr = dwmac4_del_hw_vlan_rx_fltr,
+ 	.restore_hw_vlan_rx_fltr = dwmac4_restore_hw_vlan_rx_fltr,
++	.rx_hw_vlan = dwmac4_rx_hw_vlan,
++	.set_hw_vlan_mode = dwmac4_set_hw_vlan_mode,
+ };
+ 
+ const struct stmmac_ops dwmac410_ops = {
+@@ -1224,6 +1255,8 @@ const struct stmmac_ops dwmac410_ops = {
+ 	.add_hw_vlan_rx_fltr = dwmac4_add_hw_vlan_rx_fltr,
+ 	.del_hw_vlan_rx_fltr = dwmac4_del_hw_vlan_rx_fltr,
+ 	.restore_hw_vlan_rx_fltr = dwmac4_restore_hw_vlan_rx_fltr,
++	.rx_hw_vlan = dwmac4_rx_hw_vlan,
++	.set_hw_vlan_mode = dwmac4_set_hw_vlan_mode,
+ };
+ 
+ const struct stmmac_ops dwmac510_ops = {
+@@ -1277,6 +1310,8 @@ const struct stmmac_ops dwmac510_ops = {
+ 	.add_hw_vlan_rx_fltr = dwmac4_add_hw_vlan_rx_fltr,
+ 	.del_hw_vlan_rx_fltr = dwmac4_del_hw_vlan_rx_fltr,
+ 	.restore_hw_vlan_rx_fltr = dwmac4_restore_hw_vlan_rx_fltr,
++	.rx_hw_vlan = dwmac4_rx_hw_vlan,
++	.set_hw_vlan_mode = dwmac4_set_hw_vlan_mode,
+ };
+ 
+ static u32 dwmac4_get_num_vlan(void __iomem *ioaddr)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c b/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
+index 89a14084c611..1c5802e0d7f4 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
+@@ -198,6 +198,17 @@ static int dwmac4_get_tx_ls(struct dma_desc *p)
+ 		>> TDES3_LAST_DESCRIPTOR_SHIFT;
+ }
+ 
++static u16 dwmac4_wrback_get_rx_vlan_tci(struct dma_desc *p)
++{
++	return (le32_to_cpu(p->des0) & RDES0_VLAN_TAG_MASK);
++}
++
++static bool dwmac4_wrback_get_rx_vlan_valid(struct dma_desc *p)
++{
++	return ((le32_to_cpu(p->des3) & RDES3_LAST_DESCRIPTOR) &&
++		(le32_to_cpu(p->des3) & RDES3_RDES0_VALID));
++}
++
+ static int dwmac4_wrback_get_rx_frame_len(struct dma_desc *p, int rx_coe)
+ {
+ 	return (le32_to_cpu(p->des3) & RDES3_PACKET_SIZE_MASK);
+@@ -551,6 +562,8 @@ const struct stmmac_desc_ops dwmac4_desc_ops = {
+ 	.set_tx_owner = dwmac4_set_tx_owner,
+ 	.set_rx_owner = dwmac4_set_rx_owner,
+ 	.get_tx_ls = dwmac4_get_tx_ls,
++	.get_rx_vlan_tci = dwmac4_wrback_get_rx_vlan_tci,
++	.get_rx_vlan_valid = dwmac4_wrback_get_rx_vlan_valid,
+ 	.get_rx_frame_len = dwmac4_wrback_get_rx_frame_len,
+ 	.enable_tx_timestamp = dwmac4_rd_enable_tx_timestamp,
+ 	.get_tx_timestamp_status = dwmac4_wrback_get_tx_timestamp_status,
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index 68aa2d5ca6e5..b87c8e876c69 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -56,6 +56,10 @@ struct stmmac_desc_ops {
+ 	void (*set_tx_ic)(struct dma_desc *p);
+ 	/* Last tx segment reports the transmit status */
+ 	int (*get_tx_ls)(struct dma_desc *p);
++	/* Get the tag of the descriptor */
++	u16 (*get_rx_vlan_tci)(struct dma_desc *p);
++	/* Get the valid status of descriptor */
++	bool (*get_rx_vlan_valid)(struct dma_desc *p);
+ 	/* Return the transmit status looking at the TDES1 */
+ 	int (*tx_status)(struct stmmac_extra_stats *x,
+ 			 struct dma_desc *p, void __iomem *ioaddr);
+@@ -117,6 +121,10 @@ struct stmmac_desc_ops {
+ 	stmmac_do_void_callback(__priv, desc, set_tx_ic, __args)
+ #define stmmac_get_tx_ls(__priv, __args...) \
+ 	stmmac_do_callback(__priv, desc, get_tx_ls, __args)
++#define stmmac_get_rx_vlan_tci(__priv, __args...) \
++	stmmac_do_callback(__priv, desc, get_rx_vlan_tci, __args)
++#define stmmac_get_rx_vlan_valid(__priv, __args...) \
++	stmmac_do_callback(__priv, desc, get_rx_vlan_valid, __args)
+ #define stmmac_tx_status(__priv, __args...) \
+ 	stmmac_do_callback(__priv, desc, tx_status, __args)
+ #define stmmac_get_tx_len(__priv, __args...) \
+@@ -388,6 +396,9 @@ struct stmmac_ops {
+ 	void (*update_vlan_hash)(struct mac_device_info *hw, u32 hash,
+ 				 __le16 perfect_match, bool is_double);
+ 	void (*enable_vlan)(struct mac_device_info *hw, u32 type);
++	void (*rx_hw_vlan)(struct mac_device_info *hw, struct dma_desc *rx_desc,
++			   struct sk_buff *skb);
++	void (*set_hw_vlan_mode)(struct mac_device_info *hw);
+ 	int (*add_hw_vlan_rx_fltr)(struct net_device *dev,
+ 				   struct mac_device_info *hw,
+ 				   __be16 proto, u16 vid);
+@@ -499,6 +510,10 @@ struct stmmac_ops {
+ 	stmmac_do_void_callback(__priv, mac, update_vlan_hash, __args)
+ #define stmmac_enable_vlan(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, mac, enable_vlan, __args)
++#define stmmac_rx_hw_vlan(__priv, __args...) \
++	stmmac_do_void_callback(__priv, mac, rx_hw_vlan, __args)
++#define stmmac_set_hw_vlan_mode(__priv, __args...) \
++	stmmac_do_void_callback(__priv, mac, set_hw_vlan_mode, __args)
+ #define stmmac_add_hw_vlan_rx_fltr(__priv, __args...) \
+ 	stmmac_do_callback(__priv, mac, add_hw_vlan_rx_fltr, __args)
+ #define stmmac_del_hw_vlan_rx_fltr(__priv, __args...) \
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 69b9c71f0ede..c7fd8e5e6710 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3454,6 +3454,8 @@ static int stmmac_hw_setup(struct net_device *dev, bool ptp_register)
+ 	/* Start the ball rolling... */
+ 	stmmac_start_all_dma(priv);
+ 
++	stmmac_set_hw_vlan_mode(priv, priv->hw);
++
+ 	if (priv->dma_cap.fpesel) {
+ 		stmmac_fpe_start_wq(priv);
+ 
+@@ -4968,7 +4970,12 @@ static void stmmac_dispatch_skb_zc(struct stmmac_priv *priv, u32 queue,
+ 	}
+ 
+ 	stmmac_get_rx_hwtstamp(priv, p, np, skb);
+-	stmmac_rx_vlan(priv->dev, skb);
++	if (priv->hw->hw_vlan_en)
++		/* MAC level stripping. */
++		stmmac_rx_hw_vlan(priv, priv->hw, p, skb);
++	else
++		/* Driver level stripping. */
++		stmmac_rx_vlan(priv->dev, skb);
+ 	skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+ 	if (unlikely(!coe))
+@@ -5484,7 +5491,14 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 		/* Got entire packet into SKB. Finish it. */
+ 
+ 		stmmac_get_rx_hwtstamp(priv, p, np, skb);
+-		stmmac_rx_vlan(priv->dev, skb);
++
++		if (priv->hw->hw_vlan_en)
++			/* MAC level stripping. */
++			stmmac_rx_hw_vlan(priv, priv->hw, p, skb);
++		else
++			/* Driver level stripping. */
++			stmmac_rx_vlan(priv->dev, skb);
++
+ 		skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+ 		if (unlikely(!coe))
+@@ -5783,6 +5797,13 @@ static int stmmac_set_features(struct net_device *netdev,
+ 			stmmac_enable_sph(priv, priv->ioaddr, sph_en, chan);
+ 	}
+ 
++	if (features & NETIF_F_HW_VLAN_CTAG_RX)
++		priv->hw->hw_vlan_en = true;
++	else
++		priv->hw->hw_vlan_en = false;
++
++	stmmac_set_hw_vlan_mode(priv, priv->hw);
++
+ 	return 0;
+ }
+ 
+@@ -7485,6 +7506,9 @@ int stmmac_dvr_probe(struct device *device,
+ #ifdef STMMAC_VLAN_TAG_USED
+ 	/* Both mac100 and gmac support receive VLAN tag detection */
+ 	ndev->features |= NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_HW_VLAN_STAG_RX;
++	ndev->hw_features |= NETIF_F_HW_VLAN_CTAG_RX;
++	priv->hw->hw_vlan_en = true;
++
+ 	if (priv->dma_cap.vlhash) {
+ 		ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+ 		ndev->features |= NETIF_F_HW_VLAN_STAG_FILTER;
+-- 
+2.42.0
+
