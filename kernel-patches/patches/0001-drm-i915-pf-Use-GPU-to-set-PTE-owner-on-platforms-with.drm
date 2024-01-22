@@ -1,0 +1,105 @@
+From 543614bc78caeb03a32d9f7c20c9da9db18f4a5e Mon Sep 17 00:00:00 2001
+From: "Mohd Azmy, Muhammad Amirul" <muhammad.amirul.mohd.azmy@intel.com>
+Date: Thu, 18 Jan 2024 16:30:14 +0800
+Subject: [PATCH 1/4] drm/i915/pf: Use GPU to set PTE owner on platforms with
+ Media gen13
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On platforms with Media GT gen 13, we have to use the GPU to
+update the GGTT as WA.
+Let's add the ability for PF, to set the owner of the GGTT range using the GPU,
+on platforms that require such WA.
+
+Signed-off-by: Piotr Piórkowski <piotr.piorkowski@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Signed-off-by: Mohd Azmy, Muhammad Amirul <muhammad.amirul.mohd.azmy@intel.com>
+---
+ drivers/gpu/drm/i915/gt/intel_ggtt.c | 51 ++++++----------------------
+ 1 file changed, 11 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index d13fbbbc67d7..9b964a2487d9 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -1810,10 +1810,9 @@ static int sgtable_update_ptes_via_cpu(struct i915_ggtt *ggtt, u32 ggtt_addr, st
+ int i915_ggtt_sgtable_update_ptes(struct i915_ggtt *ggtt, u32 ggtt_addr, struct sg_table *st,
+ 				  u32 num_entries, const gen8_pte_t pte_pattern)
+ {
+-	struct intel_gt *gt = ggtt->vm.gt;
+ 	int ret;
+ 
+-	if (intel_gt_is_bind_context_ready(gt))
++	if (should_update_ggtt_with_bind(ggtt))
+ 		ret = gen8_ggtt_bind_ptes(ggtt, ggtt_addr >> PAGE_SHIFT, st, num_entries,
+ 					  pte_pattern);
+ 	else
+@@ -1841,7 +1840,6 @@ void i915_ggtt_set_space_owner(struct i915_ggtt *ggtt, u16 vfid,
+ 	const gen8_pte_t pte = i915_ggtt_prepare_vf_pte(vfid);
+ 	u64 base = node->start;
+ 	u64 size = node->size;
+-	int ret = 0;
+ 
+ 	GEM_BUG_ON(!IS_SRIOV_PF(ggtt->vm.i915));
+ 	GEM_BUG_ON(base % PAGE_SIZE);
+@@ -1850,46 +1848,19 @@ void i915_ggtt_set_space_owner(struct i915_ggtt *ggtt, u16 vfid,
+ 	gt_dbg(ggtt->vm.gt, "GGTT VF%u [%#llx-%#llx] %lluK\n",
+ 	       vfid, base, base + size, size / SZ_1K);
+ 
+-	if (intel_gt_is_bind_context_ready(ggtt->vm.gt)) {
+-		struct sg_table *st;
+-		struct scatterlist *sg;
+-		u64 n_ptes = (size / PAGE_SIZE);
+-
+-		st = kmalloc(sizeof(*st), GFP_KERNEL);
+-		if (!st)
+-			WARN_ON(-ENOMEM);
+-
+-		if (sg_alloc_table(st, n_ptes, GFP_KERNEL)) {
+-			kfree(st);
+-			WARN_ON(-ENOMEM);
+-		}
+-
+-		sg = st->sgl;
+-		st->nents = 0;
+-
+-		while (size) {
+-			st->nents++;
+-			sg_set_page(sg, NULL, I915_GTT_PAGE_SIZE, 0);
+-			sg_dma_address(sg) = 0;
+-			sg_dma_len(sg) = I915_GTT_PAGE_SIZE;
+-			sg = sg_next(sg);
+-			size -= PAGE_SIZE;
+-		}
+-
+-		ret = gen8_ggtt_bind_ptes(ggtt, base >> PAGE_SHIFT, st, n_ptes, pte);
+-
+-		sg_free_table(st);
+-		kfree(st);
+-		WARN_ON(ret == false);
+-	} else {
++	/* Wa_22018453856 */
++	if (i915_ggtt_require_binder(ggtt->vm.i915) &&
++	    should_update_ggtt_with_bind(ggtt) &&
++	    gen8_ggtt_bind_ptes(ggtt, base >> PAGE_SHIFT, NULL, size / PAGE_SIZE, pte))
++			goto invalidate;
+ 
+-		gtt_entries += base >> PAGE_SHIFT;
+-		while (size) {
+-			gen8_set_pte(gtt_entries++, pte);
+-			size -= PAGE_SIZE;
+-		}
++	gtt_entries += base >> PAGE_SHIFT;
++	while (size) {
++		gen8_set_pte(gtt_entries++, pte);
++		size -= PAGE_SIZE;
+ 	}
+ 
++invalidate:
+ 	ggtt->invalidate(ggtt);
+ }
+ 
+-- 
+2.25.1
+
