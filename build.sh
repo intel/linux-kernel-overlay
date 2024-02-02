@@ -54,10 +54,9 @@ if [ -d "${BUILD_DIR}" ] && [ -f "$BUILD_DIR/.git/config" ] ; then
 elif [ -z "${KSRC_MIRROR}" ] ; then
 
 	echo "Mirror is not defined, clone the Linux kernel repository from community to $BUILD_DIR, tag: $KSRC_UPSTREAM_TAG"
-	git clone $KSRC_REPO $BUILD_DIR
+	git clone --single-branch -b $KSRC_UPSTREAM_TAG $KSRC_REPO $BUILD_DIR
 	pushd $BUILD_DIR
-	git fetch --tags --verbose
-	git checkout $KSRC_UPSTREAM_TAG
+	make kernelversion
 	popd
 else
 
