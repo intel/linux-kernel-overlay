@@ -1,0 +1,398 @@
+From b7b53c32d5472adbda39f3df11ea48e7ab21227e Mon Sep 17 00:00:00 2001
+From: Ranjan Dutta <ranjan.dutta@intel.com>
+Date: Fri, 16 Feb 2024 04:28:18 +0800
+Subject: [PATCH] Revert "drm/vmwgfx: Keep a gem reference to user bos in
+ surfaces"
+
+This reverts commit 104f95698cad038caa8f7496be67f738d8ace9cb.
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_bo.c       |  5 +++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c  |  8 +++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h      | 22 +++++--------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c  | 10 ++++-----
+ drivers/gpu/drm/vmwgfx/vmwgfx_gem.c      | 24 +++++----------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c      |  6 +++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c  |  2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c | 18 ++++++++--------
+ drivers/gpu/drm/vmwgfx/vmwgfx_shader.c   |  4 ++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_surface.c  | 27 +++++++++++++++++-------
+ 10 files changed, 55 insertions(+), 71 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index c46f380d91499..5ac5efea1d601 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -595,7 +595,7 @@ static int vmw_user_bo_synccpu_release(struct drm_file *filp,
+ 		if (!(flags & drm_vmw_synccpu_allow_cs)) {
+ 			atomic_dec(&vmw_bo->cpu_writers);
+ 		}
+-		vmw_user_bo_unref(&vmw_bo);
++		vmw_user_bo_unref(vmw_bo);
+ 	}
+ 
+ 	return ret;
+@@ -637,7 +637,7 @@ int vmw_user_bo_synccpu_ioctl(struct drm_device *dev, void *data,
+ 			return ret;
+ 
+ 		ret = vmw_user_bo_synccpu_grab(vbo, arg->flags);
+-		vmw_user_bo_unref(&vbo);
++		vmw_user_bo_unref(vbo);
+ 		if (unlikely(ret != 0)) {
+ 			if (ret == -ERESTARTSYS || ret == -EBUSY)
+ 				return -EBUSY;
+@@ -711,6 +711,7 @@ int vmw_user_bo_lookup(struct drm_file *filp,
+ 	}
+ 
+ 	*out = gem_to_vmw_bo(gobj);
++	ttm_bo_get(&(*out)->base);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c b/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
+index 97e56a94eaf80..79b30dc9d8253 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cotable.c
+@@ -407,8 +407,8 @@ static int vmw_cotable_resize(struct vmw_resource *res, size_t new_size)
+ 	 * for the new COTable. Initially pin the buffer object to make sure
+ 	 * we can use tryreserve without failure.
+ 	 */
+-	ret = vmw_gem_object_create(dev_priv, new_size, &vmw_mob_placement,
+-				    true, true, vmw_bo_bo_free, &buf);
++	ret = vmw_bo_create(dev_priv, new_size, &vmw_mob_placement,
++			    true, true, vmw_bo_bo_free, &buf);
+ 	if (ret) {
+ 		DRM_ERROR("Failed initializing new cotable MOB.\n");
+ 		return ret;
+@@ -475,7 +475,7 @@ static int vmw_cotable_resize(struct vmw_resource *res, size_t new_size)
+ 
+ 	vmw_resource_mob_attach(res);
+ 	/* Let go of the old mob. */
+-	vmw_user_bo_unref(&old_buf);
++	vmw_bo_unreference(&old_buf);
+ 	res->id = vcotbl->type;
+ 
+ 	ret = dma_resv_reserve_fences(bo->base.resv, 1);
+@@ -492,7 +492,7 @@ static int vmw_cotable_resize(struct vmw_resource *res, size_t new_size)
+ out_wait:
+ 	ttm_bo_unpin(bo);
+ 	ttm_bo_unreserve(bo);
+-	vmw_user_bo_unref(&buf);
++	vmw_bo_unreference(&buf);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index 136f1cdcf8cdf..5be15732fbc5a 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -969,11 +969,6 @@ static inline void vmw_bo_prio_del(struct vmw_buffer_object *vbo, int prio)
+ /**
+  * GEM related functionality - vmwgfx_gem.c
+  */
+-extern int vmw_gem_object_create(struct vmw_private *dev_priv,
+-				  size_t size, struct ttm_placement *placement,
+-				  bool interruptible, bool pin,
+-				  void (*bo_free)(struct ttm_buffer_object *bo),
+-				  struct vmw_buffer_object **p_bo);
+ extern int vmw_gem_object_create_with_handle(struct vmw_private *dev_priv,
+ 					     struct drm_file *filp,
+ 					     uint32_t size,
+@@ -1605,19 +1600,12 @@ vmw_bo_reference(struct vmw_buffer_object *buf)
+ 	return buf;
+ }
+ 
+-static inline struct vmw_buffer_object *vmw_user_bo_ref(struct vmw_buffer_object *vbo)
++static inline void vmw_user_bo_unref(struct vmw_buffer_object *vbo)
+ {
+-	drm_gem_object_get(&vbo->base.base);
+-	return vbo;
+-}
+-
+-static inline void vmw_user_bo_unref(struct vmw_buffer_object **buf)
+-{
+-	struct vmw_buffer_object *tmp_buf = *buf;
+-
+-	*buf = NULL;
+-	if (tmp_buf)
+-		drm_gem_object_put(&tmp_buf->base.base);
++	if (vbo) {
++		ttm_bo_put(&vbo->base);
++		drm_gem_object_put(&vbo->base.base);
++	}
+ }
+ 
+ static inline void vmw_fifo_resource_inc(struct vmw_private *dev_priv)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+index bc7f02e4ecebb..5a8b187619d3e 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -1147,7 +1147,7 @@ static int vmw_translate_mob_ptr(struct vmw_private *dev_priv,
+ 				 SVGAMobId *id,
+ 				 struct vmw_buffer_object **vmw_bo_p)
+ {
+-	struct vmw_buffer_object *vmw_bo, *tmp_bo;
++	struct vmw_buffer_object *vmw_bo;
+ 	uint32_t handle = *id;
+ 	struct vmw_relocation *reloc;
+ 	int ret;
+@@ -1159,8 +1159,7 @@ static int vmw_translate_mob_ptr(struct vmw_private *dev_priv,
+ 		return PTR_ERR(vmw_bo);
+ 	}
+ 	ret = vmw_validation_add_bo(sw_context->ctx, vmw_bo, true, false);
+-	tmp_bo = vmw_bo;
+-	vmw_user_bo_unref(&tmp_bo);
++	vmw_user_bo_unref(vmw_bo);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+@@ -1202,7 +1201,7 @@ static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
+ 				   SVGAGuestPtr *ptr,
+ 				   struct vmw_buffer_object **vmw_bo_p)
+ {
+-	struct vmw_buffer_object *vmw_bo, *tmp_bo;
++	struct vmw_buffer_object *vmw_bo;
+ 	uint32_t handle = ptr->gmrId;
+ 	struct vmw_relocation *reloc;
+ 	int ret;
+@@ -1214,8 +1213,7 @@ static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
+ 		return PTR_ERR(vmw_bo);
+ 	}
+ 	ret = vmw_validation_add_bo(sw_context->ctx, vmw_bo, false, false);
+-	tmp_bo = vmw_bo;
+-	vmw_user_bo_unref(&tmp_bo);
++	vmw_user_bo_unref(vmw_bo);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+index e7a533e39155c..4d2c28e39f4e0 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_gem.c
+@@ -133,22 +133,6 @@ void vmw_gem_destroy(struct ttm_buffer_object *bo)
+ 	kfree(vbo);
+ }
+ 
+-int vmw_gem_object_create(struct vmw_private *vmw,
+-			  size_t size, struct ttm_placement *placement,
+-			  bool interruptible, bool pin,
+-			  void (*bo_free)(struct ttm_buffer_object *bo),
+-			  struct vmw_buffer_object **p_bo)
+-{
+-	int ret = vmw_bo_create(vmw, size, placement, interruptible, pin, bo_free, p_bo);
+-
+-	if (ret != 0)
+-		goto out_no_bo;
+-
+-	(*p_bo)->base.base.funcs = &vmw_gem_object_funcs;
+-out_no_bo:
+-	return ret;
+-}
+-
+ int vmw_gem_object_create_with_handle(struct vmw_private *dev_priv,
+ 				      struct drm_file *filp,
+ 				      uint32_t size,
+@@ -157,14 +141,16 @@ int vmw_gem_object_create_with_handle(struct vmw_private *dev_priv,
+ {
+ 	int ret;
+ 
+-	ret = vmw_gem_object_create(dev_priv, size,
+-				    (dev_priv->has_mob) ?
++	ret = vmw_bo_create(dev_priv, size,
++			    (dev_priv->has_mob) ?
+ 				    &vmw_sys_placement :
+ 				    &vmw_vram_sys_placement,
+-				    true, false, &vmw_gem_destroy, p_vbo);
++			    true, false, &vmw_gem_destroy, p_vbo);
+ 	if (ret != 0)
+ 		goto out_no_bo;
+ 
++	(*p_vbo)->base.base.funcs = &vmw_gem_object_funcs;
++
+ 	ret = drm_gem_handle_create(filp, &(*p_vbo)->base.base, handle);
+ out_no_bo:
+ 	return ret;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index aa571b75cd07f..e4b2d11f2c8b6 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1402,8 +1402,8 @@ static int vmw_create_bo_proxy(struct drm_device *dev,
+ 	/* Reserve and switch the backing mob. */
+ 	mutex_lock(&res->dev_priv->cmdbuf_mutex);
+ 	(void) vmw_resource_reserve(res, false, true);
+-	vmw_user_bo_unref(&res->backup);
+-	res->backup = vmw_user_bo_ref(bo_mob);
++	vmw_bo_unreference(&res->backup);
++	res->backup = vmw_bo_reference(bo_mob);
+ 	res->backup_offset = 0;
+ 	vmw_resource_unreserve(res, false, false, false, NULL, 0);
+ 	mutex_unlock(&res->dev_priv->cmdbuf_mutex);
+@@ -1600,7 +1600,7 @@ static struct drm_framebuffer *vmw_kms_fb_create(struct drm_device *dev,
+ err_out:
+ 	/* vmw_user_lookup_handle takes one ref so does new_fb */
+ 	if (bo)
+-		vmw_user_bo_unref(&bo);
++		vmw_user_bo_unref(bo);
+ 	if (surface)
+ 		vmw_surface_unreference(&surface);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+index abc354ead4e8b..327330055ae59 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+@@ -457,7 +457,7 @@ int vmw_overlay_ioctl(struct drm_device *dev, void *data,
+ 
+ 	ret = vmw_overlay_update_stream(dev_priv, buf, arg, true);
+ 
+-	vmw_user_bo_unref(&buf);
++	vmw_user_bo_unref(buf);
+ 
+ out_unlock:
+ 	mutex_unlock(&overlay->mutex);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index 30d1c1918bb48..c7d645e5ec7bf 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -140,7 +140,7 @@ static void vmw_resource_release(struct kref *kref)
+ 		if (res->coherent)
+ 			vmw_bo_dirty_release(res->backup);
+ 		ttm_bo_unreserve(bo);
+-		vmw_user_bo_unref(&res->backup);
++		vmw_bo_unreference(&res->backup);
+ 	}
+ 
+ 	if (likely(res->hw_destroy != NULL)) {
+@@ -330,10 +330,10 @@ static int vmw_resource_buf_alloc(struct vmw_resource *res,
+ 		return 0;
+ 	}
+ 
+-	ret = vmw_gem_object_create(res->dev_priv, res->backup_size,
+-				    res->func->backup_placement,
+-				    interruptible, false,
+-				    &vmw_bo_bo_free, &backup);
++	ret = vmw_bo_create(res->dev_priv, res->backup_size,
++			    res->func->backup_placement,
++			    interruptible, false,
++			    &vmw_bo_bo_free, &backup);
+ 	if (unlikely(ret != 0))
+ 		goto out_no_bo;
+ 
+@@ -452,11 +452,11 @@ void vmw_resource_unreserve(struct vmw_resource *res,
+ 			vmw_resource_mob_detach(res);
+ 			if (res->coherent)
+ 				vmw_bo_dirty_release(res->backup);
+-			vmw_user_bo_unref(&res->backup);
++			vmw_bo_unreference(&res->backup);
+ 		}
+ 
+ 		if (new_backup) {
+-			res->backup = vmw_user_bo_ref(new_backup);
++			res->backup = vmw_bo_reference(new_backup);
+ 
+ 			/*
+ 			 * The validation code should already have added a
+@@ -544,7 +544,7 @@ vmw_resource_check_buffer(struct ww_acquire_ctx *ticket,
+ 	ttm_bo_put(val_buf->bo);
+ 	val_buf->bo = NULL;
+ 	if (backup_dirty)
+-		vmw_user_bo_unref(&res->backup);
++		vmw_bo_unreference(&res->backup);
+ 
+ 	return ret;
+ }
+@@ -719,7 +719,7 @@ int vmw_resource_validate(struct vmw_resource *res, bool intr,
+ 		goto out_no_validate;
+ 	else if (!res->func->needs_backup && res->backup) {
+ 		WARN_ON_ONCE(vmw_resource_mob_attached(res));
+-		vmw_user_bo_unref(&res->backup);
++		vmw_bo_unreference(&res->backup);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+index 303f7a82f3509..6fd4264d6b419 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_shader.c
+@@ -177,7 +177,7 @@ static int vmw_gb_shader_init(struct vmw_private *dev_priv,
+ 
+ 	res->backup_size = size;
+ 	if (byte_code) {
+-		res->backup = vmw_user_bo_ref(byte_code);
++		res->backup = vmw_bo_reference(byte_code);
+ 		res->backup_offset = offset;
+ 	}
+ 	shader->size = size;
+@@ -806,7 +806,7 @@ static int vmw_shader_define(struct drm_device *dev, struct drm_file *file_priv,
+ 				    shader_type, num_input_sig,
+ 				    num_output_sig, tfile, shader_handle);
+ out_bad_arg:
+-	vmw_user_bo_unref(&buffer);
++	vmw_user_bo_unref(buffer);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index 50769528c3f3c..1a1a286bc749f 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -683,6 +683,9 @@ static void vmw_user_surface_base_release(struct ttm_base_object **p_base)
+ 	    container_of(base, struct vmw_user_surface, prime.base);
+ 	struct vmw_resource *res = &user_srf->srf.res;
+ 
++	if (res && res->backup)
++		drm_gem_object_put(&res->backup->base.base);
++
+ 	*p_base = NULL;
+ 	vmw_resource_unreference(&res);
+ }
+@@ -845,17 +848,23 @@ int vmw_surface_define_ioctl(struct drm_device *dev, void *data,
+ 	 * expect a backup buffer to be present.
+ 	 */
+ 	if (dev_priv->has_mob && req->shareable) {
+-		ret = vmw_gem_object_create(dev_priv,
+-					    res->backup_size,
+-					    &vmw_sys_placement,
+-					    true,
+-					    false,
+-					    &vmw_gem_destroy,
+-					    &res->backup);
++		uint32_t backup_handle;
++
++		ret = vmw_gem_object_create_with_handle(dev_priv,
++							file_priv,
++							res->backup_size,
++							&backup_handle,
++							&res->backup);
+ 		if (unlikely(ret != 0)) {
+ 			vmw_resource_unreference(&res);
+ 			goto out_unlock;
+ 		}
++		vmw_bo_reference(res->backup);
++		/*
++		 * We don't expose the handle to the userspace and surface
++		 * already holds a gem reference
++		 */
++		drm_gem_handle_delete(file_priv, backup_handle);
+ 	}
+ 
+ 	tmp = vmw_resource_reference(&srf->res);
+@@ -1496,7 +1505,7 @@ vmw_gb_surface_define_internal(struct drm_device *dev,
+ 		if (ret == 0) {
+ 			if (res->backup->base.base.size < res->backup_size) {
+ 				VMW_DEBUG_USER("Surface backup buffer too small.\n");
+-				vmw_user_bo_unref(&res->backup);
++				vmw_bo_unreference(&res->backup);
+ 				ret = -EINVAL;
+ 				goto out_unlock;
+ 			} else {
+@@ -1510,6 +1519,8 @@ vmw_gb_surface_define_internal(struct drm_device *dev,
+ 							res->backup_size,
+ 							&backup_handle,
+ 							&res->backup);
++		if (ret == 0)
++			vmw_bo_reference(res->backup);
+ 	}
+ 
+ 	if (unlikely(ret != 0)) {
+-- 
+2.25.1
+
