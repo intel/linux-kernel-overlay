@@ -1,0 +1,164 @@
+From 8c12c3547991ece67cf6ddf65bf1b6ac74374b68 Mon Sep 17 00:00:00 2001
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Wed, 14 Jun 2023 12:34:00 -0700
+Subject: [PATCH 009/163] KVM: x86: Use PFERR_GUEST_ENC_MASK to indicate fault
+ is private
+
+SEV-SNP defines PFERR_GUEST_ENC_MASK (bit 32) in page-fault error bits to
+represent the guest page is encrypted.  Use the bit to designate that the
+page fault is private and that it requires looking up memory attributes.
+The vendor kvm page fault handler should set PFERR_GUEST_ENC_MASK bit based
+on their fault information.  It may or may not use the hardware value
+directly or parse the hardware value to set the bit.
+
+For KVM_X86_SW_PROTECTED_VM, ask memory attributes for the fault
+privateness.  For async page fault, carry the bit and use it for kvm page
+fault handler.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+
+---
+Changes v4 -> v5:
+- Eliminate kvm_is_fault_private() by open code the function
+- Make async page fault handler to carry is_private bit
+
+Changes v3 -> v4:
+- rename back struct kvm_page_fault::private => is_private
+- catch up rename: KVM_X86_PROTECTED_VM => KVM_X86_SW_PROTECTED_VM
+
+Changes v2 -> v3:
+- Revive PFERR_GUEST_ENC_MASK
+- rename struct kvm_page_fault::is_private => private
+- Add check KVM_X86_PROTECTED_VM
+
+Changes v1 -> v2:
+- Introduced fault type and replaced is_private with fault_type.
+- Add kvm_get_fault_type() to encapsulate the difference.
+---
+ arch/x86/include/asm/kvm_host.h |  3 +++
+ arch/x86/kvm/mmu/mmu.c          | 26 +++++++++++++++++++-------
+ arch/x86/kvm/mmu/mmu_internal.h |  2 +-
+ 3 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b5b2d0fde579..8011bc668d79 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -264,6 +264,7 @@ enum x86_intercept_stage;
+ #define PFERR_SGX_BIT 15
+ #define PFERR_GUEST_FINAL_BIT 32
+ #define PFERR_GUEST_PAGE_BIT 33
++#define PFERR_GUEST_ENC_BIT 34
+ #define PFERR_IMPLICIT_ACCESS_BIT 48
+ 
+ #define PFERR_PRESENT_MASK	BIT(PFERR_PRESENT_BIT)
+@@ -275,6 +276,7 @@ enum x86_intercept_stage;
+ #define PFERR_SGX_MASK		BIT(PFERR_SGX_BIT)
+ #define PFERR_GUEST_FINAL_MASK	BIT_ULL(PFERR_GUEST_FINAL_BIT)
+ #define PFERR_GUEST_PAGE_MASK	BIT_ULL(PFERR_GUEST_PAGE_BIT)
++#define PFERR_GUEST_ENC_MASK	BIT_ULL(PFERR_GUEST_ENC_BIT)
+ #define PFERR_IMPLICIT_ACCESS	BIT_ULL(PFERR_IMPLICIT_ACCESS_BIT)
+ 
+ #define PFERR_NESTED_GUEST_PAGE (PFERR_GUEST_PAGE_MASK |	\
+@@ -1831,6 +1833,7 @@ struct kvm_arch_async_pf {
+ 	gfn_t gfn;
+ 	unsigned long cr3;
+ 	bool direct_map;
++	u64 error_code;
+ };
+ 
+ extern u32 __read_mostly kvm_nr_uret_msrs;
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index a0564648b104..1e970009fc46 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4246,18 +4246,19 @@ static u32 alloc_apf_token(struct kvm_vcpu *vcpu)
+ 	return (vcpu->arch.apf.id++ << 12) | vcpu->vcpu_id;
+ }
+ 
+-static bool kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+-				    gfn_t gfn)
++static bool kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu,
++				    struct kvm_page_fault *fault)
+ {
+ 	struct kvm_arch_async_pf arch;
+ 
+ 	arch.token = alloc_apf_token(vcpu);
+-	arch.gfn = gfn;
++	arch.gfn = fault->gfn;
+ 	arch.direct_map = vcpu->arch.mmu->root_role.direct;
+ 	arch.cr3 = kvm_mmu_get_guest_pgd(vcpu, vcpu->arch.mmu);
++	arch.error_code = fault->error_code & PFERR_GUEST_ENC_MASK;
+ 
+-	return kvm_setup_async_pf(vcpu, cr2_or_gpa,
+-				  kvm_vcpu_gfn_to_hva(vcpu, gfn), &arch);
++	return kvm_setup_async_pf(vcpu, fault->addr,
++				  kvm_vcpu_gfn_to_hva(vcpu, fault->gfn), &arch);
+ }
+ 
+ void kvm_arch_async_page_ready(struct kvm_vcpu *vcpu, struct kvm_async_pf *work)
+@@ -4276,7 +4277,8 @@ void kvm_arch_async_page_ready(struct kvm_vcpu *vcpu, struct kvm_async_pf *work)
+ 	      work->arch.cr3 != kvm_mmu_get_guest_pgd(vcpu, vcpu->arch.mmu))
+ 		return;
+ 
+-	kvm_mmu_do_page_fault(vcpu, work->cr2_or_gpa, 0, true, NULL);
++	kvm_mmu_do_page_fault(vcpu, work->cr2_or_gpa, work->arch.error_code,
++			      true, NULL);
+ }
+ 
+ static inline u8 kvm_max_level_for_order(int order)
+@@ -4361,6 +4363,8 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	}
+ 
+ 	if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
++		if (vcpu->kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM)
++			return RET_PF_RETRY;
+ 		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
+ 		return -EFAULT;
+ 	}
+@@ -4381,7 +4385,7 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 			trace_kvm_async_pf_repeated_fault(fault->addr, fault->gfn);
+ 			kvm_make_request(KVM_REQ_APF_HALT, vcpu);
+ 			return RET_PF_RETRY;
+-		} else if (kvm_arch_setup_async_pf(vcpu, fault->addr, fault->gfn)) {
++		} else if (kvm_arch_setup_async_pf(vcpu, fault)) {
+ 			return RET_PF_RETRY;
+ 		}
+ 	}
+@@ -5805,6 +5809,14 @@ int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 err
+ 	if (WARN_ON_ONCE(!VALID_PAGE(vcpu->arch.mmu->root.hpa)))
+ 		return RET_PF_RETRY;
+ 
++	/*
++	 * This is racy with updating memory attributes with mmu_seq.  If we
++	 * hit a race, it would result in retrying page fault.
++	 */
++	if (vcpu->kvm->arch.vm_type == KVM_X86_SW_PROTECTED_VM &&
++	    kvm_mem_is_private(vcpu->kvm, gpa_to_gfn(cr2_or_gpa)))
++		error_code |= PFERR_GUEST_ENC_MASK;
++
+ 	r = RET_PF_INVALID;
+ 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
+ 		r = handle_mmio_page_fault(vcpu, cr2_or_gpa, direct);
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 21f55e8b4dc6..0443bfcf5d9c 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -292,13 +292,13 @@ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 		.user = err & PFERR_USER_MASK,
+ 		.prefetch = prefetch,
+ 		.is_tdp = likely(vcpu->arch.mmu->page_fault == kvm_tdp_page_fault),
++		.is_private = err & PFERR_GUEST_ENC_MASK,
+ 		.nx_huge_page_workaround_enabled =
+ 			is_nx_huge_page_enabled(vcpu->kvm),
+ 
+ 		.max_level = KVM_MAX_HUGEPAGE_LEVEL,
+ 		.req_level = PG_LEVEL_4K,
+ 		.goal_level = PG_LEVEL_4K,
+-		.is_private = kvm_mem_is_private(vcpu->kvm, cr2_or_gpa >> PAGE_SHIFT),
+ 	};
+ 	int r;
+ 
+-- 
+2.25.1
+

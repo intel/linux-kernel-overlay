@@ -1,0 +1,184 @@
+From 4f071cab7398f7da3f340377f102528c52be71a3 Mon Sep 17 00:00:00 2001
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Wed, 8 Dec 2021 17:40:09 -0800
+Subject: [PATCH 116/163] KVM: TDX: Silently ignore INIT/SIPI
+
+The TDX module API doesn't provide API for VMM to inject INIT IPI and SIPI.
+Instead it defines the different protocols to boot application processors.
+Ignore INIT and SIPI events for the TDX guest.
+
+There are two options. 1) (silently) ignore INIT/SIPI request or 2) return
+error to guest TDs somehow.  Given that TDX guest is paravirtualized to
+boot AP, the option 1 is chosen for simplicity.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+---
+ arch/x86/include/asm/kvm-x86-ops.h |  1 +
+ arch/x86/include/asm/kvm_host.h    |  2 ++
+ arch/x86/kvm/lapic.c               | 19 +++++++++++-------
+ arch/x86/kvm/svm/svm.c             |  1 +
+ arch/x86/kvm/vmx/main.c            | 32 ++++++++++++++++++++++++++++--
+ arch/x86/kvm/vmx/tdx.c             |  4 ++--
+ 6 files changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
+index 23197e9e2b7f..ee0b82817c63 100644
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -149,6 +149,7 @@ KVM_X86_OP_OPTIONAL(migrate_timers)
+ KVM_X86_OP(msr_filter_changed)
+ KVM_X86_OP(complete_emulated_msr)
+ KVM_X86_OP(vcpu_deliver_sipi_vector)
++KVM_X86_OP(vcpu_deliver_init)
+ KVM_X86_OP_OPTIONAL_RET0(vcpu_get_apicv_inhibit_reasons);
+ KVM_X86_OP_OPTIONAL(get_untagged_addr)
+ 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5af60068705c..c43cc26af04e 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1853,6 +1853,7 @@ struct kvm_x86_ops {
+ 	int (*complete_emulated_msr)(struct kvm_vcpu *vcpu, int err);
+ 
+ 	void (*vcpu_deliver_sipi_vector)(struct kvm_vcpu *vcpu, u8 vector);
++	void (*vcpu_deliver_init)(struct kvm_vcpu *vcpu);
+ 
+ 	/*
+ 	 * Returns vCPU specific APICv inhibit reasons
+@@ -2101,6 +2102,7 @@ void kvm_get_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg);
+ void kvm_set_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg);
+ int kvm_load_segment_descriptor(struct kvm_vcpu *vcpu, u16 selector, int seg);
+ void kvm_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector);
++void kvm_vcpu_deliver_init(struct kvm_vcpu *vcpu);
+ 
+ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int idt_index,
+ 		    int reason, bool has_error_code, u32 error_code);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 8025c7f614e0..431074679e83 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -3268,6 +3268,16 @@ int kvm_lapic_set_pv_eoi(struct kvm_vcpu *vcpu, u64 data, unsigned long len)
+ 	return 0;
+ }
+ 
++void kvm_vcpu_deliver_init(struct kvm_vcpu *vcpu)
++{
++	kvm_vcpu_reset(vcpu, true);
++	if (kvm_vcpu_is_bsp(vcpu))
++		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
++	else
++		vcpu->arch.mp_state = KVM_MP_STATE_INIT_RECEIVED;
++}
++EXPORT_SYMBOL_GPL(kvm_vcpu_deliver_init);
++
+ int kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -3299,13 +3309,8 @@ int kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 		return 0;
+ 	}
+ 
+-	if (test_and_clear_bit(KVM_APIC_INIT, &apic->pending_events)) {
+-		kvm_vcpu_reset(vcpu, true);
+-		if (kvm_vcpu_is_bsp(apic->vcpu))
+-			vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+-		else
+-			vcpu->arch.mp_state = KVM_MP_STATE_INIT_RECEIVED;
+-	}
++	if (test_and_clear_bit(KVM_APIC_INIT, &apic->pending_events))
++		static_call(kvm_x86_vcpu_deliver_init)(vcpu);
+ 	if (test_and_clear_bit(KVM_APIC_SIPI, &apic->pending_events)) {
+ 		if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
+ 			/* evaluate pending_events before reading the vector */
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index f76dd52d29ba..27546d993809 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5037,6 +5037,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.complete_emulated_msr = svm_complete_emulated_msr,
+ 
+ 	.vcpu_deliver_sipi_vector = svm_vcpu_deliver_sipi_vector,
++	.vcpu_deliver_init = kvm_vcpu_deliver_init,
+ 	.vcpu_get_apicv_inhibit_reasons = avic_vcpu_get_apicv_inhibit_reasons,
+ };
+ 
+diff --git a/arch/x86/kvm/vmx/main.c b/arch/x86/kvm/vmx/main.c
+index cf0d8ed4d18e..7eeefb29ed90 100644
+--- a/arch/x86/kvm/vmx/main.c
++++ b/arch/x86/kvm/vmx/main.c
+@@ -335,6 +335,14 @@ static void vt_enable_smi_window(struct kvm_vcpu *vcpu)
+ }
+ #endif
+ 
++static bool vt_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
++{
++	if (is_td_vcpu(vcpu))
++		return true;
++
++	return vmx_apic_init_signal_blocked(vcpu);
++}
++
+ static void vt_apicv_pre_state_restore(struct kvm_vcpu *vcpu)
+ {
+ 	struct pi_desc *pi = vcpu_to_pi_desc(vcpu);
+@@ -363,6 +371,25 @@ static void vt_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 	vmx_deliver_interrupt(apic, delivery_mode, trig_mode, vector);
+ }
+ 
++static void vt_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector)
++{
++	if (is_td_vcpu(vcpu))
++		return;
++
++	kvm_vcpu_deliver_sipi_vector(vcpu, vector);
++}
++
++static void vt_vcpu_deliver_init(struct kvm_vcpu *vcpu)
++{
++	if (is_td_vcpu(vcpu)) {
++		/* TDX doesn't support INIT.  Ignore INIT event */
++		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
++		return;
++	}
++
++	kvm_vcpu_deliver_init(vcpu);
++}
++
+ static void vt_flush_tlb_all(struct kvm_vcpu *vcpu)
+ {
+ 	if (is_td_vcpu(vcpu)) {
+@@ -726,13 +753,14 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
+ #endif
+ 
+ 	.check_emulate_instruction = vmx_check_emulate_instruction,
+-	.apic_init_signal_blocked = vmx_apic_init_signal_blocked,
++	.apic_init_signal_blocked = vt_apic_init_signal_blocked,
+ 	.migrate_timers = vmx_migrate_timers,
+ 
+ 	.msr_filter_changed = vt_msr_filter_changed,
+ 	.complete_emulated_msr = kvm_complete_insn_gp,
+ 
+-	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
++	.vcpu_deliver_sipi_vector = vt_vcpu_deliver_sipi_vector,
++	.vcpu_deliver_init = vt_vcpu_deliver_init,
+ 
+ 	.get_untagged_addr = vmx_get_untagged_addr,
+ 
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 2dd5fe926a0e..21cf12a859fd 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -819,8 +819,8 @@ void tdx_vcpu_free(struct kvm_vcpu *vcpu)
+ void tdx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 
+-	/* Ignore INIT silently because TDX doesn't support INIT event. */
+-	if (init_event)
++	/* vcpu_deliver_init method silently discards INIT event. */
++	if (KVM_BUG_ON(init_event, vcpu->kvm))
+ 		return;
+ 	if (KVM_BUG_ON(is_td_vcpu_created(to_tdx(vcpu)), vcpu->kvm))
+ 		return;
+-- 
+2.25.1
+
