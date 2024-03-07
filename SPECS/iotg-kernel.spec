@@ -66,7 +66,7 @@
 %endif
 %define embargoname 0410.mainline_tracking
 
-%define base_os_cfg_file base-os/centos.config-intel-next.x86_64
+%define base_os_cfg_file base-os/centos.config-5.15.0-0.rc7.mainline.4.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
