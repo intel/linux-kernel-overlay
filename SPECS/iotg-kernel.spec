@@ -349,7 +349,6 @@
 # Architectures we build tools/cpupower on
 %define cpupowerarchs x86_64 ppc64le aarch64
 
-
 #
 # Packages that need to be installed before the kernel is, because the %%post
 # scripts use them.
@@ -2213,7 +2212,7 @@ fi
 
 %ifarch %{cpupowerarchs}
 %files -n kernel-tools-libs
-%{_libdir}/libcpupower.so.0
+%{_libdir}/libcpupower.so.1
 %{_libdir}/libcpupower.so.0.0.1
 
 %files -n kernel-tools-libs-devel
