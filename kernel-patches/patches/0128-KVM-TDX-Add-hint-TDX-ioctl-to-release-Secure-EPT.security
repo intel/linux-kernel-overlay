@@ -1,0 +1,90 @@
+From 89171741e3f93034fb23307241cb11d7cf962a9c Mon Sep 17 00:00:00 2001
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Fri, 13 Oct 2023 02:17:03 -0700
+Subject: [PATCH 128/163] KVM: TDX: Add hint TDX ioctl to release Secure-EPT
+
+Add a new hint KVM TDX ioctl to release Secure-EPT as an optimization to
+reduce the time of the destruction of the guest.
+
+It takes tens of minutes to destroy a guest with tens or hundreds of GB of
+guest memory.  There are two cases to release pages used for the Secure-EPT
+and guest private memory.  One case is runtime while the guest is still
+running.  Another case is static when the TD won't run anymore.
+
+In Runtime: Use this when the KVM memory slot is deleted or closes KVM file
+descriptors while the user process is live.  Because the guest can still
+run, a TLB shoot-down is needed.  The sequence is TLB shoot down, cache
+flush each page, releasing the page from the Secure-EPT tree, and
+zero-clear them.  It requires four SEAMCALLs per page.
+TDH.MEM.RANGE.BLOCK() and TDH.MEM.TRACK() for TLB shoot down,
+TDH.PHYMEM.PAGE.WBINVD() for cache flush, and TDH.MEM.PAGE.REMOVE() to
+release a page.
+
+In process existing: When we know the vcpu won't run further, KVM can free
+the host key ID (HKID) for memory encryption with cache flush.  The vcpu
+can't run after that.  It simplifies the sequence to release private pages
+by reclaiming and zeroing them to reduce the number of SEAMCALLs to one per
+private page, TDH.PHYMEM.PAGE.RECLAIM().  However, this is applicable only
+when the user process exits with the MMU notifier release callback.
+
+Add a way for the user space to tell KVM a hint when it starts to destruct
+the guest for the efficient way in addition to the MMU notifier.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+
+---
+v16
+- Newly added
+---
+ arch/x86/include/uapi/asm/kvm.h | 1 +
+ arch/x86/kvm/mmu/mmu.c          | 1 +
+ arch/x86/kvm/vmx/tdx.c          | 9 +++++++++
+ 3 files changed, 11 insertions(+)
+
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index f2a37b479f26..f811f433feef 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -574,6 +574,7 @@ enum kvm_tdx_cmd_id {
+ 	KVM_TDX_INIT_VCPU,
+ 	KVM_TDX_INIT_MEM_REGION,
+ 	KVM_TDX_FINALIZE_VM,
++	KVM_TDX_RELEASE_VM,
+ 
+ 	KVM_TDX_CMD_NR_MAX,
+ };
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index fc258f112e73..53eb9508cde2 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6908,6 +6908,7 @@ void kvm_arch_flush_shadow_all(struct kvm *kvm)
+ 	static_call_cond(kvm_x86_flush_shadow_all_private)(kvm);
+ 	kvm_mmu_zap_all(kvm);
+ }
++EXPORT_SYMBOL_GPL(kvm_arch_flush_shadow_all);
+ 
+ static void kvm_mmu_zap_memslot(struct kvm *kvm, struct kvm_memory_slot *slot)
+ {
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index be1cc08dd74a..475a913ef25e 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -2818,6 +2818,15 @@ int tdx_vm_ioctl(struct kvm *kvm, void __user *argp)
+ 	case KVM_TDX_FINALIZE_VM:
+ 		r = tdx_td_finalizemr(kvm);
+ 		break;
++	case KVM_TDX_RELEASE_VM: {
++		int idx;
++
++		idx = srcu_read_lock(&kvm->srcu);
++		kvm_arch_flush_shadow_all(kvm);
++		srcu_read_unlock(&kvm->srcu, idx);
++		r = 0;
++		break;
++	}
+ 	default:
+ 		r = -EINVAL;
+ 		goto out;
+-- 
+2.25.1
+

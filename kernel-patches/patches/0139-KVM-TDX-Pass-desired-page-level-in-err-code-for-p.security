@@ -1,0 +1,157 @@
+From 0ac8c62d53aca896850e85633b3fde7388606aa2 Mon Sep 17 00:00:00 2001
+From: Xiaoyao Li <xiaoyao.li@intel.com>
+Date: Tue, 21 Nov 2023 02:18:47 -0800
+Subject: [PATCH 139/163] KVM: TDX: Pass desired page level in err code for
+ page fault handler
+
+For TDX, EPT violation can happen when TDG.MEM.PAGE.ACCEPT.
+And TDG.MEM.PAGE.ACCEPT contains the desired accept page level of TD guest.
+
+1. KVM can map it with 4KB page while TD guest wants to accept 2MB page.
+
+  TD geust will get TDX_PAGE_SIZE_MISMATCH and it should try to accept
+  4KB size.
+
+2. KVM can map it with 2MB page while TD guest wants to accept 4KB page.
+
+  KVM needs to honor it because
+  a) there is no way to tell guest KVM maps it as 2MB size. And
+  b) guest accepts it in 4KB size since guest knows some other 4KB page
+     in the same 2MB range will be used as shared page.
+
+For case 2, it need to pass desired page level to MMU's
+page_fault_handler. Use bit 29:31 of kvm PF error code for this purpose.
+
+Signed-off-by: Xiaoyao Li <xiaoyao.li@intel.com>
+---
+ arch/x86/kvm/vmx/common.h   |  6 +++++-
+ arch/x86/kvm/vmx/tdx.c      | 22 ++++++++++++++++++++--
+ arch/x86/kvm/vmx/tdx_arch.h | 19 +++++++++++++++++++
+ arch/x86/kvm/vmx/vmx.c      |  2 +-
+ 4 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/common.h b/arch/x86/kvm/vmx/common.h
+index 027aa4175d2c..787f59c44abc 100644
+--- a/arch/x86/kvm/vmx/common.h
++++ b/arch/x86/kvm/vmx/common.h
+@@ -67,7 +67,8 @@ static inline void vmx_handle_external_interrupt_irqoff(struct kvm_vcpu *vcpu,
+ }
+ 
+ static inline int __vmx_handle_ept_violation(struct kvm_vcpu *vcpu, gpa_t gpa,
+-					     unsigned long exit_qualification)
++					     unsigned long exit_qualification,
++					     int err_page_level)
+ {
+ 	u64 error_code;
+ 
+@@ -90,6 +91,9 @@ static inline int __vmx_handle_ept_violation(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 	if (kvm_is_private_gpa(vcpu->kvm, gpa))
+ 		error_code |= PFERR_GUEST_ENC_MASK;
+ 
++	if (err_page_level > PG_LEVEL_NONE)
++		error_code |= (err_page_level << PFERR_LEVEL_START_BIT) & PFERR_LEVEL_MASK;
++
+ 	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index e2a0d521f806..747152af0882 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1858,7 +1858,20 @@ void tdx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 
+ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
+ {
++	union tdx_ext_exit_qualification ext_exit_qual;
+ 	unsigned long exit_qual;
++	int err_page_level = 0;
++
++	ext_exit_qual.full = tdexit_ext_exit_qual(vcpu);
++
++	if (ext_exit_qual.type >= NUM_EXT_EXIT_QUAL) {
++		pr_err("EPT violation at gpa 0x%lx, with invalid ext exit qualification type 0x%x\n",
++			tdexit_gpa(vcpu), ext_exit_qual.type);
++		kvm_vm_bugged(vcpu->kvm);
++		return 0;
++	} else if (ext_exit_qual.type == EXT_EXIT_QUAL_ACCEPT) {
++		err_page_level = tdx_sept_level_to_pg_level(ext_exit_qual.req_sept_level);
++	}
+ 
+ 	if (kvm_is_private_gpa(vcpu->kvm, tdexit_gpa(vcpu))) {
+ 		/*
+@@ -1885,7 +1898,7 @@ static int tdx_handle_ept_violation(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	trace_kvm_page_fault(vcpu, tdexit_gpa(vcpu), exit_qual);
+-	return __vmx_handle_ept_violation(vcpu, tdexit_gpa(vcpu), exit_qual);
++	return __vmx_handle_ept_violation(vcpu, tdexit_gpa(vcpu), exit_qual, err_page_level);
+ }
+ 
+ static int tdx_handle_ept_misconfig(struct kvm_vcpu *vcpu)
+@@ -2752,6 +2765,7 @@ static int tdx_init_mem_region(struct kvm *kvm, struct kvm_tdx_cmd *cmd)
+ 	struct kvm_tdx_init_mem_region region;
+ 	struct kvm_vcpu *vcpu;
+ 	struct page *page;
++	u64 error_code;
+ 	int idx, ret = 0;
+ 	bool added = false;
+ 
+@@ -2809,7 +2823,11 @@ static int tdx_init_mem_region(struct kvm *kvm, struct kvm_tdx_cmd *cmd)
+ 		kvm_tdx->source_pa = pfn_to_hpa(page_to_pfn(page)) |
+ 				     (cmd->flags & KVM_TDX_MEASURE_MEMORY_REGION);
+ 
+-		ret = kvm_mmu_map_tdp_page(vcpu, region.gpa, TDX_SEPT_PFERR,
++		/* TODO: large page support. */
++		error_code = TDX_SEPT_PFERR;
++		error_code |= (PG_LEVEL_4K << PFERR_LEVEL_START_BIT) &
++			PFERR_LEVEL_MASK;
++		ret = kvm_mmu_map_tdp_page(vcpu, region.gpa, error_code,
+ 					   PG_LEVEL_4K);
+ 		put_page(page);
+ 		if (ret)
+diff --git a/arch/x86/kvm/vmx/tdx_arch.h b/arch/x86/kvm/vmx/tdx_arch.h
+index 0207cce72b27..eb62b8804cb4 100644
+--- a/arch/x86/kvm/vmx/tdx_arch.h
++++ b/arch/x86/kvm/vmx/tdx_arch.h
+@@ -227,6 +227,25 @@ union tdx_sept_level_state {
+ 	u64 raw;
+ };
+ 
++union tdx_ext_exit_qualification {
++	struct {
++		u64 type		:  4;
++		u64 reserved0		: 28;
++		u64 req_sept_level	:  3;
++		u64 err_sept_level	:  3;
++		u64 err_sept_state	:  8;
++		u64 err_sept_is_leaf	:  1;
++		u64 reserved1		: 17;
++	};
++	u64 full;
++};
++
++enum tdx_ext_exit_qualification_type {
++	EXT_EXIT_QUAL_NONE = 0,
++	EXT_EXIT_QUAL_ACCEPT = 1,
++	NUM_EXT_EXIT_QUAL,
++};
++
+ /*
+  * Global scope metadata field ID.
+  * See Table "Global Scope Metadata", TDX module 1.5 ABI spec.
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 79f031b2b727..695e4ad022d3 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5752,7 +5752,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
+ 	if (unlikely(allow_smaller_maxphyaddr && !kvm_vcpu_is_legal_gpa(vcpu, gpa)))
+ 		return kvm_emulate_instruction(vcpu, 0);
+ 
+-	return __vmx_handle_ept_violation(vcpu, gpa, exit_qualification);
++	return __vmx_handle_ept_violation(vcpu, gpa, exit_qualification, PG_LEVEL_NONE);
+ }
+ 
+ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
+-- 
+2.25.1
+

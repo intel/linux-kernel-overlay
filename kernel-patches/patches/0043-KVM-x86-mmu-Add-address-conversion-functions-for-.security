@@ -1,0 +1,104 @@
+From 966700f7be3569d2a26d1163ec448d290000fd1d Mon Sep 17 00:00:00 2001
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Tue, 12 Jul 2022 00:10:13 -0700
+Subject: [PATCH 043/163] KVM: x86/mmu: Add address conversion functions for
+ TDX shared bit of GPA
+
+TDX repurposes one GPA bit (51 bit or 47 bit based on configuration) to
+indicate the GPA is private(if cleared) or shared (if set) with VMM.  If
+GPA.shared is set, GPA is covered by the existing conventional EPT pointed
+by EPTP.  If GPA.shared bit is cleared, GPA is covered by TDX module.
+VMM has to issue SEAMCALLs to operate.
+
+Add a member to remember GPA shared bit for each guest TDs, add address
+conversion functions between private GPA and shared GPA and test if GPA
+is private.
+
+Because struct kvm_arch (or struct kvm which includes struct kvm_arch. See
+kvm_arch_alloc_vm() that passes __GPF_ZERO) is zero-cleared when allocated,
+the new member to remember GPA shared bit is guaranteed to be zero with
+this patch unless it's initialized explicitly.
+
+Co-developed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+---
+v18:
+- Added Reviewed-by Binbin
+---
+ arch/x86/include/asm/kvm_host.h |  4 ++++
+ arch/x86/kvm/mmu.h              | 27 +++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/tdx.c          |  5 +++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b54e0bdb77eb..96f900386026 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1503,6 +1503,10 @@ struct kvm_arch {
+ 	 */
+ #define SPLIT_DESC_CACHE_MIN_NR_OBJECTS (SPTE_ENT_PER_PAGE + 1)
+ 	struct kvm_mmu_memory_cache split_desc_cache;
++
++#ifdef CONFIG_KVM_MMU_PRIVATE
++	gfn_t gfn_shared_mask;
++#endif
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 60f21bb4c27b..191b820b7c4f 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -319,4 +319,31 @@ static inline gpa_t kvm_translate_gpa(struct kvm_vcpu *vcpu,
+ 		return gpa;
+ 	return translate_nested_gpa(vcpu, gpa, access, exception);
+ }
++
++static inline gfn_t kvm_gfn_shared_mask(const struct kvm *kvm)
++{
++#ifdef CONFIG_KVM_MMU_PRIVATE
++	return kvm->arch.gfn_shared_mask;
++#else
++	return 0;
++#endif
++}
++
++static inline gfn_t kvm_gfn_to_shared(const struct kvm *kvm, gfn_t gfn)
++{
++	return gfn | kvm_gfn_shared_mask(kvm);
++}
++
++static inline gfn_t kvm_gfn_to_private(const struct kvm *kvm, gfn_t gfn)
++{
++	return gfn & ~kvm_gfn_shared_mask(kvm);
++}
++
++static inline bool kvm_is_private_gpa(const struct kvm *kvm, gpa_t gpa)
++{
++	gfn_t mask = kvm_gfn_shared_mask(kvm);
++
++	return mask && !(gpa_to_gfn(gpa) & mask);
++}
++
+ #endif
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 245be29721b4..59d170709f82 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -953,6 +953,11 @@ static int tdx_td_init(struct kvm *kvm, struct kvm_tdx_cmd *cmd)
+ 	kvm_tdx->attributes = td_params->attributes;
+ 	kvm_tdx->xfam = td_params->xfam;
+ 
++	if (td_params->exec_controls & TDX_EXEC_CONTROL_MAX_GPAW)
++		kvm->arch.gfn_shared_mask = gpa_to_gfn(BIT_ULL(51));
++	else
++		kvm->arch.gfn_shared_mask = gpa_to_gfn(BIT_ULL(47));
++
+ out:
+ 	/* kfree() accepts NULL. */
+ 	kfree(init_vm);
+-- 
+2.25.1
+

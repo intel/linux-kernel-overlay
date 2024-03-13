@@ -1,0 +1,174 @@
+From d089da6a28e52d0680bd69d5ae26df0f50dfdbc9 Mon Sep 17 00:00:00 2001
+From: Isaku Yamahata <isaku.yamahata@intel.com>
+Date: Wed, 12 Oct 2022 17:36:35 -0700
+Subject: [PATCH 144/163] KVM: TDX: Implement merge pages into a large page
+
+Implement merge_private_stp callback.
+
+Signed-off-by: Isaku Yamahata <isaku.yamahata@intel.com>
+---
+v7:
+- Fix subject, x86/tdp_mmu => TDX
+- comment: use ulink instead of free for clarity
+
+v6:
+- repeat TDH.MEM.PAGE.PROMOTE() on TDX_INTERRUPTED_RESTARTABLE
+---
+ arch/x86/kvm/vmx/tdx.c       | 74 ++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/tdx_arch.h  |  1 +
+ arch/x86/kvm/vmx/tdx_errno.h |  2 +
+ arch/x86/kvm/vmx/tdx_ops.h   | 11 ++++++
+ 4 files changed, 88 insertions(+)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 10dbe4a4db7a..f26caa496d1b 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1742,6 +1742,51 @@ static int tdx_sept_split_private_spt(struct kvm *kvm, gfn_t gfn,
+ 	return 0;
+ }
+ 
++static int tdx_sept_merge_private_spt(struct kvm *kvm, gfn_t gfn,
++				      enum pg_level level, void *private_spt)
++{
++	int tdx_level = pg_level_to_tdx_sept_level(level);
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	struct tdx_module_args out;
++	gpa_t gpa = gfn_to_gpa(gfn) & KVM_HPAGE_MASK(level);
++	u64 err;
++
++	/* See comment in tdx_sept_set_private_spte() */
++	do {
++		err = tdh_mem_page_promote(kvm_tdx->tdr_pa, gpa, tdx_level, &out);
++	} while (err == TDX_INTERRUPTED_RESTARTABLE);
++	if (unlikely(err == TDX_ERROR_SEPT_BUSY))
++		return -EAGAIN;
++	if (unlikely(err == (TDX_EPT_INVALID_PROMOTE_CONDITIONS |
++			     TDX_OPERAND_ID_RCX)))
++		/*
++		 * Some pages are accepted, some pending.  Need to wait for TD
++		 * to accept all pages.  Tell it the caller.
++		 */
++		return -EAGAIN;
++	if (KVM_BUG_ON(err, kvm)) {
++		pr_tdx_error(TDH_MEM_PAGE_PROMOTE, err, &out);
++		return -EIO;
++	}
++	WARN_ON_ONCE(out.rcx != __pa(private_spt));
++
++	/*
++	 * TDH.MEM.PAGE.PROMOTE unlinks the Secure-EPT page for the lower level.
++	 * Flush cache for reuse.
++	 */
++	do {
++		err = tdh_phymem_page_wbinvd(set_hkid_to_hpa(__pa(private_spt),
++							     to_kvm_tdx(kvm)->hkid));
++	} while (unlikely(err == (TDX_OPERAND_BUSY | TDX_OPERAND_ID_RCX)));
++	if (WARN_ON_ONCE(err)) {
++		pr_tdx_error(TDH_PHYMEM_PAGE_WBINVD, err, NULL);
++		return -EIO;
++	}
++
++	tdx_clear_page(__pa(private_spt), PAGE_SIZE);
++	return 0;
++}
++
+ static int tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 				      enum pg_level level)
+ {
+@@ -1816,6 +1861,33 @@ static void tdx_track(struct kvm *kvm)
+ 
+ }
+ 
++static int tdx_sept_unzap_private_spte(struct kvm *kvm, gfn_t gfn,
++				       enum pg_level level)
++{
++	int tdx_level = pg_level_to_tdx_sept_level(level);
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	gpa_t gpa = gfn_to_gpa(gfn) & KVM_HPAGE_MASK(level);
++	struct tdx_module_args out;
++	u64 err;
++
++	do {
++		err = tdh_mem_range_unblock(kvm_tdx->tdr_pa, gpa, tdx_level, &out);
++
++		/*
++		 * tdh_mem_range_block() is accompanied with tdx_track() via kvm
++		 * remote tlb flush.  Wait for the caller of
++		 * tdh_mem_range_block() to complete TDX track.
++		 */
++	} while (err == (TDX_TLB_TRACKING_NOT_DONE | TDX_OPERAND_ID_SEPT));
++	if (unlikely(err == TDX_ERROR_SEPT_BUSY))
++		return -EAGAIN;
++	if (KVM_BUG_ON(err, kvm)) {
++		pr_tdx_error(TDH_MEM_RANGE_UNBLOCK, err, &out);
++		return -EIO;
++	}
++	return 0;
++}
++
+ static int tdx_sept_free_private_spt(struct kvm *kvm, gfn_t gfn,
+ 				     enum pg_level level, void *private_spt)
+ {
+@@ -3309,9 +3381,11 @@ int __init tdx_hardware_setup(struct kvm_x86_ops *x86_ops)
+ 	x86_ops->link_private_spt = tdx_sept_link_private_spt;
+ 	x86_ops->free_private_spt = tdx_sept_free_private_spt;
+ 	x86_ops->split_private_spt = tdx_sept_split_private_spt;
++	x86_ops->merge_private_spt = tdx_sept_merge_private_spt;
+ 	x86_ops->set_private_spte = tdx_sept_set_private_spte;
+ 	x86_ops->remove_private_spte = tdx_sept_remove_private_spte;
+ 	x86_ops->zap_private_spte = tdx_sept_zap_private_spte;
++	x86_ops->unzap_private_spte = tdx_sept_unzap_private_spte;
+ 
+ 	return 0;
+ 
+diff --git a/arch/x86/kvm/vmx/tdx_arch.h b/arch/x86/kvm/vmx/tdx_arch.h
+index e663abaa3aa0..aef6103c6515 100644
+--- a/arch/x86/kvm/vmx/tdx_arch.h
++++ b/arch/x86/kvm/vmx/tdx_arch.h
+@@ -29,6 +29,7 @@
+ #define TDH_MNG_KEY_FREEID		20
+ #define TDH_MNG_INIT			21
+ #define TDH_VP_INIT			22
++#define TDH_MEM_PAGE_PROMOTE		23
+ #define TDH_MEM_SEPT_RD			25
+ #define TDH_VP_RD			26
+ #define TDH_MNG_KEY_RECLAIMID		27
+diff --git a/arch/x86/kvm/vmx/tdx_errno.h b/arch/x86/kvm/vmx/tdx_errno.h
+index d08b4d14e57b..4142487f987e 100644
+--- a/arch/x86/kvm/vmx/tdx_errno.h
++++ b/arch/x86/kvm/vmx/tdx_errno.h
+@@ -24,6 +24,8 @@
+ #define TDX_FLUSHVP_NOT_DONE			0x8000082400000000ULL
+ #define TDX_EPT_WALK_FAILED			0xC0000B0000000000ULL
+ #define TDX_EPT_ENTRY_NOT_FREE			0xC0000B0200000000ULL
++#define TDX_TLB_TRACKING_NOT_DONE		0xC0000B0800000000ULL
++#define TDX_EPT_INVALID_PROMOTE_CONDITIONS	0xC0000B0900000000ULL
+ #define TDX_EPT_ENTRY_STATE_INCORRECT		0xC0000B0D00000000ULL
+ 
+ /*
+diff --git a/arch/x86/kvm/vmx/tdx_ops.h b/arch/x86/kvm/vmx/tdx_ops.h
+index f5fcc229415b..6731cdff4b4e 100644
+--- a/arch/x86/kvm/vmx/tdx_ops.h
++++ b/arch/x86/kvm/vmx/tdx_ops.h
+@@ -262,6 +262,17 @@ static inline u64 tdh_mem_page_demote(hpa_t tdr, gpa_t gpa, int level, hpa_t pag
+ 	return tdx_seamcall_sept(TDH_MEM_PAGE_DEMOTE, &in, out);
+ }
+ 
++static inline u64 tdh_mem_page_promote(hpa_t tdr, gpa_t gpa, int level,
++				       struct tdx_module_args *out)
++{
++	struct tdx_module_args in = {
++		.rcx = gpa | level,
++		.rdx = tdr,
++	};
++
++	return tdx_seamcall_sept(TDH_MEM_PAGE_PROMOTE, &in, out);
++}
++
+ static inline u64 tdh_mr_extend(hpa_t tdr, gpa_t gpa,
+ 				struct tdx_module_args *out)
+ {
+-- 
+2.25.1
+
