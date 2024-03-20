@@ -57,21 +57,21 @@
 # define buildid .local
 
 # flag used to know if is a RC
-%global isrc 1
+%global isrc 0
 
 %define pkgrelease  14
 %define rpmversion  6.8.0
 %if %{?isrc}
-%define rcversion   rc3.
+%define rcversion   .
 %endif
-%define embargoname 0306.mainline_tracking
+%define embargoname 0320.mainline_tracking
 
 %define base_os_cfg_file base-os/centos.config-5.15.0-0.rc7.mainline.4.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}240306T021306Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}240320T025053Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
@@ -465,7 +465,7 @@ BuildRequires: asciidoc
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
 %global kernel_src_repo https://github.com/torvalds/linux.git
-%global kernel_src_tag v6.8-rc3
+%global kernel_src_tag v6.8
 # END OF PROJECT SPECIFIC MACROS
 
 
