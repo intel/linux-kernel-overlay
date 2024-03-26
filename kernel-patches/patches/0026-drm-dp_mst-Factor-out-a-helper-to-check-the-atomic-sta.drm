@@ -1,0 +1,210 @@
+From c3f5de8458664e01d0b85b5cad920d04ed2883a9 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 24 Oct 2023 04:08:59 +0300
+Subject: [PATCH 26/86] drm/dp_mst: Factor out a helper to check the atomic
+ state of a topology manager
+
+Factor out a helper to check the atomic state for one MST topology
+manager, returning the MST port where the BW limit check has failed.
+This will be used in a follow-up patch by the i915 driver to improve the
+BW sharing between MST streams.
+
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: dri-devel@lists.freedesktop.org
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+Acked-by: Maxime Ripard <mripard@kernel.org>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20231030155843.2251023-5-imre.deak@intel.com
+---
+ drivers/gpu/drm/display/drm_dp_mst_topology.c | 93 +++++++++++++++----
+ include/drm/display/drm_dp_mst_helper.h       |  4 +
+ 2 files changed, 78 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/display/drm_dp_mst_topology.c b/drivers/gpu/drm/display/drm_dp_mst_topology.c
+index 4b4ce76b4f1b..decae2d82586 100644
+--- a/drivers/gpu/drm/display/drm_dp_mst_topology.c
++++ b/drivers/gpu/drm/display/drm_dp_mst_topology.c
+@@ -5144,11 +5144,13 @@ EXPORT_SYMBOL(drm_dp_mst_port_downstream_of_parent);
+ 
+ static int
+ drm_dp_mst_atomic_check_port_bw_limit(struct drm_dp_mst_port *port,
+-				      struct drm_dp_mst_topology_state *state);
++				      struct drm_dp_mst_topology_state *state,
++				      struct drm_dp_mst_port **failing_port);
+ 
+ static int
+ drm_dp_mst_atomic_check_mstb_bw_limit(struct drm_dp_mst_branch *mstb,
+-				      struct drm_dp_mst_topology_state *state)
++				      struct drm_dp_mst_topology_state *state,
++				      struct drm_dp_mst_port **failing_port)
+ {
+ 	struct drm_dp_mst_atomic_payload *payload;
+ 	struct drm_dp_mst_port *port;
+@@ -5177,7 +5179,7 @@ drm_dp_mst_atomic_check_mstb_bw_limit(struct drm_dp_mst_branch *mstb,
+ 		drm_dbg_atomic(mstb->mgr->dev, "[MSTB:%p] Checking bandwidth limits\n", mstb);
+ 
+ 	list_for_each_entry(port, &mstb->ports, next) {
+-		ret = drm_dp_mst_atomic_check_port_bw_limit(port, state);
++		ret = drm_dp_mst_atomic_check_port_bw_limit(port, state, failing_port);
+ 		if (ret < 0)
+ 			return ret;
+ 
+@@ -5189,7 +5191,8 @@ drm_dp_mst_atomic_check_mstb_bw_limit(struct drm_dp_mst_branch *mstb,
+ 
+ static int
+ drm_dp_mst_atomic_check_port_bw_limit(struct drm_dp_mst_port *port,
+-				      struct drm_dp_mst_topology_state *state)
++				      struct drm_dp_mst_topology_state *state,
++				      struct drm_dp_mst_port **failing_port)
+ {
+ 	struct drm_dp_mst_atomic_payload *payload;
+ 	int pbn_used = 0;
+@@ -5210,13 +5213,15 @@ drm_dp_mst_atomic_check_port_bw_limit(struct drm_dp_mst_port *port,
+ 			drm_dbg_atomic(port->mgr->dev,
+ 				       "[MSTB:%p] [MST PORT:%p] no BW available for the port\n",
+ 				       port->parent, port);
++			*failing_port = port;
+ 			return -EINVAL;
+ 		}
+ 
+ 		pbn_used = payload->pbn;
+ 	} else {
+ 		pbn_used = drm_dp_mst_atomic_check_mstb_bw_limit(port->mstb,
+-								 state);
++								 state,
++								 failing_port);
+ 		if (pbn_used <= 0)
+ 			return pbn_used;
+ 	}
+@@ -5225,6 +5230,7 @@ drm_dp_mst_atomic_check_port_bw_limit(struct drm_dp_mst_port *port,
+ 		drm_dbg_atomic(port->mgr->dev,
+ 			       "[MSTB:%p] [MST PORT:%p] required PBN of %d exceeds port limit of %d\n",
+ 			       port->parent, port, pbn_used, port->full_pbn);
++		*failing_port = port;
+ 		return -ENOSPC;
+ 	}
+ 
+@@ -5402,20 +5408,79 @@ int drm_dp_mst_atomic_enable_dsc(struct drm_atomic_state *state,
+ }
+ EXPORT_SYMBOL(drm_dp_mst_atomic_enable_dsc);
+ 
++/**
++ * drm_dp_mst_atomic_check_mgr - Check the atomic state of an MST topology manager
++ * @state: The global atomic state
++ * @mgr: Manager to check
++ * @mst_state: The MST atomic state for @mgr
++ * @failing_port: Returns the port with a BW limitation
++ *
++ * Checks the given MST manager's topology state for an atomic update to ensure
++ * that it's valid. This includes checking whether there's enough bandwidth to
++ * support the new timeslot allocations in the atomic update.
++ *
++ * Any atomic drivers supporting DP MST must make sure to call this or
++ * the drm_dp_mst_atomic_check() function after checking the rest of their state
++ * in their &drm_mode_config_funcs.atomic_check() callback.
++ *
++ * See also:
++ * drm_dp_mst_atomic_check()
++ * drm_dp_atomic_find_time_slots()
++ * drm_dp_atomic_release_time_slots()
++ *
++ * Returns:
++ *   - 0 if the new state is valid
++ *   - %-ENOSPC, if the new state is invalid, because of BW limitation
++ *         @failing_port is set to:
++ *         - The non-root port where a BW limit check failed
++ *           The returned port pointer is valid until at least
++ *           one payload downstream of it exists.
++ *         - %NULL if the BW limit check failed at the root port
++ *   - %-EINVAL, if the new state is invalid, because the root port has
++ *     too many payloads.
++ */
++int drm_dp_mst_atomic_check_mgr(struct drm_atomic_state *state,
++				struct drm_dp_mst_topology_mgr *mgr,
++				struct drm_dp_mst_topology_state *mst_state,
++				struct drm_dp_mst_port **failing_port)
++{
++	int ret;
++
++	*failing_port = NULL;
++
++	if (!mgr->mst_state)
++		return 0;
++
++	ret = drm_dp_mst_atomic_check_payload_alloc_limits(mgr, mst_state);
++	if (ret)
++		return ret;
++
++	mutex_lock(&mgr->lock);
++	ret = drm_dp_mst_atomic_check_mstb_bw_limit(mgr->mst_primary,
++						    mst_state,
++						    failing_port);
++	mutex_unlock(&mgr->lock);
++
++	return ret < 0 ? ret : 0;
++}
++EXPORT_SYMBOL(drm_dp_mst_atomic_check_mgr);
++
+ /**
+  * drm_dp_mst_atomic_check - Check that the new state of an MST topology in an
+  * atomic update is valid
+  * @state: Pointer to the new &struct drm_dp_mst_topology_state
+  *
+  * Checks the given topology state for an atomic update to ensure that it's
+- * valid. This includes checking whether there's enough bandwidth to support
+- * the new timeslot allocations in the atomic update.
++ * valid, calling drm_dp_mst_atomic_check_mgr() for all MST manager in the
++ * atomic state. This includes checking whether there's enough bandwidth to
++ * support the new timeslot allocations in the atomic update.
+  *
+  * Any atomic drivers supporting DP MST must make sure to call this after
+  * checking the rest of their state in their
+  * &drm_mode_config_funcs.atomic_check() callback.
+  *
+  * See also:
++ * drm_dp_mst_atomic_check_mgr()
+  * drm_dp_atomic_find_time_slots()
+  * drm_dp_atomic_release_time_slots()
+  *
+@@ -5430,21 +5495,11 @@ int drm_dp_mst_atomic_check(struct drm_atomic_state *state)
+ 	int i, ret = 0;
+ 
+ 	for_each_new_mst_mgr_in_state(state, mgr, mst_state, i) {
+-		if (!mgr->mst_state)
+-			continue;
++		struct drm_dp_mst_port *tmp_port;
+ 
+-		ret = drm_dp_mst_atomic_check_payload_alloc_limits(mgr, mst_state);
++		ret = drm_dp_mst_atomic_check_mgr(state, mgr, mst_state, &tmp_port);
+ 		if (ret)
+ 			break;
+-
+-		mutex_lock(&mgr->lock);
+-		ret = drm_dp_mst_atomic_check_mstb_bw_limit(mgr->mst_primary,
+-							    mst_state);
+-		mutex_unlock(&mgr->lock);
+-		if (ret < 0)
+-			break;
+-		else
+-			ret = 0;
+ 	}
+ 
+ 	return ret;
+diff --git a/include/drm/display/drm_dp_mst_helper.h b/include/drm/display/drm_dp_mst_helper.h
+index 92b53f08752c..fe36c8ee9a86 100644
+--- a/include/drm/display/drm_dp_mst_helper.h
++++ b/include/drm/display/drm_dp_mst_helper.h
+@@ -903,6 +903,10 @@ int drm_dp_send_power_updown_phy(struct drm_dp_mst_topology_mgr *mgr,
+ int drm_dp_send_query_stream_enc_status(struct drm_dp_mst_topology_mgr *mgr,
+ 		struct drm_dp_mst_port *port,
+ 		struct drm_dp_query_stream_enc_status_ack_reply *status);
++int __must_check drm_dp_mst_atomic_check_mgr(struct drm_atomic_state *state,
++					     struct drm_dp_mst_topology_mgr *mgr,
++					     struct drm_dp_mst_topology_state *mst_state,
++					     struct drm_dp_mst_port **failing_port);
+ int __must_check drm_dp_mst_atomic_check(struct drm_atomic_state *state);
+ int __must_check drm_dp_mst_root_conn_atomic_check(struct drm_connector_state *new_conn_state,
+ 						   struct drm_dp_mst_topology_mgr *mgr);
+-- 
+2.25.1
+
