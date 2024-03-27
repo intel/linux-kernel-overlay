@@ -221,7 +221,7 @@
 %define make_target bzImage
 %define image_install_path boot
 
-%define KVERREL %{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}
+%define KVERREL %{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}+
 %define KVERREL_RE %(echo %KVERREL | sed 's/+/[+]/g')
 %define hdrarch %_target_cpu
 %define asmarch %_target_cpu
@@ -1100,7 +1100,7 @@ BuildKernel() {
       CopyKernel=cp
     fi
 
-    KernelVer=%{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}
+    KernelVer=%{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}+
     echo BUILDING A KERNEL FOR ${Flavour} %{_target_cpu}...
 
     # make sure EXTRAVERSION says what we want it to say
