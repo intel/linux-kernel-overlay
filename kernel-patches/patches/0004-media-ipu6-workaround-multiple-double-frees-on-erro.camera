@@ -1,0 +1,73 @@
+From df8f24173777d45352d066d26e74ca4a29ad8ca4 Mon Sep 17 00:00:00 2001
+From: zouxiaoh <xiaohong.zou@intel.com>
+Date: Tue, 16 Apr 2024 16:19:37 +0800
+Subject: [PATCH 04/12] media: ipu6: workaround multiple double frees on error
+ paths
+
+Consider the case when ipu_isys_video_init() fails in, say,
+ipu_isys_csi2_init(). ipu_isys_video_init() does all the
+necessary cleanup, kfree() av->watermark, ipu_isys_queue_cleanup()
+on embedded vb2_queue struct and so. However, ipu_isys_csi2_init()
+still calls into ipu_isys_csi2_cleanup(), which performs the same
+cleanup steps in ipu_isys_video_cleanup() that ipu_isys_video_init()
+again calls release on vb2_queue, and so on. Which simply
+doesn't work.
+
+But, when, for example, isys_register_subdevices()
+figures out that, say, ipu_isys_csi2_init() has failed, it
+calls isys_unregister_subdevices() which calls
+ipu_isys_csi2_cleanup() again. So we have multiple scenarios
+under which we can double free/release resources.
+
+For the time being let's add a simple ->initialized bool
+member to ipu_isys_video which would reliably tell us
+whether cleanup is safe to perform.
+
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: hepengpx <pengpengx.he@intel.com>
+Signed-off-by: zouxiaoh <xiaohong.zou@intel.com>
+---
+ drivers/media/pci/intel/ipu-isys-video.c | 5 +++++
+ drivers/media/pci/intel/ipu-isys-video.h | 1 +
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index 3fbbb8d30e82..71ab4bba812e 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -2122,6 +2122,7 @@ int ipu_isys_video_init(struct ipu_isys_video *av,
+ 
+ 	av->pfmt = av->try_fmt_vid_mplane(av, &av->mpix);
+ 
++	av->initialized = true;
+ 	mutex_unlock(&av->mutex);
+ 
+ 	return rval;
+@@ -2142,8 +2143,12 @@ int ipu_isys_video_init(struct ipu_isys_video *av,
+ 
+ void ipu_isys_video_cleanup(struct ipu_isys_video *av)
+ {
++	if (!av->initialized)
++		return;
++
+ 	video_unregister_device(&av->vdev);
+ 	media_entity_cleanup(&av->vdev.entity);
+ 	mutex_destroy(&av->mutex);
+ 	ipu_isys_queue_cleanup(&av->aq);
++	av->initialized = false;
+ }
+diff --git a/drivers/media/pci/intel/ipu-isys-video.h b/drivers/media/pci/intel/ipu-isys-video.h
+index 4c65773a96fb..5eb66d1eae4b 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.h
++++ b/drivers/media/pci/intel/ipu-isys-video.h
+@@ -137,6 +137,7 @@ struct ipu_isys_video {
+ 	unsigned int start_streaming;
+ 	bool packed;
+ 	bool compression;
++	bool initialized;
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct v4l2_ctrl *compression_ctrl;
+ 	unsigned int ts_offsets[VIDEO_MAX_PLANES];
+-- 
+2.25.1
+
