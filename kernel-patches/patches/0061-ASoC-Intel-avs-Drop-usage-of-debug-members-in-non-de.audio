@@ -1,0 +1,183 @@
+From 6a604aa5a707237358f28ffef3595c62defa4328 Mon Sep 17 00:00:00 2001
+From: Cezary Rojewski <cezary.rojewski@intel.com>
+Date: Fri, 2 Dec 2022 16:28:33 +0100
+Subject: [PATCH 061/205] ASoC: Intel: avs: Drop usage of debug members in
+ non-debug code
+
+commit f7de161fc8d5e1ebac3c361a37b1d748e7086330 upstream.
+
+Switch to debug-context aware wrappers instead of accessing debug
+members directly allowing for readable separation of debug and non-debug
+related code. Duplicates are removed along the way.
+
+Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Link: https://lore.kernel.org/r/20221202152841.672536-9-cezary.rojewski@intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/intel/avs/apl.c     | 11 ++++-------
+ sound/soc/intel/avs/avs.h     | 16 ++--------------
+ sound/soc/intel/avs/debugfs.c | 18 ++++++++++++++++++
+ sound/soc/intel/avs/skl.c     |  5 ++---
+ sound/soc/intel/avs/utils.c   | 18 ------------------
+ 5 files changed, 26 insertions(+), 42 deletions(-)
+
+diff --git a/sound/soc/intel/avs/apl.c b/sound/soc/intel/avs/apl.c
+index c974b9dce1d1..1860099c782a 100644
+--- a/sound/soc/intel/avs/apl.c
++++ b/sound/soc/intel/avs/apl.c
+@@ -59,21 +59,18 @@ static int apl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg
+ 
+ 	memcpy_fromio(&layout, addr, sizeof(layout));
+ 
+-	if (!kfifo_initialized(&adev->dbg.trace_fifo))
++	if (!avs_logging_fw(adev))
+ 		/* consume the logs regardless of consumer presence */
+ 		goto update_read_ptr;
+ 
+ 	buf = apl_log_payload_addr(addr);
+ 
+ 	if (layout.read_ptr > layout.write_ptr) {
+-		__kfifo_fromio(&adev->dbg.trace_fifo, buf + layout.read_ptr,
+-			       apl_log_payload_size(adev) - layout.read_ptr);
++		avs_dump_fw_log(adev, buf + layout.read_ptr,
++				apl_log_payload_size(adev) - layout.read_ptr);
+ 		layout.read_ptr = 0;
+ 	}
+-	__kfifo_fromio(&adev->dbg.trace_fifo, buf + layout.read_ptr,
+-		       layout.write_ptr - layout.read_ptr);
+-
+-	wake_up(&adev->dbg.trace_waitq);
++	avs_dump_fw_log_wakeup(adev, buf + layout.read_ptr, layout.write_ptr - layout.read_ptr);
+ 
+ update_read_ptr:
+ 	writel(layout.write_ptr, addr);
+diff --git a/sound/soc/intel/avs/avs.h b/sound/soc/intel/avs/avs.h
+index f8f11d8b5936..7a9fb27d3845 100644
+--- a/sound/soc/intel/avs/avs.h
++++ b/sound/soc/intel/avs/avs.h
+@@ -94,15 +94,6 @@ struct avs_fw_entry {
+ 	struct list_head node;
+ };
+ 
+-struct avs_debug {
+-	struct kfifo trace_fifo;
+-	spinlock_t trace_lock;	/* serialize debug window I/O between each LOG_BUFFER_STATUS */
+-	wait_queue_head_t trace_waitq;
+-	u32 aging_timer_period;
+-	u32 fifo_full_timer_period;
+-	u32 logged_resources;	/* context dependent: core or library */
+-};
+-
+ /*
+  * struct avs_dev - Intel HD-Audio driver data
+  *
+@@ -146,7 +137,6 @@ struct avs_dev {
+ 	spinlock_t path_list_lock;
+ 	struct mutex path_mutex;
+ 
+-	struct avs_debug dbg;
+ 	spinlock_t trace_lock;	/* serialize debug window I/O between each LOG_BUFFER_STATUS */
+ #ifdef CONFIG_DEBUG_FS
+ 	struct kfifo trace_fifo;
+@@ -339,8 +329,6 @@ void avs_unregister_all_boards(struct avs_dev *adev);
+ 
+ /* Firmware tracing helpers */
+ 
+-unsigned int __kfifo_fromio(struct kfifo *fifo, const void __iomem *src, unsigned int len);
+-
+ #define avs_log_buffer_size(adev) \
+ 	((adev)->fw_cfg.trace_log_bytes / (adev)->hw_cfg.dsp_cores)
+ 
+@@ -356,9 +344,9 @@ static inline int avs_log_buffer_status_locked(struct avs_dev *adev, union avs_n
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&adev->dbg.trace_lock, flags);
++	spin_lock_irqsave(&adev->trace_lock, flags);
+ 	ret = avs_dsp_op(adev, log_buffer_status, msg);
+-	spin_unlock_irqrestore(&adev->dbg.trace_lock, flags);
++	spin_unlock_irqrestore(&adev->trace_lock, flags);
+ 
+ 	return ret;
+ }
+diff --git a/sound/soc/intel/avs/debugfs.c b/sound/soc/intel/avs/debugfs.c
+index ac3889e21542..78705bcb09fb 100644
+--- a/sound/soc/intel/avs/debugfs.c
++++ b/sound/soc/intel/avs/debugfs.c
+@@ -11,6 +11,24 @@
+ #include <linux/wait.h>
+ #include "avs.h"
+ 
++static unsigned int __kfifo_fromio(struct kfifo *fifo, const void __iomem *src, unsigned int len)
++{
++	struct __kfifo *__fifo = &fifo->kfifo;
++	unsigned int l, off;
++
++	len = min(len, kfifo_avail(fifo));
++	off = __fifo->in & __fifo->mask;
++	l = min(len, kfifo_size(fifo) - off);
++
++	memcpy_fromio(__fifo->data + off, src, l);
++	memcpy_fromio(__fifo->data, src + l, len - l);
++	/* Make sure data copied from SRAM is visible to all CPUs. */
++	smp_mb();
++	__fifo->in += len;
++
++	return len;
++}
++
+ bool avs_logging_fw(struct avs_dev *adev)
+ {
+ 	return kfifo_initialized(&adev->trace_fifo);
+diff --git a/sound/soc/intel/avs/skl.c b/sound/soc/intel/avs/skl.c
+index c5edb0b0df14..6bb8bbc70442 100644
+--- a/sound/soc/intel/avs/skl.c
++++ b/sound/soc/intel/avs/skl.c
+@@ -59,7 +59,7 @@ skl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg)
+ 	void __iomem *buf;
+ 	u16 size, write, offset;
+ 
+-	if (!kfifo_initialized(&adev->dbg.trace_fifo))
++	if (!avs_logging_fw(adev))
+ 		return 0;
+ 
+ 	size = avs_log_buffer_size(adev) / 2;
+@@ -69,8 +69,7 @@ skl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg)
+ 
+ 	/* Address is guaranteed to exist in SRAM2. */
+ 	buf = avs_log_buffer_addr(adev, msg->log.core) + offset;
+-	__kfifo_fromio(&adev->dbg.trace_fifo, buf, size);
+-	wake_up(&adev->dbg.trace_waitq);
++	avs_dump_fw_log_wakeup(adev, buf, size);
+ 
+ 	return 0;
+ }
+diff --git a/sound/soc/intel/avs/utils.c b/sound/soc/intel/avs/utils.c
+index 75ad434d7dfb..82416b86662d 100644
+--- a/sound/soc/intel/avs/utils.c
++++ b/sound/soc/intel/avs/utils.c
+@@ -300,21 +300,3 @@ void avs_release_firmwares(struct avs_dev *adev)
+ 		kfree(entry);
+ 	}
+ }
+-
+-unsigned int __kfifo_fromio(struct kfifo *fifo, const void __iomem *src, unsigned int len)
+-{
+-	struct __kfifo *__fifo = &fifo->kfifo;
+-	unsigned int l, off;
+-
+-	len = min(len, kfifo_avail(fifo));
+-	off = __fifo->in & __fifo->mask;
+-	l = min(len, kfifo_size(fifo) - off);
+-
+-	memcpy_fromio(__fifo->data + off, src, l);
+-	memcpy_fromio(__fifo->data, src + l, len - l);
+-	/* Make sure data copied from SRAM is visible to all CPUs. */
+-	smp_mb();
+-	__fifo->in += len;
+-
+-	return len;
+-}
+-- 
+2.25.1
+
