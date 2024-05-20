@@ -1,0 +1,304 @@
+From 4adfdb2d7c4be19ceeb072ddb701e6016ed0eaa4 Mon Sep 17 00:00:00 2001
+From: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Date: Tue, 20 Feb 2024 23:30:38 -0800
+Subject: [PATCH 3/4] drm/i915: Apply border adjustments and enable scaler on
+ the crtc
+
+If the userspace has enabled the border property on a given
+connector, then relevant adjustments to position and size are made
+in addition to enabling the scaler on the associated crtc.
+
+Similar to how the panel fitter is implemented, the visible area
+of the crtc is tracked using a struct drm_rect object that is
+part of the crtc_state. This object is added to the state checker
+and support for hardware readout is also included.
+
+v2:
+When the pipe scaler is enabled as part of applying a border, we
+need to adjust the pipe's pixel rate as well to ensure that the
+min cdclk frequency chosen is proportional to the scaling factor.
+Also, reject a downscaling factor that is >= 3 as per the bspec.
+
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+---
+ .../gpu/drm/i915/display/intel_connector.c    | 42 +++++++++++++++++++
+ .../gpu/drm/i915/display/intel_connector.h    |  2 +
+ drivers/gpu/drm/i915/display/intel_display.c  | 25 +++++++----
+ .../drm/i915/display/intel_display_types.h    |  5 +++
+ drivers/gpu/drm/i915/display/intel_dp.c       |  9 ++++
+ drivers/gpu/drm/i915/display/intel_hdmi.c     |  9 ++++
+ drivers/gpu/drm/i915/display/skl_scaler.c     | 20 +++++++--
+ 7 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_connector.c b/drivers/gpu/drm/i915/display/intel_connector.c
+index 05185db6635e..eb148d073264 100644
+--- a/drivers/gpu/drm/i915/display/intel_connector.c
++++ b/drivers/gpu/drm/i915/display/intel_connector.c
+@@ -219,6 +219,48 @@ static const struct drm_prop_enum_list force_audio_names[] = {
+ 	{ HDMI_AUDIO_ON, "on" },
+ };
+ 
++int intel_connector_apply_border(struct intel_crtc_state *crtc_state,
++				 void *border_data)
++{
++	const struct drm_display_mode *adjusted_mode =
++		&crtc_state->hw.adjusted_mode;
++	int width = adjusted_mode->crtc_hdisplay;
++	int height = adjusted_mode->crtc_vdisplay;
++	struct drm_rect *border = border_data;
++	int sx = width, sy = height;
++	int left = border->x1;
++	int top = border->y1;
++	int right = border->x2;
++	int bottom = border->y2;
++
++	if (left < 0 || top < 0 || right < 0 || bottom < 0)
++		return -EINVAL;
++
++	if (left == 1)
++		left++;
++	if (left + right >= width || top + bottom >= height)
++		return -EINVAL;
++
++	width -= (left + right);
++	height -= (top + bottom);
++
++	do_div(sx, width);
++	do_div(sy, height);
++	if (sx >= 3 || sy >= 3)
++		return -EINVAL;
++
++	if (width & 1)
++		width++;
++	if (height & 1)
++		height++;
++
++	drm_rect_init(&crtc_state->border.dst,
++		      left, top, width, height);
++	crtc_state->border.enabled = true;
++
++	return 0;
++}
++
+ void
+ intel_attach_force_audio_property(struct drm_connector *connector)
+ {
+diff --git a/drivers/gpu/drm/i915/display/intel_connector.h b/drivers/gpu/drm/i915/display/intel_connector.h
+index ab88b57d475b..93106d855452 100644
+--- a/drivers/gpu/drm/i915/display/intel_connector.h
++++ b/drivers/gpu/drm/i915/display/intel_connector.h
+@@ -26,6 +26,8 @@ bool intel_connector_get_hw_state(struct intel_connector *connector);
+ enum pipe intel_connector_get_pipe(struct intel_connector *connector);
+ int intel_connector_update_modes(struct drm_connector *connector,
+ 				 const struct drm_edid *drm_edid);
++int intel_connector_apply_border(struct intel_crtc_state *crtc_state,
++				 void *border_data);
+ int intel_ddc_get_modes(struct drm_connector *c, struct i2c_adapter *ddc);
+ void intel_attach_force_audio_property(struct drm_connector *connector);
+ void intel_attach_broadcast_rgb_property(struct drm_connector *connector);
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 3f329dcbff3a..5ce536fd60c0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1603,9 +1603,12 @@ static void hsw_crtc_enable(struct intel_atomic_state *state,
+ 		glk_pipe_scaler_clock_gating_wa(dev_priv, pipe, true);
+ 
+ 	if (DISPLAY_VER(dev_priv) >= 9) {
+-		const struct drm_rect *dst = &new_crtc_state->pch_pfit.dst;
++		const struct drm_rect *dst = new_crtc_state->pch_pfit.enabled ?
++					     &new_crtc_state->pch_pfit.dst :
++					     &new_crtc_state->border.dst;
+ 
+-		if (new_crtc_state->pch_pfit.enabled)
++		if (new_crtc_state->pch_pfit.enabled ||
++		    new_crtc_state->border.enabled)
+ 			skl_program_crtc_scaler(new_crtc_state, dst);
+ 	} else {
+ 		ilk_pfit_enable(new_crtc_state);
+@@ -2115,6 +2118,9 @@ static bool intel_crtc_supports_double_wide(const struct intel_crtc *crtc)
+ 
+ static u32 ilk_pipe_pixel_rate(const struct intel_crtc_state *crtc_state)
+ {
++	const struct drm_rect *dst = crtc_state->pch_pfit.enabled ?
++				     &crtc_state->pch_pfit.dst :
++				     &crtc_state->border.dst;
+ 	u32 pixel_rate = crtc_state->hw.pipe_mode.crtc_clock;
+ 	struct drm_rect src;
+ 
+@@ -2123,15 +2129,14 @@ static u32 ilk_pipe_pixel_rate(const struct intel_crtc_state *crtc_state)
+ 	 * PF-ID we'll need to adjust the pixel_rate here.
+ 	 */
+ 
+-	if (!crtc_state->pch_pfit.enabled)
++	if (!crtc_state->pch_pfit.enabled && !crtc_state->border.enabled)
+ 		return pixel_rate;
+ 
+ 	drm_rect_init(&src, 0, 0,
+ 		      drm_rect_width(&crtc_state->pipe_src) << 16,
+ 		      drm_rect_height(&crtc_state->pipe_src) << 16);
+ 
+-	return intel_adjusted_rate(&src, &crtc_state->pch_pfit.dst,
+-				   pixel_rate);
++	return intel_adjusted_rate(&src, dst, pixel_rate);
+ }
+ 
+ static void intel_mode_from_crtc_timings(struct drm_display_mode *mode,
+@@ -5291,6 +5296,9 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
+ 		PIPE_CONF_CHECK_BOOL(pch_pfit.enabled);
+ 		PIPE_CONF_CHECK_RECT(pch_pfit.dst);
+ 
++		PIPE_CONF_CHECK_BOOL(border.enabled);
++		PIPE_CONF_CHECK_RECT(border.dst);
++
+ 		PIPE_CONF_CHECK_I(scaler_state.scaler_id);
+ 		PIPE_CONF_CHECK_I(pixel_rate);
+ 
+@@ -6657,9 +6665,12 @@ static void intel_pipe_fastset(const struct intel_crtc_state *old_crtc_state,
+ 
+ 	/* on skylake this is done by detaching scalers */
+ 	if (DISPLAY_VER(dev_priv) >= 9) {
+-		const struct drm_rect *dst = &new_crtc_state->pch_pfit.dst;
++		const struct drm_rect *dst = new_crtc_state->pch_pfit.enabled ?
++					     &new_crtc_state->pch_pfit.dst :
++					     &new_crtc_state->border.dst;
+ 
+-		if (new_crtc_state->pch_pfit.enabled)
++		if (new_crtc_state->pch_pfit.enabled ||
++		    new_crtc_state->border.enabled)
+ 			skl_program_crtc_scaler(new_crtc_state, dst);
+ 	} else if (HAS_PCH_SPLIT(dev_priv)) {
+ 		if (new_crtc_state->pch_pfit.enabled)
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 80a7d0bba2d0..dcfa9b1c3a90 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1416,6 +1416,11 @@ struct intel_crtc_state {
+ 		u8 pixel_overlap;
+ 	} splitter;
+ 
++	struct {
++		struct drm_rect dst;
++		bool enabled;
++	} border;
++
+ 	/* for loading single buffered registers during vblank */
+ 	struct drm_vblank_work vblank_work;
+ };
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index f7448681f073..7eefa1f325e6 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -2848,6 +2848,8 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 			struct intel_crtc_state *pipe_config,
+ 			struct drm_connector_state *conn_state)
+ {
++	const struct intel_digital_connector_state *intel_conn_state =
++		to_intel_digital_connector_state(conn_state);
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+@@ -2895,6 +2897,13 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 			return ret;
+ 	}
+ 
++	if (intel_conn_state->border) {
++		ret = intel_connector_apply_border(pipe_config,
++					intel_conn_state->border->data);
++		if (ret)
++			return ret;
++	}
++
+ 	pipe_config->limited_color_range =
+ 		intel_dp_limited_color_range(pipe_config, conn_state);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index c4fff5ba10be..5f72f0b56b67 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -2284,6 +2284,8 @@ int intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 			      struct intel_crtc_state *pipe_config,
+ 			      struct drm_connector_state *conn_state)
+ {
++	const struct intel_digital_connector_state *intel_conn_state =
++		to_intel_digital_connector_state(conn_state);
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	struct drm_display_mode *adjusted_mode = &pipe_config->hw.adjusted_mode;
+ 	struct drm_connector *connector = conn_state->connector;
+@@ -2329,6 +2331,13 @@ int intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 			return ret;
+ 	}
+ 
++	if (intel_conn_state->border) {
++		ret = intel_connector_apply_border(pipe_config,
++					intel_conn_state->border->data);
++		if (ret)
++			return ret;
++	}
++
+ 	pipe_config->limited_color_range =
+ 		intel_hdmi_limited_color_range(pipe_config, conn_state);
+ 
+diff --git a/drivers/gpu/drm/i915/display/skl_scaler.c b/drivers/gpu/drm/i915/display/skl_scaler.c
+index 67a87cc0411a..a0a26e0b4e98 100644
+--- a/drivers/gpu/drm/i915/display/skl_scaler.c
++++ b/drivers/gpu/drm/i915/display/skl_scaler.c
+@@ -237,11 +237,16 @@ skl_update_scaler(struct intel_crtc_state *crtc_state, bool force_detach,
+ int skl_update_scaler_crtc(struct intel_crtc_state *crtc_state)
+ {
+ 	const struct drm_display_mode *pipe_mode = &crtc_state->hw.pipe_mode;
++	bool need_scaler = crtc_state->pch_pfit.enabled ||
++			   crtc_state->border.enabled;
+ 	int width, height;
+ 
+ 	if (crtc_state->pch_pfit.enabled) {
+ 		width = drm_rect_width(&crtc_state->pch_pfit.dst);
+ 		height = drm_rect_height(&crtc_state->pch_pfit.dst);
++	} else if (crtc_state->border.enabled) {
++		width = drm_rect_width(&crtc_state->border.dst);
++		height = drm_rect_height(&crtc_state->border.dst);
+ 	} else {
+ 		width = pipe_mode->crtc_hdisplay;
+ 		height = pipe_mode->crtc_vdisplay;
+@@ -251,8 +256,7 @@ int skl_update_scaler_crtc(struct intel_crtc_state *crtc_state)
+ 				 &crtc_state->scaler_state.scaler_id,
+ 				 drm_rect_width(&crtc_state->pipe_src),
+ 				 drm_rect_height(&crtc_state->pipe_src),
+-				 width, height, NULL, 0,
+-				 crtc_state->pch_pfit.enabled);
++				 width, height, NULL, 0, need_scaler);
+ }
+ 
+ /**
+@@ -859,6 +863,7 @@ void skl_scaler_get_config(struct intel_crtc_state *crtc_state)
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct intel_crtc_scaler_state *scaler_state = &crtc_state->scaler_state;
++	struct drm_rect *dst;
+ 	int id = -1;
+ 	int i;
+ 
+@@ -871,12 +876,19 @@ void skl_scaler_get_config(struct intel_crtc_state *crtc_state)
+ 			continue;
+ 
+ 		id = i;
+-		crtc_state->pch_pfit.enabled = true;
+ 
+ 		pos = intel_de_read(dev_priv, SKL_PS_WIN_POS(crtc->pipe, i));
+ 		size = intel_de_read(dev_priv, SKL_PS_WIN_SZ(crtc->pipe, i));
+ 
+-		drm_rect_init(&crtc_state->pch_pfit.dst,
++		if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
++			crtc_state->pch_pfit.enabled = true;
++			dst = &crtc_state->pch_pfit.dst;
++		} else {
++			crtc_state->border.enabled = true;
++			dst = &crtc_state->border.dst;
++		}
++
++		drm_rect_init(dst,
+ 			      REG_FIELD_GET(PS_WIN_XPOS_MASK, pos),
+ 			      REG_FIELD_GET(PS_WIN_YPOS_MASK, pos),
+ 			      REG_FIELD_GET(PS_WIN_XSIZE_MASK, size),
+-- 
+2.42.0
+
