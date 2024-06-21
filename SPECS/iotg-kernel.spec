@@ -66,7 +66,7 @@
 %endif
 %define embargoname 0619.mainline_tracking
 
-%define base_os_cfg_file base-os/centos.config-5.15.0-0.rc7.mainline.4.el8.x86_64
+%define base_os_cfg_file dmr.config
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
@@ -464,8 +464,8 @@ BuildRequires: asciidoc
 %endif
 
 # PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global kernel_src_repo https://github.com/torvalds/linux.git
-%global kernel_src_tag v6.9
+%global kernel_src_repo https://github.com/intel-innersource/os.linux.kernel.kernel-staging.git
+%global kernel_src_tag dmr-ceps/pre-si/linux/6.9
 # END OF PROJECT SPECIFIC MACROS
 
 
@@ -1108,17 +1108,9 @@ BuildKernel() {
     # and now to start the build process
 
     %{make} -s %{?_smp_mflags} mrproper
-    # Merge Enbargo Overlay Kernel config
-    # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-    # cp configs/kernel-config/base-os/centos.config-4.18.0-348.el8.x86_64 .config
-    cp configs/kernel-config/%{base_os_cfg_file} .config
-    ls -lah configs/kernel-config/%{features_cfg_dir}/*.cfg
-    for cfg_file in configs/kernel-config/%{features_cfg_dir}/*.cfg; do
-        echo $cfg_file
-        ./scripts/kconfig/merge_config.sh -m .config $cfg_file
-    done
-    ./scripts/kconfig/merge_config.sh -m .config configs/kernel-config/%{overlay_cfg_file}
-
+    # Copy source code Kernel config
+    cp arch/x86/configs/dmr/%{base_os_cfg_file} .config
+   
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif
