@@ -64,14 +64,14 @@
 %if %{?isrc}
 %define rcversion   rc3.
 %endif
-%define embargoname 0619.mainline_tracking
+%define embargoname 0626.mainline_tracking
 
 %define base_os_cfg_file base-os/centos.config-5.15.0-0.rc7.mainline.4.el8.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}240619T112402Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}240626T072121Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
