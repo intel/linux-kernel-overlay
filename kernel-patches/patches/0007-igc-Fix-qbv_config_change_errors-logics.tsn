@@ -1,0 +1,121 @@
+From bfbc4eeafc9470c6158684a4c5266815f3ac0f5e Mon Sep 17 00:00:00 2001
+From: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+Date: Thu, 28 Mar 2024 03:27:27 -0400
+Subject: [PATCH 07/10] igc: Fix qbv_config_change_errors logics
+
+When user issues these cmds:
+1. Either a) or b)
+   a) mqprio with hardware offload disabled
+   b) taprio with txtime-assist feature enabled
+2. etf
+3. tc qdisc delete
+4. taprio with base time in the past
+
+At step 4, qbv_config_change_errors wrongly increased by 1.
+Issue found during testing of AVNU test plans 5.1.8 and 5.1.1.
+
+Excerpt from IEEE 802.1Q-2018 8.6.9.3.1:
+"If  AdminBaseTime specifies a  time in the past, and the current
+schedule is running)
+Then:
+Increment ConfigChangeError counter"
+
+qbv_config_change_errors should only increase if based time is in the
+past and no taprio is active. In user perspective, taprio was not active
+when it was first triggered at step 4. However, i225/6 reuses qbv
+for etf, so qbv is enabled with a dummy schedule at step 2 where it
+enters igc_tsn_enable_offload() and qbv_count got incremented to 1.
+At step 4, it enters igc_tsn_enable_offload() again, qbv_count is
+incremented to 2. Because taprio is running, tc_setup_type is
+TC_SETUP_QDISC_ETF and qbv_count > 1, qbv_config_change_errors value
+got incremented.
+
+This issue happens due to reliance on qbv_count field where a
+non-zero value indicates that taprio is running. But qbv_count
+increases regardless if taprio is triggered by user or triggered by
+other tsn feature. It does not align with qbv_config_change_errors
+expectation where it is only concern with taprio triggered by user.
+
+Fixing this by relocating the qbv_config_change_errors logic to
+igc_save_qbv_schedule(), eliminating reliance on qbv_count and its
+inaccuracies from i225/6's multiple uses of qbv feature
+for other TSN features.
+
+In the new function created, taprio_offload_enable field is used to
+indicate that the current running taprio was triggered by user,
+instead of triggered by non-qbv feature like etf.
+
+Fixes: ae4fe4698300 ("igc: Add qbv_config_change_errors counter")
+Signed-off-by: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+---
+ drivers/net/ethernet/intel/igc/igc_main.c | 23 +++++++++++++++++++++--
+ drivers/net/ethernet/intel/igc/igc_tsn.c  |  8 --------
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index b0d02f05ffd7..185ed7d2e7ed 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -6377,6 +6377,21 @@ static void igc_taprio_queue_stats(struct net_device *dev,
+ 	stats->tx_overruns = 0;
+ }
+ 
++/* Taprio could be self-triggered by igc when processing non-taprio commands,
++ * such as the TC_SETUP_QDISC_ETF command. This function specifically checks if
++ * the current running taprio  was externally triggered by TAPRIO_CMD_REPLACE.
++ */
++static bool is_externally_triggered_taprio_running(struct igc_adapter *adapter)
++{
++	struct igc_hw *hw = &adapter->hw;
++
++	if ((rd32(IGC_BASET_H) || rd32(IGC_BASET_L)) &&
++	    adapter->taprio_offload_enable)
++		return true;
++	else
++		return false;
++}
++
+ static int igc_save_qbv_schedule(struct igc_adapter *adapter,
+ 				 struct tc_taprio_qopt_offload *qopt)
+ {
+@@ -6397,12 +6412,16 @@ static int igc_save_qbv_schedule(struct igc_adapter *adapter,
+ 	if (!validate_schedule(adapter, qopt))
+ 		return -EINVAL;
+ 
++	igc_ptp_read(adapter, &now);
++
++	if (is_externally_triggered_taprio_running(adapter) &&
++	    is_base_time_past(qopt->base_time, &now))
++		adapter->qbv_config_change_errors++;
++
+ 	adapter->cycle_time = qopt->cycle_time;
+ 	adapter->base_time = qopt->base_time;
+ 	adapter->taprio_offload_enable = true;
+ 
+-	igc_ptp_read(adapter, &now);
+-
+ 	for (n = 0; n < qopt->num_entries; n++) {
+ 		struct tc_taprio_sched_entry *e = &qopt->entries[n];
+ 
+diff --git a/drivers/net/ethernet/intel/igc/igc_tsn.c b/drivers/net/ethernet/intel/igc/igc_tsn.c
+index 11f068f21b67..d0fb66522dd1 100644
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -291,14 +291,6 @@ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ 		s64 n = div64_s64(ktime_sub_ns(systim, base_time), cycle);
+ 
+ 		base_time = ktime_add_ns(base_time, (n + 1) * cycle);
+-
+-		/* Increase the counter if scheduling into the past while
+-		 * Gate Control List (GCL) is running.
+-		 */
+-		if ((rd32(IGC_BASET_H) || rd32(IGC_BASET_L)) &&
+-		    (adapter->tc_setup_type == TC_SETUP_QDISC_TAPRIO) &&
+-		    (adapter->qbv_count > 1))
+-			adapter->qbv_config_change_errors++;
+ 	} else {
+ 		if (igc_is_device_id_i226(hw)) {
+ 			ktime_t adjust_time, expires_time;
+-- 
+2.25.1
+

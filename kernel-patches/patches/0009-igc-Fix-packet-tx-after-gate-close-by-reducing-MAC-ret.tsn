@@ -1,0 +1,115 @@
+From 34eb17a598c3bb5f1cad7b4bced85fa020b9f1ec Mon Sep 17 00:00:00 2001
+From: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+Date: Wed, 29 May 2024 05:30:55 -0400
+Subject: [PATCH 09/10] igc: Fix packet tx after gate close by reducing MAC
+ retry buffer
+
+AVNU testing uncovered that even when the taprio gate is closed,
+some packets still transmit.
+
+A known i225/6 hardware errata states traffic might overflow the planned
+QBV window. This happens because MAC maintains an internal buffer,
+primarily for supporting half duplex retries. Therefore, when
+the gate closes, residual MAC data in the buffer may still transmit.
+
+To mitigate this for i226, reduce the MAC's internal buffer from
+192 bytes to 88 bytes by modifying the RETX_CTL register value.
+This follows guidelines from:
+
+a) Ethernet Controller I225/I22 Spec Update Rev 2.1 Errata Item 9:
+   TSN: Packet Transmission Might Cross Qbv Window
+b) I225/6 SW User Manual Rev 1.2.4: Section 8.11.5 Retry Buffer Control
+
+Test Steps:
+1. Send taprio cmd to board A
+tc qdisc replace dev enp1s0 parent root handle 100 taprio \
+num_tc 4 \
+map 3 2 1 0 3 3 3 3 3 3 3 3 3 3 3 3 \
+queues 1@0 1@1 1@2 1@3 \
+base-time 0 \
+sched-entry S 0x07 500000 \
+sched-entry S 0x0f 500000 \
+flags 0x2 \
+txtime-delay 0
+
+- Note that for TC3, gate opens for 500us and close for another 500us
+
+3. Take tcpdump log on Board B
+
+4. Send udp packets via UDP tai app from Board A to Board B
+
+5. Analyze tcpdump log via wireshark log on Board B
+- Observed that the total time from the first to the last packet
+received during one cycle for TC3 does not exceed 500us
+
+Signed-off-by: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+---
+ drivers/net/ethernet/intel/igc/igc_defines.h |  5 +++++
+ drivers/net/ethernet/intel/igc/igc_tsn.c     | 15 +++++++++++++--
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc_defines.h b/drivers/net/ethernet/intel/igc/igc_defines.h
+index 6a9d89f34c95..8c7bf5ec3a5a 100644
+--- a/drivers/net/ethernet/intel/igc/igc_defines.h
++++ b/drivers/net/ethernet/intel/igc/igc_defines.h
+@@ -429,6 +429,11 @@
+ #define IGC_DTXMXPKTSZ_TSN	0x19 /* 1600 bytes of max TX DMA packet size */
+ #define IGC_DTXMXPKTSZ_DEFAULT	0x98 /* 9728-byte Jumbo frames */
+ 
++#define IGC_RETX_CTL			0x041C
++#define IGC_RETX_CTL_WATERMARK_MASK	0xF
++#define IGC_RETX_CTL_QBVFULLTH_SHIFT	8
++#define IGC_RETX_CTL_QBVFULLEN_ENA	0x1000
++
+ /* Transmit Scheduling Latency */
+ /* Latency between transmission scheduling (LaunchTime) and the time
+  * the packet is transmitted to the network in nanosecond.
+diff --git a/drivers/net/ethernet/intel/igc/igc_tsn.c b/drivers/net/ethernet/intel/igc/igc_tsn.c
+index 0de86120efb5..9f7cd8378e0b 100644
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -87,7 +87,7 @@ void igc_tsn_adjust_txtime_offset(struct igc_adapter *adapter)
+ static int igc_tsn_disable_offload(struct igc_adapter *adapter)
+ {
+ 	struct igc_hw *hw = &adapter->hw;
+-	u32 tqavctrl, rxpbs;
++	u32 tqavctrl, rxpbs, retxctl;
+ 	int i;
+ 
+ 	adapter->add_frag_size = IGC_I225_MIN_FRAG_SIZE_DEFAULT;
+@@ -101,6 +101,10 @@ static int igc_tsn_disable_offload(struct igc_adapter *adapter)
+ 
+ 	wr32(IGC_RXPBS, rxpbs);
+ 
++	/* Reset everything except watermark default value */
++	retxctl = rd32(IGC_RETX_CTL) & IGC_RETX_CTL_WATERMARK_MASK;
++	wr32(IGC_RETX_CTL, retxctl);
++
+ 	tqavctrl = rd32(IGC_TQAVCTRL);
+ 	tqavctrl &= ~(IGC_TQAVCTRL_TRANSMIT_MODE_TSN |
+ 		      IGC_TQAVCTRL_ENHANCED_QAV | IGC_TQAVCTRL_FUTSCDDIS |
+@@ -128,13 +132,20 @@ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ 	u32 tqavctrl, baset_l, baset_h;
+ 	u32 sec, nsec, cycle, rxpbs;
+ 	ktime_t base_time, systim;
+-	u32 frag_size_mult;
++	u32 frag_size_mult, retxctl, retxctl_watermark;
+ 	int i;
+ 
+ 	wr32(IGC_TSAUXC, 0);
+ 	wr32(IGC_DTXMXPKTSZ, IGC_DTXMXPKTSZ_TSN);
+ 	wr32(IGC_TXPBS, IGC_TXPBSIZE_TSN);
+ 
++	retxctl = rd32(IGC_RETX_CTL);
++	retxctl_watermark = retxctl & IGC_RETX_CTL_WATERMARK_MASK;
++	/* Set retxctl_watermark value to QBVFULLTH and set QBVFULLEN */
++	retxctl |= (retxctl_watermark << IGC_RETX_CTL_QBVFULLTH_SHIFT) |
++		   IGC_RETX_CTL_QBVFULLEN_ENA;
++	wr32(IGC_RETX_CTL, retxctl);
++
+ 	rxpbs = rd32(IGC_RXPBS) & ~IGC_RXPBSIZE_SIZE_MASK;
+ 	rxpbs |= IGC_RXPBSIZE_TSN;
+ 
+-- 
+2.25.1
+
