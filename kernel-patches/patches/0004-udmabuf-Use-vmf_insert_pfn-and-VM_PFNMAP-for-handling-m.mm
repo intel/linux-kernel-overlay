@@ -1,0 +1,61 @@
+From 080e7157e395d1c5aa922a1ab70e61ac6f22a7f9 Mon Sep 17 00:00:00 2001
+From: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Date: Thu, 4 Apr 2024 00:26:11 -0700
+Subject: [PATCH 4/8] udmabuf: Use vmf_insert_pfn and VM_PFNMAP for handling
+ mmap
+
+Add VM_PFNMAP to vm_flags in the mmap handler to ensure that
+the mappings would be managed without using struct page.
+
+And, in the vm_fault handler, use vmf_insert_pfn to share the
+page's pfn to userspace instead of directly sharing the page
+(via struct page *).
+
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Dongwon Kim <dongwon.kim@intel.com>
+Cc: Junxiao Chang <junxiao.chang@intel.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+---
+ drivers/dma-buf/udmabuf.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index c40645999648..820c993c8659 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -35,12 +35,13 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct udmabuf *ubuf = vma->vm_private_data;
+ 	pgoff_t pgoff = vmf->pgoff;
++	unsigned long pfn;
+ 
+ 	if (pgoff >= ubuf->pagecount)
+ 		return VM_FAULT_SIGBUS;
+-	vmf->page = ubuf->pages[pgoff];
+-	get_page(vmf->page);
+-	return 0;
++
++	pfn = page_to_pfn(ubuf->pages[pgoff]);
++	return vmf_insert_pfn(vma, vmf->address, pfn);
+ }
+ 
+ static const struct vm_operations_struct udmabuf_vm_ops = {
+@@ -56,6 +57,7 @@ static int mmap_udmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+ 
+ 	vma->vm_ops = &udmabuf_vm_ops;
+ 	vma->vm_private_data = ubuf;
++	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+
