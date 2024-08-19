@@ -1,0 +1,120 @@
+From a65c5f31aeb2254d1ab9c96260a7edcdc5a0f8a3 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Sat, 15 Jun 2024 20:16:59 +0000
+Subject: [PATCH 29/39] perf/x86/intel: Support hybrid PMU with multiple atom
+ uarchs
+
+The upcoming ARL-H hybrid processor contains 2 different atom uarchs
+which have different PMU capabilities. To distinguish these atom uarchs,
+CPUID.1AH.EAX[23:0] defines a native model ID which can be used to
+uniquely identify the uarch of the core by combining with core type.
+
+Thus a 3rd hybrid pmu type "hybrid_small2" is defined to mark the 2nd
+atom uarch. The helper find_hybrid_pmu_for_cpu() would compare the
+hybrid pmu type and dynamically read core native id from cpu to identify
+the corresponding hybrid pmu structure.
+
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/intel/core.c | 24 +++++++++++++++++-------
+ arch/x86/events/perf_event.h | 18 +++++++++++++++++-
+ 2 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 7a741c926982..a98cfaee48a0 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -4957,17 +4957,26 @@ static struct x86_hybrid_pmu *find_hybrid_pmu_for_cpu(void)
+ 
+ 	/*
+ 	 * This essentially just maps between the 'hybrid_cpu_type'
+-	 * and 'hybrid_pmu_type' enums:
++	 * and 'hybrid_pmu_type' enums except for ARL-H processor
++	 * which needs to compare atom uarch native id since ARL-H
++	 * contains two different atom uarchs.
+ 	 */
+ 	for (i = 0; i < x86_pmu.num_hybrid_pmus; i++) {
+ 		enum hybrid_pmu_type pmu_type = x86_pmu.hybrid_pmu[i].pmu_type;
++		u32 native_id;
+ 
+-		if (cpu_type == HYBRID_INTEL_CORE &&
+-		    pmu_type == hybrid_big)
+-			return &x86_pmu.hybrid_pmu[i];
+-		if (cpu_type == HYBRID_INTEL_ATOM &&
+-		    pmu_type == hybrid_small)
++		if (cpu_type == HYBRID_INTEL_CORE && pmu_type == hybrid_big)
+ 			return &x86_pmu.hybrid_pmu[i];
++		if (cpu_type == HYBRID_INTEL_ATOM) {
++			if (x86_pmu.num_hybrid_pmus == 2 && pmu_type == hybrid_small)
++				return &x86_pmu.hybrid_pmu[i];
++
++			native_id = get_this_hybrid_cpu_native_id();
++			if (native_id == skt_native_id && pmu_type == hybrid_small)
++				return &x86_pmu.hybrid_pmu[i];
++			if (native_id == cmt_native_id && pmu_type == hybrid_small2)
++				return &x86_pmu.hybrid_pmu[i];
++		}
+ 	}
+ 
+ 	return NULL;
+@@ -6273,6 +6282,7 @@ static inline int intel_pmu_v6_addr_offset(int index, bool eventsel)
+ static const struct { enum hybrid_pmu_type id; char *name; } intel_hybrid_pmu_type_map[] __initconst = {
+ 	{ hybrid_small, "cpu_atom" },
+ 	{ hybrid_big, "cpu_core" },
++	{ hybrid_small2, "cpu_atom2" },
+ };
+ 
+ static __always_inline int intel_pmu_init_hybrid(enum hybrid_pmu_type pmus)
+@@ -6305,7 +6315,7 @@ static __always_inline int intel_pmu_init_hybrid(enum hybrid_pmu_type pmus)
+ 							0, x86_pmu_num_counters(&pmu->pmu), 0, 0);
+ 
+ 		pmu->intel_cap.capabilities = x86_pmu.intel_cap.capabilities;
+-		if (pmu->pmu_type & hybrid_small) {
++		if (pmu->pmu_type & hybrid_small_all) {
+ 			pmu->intel_cap.perf_metrics = 0;
+ 			pmu->intel_cap.pebs_output_pt_available = 1;
+ 			pmu->mid_ack = true;
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 3fd812a7e4cc..bdc534e0f2a5 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -669,6 +669,13 @@ enum {
+ #define PERF_PEBS_DATA_SOURCE_GRT_MAX	0x10
+ #define PERF_PEBS_DATA_SOURCE_GRT_MASK	(PERF_PEBS_DATA_SOURCE_GRT_MAX - 1)
+ 
++
++/*
++ * CPUID.1AH.EAX[31:0] uniquely identifies the microarchitecture
++ * of the core. Bits 31-24 indicates its core type (Core or Atom)
++ * and Bits [23:0] indicates the native model ID of the core.
++ * Core type and native model ID are defined in below enumerations.
++ */
+ enum hybrid_cpu_type {
+ 	HYBRID_INTEL_NONE,
+ 	HYBRID_INTEL_ATOM	= 0x20,
+@@ -677,12 +684,21 @@ enum hybrid_cpu_type {
+ 
+ #define X86_HYBRID_PMU_ATOM_IDX		0
+ #define X86_HYBRID_PMU_CORE_IDX		1
++#define X86_HYBRID_PMU_ATOM2_IDX	2
+ enum hybrid_pmu_type {
+ 	not_hybrid,
+ 	hybrid_small		= BIT(X86_HYBRID_PMU_ATOM_IDX),
+ 	hybrid_big		= BIT(X86_HYBRID_PMU_CORE_IDX),
++	hybrid_small2		= BIT(X86_HYBRID_PMU_ATOM2_IDX),
++	/* The belows are only used for matching */
++	hybrid_big_small	= hybrid_big | hybrid_small,
++	hybrid_small_all	= hybrid_small | hybrid_small2,
++	hybrid_big_small_arl_h	= hybrid_big | hybrid_small_all,
++};
+ 
+-	hybrid_big_small	= hybrid_big | hybrid_small, /* only used for matching */
++enum atom_native_id {
++	cmt_native_id           = 0x2,  /* Crestmont */
++	skt_native_id           = 0x3,  /* Skymont */
+ };
+ 
+ struct x86_hybrid_pmu {
+-- 
+2.25.1
+
