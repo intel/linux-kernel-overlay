@@ -1,0 +1,204 @@
+From 36ace7814c9921513898363d31c7eb125e660e7f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Amadeusz=20S=C5=82awi=C5=84ski?=
+ <amadeuszx.slawinski@linux.intel.com>
+Date: Wed, 14 Dec 2022 19:54:59 +0100
+Subject: [PATCH 073/205] ASoC: Intel: avs: Parse control tuples
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit be2b81b519d7121290cfecc5fdfb4907ecc41c39 upstream.
+
+Add callback to handle loading of kcontrol and linking it to active
+widget. In order to link kcontrol to specific modules add additional
+field to module data, as well as specify control id in kcontrol data.
+
+Co-authored-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+Link: https://lore.kernel.org/r/20221214185500.3896902-4-amadeuszx.slawinski@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ include/uapi/sound/intel/avs/tokens.h |  4 ++
+ sound/soc/intel/avs/control.c         | 10 ++++
+ sound/soc/intel/avs/topology.c        | 76 +++++++++++++++++++++++++++
+ sound/soc/intel/avs/topology.h        |  3 ++
+ 4 files changed, 93 insertions(+)
+
+diff --git a/include/uapi/sound/intel/avs/tokens.h b/include/uapi/sound/intel/avs/tokens.h
+index 754f02b2f444..4ffe546aa409 100644
+--- a/include/uapi/sound/intel/avs/tokens.h
++++ b/include/uapi/sound/intel/avs/tokens.h
+@@ -108,6 +108,7 @@ enum avs_tplg_token {
+ 	AVS_TKN_MOD_CORE_ID_U8				= 1704,
+ 	AVS_TKN_MOD_PROC_DOMAIN_U8			= 1705,
+ 	AVS_TKN_MOD_MODCFG_EXT_ID_U32			= 1706,
++	AVS_TKN_MOD_KCONTROL_ID_U32			= 1707,
+ 
+ 	/* struct avs_tplg_path_template */
+ 	AVS_TKN_PATH_TMPL_ID_U32			= 1801,
+@@ -121,6 +122,9 @@ enum avs_tplg_token {
+ 	AVS_TKN_PIN_FMT_INDEX_U32			= 2201,
+ 	AVS_TKN_PIN_FMT_IOBS_U32			= 2202,
+ 	AVS_TKN_PIN_FMT_AFMT_ID_U32			= 2203,
++
++	/* struct avs_tplg_kcontrol */
++	AVS_TKN_KCONTROL_ID_U32				= 2301,
+ };
+ 
+ #endif
+diff --git a/sound/soc/intel/avs/control.c b/sound/soc/intel/avs/control.c
+index 92b3aad0baca..a8b14b784f8a 100644
+--- a/sound/soc/intel/avs/control.c
++++ b/sound/soc/intel/avs/control.c
+@@ -23,6 +23,16 @@ static struct avs_dev *avs_get_kcontrol_adev(struct snd_kcontrol *kcontrol)
+ 
+ static struct avs_path_module *avs_get_kcontrol_module(struct avs_dev *adev, u32 id)
+ {
++	struct avs_path *path;
++	struct avs_path_pipeline *ppl;
++	struct avs_path_module *mod;
++
++	list_for_each_entry(path, &adev->path_list, node)
++		list_for_each_entry(ppl, &path->ppl_list, node)
++			list_for_each_entry(mod, &ppl->mod_list, node)
++				if (mod->template->ctl_id && mod->template->ctl_id == id)
++					return mod;
++
+ 	return NULL;
+ }
+ 
+diff --git a/sound/soc/intel/avs/topology.c b/sound/soc/intel/avs/topology.c
+index e845eaf0a1e7..5fee7a8ec06a 100644
+--- a/sound/soc/intel/avs/topology.c
++++ b/sound/soc/intel/avs/topology.c
+@@ -13,6 +13,7 @@
+ #include <sound/soc-topology.h>
+ #include <uapi/sound/intel/avs/tokens.h>
+ #include "avs.h"
++#include "control.h"
+ #include "topology.h"
+ 
+ /* Get pointer to vendor array at the specified offset. */
+@@ -1070,6 +1071,12 @@ static const struct avs_tplg_token_parser module_parsers[] = {
+ 		.offset = offsetof(struct avs_tplg_module, cfg_ext),
+ 		.parse = avs_parse_modcfg_ext_ptr,
+ 	},
++	{
++		.token = AVS_TKN_MOD_KCONTROL_ID_U32,
++		.type = SND_SOC_TPLG_TUPLE_TYPE_WORD,
++		.offset = offsetof(struct avs_tplg_module, ctl_id),
++		.parse = avs_parse_byte_token,
++	},
+ };
+ 
+ static struct avs_tplg_module *
+@@ -1435,6 +1442,16 @@ static int avs_widget_load(struct snd_soc_component *comp, int index,
+ 	return 0;
+ }
+ 
++static int avs_widget_ready(struct snd_soc_component *comp, int index,
++			    struct snd_soc_dapm_widget *w,
++			    struct snd_soc_tplg_dapm_widget *dw)
++{
++	struct avs_tplg_path_template *template = w->priv;
++
++	template->w = w;
++	return 0;
++}
++
+ static int avs_dai_load(struct snd_soc_component *comp, int index,
+ 			struct snd_soc_dai_driver *dai_drv, struct snd_soc_tplg_pcm *pcm,
+ 			struct snd_soc_dai *dai)
+@@ -1586,9 +1603,68 @@ static int avs_manifest(struct snd_soc_component *comp, int index,
+ 	return avs_tplg_parse_bindings(comp, tuples, remaining);
+ }
+ 
++#define AVS_CONTROL_OPS_VOLUME	257
++
++static const struct snd_soc_tplg_kcontrol_ops avs_control_ops[] = {
++	{
++		.id = AVS_CONTROL_OPS_VOLUME,
++		.get = avs_control_volume_get,
++		.put = avs_control_volume_put,
++	},
++};
++
++static const struct avs_tplg_token_parser control_parsers[] = {
++	{
++		.token = AVS_TKN_KCONTROL_ID_U32,
++		.type = SND_SOC_TPLG_TUPLE_TYPE_WORD,
++		.offset = offsetof(struct avs_control_data, id),
++		.parse = avs_parse_word_token,
++	},
++};
++
++static int
++avs_control_load(struct snd_soc_component *comp, int index, struct snd_kcontrol_new *ctmpl,
++		 struct snd_soc_tplg_ctl_hdr *hdr)
++{
++	struct snd_soc_tplg_vendor_array *tuples;
++	struct snd_soc_tplg_mixer_control *tmc;
++	struct avs_control_data *ctl_data;
++	struct soc_mixer_control *mc;
++	size_t block_size;
++	int ret;
++
++	switch (hdr->type) {
++	case SND_SOC_TPLG_TYPE_MIXER:
++		tmc = container_of(hdr, typeof(*tmc), hdr);
++		tuples = tmc->priv.array;
++		block_size = le32_to_cpu(tmc->priv.size);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	ctl_data = devm_kzalloc(comp->card->dev, sizeof(*ctl_data), GFP_KERNEL);
++	if (!ctl_data)
++		return -ENOMEM;
++
++	ret = parse_dictionary_entries(comp, tuples, block_size, ctl_data, 1, sizeof(*ctl_data),
++				       AVS_TKN_KCONTROL_ID_U32, control_parsers,
++				       ARRAY_SIZE(control_parsers));
++	if (ret)
++		return ret;
++
++	mc = (struct soc_mixer_control *)ctmpl->private_value;
++	mc->dobj.private = ctl_data;
++	return 0;
++}
++
+ static struct snd_soc_tplg_ops avs_tplg_ops = {
++	.io_ops			= avs_control_ops,
++	.io_ops_count		= ARRAY_SIZE(avs_control_ops),
++	.control_load		= avs_control_load,
+ 	.dapm_route_load	= avs_route_load,
+ 	.widget_load		= avs_widget_load,
++	.widget_ready		= avs_widget_ready,
+ 	.dai_load		= avs_dai_load,
+ 	.link_load		= avs_link_load,
+ 	.manifest		= avs_manifest,
+diff --git a/sound/soc/intel/avs/topology.h b/sound/soc/intel/avs/topology.h
+index 68e5f6312353..6e1c8e9b2496 100644
+--- a/sound/soc/intel/avs/topology.h
++++ b/sound/soc/intel/avs/topology.h
+@@ -138,6 +138,8 @@ struct avs_tplg_path_template_id {
+ struct avs_tplg_path_template {
+ 	u32 id;
+ 
++	struct snd_soc_dapm_widget *w;
++
+ 	struct list_head path_list;
+ 
+ 	struct avs_tplg *owner;
+@@ -180,6 +182,7 @@ struct avs_tplg_module {
+ 	u8 core_id;
+ 	u8 domain;
+ 	struct avs_tplg_modcfg_ext *cfg_ext;
++	u32 ctl_id;
+ 
+ 	struct avs_tplg_pipeline *owner;
+ 	/* Pipeline modules management. */
+-- 
+2.25.1
+

@@ -1,0 +1,126 @@
+From 65e865d7de35defc5a16aff9eb296dd54efd2bf9 Mon Sep 17 00:00:00 2001
+From: Cezary Rojewski <cezary.rojewski@intel.com>
+Date: Fri, 2 Dec 2022 16:28:29 +0100
+Subject: [PATCH 057/205] ASoC: Intel: avs: Introduce
+ avs_log_buffer_status_locked()
+
+commit bb03099bf2253fcd1a4d57e6f5ee4e8000911e77 upstream.
+
+Simplify locking of firmware log gathering by providing single location
+for such purpose.
+
+Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Link: https://lore.kernel.org/r/20221202152841.672536-5-cezary.rojewski@intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/intel/avs/apl.c |  5 +----
+ sound/soc/intel/avs/avs.h | 12 ++++++++++++
+ sound/soc/intel/avs/ipc.c |  2 +-
+ sound/soc/intel/avs/skl.c |  7 +------
+ 4 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/sound/soc/intel/avs/apl.c b/sound/soc/intel/avs/apl.c
+index a7785139c770..45529c5ca401 100644
+--- a/sound/soc/intel/avs/apl.c
++++ b/sound/soc/intel/avs/apl.c
+@@ -50,7 +50,6 @@ static int apl_enable_logs(struct avs_dev *adev, enum avs_log_enable enable, u32
+ static int apl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg)
+ {
+ 	struct apl_log_buffer_layout layout;
+-	unsigned long flags;
+ 	void __iomem *addr, *buf;
+ 
+ 	addr = avs_log_buffer_addr(adev, msg->log.core);
+@@ -59,7 +58,6 @@ static int apl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg
+ 
+ 	memcpy_fromio(&layout, addr, sizeof(layout));
+ 
+-	spin_lock_irqsave(&adev->dbg.trace_lock, flags);
+ 	if (!kfifo_initialized(&adev->dbg.trace_fifo))
+ 		/* consume the logs regardless of consumer presence */
+ 		goto update_read_ptr;
+@@ -78,7 +76,6 @@ static int apl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg
+ 	wake_up(&adev->dbg.trace_waitq);
+ 
+ update_read_ptr:
+-	spin_unlock_irqrestore(&adev->dbg.trace_lock, flags);
+ 	writel(layout.write_ptr, addr);
+ 	return 0;
+ }
+@@ -140,7 +137,7 @@ static int apl_coredump(struct avs_dev *adev, union avs_notify_msg *msg)
+ 		 * gathered before dumping stack
+ 		 */
+ 		lbs_msg.log.core = msg->ext.coredump.core_id;
+-		avs_dsp_op(adev, log_buffer_status, &lbs_msg);
++		avs_log_buffer_status_locked(adev, &lbs_msg);
+ 	}
+ 
+ 	pos = dump + AVS_FW_REGS_SIZE;
+diff --git a/sound/soc/intel/avs/avs.h b/sound/soc/intel/avs/avs.h
+index 8d05b27608fe..1c89af6240d2 100644
+--- a/sound/soc/intel/avs/avs.h
++++ b/sound/soc/intel/avs/avs.h
+@@ -344,6 +344,18 @@ unsigned int __kfifo_fromio_locked(struct kfifo *fifo, const void __iomem *src,
+ 			 (avs_sram_addr(adev, AVS_DEBUG_WINDOW) + __offset); \
+ })
+ 
++static inline int avs_log_buffer_status_locked(struct avs_dev *adev, union avs_notify_msg *msg)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&adev->dbg.trace_lock, flags);
++	ret = avs_dsp_op(adev, log_buffer_status, msg);
++	spin_unlock_irqrestore(&adev->dbg.trace_lock, flags);
++
++	return ret;
++}
++
+ struct apl_log_buffer_layout {
+ 	u32 read_ptr;
+ 	u32 write_ptr;
+diff --git a/sound/soc/intel/avs/ipc.c b/sound/soc/intel/avs/ipc.c
+index af8a260093f4..bdf013c3dd12 100644
+--- a/sound/soc/intel/avs/ipc.c
++++ b/sound/soc/intel/avs/ipc.c
+@@ -266,7 +266,7 @@ static void avs_dsp_process_notification(struct avs_dev *adev, u64 header)
+ 		break;
+ 
+ 	case AVS_NOTIFY_LOG_BUFFER_STATUS:
+-		avs_dsp_op(adev, log_buffer_status, &msg);
++		avs_log_buffer_status_locked(adev, &msg);
+ 		break;
+ 
+ 	case AVS_NOTIFY_EXCEPTION_CAUGHT:
+diff --git a/sound/soc/intel/avs/skl.c b/sound/soc/intel/avs/skl.c
+index dc98b5cf900f..ff690e99d960 100644
+--- a/sound/soc/intel/avs/skl.c
++++ b/sound/soc/intel/avs/skl.c
+@@ -55,15 +55,11 @@ int skl_log_buffer_offset(struct avs_dev *adev, u32 core)
+ static int
+ skl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg)
+ {
+-	unsigned long flags;
+ 	void __iomem *buf;
+ 	u16 size, write, offset;
+ 
+-	spin_lock_irqsave(&adev->dbg.trace_lock, flags);
+-	if (!kfifo_initialized(&adev->dbg.trace_fifo)) {
+-		spin_unlock_irqrestore(&adev->dbg.trace_lock, flags);
++	if (!kfifo_initialized(&adev->dbg.trace_fifo))
+ 		return 0;
+-	}
+ 
+ 	size = avs_log_buffer_size(adev) / 2;
+ 	write = readl(avs_sram_addr(adev, AVS_FW_REGS_WINDOW) + FW_REGS_DBG_LOG_WP(msg->log.core));
+@@ -74,7 +70,6 @@ skl_log_buffer_status(struct avs_dev *adev, union avs_notify_msg *msg)
+ 	buf = avs_log_buffer_addr(adev, msg->log.core) + offset;
+ 	__kfifo_fromio_locked(&adev->dbg.trace_fifo, buf, size, &adev->dbg.fifo_lock);
+ 	wake_up(&adev->dbg.trace_waitq);
+-	spin_unlock_irqrestore(&adev->dbg.trace_lock, flags);
+ 
+ 	return 0;
+ }
+-- 
+2.25.1
+

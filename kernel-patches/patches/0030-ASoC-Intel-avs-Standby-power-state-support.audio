@@ -1,0 +1,199 @@
+From bffa9549533d14ce5aff284274132fa6754be720 Mon Sep 17 00:00:00 2001
+From: Piotr Maziarz <piotrx.maziarz@linux.intel.com>
+Date: Thu, 27 Oct 2022 14:47:00 +0200
+Subject: [PATCH 030/205] ASoC: Intel: avs: Standby power-state support
+
+commit d56829e9c1cb90044c07337fe90a9828fdb165c0 upstream.
+
+Introduce avs_suspend_standby() and avs_resume_standby() to support S0IX
+streaming. The AudioDSP is not shutdown during such scenario and the PCI
+device is armed for possible wake operation through an audio event.
+
+As capability for a stream to be active during low power S0 is based off
+of ->ignore_suspend, adjust the field's value according to platform
+capabilities if needed.
+
+Signed-off-by: Piotr Maziarz <piotrx.maziarz@linux.intel.com>
+Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Link: https://lore.kernel.org/r/20221027124702.1761002-8-cezary.rojewski@intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/intel/avs/avs.h      |  7 ++++
+ sound/soc/intel/avs/core.c     | 75 ++++++++++++++++++++++++++++++----
+ sound/soc/intel/avs/topology.c | 10 +++++
+ 3 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/sound/soc/intel/avs/avs.h b/sound/soc/intel/avs/avs.h
+index fb73d207697f..8d05b27608fe 100644
+--- a/sound/soc/intel/avs/avs.h
++++ b/sound/soc/intel/avs/avs.h
+@@ -24,6 +24,13 @@ struct avs_tplg_library;
+ struct avs_soc_component;
+ struct avs_ipc_msg;
+ 
++#ifdef CONFIG_ACPI
++#define AVS_S0IX_SUPPORTED \
++	(acpi_gbl_FADT.flags & ACPI_FADT_LOW_POWER_S0)
++#else
++#define AVS_S0IX_SUPPORTED false
++#endif
++
+ /*
+  * struct avs_dsp_ops - Platform-specific DSP operations
+  *
+diff --git a/sound/soc/intel/avs/core.c b/sound/soc/intel/avs/core.c
+index 071b70926baf..93bf4204c209 100644
+--- a/sound/soc/intel/avs/core.c
++++ b/sound/soc/intel/avs/core.c
+@@ -557,12 +557,30 @@ static void avs_pci_remove(struct pci_dev *pci)
+ 	pm_runtime_get_noresume(&pci->dev);
+ }
+ 
+-static int __maybe_unused avs_suspend_common(struct avs_dev *adev)
++static int avs_suspend_standby(struct avs_dev *adev)
++{
++	struct hdac_bus *bus = &adev->base.core;
++	struct pci_dev *pci = adev->base.pci;
++
++	if (bus->cmd_dma_state)
++		snd_hdac_bus_stop_cmd_io(bus);
++
++	snd_hdac_ext_bus_link_power_down_all(bus);
++
++	enable_irq_wake(pci->irq);
++	pci_save_state(pci);
++
++	return 0;
++}
++
++static int __maybe_unused avs_suspend_common(struct avs_dev *adev, bool low_power)
+ {
+ 	struct hdac_bus *bus = &adev->base.core;
+ 	int ret;
+ 
+ 	flush_work(&adev->probe_work);
++	if (low_power && adev->num_lp_paths)
++		return avs_suspend_standby(adev);
+ 
+ 	snd_hdac_ext_bus_link_power_down_all(bus);
+ 
+@@ -600,12 +618,31 @@ static int __maybe_unused avs_suspend_common(struct avs_dev *adev)
+ 	return 0;
+ }
+ 
+-static int __maybe_unused avs_resume_common(struct avs_dev *adev, bool purge)
++static int avs_resume_standby(struct avs_dev *adev)
++{
++	struct hdac_bus *bus = &adev->base.core;
++	struct pci_dev *pci = adev->base.pci;
++
++	pci_restore_state(pci);
++	disable_irq_wake(pci->irq);
++
++	snd_hdac_ext_bus_link_power_up_all(bus);
++
++	if (bus->cmd_dma_state)
++		snd_hdac_bus_init_cmd_io(bus);
++
++	return 0;
++}
++
++static int __maybe_unused avs_resume_common(struct avs_dev *adev, bool low_power, bool purge)
+ {
+ 	struct hdac_bus *bus = &adev->base.core;
+ 	struct hdac_ext_link *hlink;
+ 	int ret;
+ 
++	if (low_power && adev->num_lp_paths)
++		return avs_resume_standby(adev);
++
+ 	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, true);
+ 	avs_hdac_bus_init_chip(bus, true);
+ 
+@@ -633,26 +670,50 @@ static int __maybe_unused avs_resume_common(struct avs_dev *adev, bool purge)
+ 
+ static int __maybe_unused avs_suspend(struct device *dev)
+ {
+-	return avs_suspend_common(to_avs_dev(dev));
++	return avs_suspend_common(to_avs_dev(dev), true);
+ }
+ 
+ static int __maybe_unused avs_resume(struct device *dev)
+ {
+-	return avs_resume_common(to_avs_dev(dev), true);
++	return avs_resume_common(to_avs_dev(dev), true, true);
+ }
+ 
+ static int __maybe_unused avs_runtime_suspend(struct device *dev)
+ {
+-	return avs_suspend_common(to_avs_dev(dev));
++	return avs_suspend_common(to_avs_dev(dev), true);
+ }
+ 
+ static int __maybe_unused avs_runtime_resume(struct device *dev)
+ {
+-	return avs_resume_common(to_avs_dev(dev), true);
++	return avs_resume_common(to_avs_dev(dev), true, false);
++}
++
++static int __maybe_unused avs_freeze(struct device *dev)
++{
++	return avs_suspend_common(to_avs_dev(dev), false);
++}
++static int __maybe_unused avs_thaw(struct device *dev)
++{
++	return avs_resume_common(to_avs_dev(dev), false, true);
++}
++
++static int __maybe_unused avs_poweroff(struct device *dev)
++{
++	return avs_suspend_common(to_avs_dev(dev), false);
++}
++
++static int __maybe_unused avs_restore(struct device *dev)
++{
++	return avs_resume_common(to_avs_dev(dev), false, true);
+ }
+ 
+ static const struct dev_pm_ops avs_dev_pm = {
+-	SET_SYSTEM_SLEEP_PM_OPS(avs_suspend, avs_resume)
++	.suspend = avs_suspend,
++	.resume = avs_resume,
++	.freeze = avs_freeze,
++	.thaw = avs_thaw,
++	.poweroff = avs_poweroff,
++	.restore = avs_restore,
+ 	SET_RUNTIME_PM_OPS(avs_runtime_suspend, avs_runtime_resume, NULL)
+ };
+ 
+diff --git a/sound/soc/intel/avs/topology.c b/sound/soc/intel/avs/topology.c
+index 8a9f9fc48938..e845eaf0a1e7 100644
+--- a/sound/soc/intel/avs/topology.c
++++ b/sound/soc/intel/avs/topology.c
+@@ -1405,6 +1405,11 @@ static int avs_widget_load(struct snd_soc_component *comp, int index,
+ 	if (!le32_to_cpu(dw->priv.size))
+ 		return 0;
+ 
++	if (w->ignore_suspend && !AVS_S0IX_SUPPORTED) {
++		dev_info_once(comp->dev, "Device does not support S0IX, check BIOS settings\n");
++		w->ignore_suspend = false;
++	}
++
+ 	tplg = acomp->tplg;
+ 	mach = dev_get_platdata(comp->card->dev);
+ 
+@@ -1442,6 +1447,11 @@ static int avs_dai_load(struct snd_soc_component *comp, int index,
+ static int avs_link_load(struct snd_soc_component *comp, int index, struct snd_soc_dai_link *link,
+ 			 struct snd_soc_tplg_link_config *cfg)
+ {
++	if (link->ignore_suspend && !AVS_S0IX_SUPPORTED) {
++		dev_info_once(comp->dev, "Device does not support S0IX, check BIOS settings\n");
++		link->ignore_suspend = false;
++	}
++
+ 	if (!link->no_pcm) {
+ 		/* Stream control handled by IPCs. */
+ 		link->nonatomic = true;
+-- 
+2.25.1
+
