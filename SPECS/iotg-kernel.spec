@@ -71,7 +71,7 @@
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}240829T031537Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}240829T033101Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
