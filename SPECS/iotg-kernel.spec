@@ -64,14 +64,14 @@
 %if %{?isrc}
 %define rcversion   rc3.
 %endif
-%define embargoname 0829.mainline_tracking
+%define embargoname 0904.mainline_tracking
 
 %define base_os_cfg_file base-os/centos.config-intel-next.x86_64
 %define features_cfg_dir features
 %define overlay_cfg_file overlay/overlay.cfg
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}240829T033101Z_%{pkgrelease}%{?dist}
+%define specrelease %{?rcversion}240904T074300Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
