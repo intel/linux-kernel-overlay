@@ -1,0 +1,167 @@
+From 2f7191af152167c4239eafa6d22eef0b6932f3b9 Mon Sep 17 00:00:00 2001
+From: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Date: Thu, 22 Aug 2024 14:30:54 +0300
+Subject: [PATCH 2/2] spi: pxa2xx: Move PM runtime handling to the glue drivers
+
+PCI and platform buses have different defaults for runtime PM.
+In particular PCI probe is assumed to be called when PM runtime
+is enabled by the PCI core. In this case if we try enable it again
+the PM runtime complaints with
+
+    pxa2xx_spi_pci 0000:00:07.0: Unbalanced pm_runtime_enable!
+
+Fix this by moving PM runtime handling from the SPI PXA2xx core
+to the glue drivers.
+
+Fixes: cc160697a576 ("spi: pxa2xx: Convert PCI driver to use spi-pxa2xx code directly")
+Fixes: 3d8f037fbcab ("spi: pxa2xx: Move platform driver to a separate file")
+Fixes: 20ade9b9771c ("spi: pxa2xx: Extract pxa2xx_spi_platform_*() callbacks")
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Link: https://patch.msgid.link/20240822113408.750831-3-andriy.shevchenko@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ drivers/spi/spi-pxa2xx-pci.c      | 15 ++++++++++++++-
+ drivers/spi/spi-pxa2xx-platform.c | 22 ++++++++++++++++++++--
+ drivers/spi/spi-pxa2xx.c          | 15 +--------------
+ 3 files changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/spi/spi-pxa2xx-pci.c b/drivers/spi/spi-pxa2xx-pci.c
+index c98bb214b6ae..cc8dcf782399 100644
+--- a/drivers/spi/spi-pxa2xx-pci.c
++++ b/drivers/spi/spi-pxa2xx-pci.c
+@@ -11,6 +11,7 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/pm.h>
++#include <linux/pm_runtime.h>
+ #include <linux/sprintf.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
+@@ -297,11 +298,23 @@ static int pxa2xx_spi_pci_probe(struct pci_dev *dev,
+ 		return ret;
+ 	ssp->irq = pci_irq_vector(dev, 0);
+ 
+-	return pxa2xx_spi_probe(&dev->dev, ssp, pdata);
++	ret = pxa2xx_spi_probe(&dev->dev, ssp, pdata);
++	if (ret)
++		return ret;
++
++	pm_runtime_set_autosuspend_delay(&dev->dev, 50);
++	pm_runtime_use_autosuspend(&dev->dev);
++	pm_runtime_put_autosuspend(&dev->dev);
++	pm_runtime_allow(&dev->dev);
++
++	return 0;
+ }
+ 
+ static void pxa2xx_spi_pci_remove(struct pci_dev *dev)
+ {
++	pm_runtime_forbid(&dev->dev);
++	pm_runtime_get_noresume(&dev->dev);
++
+ 	pxa2xx_spi_remove(&dev->dev);
+ }
+ 
+diff --git a/drivers/spi/spi-pxa2xx-platform.c b/drivers/spi/spi-pxa2xx-platform.c
+index f9504cddc7ba..595af9fa4e0f 100644
+--- a/drivers/spi/spi-pxa2xx-platform.c
++++ b/drivers/spi/spi-pxa2xx-platform.c
+@@ -7,6 +7,7 @@
+ #include <linux/init.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/property.h>
+ #include <linux/types.h>
+ 
+@@ -142,6 +143,7 @@ static int pxa2xx_spi_platform_probe(struct platform_device *pdev)
+ 	struct pxa2xx_spi_controller *platform_info;
+ 	struct device *dev = &pdev->dev;
+ 	struct ssp_device *ssp;
++	int ret;
+ 
+ 	platform_info = dev_get_platdata(dev);
+ 	if (!platform_info) {
+@@ -156,12 +158,28 @@ static int pxa2xx_spi_platform_probe(struct platform_device *pdev)
+ 	if (!ssp)
+ 		ssp = &platform_info->ssp;
+ 
+-	return pxa2xx_spi_probe(dev, ssp, platform_info);
++	pm_runtime_set_autosuspend_delay(dev, 50);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = pxa2xx_spi_probe(dev, ssp, platform_info);
++	if (ret)
++		pm_runtime_disable(dev);
++
++	return ret;
+ }
+ 
+ static void pxa2xx_spi_platform_remove(struct platform_device *pdev)
+ {
+-	pxa2xx_spi_remove(&pdev->dev);
++	struct device *dev = &pdev->dev;
++
++	pm_runtime_get_sync(dev);
++
++	pxa2xx_spi_remove(dev);
++
++	pm_runtime_put_noidle(dev);
++	pm_runtime_disable(dev);
+ }
+ 
+ static const struct acpi_device_id pxa2xx_spi_acpi_match[] = {
+diff --git a/drivers/spi/spi-pxa2xx.c b/drivers/spi/spi-pxa2xx.c
+index fbb1e5e2b84a..de41d2abd4b6 100644
+--- a/drivers/spi/spi-pxa2xx.c
++++ b/drivers/spi/spi-pxa2xx.c
+@@ -1452,24 +1452,16 @@ int pxa2xx_spi_probe(struct device *dev, struct ssp_device *ssp,
+ 		}
+ 	}
+ 
+-	pm_runtime_set_autosuspend_delay(dev, 50);
+-	pm_runtime_use_autosuspend(dev);
+-	pm_runtime_set_active(dev);
+-	pm_runtime_enable(dev);
+-
+ 	/* Register with the SPI framework */
+ 	dev_set_drvdata(dev, drv_data);
+ 	status = spi_register_controller(controller);
+ 	if (status) {
+ 		dev_err_probe(dev, status, "problem registering SPI controller\n");
+-		goto out_error_pm_runtime_enabled;
++		goto out_error_clock_enabled;
+ 	}
+ 
+ 	return status;
+ 
+-out_error_pm_runtime_enabled:
+-	pm_runtime_disable(dev);
+-
+ out_error_clock_enabled:
+ 	clk_disable_unprepare(ssp->clk);
+ 
+@@ -1486,8 +1478,6 @@ void pxa2xx_spi_remove(struct device *dev)
+ 	struct driver_data *drv_data = dev_get_drvdata(dev);
+ 	struct ssp_device *ssp = drv_data->ssp;
+ 
+-	pm_runtime_get_sync(dev);
+-
+ 	spi_unregister_controller(drv_data->controller);
+ 
+ 	/* Disable the SSP at the peripheral and SOC level */
+@@ -1498,9 +1488,6 @@ void pxa2xx_spi_remove(struct device *dev)
+ 	if (drv_data->controller_info->enable_dma)
+ 		pxa2xx_spi_dma_release(drv_data);
+ 
+-	pm_runtime_put_noidle(dev);
+-	pm_runtime_disable(dev);
+-
+ 	/* Release IRQ */
+ 	free_irq(ssp->irq, drv_data);
+ }
+-- 
+2.25.1
+
