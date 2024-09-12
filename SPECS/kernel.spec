@@ -64,13 +64,13 @@
 %if %{isrc_rt}
 %define sux_ver .
 %endif
-%define pkgrelease  129
-%define rpmversion  6.9.0
+%define pkgrelease  143
+%define rpmversion  6.10.0
 
-%define embargoname 0821.dmr
+%define embargoname 0909.dmr
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?sux_ver}240821T025644Z_%{pkgrelease}%{?dist}
+%define specrelease %{?sux_ver}240909T084927Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
 
