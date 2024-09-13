@@ -56,20 +56,24 @@
 
 # define buildid .local
 
-# flag used to know if is a RC
-%global isrc 1
+# TODO: Below variant need be updated according to the kernel info
 
-%define pkgrelease  14
-%define rpmversion  5.13.0
-%if %{?isrc}
-%define rcversion   rc6.
+# flag used to know if is a RC
+%define _wrong_version_format_terminate_build 0
+%global isrc_rt 1
+%if %{isrc_rt}
+%define sux_ver rt14.
 %endif
-%define embargoname 0616.iotg_next
+%define pkgrelease  142
+%define rpmversion  6.10.0
+
+%define embargoname 0910.dmr
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease %{?rcversion}210616T015924Z_%{pkgrelease}%{?dist}
+%define specrelease %{?sux_ver}240910T012255Z_%{pkgrelease}%{?dist}
 
 %define pkg_release %{specrelease}%{?buildid}
+
 
 # What parts do we want to build?  We must build at least one kernel.
 # These are the kernels that are built IF the architecture allows it.
@@ -217,7 +221,9 @@
 %define make_target bzImage
 %define image_install_path boot
 
-%define KVERREL %{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}
+
+%define KVERREL %{version}-%{?sux_ver}%{embargoname}.%{pkgrelease}.%{_target_cpu}
+
 %define KVERREL_RE %(echo %KVERREL | sed 's/+/[+]/g')
 %define hdrarch %_target_cpu
 %define asmarch %_target_cpu
@@ -345,7 +351,6 @@
 # Architectures we build tools/cpupower on
 %define cpupowerarchs x86_64 ppc64le aarch64
 
-
 #
 # Packages that need to be installed before the kernel is, because the %%post
 # scripts use them.
@@ -354,7 +359,7 @@
 %define initrd_prereq  dracut >= 027
 
 
-Name: iotg-next%{?variant}
+Name: dmr-ceps%{?variant}
 Group: System Environment/Kernel
 License: GPL-2.0 Distributable
 URL: http://www.kernel.org/
@@ -460,12 +465,6 @@ BuildRequires: xmlto
 BuildRequires: asciidoc
 %endif
 
-# PROJECT SPECIFIC MACROS, CAN BE CUSTOMIZED AS EXTERNAL INTERFACE
-%global kernel_src_repo 'https://github.com/torvalds/linux.git'
-%global kernel_src_tag v5.13-rc6
-# END OF PROJECT SPECIFIC MACROS
-
-
 Source11: x509.genkey
 
 # Name of the packaged file containing signing key
@@ -497,7 +496,6 @@ Source400: mod-kvm.list
 # Sources for kernel-tools
 Source2000: cpupower.service
 Source2001: cpupower.config
-Source2002: overlay.config
 Source2003: patches.tar
 
 ## Patches needed for building this package
@@ -934,49 +932,21 @@ ApplyOptionalPatch()
 
 # clone the source code
 pwd
-
-[ ! -d "linux-%{KVERREL}" ] && git clone %kernel_src_repo linux-%{KVERREL}
+# TODO: Here we don't need clone the code from somewhere, just use the current 
+# source code. 
+[ ! -d "linux-%{KVERREL}" ] && mkdir -p linux-%{KVERREL}
 cd linux-%{KVERREL}
 
-if [ -d "./patches" ]; then
-  rm .pc -rf
-  # quilt pop -a -q
-  rm ./patches -rf 
-fi
+# Copy the kernel config from arch/x86/configs folder to here
+cp ./arch/x86/configs/dmr_ceps-rt.config .config
+make olddefconfig
 
-git reset --hard
-git checkout %kernel_src_tag
-git clean -df
-
-
-# BEGIN OF PATCH APPLICATION
-# ApplyOptionalPatch 0001-x86-microcode-Force-update-a-uCode.patch
-
-if [ -f "${RPM_SOURCE_DIR}/patches.tar" ]; then
-
-  tar -xf ${RPM_SOURCE_DIR}/patches.tar -C .
-  quilt push -a
-  res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
-  if [ "$res" = "File series fully applied" ]; then
-    echo "##### Patch file series fully applied."
-  else
-    echo "##### The patches has not been fully applied: ${res}."
-    exit 1
-  fi
-else
-  echo "WARNING: There are no Linux kernel overlay patches in ${RPM_SOURCE_DIR}/patches.tar !"
-fi
-# END OF PATCH APPLICATIONS
 
 # Any further pre-build tree manipulations happen here.
 
-%if %{with_realtime}
 # remove the localversion-rt file since it screws around with
 # the uname output
-if [ -f localversion-rt ]; then
-   rm -f localversion-rt
-fi
-%endif
+rm -f localversion-rt
 
 # remove the localversion-intel file since it screws around with
 # the uname output
@@ -1024,8 +994,6 @@ cd configs
 
 # Copy config files
 pwd
-
-cp $RPM_SOURCE_DIR/overlay.config overlay.config
 
 # Note we need to disable these flags for cross builds because the flags
 # from redhat-rpm-config assume that host == target so target arch
@@ -1097,18 +1065,19 @@ BuildKernel() {
       CopyKernel=cp
     fi
 
-    KernelVer=%{version}-%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}
+    KernelVer=%{version}-%{?sux_ver}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}
     echo BUILDING A KERNEL FOR ${Flavour} %{_target_cpu}...
+    echo KVERREL %{KVERREL}...
 
     # make sure EXTRAVERSION says what we want it to say
-    perl -p -i -e "s/^EXTRAVERSION.*/EXTRAVERSION = -%{?rcversion}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}/" Makefile
+    perl -p -i -e "s/^EXTRAVERSION.*/EXTRAVERSION = -%{?sux_ver}%{embargoname}.%{pkgrelease}.%{_target_cpu}${Flav}/" Makefile
 
     # and now to start the build process
 
     %{make} -s %{?_smp_mflags} mrproper
-    # Merge Enbargo Overlay Kernel config
-    # ./scripts/kconfig/merge_config.sh -m configs/$Config configs/overlay.config
-    cp configs/overlay.config .config
+    # Copy source code Kernel config
+    cp arch/x86/configs/dmr_ceps-rt.config .config
+   
     %if %{signkernel}%{signmodules}
     cp %{SOURCE11} certs/.
     %endif
@@ -1369,8 +1338,8 @@ BuildKernel() {
 %ifarch x86_64
     # files for 'make prepare' to succeed with kernel-devel
     cp -a --parents arch/x86/entry/syscalls/syscall_32.tbl $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
-    cp -a --parents arch/x86/entry/syscalls/syscalltbl.sh $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
-    cp -a --parents arch/x86/entry/syscalls/syscallhdr.sh $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
+    cp -a --parents scripts/syscalltbl.sh $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
+    cp -a --parents scripts/syscallhdr.sh $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
     cp -a --parents arch/x86/entry/syscalls/syscall_64.tbl $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
     cp -a --parents arch/x86/tools/relocs_32.c $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
     cp -a --parents arch/x86/tools/relocs_64.c $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/
@@ -1846,7 +1815,7 @@ install -m644 %{SOURCE2001} %{buildroot}%{_sysconfdir}/sysconfig/cpupower
    %{tools_make} DESTDIR=%{buildroot} install
    popd
    pushd tools/power/x86/intel-speed-select
-   %{tools_make} CFLAGS+="-D_GNU_SOURCE -Iinclude" DESTDIR=%{buildroot} install
+   %{tools_make} CFLAGS+="-D_GNU_SOURCE -Iinclude -I/usr/include/libnl3" DESTDIR=%{buildroot} install
    popd
 %endif
 pushd tools/thermal/tmon
@@ -2202,7 +2171,7 @@ fi
 
 %ifarch %{cpupowerarchs}
 %files -n kernel-tools-libs
-%{_libdir}/libcpupower.so.0
+%{_libdir}/libcpupower.so.1
 %{_libdir}/libcpupower.so.0.0.1
 
 %files -n kernel-tools-libs-devel
