@@ -1,0 +1,141 @@
+From 175d7d7868bd6fb2d8a429cc083432b80ac5a891 Mon Sep 17 00:00:00 2001
+From: Vitaly Lifshits <vitaly.lifshits@intel.com>
+Date: Thu, 20 Jun 2024 09:36:45 +0300
+Subject: [PATCH 2/2] e1000e: fix force smbus during suspend flow
+
+Commit 861e8086029e ("e1000e: move force SMBUS from enable ulp function
+to avoid PHY loss issue") resolved a PHY access loss during suspend on
+Meteor Lake consumer platforms, but it affected corporate systems
+incorrectly.
+
+A better fix, working for both consumer and corporate systems, was
+proposed in commit bfd546a552e1 ("e1000e: move force SMBUS near the end
+of enable_ulp function"). However, it introduced a regression on older
+devices, such as [8086:15B8], [8086:15F9], [8086:15BE].
+
+This patch aims to fix the secondary regression, by limiting the scope of
+the changes to Meteor Lake platforms only.
+
+Fixes: bfd546a552e1 ("e1000e: move force SMBUS near the end of enable_ulp function")
+Reported-by: Todd Brandt <todd.e.brandt@intel.com>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=218940
+Reported-by: Dieter Mummenschanz <dmummenschanz@web.de>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=218936
+Signed-off-by: Vitaly Lifshits <vitaly.lifshits@intel.com>
+Reported-by: Todd Brandt <todd.e.brandt@intel.com>
+Reported-by: Dieter Mummenschanz <dmummenschanz@web.de>
+Signed-off-by: Vitaly Lifshits <vitaly.lifshits@intel.com>
+Tested-by: Mor Bar-Gabay <morx.bar.gabay@intel.com> (A Contingent worker
+---
+ drivers/net/ethernet/intel/e1000e/ich8lan.c | 73 +++++++++++++++------
+ 1 file changed, 53 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/e1000e/ich8lan.c b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+index d678ca025465..0900e031d5f2 100644
+--- a/drivers/net/ethernet/intel/e1000e/ich8lan.c
++++ b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+@@ -137,6 +137,7 @@ static void e1000_gate_hw_phy_config_ich8lan(struct e1000_hw *hw, bool gate);
+ static s32 e1000_disable_ulp_lpt_lp(struct e1000_hw *hw, bool force);
+ static s32 e1000_setup_copper_link_pch_lpt(struct e1000_hw *hw);
+ static s32 e1000_oem_bits_config_ich8lan(struct e1000_hw *hw, bool d0_state);
++static s32 e1000e_force_smbus(struct e1000_hw *hw);
+ 
+ static inline u16 __er16flash(struct e1000_hw *hw, unsigned long reg)
+ {
+@@ -1108,6 +1109,46 @@ static s32 e1000_platform_pm_pch_lpt(struct e1000_hw *hw, bool link)
+ 	return 0;
+ }
+ 
++/**
++ *  e1000e_force_smbus - Force interfaces to transition to SMBUS mode.
++ *  @hw: pointer to the HW structure
++ *
++ *  Force the MAC and the PHY to SMBUS mode. Assumes semaphore already
++ *  acquired.
++ *
++ * Return: 0 on success, negative errno on failure.
++ **/
++static s32 e1000e_force_smbus(struct e1000_hw *hw)
++{
++	u16 smb_ctrl = 0;
++	u32 ctrl_ext;
++	s32 ret_val;
++
++	/* Switching PHY interface always returns MDI error
++	 * so disable retry mechanism to avoid wasting time
++	 */
++	e1000e_disable_phy_retry(hw);
++
++	/* Force SMBus mode in the PHY */
++	ret_val = e1000_read_phy_reg_hv_locked(hw, CV_SMB_CTRL, &smb_ctrl);
++	if (ret_val) {
++		e1000e_enable_phy_retry(hw);
++		return ret_val;
++	}
++
++	smb_ctrl |= CV_SMB_CTRL_FORCE_SMBUS;
++	e1000_write_phy_reg_hv_locked(hw, CV_SMB_CTRL, smb_ctrl);
++
++	e1000e_enable_phy_retry(hw);
++
++	/* Force SMBus mode in the MAC */
++	ctrl_ext = er32(CTRL_EXT);
++	ctrl_ext |= E1000_CTRL_EXT_FORCE_SMBUS;
++	ew32(CTRL_EXT, ctrl_ext);
++
++	return 0;
++}
++
+ /**
+  *  e1000_enable_ulp_lpt_lp - configure Ultra Low Power mode for LynxPoint-LP
+  *  @hw: pointer to the HW structure
+@@ -1165,6 +1206,14 @@ s32 e1000_enable_ulp_lpt_lp(struct e1000_hw *hw, bool to_sx)
+ 	if (ret_val)
+ 		goto out;
+ 
++	if (hw->mac.type != e1000_pch_mtp) {
++		ret_val = e1000e_force_smbus(hw);
++		if (ret_val) {
++			e_dbg("Failed to force SMBUS: %d\n", ret_val);
++			goto release;
++		}
++	}
++
+ 	/* Si workaround for ULP entry flow on i127/rev6 h/w.  Enable
+ 	 * LPLU and disable Gig speed when entering ULP
+ 	 */
+@@ -1225,27 +1274,11 @@ s32 e1000_enable_ulp_lpt_lp(struct e1000_hw *hw, bool to_sx)
+ 	}
+ 
+ release:
+-	/* Switching PHY interface always returns MDI error
+-	 * so disable retry mechanism to avoid wasting time
+-	 */
+-	e1000e_disable_phy_retry(hw);
+-
+-	/* Force SMBus mode in PHY */
+-	ret_val = e1000_read_phy_reg_hv_locked(hw, CV_SMB_CTRL, &phy_reg);
+-	if (ret_val) {
+-		e1000e_enable_phy_retry(hw);
+-		hw->phy.ops.release(hw);
+-		goto out;
++	if (hw->mac.type == e1000_pch_mtp) {
++		ret_val = e1000e_force_smbus(hw);
++		if (ret_val)
++			e_dbg("Failed to force SMBUS over MTL system: %d\n", ret_val);
+ 	}
+-	phy_reg |= CV_SMB_CTRL_FORCE_SMBUS;
+-	e1000_write_phy_reg_hv_locked(hw, CV_SMB_CTRL, phy_reg);
+-
+-	e1000e_enable_phy_retry(hw);
+-
+-	/* Force SMBus mode in MAC */
+-	mac_reg = er32(CTRL_EXT);
+-	mac_reg |= E1000_CTRL_EXT_FORCE_SMBUS;
+-	ew32(CTRL_EXT, mac_reg);
+ 
+ 	hw->phy.ops.release(hw);
+ out:
+-- 
+2.34.1
+
