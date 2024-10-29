@@ -1,0 +1,180 @@
+From 1af272e1198f03ec714a5bc7244917292bc22b71 Mon Sep 17 00:00:00 2001
+From: Cezary Rojewski <cezary.rojewski@intel.com>
+Date: Wed, 14 Feb 2024 16:14:24 +0100
+Subject: [PATCH 4/4] ASoC: Intel: avs: Allow for viewing path components
+ runtime info
+
+Enrich debug capabilities by adding information about properties of
+of active modules or running pipelines.
+
+Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+---
+ sound/soc/intel/avs/messages.h | 15 +++++-
+ sound/soc/intel/avs/path.c     | 95 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 107 insertions(+), 3 deletions(-)
+
+diff --git a/sound/soc/intel/avs/messages.h b/sound/soc/intel/avs/messages.h
+index a0217eac91227..60748c9b91207 100644
+--- a/sound/soc/intel/avs/messages.h
++++ b/sound/soc/intel/avs/messages.h
+@@ -95,7 +95,13 @@ union avs_global_msg {
+ } __packed;
+ 
+ struct avs_tlv {
+-	u32 type;
++	union {
++		u32 type;
++		struct {
++			u32 type:8;
++			u32 instance:24;
++		} ext;
++	};
+ 	u32 length;
+ 	u32 value[];
+ } __packed;
+@@ -340,6 +346,12 @@ struct avs_dxstate_info {
+ int avs_ipc_set_dx(struct avs_dev *adev, u32 core_mask, bool powerup);
+ int avs_ipc_set_d0ix(struct avs_dev *adev, bool enable_pg, bool streaming);
+ 
++#define AVS_VENDOR_CONFIG	0xFF
++
++enum avs_mod_runtime_param {
++	AVS_MOD_INST_PROPS = 0xFE,
++};
++
+ /* Base-firmware runtime parameters */
+ 
+ #define AVS_BASEFW_MOD_ID	0
+@@ -351,6 +363,7 @@ enum avs_basefw_runtime_param {
+ 	AVS_BASEFW_HARDWARE_CONFIG = 8,
+ 	AVS_BASEFW_MODULES_INFO = 9,
+ 	AVS_BASEFW_PIPELINE_LIST_INFO = 10,
++	AVS_BASEFW_PIPELINE_PROPS = 11,
+ 	AVS_BASEFW_SCHEDULER_INFO = 12,
+ 	AVS_BASEFW_GATEWAYS_INFO = 13,
+ 	AVS_BASEFW_LIBRARIES_INFO = 16,
+diff --git a/sound/soc/intel/avs/path.c b/sound/soc/intel/avs/path.c
+index f465f9219e5e3..353a845672a2a 100644
+--- a/sound/soc/intel/avs/path.c
++++ b/sound/soc/intel/avs/path.c
+@@ -677,12 +677,55 @@ static ssize_t avs_path_module_fw_instance_show(struct kobject *kobj,
+ static struct kobj_attribute avs_path_module_fw_instance =
+ 		__ATTR(fw_instance, 0444, avs_path_module_fw_instance_show, NULL);
+ 
++
++static ssize_t avs_path_module_props_read(struct file *file, struct kobject *kobj,
++					  struct bin_attribute *attr, char *buf, loff_t pos,
++					  size_t buf_size)
++{
++	struct avs_path_module *mod = container_of(kobj, struct avs_path_module, kobj);
++	struct avs_dev *adev = mod->owner->owner->owner;
++	size_t data_size;
++	u8 *data;
++	int ret;
++
++	/* Prevent chaining, send and dump IPC value just once. */
++	if (pos)
++		return 0;
++
++	ret = avs_ipc_get_large_config(adev, mod->module_id, mod->instance_id, AVS_MOD_INST_PROPS,
++				       NULL, 0, &data, &data_size);
++	if (ret < 0)
++		return AVS_IPC_RET(ret);
++
++	if (buf_size > data_size - pos)
++		buf_size = data_size - pos;
++	memcpy(buf, data, buf_size);
++	kfree(data);
++	return buf_size;
++}
++static struct bin_attribute avs_path_module_props =
++	__BIN_ATTR(props, 0444, avs_path_module_props_read, NULL, AVS_MAILBOX_SIZE);
++
+ static struct attribute *avs_path_module_attrs[] = {
+ 	&avs_path_module_fw_id.attr,
+ 	&avs_path_module_fw_instance.attr,
+ 	NULL,
+ };
+-ATTRIBUTE_GROUPS(avs_path_module);
++
++static struct bin_attribute *avs_path_module_bin_attrs[] = {
++	&avs_path_module_props,
++	NULL
++};
++
++static const struct attribute_group avs_path_module_group = {
++	.attrs = avs_path_module_attrs,
++	.bin_attrs = avs_path_module_bin_attrs,
++};
++
++static const struct attribute_group *avs_path_module_groups[] = {
++	&avs_path_module_group,
++	NULL
++};
+ 
+ static struct kobj_type avs_path_module_ktype = {
+ 	.release = avs_path_module_release,
+@@ -881,11 +924,59 @@ static ssize_t avs_path_pipeline_state_store(struct kobject *kobj,
+ static struct kobj_attribute avs_path_pipeline_state =
+ 	__ATTR(state, 0664, avs_path_pipeline_state_show, avs_path_pipeline_state_store);
+ 
++static ssize_t avs_path_pipeline_props_read(struct file *file, struct kobject *kobj,
++					    struct bin_attribute *attr, char *buf, loff_t pos,
++					    size_t buf_size)
++{
++	struct avs_path_pipeline *ppl = container_of(kobj, struct avs_path_pipeline, kobj);
++	struct avs_dev *adev = ppl->owner->owner;
++	struct avs_tlv tlv;
++	size_t data_size;
++	u8 *data;
++	int ret;
++
++	/* Prevent chaining, send and dump IPC value just once. */
++	if (pos)
++		return 0;
++
++	tlv.ext.type = AVS_BASEFW_PIPELINE_PROPS;
++	tlv.ext.instance = ppl->instance_id;
++	tlv.length = AVS_MAILBOX_SIZE - sizeof(tlv);
++
++	ret = avs_ipc_get_large_config(adev, AVS_BASEFW_MOD_ID, AVS_BASEFW_INST_ID,
++				       AVS_VENDOR_CONFIG, (u8 *)&tlv, sizeof(tlv),
++				       &data, &data_size);
++	if (ret < 0)
++		return AVS_IPC_RET(ret);
++
++	if (buf_size > data_size - pos)
++		buf_size = data_size - pos;
++	memcpy(buf, data, buf_size);
++	kfree(data);
++	return buf_size;
++}
++static struct bin_attribute avs_path_pipeline_props =
++	__BIN_ATTR(props, 0444, avs_path_pipeline_props_read, NULL, AVS_MAILBOX_SIZE);
++
+ static struct attribute *avs_path_pipeline_attrs[] = {
+ 	&avs_path_pipeline_state.attr,
+ 	NULL,
+ };
+-ATTRIBUTE_GROUPS(avs_path_pipeline);
++
++static struct bin_attribute *avs_path_pipeline_bin_attrs[] = {
++	&avs_path_pipeline_props,
++	NULL
++};
++
++static const struct attribute_group avs_path_pipeline_group = {
++	.attrs = avs_path_pipeline_attrs,
++	.bin_attrs = avs_path_pipeline_bin_attrs,
++};
++
++static const struct attribute_group *avs_path_pipeline_groups[] = {
++	&avs_path_pipeline_group,
++	NULL
++};
+ 
+ static struct kobj_type avs_path_pipeline_ktype = {
+ 	.release = avs_path_pipeline_release,
+-- 
+2.25.1
+
