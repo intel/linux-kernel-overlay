@@ -1,0 +1,373 @@
+From 8c7bd41ebc50c77881f4be2d1e9c744e398893e6 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Wed, 31 Jul 2024 13:17:32 -0700
+Subject: [PATCH 21/39] perf: Generic hotplug support for a PMU with a scope
+
+The perf subsystem assumes that the counters of a PMU are per-CPU. So
+the user space tool reads a counter from each CPU. However, many PMUs
+have a scope. To address this, a cpumask is exposed by the kernel driver
+to restrict to one CPU for a "scope". In case the given CPU is removed,
+the hotplug support has to be implemented for each such driver.
+
+The codes to support the cpumask and hotplug are very similar.
+- Expose a cpumask into sysfs
+- Pickup another CPU in the same scope if the given CPU is removed.
+- Invoke the perf_pmu_migrate_context() to migrate to a new CPU.
+- In event init, always set the CPU in the cpumask to event->cpu
+- Usually, an event can be read from any CPU of the scope. (For now,
+  it is only supported by the pkg scope PMU, via
+  PERF_EV_CAP_READ_ACTIVE_PKG, e.g., cstate_pkg, rapl, etc)
+
+The above-duplicated codes are implemented for each PMU driver. It would
+be good to introduce a generic infrastructure to avoid such duplication.
+
+5 popular scopes are implemented here, core, die, cluster, pkg, and
+the system-wide. The scope can be set when a PMU is registered. If so, a
+"cpumask" is automatically exposed for the PMU.
+
+The "cpumask" is from the perf_online_<scope>_mask, which is to track
+the active CPU for each scope. They are set when the first CPU of the
+scope is online via the generic perf hotplug support. When a
+corresponding CPU is removed, the perf_online_<scope>_mask is updated
+accordingly and the PMU will be moved to a new CPU from the same scope
+if possible.
+
+Add a new event cap, PERF_EV_CAP_READ_SCOPE. The event of such "scoped"
+PMU can be read from any CPU in the scope.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+---
+ include/linux/perf_event.h |  21 +++++
+ kernel/events/core.c       | 177 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 194 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 8e508f77f42c..920653536b69 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -302,6 +302,19 @@ struct perf_event_pmu_context;
+ #define PERF_PMU_CAP_EXTENDED_HW_TYPE		0x0100
+ #define PERF_PMU_CAP_AUX_PAUSE			0x0200
+ 
++/**
++ * pmu::scope
++ */
++enum perf_pmu_scope {
++	PERF_PMU_SCOPE_NONE	= 0,
++	PERF_PMU_SCOPE_CORE,
++	PERF_PMU_SCOPE_DIE,
++	PERF_PMU_SCOPE_CLUSTER,
++	PERF_PMU_SCOPE_PKG,
++	PERF_PMU_SCOPE_SYS_WIDE,
++	PERF_PMU_MAX_SCOPE,
++};
++
+ struct perf_output_handle;
+ 
+ #define PMU_NULL_DEV	((void *)(~0UL))
+@@ -325,6 +338,11 @@ struct pmu {
+ 	 */
+ 	int				capabilities;
+ 
++	/*
++	 * PMU scope
++	 */
++	unsigned int			scope;
++
+ 	int __percpu			*pmu_disable_count;
+ 	struct perf_cpu_pmu_context __percpu *cpu_pmu_context;
+ 	atomic_t			exclusive_cnt; /* < 0: cpu; > 0: tsk */
+@@ -639,10 +657,13 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
+  * PERF_EV_CAP_SIBLING: An event with this flag must be a group sibling and
+  * cannot be a group leader. If an event with this flag is detached from the
+  * group it is scheduled out and moved into an unrecoverable ERROR state.
++ * PERF_EV_CAP_READ_SCOPE: A CPU event that can be read from any CPU of the
++ * PMU scope where it is active.
+  */
+ #define PERF_EV_CAP_SOFTWARE		BIT(0)
+ #define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
+ #define PERF_EV_CAP_SIBLING		BIT(2)
++#define PERF_EV_CAP_READ_SCOPE		BIT(3)
+ 
+ #define SWEVENT_HLIST_BITS		8
+ #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 0490efa1e98f..fd4626387ee9 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -407,6 +407,11 @@ static LIST_HEAD(pmus);
+ static DEFINE_MUTEX(pmus_lock);
+ static struct srcu_struct pmus_srcu;
+ static cpumask_var_t perf_online_mask;
++static cpumask_var_t perf_online_core_mask;
++static cpumask_var_t perf_online_die_mask;
++static cpumask_var_t perf_online_cluster_mask;
++static cpumask_var_t perf_online_pkg_mask;
++static cpumask_var_t perf_online_sys_mask;
+ static struct kmem_cache *perf_event_cache;
+ 
+ /*
+@@ -4462,16 +4467,40 @@ struct perf_read_data {
+ 	int ret;
+ };
+ 
++static inline const struct cpumask *perf_scope_cpu_topology_cpumask(unsigned int scope, int cpu)
++{
++	switch (scope) {
++	case PERF_PMU_SCOPE_CORE:
++		return topology_sibling_cpumask(cpu);
++	case PERF_PMU_SCOPE_DIE:
++		return topology_die_cpumask(cpu);
++	case PERF_PMU_SCOPE_CLUSTER:
++		return topology_cluster_cpumask(cpu);
++	case PERF_PMU_SCOPE_PKG:
++		return topology_core_cpumask(cpu);
++	case PERF_PMU_SCOPE_SYS_WIDE:
++		return cpu_online_mask;
++	}
++
++	return NULL;
++}
++
+ static int __perf_event_read_cpu(struct perf_event *event, int event_cpu)
+ {
++	int local_cpu = smp_processor_id();
+ 	u16 local_pkg, event_pkg;
+ 
+ 	if ((unsigned)event_cpu >= nr_cpu_ids)
+ 		return event_cpu;
+ 
+-	if (event->group_caps & PERF_EV_CAP_READ_ACTIVE_PKG) {
+-		int local_cpu = smp_processor_id();
++	if (event->group_caps & PERF_EV_CAP_READ_SCOPE) {
++		const struct cpumask *cpumask = perf_scope_cpu_topology_cpumask(event->pmu->scope, event_cpu);
++
++		if (cpumask && cpumask_test_cpu(local_cpu, cpumask))
++			return local_cpu;
++	}
+ 
++	if (event->group_caps & PERF_EV_CAP_READ_ACTIVE_PKG) {
+ 		event_pkg = topology_physical_package_id(event_cpu);
+ 		local_pkg = topology_physical_package_id(local_cpu);
+ 
+@@ -11530,10 +11559,42 @@ perf_event_mux_interval_ms_store(struct device *dev,
+ }
+ static DEVICE_ATTR_RW(perf_event_mux_interval_ms);
+ 
++static inline struct cpumask *perf_scope_cpumask(unsigned int scope)
++{
++	switch (scope) {
++	case PERF_PMU_SCOPE_CORE:
++		return perf_online_core_mask;
++	case PERF_PMU_SCOPE_DIE:
++		return perf_online_die_mask;
++	case PERF_PMU_SCOPE_CLUSTER:
++		return perf_online_cluster_mask;
++	case PERF_PMU_SCOPE_PKG:
++		return perf_online_pkg_mask;
++	case PERF_PMU_SCOPE_SYS_WIDE:
++		return perf_online_sys_mask;
++	}
++
++	return NULL;
++}
++
++static ssize_t cpumask_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct pmu *pmu = dev_get_drvdata(dev);
++	struct cpumask *mask = perf_scope_cpumask(pmu->scope);
++
++	if (mask)
++		return cpumap_print_to_pagebuf(true, buf, mask);
++	return 0;
++}
++
++static DEVICE_ATTR_RO(cpumask);
++
+ static struct attribute *pmu_dev_attrs[] = {
+ 	&dev_attr_type.attr,
+ 	&dev_attr_perf_event_mux_interval_ms.attr,
+ 	&dev_attr_nr_addr_filters.attr,
++	&dev_attr_cpumask.attr,
+ 	NULL,
+ };
+ 
+@@ -11545,6 +11606,10 @@ static umode_t pmu_dev_is_visible(struct kobject *kobj, struct attribute *a, int
+ 	if (n == 2 && !pmu->nr_addr_filters)
+ 		return 0;
+ 
++	/* cpumask */
++	if (n == 3 && pmu->scope == PERF_PMU_SCOPE_NONE)
++		return 0;
++
+ 	return a->mode;
+ }
+ 
+@@ -11629,6 +11694,11 @@ int perf_pmu_register(struct pmu *pmu, const char *name, int type)
+ 		goto free_pdc;
+ 	}
+ 
++	if (WARN_ONCE(pmu->scope >= PERF_PMU_MAX_SCOPE, "Can not register a pmu with an invalid scope.\n")) {
++		ret = -EINVAL;
++		goto free_pdc;
++	}
++
+ 	pmu->name = name;
+ 
+ 	if (type >= 0)
+@@ -11783,6 +11853,25 @@ static int perf_try_init_event(struct pmu *pmu, struct perf_event *event)
+ 		    event_has_any_exclude_flag(event))
+ 			ret = -EINVAL;
+ 
++		if (pmu->scope != PERF_PMU_SCOPE_NONE && event->cpu >= 0) {
++			const struct cpumask *cpumask = perf_scope_cpu_topology_cpumask(pmu->scope, event->cpu);
++			struct cpumask *pmu_cpumask = perf_scope_cpumask(pmu->scope);
++			int cpu;
++
++			if (pmu_cpumask && cpumask) {
++				cpu = cpumask_any_and(pmu_cpumask, cpumask);
++				if (cpu >= nr_cpu_ids)
++					ret = -ENODEV;
++				else {
++					event->cpu = cpu;
++					/* An event can be read from any CPU of the scope. */
++					event->event_caps |= PERF_EV_CAP_READ_SCOPE;
++				}
++			} else {
++				ret = -ENODEV;
++			}
++		}
++
+ 		if (ret && event->destroy)
+ 			event->destroy(event);
+ 	}
+@@ -13747,6 +13836,12 @@ static void __init perf_event_init_all_cpus(void)
+ 	int cpu;
+ 
+ 	zalloc_cpumask_var(&perf_online_mask, GFP_KERNEL);
++	zalloc_cpumask_var(&perf_online_core_mask, GFP_KERNEL);
++	zalloc_cpumask_var(&perf_online_die_mask, GFP_KERNEL);
++	zalloc_cpumask_var(&perf_online_cluster_mask, GFP_KERNEL);
++	zalloc_cpumask_var(&perf_online_pkg_mask, GFP_KERNEL);
++	zalloc_cpumask_var(&perf_online_sys_mask, GFP_KERNEL);
++
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		swhash = &per_cpu(swevent_htable, cpu);
+@@ -13796,6 +13891,40 @@ static void __perf_event_exit_context(void *__info)
+ 	raw_spin_unlock(&ctx->lock);
+ }
+ 
++static void perf_event_clear_cpumask(unsigned int cpu)
++{
++	int target[PERF_PMU_MAX_SCOPE];
++	unsigned int scope;
++	struct pmu *pmu;
++
++	cpumask_clear_cpu(cpu, perf_online_mask);
++
++	for (scope = PERF_PMU_SCOPE_NONE + 1; scope < PERF_PMU_MAX_SCOPE; scope++) {
++		const struct cpumask *cpumask = perf_scope_cpu_topology_cpumask(scope, cpu);
++		struct cpumask *pmu_cpumask = perf_scope_cpumask(scope);
++
++		target[scope] = -1;
++		if (WARN_ON_ONCE(!pmu_cpumask || !cpumask))
++			continue;
++
++		if (!cpumask_test_and_clear_cpu(cpu, pmu_cpumask))
++			continue;
++		target[scope] = cpumask_any_but(cpumask, cpu);
++		if (target[scope] < nr_cpu_ids)
++			cpumask_set_cpu(target[scope], pmu_cpumask);
++	}
++
++	/* migrate */
++	list_for_each_entry_rcu(pmu, &pmus, entry, lockdep_is_held(&pmus_srcu)) {
++		if (pmu->scope == PERF_PMU_SCOPE_NONE ||
++		    WARN_ON_ONCE(pmu->scope >= PERF_PMU_MAX_SCOPE))
++			continue;
++
++		if (target[pmu->scope] >= 0 && target[pmu->scope] < nr_cpu_ids)
++			perf_pmu_migrate_context(pmu, cpu, target[pmu->scope]);
++	}
++}
++
+ static void perf_event_exit_cpu_context(int cpu)
+ {
+ 	struct perf_cpu_context *cpuctx;
+@@ -13803,6 +13932,11 @@ static void perf_event_exit_cpu_context(int cpu)
+ 
+ 	// XXX simplify cpuctx->online
+ 	mutex_lock(&pmus_lock);
++	/*
++	 * Clear the cpumasks, and migrate to other CPUs if possible.
++	 * Must be invoked before the __perf_event_exit_context.
++	 */
++	perf_event_clear_cpumask(cpu);
+ 	cpuctx = per_cpu_ptr(&perf_cpu_context, cpu);
+ 	ctx = &cpuctx->ctx;
+ 
+@@ -13810,7 +13944,6 @@ static void perf_event_exit_cpu_context(int cpu)
+ 	smp_call_function_single(cpu, __perf_event_exit_context, ctx, 1);
+ 	cpuctx->online = 0;
+ 	mutex_unlock(&ctx->mutex);
+-	cpumask_clear_cpu(cpu, perf_online_mask);
+ 	mutex_unlock(&pmus_lock);
+ }
+ #else
+@@ -13819,6 +13952,42 @@ static void perf_event_exit_cpu_context(int cpu) { }
+ 
+ #endif
+ 
++static void perf_event_setup_cpumask(unsigned int cpu)
++{
++	struct cpumask *pmu_cpumask;
++	unsigned int scope;
++
++	cpumask_set_cpu(cpu, perf_online_mask);
++
++	/*
++	 * Early boot stage, the cpumask hasn't been set yet.
++	 * The perf_online_<domain>_masks includes the first CPU of each domain.
++	 * Always uncondifionally set the boot CPU for the perf_online_<domain>_masks.
++	 */
++	if (!topology_sibling_cpumask(cpu)) {
++		for (scope = PERF_PMU_SCOPE_NONE + 1; scope < PERF_PMU_MAX_SCOPE; scope++) {
++			pmu_cpumask = perf_scope_cpumask(scope);
++			if (WARN_ON_ONCE(!pmu_cpumask))
++				continue;
++			cpumask_set_cpu(cpu, pmu_cpumask);
++		}
++		return;
++	}
++
++	for (scope = PERF_PMU_SCOPE_NONE + 1; scope < PERF_PMU_MAX_SCOPE; scope++) {
++		const struct cpumask *cpumask = perf_scope_cpu_topology_cpumask(scope, cpu);
++
++		pmu_cpumask = perf_scope_cpumask(scope);
++
++		if (WARN_ON_ONCE(!pmu_cpumask || !cpumask))
++			continue;
++
++		if (!cpumask_empty(cpumask) &&
++		    cpumask_any_and(pmu_cpumask, cpumask) >= nr_cpu_ids)
++			cpumask_set_cpu(cpu, pmu_cpumask);
++	}
++}
++
+ int perf_event_init_cpu(unsigned int cpu)
+ {
+ 	struct perf_cpu_context *cpuctx;
+@@ -13827,7 +13996,7 @@ int perf_event_init_cpu(unsigned int cpu)
+ 	perf_swevent_init_cpu(cpu);
+ 
+ 	mutex_lock(&pmus_lock);
+-	cpumask_set_cpu(cpu, perf_online_mask);
++	perf_event_setup_cpumask(cpu);
+ 	cpuctx = per_cpu_ptr(&perf_cpu_context, cpu);
+ 	ctx = &cpuctx->ctx;
+ 
+-- 
+2.25.1
+

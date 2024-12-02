@@ -1,0 +1,106 @@
+From d0b7795d659a4bd580410bbb63b30e3433910c8d Mon Sep 17 00:00:00 2001
+From: Xiong Zhang <xiong.y.zhang@intel.com>
+Date: Thu, 10 Aug 2023 17:40:11 +0800
+Subject: [PATCH 32/39] KVM: x86/PMU: Don't release vLBR caused by PMI
+
+vLBR event will be released at vcpu sched-in time if LBR_EN bit is not
+set in GUEST_IA32_DEBUGCTL VMCS field, this bit is cleared in two cases:
+1. guest disable LBR through WRMSR
+2. KVM disable LBR at PMI injection to emulate guest FREEZE_LBR_ON_PMI.
+
+The first case is guest LBR won't be used anymore and vLBR event can be
+released, but guest LBR is still be used in the second case, vLBR event
+can not be released.
+
+Considering this serial:
+1. vPMC overflow, KVM injects vPMI and clears guest LBR_EN
+2. guest handles PMI, and reads LBR records.
+3. vCPU is sched-out, later sched-in, vLBR event is released.
+4. Guest continue reading LBR records, KVM creates vLBR event again,
+the vLBR event is the only LBR user on host now, host PMU driver will
+reset HW LBR facility at vLBR creataion.
+5. Guest gets the remain LBR records with reset state.
+This is conflict with FREEZE_LBR_ON_PMI meaning, so vLBR event can
+not be release on PMI.
+
+This commit adds a freeze_on_pmi flag, this flag is set at pmi
+injection and is cleared when guest operates guest DEBUGCTL_MSR. If
+this flag is true, vLBR event will not be released.
+
+Signed-off-by: Xiong Zhang <xiong.y.zhang@intel.com>
+---
+ arch/x86/kvm/vmx/pmu_intel.c |  5 ++++-
+ arch/x86/kvm/vmx/vmx.c       | 12 +++++++++---
+ arch/x86/kvm/vmx/vmx.h       |  3 +++
+ 3 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/pmu_intel.c b/arch/x86/kvm/vmx/pmu_intel.c
+index 83382a4d1d66..8cd4554b205d 100644
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@ -588,6 +588,7 @@ static void intel_pmu_init(struct kvm_vcpu *vcpu)
+ 	lbr_desc->records.nr = 0;
+ 	lbr_desc->event = NULL;
+ 	lbr_desc->msr_passthrough = false;
++	lbr_desc->freeze_on_pmi = false;
+ }
+ 
+ static void intel_pmu_reset(struct kvm_vcpu *vcpu)
+@@ -610,6 +611,7 @@ static void intel_pmu_legacy_freezing_lbrs_on_pmi(struct kvm_vcpu *vcpu)
+ 	if (data & DEBUGCTLMSR_FREEZE_LBRS_ON_PMI) {
+ 		data &= ~DEBUGCTLMSR_LBR;
+ 		vmcs_write64(GUEST_IA32_DEBUGCTL, data);
++		vcpu_to_lbr_desc(vcpu)->freeze_on_pmi = true;
+ 	}
+ }
+ 
+@@ -701,7 +703,8 @@ void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu)
+ 
+ static void intel_pmu_cleanup(struct kvm_vcpu *vcpu)
+ {
+-	if (!(vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR))
++	if (!(vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR) &&
++	    !vcpu_to_lbr_desc(vcpu)->freeze_on_pmi)
+ 		intel_pmu_release_guest_lbr_event(vcpu);
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index f18c2d8c7476..ef18b0d8ace0 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2277,9 +2277,15 @@ int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			get_vmcs12(vcpu)->guest_ia32_debugctl = data;
+ 
+ 		vmcs_write64(GUEST_IA32_DEBUGCTL, data);
+-		if (intel_pmu_lbr_is_enabled(vcpu) && !to_vmx(vcpu)->lbr_desc.event &&
+-		    (data & DEBUGCTLMSR_LBR))
+-			intel_pmu_create_guest_lbr_event(vcpu);
++
++		if (intel_pmu_lbr_is_enabled(vcpu)) {
++			struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++
++			lbr_desc->freeze_on_pmi = false;
++			if (!lbr_desc->event && (data & DEBUGCTLMSR_LBR))
++				intel_pmu_create_guest_lbr_event(vcpu);
++		}
++
+ 		return 0;
+ 	}
+ 	case MSR_IA32_BNDCFGS:
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 42498fa63abb..08535fb63963 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -108,6 +108,9 @@ struct lbr_desc {
+ 
+ 	/* True if LBRs are marked as not intercepted in the MSR bitmap */
+ 	bool msr_passthrough;
++
++	/* True if LBR is frozen on PMI */
++	bool freeze_on_pmi;
+ };
+ 
+ extern struct x86_pmu_lbr vmx_lbr_caps;
+-- 
+2.25.1
+

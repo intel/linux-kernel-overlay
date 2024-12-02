@@ -1,0 +1,76 @@
+From 440047a19f4e9ca24f9f69c7ddcd37665d018430 Mon Sep 17 00:00:00 2001
+From: Xiong Zhang <xiong.y.zhang@intel.com>
+Date: Wed, 23 Aug 2023 16:57:53 +0800
+Subject: [PATCH 36/39] KVM: x86/pmu: Check CPUID.0AH.ECX consistency
+
+With Arch PMU V5, register CPUID.0AH.ECX indicates Fixed Counter
+enumeration. It is a bit mask which enumerates the supported Fixed
+counters.
+FxCtrl[i]_is_supported := ECX[i] || (EDX[4:0] > i)
+where EDX[4:0] is Number of continuous fixed-function performance
+counters starting from 0 (if version ID > 1).
+
+Here ECX and EDX[4:0] should satisfy the following consistency:
+1. if 1 < pmu_version < 5, ECX == 0;
+2. if pmu_version == 5 && edx[4:0] == 0, ECX[bit 0] == 0
+3. if pmu_version == 5 && edx[4:0] > 0,
+   ecx & ((1 << edx[4:0]) - 1) == (1 << edx[4:0]) -1
+
+Otherwise it is mess to decide whether a fixed counter is supported
+or not. i.e. pmu_version = 5, edx[4:0] = 3, ecx = 0x10, it is hard
+to decide whether fixed counters 0 ~ 2 are supported or not.
+
+User can call SET_CPUID2 ioctl to set guest CPUID.0AH, this commit
+adds a check to guarantee ecx and edx consistency specified by user.
+
+Once user specifies an un-consistency value, KVM can return an
+error to user and drop user setting, or correct the un-consistency
+data and accept the corrected data, this commit chooses to
+return an error to user.
+
+Signed-off-by: Xiong Zhang <xiong.y.zhang@intel.com>
+---
+ arch/x86/kvm/cpuid.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 2617be544480..d8e0beac99b0 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -150,6 +150,33 @@ static int kvm_check_cpuid(struct kvm_vcpu *vcpu,
+ 			return -EINVAL;
+ 	}
+ 
++	best = cpuid_entry2_find(entries, nent, 0xa,
++				 KVM_CPUID_INDEX_NOT_SIGNIFICANT);
++	if (best && vcpu->kvm->arch.enable_pmu) {
++		union cpuid10_eax eax;
++		union cpuid10_edx   edx;
++
++		eax.full = best->eax;
++		edx.full = best->edx;
++
++		if (eax.split.version_id > 1 &&
++		    eax.split.version_id < 5 &&
++		    best->ecx != 0) {
++			return -EINVAL;
++		} else if (eax.split.version_id >= 5) {
++			int fixed_count = edx.split.num_counters_fixed;
++
++			if (fixed_count == 0 && (best->ecx & 0x1)) {
++				return -EINVAL;
++			} else if (fixed_count > 0) {
++				int low_fixed_mask = (1 << fixed_count) - 1;
++
++				if ((best->ecx & low_fixed_mask) != low_fixed_mask)
++					return -EINVAL;
++			}
++		}
++	}
++
+ 	/*
+ 	 * Exposing dynamic xfeatures to the guest requires additional
+ 	 * enabling in the FPU, e.g. to expand the guest XSAVE state size.
+-- 
+2.25.1
+
