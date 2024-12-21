@@ -1,11 +1,6 @@
-WARNING
--------------------------------------------------------------------------------
-This repository includes the intel embargoed Linux kernel source code and confidential
-information, Pls. following related intel policy when you distribute it.
-
 Overview
 -------------------------------------------------------------------------------
-This is the IoTG Linux kernel overlay repository (Ubuntu). It includes the Out-Of-Tree(OOT) IoTG
+This is the Intel Linux kernel overlay repository (Ubuntu). It includes the Out-Of-Tree(OOT)
 Linux kernel patches, kernel config and other files. With them, user can build the Linux
 kernel .deb packages.
 
