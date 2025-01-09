@@ -1,0 +1,110 @@
+From 0804078287e7fb06dc514c9f8b1c7cfbde18626b Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 6 Dec 2024 18:24:06 +0530
+Subject: [PATCH 321/708] drm/amd/pm: Revert state if force level fails
+
+Before forcing level, CG/PG is disabled or enabled depending on the new
+level. However if the force level operation fails, CG/PG state remains
+modified. Revert the state change on failure. Also, move invalid
+operation checks to the beginning before any logic that could change SOC
+state.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c | 58 +++++++++++++++++------------
+ 1 file changed, 35 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index 4d90e3f0bd17..6a9e26905edf 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -987,6 +987,24 @@ enum amd_dpm_forced_level amdgpu_dpm_get_performance_level(struct amdgpu_device
+ 	return level;
+ }
+ 
++static void amdgpu_dpm_enter_umd_state(struct amdgpu_device *adev)
++{
++	/* enter UMD Pstate */
++	amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_GFX,
++					       AMD_PG_STATE_UNGATE);
++	amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_GFX,
++					       AMD_CG_STATE_UNGATE);
++}
++
++static void amdgpu_dpm_exit_umd_state(struct amdgpu_device *adev)
++{
++	/* exit UMD Pstate */
++	amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_GFX,
++					       AMD_CG_STATE_GATE);
++	amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_GFX,
++					       AMD_PG_STATE_GATE);
++}
++
+ int amdgpu_dpm_force_performance_level(struct amdgpu_device *adev,
+ 				       enum amd_dpm_forced_level level)
+ {
+@@ -1007,6 +1025,10 @@ int amdgpu_dpm_force_performance_level(struct amdgpu_device *adev,
+ 	if (current_level == level)
+ 		return 0;
+ 
++	if (!(current_level & profile_mode_mask) &&
++	    (level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT))
++		return -EINVAL;
++
+ 	if (adev->asic_type == CHIP_RAVEN) {
+ 		if (!(adev->apu_flags & AMD_APU_IS_RAVEN2)) {
+ 			if (current_level != AMD_DPM_FORCED_LEVEL_MANUAL &&
+@@ -1018,35 +1040,25 @@ int amdgpu_dpm_force_performance_level(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
+-	if (!(current_level & profile_mode_mask) &&
+-	    (level == AMD_DPM_FORCED_LEVEL_PROFILE_EXIT))
+-		return -EINVAL;
+-
+-	if (!(current_level & profile_mode_mask) &&
+-	      (level & profile_mode_mask)) {
+-		/* enter UMD Pstate */
+-		amdgpu_device_ip_set_powergating_state(adev,
+-						       AMD_IP_BLOCK_TYPE_GFX,
+-						       AMD_PG_STATE_UNGATE);
+-		amdgpu_device_ip_set_clockgating_state(adev,
+-						       AMD_IP_BLOCK_TYPE_GFX,
+-						       AMD_CG_STATE_UNGATE);
+-	} else if ((current_level & profile_mode_mask) &&
+-		    !(level & profile_mode_mask)) {
+-		/* exit UMD Pstate */
+-		amdgpu_device_ip_set_clockgating_state(adev,
+-						       AMD_IP_BLOCK_TYPE_GFX,
+-						       AMD_CG_STATE_GATE);
+-		amdgpu_device_ip_set_powergating_state(adev,
+-						       AMD_IP_BLOCK_TYPE_GFX,
+-						       AMD_PG_STATE_GATE);
+-	}
++	if (!(current_level & profile_mode_mask) && (level & profile_mode_mask))
++		amdgpu_dpm_enter_umd_state(adev);
++	else if ((current_level & profile_mode_mask) &&
++		 !(level & profile_mode_mask))
++		amdgpu_dpm_exit_umd_state(adev);
+ 
+ 	mutex_lock(&adev->pm.mutex);
+ 
+ 	if (pp_funcs->force_performance_level(adev->powerplay.pp_handle,
+ 					      level)) {
+ 		mutex_unlock(&adev->pm.mutex);
++		/* If new level failed, retain the umd state as before */
++		if (!(current_level & profile_mode_mask) &&
++		    (level & profile_mode_mask))
++			amdgpu_dpm_exit_umd_state(adev);
++		else if ((current_level & profile_mode_mask) &&
++			 !(level & profile_mode_mask))
++			amdgpu_dpm_enter_umd_state(adev);
++
+ 		return -EINVAL;
+ 	}
+ 
+-- 
+2.25.1
+

@@ -1,0 +1,123 @@
+From a22b2bca0147da0274e528d600551a1f23f11aca Mon Sep 17 00:00:00 2001
+From: Mika Kahola <mika.kahola@intel.com>
+Date: Wed, 27 Nov 2024 09:31:59 +0200
+Subject: [PATCH 187/708] drm/i915/xe3lpd: Power request asserting/deasserting
+
+There is a HW issue that arises when there are race conditions
+between TCSS entering/exiting TC7 or TC10 states while the
+driver is asserting/deasserting TCSS power request. As a
+workaround, Display driver will implement a mailbox sequence
+to ensure that the TCSS is in TC0 when TCSS power request is
+asserted/deasserted.
+
+The sequence is the following
+
+1. Read mailbox command status and wait until run/busy bit is
+   clear
+2. Write mailbox data value '1' for power request asserting
+   and '0' for power request deasserting
+3. Write mailbox command run/busy bit and command value with 0x1
+4. Read mailbox command and wait until run/busy bit is clear
+   before continuing power request.
+
+v2: Rename WA function (Gustavo)
+    Limit WA only for PTL platform with a TODO note (Gustavo)
+    Add TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY for clarity when writing
+    register data (Gustavo)
+    Move register defs from i915_reg.h to intel_cx0_phy_regs.h (Gustavo)
+v3: Use "struct intel_display" instead of "struct drm_i915_private" (Jani)
+    Move defs above C10 definitions in the
+    intel_cx0_phy_regs.h file (Gustavo)
+    Move drm_WARN_ON() inside WA function (Gustavo)
+    Rename workaround function as wa_14020908590() (Gustvo)
+    Use boolean enable instead of if-else structure (Raag)
+v4: Drop drm_WARN_ON() (Raag)
+    Fix function definition to fit into a single line (Raag)
+v5: Drop TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY from TCSS_DISP_MAILBOX_IN_CMD_DATA(val)
+    macro (Jani)
+    Rename WA function with some meaningful name and add comment
+    on WA number (Jani)
+    Use struct intel_display on WA calling function (Jani)
+
+Reviewed-by: Raag Jadav <raag.jadav@intel.com> (v4)
+Acked-by: Jani Nikula <jani.nikula@intel.com> (v5)
+Signed-off-by: Mika Kahola <mika.kahola@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241127073200.124907-2-mika.kahola@intel.com
+---
+ .../gpu/drm/i915/display/intel_cx0_phy_regs.h |  7 ++++
+ drivers/gpu/drm/i915/display/intel_tc.c       | 32 +++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h b/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
+index f0e5c196eae4..c685479c9756 100644
+--- a/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
++++ b/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
+@@ -200,6 +200,13 @@
+ #define   XELPDP_SSC_ENABLE_PLLA			REG_BIT(1)
+ #define   XELPDP_SSC_ENABLE_PLLB			REG_BIT(0)
+ 
++#define TCSS_DISP_MAILBOX_IN_CMD		_MMIO(0x161300)
++#define   TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY	REG_BIT(31)
++#define   TCSS_DISP_MAILBOX_IN_CMD_CMD_MASK	REG_GENMASK(7, 0)
++#define   TCSS_DISP_MAILBOX_IN_CMD_DATA(val)	REG_FIELD_PREP(TCSS_DISP_MAILBOX_IN_CMD_CMD_MASK, val)
++
++#define TCSS_DISP_MAILBOX_IN_DATA		_MMIO(0x161304)
++
+ /* C10 Vendor Registers */
+ #define PHY_C10_VDR_PLL(idx)		(0xC00 + (idx))
+ #define   C10_PLL0_FRACEN		REG_BIT8(4)
+diff --git a/drivers/gpu/drm/i915/display/intel_tc.c b/drivers/gpu/drm/i915/display/intel_tc.c
+index b16c4d2d4077..82e82e8ec11a 100644
+--- a/drivers/gpu/drm/i915/display/intel_tc.c
++++ b/drivers/gpu/drm/i915/display/intel_tc.c
+@@ -1013,15 +1013,47 @@ xelpdp_tc_phy_wait_for_tcss_power(struct intel_tc_port *tc, bool enabled)
+ 	return true;
+ }
+ 
++/*
++ * Gfx driver WA 14020908590 for PTL tcss_rxdetect_clkswb_req/ack
++ * handshake violation when pwwreq= 0->1 during TC7/10 entry
++ */
++static void xelpdp_tc_power_request_wa(struct intel_display *display, bool enable)
++{
++	/* check if mailbox is running busy */
++	if (intel_de_wait_for_clear(display, TCSS_DISP_MAILBOX_IN_CMD,
++				    TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY, 10)) {
++		drm_dbg_kms(display->drm,
++			    "Timeout waiting for TCSS mailbox run/busy bit to clear\n");
++		return;
++	}
++
++	intel_de_write(display, TCSS_DISP_MAILBOX_IN_DATA, enable ? 1 : 0);
++	intel_de_write(display, TCSS_DISP_MAILBOX_IN_CMD,
++		       TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY |
++		       TCSS_DISP_MAILBOX_IN_CMD_DATA(0x1));
++
++	/* wait to clear mailbox running busy bit before continuing */
++	if (intel_de_wait_for_clear(display, TCSS_DISP_MAILBOX_IN_CMD,
++				    TCSS_DISP_MAILBOX_IN_CMD_RUN_BUSY, 10)) {
++		drm_dbg_kms(display->drm,
++			    "Timeout after writing data to mailbox. Mailbox run/busy bit did not clear\n");
++		return;
++	}
++}
++
+ static void __xelpdp_tc_phy_enable_tcss_power(struct intel_tc_port *tc, bool enable)
+ {
+ 	struct drm_i915_private *i915 = tc_to_i915(tc);
++	struct intel_display *display = &i915->display;
+ 	enum port port = tc->dig_port->base.port;
+ 	i915_reg_t reg = XELPDP_PORT_BUF_CTL1(i915, port);
+ 	u32 val;
+ 
+ 	assert_tc_cold_blocked(tc);
+ 
++	if (DISPLAY_VER(display) == 30)
++		xelpdp_tc_power_request_wa(display, enable);
++
+ 	val = intel_de_read(i915, reg);
+ 	if (enable)
+ 		val |= XELPDP_TCSS_POWER_REQUEST;
+-- 
+2.25.1
+

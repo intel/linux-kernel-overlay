@@ -1,0 +1,373 @@
+From 9b2bcf2ee2e5972b3ed641fbcdaf924c05b01093 Mon Sep 17 00:00:00 2001
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Mon, 18 Nov 2024 09:29:40 -0800
+Subject: [PATCH 049/708] accel/amdxdna: Add suspend and resume
+
+Implement PCI power management suspend and resume callbacks.
+
+Co-developed-by: Narendra Gutta <VenkataNarendraKumar.Gutta@amd.com>
+Signed-off-by: Narendra Gutta <VenkataNarendraKumar.Gutta@amd.com>
+Co-developed-by: Xiaoming Ren <xiaoming.ren@amd.com>
+Signed-off-by: Xiaoming Ren <xiaoming.ren@amd.com>
+Co-developed-by: Min Ma <min.ma@amd.com>
+Signed-off-by: Min Ma <min.ma@amd.com>
+Reviewed-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Signed-off-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241118172942.2014541-9-lizhi.hou@amd.com
+---
+ drivers/accel/amdxdna/aie2_ctx.c        |  30 ++++++
+ drivers/accel/amdxdna/aie2_pci.c        |   4 +
+ drivers/accel/amdxdna/aie2_pci.h        |   2 +
+ drivers/accel/amdxdna/amdxdna_ctx.c     |  26 +++++
+ drivers/accel/amdxdna/amdxdna_ctx.h     |   2 +
+ drivers/accel/amdxdna/amdxdna_pci_drv.c | 120 +++++++++++++++++++++++-
+ drivers/accel/amdxdna/amdxdna_pci_drv.h |   4 +
+ 7 files changed, 185 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 2040a01256eb..90e8d87666a9 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -137,6 +137,36 @@ static void aie2_hwctx_wait_for_idle(struct amdxdna_hwctx *hwctx)
+ 	dma_fence_put(fence);
+ }
+ 
++void aie2_hwctx_suspend(struct amdxdna_hwctx *hwctx)
++{
++	struct amdxdna_dev *xdna = hwctx->client->xdna;
++
++	/*
++	 * Command timeout is unlikely. But if it happens, it doesn't
++	 * break the system. aie2_hwctx_stop() will destroy mailbox
++	 * and abort all commands.
++	 */
++	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
++	aie2_hwctx_wait_for_idle(hwctx);
++	aie2_hwctx_stop(xdna, hwctx, NULL);
++	hwctx->old_status = hwctx->status;
++	hwctx->status = HWCTX_STAT_STOP;
++}
++
++void aie2_hwctx_resume(struct amdxdna_hwctx *hwctx)
++{
++	struct amdxdna_dev *xdna = hwctx->client->xdna;
++
++	/*
++	 * The resume path cannot guarantee that mailbox channel can be
++	 * regenerated. If this happen, when submit message to this
++	 * mailbox channel, error will return.
++	 */
++	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
++	hwctx->status = hwctx->old_status;
++	aie2_hwctx_restart(xdna, hwctx);
++}
++
+ static void
+ aie2_sched_notify(struct amdxdna_sched_job *job)
+ {
+diff --git a/drivers/accel/amdxdna/aie2_pci.c b/drivers/accel/amdxdna/aie2_pci.c
+index 465764712040..803ebb237971 100644
+--- a/drivers/accel/amdxdna/aie2_pci.c
++++ b/drivers/accel/amdxdna/aie2_pci.c
+@@ -496,9 +496,13 @@ static void aie2_fini(struct amdxdna_dev *xdna)
+ const struct amdxdna_dev_ops aie2_ops = {
+ 	.init           = aie2_init,
+ 	.fini           = aie2_fini,
++	.resume         = aie2_hw_start,
++	.suspend        = aie2_hw_stop,
+ 	.hwctx_init     = aie2_hwctx_init,
+ 	.hwctx_fini     = aie2_hwctx_fini,
+ 	.hwctx_config   = aie2_hwctx_config,
+ 	.cmd_submit     = aie2_cmd_submit,
+ 	.hmm_invalidate = aie2_hmm_invalidate,
++	.hwctx_suspend  = aie2_hwctx_suspend,
++	.hwctx_resume   = aie2_hwctx_resume,
+ };
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index 9836f721fc9a..72691c9eebd7 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -240,6 +240,8 @@ int aie2_sync_bo(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx);
+ void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx);
+ int aie2_hwctx_config(struct amdxdna_hwctx *hwctx, u32 type, u64 value, void *buf, u32 size);
++void aie2_hwctx_suspend(struct amdxdna_hwctx *hwctx);
++void aie2_hwctx_resume(struct amdxdna_hwctx *hwctx);
+ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
+ void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
+ void aie2_restart_ctx(struct amdxdna_client *client);
+diff --git a/drivers/accel/amdxdna/amdxdna_ctx.c b/drivers/accel/amdxdna/amdxdna_ctx.c
+index 13cfbab9caa0..5478b631b73f 100644
+--- a/drivers/accel/amdxdna/amdxdna_ctx.c
++++ b/drivers/accel/amdxdna/amdxdna_ctx.c
+@@ -59,6 +59,32 @@ static struct dma_fence *amdxdna_fence_create(struct amdxdna_hwctx *hwctx)
+ 	return &fence->base;
+ }
+ 
++void amdxdna_hwctx_suspend(struct amdxdna_client *client)
++{
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_hwctx *hwctx;
++	int next = 0;
++
++	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
++	mutex_lock(&client->hwctx_lock);
++	idr_for_each_entry_continue(&client->hwctx_idr, hwctx, next)
++		xdna->dev_info->ops->hwctx_suspend(hwctx);
++	mutex_unlock(&client->hwctx_lock);
++}
++
++void amdxdna_hwctx_resume(struct amdxdna_client *client)
++{
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_hwctx *hwctx;
++	int next = 0;
++
++	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
++	mutex_lock(&client->hwctx_lock);
++	idr_for_each_entry_continue(&client->hwctx_idr, hwctx, next)
++		xdna->dev_info->ops->hwctx_resume(hwctx);
++	mutex_unlock(&client->hwctx_lock);
++}
++
+ static void amdxdna_hwctx_destroy_rcu(struct amdxdna_hwctx *hwctx,
+ 				      struct srcu_struct *ss)
+ {
+diff --git a/drivers/accel/amdxdna/amdxdna_ctx.h b/drivers/accel/amdxdna/amdxdna_ctx.h
+index 18ed9bdbd6d8..80b0304193ec 100644
+--- a/drivers/accel/amdxdna/amdxdna_ctx.h
++++ b/drivers/accel/amdxdna/amdxdna_ctx.h
+@@ -144,6 +144,8 @@ static inline u32 amdxdna_hwctx_col_map(struct amdxdna_hwctx *hwctx)
+ 
+ void amdxdna_sched_job_cleanup(struct amdxdna_sched_job *job);
+ void amdxdna_hwctx_remove_all(struct amdxdna_client *client);
++void amdxdna_hwctx_suspend(struct amdxdna_client *client);
++void amdxdna_hwctx_resume(struct amdxdna_client *client);
+ 
+ int amdxdna_cmd_submit(struct amdxdna_client *client,
+ 		       u32 cmd_bo_hdls, u32 *arg_bo_hdls, u32 arg_bo_cnt,
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.c b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+index 2262157b26a6..c4df674fdf50 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+@@ -13,11 +13,14 @@
+ #include <drm/gpu_scheduler.h>
+ #include <linux/iommu.h>
+ #include <linux/pci.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "amdxdna_ctx.h"
+ #include "amdxdna_gem.h"
+ #include "amdxdna_pci_drv.h"
+ 
++#define AMDXDNA_AUTOSUSPEND_DELAY	5000 /* milliseconds */
++
+ /*
+  * Bind the driver base on (vendor_id, device_id) pair and later use the
+  * (device_id, rev_id) pair as a key to select the devices. The devices with
+@@ -45,9 +48,17 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
+ 	struct amdxdna_client *client;
+ 	int ret;
+ 
++	ret = pm_runtime_resume_and_get(ddev->dev);
++	if (ret) {
++		XDNA_ERR(xdna, "Failed to get rpm, ret %d", ret);
++		return ret;
++	}
++
+ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
+-	if (!client)
+-		return -ENOMEM;
++	if (!client) {
++		ret = -ENOMEM;
++		goto put_rpm;
++	}
+ 
+ 	client->pid = pid_nr(filp->pid);
+ 	client->xdna = xdna;
+@@ -83,6 +94,9 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
+ 	iommu_sva_unbind_device(client->sva);
+ failed:
+ 	kfree(client);
++put_rpm:
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
+ 
+ 	return ret;
+ }
+@@ -105,6 +119,8 @@ static void amdxdna_drm_close(struct drm_device *ddev, struct drm_file *filp)
+ 
+ 	XDNA_DBG(xdna, "pid %d closed", client->pid);
+ 	kfree(client);
++	pm_runtime_mark_last_busy(ddev->dev);
++	pm_runtime_put_autosuspend(ddev->dev);
+ }
+ 
+ static int amdxdna_flush(struct file *f, fl_owner_t id)
+@@ -183,10 +199,11 @@ amdxdna_get_dev_info(struct pci_dev *pdev)
+ 
+ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
++	struct device *dev = &pdev->dev;
+ 	struct amdxdna_dev *xdna;
+ 	int ret;
+ 
+-	xdna = devm_drm_dev_alloc(&pdev->dev, &amdxdna_drm_drv, typeof(*xdna), ddev);
++	xdna = devm_drm_dev_alloc(dev, &amdxdna_drm_drv, typeof(*xdna), ddev);
+ 	if (IS_ERR(xdna))
+ 		return PTR_ERR(xdna);
+ 
+@@ -219,12 +236,19 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto failed_dev_fini;
+ 	}
+ 
++	pm_runtime_set_autosuspend_delay(dev, AMDXDNA_AUTOSUSPEND_DELAY);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_allow(dev);
++
+ 	ret = drm_dev_register(&xdna->ddev, 0);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "DRM register failed, ret %d", ret);
++		pm_runtime_forbid(dev);
+ 		goto failed_sysfs_fini;
+ 	}
+ 
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
+ 	return 0;
+ 
+ failed_sysfs_fini:
+@@ -239,8 +263,12 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ static void amdxdna_remove(struct pci_dev *pdev)
+ {
+ 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
++	struct device *dev = &pdev->dev;
+ 	struct amdxdna_client *client;
+ 
++	pm_runtime_get_noresume(dev);
++	pm_runtime_forbid(dev);
++
+ 	drm_dev_unplug(&xdna->ddev);
+ 	amdxdna_sysfs_fini(xdna);
+ 
+@@ -262,11 +290,97 @@ static void amdxdna_remove(struct pci_dev *pdev)
+ 	mutex_unlock(&xdna->dev_lock);
+ }
+ 
++static int amdxdna_dev_suspend_nolock(struct amdxdna_dev *xdna)
++{
++	if (xdna->dev_info->ops->suspend)
++		xdna->dev_info->ops->suspend(xdna);
++
++	return 0;
++}
++
++static int amdxdna_dev_resume_nolock(struct amdxdna_dev *xdna)
++{
++	if (xdna->dev_info->ops->resume)
++		return xdna->dev_info->ops->resume(xdna);
++
++	return 0;
++}
++
++static int amdxdna_pmops_suspend(struct device *dev)
++{
++	struct amdxdna_dev *xdna = pci_get_drvdata(to_pci_dev(dev));
++	struct amdxdna_client *client;
++
++	mutex_lock(&xdna->dev_lock);
++	list_for_each_entry(client, &xdna->client_list, node)
++		amdxdna_hwctx_suspend(client);
++
++	amdxdna_dev_suspend_nolock(xdna);
++	mutex_unlock(&xdna->dev_lock);
++
++	return 0;
++}
++
++static int amdxdna_pmops_resume(struct device *dev)
++{
++	struct amdxdna_dev *xdna = pci_get_drvdata(to_pci_dev(dev));
++	struct amdxdna_client *client;
++	int ret;
++
++	XDNA_INFO(xdna, "firmware resuming...");
++	mutex_lock(&xdna->dev_lock);
++	ret = amdxdna_dev_resume_nolock(xdna);
++	if (ret) {
++		XDNA_ERR(xdna, "resume NPU firmware failed");
++		mutex_unlock(&xdna->dev_lock);
++		return ret;
++	}
++
++	XDNA_INFO(xdna, "hardware context resuming...");
++	list_for_each_entry(client, &xdna->client_list, node)
++		amdxdna_hwctx_resume(client);
++	mutex_unlock(&xdna->dev_lock);
++
++	return 0;
++}
++
++static int amdxdna_rpmops_suspend(struct device *dev)
++{
++	struct amdxdna_dev *xdna = pci_get_drvdata(to_pci_dev(dev));
++	int ret;
++
++	mutex_lock(&xdna->dev_lock);
++	ret = amdxdna_dev_suspend_nolock(xdna);
++	mutex_unlock(&xdna->dev_lock);
++
++	XDNA_DBG(xdna, "Runtime suspend done ret: %d", ret);
++	return ret;
++}
++
++static int amdxdna_rpmops_resume(struct device *dev)
++{
++	struct amdxdna_dev *xdna = pci_get_drvdata(to_pci_dev(dev));
++	int ret;
++
++	mutex_lock(&xdna->dev_lock);
++	ret = amdxdna_dev_resume_nolock(xdna);
++	mutex_unlock(&xdna->dev_lock);
++
++	XDNA_DBG(xdna, "Runtime resume done ret: %d", ret);
++	return ret;
++}
++
++static const struct dev_pm_ops amdxdna_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(amdxdna_pmops_suspend, amdxdna_pmops_resume)
++	SET_RUNTIME_PM_OPS(amdxdna_rpmops_suspend, amdxdna_rpmops_resume, NULL)
++};
++
+ static struct pci_driver amdxdna_pci_driver = {
+ 	.name = KBUILD_MODNAME,
+ 	.id_table = pci_ids,
+ 	.probe = amdxdna_probe,
+ 	.remove = amdxdna_remove,
++	.driver.pm = &amdxdna_pm_ops,
+ };
+ 
+ module_pci_driver(amdxdna_pci_driver);
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.h b/drivers/accel/amdxdna/amdxdna_pci_drv.h
+index 30ea8da55d69..52c59249c8a0 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.h
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.h
+@@ -28,10 +28,14 @@ struct amdxdna_sched_job;
+ struct amdxdna_dev_ops {
+ 	int (*init)(struct amdxdna_dev *xdna);
+ 	void (*fini)(struct amdxdna_dev *xdna);
++	int (*resume)(struct amdxdna_dev *xdna);
++	void (*suspend)(struct amdxdna_dev *xdna);
+ 	int (*hwctx_init)(struct amdxdna_hwctx *hwctx);
+ 	void (*hwctx_fini)(struct amdxdna_hwctx *hwctx);
+ 	int (*hwctx_config)(struct amdxdna_hwctx *hwctx, u32 type, u64 value, void *buf, u32 size);
+ 	void (*hmm_invalidate)(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
++	void (*hwctx_suspend)(struct amdxdna_hwctx *hwctx);
++	void (*hwctx_resume)(struct amdxdna_hwctx *hwctx);
+ 	int (*cmd_submit)(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
+ };
+ 
+-- 
+2.25.1
+

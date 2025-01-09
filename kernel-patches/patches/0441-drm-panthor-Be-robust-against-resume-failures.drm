@@ -1,0 +1,129 @@
+From fcd5f71a98a857319cb319e239dc9bd052641dc0 Mon Sep 17 00:00:00 2001
+From: Boris Brezillon <boris.brezillon@collabora.com>
+Date: Wed, 11 Dec 2024 08:54:18 +0100
+Subject: [PATCH 441/708] drm/panthor: Be robust against resume failures
+
+When the runtime PM resume callback returns an error, it puts the device
+in a state where it can't be resumed anymore. Make sure we can recover
+from such transient failures by calling pm_runtime_set_suspended()
+explicitly after a pm_runtime_resume_and_get() failure.
+
+v3:
+- Add R-b/A-b
+
+v2:
+- Add a comment explaining potential races in
+  panthor_device_resume_and_get()
+
+Signed-off-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Adrian Larumbe <adrian.larumbe@collabora.com>
+Acked-by: Steven Price <steven.price@arm.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241211075419.2333731-5-boris.brezillon@collabora.com
+---
+ drivers/gpu/drm/panthor/panthor_device.c |  1 +
+ drivers/gpu/drm/panthor/panthor_device.h | 26 ++++++++++++++++++++++++
+ drivers/gpu/drm/panthor/panthor_drv.c    |  2 +-
+ drivers/gpu/drm/panthor/panthor_sched.c  |  4 ++--
+ 4 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_device.c b/drivers/gpu/drm/panthor/panthor_device.c
+index 4faca2684324..5f9602bddc53 100644
+--- a/drivers/gpu/drm/panthor/panthor_device.c
++++ b/drivers/gpu/drm/panthor/panthor_device.c
+@@ -504,6 +504,7 @@ int panthor_device_resume(struct device *dev)
+ 
+ err_set_suspended:
+ 	atomic_set(&ptdev->pm.state, PANTHOR_DEVICE_PM_STATE_SUSPENDED);
++	atomic_set(&ptdev->pm.recovery_needed, 1);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/panthor/panthor_device.h b/drivers/gpu/drm/panthor/panthor_device.h
+index 0e68f5a70d20..b6c4f25a5d6e 100644
+--- a/drivers/gpu/drm/panthor/panthor_device.h
++++ b/drivers/gpu/drm/panthor/panthor_device.h
+@@ -9,6 +9,7 @@
+ #include <linux/atomic.h>
+ #include <linux/io-pgtable.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/pm_runtime.h>
+ #include <linux/sched.h>
+ #include <linux/spinlock.h>
+ 
+@@ -180,6 +181,9 @@ struct panthor_device {
+ 		 * is suspended.
+ 		 */
+ 		struct page *dummy_latest_flush;
++
++		/** @recovery_needed: True when a resume attempt failed. */
++		atomic_t recovery_needed;
+ 	} pm;
+ 
+ 	/** @profile_mask: User-set profiling flags for job accounting. */
+@@ -243,6 +247,28 @@ int panthor_device_mmap_io(struct panthor_device *ptdev,
+ int panthor_device_resume(struct device *dev);
+ int panthor_device_suspend(struct device *dev);
+ 
++static inline int panthor_device_resume_and_get(struct panthor_device *ptdev)
++{
++	int ret = pm_runtime_resume_and_get(ptdev->base.dev);
++
++	/* If the resume failed, we need to clear the runtime_error, which
++	 * can done by forcing the RPM state to suspended. If multiple
++	 * threads called panthor_device_resume_and_get(), we only want
++	 * one of them to update the state, hence the cmpxchg. Note that a
++	 * thread might enter panthor_device_resume_and_get() and call
++	 * pm_runtime_resume_and_get() after another thread had attempted
++	 * to resume and failed. This means we will end up with an error
++	 * without even attempting a resume ourselves. The only risk here
++	 * is to report an error when the second resume attempt might have
++	 * succeeded. Given resume errors are not expected, this is probably
++	 * something we can live with.
++	 */
++	if (ret && atomic_cmpxchg(&ptdev->pm.recovery_needed, 1, 0) == 1)
++		pm_runtime_set_suspended(ptdev->base.dev);
++
++	return ret;
++}
++
+ enum drm_panthor_exception_type {
+ 	DRM_PANTHOR_EXCEPTION_OK = 0x00,
+ 	DRM_PANTHOR_EXCEPTION_TERMINATED = 0x04,
+diff --git a/drivers/gpu/drm/panthor/panthor_drv.c b/drivers/gpu/drm/panthor/panthor_drv.c
+index 32421bad3097..33cfba877525 100644
+--- a/drivers/gpu/drm/panthor/panthor_drv.c
++++ b/drivers/gpu/drm/panthor/panthor_drv.c
+@@ -763,7 +763,7 @@ static int panthor_query_timestamp_info(struct panthor_device *ptdev,
+ {
+ 	int ret;
+ 
+-	ret = pm_runtime_resume_and_get(ptdev->base.dev);
++	ret = panthor_device_resume_and_get(ptdev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/panthor/panthor_sched.c b/drivers/gpu/drm/panthor/panthor_sched.c
+index ef4bec7ff9c7..58200d299fbb 100644
+--- a/drivers/gpu/drm/panthor/panthor_sched.c
++++ b/drivers/gpu/drm/panthor/panthor_sched.c
+@@ -2354,7 +2354,7 @@ static void tick_work(struct work_struct *work)
+ 	if (!drm_dev_enter(&ptdev->base, &cookie))
+ 		return;
+ 
+-	ret = pm_runtime_resume_and_get(ptdev->base.dev);
++	ret = panthor_device_resume_and_get(ptdev);
+ 	if (drm_WARN_ON(&ptdev->base, ret))
+ 		goto out_dev_exit;
+ 
+@@ -3115,7 +3115,7 @@ queue_run_job(struct drm_sched_job *sched_job)
+ 		return dma_fence_get(job->done_fence);
+ 	}
+ 
+-	ret = pm_runtime_resume_and_get(ptdev->base.dev);
++	ret = panthor_device_resume_and_get(ptdev);
+ 	if (drm_WARN_ON(&ptdev->base, ret))
+ 		return ERR_PTR(ret);
+ 
+-- 
+2.25.1
+

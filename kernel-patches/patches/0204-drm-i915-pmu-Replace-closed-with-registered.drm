@@ -1,0 +1,149 @@
+From 23d019e08c0f4926aef5daa031acfe272692207e Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Mon, 4 Nov 2024 13:35:11 -0800
+Subject: [PATCH 204/708] drm/i915/pmu: Replace closed with registered
+
+Since i915 calls perf_pmu_register/perf_pmu_unregister, let's call the
+variable "registered" so we can flip the logic and rely on it being
+false by default. Looking at other drivers, it's also more common.
+Examples: arch/x86/events/intel/uncore.c and
+drivers/powercap/intel_rapl_common.c.
+
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241104213512.2314930-4-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/i915/i915_pmu.c | 25 +++++++++++++------------
+ drivers/gpu/drm/i915/i915_pmu.h |  4 ++--
+ 2 files changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_pmu.c b/drivers/gpu/drm/i915/i915_pmu.c
+index 86faa5705fd8..bd476297ed0a 100644
+--- a/drivers/gpu/drm/i915/i915_pmu.c
++++ b/drivers/gpu/drm/i915/i915_pmu.c
+@@ -302,7 +302,7 @@ void i915_pmu_gt_parked(struct intel_gt *gt)
+ {
+ 	struct i915_pmu *pmu = &gt->i915->pmu;
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return;
+ 
+ 	spin_lock_irq(&pmu->lock);
+@@ -324,7 +324,7 @@ void i915_pmu_gt_unparked(struct intel_gt *gt)
+ {
+ 	struct i915_pmu *pmu = &gt->i915->pmu;
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return;
+ 
+ 	spin_lock_irq(&pmu->lock);
+@@ -626,7 +626,7 @@ static int i915_pmu_event_init(struct perf_event *event)
+ 	struct drm_i915_private *i915 = pmu_to_i915(pmu);
+ 	int ret;
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return -ENODEV;
+ 
+ 	if (event->attr.type != event->pmu->type)
+@@ -724,7 +724,7 @@ static void i915_pmu_event_read(struct perf_event *event)
+ 	struct hw_perf_event *hwc = &event->hw;
+ 	u64 prev, new;
+ 
+-	if (pmu->closed) {
++	if (!pmu->registered) {
+ 		event->hw.state = PERF_HES_STOPPED;
+ 		return;
+ 	}
+@@ -850,7 +850,7 @@ static void i915_pmu_event_start(struct perf_event *event, int flags)
+ {
+ 	struct i915_pmu *pmu = event_to_pmu(event);
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return;
+ 
+ 	i915_pmu_enable(event);
+@@ -861,7 +861,7 @@ static void i915_pmu_event_stop(struct perf_event *event, int flags)
+ {
+ 	struct i915_pmu *pmu = event_to_pmu(event);
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		goto out;
+ 
+ 	if (flags & PERF_EF_UPDATE)
+@@ -877,7 +877,7 @@ static int i915_pmu_event_add(struct perf_event *event, int flags)
+ {
+ 	struct i915_pmu *pmu = event_to_pmu(event);
+ 
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return -ENODEV;
+ 
+ 	if (flags & PERF_EF_START)
+@@ -1193,7 +1193,7 @@ static int i915_pmu_cpu_offline(unsigned int cpu, struct hlist_node *node)
+ 	 * Unregistering an instance generates a CPU offline event which we must
+ 	 * ignore to avoid incorrectly modifying the shared i915_pmu_cpumask.
+ 	 */
+-	if (pmu->closed)
++	if (!pmu->registered)
+ 		return 0;
+ 
+ 	if (cpumask_test_and_clear_cpu(cpu, &i915_pmu_cpumask)) {
+@@ -1263,8 +1263,6 @@ void i915_pmu_register(struct drm_i915_private *i915)
+ 	};
+ 	int ret = -ENOMEM;
+ 
+-	pmu->closed = true;
+-
+ 	spin_lock_init(&pmu->lock);
+ 	hrtimer_init(&pmu->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	pmu->timer.function = i915_sample;
+@@ -1313,7 +1311,7 @@ void i915_pmu_register(struct drm_i915_private *i915)
+ 	if (ret)
+ 		goto err_unreg;
+ 
+-	pmu->closed = false;
++	pmu->registered = true;
+ 
+ 	return;
+ 
+@@ -1334,12 +1332,15 @@ void i915_pmu_unregister(struct drm_i915_private *i915)
+ {
+ 	struct i915_pmu *pmu = &i915->pmu;
+ 
++	if (!pmu->registered)
++		return;
++
+ 	/*
+ 	 * "Disconnect" the PMU callbacks - since all are atomic synchronize_rcu
+ 	 * ensures all currently executing ones will have exited before we
+ 	 * proceed with unregistration.
+ 	 */
+-	pmu->closed = true;
++	pmu->registered = false;
+ 	synchronize_rcu();
+ 
+ 	hrtimer_cancel(&pmu->timer);
+diff --git a/drivers/gpu/drm/i915/i915_pmu.h b/drivers/gpu/drm/i915/i915_pmu.h
+index 41af038c3738..8e66d63d0c9f 100644
+--- a/drivers/gpu/drm/i915/i915_pmu.h
++++ b/drivers/gpu/drm/i915/i915_pmu.h
+@@ -68,9 +68,9 @@ struct i915_pmu {
+ 	 */
+ 	struct pmu base;
+ 	/**
+-	 * @closed: i915 is unregistering.
++	 * @registered: PMU is registered and not in the unregistering process.
+ 	 */
+-	bool closed;
++	bool registered;
+ 	/**
+ 	 * @name: Name as registered with perf core.
+ 	 */
+-- 
+2.25.1
+

@@ -1,0 +1,506 @@
+From ce65cc04cc584d26a3417d41f1dc63b34ddd6905 Mon Sep 17 00:00:00 2001
+From: Dillon Varone <dillon.varone@amd.com>
+Date: Fri, 29 Nov 2024 16:37:32 -0500
+Subject: [PATCH 378/708] drm/amd/display: Add support for FAMS2+ interface
+ versions
+
+Current driver interface does not allow for flexibility in coexistence
+of multiple interface versions, so add support for checking minor
+interface revisions and providing appropriate programming.
+
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Dillon Varone <dillon.varone@amd.com>
+Signed-off-by: Rodrigo Siqueira <rodrigo.siqueira@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/display/dc/dc.h           |  1 +
+ drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c  | 40 ++++-----
+ .../amd/display/dc/dml2/dml21/dml21_utils.c   | 80 +++++++++++------
+ .../dml21/inc/bounding_boxes/dcn4_soc_bb.h    |  2 +-
+ .../display/dc/dml2/dml21/inc/dml_top_types.h |  3 +-
+ .../dml2/dml21/src/dml2_core/dml2_core_dcn4.c |  3 +-
+ .../src/dml2_core/dml2_core_dcn4_calcs.c      | 90 ++++++++++---------
+ .../src/dml2_core/dml2_core_dcn4_calcs.h      |  2 +-
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.c |  3 +-
+ .../gpu/drm/amd/display/dc/inc/core_types.h   |  4 +-
+ .../amd/display/dc/optc/dcn401/dcn401_optc.c  |  4 +-
+ .../dc/resource/dcn401/dcn401_resource.c      |  4 +
+ 12 files changed, 134 insertions(+), 102 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 9cd81de4be02..961b8245523c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -1056,6 +1056,7 @@ struct dc_debug_options {
+ 	bool dml21_force_pstate_method;
+ 	uint32_t dml21_force_pstate_method_values[MAX_PIPES];
+ 	uint32_t dml21_disable_pstate_method_mask;
++	union fw_assisted_mclk_switch_version fams_version;
+ 	union dmub_fams2_global_feature_config fams2_config;
+ 	bool enable_legacy_clock_update;
+ 	unsigned int force_cositing;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+index 4127a4a2f1e0..44ff9abe2880 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+@@ -1714,30 +1714,26 @@ void dc_dmub_srv_fams2_update_config(struct dc *dc,
+ 
+ 		/* construct per-stream configs */
+ 		for (i = 0; i < context->bw_ctx.bw.dcn.fams2_global_config.num_streams; i++) {
+-			struct dmub_rb_cmd_fams2 *stream_cmd = &cmd[i+1].fams2_config;
+-			struct dmub_rb_cmd_fams2 *sub_state_cmd = &cmd[i+1+context->bw_ctx.bw.dcn.fams2_global_config.num_streams].fams2_config;
++			struct dmub_rb_cmd_fams2 *stream_base_cmd = &cmd[i+1].fams2_config;
++			struct dmub_rb_cmd_fams2 *stream_sub_state_cmd = &cmd[i+1+context->bw_ctx.bw.dcn.fams2_global_config.num_streams].fams2_config;
+ 
+ 			/* configure command header */
+-			stream_cmd->header.type = DMUB_CMD__FW_ASSISTED_MCLK_SWITCH;
+-			stream_cmd->header.sub_type = DMUB_CMD__FAMS2_CONFIG;
+-			stream_cmd->header.payload_bytes = sizeof(struct dmub_rb_cmd_fams2) - sizeof(struct dmub_cmd_header);
+-			stream_cmd->header.multi_cmd_pending = 1;
+-			sub_state_cmd->header.type = DMUB_CMD__FW_ASSISTED_MCLK_SWITCH;
+-			sub_state_cmd->header.sub_type = DMUB_CMD__FAMS2_CONFIG;
+-			sub_state_cmd->header.payload_bytes = sizeof(struct dmub_rb_cmd_fams2) - sizeof(struct dmub_cmd_header);
+-			sub_state_cmd->header.multi_cmd_pending = 1;
+-			/* copy stream static state */
+-			memcpy(&stream_cmd->config.stream_v1.base,
+-					&context->bw_ctx.bw.dcn.fams2_stream_params[i],
+-					sizeof(struct dmub_fams2_cmd_stream_static_base_state));
+-			// TODO: Use the below memcpy call instead of the above once DML is updated
+-			/*memcpy(&stream_cmd->config.stream_v1.base,
+-					&context->bw_ctx.bw.dcn.fams2_stream_params[i].base,
+-					sizeof(struct dmub_fams2_cmd_stream_static_base_state));*/
+-			/* copy stream sub state */
+-			memcpy(&stream_cmd->config.stream_v1.sub_state,
+-					&context->bw_ctx.bw.dcn.fams2_stream_params[i].sub_state,
+-					sizeof(union dmub_fams2_cmd_stream_static_sub_state));
++			stream_base_cmd->header.type = DMUB_CMD__FW_ASSISTED_MCLK_SWITCH;
++			stream_base_cmd->header.sub_type = DMUB_CMD__FAMS2_CONFIG;
++			stream_base_cmd->header.payload_bytes = sizeof(struct dmub_rb_cmd_fams2) - sizeof(struct dmub_cmd_header);
++			stream_base_cmd->header.multi_cmd_pending = 1;
++			stream_sub_state_cmd->header.type = DMUB_CMD__FW_ASSISTED_MCLK_SWITCH;
++			stream_sub_state_cmd->header.sub_type = DMUB_CMD__FAMS2_CONFIG;
++			stream_sub_state_cmd->header.payload_bytes = sizeof(struct dmub_rb_cmd_fams2) - sizeof(struct dmub_cmd_header);
++			stream_sub_state_cmd->header.multi_cmd_pending = 1;
++			/* copy stream static base state */
++			memcpy(&stream_base_cmd->config,
++					&context->bw_ctx.bw.dcn.fams2_stream_base_params[i],
++					sizeof(union dmub_cmd_fams2_config));
++			/* copy stream static sub state */
++			memcpy(&stream_sub_state_cmd->config,
++					&context->bw_ctx.bw.dcn.fams2_stream_sub_params[i],
++					sizeof(union dmub_cmd_fams2_config));
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_utils.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_utils.c
+index 51d491bffa32..cb966f8d3216 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_utils.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_utils.c
+@@ -482,7 +482,8 @@ void dml21_build_fams2_programming(const struct dc *dc,
+ 	unsigned int num_fams2_streams = 0;
+ 
+ 	/* reset fams2 data */
+-	memset(&context->bw_ctx.bw.dcn.fams2_stream_params, 0, sizeof(struct dmub_fams2_stream_static_state) * DML2_MAX_PLANES);
++	memset(&context->bw_ctx.bw.dcn.fams2_stream_base_params, 0, sizeof(union dmub_cmd_fams2_config) * DML2_MAX_PLANES);
++	memset(&context->bw_ctx.bw.dcn.fams2_stream_sub_params, 0, sizeof(union dmub_cmd_fams2_config) * DML2_MAX_PLANES);
+ 	memset(&context->bw_ctx.bw.dcn.fams2_global_config, 0, sizeof(struct dmub_cmd_fams2_global_config));
+ 
+ 	if (dml_ctx->v21.mode_programming.programming->fams2_required) {
+@@ -490,8 +491,10 @@ void dml21_build_fams2_programming(const struct dc *dc,
+ 			int dml_stream_idx;
+ 			struct dc_stream_state *phantom_stream;
+ 			struct dc_stream_status *phantom_status;
++			enum fams2_stream_type type = 0;
+ 
+-			struct dmub_fams2_stream_static_state *static_state = &context->bw_ctx.bw.dcn.fams2_stream_params[num_fams2_streams];
++			union dmub_cmd_fams2_config *static_base_state = &context->bw_ctx.bw.dcn.fams2_stream_base_params[num_fams2_streams];
++			union dmub_cmd_fams2_config *static_sub_state = &context->bw_ctx.bw.dcn.fams2_stream_sub_params[num_fams2_streams];
+ 
+ 			struct dc_stream_state *stream = context->streams[i];
+ 
+@@ -508,28 +511,38 @@ void dml21_build_fams2_programming(const struct dc *dc,
+ 			}
+ 
+ 			/* copy static state from PMO */
+-			memcpy(static_state,
+-					&dml_ctx->v21.mode_programming.programming->stream_programming[dml_stream_idx].fams2_params,
+-					sizeof(struct dmub_fams2_stream_static_state));
+-
+-			/* get information from context */
+-			static_state->num_planes = context->stream_status[i].plane_count;
+-			static_state->otg_inst = context->stream_status[i].primary_otg_inst;
+-
+-			/* populate pipe masks for planes */
+-			for (j = 0; j < context->stream_status[i].plane_count; j++) {
+-				for (k = 0; k < dc->res_pool->pipe_count; k++) {
+-					if (context->res_ctx.pipe_ctx[k].stream &&
+-							context->res_ctx.pipe_ctx[k].stream->stream_id == stream->stream_id &&
+-							context->res_ctx.pipe_ctx[k].plane_state == context->stream_status[i].plane_states[j]) {
+-						static_state->pipe_mask |= (1 << k);
+-						static_state->plane_pipe_masks[j] |= (1 << k);
++			memcpy(static_base_state,
++					&dml_ctx->v21.mode_programming.programming->stream_programming[dml_stream_idx].fams2_base_params,
++					sizeof(union dmub_cmd_fams2_config));
++			memcpy(static_sub_state,
++					&dml_ctx->v21.mode_programming.programming->stream_programming[dml_stream_idx].fams2_sub_params,
++					sizeof(union dmub_cmd_fams2_config));
++
++			switch (dc->debug.fams_version.minor) {
++			case 1:
++			default:
++				type = static_base_state->stream_v1.base.type;
++
++				/* get information from context */
++				static_base_state->stream_v1.base.num_planes = context->stream_status[i].plane_count;
++				static_base_state->stream_v1.base.otg_inst = context->stream_status[i].primary_otg_inst;
++
++				/* populate pipe masks for planes */
++				for (j = 0; j < context->stream_status[i].plane_count; j++) {
++					for (k = 0; k < dc->res_pool->pipe_count; k++) {
++						if (context->res_ctx.pipe_ctx[k].stream &&
++								context->res_ctx.pipe_ctx[k].stream->stream_id == stream->stream_id &&
++								context->res_ctx.pipe_ctx[k].plane_state == context->stream_status[i].plane_states[j]) {
++							static_base_state->stream_v1.base.pipe_mask |= (1 << k);
++							static_base_state->stream_v1.base.plane_pipe_masks[j] |= (1 << k);
++						}
+ 					}
+ 				}
+ 			}
+ 
++
+ 			/* get per method programming */
+-			switch (static_state->type) {
++			switch (type) {
+ 			case FAMS2_STREAM_TYPE_VBLANK:
+ 			case FAMS2_STREAM_TYPE_VACTIVE:
+ 			case FAMS2_STREAM_TYPE_DRR:
+@@ -543,16 +556,27 @@ void dml21_build_fams2_programming(const struct dc *dc,
+ 
+ 				/* phantom status should always be present */
+ 				ASSERT(phantom_status);
+-				static_state->sub_state.subvp.phantom_otg_inst = phantom_status->primary_otg_inst;
++				if (!phantom_status)
++					break;
+ 
+-				/* populate pipe masks for phantom planes */
+-				for (j = 0; j < phantom_status->plane_count; j++) {
+-					for (k = 0; k < dc->res_pool->pipe_count; k++) {
+-						if (context->res_ctx.pipe_ctx[k].stream &&
+-								context->res_ctx.pipe_ctx[k].stream->stream_id == phantom_stream->stream_id &&
+-								context->res_ctx.pipe_ctx[k].plane_state == phantom_status->plane_states[j]) {
+-							static_state->sub_state.subvp.phantom_pipe_mask |= (1 << k);
+-							static_state->sub_state.subvp.phantom_plane_pipe_masks[j] |= (1 << k);
++				switch (dc->debug.fams_version.minor) {
++				case 1:
++				default:
++					static_sub_state->stream_v1.sub_state.subvp.phantom_otg_inst = phantom_status->primary_otg_inst;
++
++					/* populate pipe masks for phantom planes */
++					for (j = 0; j < phantom_status->plane_count; j++) {
++						for (k = 0; k < dc->res_pool->pipe_count; k++) {
++							if (context->res_ctx.pipe_ctx[k].stream &&
++									context->res_ctx.pipe_ctx[k].stream->stream_id == phantom_stream->stream_id &&
++									context->res_ctx.pipe_ctx[k].plane_state == phantom_status->plane_states[j]) {
++								switch (dc->debug.fams_version.minor) {
++								case 1:
++								default:
++									static_sub_state->stream_v1.sub_state.subvp.phantom_pipe_mask |= (1 << k);
++									static_sub_state->stream_v1.sub_state.subvp.phantom_plane_pipe_masks[j] |= (1 << k);
++								}
++							}
+ 						}
+ 					}
+ 				}
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/bounding_boxes/dcn4_soc_bb.h b/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/bounding_boxes/dcn4_soc_bb.h
+index 8ef7977841de..8b18027b8357 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/bounding_boxes/dcn4_soc_bb.h
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/bounding_boxes/dcn4_soc_bb.h
+@@ -354,7 +354,7 @@ static const struct dml2_ip_capabilities dml2_dcn401_max_ip_caps = {
+ 
+ 	.fams2 = {
+ 		.max_allow_delay_us = 100 * 1000,
+-		.scheduling_delay_us = 125,
++		.scheduling_delay_us = 550,
+ 		.vertical_interrupt_ack_delay_us = 40,
+ 		.allow_programming_delay_us = 18,
+ 		.min_allow_width_us = 20,
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/dml_top_types.h b/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/dml_top_types.h
+index eeb96c455658..476cbd7a4790 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/dml_top_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/inc/dml_top_types.h
+@@ -289,7 +289,8 @@ struct dml2_per_stream_programming {
+ 		union dml2_global_sync_programming global_sync;
+ 	} phantom_stream;
+ 
+-	struct dmub_fams2_stream_static_state fams2_params;
++	union dmub_cmd_fams2_config fams2_base_params;
++	union dmub_cmd_fams2_config fams2_sub_params;
+ };
+ 
+ //-----------------
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4.c
+index 3d41ffde91c1..367dc8ca89a9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4.c
+@@ -360,7 +360,8 @@ static void pack_mode_programming_params_with_implicit_subvp(struct dml2_core_in
+ 				/* unconditionally populate fams2 params */
+ 				dml2_core_calcs_get_stream_fams2_programming(&core->clean_me_up.mode_lib,
+ 					display_cfg,
+-					&programming->stream_programming[main_plane->stream_index].fams2_params,
++					&programming->stream_programming[main_plane->stream_index].fams2_base_params,
++					&programming->stream_programming[main_plane->stream_index].fams2_sub_params,
+ 					programming->stream_programming[main_plane->stream_index].uclk_pstate_method,
+ 					plane_index);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.c
+index 5fb91b882453..74baa480441f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.c
+@@ -12332,7 +12332,8 @@ void dml2_core_calcs_get_global_fams2_programming(const struct dml2_core_interna
+ 
+ void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_internal_display_mode_lib *mode_lib,
+ 		const struct display_configuation_with_meta *display_cfg,
+-		struct dmub_fams2_stream_static_state *fams2_programming,
++		union dmub_cmd_fams2_config *fams2_base_programming,
++		union dmub_cmd_fams2_config *fams2_sub_programming,
+ 		enum dml2_uclk_pstate_support_method pstate_method,
+ 		int plane_index)
+ {
+@@ -12340,6 +12341,9 @@ void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_interna
+ 	const struct dml2_stream_parameters *stream_descriptor = &display_cfg->display_config.stream_descriptors[plane_descriptor->stream_index];
+ 	const struct dml2_fams2_meta *stream_fams2_meta = &display_cfg->stage3.stream_fams2_meta[plane_descriptor->stream_index];
+ 
++	struct dmub_fams2_cmd_stream_static_base_state *base_programming = &fams2_base_programming->stream_v1.base;
++	union dmub_fams2_cmd_stream_static_sub_state *sub_programming = &fams2_sub_programming->stream_v1.sub_state;
++
+ 	unsigned int i;
+ 
+ 	if (display_cfg->display_config.overrides.all_streams_blanked) {
+@@ -12348,34 +12352,34 @@ void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_interna
+ 	}
+ 
+ 	/* from display configuration */
+-	fams2_programming->htotal = (uint16_t)stream_descriptor->timing.h_total;
+-	fams2_programming->vtotal = (uint16_t)stream_descriptor->timing.v_total;
+-	fams2_programming->vblank_start = (uint16_t)(stream_fams2_meta->nom_vtotal -
++	base_programming->htotal = (uint16_t)stream_descriptor->timing.h_total;
++	base_programming->vtotal = (uint16_t)stream_descriptor->timing.v_total;
++	base_programming->vblank_start = (uint16_t)(stream_fams2_meta->nom_vtotal -
+ 		stream_descriptor->timing.v_front_porch);
+-	fams2_programming->vblank_end = (uint16_t)(stream_fams2_meta->nom_vtotal -
++	base_programming->vblank_end = (uint16_t)(stream_fams2_meta->nom_vtotal -
+ 		stream_descriptor->timing.v_front_porch -
+ 		stream_descriptor->timing.v_active);
+-	fams2_programming->config.bits.is_drr = stream_descriptor->timing.drr_config.enabled;
++	base_programming->config.bits.is_drr = stream_descriptor->timing.drr_config.enabled;
+ 
+ 	/* from meta */
+-	fams2_programming->otg_vline_time_ns =
++	base_programming->otg_vline_time_ns =
+ 		(unsigned int)(stream_fams2_meta->otg_vline_time_us * 1000.0);
+-	fams2_programming->scheduling_delay_otg_vlines = (uint8_t)stream_fams2_meta->scheduling_delay_otg_vlines;
+-	fams2_programming->contention_delay_otg_vlines = (uint8_t)stream_fams2_meta->contention_delay_otg_vlines;
+-	fams2_programming->vline_int_ack_delay_otg_vlines = (uint8_t)stream_fams2_meta->vertical_interrupt_ack_delay_otg_vlines;
+-	fams2_programming->drr_keepout_otg_vline = (uint16_t)(stream_fams2_meta->nom_vtotal -
++	base_programming->scheduling_delay_otg_vlines = (uint8_t)stream_fams2_meta->scheduling_delay_otg_vlines;
++	base_programming->contention_delay_otg_vlines = (uint8_t)stream_fams2_meta->contention_delay_otg_vlines;
++	base_programming->vline_int_ack_delay_otg_vlines = (uint8_t)stream_fams2_meta->vertical_interrupt_ack_delay_otg_vlines;
++	base_programming->drr_keepout_otg_vline = (uint16_t)(stream_fams2_meta->nom_vtotal -
+ 		stream_descriptor->timing.v_front_porch -
+ 		stream_fams2_meta->method_drr.programming_delay_otg_vlines);
+-	fams2_programming->allow_to_target_delay_otg_vlines = (uint8_t)stream_fams2_meta->allow_to_target_delay_otg_vlines;
+-	fams2_programming->max_vtotal = (uint16_t)stream_fams2_meta->max_vtotal;
++	base_programming->allow_to_target_delay_otg_vlines = (uint8_t)stream_fams2_meta->allow_to_target_delay_otg_vlines;
++	base_programming->max_vtotal = (uint16_t)stream_fams2_meta->max_vtotal;
+ 
+ 	/* from core */
+-	fams2_programming->config.bits.min_ttu_vblank_usable = true;
++	base_programming->config.bits.min_ttu_vblank_usable = true;
+ 	for (i = 0; i < display_cfg->display_config.num_planes; i++) {
+ 		/* check if all planes support p-state in blank */
+ 		if (display_cfg->display_config.plane_descriptors[i].stream_index == plane_descriptor->stream_index &&
+ 				mode_lib->mp.MinTTUVBlank[i] <= mode_lib->mp.Watermark.DRAMClockChangeWatermark) {
+-			fams2_programming->config.bits.min_ttu_vblank_usable = false;
++			base_programming->config.bits.min_ttu_vblank_usable = false;
+ 			break;
+ 		}
+ 	}
+@@ -12384,67 +12388,67 @@ void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_interna
+ 	case dml2_uclk_pstate_support_method_vactive:
+ 	case dml2_uclk_pstate_support_method_fw_vactive_drr:
+ 		/* legacy vactive */
+-		fams2_programming->type = FAMS2_STREAM_TYPE_VACTIVE;
+-		fams2_programming->sub_state.legacy.vactive_det_fill_delay_otg_vlines =
++		base_programming->type = FAMS2_STREAM_TYPE_VACTIVE;
++		sub_programming->legacy.vactive_det_fill_delay_otg_vlines =
+ 				(uint8_t)stream_fams2_meta->method_vactive.max_vactive_det_fill_delay_otg_vlines;
+-		fams2_programming->allow_start_otg_vline =
++		base_programming->allow_start_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_vactive.common.allow_start_otg_vline;
+-		fams2_programming->allow_end_otg_vline =
++		base_programming->allow_end_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_vactive.common.allow_end_otg_vline;
+-		fams2_programming->config.bits.clamp_vtotal_min = true;
++		base_programming->config.bits.clamp_vtotal_min = true;
+ 		break;
+ 	case dml2_uclk_pstate_support_method_vblank:
+ 	case dml2_uclk_pstate_support_method_fw_vblank_drr:
+ 		/* legacy vblank */
+-		fams2_programming->type = FAMS2_STREAM_TYPE_VBLANK;
+-		fams2_programming->allow_start_otg_vline =
++		base_programming->type = FAMS2_STREAM_TYPE_VBLANK;
++		base_programming->allow_start_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_vblank.common.allow_start_otg_vline;
+-		fams2_programming->allow_end_otg_vline =
++		base_programming->allow_end_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_vblank.common.allow_end_otg_vline;
+-		fams2_programming->config.bits.clamp_vtotal_min = true;
++		base_programming->config.bits.clamp_vtotal_min = true;
+ 		break;
+ 	case dml2_uclk_pstate_support_method_fw_drr:
+ 		/* drr */
+-		fams2_programming->type = FAMS2_STREAM_TYPE_DRR;
+-		fams2_programming->sub_state.drr.programming_delay_otg_vlines =
++		base_programming->type = FAMS2_STREAM_TYPE_DRR;
++		sub_programming->drr.programming_delay_otg_vlines =
+ 				(uint8_t)stream_fams2_meta->method_drr.programming_delay_otg_vlines;
+-		fams2_programming->sub_state.drr.nom_stretched_vtotal =
++		sub_programming->drr.nom_stretched_vtotal =
+ 				(uint16_t)stream_fams2_meta->method_drr.stretched_vtotal;
+-		fams2_programming->allow_start_otg_vline =
++		base_programming->allow_start_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_drr.common.allow_start_otg_vline;
+-		fams2_programming->allow_end_otg_vline =
++		base_programming->allow_end_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_drr.common.allow_end_otg_vline;
+ 		/* drr only clamps to vtotal min for single display */
+-		fams2_programming->config.bits.clamp_vtotal_min = display_cfg->display_config.num_streams == 1;
+-		fams2_programming->sub_state.drr.only_stretch_if_required = true;
++		base_programming->config.bits.clamp_vtotal_min = display_cfg->display_config.num_streams == 1;
++		sub_programming->drr.only_stretch_if_required = true;
+ 		break;
+ 	case dml2_uclk_pstate_support_method_fw_subvp_phantom:
+ 	case dml2_uclk_pstate_support_method_fw_subvp_phantom_drr:
+ 		/* subvp */
+-		fams2_programming->type = FAMS2_STREAM_TYPE_SUBVP;
+-		fams2_programming->sub_state.subvp.vratio_numerator =
++		base_programming->type = FAMS2_STREAM_TYPE_SUBVP;
++		sub_programming->subvp.vratio_numerator =
+ 				(uint16_t)(plane_descriptor->composition.scaler_info.plane0.v_ratio * 1000.0);
+-		fams2_programming->sub_state.subvp.vratio_denominator = 1000;
+-		fams2_programming->sub_state.subvp.programming_delay_otg_vlines =
++		sub_programming->subvp.vratio_denominator = 1000;
++		sub_programming->subvp.programming_delay_otg_vlines =
+ 				(uint8_t)stream_fams2_meta->method_subvp.programming_delay_otg_vlines;
+-		fams2_programming->sub_state.subvp.prefetch_to_mall_otg_vlines =
++		sub_programming->subvp.prefetch_to_mall_otg_vlines =
+ 				(uint8_t)stream_fams2_meta->method_subvp.prefetch_to_mall_delay_otg_vlines;
+-		fams2_programming->sub_state.subvp.phantom_vtotal =
++		sub_programming->subvp.phantom_vtotal =
+ 				(uint16_t)stream_fams2_meta->method_subvp.phantom_vtotal;
+-		fams2_programming->sub_state.subvp.phantom_vactive =
++		sub_programming->subvp.phantom_vactive =
+ 				(uint16_t)stream_fams2_meta->method_subvp.phantom_vactive;
+-		fams2_programming->sub_state.subvp.config.bits.is_multi_planar =
++		sub_programming->subvp.config.bits.is_multi_planar =
+ 				plane_descriptor->surface.plane1.height > 0;
+-		fams2_programming->sub_state.subvp.config.bits.is_yuv420 =
++		sub_programming->subvp.config.bits.is_yuv420 =
+ 				plane_descriptor->pixel_format == dml2_420_8 ||
+ 				plane_descriptor->pixel_format == dml2_420_10 ||
+ 				plane_descriptor->pixel_format == dml2_420_12;
+ 
+-		fams2_programming->allow_start_otg_vline =
++		base_programming->allow_start_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_subvp.common.allow_start_otg_vline;
+-		fams2_programming->allow_end_otg_vline =
++		base_programming->allow_end_otg_vline =
+ 				(uint16_t)stream_fams2_meta->method_subvp.common.allow_end_otg_vline;
+-		fams2_programming->config.bits.clamp_vtotal_min = true;
++		base_programming->config.bits.clamp_vtotal_min = true;
+ 		break;
+ 	case dml2_uclk_pstate_support_method_reserved_hw:
+ 	case dml2_uclk_pstate_support_method_reserved_fw:
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.h b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.h
+index df2d1550a14b..d4c40b8c3752 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.h
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.h
+@@ -28,7 +28,7 @@ void dml2_core_calcs_get_plane_support_info(const struct dml2_display_cfg *displ
+ void dml2_core_calcs_get_informative(const struct dml2_core_internal_display_mode_lib *mode_lib, struct dml2_display_cfg_programming *out);
+ void dml2_core_calcs_get_stream_support_info(const struct dml2_display_cfg *display_cfg, const struct dml2_core_internal_display_mode_lib *mode_lib, struct core_stream_support_info *out, int plane_index);
+ void dml2_core_calcs_get_mall_allocation(struct dml2_core_internal_display_mode_lib *mode_lib, unsigned int *out, int pipe_index);
+-void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_internal_display_mode_lib *mode_lib, const struct display_configuation_with_meta *display_cfg, struct dmub_fams2_stream_static_state *fams2_programming, enum dml2_uclk_pstate_support_method pstate_method, int plane_index);
++void dml2_core_calcs_get_stream_fams2_programming(const struct dml2_core_internal_display_mode_lib *mode_lib, const struct display_configuation_with_meta *display_cfg, union dmub_cmd_fams2_config *fams2_base_programming, union dmub_cmd_fams2_config *fams2_sub_programming, enum dml2_uclk_pstate_support_method pstate_method, int plane_index);
+ void dml2_core_calcs_get_global_fams2_programming(const struct dml2_core_internal_display_mode_lib *mode_lib, const struct display_configuation_with_meta *display_cfg, struct dmub_cmd_fams2_global_config *fams2_global_config);
+ 
+ void dml2_core_calcs_get_dpte_row_height(unsigned int *dpte_row_height, struct dml2_core_internal_display_mode_lib *mode_lib, bool is_plane1, enum dml2_source_format_class SourcePixelFormat, enum dml2_swizzle_mode SurfaceTiling, enum dml2_rotation_angle ScanDirection, unsigned int pitch, unsigned int GPUVMMinPageSizeKBytes);
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+index 307782592789..3f27d8ae7f5d 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+@@ -435,7 +435,8 @@ void dcn401_init_hw(struct dc *dc)
+ 		dc->caps.dmub_caps.psr = dc->ctx->dmub_srv->dmub->feature_caps.psr;
+ 		dc->caps.dmub_caps.mclk_sw = dc->ctx->dmub_srv->dmub->feature_caps.fw_assisted_mclk_switch_ver > 0;
+ 		dc->caps.dmub_caps.fams_ver = dc->ctx->dmub_srv->dmub->feature_caps.fw_assisted_mclk_switch_ver;
+-		dc->debug.fams2_config.bits.enable &= dc->ctx->dmub_srv->dmub->feature_caps.fw_assisted_mclk_switch_ver == 2;
++		dc->debug.fams2_config.bits.enable &=
++				dc->caps.dmub_caps.fams_ver == dc->debug.fams_version.ver; // sw & fw fams versions must match for support
+ 		if ((!dc->debug.fams2_config.bits.enable && dc->res_pool->funcs->update_bw_bounding_box)
+ 			|| res_pool->ref_clocks.dchub_ref_clock_inKhz / 1000 != current_dchub_ref_freq) {
+ 			/* update bounding box if FAMS2 disabled, or if dchub clk has changed */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index 785baffd33ad..06a420154888 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -539,8 +539,8 @@ struct dcn_bw_output {
+ 	bool legacy_svp_drr_stream_index_valid;
+ 	struct dml2_mcache_surface_allocation mcache_allocations[DML2_MAX_PLANES];
+ 	struct dmub_cmd_fams2_global_config fams2_global_config;
+-	struct dmub_fams2_stream_static_state fams2_stream_params[DML2_MAX_PLANES];
+-	/*struct dmub_fams2_stream_static_state_v1 fams2_stream_params[DML2_MAX_PLANES];*/ // TODO: Update to this once DML is updated
++	union dmub_cmd_fams2_config fams2_stream_base_params[DML2_MAX_PLANES];
++	union dmub_cmd_fams2_config fams2_stream_sub_params[DML2_MAX_PLANES];
+ 	struct dml2_display_arb_regs arb_regs;
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
+index 783ca9acc762..338a0cad23a5 100644
+--- a/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
+@@ -315,7 +315,7 @@ void optc401_set_drr(
+ 	struct drr_params amended_params = { 0 };
+ 	bool program_manual_trigger = false;
+ 
+-	if (dc->caps.dmub_caps.fams_ver >= 2 && dc->debug.fams2_config.bits.enable) {
++	if (dc->caps.dmub_caps.fams_ver == dc->debug.fams_version.ver && dc->debug.fams2_config.bits.enable) {
+ 		if (params != NULL &&
+ 				params->vertical_total_max > 0 &&
+ 				params->vertical_total_min > 0) {
+@@ -380,7 +380,7 @@ void optc401_set_vtotal_min_max(struct timing_generator *optc, int vtotal_min, i
+ {
+ 	struct dc *dc = optc->ctx->dc;
+ 
+-	if (dc->caps.dmub_caps.fams_ver >= 2 && dc->debug.fams2_config.bits.enable) {
++	if (dc->caps.dmub_caps.fams_ver == dc->debug.fams_version.ver && dc->debug.fams2_config.bits.enable) {
+ 		/* FAMS2 */
+ 		dc_dmub_srv_fams2_drr_update(dc, optc->inst,
+ 				vtotal_min,
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+index 2a3dabfe3cea..09f5b8b40791 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+@@ -726,6 +726,10 @@ static const struct dc_debug_options debug_defaults_drv = {
+ 	.disable_unbounded_requesting = false,
+ 	.enable_legacy_fast_update = false,
+ 	.dcc_meta_propagation_delay_us = 10,
++	.fams_version = {
++		.minor = 1,
++		.major = 2,
++	}, //v2.1
+ 	.fams2_config = {
+ 		.bits = {
+ 			.enable = true,
+-- 
+2.25.1
+

@@ -1,0 +1,141 @@
+From 34493d07a6282de32c46e86d490b58cd51cdf595 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 28 Nov 2024 13:08:24 -0800
+Subject: [PATCH 183/708] drm/xe: Add mutex locking to devcoredump
+
+There are now multiple places that can trigger a coredump. Some of
+which can happen in parallel. There is already a check against
+capturing multiple dumps sequentially, but without locking it doesn't
+guarantee to work against concurrent dumps. And if two dumps do happen
+in parallel, they can end up doing Bad Things such as one call stack
+freeing the data the other call stack is still processing. Which leads
+to a crashed kernel.
+
+Further, it is possible for the DRM timeout to expire and trigger a
+free of the capture while a user is still reading that capture out
+through sysfs. Again leading to dodgy pointer problems.
+
+So, add a mutext lock around the capture, read and free functions to
+prevent inteference.
+
+v2: Swap tiny scope spin_lock for larger scope mutex and fix
+kernel-doc comment (review feedback from Matthew Brost)
+v3: Move mutex locks to exclude worker thread and add reclaim
+annotation (review feedback from Matthew Brost)
+v4: Fix typo.
+
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241128210824.3302147-4-John.C.Harrison@Intel.com
+---
+ drivers/gpu/drm/xe/xe_devcoredump.c       | 33 +++++++++++++++++++++--
+ drivers/gpu/drm/xe/xe_devcoredump_types.h |  4 ++-
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump.c b/drivers/gpu/drm/xe/xe_devcoredump.c
+index d24f1088e298..71636e80b71d 100644
+--- a/drivers/gpu/drm/xe/xe_devcoredump.c
++++ b/drivers/gpu/drm/xe/xe_devcoredump.c
+@@ -183,16 +183,24 @@ static ssize_t xe_devcoredump_read(char *buffer, loff_t offset,
+ 	/* Ensure delayed work is captured before continuing */
+ 	flush_work(&ss->work);
+ 
+-	if (!ss->read.buffer)
++	mutex_lock(&coredump->lock);
++
++	if (!ss->read.buffer) {
++		mutex_unlock(&coredump->lock);
+ 		return -ENODEV;
++	}
+ 
+-	if (offset >= ss->read.size)
++	if (offset >= ss->read.size) {
++		mutex_unlock(&coredump->lock);
+ 		return 0;
++	}
+ 
+ 	byte_copied = count < ss->read.size - offset ? count :
+ 		ss->read.size - offset;
+ 	memcpy(buffer, ss->read.buffer + offset, byte_copied);
+ 
++	mutex_unlock(&coredump->lock);
++
+ 	return byte_copied;
+ }
+ 
+@@ -206,6 +214,8 @@ static void xe_devcoredump_free(void *data)
+ 
+ 	cancel_work_sync(&coredump->snapshot.work);
+ 
++	mutex_lock(&coredump->lock);
++
+ 	xe_devcoredump_snapshot_free(&coredump->snapshot);
+ 	kvfree(coredump->snapshot.read.buffer);
+ 
+@@ -214,6 +224,8 @@ static void xe_devcoredump_free(void *data)
+ 	coredump->captured = false;
+ 	drm_info(&coredump_to_xe(coredump)->drm,
+ 		 "Xe device coredump has been deleted.\n");
++
++	mutex_unlock(&coredump->lock);
+ }
+ 
+ static void xe_devcoredump_deferred_snap_work(struct work_struct *work)
+@@ -327,8 +339,11 @@ void xe_devcoredump(struct xe_exec_queue *q, struct xe_sched_job *job, const cha
+ 	struct xe_devcoredump *coredump = &xe->devcoredump;
+ 	va_list varg;
+ 
++	mutex_lock(&coredump->lock);
++
+ 	if (coredump->captured) {
+ 		drm_dbg(&xe->drm, "Multiple hangs are occurring, but only the first snapshot was taken\n");
++		mutex_unlock(&coredump->lock);
+ 		return;
+ 	}
+ 
+@@ -343,6 +358,8 @@ void xe_devcoredump(struct xe_exec_queue *q, struct xe_sched_job *job, const cha
+ 	drm_info(&xe->drm, "Xe device coredump has been created\n");
+ 	drm_info(&xe->drm, "Check your /sys/class/drm/card%d/device/devcoredump/data\n",
+ 		 xe->drm.primary->index);
++
++	mutex_unlock(&coredump->lock);
+ }
+ 
+ static void xe_driver_devcoredump_fini(void *arg)
+@@ -354,6 +371,18 @@ static void xe_driver_devcoredump_fini(void *arg)
+ 
+ int xe_devcoredump_init(struct xe_device *xe)
+ {
++	int err;
++
++	err = drmm_mutex_init(&xe->drm, &xe->devcoredump.lock);
++	if (err)
++		return err;
++
++	if (IS_ENABLED(CONFIG_LOCKDEP)) {
++		fs_reclaim_acquire(GFP_KERNEL);
++		might_lock(&xe->devcoredump.lock);
++		fs_reclaim_release(GFP_KERNEL);
++	}
++
+ 	return devm_add_action_or_reset(xe->drm.dev, xe_driver_devcoredump_fini, &xe->drm);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump_types.h b/drivers/gpu/drm/xe/xe_devcoredump_types.h
+index e6234e887102..1a1d16a96b2d 100644
+--- a/drivers/gpu/drm/xe/xe_devcoredump_types.h
++++ b/drivers/gpu/drm/xe/xe_devcoredump_types.h
+@@ -80,7 +80,9 @@ struct xe_devcoredump_snapshot {
+  * for reading the information.
+  */
+ struct xe_devcoredump {
+-	/** @captured: The snapshot of the first hang has already been taken. */
++	/** @lock: protects access to entire structure */
++	struct mutex lock;
++	/** @captured: The snapshot of the first hang has already been taken */
+ 	bool captured;
+ 	/** @snapshot: Snapshot is captured at time of the first crash */
+ 	struct xe_devcoredump_snapshot snapshot;
+-- 
+2.25.1
+

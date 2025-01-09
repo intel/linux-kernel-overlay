@@ -1,0 +1,229 @@
+From e92e4f9f4801993d0b7f4126dc8153d91997c22c Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Thu, 24 Oct 2024 11:01:57 +0530
+Subject: [PATCH 227/708] drm/amdgpu: Prefer RAS recovery for scheduler hang
+
+Before scheduling a recovery due to scheduler/job hang, check if a RAS
+error is detected. If so, choose RAS recovery to handle the situation. A
+scheduler/job hang could be the side effect of a RAS error. In such
+cases, it is required to go through the RAS error recovery process. A
+RAS error recovery process in certains cases also could avoid a full
+device device reset.
+
+An error state is maintained in RAS context to detect the block
+affected. Fatal Error state uses unused block id. Set the block id when
+error is detected. If the interrupt handler detected a poison error,
+it's not required to look for a fatal error. Skip fatal error checking
+in such cases.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/aldebaran.c        |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    | 15 ++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c       | 55 ++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h       | 11 +++-
+ .../gpu/drm/amd/amdkfd/kfd_int_process_v9.c   |  2 +
+ 5 files changed, 78 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/aldebaran.c b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+index f44de9d4b6a1..e13fbd974141 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aldebaran.c
++++ b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+@@ -334,6 +334,8 @@ aldebaran_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 				AMDGPU_INIT_LEVEL_RESET_RECOVERY);
+ 		dev_info(tmp_adev->dev,
+ 			 "GPU reset succeeded, trying to resume\n");
++		/*TBD: Ideally should clear only GFX, SDMA blocks*/
++		amdgpu_ras_clear_err_state(tmp_adev);
+ 		r = aldebaran_mode2_restore_ip(tmp_adev);
+ 		if (r)
+ 			goto end;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index d272d95dd5b2..97d3e5f29638 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -5181,7 +5181,7 @@ static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
+ 	if (r)
+ 		return r;
+ 
+-	amdgpu_ras_set_fed(adev, false);
++	amdgpu_ras_clear_err_state(adev);
+ 	amdgpu_irq_gpu_reset_resume_helper(adev);
+ 
+ 	/* some sw clean up VF needs to do before recover */
+@@ -5484,7 +5484,7 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
+ 		amdgpu_set_init_level(tmp_adev, init_level);
+ 		if (full_reset) {
+ 			/* post card */
+-			amdgpu_ras_set_fed(tmp_adev, false);
++			amdgpu_ras_clear_err_state(tmp_adev);
+ 			r = amdgpu_device_asic_init(tmp_adev);
+ 			if (r) {
+ 				dev_warn(tmp_adev->dev, "asic atom init failed!");
+@@ -5817,6 +5817,17 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+ 	bool audio_suspended = false;
+ 	int retry_limit = AMDGPU_MAX_RETRY_LIMIT;
+ 
++	/*
++	 * If it reaches here because of hang/timeout and a RAS error is
++	 * detected at the same time, let RAS recovery take care of it.
++	 */
++	if (amdgpu_ras_is_err_state(adev, AMDGPU_RAS_BLOCK__ANY) &&
++	    reset_context->src != AMDGPU_RESET_SRC_RAS) {
++		dev_dbg(adev->dev,
++			"Gpu recovery from source: %d yielding to RAS error recovery handling",
++			reset_context->src);
++		return 0;
++	}
+ 	/*
+ 	 * Special case: RAS triggered and full reset isn't supported
+ 	 */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index f22242ab2407..4df9a8dfe9eb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -2156,6 +2156,16 @@ void amdgpu_ras_interrupt_fatal_error_handler(struct amdgpu_device *adev)
+ 	/* Fatal error events are handled on host side */
+ 	if (amdgpu_sriov_vf(adev))
+ 		return;
++	/**
++	 * If the current interrupt is caused by a non-fatal RAS error, skip
++	 * check for fatal error. For fatal errors, FED status of all devices
++	 * in XGMI hive gets set when the first device gets fatal error
++	 * interrupt. The error gets propagated to other devices as well, so
++	 * make sure to ack the interrupt regardless of FED status.
++	 */
++	if (!amdgpu_ras_get_fed_status(adev) &&
++	    amdgpu_ras_is_err_state(adev, AMDGPU_RAS_BLOCK__ANY))
++		return;
+ 
+ 	if (adev->nbio.ras &&
+ 	    adev->nbio.ras->handle_ras_controller_intr_no_bifring)
+@@ -2185,6 +2195,7 @@ static void amdgpu_ras_interrupt_poison_consumption_handler(struct ras_manager *
+ 	if (ret)
+ 		return;
+ 
++	amdgpu_ras_set_err_poison(adev, block_obj->ras_comm.block);
+ 	/* both query_poison_status and handle_poison_consumption are optional,
+ 	 * but at least one of them should be implemented if we need poison
+ 	 * consumption handler
+@@ -4172,16 +4183,56 @@ bool amdgpu_ras_get_fed_status(struct amdgpu_device *adev)
+ 	if (!ras)
+ 		return false;
+ 
+-	return atomic_read(&ras->fed);
++	return test_bit(AMDGPU_RAS_BLOCK__LAST, &ras->ras_err_state);
+ }
+ 
+ void amdgpu_ras_set_fed(struct amdgpu_device *adev, bool status)
+ {
+ 	struct amdgpu_ras *ras;
+ 
++	ras = amdgpu_ras_get_context(adev);
++	if (ras) {
++		if (status)
++			set_bit(AMDGPU_RAS_BLOCK__LAST, &ras->ras_err_state);
++		else
++			clear_bit(AMDGPU_RAS_BLOCK__LAST, &ras->ras_err_state);
++	}
++}
++
++void amdgpu_ras_clear_err_state(struct amdgpu_device *adev)
++{
++	struct amdgpu_ras *ras;
++
+ 	ras = amdgpu_ras_get_context(adev);
+ 	if (ras)
+-		atomic_set(&ras->fed, !!status);
++		ras->ras_err_state = 0;
++}
++
++void amdgpu_ras_set_err_poison(struct amdgpu_device *adev,
++			       enum amdgpu_ras_block block)
++{
++	struct amdgpu_ras *ras;
++
++	ras = amdgpu_ras_get_context(adev);
++	if (ras)
++		set_bit(block, &ras->ras_err_state);
++}
++
++bool amdgpu_ras_is_err_state(struct amdgpu_device *adev, int block)
++{
++	struct amdgpu_ras *ras;
++
++	ras = amdgpu_ras_get_context(adev);
++	if (ras) {
++		if (block == AMDGPU_RAS_BLOCK__ANY)
++			return (ras->ras_err_state != 0);
++		else
++			return test_bit(block, &ras->ras_err_state) ||
++			       test_bit(AMDGPU_RAS_BLOCK__LAST,
++					&ras->ras_err_state);
++	}
++
++	return false;
+ }
+ 
+ static struct ras_event_manager *__get_ras_event_mgr(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+index 6db772ecfee4..b13debcf48ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+@@ -99,7 +99,8 @@ enum amdgpu_ras_block {
+ 	AMDGPU_RAS_BLOCK__IH,
+ 	AMDGPU_RAS_BLOCK__MPIO,
+ 
+-	AMDGPU_RAS_BLOCK__LAST
++	AMDGPU_RAS_BLOCK__LAST,
++	AMDGPU_RAS_BLOCK__ANY = -1
+ };
+ 
+ enum amdgpu_ras_mca_block {
+@@ -558,8 +559,8 @@ struct amdgpu_ras {
+ 	struct ras_ecc_log_info  umc_ecc_log;
+ 	struct delayed_work page_retirement_dwork;
+ 
+-	/* Fatal error detected flag */
+-	atomic_t fed;
++	/* ras errors detected */
++	unsigned long ras_err_state;
+ 
+ 	/* RAS event manager */
+ 	struct ras_event_manager __event_mgr;
+@@ -952,6 +953,10 @@ ssize_t amdgpu_ras_aca_sysfs_read(struct device *dev, struct device_attribute *a
+ 
+ void amdgpu_ras_set_fed(struct amdgpu_device *adev, bool status);
+ bool amdgpu_ras_get_fed_status(struct amdgpu_device *adev);
++void amdgpu_ras_set_err_poison(struct amdgpu_device *adev,
++			       enum amdgpu_ras_block block);
++void amdgpu_ras_clear_err_state(struct amdgpu_device *adev);
++bool amdgpu_ras_is_err_state(struct amdgpu_device *adev, int block);
+ 
+ u64 amdgpu_ras_acquire_event_id(struct amdgpu_device *adev, enum ras_event_type type);
+ int amdgpu_ras_mark_ras_event_caller(struct amdgpu_device *adev, enum ras_event_type type,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+index d46a13156ee9..0cb5c582ce7d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v9.c
+@@ -184,6 +184,7 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
+ 		} else {
+ 			reset = AMDGPU_RAS_GPU_RESET_MODE2_RESET;
+ 		}
++		amdgpu_ras_set_err_poison(dev->adev, AMDGPU_RAS_BLOCK__GFX);
+ 		break;
+ 	case SOC15_IH_CLIENTID_VMC:
+ 	case SOC15_IH_CLIENTID_VMC1:
+@@ -213,6 +214,7 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
+ 		} else {
+ 			reset = AMDGPU_RAS_GPU_RESET_MODE2_RESET;
+ 		}
++		amdgpu_ras_set_err_poison(dev->adev, AMDGPU_RAS_BLOCK__SDMA);
+ 		break;
+ 	default:
+ 		dev_warn(dev->adev->dev,
+-- 
+2.25.1
+

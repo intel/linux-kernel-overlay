@@ -1,0 +1,181 @@
+From 8de8a96c4d702d1b4a5e65a6b9312ea06057919f Mon Sep 17 00:00:00 2001
+From: Philip Yang <Philip.Yang@amd.com>
+Date: Tue, 12 Nov 2024 22:07:33 -0500
+Subject: [PATCH 406/708] drm/amdgpu: Optimize gfx v9 GPU page fault handling
+
+After GPU page fault, there are lots of page fault interrupts generated
+at short period even with CAM filter enabled because the fault address
+is different. Each page fault copy to KFD ih fifo to send event to user
+space by KFD interrupt worker, this could cause KFD ih fifo overflow
+while other processes generate events at same time.
+
+KFD process is aborted after GPU page fault, we only need one GPU page
+fault interrupt sent to KFD ih fifo to send memory exception event to
+user space.
+
+Incease KFD ih fifo size to 2 times of IH primary ring size, to handle
+the burst events case.
+
+This patch handle the gfx v9 path, cover retry on/off and CAM filter
+on/off cases.
+
+Signed-off-by: Philip Yang <Philip.Yang@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h | 10 ++++
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c      |  3 +
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c    | 67 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h      |  3 +
+ 5 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 4b80ad860639..8af67f18500a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -433,6 +433,9 @@ void kgd2kfd_unlock_kfd(void);
+ int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
+ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
+ bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
++bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
++			       bool retry_fault);
++
+ #else
+ static inline int kgd2kfd_init(void)
+ {
+@@ -518,5 +521,12 @@ static inline bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	return false;
+ }
++
++static inline bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
++				      bool retry_fault)
++{
++	return false;
++}
++
+ #endif
+ #endif /* AMDGPU_AMDKFD_H_INCLUDED */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 48f1b9cf1f88..291549765c38 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -623,6 +623,9 @@ static int gmc_v9_0_process_interrupt(struct amdgpu_device *adev,
+ 		}
+ 	}
+ 
++	if (kgd2kfd_vmfault_fast_path(adev, entry, retry_fault))
++		return 1;
++
+ 	if (!printk_ratelimit())
+ 		return 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index ac0fdaa1ea23..9b49563f2c42 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -1521,6 +1521,73 @@ bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
+ 	return kfd_compute_active(node);
+ }
+ 
++/**
++ * kgd2kfd_vmfault_fast_path() - KFD vm page fault interrupt handling fast path for gmc v9
++ * @adev: amdgpu device
++ * @entry: vm fault interrupt vector
++ * @retry_fault: if this is retry fault
++ *
++ * retry fault -
++ *    with CAM enabled, adev primary ring
++ *                           |  gmc_v9_0_process_interrupt()
++ *                      adev soft_ring
++ *                           |  gmc_v9_0_process_interrupt() worker failed to recover page fault
++ *                      KFD node ih_fifo
++ *                           |  KFD interrupt_wq worker
++ *                      kfd_signal_vm_fault_event
++ *
++ *    without CAM,      adev primary ring1
++ *                           |  gmc_v9_0_process_interrupt worker failed to recvoer page fault
++ *                      KFD node ih_fifo
++ *                           |  KFD interrupt_wq worker
++ *                      kfd_signal_vm_fault_event
++ *
++ * no-retry fault -
++ *                      adev primary ring
++ *                           |  gmc_v9_0_process_interrupt()
++ *                      KFD node ih_fifo
++ *                           |  KFD interrupt_wq worker
++ *                      kfd_signal_vm_fault_event
++ *
++ * fast path - After kfd_signal_vm_fault_event, gmc_v9_0_process_interrupt drop the page fault
++ *            of same process, don't copy interrupt to KFD node ih_fifo.
++ *            With gdb debugger enabled, need convert the retry fault to no-retry fault for
++ *            debugger, cannot use the fast path.
++ *
++ * Return:
++ *   true - use the fast path to handle this fault
++ *   false - use normal path to handle it
++ */
++bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
++			       bool retry_fault)
++{
++	struct kfd_process *p;
++	u32 cam_index;
++
++	if (entry->ih == &adev->irq.ih_soft || entry->ih == &adev->irq.ih1) {
++		p = kfd_lookup_process_by_pasid(entry->pasid);
++		if (!p)
++			return true;
++
++		if (p->gpu_page_fault && !p->debug_trap_enabled) {
++			if (retry_fault && adev->irq.retry_cam_enabled) {
++				cam_index = entry->src_data[2] & 0x3ff;
++				WDOORBELL32(adev->irq.retry_cam_doorbell_index, cam_index);
++			}
++
++			kfd_unref_process(p);
++			return true;
++		}
++
++		/*
++		 * This is the first page fault, set flag and then signal user space
++		 */
++		p->gpu_page_fault = true;
++		kfd_unref_process(p);
++	}
++	return false;
++}
++
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ /* This function will send a package to HIQ to hang the HWS
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+index e7412de9a0ac..8e00800f3207 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_interrupt.c
+@@ -46,7 +46,7 @@
+ #include <linux/kfifo.h>
+ #include "kfd_priv.h"
+ 
+-#define KFD_IH_NUM_ENTRIES 8192
++#define KFD_IH_NUM_ENTRIES 16384
+ 
+ static void interrupt_wq(struct work_struct *);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 800e4ae5b573..e529fdc1b422 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1003,6 +1003,9 @@ struct kfd_process {
+ 	struct semaphore runtime_enable_sema;
+ 	bool is_runtime_retry;
+ 	struct kfd_runtime_info runtime_info;
++
++	/* if gpu page fault sent to KFD */
++	bool gpu_page_fault;
+ };
+ 
+ #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
+-- 
+2.25.1
+

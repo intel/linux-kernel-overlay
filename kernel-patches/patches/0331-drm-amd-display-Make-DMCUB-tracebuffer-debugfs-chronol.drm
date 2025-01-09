@@ -1,0 +1,127 @@
+From 632c1d73df2f5ff2d94ef686af21f1d07e383a96 Mon Sep 17 00:00:00 2001
+From: Leo Li <sunpeng.li@amd.com>
+Date: Tue, 26 Nov 2024 12:34:39 -0500
+Subject: [PATCH 331/708] drm/amd/display: Make DMCUB tracebuffer debugfs
+ chronological
+
+[Why]
+
+Previously, the debugfs did a simple dump of the tracebuffer region.
+Because the tracebuffer is a ring, it meant that the entries printed may
+not be in chronological order if the ring rolled over. This makes
+parsing the tracelog cumbersome.
+
+[How]
+
+Since dmcub provides the current entry count, use that to determine
+the latest tracelog entry and output the log chronologically.
+
+Also, the fb region size is not accurate of the actual tracebuffer size;
+it has been padded to alignment requirements. Use the tracebuffer size
+reported by the fw meta_info, if available. If not, a fallback to the
+hardcoded default is needed. To make this value available to other .c
+files, its define was moved to dmub_srv.h.
+
+Also, print a indicator at the start of the log if rollover occurred.
+
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Leo Li <sunpeng.li@amd.com>
+Signed-off-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../amd/display/amdgpu_dm/amdgpu_dm_debugfs.c | 26 ++++++++++++++++---
+ drivers/gpu/drm/amd/display/dmub/dmub_srv.h   |  3 +++
+ .../gpu/drm/amd/display/dmub/src/dmub_srv.c   |  4 ---
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+index 6a97bb2d9160..11a7ac54f91c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+@@ -902,9 +902,10 @@ static int dmub_tracebuffer_show(struct seq_file *m, void *data)
+ {
+ 	struct amdgpu_device *adev = m->private;
+ 	struct dmub_srv_fb_info *fb_info = adev->dm.dmub_fb_info;
++	struct dmub_fw_meta_info *fw_meta_info = &adev->dm.dmub_srv->meta_info;
+ 	struct dmub_debugfs_trace_entry *entries;
+ 	uint8_t *tbuf_base;
+-	uint32_t tbuf_size, max_entries, num_entries, i;
++	uint32_t tbuf_size, max_entries, num_entries, first_entry, i;
+ 
+ 	if (!fb_info)
+ 		return 0;
+@@ -913,20 +914,39 @@ static int dmub_tracebuffer_show(struct seq_file *m, void *data)
+ 	if (!tbuf_base)
+ 		return 0;
+ 
+-	tbuf_size = fb_info->fb[DMUB_WINDOW_5_TRACEBUFF].size;
++	tbuf_size = fw_meta_info ? fw_meta_info->trace_buffer_size :
++				   DMUB_TRACE_BUFFER_SIZE;
+ 	max_entries = (tbuf_size - sizeof(struct dmub_debugfs_trace_header)) /
+ 		      sizeof(struct dmub_debugfs_trace_entry);
+ 
+ 	num_entries =
+ 		((struct dmub_debugfs_trace_header *)tbuf_base)->entry_count;
+ 
++	/* DMCUB tracebuffer is a ring. If it rolled over, print a hint that
++	 * entries are being overwritten.
++	 */
++	if (num_entries > max_entries)
++		seq_printf(m, "...\n");
++
++	first_entry = num_entries % max_entries;
+ 	num_entries = min(num_entries, max_entries);
+ 
+ 	entries = (struct dmub_debugfs_trace_entry
+ 			   *)(tbuf_base +
+ 			      sizeof(struct dmub_debugfs_trace_header));
+ 
+-	for (i = 0; i < num_entries; ++i) {
++	/* To print entries chronologically, start from the first entry till the
++	 * top of buffer, then from base of buffer to first entry.
++	 */
++	for (i = first_entry; i < num_entries; ++i) {
++		struct dmub_debugfs_trace_entry *entry = &entries[i];
++
++		seq_printf(m,
++			   "trace_code=%u tick_count=%u param0=%u param1=%u\n",
++			   entry->trace_code, entry->tick_count, entry->param0,
++			   entry->param1);
++	}
++	for (i = 0; i < first_entry; ++i) {
+ 		struct dmub_debugfs_trace_entry *entry = &entries[i];
+ 
+ 		seq_printf(m,
+diff --git a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+index b353c4ceb60d..4b3ccbca0da2 100644
+--- a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
++++ b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+@@ -69,6 +69,9 @@
+ 
+ #define DMUB_PC_SNAPSHOT_COUNT 10
+ 
++/* Default tracebuffer size if meta is absent. */
++#define DMUB_TRACE_BUFFER_SIZE (64 * 1024)
++
+ /* Forward declarations */
+ struct dmub_srv;
+ struct dmub_srv_common_regs;
+diff --git a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+index a3f3ff5d49ac..15ea216e903d 100644
+--- a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+@@ -61,10 +61,6 @@
+ /* Default state size if meta is absent. */
+ #define DMUB_FW_STATE_SIZE (64 * 1024)
+ 
+-/* Default tracebuffer size if meta is absent. */
+-#define DMUB_TRACE_BUFFER_SIZE (64 * 1024)
+-
+-
+ /* Default scratch mem size. */
+ #define DMUB_SCRATCH_MEM_SIZE (1024)
+ 
+-- 
+2.25.1
+

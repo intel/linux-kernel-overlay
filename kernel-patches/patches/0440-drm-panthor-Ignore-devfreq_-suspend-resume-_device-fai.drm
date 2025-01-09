@@ -1,0 +1,154 @@
+From aba53a44defd121722410823920dc010cc2b913a Mon Sep 17 00:00:00 2001
+From: Boris Brezillon <boris.brezillon@collabora.com>
+Date: Wed, 11 Dec 2024 08:54:17 +0100
+Subject: [PATCH 440/708] drm/panthor: Ignore devfreq_{suspend,
+ resume}_device() failures
+
+devfreq_{resume,suspend}_device() don't bother undoing the suspend_count
+modifications if something fails, so either it assumes failures are
+harmless, or it's super fragile/buggy. In either case it's not something
+we can address at the driver level, so let's just assume failures are
+harmless for now, like is done in panfrost.
+
+v3:
+- Add R-b
+
+v2:
+- Add R-b
+
+Signed-off-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Reviewed-by: Adrian Larumbe <adrian.larumbe@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241211075419.2333731-4-boris.brezillon@collabora.com
+---
+ drivers/gpu/drm/panthor/panthor_devfreq.c | 12 ++++----
+ drivers/gpu/drm/panthor/panthor_devfreq.h |  4 +--
+ drivers/gpu/drm/panthor/panthor_device.c  | 35 ++---------------------
+ 3 files changed, 11 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_devfreq.c b/drivers/gpu/drm/panthor/panthor_devfreq.c
+index ecc7a52bd688..3686515d368d 100644
+--- a/drivers/gpu/drm/panthor/panthor_devfreq.c
++++ b/drivers/gpu/drm/panthor/panthor_devfreq.c
+@@ -243,26 +243,26 @@ int panthor_devfreq_init(struct panthor_device *ptdev)
+ 	return 0;
+ }
+ 
+-int panthor_devfreq_resume(struct panthor_device *ptdev)
++void panthor_devfreq_resume(struct panthor_device *ptdev)
+ {
+ 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
+ 
+ 	if (!pdevfreq->devfreq)
+-		return 0;
++		return;
+ 
+ 	panthor_devfreq_reset(pdevfreq);
+ 
+-	return devfreq_resume_device(pdevfreq->devfreq);
++	drm_WARN_ON(&ptdev->base, devfreq_resume_device(pdevfreq->devfreq));
+ }
+ 
+-int panthor_devfreq_suspend(struct panthor_device *ptdev)
++void panthor_devfreq_suspend(struct panthor_device *ptdev)
+ {
+ 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
+ 
+ 	if (!pdevfreq->devfreq)
+-		return 0;
++		return;
+ 
+-	return devfreq_suspend_device(pdevfreq->devfreq);
++	drm_WARN_ON(&ptdev->base, devfreq_suspend_device(pdevfreq->devfreq));
+ }
+ 
+ void panthor_devfreq_record_busy(struct panthor_device *ptdev)
+diff --git a/drivers/gpu/drm/panthor/panthor_devfreq.h b/drivers/gpu/drm/panthor/panthor_devfreq.h
+index 83a5c9522493..b7631de695f7 100644
+--- a/drivers/gpu/drm/panthor/panthor_devfreq.h
++++ b/drivers/gpu/drm/panthor/panthor_devfreq.h
+@@ -12,8 +12,8 @@ struct panthor_devfreq;
+ 
+ int panthor_devfreq_init(struct panthor_device *ptdev);
+ 
+-int panthor_devfreq_resume(struct panthor_device *ptdev);
+-int panthor_devfreq_suspend(struct panthor_device *ptdev);
++void panthor_devfreq_resume(struct panthor_device *ptdev);
++void panthor_devfreq_suspend(struct panthor_device *ptdev);
+ 
+ void panthor_devfreq_record_busy(struct panthor_device *ptdev);
+ void panthor_devfreq_record_idle(struct panthor_device *ptdev);
+diff --git a/drivers/gpu/drm/panthor/panthor_device.c b/drivers/gpu/drm/panthor/panthor_device.c
+index b3c117d55c2a..4faca2684324 100644
+--- a/drivers/gpu/drm/panthor/panthor_device.c
++++ b/drivers/gpu/drm/panthor/panthor_device.c
+@@ -457,9 +457,7 @@ int panthor_device_resume(struct device *dev)
+ 	if (ret)
+ 		goto err_disable_stacks_clk;
+ 
+-	ret = panthor_devfreq_resume(ptdev);
+-	if (ret)
+-		goto err_disable_coregroup_clk;
++	panthor_devfreq_resume(ptdev);
+ 
+ 	if (panthor_device_is_initialized(ptdev) &&
+ 	    drm_dev_enter(&ptdev->base, &cookie)) {
+@@ -496,8 +494,6 @@ int panthor_device_resume(struct device *dev)
+ 
+ err_suspend_devfreq:
+ 	panthor_devfreq_suspend(ptdev);
+-
+-err_disable_coregroup_clk:
+ 	clk_disable_unprepare(ptdev->clks.coregroup);
+ 
+ err_disable_stacks_clk:
+@@ -514,7 +510,7 @@ int panthor_device_resume(struct device *dev)
+ int panthor_device_suspend(struct device *dev)
+ {
+ 	struct panthor_device *ptdev = dev_get_drvdata(dev);
+-	int ret, cookie;
++	int cookie;
+ 
+ 	if (atomic_read(&ptdev->pm.state) != PANTHOR_DEVICE_PM_STATE_ACTIVE)
+ 		return -EINVAL;
+@@ -546,36 +542,11 @@ int panthor_device_suspend(struct device *dev)
+ 		drm_dev_exit(cookie);
+ 	}
+ 
+-	ret = panthor_devfreq_suspend(ptdev);
+-	if (ret) {
+-		if (panthor_device_is_initialized(ptdev) &&
+-		    drm_dev_enter(&ptdev->base, &cookie)) {
+-			panthor_gpu_resume(ptdev);
+-			panthor_mmu_resume(ptdev);
+-			drm_WARN_ON(&ptdev->base, panthor_fw_resume(ptdev));
+-			panthor_sched_resume(ptdev);
+-			drm_dev_exit(cookie);
+-		}
+-
+-		goto err_set_active;
+-	}
++	panthor_devfreq_suspend(ptdev);
+ 
+ 	clk_disable_unprepare(ptdev->clks.coregroup);
+ 	clk_disable_unprepare(ptdev->clks.stacks);
+ 	clk_disable_unprepare(ptdev->clks.core);
+ 	atomic_set(&ptdev->pm.state, PANTHOR_DEVICE_PM_STATE_SUSPENDED);
+ 	return 0;
+-
+-err_set_active:
+-	/* If something failed and we have to revert back to an
+-	 * active state, we also need to clear the MMIO userspace
+-	 * mappings, so any dumb pages that were mapped while we
+-	 * were trying to suspend gets invalidated.
+-	 */
+-	mutex_lock(&ptdev->pm.mmio_lock);
+-	atomic_set(&ptdev->pm.state, PANTHOR_DEVICE_PM_STATE_ACTIVE);
+-	unmap_mapping_range(ptdev->base.anon_inode->i_mapping,
+-			    DRM_PANTHOR_USER_MMIO_OFFSET, 0, 1);
+-	mutex_unlock(&ptdev->pm.mmio_lock);
+-	return ret;
+ }
+-- 
+2.25.1
+

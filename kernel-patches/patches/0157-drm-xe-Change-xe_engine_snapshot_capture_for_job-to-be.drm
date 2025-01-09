@@ -1,0 +1,266 @@
+From ef92f37418d971575626659d2b90acf265aebb7b Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 13 Nov 2024 18:25:21 -0800
+Subject: [PATCH 157/708] drm/xe: Change xe_engine_snapshot_capture_for_job to
+ be for queue
+
+During capture time, the target job may be unavailable (e.g., if it's in
+LR mode). However, the associated exec queue will be available
+regardless, change xe_engine_snapshot_capture_for_job to take a queue
+argument ann rename to xe_engine_snapshot_capture_for_queue.
+
+v2:
+ - Reword commit message (Jonathan)
+ - Remove redundant queueu check (Zhanjun)
+ - Remove devcoredump job member (Zhanjun)
+
+Cc: Zhanjun Dong <zhanjun.dong@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241114022522.1951351-7-matthew.brost@intel.com
+---
+ drivers/gpu/drm/xe/xe_devcoredump.c       |  5 +---
+ drivers/gpu/drm/xe/xe_devcoredump_types.h |  2 --
+ drivers/gpu/drm/xe/xe_guc_capture.c       | 29 ++++++++++-------------
+ drivers/gpu/drm/xe/xe_guc_capture.h       |  6 ++---
+ drivers/gpu/drm/xe/xe_guc_submit.c        |  4 ++--
+ drivers/gpu/drm/xe/xe_hw_engine.c         |  8 +++----
+ drivers/gpu/drm/xe/xe_hw_engine.h         |  4 ++--
+ 7 files changed, 24 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump.c b/drivers/gpu/drm/xe/xe_devcoredump.c
+index a302811578db..3bf4b0bd7acd 100644
+--- a/drivers/gpu/drm/xe/xe_devcoredump.c
++++ b/drivers/gpu/drm/xe/xe_devcoredump.c
+@@ -208,7 +208,6 @@ static void xe_devcoredump_free(void *data)
+ 	/* To prevent stale data on next snapshot, clear everything */
+ 	memset(&coredump->snapshot, 0, sizeof(coredump->snapshot));
+ 	coredump->captured = false;
+-	coredump->job = NULL;
+ 	drm_info(&coredump_to_xe(coredump)->drm,
+ 		 "Xe device coredump has been deleted.\n");
+ }
+@@ -274,7 +273,6 @@ static void devcoredump_snapshot(struct xe_devcoredump *coredump,
+ 	strscpy(ss->process_name, process_name);
+ 
+ 	ss->gt = q->gt;
+-	coredump->job = job;
+ 	INIT_WORK(&ss->work, xe_devcoredump_deferred_snap_work);
+ 
+ 	cookie = dma_fence_begin_signalling();
+@@ -297,8 +295,7 @@ static void devcoredump_snapshot(struct xe_devcoredump *coredump,
+ 		ss->job = xe_sched_job_snapshot_capture(job);
+ 	ss->vm = xe_vm_snapshot_capture(q->vm);
+ 
+-	if (job)
+-		xe_engine_snapshot_capture_for_job(job);
++	xe_engine_snapshot_capture_for_queue(q);
+ 
+ 	queue_work(system_unbound_wq, &ss->work);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump_types.h b/drivers/gpu/drm/xe/xe_devcoredump_types.h
+index 3703ddea1252..be4d59ea9ac8 100644
+--- a/drivers/gpu/drm/xe/xe_devcoredump_types.h
++++ b/drivers/gpu/drm/xe/xe_devcoredump_types.h
+@@ -80,8 +80,6 @@ struct xe_devcoredump {
+ 	bool captured;
+ 	/** @snapshot: Snapshot is captured at time of the first crash */
+ 	struct xe_devcoredump_snapshot snapshot;
+-	/** @job: Point to the faulting job */
+-	struct xe_sched_job *job;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_guc_capture.c b/drivers/gpu/drm/xe/xe_guc_capture.c
+index d63912d28246..42d401ccb0a9 100644
+--- a/drivers/gpu/drm/xe/xe_guc_capture.c
++++ b/drivers/gpu/drm/xe/xe_guc_capture.c
+@@ -1840,29 +1840,24 @@ void xe_engine_snapshot_print(struct xe_hw_engine_snapshot *snapshot, struct drm
+ }
+ 
+ /**
+- * xe_guc_capture_get_matching_and_lock - Matching GuC capture for the job.
+- * @job: The job object.
++ * xe_guc_capture_get_matching_and_lock - Matching GuC capture for the queue.
++ * @q: The exec queue object
+  *
+- * Search within the capture outlist for the job, could be used for check if
+- * GuC capture is ready for the job.
++ * Search within the capture outlist for the queue, could be used for check if
++ * GuC capture is ready for the queue.
+  * If found, the locked boolean of the node will be flagged.
+  *
+  * Returns: found guc-capture node ptr else NULL
+  */
+ struct __guc_capture_parsed_output *
+-xe_guc_capture_get_matching_and_lock(struct xe_sched_job *job)
++xe_guc_capture_get_matching_and_lock(struct xe_exec_queue *q)
+ {
+ 	struct xe_hw_engine *hwe;
+ 	enum xe_hw_engine_id id;
+-	struct xe_exec_queue *q;
+ 	struct xe_device *xe;
+ 	u16 guc_class = GUC_LAST_ENGINE_CLASS + 1;
+ 	struct xe_devcoredump_snapshot *ss;
+ 
+-	if (!job)
+-		return NULL;
+-
+-	q = job->q;
+ 	if (!q || !q->gt)
+ 		return NULL;
+ 
+@@ -1874,7 +1869,7 @@ xe_guc_capture_get_matching_and_lock(struct xe_sched_job *job)
+ 	if (ss->matched_node && ss->matched_node->source == XE_ENGINE_CAPTURE_SOURCE_GUC)
+ 		return ss->matched_node;
+ 
+-	/* Find hwe for the job */
++	/* Find hwe for the queue */
+ 	for_each_hw_engine(hwe, q->gt, id) {
+ 		if (hwe != q->hwe)
+ 			continue;
+@@ -1906,17 +1901,16 @@ xe_guc_capture_get_matching_and_lock(struct xe_sched_job *job)
+ }
+ 
+ /**
+- * xe_engine_snapshot_capture_for_job - Take snapshot of associated engine
+- * @job: The job object
++ * xe_engine_snapshot_capture_for_queue - Take snapshot of associated engine
++ * @q: The exec queue object
+  *
+  * Take snapshot of associated HW Engine
+  *
+  * Returns: None.
+  */
+ void
+-xe_engine_snapshot_capture_for_job(struct xe_sched_job *job)
++xe_engine_snapshot_capture_for_queue(struct xe_exec_queue *q)
+ {
+-	struct xe_exec_queue *q = job->q;
+ 	struct xe_device *xe = gt_to_xe(q->gt);
+ 	struct xe_devcoredump *coredump = &xe->devcoredump;
+ 	struct xe_hw_engine *hwe;
+@@ -1934,11 +1928,12 @@ xe_engine_snapshot_capture_for_job(struct xe_sched_job *job)
+ 		}
+ 
+ 		if (!coredump->snapshot.hwe[id]) {
+-			coredump->snapshot.hwe[id] = xe_hw_engine_snapshot_capture(hwe, job);
++			coredump->snapshot.hwe[id] =
++				xe_hw_engine_snapshot_capture(hwe, q);
+ 		} else {
+ 			struct __guc_capture_parsed_output *new;
+ 
+-			new = xe_guc_capture_get_matching_and_lock(job);
++			new = xe_guc_capture_get_matching_and_lock(q);
+ 			if (new) {
+ 				struct xe_guc *guc =  &q->gt->uc.guc;
+ 
+diff --git a/drivers/gpu/drm/xe/xe_guc_capture.h b/drivers/gpu/drm/xe/xe_guc_capture.h
+index 97a795d13dd1..20a078dc4b85 100644
+--- a/drivers/gpu/drm/xe/xe_guc_capture.h
++++ b/drivers/gpu/drm/xe/xe_guc_capture.h
+@@ -11,10 +11,10 @@
+ #include "xe_guc.h"
+ #include "xe_guc_fwif.h"
+ 
++struct xe_exec_queue;
+ struct xe_guc;
+ struct xe_hw_engine;
+ struct xe_hw_engine_snapshot;
+-struct xe_sched_job;
+ 
+ static inline enum guc_capture_list_class_type xe_guc_class_to_capture_class(u16 class)
+ {
+@@ -50,10 +50,10 @@ size_t xe_guc_capture_ads_input_worst_size(struct xe_guc *guc);
+ const struct __guc_mmio_reg_descr_group *
+ xe_guc_capture_get_reg_desc_list(struct xe_gt *gt, u32 owner, u32 type,
+ 				 enum guc_capture_list_class_type capture_class, bool is_ext);
+-struct __guc_capture_parsed_output *xe_guc_capture_get_matching_and_lock(struct xe_sched_job *job);
++struct __guc_capture_parsed_output *xe_guc_capture_get_matching_and_lock(struct xe_exec_queue *q);
+ void xe_engine_manual_capture(struct xe_hw_engine *hwe, struct xe_hw_engine_snapshot *snapshot);
+ void xe_engine_snapshot_print(struct xe_hw_engine_snapshot *snapshot, struct drm_printer *p);
+-void xe_engine_snapshot_capture_for_job(struct xe_sched_job *job);
++void xe_engine_snapshot_capture_for_queue(struct xe_exec_queue *q);
+ void xe_guc_capture_steered_list_init(struct xe_guc *guc);
+ void xe_guc_capture_put_matched_nodes(struct xe_guc *guc);
+ int xe_guc_capture_init(struct xe_guc *guc);
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+index ae3cee8034ac..a852bc79f64b 100644
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -1064,13 +1064,13 @@ guc_exec_queue_timedout_job(struct drm_sched_job *drm_job)
+ 	 * do manual capture first and decide later if we need to use it
+ 	 */
+ 	if (!exec_queue_killed(q) && !xe->devcoredump.captured &&
+-	    !xe_guc_capture_get_matching_and_lock(job)) {
++	    !xe_guc_capture_get_matching_and_lock(q)) {
+ 		/* take force wake before engine register manual capture */
+ 		fw_ref = xe_force_wake_get(gt_to_fw(q->gt), XE_FORCEWAKE_ALL);
+ 		if (!xe_force_wake_ref_has_domain(fw_ref, XE_FORCEWAKE_ALL))
+ 			xe_gt_info(q->gt, "failed to get forcewake for coredump capture\n");
+ 
+-		xe_engine_snapshot_capture_for_job(job);
++		xe_engine_snapshot_capture_for_queue(q);
+ 
+ 		xe_force_wake_put(gt_to_fw(q->gt), fw_ref);
+ 	}
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index 1557acee3523..0cfa2b9282be 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -829,7 +829,7 @@ void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
+ /**
+  * xe_hw_engine_snapshot_capture - Take a quick snapshot of the HW Engine.
+  * @hwe: Xe HW Engine.
+- * @job: The job object.
++ * @q: The exec queue object.
+  *
+  * This can be printed out in a later stage like during dev_coredump
+  * analysis.
+@@ -838,7 +838,7 @@ void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
+  * caller, using `xe_hw_engine_snapshot_free`.
+  */
+ struct xe_hw_engine_snapshot *
+-xe_hw_engine_snapshot_capture(struct xe_hw_engine *hwe, struct xe_sched_job *job)
++xe_hw_engine_snapshot_capture(struct xe_hw_engine *hwe, struct xe_exec_queue *q)
+ {
+ 	struct xe_hw_engine_snapshot *snapshot;
+ 	struct __guc_capture_parsed_output *node;
+@@ -864,9 +864,9 @@ xe_hw_engine_snapshot_capture(struct xe_hw_engine *hwe, struct xe_sched_job *job
+ 	if (IS_SRIOV_VF(gt_to_xe(hwe->gt)))
+ 		return snapshot;
+ 
+-	if (job) {
++	if (q) {
+ 		/* If got guc capture, set source to GuC */
+-		node = xe_guc_capture_get_matching_and_lock(job);
++		node = xe_guc_capture_get_matching_and_lock(q);
+ 		if (node) {
+ 			struct xe_device *xe = gt_to_xe(hwe->gt);
+ 			struct xe_devcoredump *coredump = &xe->devcoredump;
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.h b/drivers/gpu/drm/xe/xe_hw_engine.h
+index da0a6922a26f..6b5f9fa2a594 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.h
++++ b/drivers/gpu/drm/xe/xe_hw_engine.h
+@@ -11,7 +11,7 @@
+ struct drm_printer;
+ struct drm_xe_engine_class_instance;
+ struct xe_device;
+-struct xe_sched_job;
++struct xe_exec_queue;
+ 
+ #ifdef CONFIG_DRM_XE_JOB_TIMEOUT_MIN
+ #define XE_HW_ENGINE_JOB_TIMEOUT_MIN CONFIG_DRM_XE_JOB_TIMEOUT_MIN
+@@ -56,7 +56,7 @@ void xe_hw_engine_enable_ring(struct xe_hw_engine *hwe);
+ u32 xe_hw_engine_mask_per_class(struct xe_gt *gt,
+ 				enum xe_engine_class engine_class);
+ struct xe_hw_engine_snapshot *
+-xe_hw_engine_snapshot_capture(struct xe_hw_engine *hwe, struct xe_sched_job *job);
++xe_hw_engine_snapshot_capture(struct xe_hw_engine *hwe, struct xe_exec_queue *q);
+ void xe_hw_engine_snapshot_free(struct xe_hw_engine_snapshot *snapshot);
+ void xe_hw_engine_print(struct xe_hw_engine *hwe, struct drm_printer *p);
+ void xe_hw_engine_setup_default_lrc_state(struct xe_hw_engine *hwe);
+-- 
+2.25.1
+

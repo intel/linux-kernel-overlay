@@ -1,0 +1,82 @@
+From b9ffc9da34e02aa202e88e40469539461384bcd2 Mon Sep 17 00:00:00 2001
+From: Tomasz Lis <tomasz.lis@intel.com>
+Date: Mon, 4 Nov 2024 22:34:49 +0100
+Subject: [PATCH 130/708] drm/xe/vf: Defer fixups if migrated twice fast
+
+If another VF migration happened during post-migration recovery,
+then the current worker should be finished to allow the next
+one start swiftly and cleanly.
+
+Check for defer in two places: before fixups, and before
+sending RESFIX_DONE.
+
+Signed-off-by: Tomasz Lis <tomasz.lis@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241104213449.1455694-6-tomasz.lis@intel.com
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+---
+ drivers/gpu/drm/xe/xe_sriov_vf.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_sriov_vf.c b/drivers/gpu/drm/xe/xe_sriov_vf.c
+index ad29bd835d8e..c1275e64aa9c 100644
+--- a/drivers/gpu/drm/xe/xe_sriov_vf.c
++++ b/drivers/gpu/drm/xe/xe_sriov_vf.c
+@@ -157,6 +157,19 @@ static int vf_post_migration_requery_guc(struct xe_device *xe)
+ 	return ret;
+ }
+ 
++/*
++ * vf_post_migration_imminent - Check if post-restore recovery is coming.
++ * @xe: the &xe_device struct instance
++ *
++ * Return: True if migration recovery worker will soon be running. Any worker currently
++ * executing does not affect the result.
++ */
++static bool vf_post_migration_imminent(struct xe_device *xe)
++{
++	return xe->sriov.vf.migration.gt_flags != 0 ||
++	work_pending(&xe->sriov.vf.migration.worker);
++}
++
+ /*
+  * Notify all GuCs about resource fixups apply finished.
+  */
+@@ -166,8 +179,14 @@ static void vf_post_migration_notify_resfix_done(struct xe_device *xe)
+ 	unsigned int id;
+ 
+ 	for_each_gt(gt, xe, id) {
++		if (vf_post_migration_imminent(xe))
++			goto skip;
+ 		xe_gt_sriov_vf_notify_resfix_done(gt);
+ 	}
++	return;
++
++skip:
++	drm_dbg(&xe->drm, "another recovery imminent, skipping notifications\n");
+ }
+ 
+ static void vf_post_migration_recovery(struct xe_device *xe)
+@@ -177,6 +196,8 @@ static void vf_post_migration_recovery(struct xe_device *xe)
+ 	drm_dbg(&xe->drm, "migration recovery in progress\n");
+ 	xe_pm_runtime_get(xe);
+ 	err = vf_post_migration_requery_guc(xe);
++	if (vf_post_migration_imminent(xe))
++		goto defer;
+ 	if (unlikely(err))
+ 		goto fail;
+ 
+@@ -185,6 +206,10 @@ static void vf_post_migration_recovery(struct xe_device *xe)
+ 	xe_pm_runtime_put(xe);
+ 	drm_notice(&xe->drm, "migration recovery ended\n");
+ 	return;
++defer:
++	xe_pm_runtime_put(xe);
++	drm_dbg(&xe->drm, "migration recovery deferred\n");
++	return;
+ fail:
+ 	xe_pm_runtime_put(xe);
+ 	drm_err(&xe->drm, "migration recovery failed (%pe)\n", ERR_PTR(err));
+-- 
+2.25.1
+

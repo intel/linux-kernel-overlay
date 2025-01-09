@@ -1,0 +1,123 @@
+From 628d8628eed4a937b38ef4c0b78dfb1384b6fe43 Mon Sep 17 00:00:00 2001
+From: Samson Tam <Samson.Tam@amd.com>
+Date: Thu, 14 Nov 2024 03:10:05 -0500
+Subject: [PATCH 248/708] drm/amd/display: Add support for custom recout_width
+ in SPL
+
+[WHY]
+Add support for custom recout_width for mpc combine in SPL
+
+[HOW]
+1. Rename mpc_combine_h and mpc_combine_v
+2. Add flag use_recout_width_aligned to use custom recout_width
+3. Create union to use either mpc_num_h_slices or mpc_recout_width_align
+
+Reviewed-by: Navid Assadian <navid.assadian@amd.com>
+Signed-off-by: Samson Tam <Samson.Tam@amd.com>
+Signed-off-by: Alex Hung <alex.hung@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ .../gpu/drm/amd/display/dc/dc_spl_translate.c |  8 +++--
+ drivers/gpu/drm/amd/display/dc/spl/dc_spl.c   | 31 ++++++++++++++-----
+ .../gpu/drm/amd/display/dc/spl/dc_spl_types.h | 10 ++++--
+ 3 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c b/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
+index 0e310fd48b5c..a4907cfe3f08 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
+@@ -108,12 +108,14 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
+ 	spl_in->basic_in.horizontal_mirror = plane_state->horizontal_mirror;
+ 
+ 	// Calculate horizontal splits and split index
+-	spl_in->basic_in.mpc_combine_h = resource_get_mpc_slice_count(pipe_ctx);
++	spl_in->basic_in.num_h_slices_recout_width_align.use_recout_width_aligned = false;
++	spl_in->basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices =
++		resource_get_mpc_slice_count(pipe_ctx);
+ 
+ 	if (stream->view_format == VIEW_3D_FORMAT_SIDE_BY_SIDE)
+-		spl_in->basic_in.mpc_combine_v = 0;
++		spl_in->basic_in.mpc_h_slice_index = 0;
+ 	else
+-		spl_in->basic_in.mpc_combine_v = resource_get_mpc_slice_index(pipe_ctx);
++		spl_in->basic_in.mpc_h_slice_index = resource_get_mpc_slice_index(pipe_ctx);
+ 
+ 	populate_splrect_from_rect(&spl_in->basic_out.odm_slice_rect, &odm_slice_src);
+ 	spl_in->basic_out.odm_combine_factor = 0;
+diff --git a/drivers/gpu/drm/amd/display/dc/spl/dc_spl.c b/drivers/gpu/drm/amd/display/dc/spl/dc_spl.c
+index 27fd20fa2942..c92312fec7a9 100644
+--- a/drivers/gpu/drm/amd/display/dc/spl/dc_spl.c
++++ b/drivers/gpu/drm/amd/display/dc/spl/dc_spl.c
+@@ -137,15 +137,32 @@ static struct spl_rect calculate_mpc_slice_in_timing_active(
+ 		struct spl_in *spl_in,
+ 		struct spl_rect *plane_clip_rec)
+ {
+-	int mpc_slice_count = spl_in->basic_in.mpc_combine_h;
+-	int mpc_slice_idx = spl_in->basic_in.mpc_combine_v;
++	bool use_recout_width_aligned =
++		spl_in->basic_in.num_h_slices_recout_width_align.use_recout_width_aligned;
++	int mpc_slice_count =
++		spl_in->basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices;
++	int recout_width_align =
++		spl_in->basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_recout_width_align;
++	int mpc_slice_idx = spl_in->basic_in.mpc_h_slice_index;
+ 	int epimo = mpc_slice_count - plane_clip_rec->width % mpc_slice_count - 1;
+ 	struct spl_rect mpc_rec;
+ 
+-	mpc_rec.width = plane_clip_rec->width / mpc_slice_count;
+-	mpc_rec.x = plane_clip_rec->x + mpc_rec.width * mpc_slice_idx;
+-	mpc_rec.height = plane_clip_rec->height;
+-	mpc_rec.y = plane_clip_rec->y;
++	if (use_recout_width_aligned) {
++		mpc_rec.width = recout_width_align;
++		if ((mpc_rec.width * (mpc_slice_idx + 1)) > plane_clip_rec->width) {
++			mpc_rec.width = plane_clip_rec->width % recout_width_align;
++			mpc_rec.x = plane_clip_rec->x + recout_width_align * mpc_slice_idx;
++		} else
++			mpc_rec.x = plane_clip_rec->x + mpc_rec.width * mpc_slice_idx;
++		mpc_rec.height = plane_clip_rec->height;
++		mpc_rec.y = plane_clip_rec->y;
++
++	} else {
++		mpc_rec.width = plane_clip_rec->width / mpc_slice_count;
++		mpc_rec.x = plane_clip_rec->x + mpc_rec.width * mpc_slice_idx;
++		mpc_rec.height = plane_clip_rec->height;
++		mpc_rec.y = plane_clip_rec->y;
++	}
+ 	SPL_ASSERT(mpc_slice_count == 1 ||
+ 			spl_in->basic_out.view_format != SPL_VIEW_3D_SIDE_BY_SIDE ||
+ 			mpc_rec.width % 2 == 0);
+@@ -678,7 +695,7 @@ static void spl_handle_3d_recout(struct spl_in *spl_in, struct spl_rect *recout)
+ 	 * since 3d is special and needs to calculate vp as if there is no recout offset
+ 	 * This may break with rotation, good thing we aren't mixing hw rotation and 3d
+ 	 */
+-	if (spl_in->basic_in.mpc_combine_v) {
++	if (spl_in->basic_in.mpc_h_slice_index) {
+ 		SPL_ASSERT(spl_in->basic_in.rotation == SPL_ROTATION_ANGLE_0 ||
+ 			(spl_in->basic_out.view_format != SPL_VIEW_3D_TOP_AND_BOTTOM &&
+ 					spl_in->basic_out.view_format != SPL_VIEW_3D_SIDE_BY_SIDE));
+diff --git a/drivers/gpu/drm/amd/display/dc/spl/dc_spl_types.h b/drivers/gpu/drm/amd/display/dc/spl/dc_spl_types.h
+index 55d557df4aa5..0e6db94bbfb2 100644
+--- a/drivers/gpu/drm/amd/display/dc/spl/dc_spl_types.h
++++ b/drivers/gpu/drm/amd/display/dc/spl/dc_spl_types.h
+@@ -436,8 +436,14 @@ struct basic_in	{
+ 	struct spl_rect clip_rect; // Clip rect
+ 	enum spl_rotation_angle rotation;  // Rotation
+ 	bool horizontal_mirror;  // Horizontal mirror
+-	int mpc_combine_h; // MPC Horizontal Combine Factor (split_count)
+-	int mpc_combine_v; // MPC Vertical Combine Factor (split_idx)
++	struct { // previous mpc_combine_h - split count
++		bool use_recout_width_aligned;
++		union {
++			int mpc_num_h_slices;
++			int mpc_recout_width_align;
++		} num_slices_recout_width;
++	} num_h_slices_recout_width_align;
++	int mpc_h_slice_index; // previous mpc_combine_v - split_idx
+ 	// Inputs for adaptive scaler - TODO
+ 	enum spl_transfer_func_type tf_type; /* Transfer function type */
+ 	enum spl_transfer_func_predefined tf_predefined_type; /* Transfer function predefined type */
+-- 
+2.25.1
+

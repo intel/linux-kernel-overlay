@@ -1,0 +1,97 @@
+From 7445440eec805fcf5db649d338e73c5a9855d73e Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Thu, 7 Nov 2024 21:33:16 -0800
+Subject: [PATCH 148/708] drm/xe: Wait on killed exec queues
+
+When an exec queue is killed it triggers an async process of asking the
+GuC to schedule the context out. The timestamp in the context image is
+only updated when this process completes. In case a userspace process
+kills an exec and tries to read the timestamp, it may not get an updated
+runtime.
+
+Add synchronization between the process reading the fdinfo and the exec
+queue being killed. After reading all the timestamps, wait on exec
+queues in the process of being killed. When that wait is over,
+xe_exec_queue_fini() was already called and updated the timestamps.
+
+v2: Do not update pending_removal before validating user args
+    (Matthew Auld)
+v3: Move wait on pending to be done before getting any timestamp
+    so it's more likely for the gpu and exec queue timestamps to
+    be closer together
+
+Closes: https://gitlab.freedesktop.org/drm/xe/kernel/-/issues/2667
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241108053318.3483678-2-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/xe_device_types.h | 5 +++++
+ drivers/gpu/drm/xe/xe_drm_client.c   | 7 +++++++
+ drivers/gpu/drm/xe/xe_exec_queue.c   | 6 ++++++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index bccca63c8a48..fffbb7d1c40b 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -607,6 +607,11 @@ struct xe_file {
+ 		 * which does things while being held.
+ 		 */
+ 		struct mutex lock;
++		/**
++		 * @exec_queue.pending_removal: items pending to be removed to
++		 * synchronize GPU state update with ongoing query.
++		 */
++		atomic_t pending_removal;
+ 	} exec_queue;
+ 
+ 	/** @run_ticks: hw engine class run time in ticks for this drm client */
+diff --git a/drivers/gpu/drm/xe/xe_drm_client.c b/drivers/gpu/drm/xe/xe_drm_client.c
+index 22f0f1a6dfd5..dd4e16a84874 100644
+--- a/drivers/gpu/drm/xe/xe_drm_client.c
++++ b/drivers/gpu/drm/xe/xe_drm_client.c
+@@ -280,6 +280,13 @@ static void show_run_ticks(struct drm_printer *p, struct drm_file *file)
+ 	u64 gpu_timestamp;
+ 	unsigned int fw_ref;
+ 
++	/*
++	 * Wait for any exec queue going away: their cycles will get updated on
++	 * context switch out, so wait for that to happen
++	 */
++	wait_var_event(&xef->exec_queue.pending_removal,
++		       !atomic_read(&xef->exec_queue.pending_removal));
++
+ 	xe_pm_runtime_get(xe);
+ 
+ 	/* Accumulate all the exec queues from this client */
+diff --git a/drivers/gpu/drm/xe/xe_exec_queue.c b/drivers/gpu/drm/xe/xe_exec_queue.c
+index fd0f3b3c9101..ff556773c106 100644
+--- a/drivers/gpu/drm/xe/xe_exec_queue.c
++++ b/drivers/gpu/drm/xe/xe_exec_queue.c
+@@ -262,8 +262,11 @@ void xe_exec_queue_fini(struct xe_exec_queue *q)
+ 
+ 	/*
+ 	 * Before releasing our ref to lrc and xef, accumulate our run ticks
++	 * and wakeup any waiters.
+ 	 */
+ 	xe_exec_queue_update_run_ticks(q);
++	if (q->xef && atomic_dec_and_test(&q->xef->exec_queue.pending_removal))
++		wake_up_var(&q->xef->exec_queue.pending_removal);
+ 
+ 	for (i = 0; i < q->width; ++i)
+ 		xe_lrc_put(q->lrc[i]);
+@@ -826,7 +829,10 @@ int xe_exec_queue_destroy_ioctl(struct drm_device *dev, void *data,
+ 
+ 	mutex_lock(&xef->exec_queue.lock);
+ 	q = xa_erase(&xef->exec_queue.xa, args->exec_queue_id);
++	if (q)
++		atomic_inc(&xef->exec_queue.pending_removal);
+ 	mutex_unlock(&xef->exec_queue.lock);
++
+ 	if (XE_IOCTL_DBG(xe, !q))
+ 		return -ENOENT;
+ 
+-- 
+2.25.1
+

@@ -1,0 +1,189 @@
+From 85351ae44493f25aab314614fdb620ad17599749 Mon Sep 17 00:00:00 2001
+From: Louis Chauvet <louis.chauvet@bootlin.com>
+Date: Tue, 19 Nov 2024 14:34:04 +0100
+Subject: [PATCH 030/708] drm/vkms: Remove index parameter from
+ init_vkms_output
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VKMS currently supports only one CRTC, so it make no sense to have this
+index configurable. To avoid issues, replace this hardcoded index by
+drm_crtc_mask when applicable.
+
+There is no need to manually set a crtc mask on primary and cursor plane
+as it is automatically set by drmm_crtc_alloc_with_planes.
+
+In addition, this will remove the use of an uninitialized structure in
+vkms_add_overlay_plane. This currently works by chance because two things:
+- vkms_plane_init always set a possible_crtcs value, so the problematic
+  branch is never used;
+- drm_crtc_mask on an kzalloc'd drm_crtc returns BIT(0), and the VKMS CRTC
+  always have this id.
+
+Reviewed-by: José Expósito <jose.exposito89@gmail.com>
+Reviewed-by: Maíra Canal <mcanal@igalia.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241119-vkms-remove-index-v3-1-976321a3f801@bootlin.com
+Signed-off-by: Louis Chauvet <louis.chauvet@bootlin.com>
+---
+ drivers/gpu/drm/vkms/vkms_drv.c    |  2 +-
+ drivers/gpu/drm/vkms/vkms_drv.h    |  8 ++---
+ drivers/gpu/drm/vkms/vkms_output.c | 49 ++++++++++--------------------
+ drivers/gpu/drm/vkms/vkms_plane.c  |  4 +--
+ 4 files changed, 21 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.c b/drivers/gpu/drm/vkms/vkms_drv.c
+index bab13943d8e0..e4ae69d9ef87 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -174,7 +174,7 @@ static int vkms_modeset_init(struct vkms_device *vkmsdev)
+ 	dev->mode_config.preferred_depth = 0;
+ 	dev->mode_config.helper_private = &vkms_mode_config_helpers;
+ 
+-	return vkms_output_init(vkmsdev, 0);
++	return vkms_output_init(vkmsdev);
+ }
+ 
+ static int vkms_create(struct vkms_config *config)
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 672fe191e239..036101ee4ea1 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -212,21 +212,17 @@ int vkms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
+  * vkms_output_init() - Initialize all sub-components needed for a VKMS device.
+  *
+  * @vkmsdev: VKMS device to initialize
+- * @index: CRTC which can be attached to the planes. The caller must ensure that
+- *	   @index is positive and less or equals to 31.
+  */
+-int vkms_output_init(struct vkms_device *vkmsdev, int index);
++int vkms_output_init(struct vkms_device *vkmsdev);
+ 
+ /**
+  * vkms_plane_init() - Initialize a plane
+  *
+  * @vkmsdev: VKMS device containing the plane
+  * @type: type of plane to initialize
+- * @index: CRTC which can be attached to the plane. The caller must ensure that
+- *	   @index is positive and less or equals to 31.
+  */
+ struct vkms_plane *vkms_plane_init(struct vkms_device *vkmsdev,
+-				   enum drm_plane_type type, int index);
++				   enum drm_plane_type type);
+ 
+ /* CRC Support */
+ const char *const *vkms_get_crc_sources(struct drm_crtc *crtc,
+diff --git a/drivers/gpu/drm/vkms/vkms_output.c b/drivers/gpu/drm/vkms/vkms_output.c
+index 25a99fde126c..8f4bd5aef087 100644
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -32,29 +32,14 @@ static const struct drm_connector_helper_funcs vkms_conn_helper_funcs = {
+ 	.get_modes    = vkms_conn_get_modes,
+ };
+ 
+-static int vkms_add_overlay_plane(struct vkms_device *vkmsdev, int index,
+-				  struct drm_crtc *crtc)
+-{
+-	struct vkms_plane *overlay;
+-
+-	overlay = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_OVERLAY, index);
+-	if (IS_ERR(overlay))
+-		return PTR_ERR(overlay);
+-
+-	if (!overlay->base.possible_crtcs)
+-		overlay->base.possible_crtcs = drm_crtc_mask(crtc);
+-
+-	return 0;
+-}
+-
+-int vkms_output_init(struct vkms_device *vkmsdev, int index)
++int vkms_output_init(struct vkms_device *vkmsdev)
+ {
+ 	struct vkms_output *output = &vkmsdev->output;
+ 	struct drm_device *dev = &vkmsdev->drm;
+ 	struct drm_connector *connector = &output->connector;
+ 	struct drm_encoder *encoder = &output->encoder;
+ 	struct drm_crtc *crtc = &output->crtc;
+-	struct vkms_plane *primary, *cursor = NULL;
++	struct vkms_plane *primary, *overlay, *cursor = NULL;
+ 	int ret;
+ 	int writeback;
+ 	unsigned int n;
+@@ -65,29 +50,31 @@ int vkms_output_init(struct vkms_device *vkmsdev, int index)
+ 	 * The overlay and cursor planes are not mandatory, but can be used to perform complex
+ 	 * composition.
+ 	 */
+-	primary = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_PRIMARY, index);
++	primary = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_PRIMARY);
+ 	if (IS_ERR(primary))
+ 		return PTR_ERR(primary);
+ 
+-	if (vkmsdev->config->overlay) {
+-		for (n = 0; n < NUM_OVERLAY_PLANES; n++) {
+-			ret = vkms_add_overlay_plane(vkmsdev, index, crtc);
+-			if (ret)
+-				return ret;
+-		}
+-	}
+-
+ 	if (vkmsdev->config->cursor) {
+-		cursor = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_CURSOR, index);
++		cursor = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_CURSOR);
+ 		if (IS_ERR(cursor))
+ 			return PTR_ERR(cursor);
+ 	}
+ 
+-	/* [1]: Allocation of a CRTC, its index will be BIT(0) = 1 */
+ 	ret = vkms_crtc_init(dev, crtc, &primary->base, &cursor->base);
+ 	if (ret)
+ 		return ret;
+ 
++	if (vkmsdev->config->overlay) {
++		for (n = 0; n < NUM_OVERLAY_PLANES; n++) {
++			overlay = vkms_plane_init(vkmsdev, DRM_PLANE_TYPE_OVERLAY);
++			if (IS_ERR(overlay)) {
++				DRM_DEV_ERROR(dev->dev, "Failed to init vkms plane\n");
++				return PTR_ERR(overlay);
++			}
++			overlay->base.possible_crtcs = drm_crtc_mask(crtc);
++		}
++	}
++
+ 	ret = drm_connector_init(dev, connector, &vkms_connector_funcs,
+ 				 DRM_MODE_CONNECTOR_VIRTUAL);
+ 	if (ret) {
+@@ -103,11 +90,7 @@ int vkms_output_init(struct vkms_device *vkmsdev, int index)
+ 		DRM_ERROR("Failed to init encoder\n");
+ 		goto err_encoder;
+ 	}
+-	/*
+-	 * This is a hardcoded value to select crtc for the encoder.
+-	 * BIT(0) here designate the first registered CRTC, the one allocated in [1]
+-	 */
+-	encoder->possible_crtcs = BIT(0);
++	encoder->possible_crtcs = drm_crtc_mask(crtc);
+ 
+ 	ret = drm_connector_attach_encoder(connector, encoder);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/vkms/vkms_plane.c b/drivers/gpu/drm/vkms/vkms_plane.c
+index e5c625ab8e3e..ad137c9a75f5 100644
+--- a/drivers/gpu/drm/vkms/vkms_plane.c
++++ b/drivers/gpu/drm/vkms/vkms_plane.c
+@@ -198,12 +198,12 @@ static const struct drm_plane_helper_funcs vkms_plane_helper_funcs = {
+ };
+ 
+ struct vkms_plane *vkms_plane_init(struct vkms_device *vkmsdev,
+-				   enum drm_plane_type type, int index)
++				   enum drm_plane_type type)
+ {
+ 	struct drm_device *dev = &vkmsdev->drm;
+ 	struct vkms_plane *plane;
+ 
+-	plane = drmm_universal_plane_alloc(dev, struct vkms_plane, base, 1 << index,
++	plane = drmm_universal_plane_alloc(dev, struct vkms_plane, base, 0,
+ 					   &vkms_plane_funcs,
+ 					   vkms_formats, ARRAY_SIZE(vkms_formats),
+ 					   NULL, type, NULL);
+-- 
+2.25.1
+

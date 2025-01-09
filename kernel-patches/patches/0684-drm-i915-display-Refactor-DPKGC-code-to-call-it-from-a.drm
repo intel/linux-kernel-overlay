@@ -1,0 +1,113 @@
+From f94407662353c063b39df2c90e92f0fac2edc6dd Mon Sep 17 00:00:00 2001
+From: Suraj Kandpal <suraj.kandpal@intel.com>
+Date: Tue, 3 Dec 2024 14:17:04 +0530
+Subject: [PATCH 684/708] drm/i915/display: Refactor DPKGC code to call it from
+ atomic_commit_tail
+
+Refactor the code to check the fixed refresh rate condition in the dpkgc
+function itself and call it from intel_atomic_commit_tail so that we
+have all the required values specially linetime which is computed after
+intel_wm_compute, this will also help implement some WA's which requires
+linetime. This also avoid writing into any of the registers while we are
+in compute_config phase.
+
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Reviewed-by: Mitul Golani <mitulkumar.ajitkumar.golani@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241203084706.2126189-4-suraj.kandpal@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c |  2 ++
+ drivers/gpu/drm/i915/display/skl_watermark.c | 28 +++++++++++---------
+ drivers/gpu/drm/i915/display/skl_watermark.h |  1 +
+ 3 files changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 4805bf682d43..28c1b372cc95 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7831,6 +7831,8 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 	/* Now enable the clocks, plane, pipe, and connectors that we set up. */
+ 	dev_priv->display.funcs.display->commit_modeset_enables(state);
+ 
++	intel_program_dpkgc_latency(state);
++
+ 	if (state->modeset)
+ 		intel_set_cdclk_post_plane_update(state);
+ 
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index 4e46567f1359..95b306c22954 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -2854,18 +2854,30 @@ static int skl_wm_add_affected_planes(struct intel_atomic_state *state,
+  * Program DEEP PKG_C_LATENCY Pkg C with all 1's.
+  * Program PKG_C_LATENCY Added Wake Time = 0
+  */
+-static void
+-skl_program_dpkgc_latency(struct drm_i915_private *i915, bool enable_dpkgc)
++void
++intel_program_dpkgc_latency(struct intel_atomic_state *state)
+ {
+-	struct intel_display *display = to_intel_display(&i915->drm);
++	struct intel_display *display = to_intel_display(state);
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	struct intel_crtc *crtc;
++	struct intel_crtc_state *new_crtc_state;
+ 	u32 max_latency = LNL_PKG_C_LATENCY_MASK;
+ 	u32 clear, val;
+ 	u32 added_wake_time = 0;
++	bool fixed_refresh_rate = false;
++	int i;
+ 
+ 	if (DISPLAY_VER(display) < 20)
+ 		return;
+ 
+-	if (enable_dpkgc) {
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		if (!new_crtc_state->vrr.enable ||
++		    (new_crtc_state->vrr.vmin == new_crtc_state->vrr.vmax &&
++		     new_crtc_state->vrr.vmin == new_crtc_state->vrr.flipline))
++			fixed_refresh_rate = true;
++	}
++
++	if (fixed_refresh_rate) {
+ 		max_latency = skl_watermark_max_latency(i915, 1);
+ 		if (max_latency == 0)
+ 			max_latency = LNL_PKG_C_LATENCY_MASK;
+@@ -2886,7 +2898,6 @@ skl_compute_wm(struct intel_atomic_state *state)
+ 	struct intel_crtc *crtc;
+ 	struct intel_crtc_state __maybe_unused *new_crtc_state;
+ 	int ret, i;
+-	bool enable_dpkgc = false;
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		ret = skl_build_pipe_wm(state, crtc);
+@@ -2911,15 +2922,8 @@ skl_compute_wm(struct intel_atomic_state *state)
+ 		ret = skl_wm_add_affected_planes(state, crtc);
+ 		if (ret)
+ 			return ret;
+-
+-		if ((new_crtc_state->vrr.vmin == new_crtc_state->vrr.vmax &&
+-		     new_crtc_state->vrr.vmin == new_crtc_state->vrr.flipline) ||
+-		    !new_crtc_state->vrr.enable)
+-			enable_dpkgc = true;
+ 	}
+ 
+-	skl_program_dpkgc_latency(to_i915(state->base.dev), enable_dpkgc);
+-
+ 	skl_print_wm_changes(state);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.h b/drivers/gpu/drm/i915/display/skl_watermark.h
+index e73baec94873..35a1df7336e8 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.h
++++ b/drivers/gpu/drm/i915/display/skl_watermark.h
+@@ -87,6 +87,7 @@ void intel_dbuf_mdclk_cdclk_ratio_update(struct drm_i915_private *i915,
+ 					 int ratio, bool joined_mbus);
+ void intel_dbuf_mbus_pre_ddb_update(struct intel_atomic_state *state);
+ void intel_dbuf_mbus_post_ddb_update(struct intel_atomic_state *state);
++void intel_program_dpkgc_latency(struct intel_atomic_state *state);
+ 
+ #endif /* __SKL_WATERMARK_H__ */
+ 
+-- 
+2.25.1
+
