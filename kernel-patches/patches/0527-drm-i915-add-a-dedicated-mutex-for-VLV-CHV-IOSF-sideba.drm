@@ -1,0 +1,128 @@
+From c7fe3a80e1350212639962a081271a79126a6dca Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Tue, 29 Oct 2024 11:25:25 +0200
+Subject: [PATCH 527/708] drm/i915: add a dedicated mutex for VLV/CHV IOSF
+ sideband
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The VLV/CHV IOSF sideband is unrelated to pcode. It's just confusing to
+piggyback on the same mutex. Add a dedicated lock with init and cleanup
+functions.
+
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/31ccbf33c6b6114d0bcb40a2e174f19162d4e177.1730193891.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/i915/i915_driver.c  |  3 +++
+ drivers/gpu/drm/i915/i915_drv.h     |  5 +++++
+ drivers/gpu/drm/i915/vlv_sideband.c | 18 +++++++++++++++---
+ drivers/gpu/drm/i915/vlv_sideband.h |  3 +++
+ 4 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index ea26aedca4b4..af6956d34f9a 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -105,6 +105,7 @@
+ #include "intel_pcode.h"
+ #include "intel_region_ttm.h"
+ #include "intel_sbi.h"
++#include "vlv_sideband.h"
+ #include "vlv_suspend.h"
+ 
+ static const struct drm_driver i915_drm_driver;
+@@ -233,6 +234,7 @@ static int i915_driver_early_probe(struct drm_i915_private *dev_priv)
+ 	spin_lock_init(&dev_priv->gpu_error.lock);
+ 
+ 	intel_sbi_init(dev_priv);
++	vlv_iosf_sb_init(dev_priv);
+ 	mutex_init(&dev_priv->sb_lock);
+ 	cpu_latency_qos_add_request(&dev_priv->sb_qos, PM_QOS_DEFAULT_VALUE);
+ 
+@@ -294,6 +296,7 @@ static void i915_driver_late_release(struct drm_i915_private *dev_priv)
+ 
+ 	cpu_latency_qos_remove_request(&dev_priv->sb_qos);
+ 	mutex_destroy(&dev_priv->sb_lock);
++	vlv_iosf_sb_fini(dev_priv);
+ 	intel_sbi_fini(dev_priv);
+ 
+ 	i915_params_free(&dev_priv->params);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 71b46b7d58e5..f19b678d1fed 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -239,6 +239,11 @@ struct drm_i915_private {
+ 	/* LPT/WPT IOSF sideband protection */
+ 	struct mutex sbi_lock;
+ 
++	/* VLV/CHV IOSF sideband */
++	struct {
++		struct mutex lock; /* protect sideband access */
++	} vlv_iosf_sb;
++
+ 	/* Sideband mailbox protection */
+ 	struct mutex sb_lock;
+ 	struct pm_qos_request sb_qos;
+diff --git a/drivers/gpu/drm/i915/vlv_sideband.c b/drivers/gpu/drm/i915/vlv_sideband.c
+index 68291412f4cb..ed7de9c8d0ad 100644
+--- a/drivers/gpu/drm/i915/vlv_sideband.c
++++ b/drivers/gpu/drm/i915/vlv_sideband.c
+@@ -62,12 +62,12 @@ void vlv_iosf_sb_get(struct drm_i915_private *i915, unsigned long ports)
+ 	if (ports & BIT(VLV_IOSF_SB_PUNIT))
+ 		__vlv_punit_get(i915);
+ 
+-	mutex_lock(&i915->sb_lock);
++	mutex_lock(&i915->vlv_iosf_sb.lock);
+ }
+ 
+ void vlv_iosf_sb_put(struct drm_i915_private *i915, unsigned long ports)
+ {
+-	mutex_unlock(&i915->sb_lock);
++	mutex_unlock(&i915->vlv_iosf_sb.lock);
+ 
+ 	if (ports & BIT(VLV_IOSF_SB_PUNIT))
+ 		__vlv_punit_put(i915);
+@@ -81,7 +81,7 @@ static int vlv_sideband_rw(struct drm_i915_private *i915,
+ 	const bool is_read = (opcode == SB_MRD_NP || opcode == SB_CRRDDA_NP);
+ 	int err;
+ 
+-	lockdep_assert_held(&i915->sb_lock);
++	lockdep_assert_held(&i915->vlv_iosf_sb.lock);
+ 	if (port == IOSF_PORT_PUNIT)
+ 		iosf_mbi_assert_punit_acquired();
+ 
+@@ -249,3 +249,15 @@ void vlv_flisdsi_write(struct drm_i915_private *i915, u32 reg, u32 val)
+ 	vlv_sideband_rw(i915, DPIO_DEVFN, IOSF_PORT_FLISDSI, SB_CRWRDA_NP,
+ 			reg, &val);
+ }
++
++void vlv_iosf_sb_init(struct drm_i915_private *i915)
++{
++	if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915))
++		mutex_init(&i915->vlv_iosf_sb.lock);
++}
++
++void vlv_iosf_sb_fini(struct drm_i915_private *i915)
++{
++	if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915))
++		mutex_destroy(&i915->vlv_iosf_sb.lock);
++}
+diff --git a/drivers/gpu/drm/i915/vlv_sideband.h b/drivers/gpu/drm/i915/vlv_sideband.h
+index c20cf41b2d39..31813e07c56f 100644
+--- a/drivers/gpu/drm/i915/vlv_sideband.h
++++ b/drivers/gpu/drm/i915/vlv_sideband.h
+@@ -25,6 +25,9 @@ enum {
+ 	VLV_IOSF_SB_PUNIT,
+ };
+ 
++void vlv_iosf_sb_init(struct drm_i915_private *i915);
++void vlv_iosf_sb_fini(struct drm_i915_private *i915);
++
+ void vlv_iosf_sb_get(struct drm_i915_private *i915, unsigned long ports);
+ void vlv_iosf_sb_put(struct drm_i915_private *i915, unsigned long ports);
+ 
+-- 
+2.25.1
+

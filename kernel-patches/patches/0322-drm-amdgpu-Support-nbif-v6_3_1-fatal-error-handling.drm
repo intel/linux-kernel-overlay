@@ -1,0 +1,196 @@
+From 8d0cbd907edb075e108de0aeee7d26ea2d414a58 Mon Sep 17 00:00:00 2001
+From: Candice Li <candice.li@amd.com>
+Date: Thu, 8 Aug 2024 16:40:41 +0800
+Subject: [PATCH 322/708] drm/amdgpu: Support nbif v6_3_1 fatal error handling
+
+Add nbif v6_3_1 fatal error handling support.
+
+Signed-off-by: Candice Li <candice.li@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c  | 12 ++++
+ drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c | 81 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/soc24.c       | 19 +++++-
+ 4 files changed, 111 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 623ae9b38800..db081618e85c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -36,6 +36,7 @@
+ #include "amdgpu_xgmi.h"
+ #include "ivsrcid/nbio/irqsrcs_nbif_7_4.h"
+ #include "nbio_v4_3.h"
++#include "nbif_v6_3_1.h"
+ #include "nbio_v7_9.h"
+ #include "atom.h"
+ #include "amdgpu_reset.h"
+@@ -3911,6 +3912,17 @@ int amdgpu_ras_init(struct amdgpu_device *adev)
+ 			 * check DF RAS */
+ 			adev->nbio.ras = &nbio_v4_3_ras;
+ 		break;
++	case IP_VERSION(6, 3, 1):
++		if (adev->ras_hw_enabled & (1 << AMDGPU_RAS_BLOCK__DF))
++			/* unlike other generation of nbio ras,
++			 * nbif v6_3_1 only support fatal error interrupt
++			 * to inform software that DF is freezed due to
++			 * system fatal error event. driver should not
++			 * enable nbio ras in such case. Instead,
++			 * check DF RAS
++			 */
++			adev->nbio.ras = &nbif_v6_3_1_ras;
++		break;
+ 	case IP_VERSION(7, 9, 0):
+ 	case IP_VERSION(7, 9, 1):
+ 		if (!adev->gmc.is_app_apu)
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
+index 39919e0892c1..c92875ceb31f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
+@@ -28,6 +28,7 @@
+ #include "nbif/nbif_6_3_1_sh_mask.h"
+ #include "pcie/pcie_6_1_0_offset.h"
+ #include "pcie/pcie_6_1_0_sh_mask.h"
++#include "ivsrcid/nbio/irqsrcs_nbif_7_4.h"
+ #include <uapi/linux/kfd_ioctl.h>
+ 
+ static void nbif_v6_3_1_remap_hdp_registers(struct amdgpu_device *adev)
+@@ -518,3 +519,83 @@ const struct amdgpu_nbio_funcs nbif_v6_3_1_sriov_funcs = {
+ 	.get_rom_offset = nbif_v6_3_1_get_rom_offset,
+ 	.set_reg_remap = nbif_v6_3_1_set_reg_remap,
+ };
++
++static int nbif_v6_3_1_set_ras_err_event_athub_irq_state(struct amdgpu_device *adev,
++						       struct amdgpu_irq_src *src,
++						       unsigned type,
++						       enum amdgpu_interrupt_state state)
++{
++	/* The ras_controller_irq enablement should be done in psp bl when it
++	 * tries to enable ras feature. Driver only need to set the correct interrupt
++	 * vector for bare-metal and sriov use case respectively
++	 */
++	uint32_t bif_doorbell_int_cntl;
++
++	bif_doorbell_int_cntl = RREG32_SOC15(NBIO, 0, regBIF_BX0_BIF_DOORBELL_INT_CNTL);
++	bif_doorbell_int_cntl = REG_SET_FIELD(bif_doorbell_int_cntl,
++					      BIF_BX0_BIF_DOORBELL_INT_CNTL,
++					      RAS_ATHUB_ERR_EVENT_INTERRUPT_DISABLE,
++					      (state == AMDGPU_IRQ_STATE_ENABLE) ? 0 : 1);
++	WREG32_SOC15(NBIO, 0, regBIF_BX0_BIF_DOORBELL_INT_CNTL, bif_doorbell_int_cntl);
++
++	return 0;
++}
++
++static int nbif_v6_3_1_process_err_event_athub_irq(struct amdgpu_device *adev,
++						 struct amdgpu_irq_src *source,
++						 struct amdgpu_iv_entry *entry)
++{
++	/* By design, the ih cookie for err_event_athub_irq should be written
++	 * to bif ring. since bif ring is not enabled, just leave process callback
++	 * as a dummy one.
++	 */
++	return 0;
++}
++
++static const struct amdgpu_irq_src_funcs nbif_v6_3_1_ras_err_event_athub_irq_funcs = {
++	.set = nbif_v6_3_1_set_ras_err_event_athub_irq_state,
++	.process = nbif_v6_3_1_process_err_event_athub_irq,
++};
++
++static void nbif_v6_3_1_handle_ras_err_event_athub_intr_no_bifring(struct amdgpu_device *adev)
++{
++	uint32_t bif_doorbell_int_cntl;
++
++	bif_doorbell_int_cntl = RREG32_SOC15(NBIO, 0, regBIF_BX0_BIF_DOORBELL_INT_CNTL);
++	if (REG_GET_FIELD(bif_doorbell_int_cntl,
++			  BIF_BX0_BIF_DOORBELL_INT_CNTL,
++			  RAS_ATHUB_ERR_EVENT_INTERRUPT_STATUS)) {
++		/* driver has to clear the interrupt status when bif ring is disabled */
++		bif_doorbell_int_cntl = REG_SET_FIELD(bif_doorbell_int_cntl,
++						BIF_BX0_BIF_DOORBELL_INT_CNTL,
++						RAS_ATHUB_ERR_EVENT_INTERRUPT_CLEAR, 1);
++		WREG32_SOC15(NBIO, 0, regBIF_BX0_BIF_DOORBELL_INT_CNTL, bif_doorbell_int_cntl);
++		amdgpu_ras_global_ras_isr(adev);
++	}
++}
++
++static int nbif_v6_3_1_init_ras_err_event_athub_interrupt(struct amdgpu_device *adev)
++{
++	int r;
++
++	/* init the irq funcs */
++	adev->nbio.ras_err_event_athub_irq.funcs =
++		&nbif_v6_3_1_ras_err_event_athub_irq_funcs;
++	adev->nbio.ras_err_event_athub_irq.num_types = 1;
++
++	/* register ras err event athub interrupt
++	 * nbif v6_3_1 uses the same irq source as nbio v7_4
++	 */
++	r = amdgpu_irq_add_id(adev, SOC21_IH_CLIENTID_BIF,
++			      NBIF_7_4__SRCID__ERREVENT_ATHUB_INTERRUPT,
++			      &adev->nbio.ras_err_event_athub_irq);
++
++	return r;
++}
++
++struct amdgpu_nbio_ras nbif_v6_3_1_ras = {
++	.handle_ras_err_event_athub_intr_no_bifring =
++		nbif_v6_3_1_handle_ras_err_event_athub_intr_no_bifring,
++	.init_ras_err_event_athub_interrupt =
++		nbif_v6_3_1_init_ras_err_event_athub_interrupt,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.h b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.h
+index b7f2e0d88905..9ac4831d39e1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.h
++++ b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.h
+@@ -29,5 +29,6 @@
+ extern const struct nbio_hdp_flush_reg nbif_v6_3_1_hdp_flush_reg;
+ extern const struct amdgpu_nbio_funcs nbif_v6_3_1_funcs;
+ extern const struct amdgpu_nbio_funcs nbif_v6_3_1_sriov_funcs;
++extern struct amdgpu_nbio_ras nbif_v6_3_1_ras;
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc24.c b/drivers/gpu/drm/amd/amdgpu/soc24.c
+index eda03d40d765..6b8e078ee7c7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc24.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc24.c
+@@ -444,8 +444,18 @@ static int soc24_common_late_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+-	if (amdgpu_sriov_vf(adev))
++	if (amdgpu_sriov_vf(adev)) {
+ 		xgpu_nv_mailbox_get_irq(adev);
++	} else {
++		if (adev->nbio.ras &&
++		    adev->nbio.ras_err_event_athub_irq.funcs)
++			/* don't need to fail gpu late init
++			 * if enabling athub_err_event interrupt failed
++			 * nbif v6_3_1 only support fatal error hanlding
++			 * just enable the interrupt directly
++			 */
++			amdgpu_irq_get(adev, &adev->nbio.ras_err_event_athub_irq, 0);
++	}
+ 
+ 	/* Enable selfring doorbell aperture late because doorbell BAR
+ 	 * aperture will change if resize BAR successfully in gmc sw_init.
+@@ -501,8 +511,13 @@ static int soc24_common_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	adev->nbio.funcs->enable_doorbell_aperture(adev, false);
+ 	adev->nbio.funcs->enable_doorbell_selfring_aperture(adev, false);
+ 
+-	if (amdgpu_sriov_vf(adev))
++	if (amdgpu_sriov_vf(adev)) {
+ 		xgpu_nv_mailbox_put_irq(adev);
++	} else {
++		if (adev->nbio.ras &&
++		    adev->nbio.ras_err_event_athub_irq.funcs)
++			amdgpu_irq_put(adev, &adev->nbio.ras_err_event_athub_irq, 0);
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.25.1
+

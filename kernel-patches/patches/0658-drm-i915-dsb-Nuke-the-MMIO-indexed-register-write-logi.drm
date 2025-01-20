@@ -1,0 +1,113 @@
+From 7919a6719bda28ec78f94e7a786825c0c8bf7153 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 20 Nov 2024 18:41:22 +0200
+Subject: [PATCH 658/708] drm/i915/dsb: Nuke the MMIO->indexed register write
+ logic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We've determined that indexed DSB writes are only faster
+than MMIO writes when writing the same register ~5 or more
+times. That seems very unlikely to happen in any other case
+than when using indexed LUT registers. Simplify the code
+by removing the MMIO->indexed write conversion logic and
+just emit the instruction as an indexed write from the get go.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241120164123.12706-4-ville.syrjala@linux.intel.com
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_dsb.c | 58 ++++++------------------
+ 1 file changed, 14 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 4d3785f5cb52..e6f8fc743fb4 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -256,15 +256,6 @@ static bool intel_dsb_prev_ins_is_write(struct intel_dsb *dsb,
+ 	return prev_opcode == opcode && prev_reg == i915_mmio_reg_offset(reg);
+ }
+ 
+-static bool intel_dsb_prev_ins_is_mmio_write(struct intel_dsb *dsb, i915_reg_t reg)
+-{
+-	/* only full byte-enables can be converted to indexed writes */
+-	return intel_dsb_prev_ins_is_write(dsb,
+-					   DSB_OPCODE_MMIO_WRITE << DSB_OPCODE_SHIFT |
+-					   DSB_BYTE_EN << DSB_BYTE_EN_SHIFT,
+-					   reg);
+-}
+-
+ static bool intel_dsb_prev_ins_is_indexed_write(struct intel_dsb *dsb, i915_reg_t reg)
+ {
+ 	return intel_dsb_prev_ins_is_write(dsb,
+@@ -273,7 +264,7 @@ static bool intel_dsb_prev_ins_is_indexed_write(struct intel_dsb *dsb, i915_reg_
+ }
+ 
+ /**
+- * intel_dsb_reg_write_indexed() - Emit register wriite to the DSB context
++ * intel_dsb_reg_write_indexed() - Emit indexed register write to the DSB context
+  * @dsb: DSB context
+  * @reg: register address.
+  * @val: value.
+@@ -304,44 +295,23 @@ void intel_dsb_reg_write_indexed(struct intel_dsb *dsb,
+ 	 * we are writing odd no of dwords, Zeros will be added in the end for
+ 	 * padding.
+ 	 */
+-	if (!intel_dsb_prev_ins_is_mmio_write(dsb, reg) &&
+-	    !intel_dsb_prev_ins_is_indexed_write(dsb, reg)) {
+-		intel_dsb_emit(dsb, val,
+-			       (DSB_OPCODE_MMIO_WRITE << DSB_OPCODE_SHIFT) |
+-			       (DSB_BYTE_EN << DSB_BYTE_EN_SHIFT) |
++	if (!intel_dsb_prev_ins_is_indexed_write(dsb, reg))
++		intel_dsb_emit(dsb, 0, /* count */
++			       (DSB_OPCODE_INDEXED_WRITE << DSB_OPCODE_SHIFT) |
+ 			       i915_mmio_reg_offset(reg));
+-	} else {
+-		if (!assert_dsb_has_room(dsb))
+-			return;
+-
+-		/* convert to indexed write? */
+-		if (intel_dsb_prev_ins_is_mmio_write(dsb, reg)) {
+-			u32 prev_val = dsb->ins[0];
+ 
+-			dsb->ins[0] = 1; /* count */
+-			dsb->ins[1] = (DSB_OPCODE_INDEXED_WRITE << DSB_OPCODE_SHIFT) |
+-				i915_mmio_reg_offset(reg);
+-
+-			intel_dsb_buffer_write(&dsb->dsb_buf, dsb->ins_start_offset + 0,
+-					       dsb->ins[0]);
+-			intel_dsb_buffer_write(&dsb->dsb_buf, dsb->ins_start_offset + 1,
+-					       dsb->ins[1]);
+-			intel_dsb_buffer_write(&dsb->dsb_buf, dsb->ins_start_offset + 2,
+-					       prev_val);
+-
+-			dsb->free_pos++;
+-		}
++	if (!assert_dsb_has_room(dsb))
++		return;
+ 
+-		intel_dsb_buffer_write(&dsb->dsb_buf, dsb->free_pos++, val);
+-		/* Update the count */
+-		dsb->ins[0]++;
+-		intel_dsb_buffer_write(&dsb->dsb_buf, dsb->ins_start_offset + 0,
+-				       dsb->ins[0]);
++	/* Update the count */
++	dsb->ins[0]++;
++	intel_dsb_buffer_write(&dsb->dsb_buf, dsb->ins_start_offset + 0,
++			       dsb->ins[0]);
+ 
+-		/* if number of data words is odd, then the last dword should be 0.*/
+-		if (dsb->free_pos & 0x1)
+-			intel_dsb_buffer_write(&dsb->dsb_buf, dsb->free_pos, 0);
+-	}
++	intel_dsb_buffer_write(&dsb->dsb_buf, dsb->free_pos++, val);
++	/* if number of data words is odd, then the last dword should be 0.*/
++	if (dsb->free_pos & 0x1)
++		intel_dsb_buffer_write(&dsb->dsb_buf, dsb->free_pos, 0);
+ }
+ 
+ void intel_dsb_reg_write(struct intel_dsb *dsb,
+-- 
+2.25.1
+

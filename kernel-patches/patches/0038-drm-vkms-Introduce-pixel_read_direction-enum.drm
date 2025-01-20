@@ -1,0 +1,148 @@
+From a1ed5e808578e686447647266d6a8daae85e0160 Mon Sep 17 00:00:00 2001
+From: Louis Chauvet <louis.chauvet@bootlin.com>
+Date: Mon, 18 Nov 2024 19:28:22 +0100
+Subject: [PATCH 038/708] drm/vkms: Introduce pixel_read_direction enum
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The pixel_read_direction enum is useful to describe the reading direction
+in a plane. It avoids using the rotation property of DRM, which not
+practical to know the direction of reading.
+This patch also introduce two helpers, one to compute the
+pixel_read_direction from the DRM rotation property, and one to compute
+the step, in byte, between two successive pixel in a specific direction.
+
+Acked-by: Maíra Canal <mairacanal@riseup.net>
+Reviewed-by: José Expósito <jose.exposito89@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241118-yuv-v14-7-2dbc2f1e222c@bootlin.com
+Signed-off-by: Louis Chauvet <louis.chauvet@bootlin.com>
+---
+ drivers/gpu/drm/vkms/vkms_composer.c | 44 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_drv.h      | 11 +++++++
+ drivers/gpu/drm/vkms/vkms_formats.c  | 32 ++++++++++++++++++++
+ 3 files changed, 87 insertions(+)
+
+diff --git a/drivers/gpu/drm/vkms/vkms_composer.c b/drivers/gpu/drm/vkms/vkms_composer.c
+index e406ab4b14fd..c2181afa4121 100644
+--- a/drivers/gpu/drm/vkms/vkms_composer.c
++++ b/drivers/gpu/drm/vkms/vkms_composer.c
+@@ -159,6 +159,50 @@ static void apply_lut(const struct vkms_crtc_state *crtc_state, struct line_buff
+ 	}
+ }
+ 
++/**
++ * direction_for_rotation() - Get the correct reading direction for a given rotation
++ *
++ * @rotation: Rotation to analyze. It correspond the field @frame_info.rotation.
++ *
++ * This function will use the @rotation setting of a source plane to compute the reading
++ * direction in this plane which correspond to a "left to right writing" in the CRTC.
++ * For example, if the buffer is reflected on X axis, the pixel must be read from right to left
++ * to be written from left to right on the CRTC.
++ */
++static enum pixel_read_direction direction_for_rotation(unsigned int rotation)
++{
++	struct drm_rect tmp_a, tmp_b;
++	int x, y;
++
++	/*
++	 * Points A and B are depicted as zero-size rectangles on the CRTC.
++	 * The CRTC writing direction is from A to B. The plane reading direction
++	 * is discovered by inverse-transforming A and B.
++	 * The reading direction is computed by rotating the vector AB (top-left to top-right) in a
++	 * 1x1 square.
++	 */
++
++	tmp_a = DRM_RECT_INIT(0, 0, 0, 0);
++	tmp_b = DRM_RECT_INIT(1, 0, 0, 0);
++	drm_rect_rotate_inv(&tmp_a, 1, 1, rotation);
++	drm_rect_rotate_inv(&tmp_b, 1, 1, rotation);
++
++	x = tmp_b.x1 - tmp_a.x1;
++	y = tmp_b.y1 - tmp_a.y1;
++
++	if (x == 1 && y == 0)
++		return READ_LEFT_TO_RIGHT;
++	else if (x == -1 && y == 0)
++		return READ_RIGHT_TO_LEFT;
++	else if (y == 1 && x == 0)
++		return READ_TOP_TO_BOTTOM;
++	else if (y == -1 && x == 0)
++		return READ_BOTTOM_TO_TOP;
++
++	WARN_ONCE(true, "The inverse of the rotation gives an incorrect direction.");
++	return READ_LEFT_TO_RIGHT;
++}
++
+ /**
+  * blend - blend the pixels from all planes and compute crc
+  * @wb: The writeback frame buffer metadata
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 86af4606c1ee..272d7215071b 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -69,6 +69,17 @@ struct vkms_writeback_job {
+ 	pixel_write_t pixel_write;
+ };
+ 
++/**
++ * enum pixel_read_direction - Enum used internally by VKMS to represent a reading direction in a
++ * plane.
++ */
++enum pixel_read_direction {
++	READ_BOTTOM_TO_TOP,
++	READ_TOP_TO_BOTTOM,
++	READ_RIGHT_TO_LEFT,
++	READ_LEFT_TO_RIGHT
++};
++
+ /**
+  * typedef pixel_read_t - These functions are used to read a pixel in the source frame,
+  * convert it to `struct pixel_argb_u16` and write it to @out_pixel.
+diff --git a/drivers/gpu/drm/vkms/vkms_formats.c b/drivers/gpu/drm/vkms/vkms_formats.c
+index f9045a80aceb..5dad7bcec0a6 100644
+--- a/drivers/gpu/drm/vkms/vkms_formats.c
++++ b/drivers/gpu/drm/vkms/vkms_formats.c
+@@ -79,6 +79,38 @@ static void packed_pixels_addr(const struct vkms_frame_info *frame_info,
+ 	*addr = (u8 *)frame_info->map[0].vaddr + offset;
+ }
+ 
++/**
++ * get_block_step_bytes() - Common helper to compute the correct step value between each pixel block
++ * to read in a certain direction.
++ *
++ * @fb: Framebuffer to iter on
++ * @direction: Direction of the reading
++ * @plane_index: Plane to get the step from
++ *
++ * As the returned count is the number of bytes between two consecutive blocks in a direction,
++ * the caller may have to read multiple pixels before using the next one (for example, to read from
++ * left to right in a DRM_FORMAT_R1 plane, each block contains 8 pixels, so the step must be used
++ * only every 8 pixels).
++ */
++static int get_block_step_bytes(struct drm_framebuffer *fb, enum pixel_read_direction direction,
++				int plane_index)
++{
++	switch (direction) {
++	case READ_LEFT_TO_RIGHT:
++		return fb->format->char_per_block[plane_index];
++	case READ_RIGHT_TO_LEFT:
++		return -fb->format->char_per_block[plane_index];
++	case READ_TOP_TO_BOTTOM:
++		return (int)fb->pitches[plane_index] * drm_format_info_block_width(fb->format,
++										   plane_index);
++	case READ_BOTTOM_TO_TOP:
++		return -(int)fb->pitches[plane_index] * drm_format_info_block_width(fb->format,
++										    plane_index);
++	}
++
++	return 0;
++}
++
+ /**
+  * packed_pixels_addr_1x1() - Get the pointer to the block containing the pixel at the given
+  * coordinates
+-- 
+2.25.1
+

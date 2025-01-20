@@ -1,0 +1,220 @@
+From f3728b432e59dffb2cce3e5aee1e24511d0938de Mon Sep 17 00:00:00 2001
+From: Gustavo Sousa <gustavo.sousa@intel.com>
+Date: Fri, 8 Nov 2024 09:57:16 -0300
+Subject: [PATCH 571/708] drm/i915/dmc_wl: Deal with existing references when
+ disabling
+
+It is possible that there are active wakelock references at the time we
+are disabling the DMC wakelock mechanism. We need to deal with that in
+two ways:
+
+(A) Implement the missing step from Bspec:
+
+    The Bspec instructs us to clear any existing wakelock request bit
+    after disabling the mechanism. That gives a clue that it is okay to
+    disable while there are locks held and we do not need to wait for
+    them. However, since the spec is not explicit about it, we need
+    still to get confirmation with the hardware team. Let's thus
+    implement the spec and add a TODO note.
+
+(B) Ensure a consistent driver state:
+
+    The enable/disable logic would be problematic if the following
+    sequence of events would happen:
+
+    1. Function A calls intel_dmc_wl_get();
+    2. Some function calls intel_dmc_wl_disable();
+    3. Some function calls intel_dmc_wl_enable();
+    4. Function A is done and calls intel_dmc_wl_put().
+
+    At (2), the refcount becomes zero and then (4) causes an invalid
+    decrement to the refcount. That would cause some issues:
+
+        - At the time between (3) and (4), function A would think that
+          the hardware lock is held but it could not be really held
+          until intel_dmc_wl_get() is called by something else.
+        - The call made to (4) could cause the refcount to become zero
+          and consequently the hardware lock to be released while there
+          could be innocent paths trusting they still have the lock.
+
+    To fix that, we need to keep the refcount correctly in sync with
+    intel_dmc_wl_{get,put}() calls and retake the hardware lock when
+    enabling the DMC wakelock with a non-zero refcount.
+
+    One missing piece left to be handled here is the following scenario:
+
+    1. Function A calls intel_dmc_wl_get();
+    2. Some function calls intel_dmc_wl_disable();
+    3. Some function calls intel_dmc_wl_enable();
+    4. Concurrently with (3), function A performs the MMIO in between
+       setting DMC_WAKELOCK_CFG_ENABLE and asserting the lock with
+       __intel_dmc_wl_take().
+
+    I'm mostly sure this would cause issues future display IPs if DMC
+    trap implementation was completely removed. We need to check with
+    the hardware team whether it would be safe to assert the hardware
+    lock before setting DMC_WAKELOCK_CFG_ENABLE to avoid this scenario.
+    If not, then we would have to deal with that via software
+    synchronization.
+
+Reviewed-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Gustavo Sousa <gustavo.sousa@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241108130218.24125-12-gustavo.sousa@intel.com
+---
+ drivers/gpu/drm/i915/display/intel_dmc_wl.c | 97 ++++++++++++++-------
+ 1 file changed, 67 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc_wl.c b/drivers/gpu/drm/i915/display/intel_dmc_wl.c
+index 4a182a049374..b8887216a684 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc_wl.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc_wl.c
+@@ -181,6 +181,37 @@ static void intel_dmc_wl_work(struct work_struct *work)
+ 	spin_unlock_irqrestore(&wl->lock, flags);
+ }
+ 
++static void __intel_dmc_wl_take(struct intel_display *display)
++{
++	struct intel_dmc_wl *wl = &display->wl;
++
++	/*
++	 * Only try to take the wakelock if it's not marked as taken
++	 * yet.  It may be already taken at this point if we have
++	 * already released the last reference, but the work has not
++	 * run yet.
++	 */
++	if (wl->taken)
++		return;
++
++	__intel_de_rmw_nowl(display, DMC_WAKELOCK1_CTL, 0,
++			    DMC_WAKELOCK_CTL_REQ);
++
++	/*
++	 * We need to use the atomic variant of the waiting routine
++	 * because the DMC wakelock is also taken in atomic context.
++	 */
++	if (__intel_de_wait_for_register_atomic_nowl(display, DMC_WAKELOCK1_CTL,
++						     DMC_WAKELOCK_CTL_ACK,
++						     DMC_WAKELOCK_CTL_ACK,
++						     DMC_WAKELOCK_CTL_TIMEOUT_US)) {
++		WARN_RATELIMIT(1, "DMC wakelock ack timed out");
++		return;
++	}
++
++	wl->taken = true;
++}
++
+ static bool intel_dmc_wl_reg_in_range(i915_reg_t reg,
+ 				      const struct intel_dmc_wl_range ranges[])
+ {
+@@ -275,7 +306,23 @@ void intel_dmc_wl_enable(struct intel_display *display, u32 dc_state)
+ 	__intel_de_rmw_nowl(display, DMC_WAKELOCK_CFG, 0, DMC_WAKELOCK_CFG_ENABLE);
+ 
+ 	wl->enabled = true;
+-	wl->taken = false;
++
++	/*
++	 * This would be racy in the following scenario:
++	 *
++	 *   1. Function A calls intel_dmc_wl_get();
++	 *   2. Some function calls intel_dmc_wl_disable();
++	 *   3. Some function calls intel_dmc_wl_enable();
++	 *   4. Concurrently with (3), function A performs the MMIO in between
++	 *      setting DMC_WAKELOCK_CFG_ENABLE and asserting the lock with
++	 *      __intel_dmc_wl_take().
++	 *
++	 * TODO: Check with the hardware team whether it is safe to assert the
++	 * hardware lock before enabling to avoid such a scenario. Otherwise, we
++	 * would need to deal with it via software synchronization.
++	 */
++	if (refcount_read(&wl->refcount))
++		__intel_dmc_wl_take(display);
+ 
+ out_unlock:
+ 	spin_unlock_irqrestore(&wl->lock, flags);
+@@ -299,8 +346,18 @@ void intel_dmc_wl_disable(struct intel_display *display)
+ 	/* Disable wakelock in DMC */
+ 	__intel_de_rmw_nowl(display, DMC_WAKELOCK_CFG, DMC_WAKELOCK_CFG_ENABLE, 0);
+ 
+-	refcount_set(&wl->refcount, 0);
+ 	wl->enabled = false;
++
++	/*
++	 * The spec is not explicit about the expectation of existing
++	 * lock users at the moment of disabling, but it does say that we must
++	 * clear DMC_WAKELOCK_CTL_REQ, which gives us a clue that it is okay to
++	 * disable with existing lock users.
++	 *
++	 * TODO: Get the correct expectation from the hardware team.
++	 */
++	__intel_de_rmw_nowl(display, DMC_WAKELOCK1_CTL, DMC_WAKELOCK_CTL_REQ, 0);
++
+ 	wl->taken = false;
+ 
+ out_unlock:
+@@ -320,8 +377,11 @@ void intel_dmc_wl_get(struct intel_display *display, i915_reg_t reg)
+ 	if (i915_mmio_reg_valid(reg) && !intel_dmc_wl_check_range(reg, wl->dc_state))
+ 		goto out_unlock;
+ 
+-	if (!wl->enabled)
++	if (!wl->enabled) {
++		if (!refcount_inc_not_zero(&wl->refcount))
++			refcount_set(&wl->refcount, 1);
+ 		goto out_unlock;
++	}
+ 
+ 	cancel_delayed_work(&wl->work);
+ 
+@@ -330,30 +390,7 @@ void intel_dmc_wl_get(struct intel_display *display, i915_reg_t reg)
+ 
+ 	refcount_set(&wl->refcount, 1);
+ 
+-	/*
+-	 * Only try to take the wakelock if it's not marked as taken
+-	 * yet.  It may be already taken at this point if we have
+-	 * already released the last reference, but the work has not
+-	 * run yet.
+-	 */
+-	if (!wl->taken) {
+-		__intel_de_rmw_nowl(display, DMC_WAKELOCK1_CTL, 0,
+-				    DMC_WAKELOCK_CTL_REQ);
+-
+-		/*
+-		 * We need to use the atomic variant of the waiting routine
+-		 * because the DMC wakelock is also taken in atomic context.
+-		 */
+-		if (__intel_de_wait_for_register_atomic_nowl(display, DMC_WAKELOCK1_CTL,
+-							     DMC_WAKELOCK_CTL_ACK,
+-							     DMC_WAKELOCK_CTL_ACK,
+-							     DMC_WAKELOCK_CTL_TIMEOUT_US)) {
+-			WARN_RATELIMIT(1, "DMC wakelock ack timed out");
+-			goto out_unlock;
+-		}
+-
+-		wl->taken = true;
+-	}
++	__intel_dmc_wl_take(display);
+ 
+ out_unlock:
+ 	spin_unlock_irqrestore(&wl->lock, flags);
+@@ -372,14 +409,14 @@ void intel_dmc_wl_put(struct intel_display *display, i915_reg_t reg)
+ 	if (i915_mmio_reg_valid(reg) && !intel_dmc_wl_check_range(reg, wl->dc_state))
+ 		goto out_unlock;
+ 
+-	if (!wl->enabled)
+-		goto out_unlock;
+-
+ 	if (WARN_RATELIMIT(!refcount_read(&wl->refcount),
+ 			   "Tried to put wakelock with refcount zero\n"))
+ 		goto out_unlock;
+ 
+ 	if (refcount_dec_and_test(&wl->refcount)) {
++		if (!wl->enabled)
++			goto out_unlock;
++
+ 		__intel_dmc_wl_release(display);
+ 
+ 		goto out_unlock;
+-- 
+2.25.1
+

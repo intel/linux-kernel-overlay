@@ -1,0 +1,172 @@
+From 2575e85a4ab1caccad1fd3bbf85b10bfd60eaabd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 27 Nov 2024 08:11:16 +0200
+Subject: [PATCH 656/708] drm/i915/dpt: Evict all DPT VMAs on suspend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently intel_dpt_resume() tries to blindly rewrite all the
+PTEs for currently bound DPT VMAs. That is problematic because
+the CPU mapping for the DPT is only really guaranteed to exist
+while the DPT object has been pinned. In the past we worked
+around this issue by making DPT objects unshrinkable, but that
+is undesirable as it'll waste physical RAM.
+
+Let's instead forcefully evict all the DPT VMAs on suspend,
+thus guaranteeing that intel_dpt_resume() has nothing to do.
+To guarantee that all the DPT VMAs are evictable by
+intel_dpt_suspend() we need to flush the cleanup workqueue
+after the display output has been shut down.
+
+And for good measure throw in a few extra WARNs to catch
+any mistakes.
+
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Vidya Srinivas <vidya.srinivas@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241127061117.25622-4-ville.syrjala@linux.intel.com
+Reviewed-by: Vidya Srinivas <vidya.srinivas@intel.com>
+Tested-by: Vidya Srinivas <vidya.srinivas@intel.com>
+---
+ .../drm/i915/display/intel_display_driver.c   |  3 +++
+ drivers/gpu/drm/i915/display/intel_dpt.c      |  4 ++--
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          | 19 ++++++++++++++-----
+ drivers/gpu/drm/i915/gt/intel_gtt.h           |  4 ++--
+ 4 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+index 286d6f893afa..973bee43b554 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -680,6 +680,9 @@ int intel_display_driver_suspend(struct drm_i915_private *i915)
+ 	else
+ 		i915->display.restore.modeset_state = state;
+ 
++	/* ensure all DPT VMAs have been unpinned for intel_dpt_suspend() */
++	flush_workqueue(i915->display.wq.cleanup);
++
+ 	intel_dp_mst_suspend(i915);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/display/intel_dpt.c b/drivers/gpu/drm/i915/display/intel_dpt.c
+index ce8c76e44e6a..8b1f0e92a11c 100644
+--- a/drivers/gpu/drm/i915/display/intel_dpt.c
++++ b/drivers/gpu/drm/i915/display/intel_dpt.c
+@@ -205,7 +205,7 @@ void intel_dpt_resume(struct drm_i915_private *i915)
+ 		struct intel_framebuffer *fb = to_intel_framebuffer(drm_fb);
+ 
+ 		if (fb->dpt_vm)
+-			i915_ggtt_resume_vm(fb->dpt_vm);
++			i915_ggtt_resume_vm(fb->dpt_vm, true);
+ 	}
+ 	mutex_unlock(&i915->drm.mode_config.fb_lock);
+ }
+@@ -233,7 +233,7 @@ void intel_dpt_suspend(struct drm_i915_private *i915)
+ 		struct intel_framebuffer *fb = to_intel_framebuffer(drm_fb);
+ 
+ 		if (fb->dpt_vm)
+-			i915_ggtt_suspend_vm(fb->dpt_vm);
++			i915_ggtt_suspend_vm(fb->dpt_vm, true);
+ 	}
+ 
+ 	mutex_unlock(&i915->drm.mode_config.fb_lock);
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index d60a6ca0cae5..f6c59f20832f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -107,11 +107,12 @@ int i915_ggtt_init_hw(struct drm_i915_private *i915)
+ /**
+  * i915_ggtt_suspend_vm - Suspend the memory mappings for a GGTT or DPT VM
+  * @vm: The VM to suspend the mappings for
++ * @evict_all: Evict all VMAs
+  *
+  * Suspend the memory mappings for all objects mapped to HW via the GGTT or a
+  * DPT page table.
+  */
+-void i915_ggtt_suspend_vm(struct i915_address_space *vm)
++void i915_ggtt_suspend_vm(struct i915_address_space *vm, bool evict_all)
+ {
+ 	struct i915_vma *vma, *vn;
+ 	int save_skip_rewrite;
+@@ -157,7 +158,7 @@ void i915_ggtt_suspend_vm(struct i915_address_space *vm)
+ 			goto retry;
+ 		}
+ 
+-		if (!i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND)) {
++		if (evict_all || !i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND)) {
+ 			i915_vma_wait_for_bind(vma);
+ 
+ 			__i915_vma_evict(vma, false);
+@@ -172,13 +173,15 @@ void i915_ggtt_suspend_vm(struct i915_address_space *vm)
+ 	vm->skip_pte_rewrite = save_skip_rewrite;
+ 
+ 	mutex_unlock(&vm->mutex);
++
++	drm_WARN_ON(&vm->i915->drm, evict_all && !list_empty(&vm->bound_list));
+ }
+ 
+ void i915_ggtt_suspend(struct i915_ggtt *ggtt)
+ {
+ 	struct intel_gt *gt;
+ 
+-	i915_ggtt_suspend_vm(&ggtt->vm);
++	i915_ggtt_suspend_vm(&ggtt->vm, false);
+ 	ggtt->invalidate(ggtt);
+ 
+ 	list_for_each_entry(gt, &ggtt->gt_list, ggtt_link)
+@@ -1545,6 +1548,7 @@ int i915_ggtt_enable_hw(struct drm_i915_private *i915)
+ /**
+  * i915_ggtt_resume_vm - Restore the memory mappings for a GGTT or DPT VM
+  * @vm: The VM to restore the mappings for
++ * @all_evicted: Were all VMAs expected to be evicted on suspend?
+  *
+  * Restore the memory mappings for all objects mapped to HW via the GGTT or a
+  * DPT page table.
+@@ -1552,13 +1556,18 @@ int i915_ggtt_enable_hw(struct drm_i915_private *i915)
+  * Returns %true if restoring the mapping for any object that was in a write
+  * domain before suspend.
+  */
+-bool i915_ggtt_resume_vm(struct i915_address_space *vm)
++bool i915_ggtt_resume_vm(struct i915_address_space *vm, bool all_evicted)
+ {
+ 	struct i915_vma *vma;
+ 	bool write_domain_objs = false;
+ 
+ 	drm_WARN_ON(&vm->i915->drm, !vm->is_ggtt && !vm->is_dpt);
+ 
++	if (all_evicted) {
++		drm_WARN_ON(&vm->i915->drm, !list_empty(&vm->bound_list));
++		return false;
++	}
++
+ 	/* First fill our portion of the GTT with scratch pages */
+ 	vm->clear_range(vm, 0, vm->total);
+ 
+@@ -1598,7 +1607,7 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt)
+ 	list_for_each_entry(gt, &ggtt->gt_list, ggtt_link)
+ 		intel_gt_check_and_clear_faults(gt);
+ 
+-	flush = i915_ggtt_resume_vm(&ggtt->vm);
++	flush = i915_ggtt_resume_vm(&ggtt->vm, false);
+ 
+ 	if (drm_mm_node_allocated(&ggtt->error_capture))
+ 		ggtt->vm.scratch_range(&ggtt->vm, ggtt->error_capture.start,
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index 6b85222ee3ea..0a36ea751b63 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -608,8 +608,8 @@ int i915_ppgtt_init_hw(struct intel_gt *gt);
+ struct i915_ppgtt *i915_ppgtt_create(struct intel_gt *gt,
+ 				     unsigned long lmem_pt_obj_flags);
+ 
+-void i915_ggtt_suspend_vm(struct i915_address_space *vm);
+-bool i915_ggtt_resume_vm(struct i915_address_space *vm);
++void i915_ggtt_suspend_vm(struct i915_address_space *vm, bool evict_all);
++bool i915_ggtt_resume_vm(struct i915_address_space *vm, bool all_evicted);
+ void i915_ggtt_suspend(struct i915_ggtt *gtt);
+ void i915_ggtt_resume(struct i915_ggtt *ggtt);
+ 
+-- 
+2.25.1
+

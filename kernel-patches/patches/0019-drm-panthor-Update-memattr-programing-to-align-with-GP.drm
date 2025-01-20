@@ -1,0 +1,94 @@
+From f12c43419870c5d95e72c60d74b73852a065ecf6 Mon Sep 17 00:00:00 2001
+From: Akash Goel <akash.goel@arm.com>
+Date: Wed, 30 Oct 2024 22:54:05 +0000
+Subject: [PATCH 019/708] drm/panthor: Update memattr programing to align with
+ GPU spec
+
+Mali GPU Arch spec forbids the GPU PTEs to indicate Inner or Outer
+shareability when no_coherency protocol is selected. Doing so results in
+unexpected or undesired snooping of the CPU caches on some platforms,
+such as Juno FPGA, causing functional issues. For example the boot of
+MCU firmware fails as GPU ends up reading stale data for the FW memory
+pages from the CPU's cache. The FW memory pages are initialized with
+uncached mapping when the device is not reported to be dma-coherent.
+The shareability bits are set to inner-shareable when IOMMU_CACHE flag
+is passed to map_pages() callback and IOMMU_CACHE flag is passed by
+Panthor driver when memory needs to be mapped as cached on the GPU side.
+
+IOMMU_CACHE seems to imply cache coherent and is probably not fit for
+purpose for the memory that is mapped as cached on GPU side but doesn't
+need to remain coherent with the CPU.
+
+This commit updates the programming of MEMATTR register to use
+MIDGARD_INNER instead of CPU_INNER when coherency is disabled. That way
+the inner-shareability specified in the GPU PTEs would map to Mali's
+internal-shareable mode, which is always supported by the GPU regardless
+of the coherency protocal and is required by the Userspace driver to
+ensure coherency between the shader cores.
+
+v2:
+- Added R-b tags
+
+Signed-off-by: Akash Goel <akash.goel@arm.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Liviu Dudau <liviu.dudau@arm.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Link: https://lore.kernel.org/r/20241030225407.4077513-2-akash.goel@arm.com
+Signed-off-by: Liviu Dudau <liviu.dudau@arm.com>
+---
+ drivers/gpu/drm/panthor/panthor_mmu.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_mmu.c b/drivers/gpu/drm/panthor/panthor_mmu.c
+index a49132f3778b..c3f0b0225cf9 100644
+--- a/drivers/gpu/drm/panthor/panthor_mmu.c
++++ b/drivers/gpu/drm/panthor/panthor_mmu.c
+@@ -1941,7 +1941,7 @@ struct panthor_heap_pool *panthor_vm_get_heap_pool(struct panthor_vm *vm, bool c
+ 	return pool;
+ }
+ 
+-static u64 mair_to_memattr(u64 mair)
++static u64 mair_to_memattr(u64 mair, bool coherent)
+ {
+ 	u64 memattr = 0;
+ 	u32 i;
+@@ -1960,14 +1960,21 @@ static u64 mair_to_memattr(u64 mair)
+ 				   AS_MEMATTR_AARCH64_SH_MIDGARD_INNER |
+ 				   AS_MEMATTR_AARCH64_INNER_ALLOC_EXPL(false, false);
+ 		} else {
+-			/* Use SH_CPU_INNER mode so SH_IS, which is used when
+-			 * IOMMU_CACHE is set, actually maps to the standard
+-			 * definition of inner-shareable and not Mali's
+-			 * internal-shareable mode.
+-			 */
+ 			out_attr = AS_MEMATTR_AARCH64_INNER_OUTER_WB |
+-				   AS_MEMATTR_AARCH64_SH_CPU_INNER |
+ 				   AS_MEMATTR_AARCH64_INNER_ALLOC_EXPL(inner & 1, inner & 2);
++			/* Use SH_MIDGARD_INNER mode when device isn't coherent,
++			 * so SH_IS, which is used when IOMMU_CACHE is set, maps
++			 * to Mali's internal-shareable mode. As per the Mali
++			 * Spec, inner and outer-shareable modes aren't allowed
++			 * for WB memory when coherency is disabled.
++			 * Use SH_CPU_INNER mode when coherency is enabled, so
++			 * that SH_IS actually maps to the standard definition of
++			 * inner-shareable.
++			 */
++			if (!coherent)
++				out_attr |= AS_MEMATTR_AARCH64_SH_MIDGARD_INNER;
++			else
++				out_attr |= AS_MEMATTR_AARCH64_SH_CPU_INNER;
+ 		}
+ 
+ 		memattr |= (u64)out_attr << (8 * i);
+@@ -2339,7 +2346,7 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
+ 		goto err_sched_fini;
+ 
+ 	mair = io_pgtable_ops_to_pgtable(vm->pgtbl_ops)->cfg.arm_lpae_s1_cfg.mair;
+-	vm->memattr = mair_to_memattr(mair);
++	vm->memattr = mair_to_memattr(mair, ptdev->coherent);
+ 
+ 	mutex_lock(&ptdev->mmu->vm.lock);
+ 	list_add_tail(&vm->node, &ptdev->mmu->vm.list);
+-- 
+2.25.1
+

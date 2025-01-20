@@ -1,0 +1,609 @@
+From 6f429e7526d5490f6d786d2b98eb60539ff5ba81 Mon Sep 17 00:00:00 2001
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Mon, 18 Nov 2024 09:29:42 -0800
+Subject: [PATCH 051/708] accel/amdxdna: Add query functions
+
+Add GET_INFO ioctl to retrieve hardware information, including
+AIE, clock, hardware context etc.
+
+Co-developed-by: Min Ma <min.ma@amd.com>
+Signed-off-by: Min Ma <min.ma@amd.com>
+Reviewed-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Signed-off-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241118172942.2014541-11-lizhi.hou@amd.com
+---
+ drivers/accel/amdxdna/aie2_message.c    |  65 +++++++
+ drivers/accel/amdxdna/aie2_pci.c        | 222 ++++++++++++++++++++++++
+ drivers/accel/amdxdna/aie2_pci.h        |   1 +
+ drivers/accel/amdxdna/amdxdna_pci_drv.c |  19 ++
+ drivers/accel/amdxdna/amdxdna_pci_drv.h |   3 +
+ include/uapi/drm/amdxdna_accel.h        | 166 ++++++++++++++++++
+ 6 files changed, 476 insertions(+)
+
+diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
+index eb7e27045213..c01a1d957b56 100644
+--- a/drivers/accel/amdxdna/aie2_message.c
++++ b/drivers/accel/amdxdna/aie2_message.c
+@@ -308,6 +308,71 @@ int aie2_map_host_buf(struct amdxdna_dev_hdl *ndev, u32 context_id, u64 addr, u6
+ 	return 0;
+ }
+ 
++int aie2_query_status(struct amdxdna_dev_hdl *ndev, char __user *buf,
++		      u32 size, u32 *cols_filled)
++{
++	DECLARE_AIE2_MSG(aie_column_info, MSG_OP_QUERY_COL_STATUS);
++	struct amdxdna_dev *xdna = ndev->xdna;
++	struct amdxdna_client *client;
++	struct amdxdna_hwctx *hwctx;
++	dma_addr_t dma_addr;
++	u32 aie_bitmap = 0;
++	u8 *buff_addr;
++	int next = 0;
++	int ret, idx;
++
++	buff_addr = dma_alloc_noncoherent(xdna->ddev.dev, size, &dma_addr,
++					  DMA_FROM_DEVICE, GFP_KERNEL);
++	if (!buff_addr)
++		return -ENOMEM;
++
++	/* Go through each hardware context and mark the AIE columns that are active */
++	list_for_each_entry(client, &xdna->client_list, node) {
++		idx = srcu_read_lock(&client->hwctx_srcu);
++		idr_for_each_entry_continue(&client->hwctx_idr, hwctx, next)
++			aie_bitmap |= amdxdna_hwctx_col_map(hwctx);
++		srcu_read_unlock(&client->hwctx_srcu, idx);
++	}
++
++	*cols_filled = 0;
++	req.dump_buff_addr = dma_addr;
++	req.dump_buff_size = size;
++	req.num_cols = hweight32(aie_bitmap);
++	req.aie_bitmap = aie_bitmap;
++
++	drm_clflush_virt_range(buff_addr, size); /* device can access */
++	ret = aie2_send_mgmt_msg_wait(ndev, &msg);
++	if (ret) {
++		XDNA_ERR(xdna, "Error during NPU query, status %d", ret);
++		goto fail;
++	}
++
++	if (resp.status != AIE2_STATUS_SUCCESS) {
++		XDNA_ERR(xdna, "Query NPU status failed, status 0x%x", resp.status);
++		ret = -EINVAL;
++		goto fail;
++	}
++	XDNA_DBG(xdna, "Query NPU status completed");
++
++	if (size < resp.size) {
++		ret = -EINVAL;
++		XDNA_ERR(xdna, "Bad buffer size. Available: %u. Needs: %u", size, resp.size);
++		goto fail;
++	}
++
++	if (copy_to_user(buf, buff_addr, resp.size)) {
++		ret = -EFAULT;
++		XDNA_ERR(xdna, "Failed to copy NPU status to user space");
++		goto fail;
++	}
++
++	*cols_filled = aie_bitmap;
++
++fail:
++	dma_free_noncoherent(xdna->ddev.dev, size, buff_addr, dma_addr, DMA_FROM_DEVICE);
++	return ret;
++}
++
+ int aie2_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 size,
+ 				 void *handle, int (*cb)(void*, const u32 *, size_t))
+ {
+diff --git a/drivers/accel/amdxdna/aie2_pci.c b/drivers/accel/amdxdna/aie2_pci.c
+index 5467aabe7308..349ada697e48 100644
+--- a/drivers/accel/amdxdna/aie2_pci.c
++++ b/drivers/accel/amdxdna/aie2_pci.c
+@@ -5,6 +5,7 @@
+ 
+ #include <drm/amdxdna_accel.h>
+ #include <drm/drm_device.h>
++#include <drm/drm_drv.h>
+ #include <drm/drm_gem_shmem_helper.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_print.h>
+@@ -525,11 +526,232 @@ static void aie2_fini(struct amdxdna_dev *xdna)
+ 	pci_free_irq_vectors(pdev);
+ }
+ 
++static int aie2_get_aie_status(struct amdxdna_client *client,
++			       struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_drm_query_aie_status status;
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_dev_hdl *ndev;
++	int ret;
++
++	ndev = xdna->dev_handle;
++	if (copy_from_user(&status, u64_to_user_ptr(args->buffer), sizeof(status))) {
++		XDNA_ERR(xdna, "Failed to copy AIE request into kernel");
++		return -EFAULT;
++	}
++
++	if (ndev->metadata.cols * ndev->metadata.size < status.buffer_size) {
++		XDNA_ERR(xdna, "Invalid buffer size. Given Size: %u. Need Size: %u.",
++			 status.buffer_size, ndev->metadata.cols * ndev->metadata.size);
++		return -EINVAL;
++	}
++
++	ret = aie2_query_status(ndev, u64_to_user_ptr(status.buffer),
++				status.buffer_size, &status.cols_filled);
++	if (ret) {
++		XDNA_ERR(xdna, "Failed to get AIE status info. Ret: %d", ret);
++		return ret;
++	}
++
++	if (copy_to_user(u64_to_user_ptr(args->buffer), &status, sizeof(status))) {
++		XDNA_ERR(xdna, "Failed to copy AIE request info to user space");
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
++static int aie2_get_aie_metadata(struct amdxdna_client *client,
++				 struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_drm_query_aie_metadata *meta;
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_dev_hdl *ndev;
++	int ret = 0;
++
++	ndev = xdna->dev_handle;
++	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
++	if (!meta)
++		return -ENOMEM;
++
++	meta->col_size = ndev->metadata.size;
++	meta->cols = ndev->metadata.cols;
++	meta->rows = ndev->metadata.rows;
++
++	meta->version.major = ndev->metadata.version.major;
++	meta->version.minor = ndev->metadata.version.minor;
++
++	meta->core.row_count = ndev->metadata.core.row_count;
++	meta->core.row_start = ndev->metadata.core.row_start;
++	meta->core.dma_channel_count = ndev->metadata.core.dma_channel_count;
++	meta->core.lock_count = ndev->metadata.core.lock_count;
++	meta->core.event_reg_count = ndev->metadata.core.event_reg_count;
++
++	meta->mem.row_count = ndev->metadata.mem.row_count;
++	meta->mem.row_start = ndev->metadata.mem.row_start;
++	meta->mem.dma_channel_count = ndev->metadata.mem.dma_channel_count;
++	meta->mem.lock_count = ndev->metadata.mem.lock_count;
++	meta->mem.event_reg_count = ndev->metadata.mem.event_reg_count;
++
++	meta->shim.row_count = ndev->metadata.shim.row_count;
++	meta->shim.row_start = ndev->metadata.shim.row_start;
++	meta->shim.dma_channel_count = ndev->metadata.shim.dma_channel_count;
++	meta->shim.lock_count = ndev->metadata.shim.lock_count;
++	meta->shim.event_reg_count = ndev->metadata.shim.event_reg_count;
++
++	if (copy_to_user(u64_to_user_ptr(args->buffer), meta, sizeof(*meta)))
++		ret = -EFAULT;
++
++	kfree(meta);
++	return ret;
++}
++
++static int aie2_get_aie_version(struct amdxdna_client *client,
++				struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_drm_query_aie_version version;
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_dev_hdl *ndev;
++
++	ndev = xdna->dev_handle;
++	version.major = ndev->version.major;
++	version.minor = ndev->version.minor;
++
++	if (copy_to_user(u64_to_user_ptr(args->buffer), &version, sizeof(version)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static int aie2_get_clock_metadata(struct amdxdna_client *client,
++				   struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_drm_query_clock_metadata *clock;
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_dev_hdl *ndev;
++	int ret = 0;
++
++	ndev = xdna->dev_handle;
++	clock = kzalloc(sizeof(*clock), GFP_KERNEL);
++	if (!clock)
++		return -ENOMEM;
++
++	memcpy(clock->mp_npu_clock.name, ndev->mp_npu_clock.name,
++	       sizeof(clock->mp_npu_clock.name));
++	clock->mp_npu_clock.freq_mhz = ndev->mp_npu_clock.freq_mhz;
++	memcpy(clock->h_clock.name, ndev->h_clock.name, sizeof(clock->h_clock.name));
++	clock->h_clock.freq_mhz = ndev->h_clock.freq_mhz;
++
++	if (copy_to_user(u64_to_user_ptr(args->buffer), clock, sizeof(*clock)))
++		ret = -EFAULT;
++
++	kfree(clock);
++	return ret;
++}
++
++static int aie2_get_hwctx_status(struct amdxdna_client *client,
++				 struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_drm_query_hwctx __user *buf;
++	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_drm_query_hwctx *tmp;
++	struct amdxdna_client *tmp_client;
++	struct amdxdna_hwctx *hwctx;
++	bool overflow = false;
++	u32 req_bytes = 0;
++	u32 hw_i = 0;
++	int ret = 0;
++	int next;
++	int idx;
++
++	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
++
++	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
++	buf = u64_to_user_ptr(args->buffer);
++	list_for_each_entry(tmp_client, &xdna->client_list, node) {
++		idx = srcu_read_lock(&tmp_client->hwctx_srcu);
++		next = 0;
++		idr_for_each_entry_continue(&tmp_client->hwctx_idr, hwctx, next) {
++			req_bytes += sizeof(*tmp);
++			if (args->buffer_size < req_bytes) {
++				/* Continue iterating to get the required size */
++				overflow = true;
++				continue;
++			}
++
++			memset(tmp, 0, sizeof(*tmp));
++			tmp->pid = tmp_client->pid;
++			tmp->context_id = hwctx->id;
++			tmp->start_col = hwctx->start_col;
++			tmp->num_col = hwctx->num_col;
++			tmp->command_submissions = hwctx->priv->seq;
++			tmp->command_completions = hwctx->priv->completed;
++
++			if (copy_to_user(&buf[hw_i], tmp, sizeof(*tmp))) {
++				ret = -EFAULT;
++				srcu_read_unlock(&tmp_client->hwctx_srcu, idx);
++				goto out;
++			}
++			hw_i++;
++		}
++		srcu_read_unlock(&tmp_client->hwctx_srcu, idx);
++	}
++
++	if (overflow) {
++		XDNA_ERR(xdna, "Invalid buffer size. Given: %u Need: %u.",
++			 args->buffer_size, req_bytes);
++		ret = -EINVAL;
++	}
++
++out:
++	kfree(tmp);
++	args->buffer_size = req_bytes;
++	return ret;
++}
++
++static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)
++{
++	struct amdxdna_dev *xdna = client->xdna;
++	int ret, idx;
++
++	if (!drm_dev_enter(&xdna->ddev, &idx))
++		return -ENODEV;
++
++	switch (args->param) {
++	case DRM_AMDXDNA_QUERY_AIE_STATUS:
++		ret = aie2_get_aie_status(client, args);
++		break;
++	case DRM_AMDXDNA_QUERY_AIE_METADATA:
++		ret = aie2_get_aie_metadata(client, args);
++		break;
++	case DRM_AMDXDNA_QUERY_AIE_VERSION:
++		ret = aie2_get_aie_version(client, args);
++		break;
++	case DRM_AMDXDNA_QUERY_CLOCK_METADATA:
++		ret = aie2_get_clock_metadata(client, args);
++		break;
++	case DRM_AMDXDNA_QUERY_HW_CONTEXTS:
++		ret = aie2_get_hwctx_status(client, args);
++		break;
++	default:
++		XDNA_ERR(xdna, "Not supported request parameter %u", args->param);
++		ret = -EOPNOTSUPP;
++	}
++	XDNA_DBG(xdna, "Got param %d", args->param);
++
++	drm_dev_exit(idx);
++	return ret;
++}
++
+ const struct amdxdna_dev_ops aie2_ops = {
+ 	.init           = aie2_init,
+ 	.fini           = aie2_fini,
+ 	.resume         = aie2_hw_start,
+ 	.suspend        = aie2_hw_stop,
++	.get_aie_info   = aie2_get_info,
+ 	.hwctx_init     = aie2_hwctx_init,
+ 	.hwctx_fini     = aie2_hwctx_fini,
+ 	.hwctx_config   = aie2_hwctx_config,
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index 4422dd6c985e..6a2686255c9c 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -231,6 +231,7 @@ int aie2_query_firmware_version(struct amdxdna_dev_hdl *ndev,
+ int aie2_create_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_hwctx *hwctx);
+ int aie2_destroy_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_hwctx *hwctx);
+ int aie2_map_host_buf(struct amdxdna_dev_hdl *ndev, u32 context_id, u64 addr, u64 size);
++int aie2_query_status(struct amdxdna_dev_hdl *ndev, char *buf, u32 size, u32 *cols_filled);
+ int aie2_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 size,
+ 				 void *handle, int (*cb)(void*, const u32 *, size_t));
+ int aie2_config_cu(struct amdxdna_hwctx *hwctx);
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.c b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+index c4df674fdf50..02533732d4ca 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+@@ -143,6 +143,23 @@ static int amdxdna_flush(struct file *f, fl_owner_t id)
+ 	return 0;
+ }
+ 
++static int amdxdna_drm_get_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
++{
++	struct amdxdna_client *client = filp->driver_priv;
++	struct amdxdna_dev *xdna = to_xdna_dev(dev);
++	struct amdxdna_drm_get_info *args = data;
++	int ret;
++
++	if (!xdna->dev_info->ops->get_aie_info)
++		return -EOPNOTSUPP;
++
++	XDNA_DBG(xdna, "Request parameter %u", args->param);
++	mutex_lock(&xdna->dev_lock);
++	ret = xdna->dev_info->ops->get_aie_info(client, args);
++	mutex_unlock(&xdna->dev_lock);
++	return ret;
++}
++
+ static const struct drm_ioctl_desc amdxdna_drm_ioctls[] = {
+ 	/* Context */
+ 	DRM_IOCTL_DEF_DRV(AMDXDNA_CREATE_HWCTX, amdxdna_drm_create_hwctx_ioctl, 0),
+@@ -154,6 +171,8 @@ static const struct drm_ioctl_desc amdxdna_drm_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDXDNA_SYNC_BO, amdxdna_drm_sync_bo_ioctl, 0),
+ 	/* Execution */
+ 	DRM_IOCTL_DEF_DRV(AMDXDNA_EXEC_CMD, amdxdna_drm_submit_cmd_ioctl, 0),
++	/* AIE hardware */
++	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_INFO, amdxdna_drm_get_info_ioctl, 0),
+ };
+ 
+ static const struct file_operations amdxdna_fops = {
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.h b/drivers/accel/amdxdna/amdxdna_pci_drv.h
+index 52c59249c8a0..c50d65a050ad 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.h
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.h
+@@ -17,7 +17,9 @@
+ 
+ extern const struct drm_driver amdxdna_drm_drv;
+ 
++struct amdxdna_client;
+ struct amdxdna_dev;
++struct amdxdna_drm_get_info;
+ struct amdxdna_gem_obj;
+ struct amdxdna_hwctx;
+ struct amdxdna_sched_job;
+@@ -37,6 +39,7 @@ struct amdxdna_dev_ops {
+ 	void (*hwctx_suspend)(struct amdxdna_hwctx *hwctx);
+ 	void (*hwctx_resume)(struct amdxdna_hwctx *hwctx);
+ 	int (*cmd_submit)(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
++	int (*get_aie_info)(struct amdxdna_client *client, struct amdxdna_drm_get_info *args);
+ };
+ 
+ /*
+diff --git a/include/uapi/drm/amdxdna_accel.h b/include/uapi/drm/amdxdna_accel.h
+index 3e88ed386fac..af12af8bd699 100644
+--- a/include/uapi/drm/amdxdna_accel.h
++++ b/include/uapi/drm/amdxdna_accel.h
+@@ -32,6 +32,7 @@ enum amdxdna_drm_ioctl_id {
+ 	DRM_AMDXDNA_GET_BO_INFO,
+ 	DRM_AMDXDNA_SYNC_BO,
+ 	DRM_AMDXDNA_EXEC_CMD,
++	DRM_AMDXDNA_GET_INFO,
+ };
+ 
+ /**
+@@ -235,6 +236,167 @@ struct amdxdna_drm_exec_cmd {
+ 	__u64 seq;
+ };
+ 
++/**
++ * struct amdxdna_drm_query_aie_status - Query the status of the AIE hardware
++ * @buffer: The user space buffer that will return the AIE status.
++ * @buffer_size: The size of the user space buffer.
++ * @cols_filled: A bitmap of AIE columns whose data has been returned in the buffer.
++ */
++struct amdxdna_drm_query_aie_status {
++	__u64 buffer; /* out */
++	__u32 buffer_size; /* in */
++	__u32 cols_filled; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_version - Query the version of the AIE hardware
++ * @major: The major version number.
++ * @minor: The minor version number.
++ */
++struct amdxdna_drm_query_aie_version {
++	__u32 major; /* out */
++	__u32 minor; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_tile_metadata - Query the metadata of AIE tile (core, mem, shim)
++ * @row_count: The number of rows.
++ * @row_start: The starting row number.
++ * @dma_channel_count: The number of dma channels.
++ * @lock_count: The number of locks.
++ * @event_reg_count: The number of events.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_aie_tile_metadata {
++	__u16 row_count;
++	__u16 row_start;
++	__u16 dma_channel_count;
++	__u16 lock_count;
++	__u16 event_reg_count;
++	__u16 pad[3];
++};
++
++/**
++ * struct amdxdna_drm_query_aie_metadata - Query the metadata of the AIE hardware
++ * @col_size: The size of a column in bytes.
++ * @cols: The total number of columns.
++ * @rows: The total number of rows.
++ * @version: The version of the AIE hardware.
++ * @core: The metadata for all core tiles.
++ * @mem: The metadata for all mem tiles.
++ * @shim: The metadata for all shim tiles.
++ */
++struct amdxdna_drm_query_aie_metadata {
++	__u32 col_size;
++	__u16 cols;
++	__u16 rows;
++	struct amdxdna_drm_query_aie_version version;
++	struct amdxdna_drm_query_aie_tile_metadata core;
++	struct amdxdna_drm_query_aie_tile_metadata mem;
++	struct amdxdna_drm_query_aie_tile_metadata shim;
++};
++
++/**
++ * struct amdxdna_drm_query_clock - Metadata for a clock
++ * @name: The clock name.
++ * @freq_mhz: The clock frequency.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_clock {
++	__u8 name[16];
++	__u32 freq_mhz;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_drm_query_clock_metadata - Query metadata for clocks
++ * @mp_npu_clock: The metadata for MP-NPU clock.
++ * @h_clock: The metadata for H clock.
++ */
++struct amdxdna_drm_query_clock_metadata {
++	struct amdxdna_drm_query_clock mp_npu_clock;
++	struct amdxdna_drm_query_clock h_clock;
++};
++
++enum amdxdna_sensor_type {
++	AMDXDNA_SENSOR_TYPE_POWER
++};
++
++/**
++ * struct amdxdna_drm_query_sensor - The data for single sensor.
++ * @label: The name for a sensor.
++ * @input: The current value of the sensor.
++ * @max: The maximum value possible for the sensor.
++ * @average: The average value of the sensor.
++ * @highest: The highest recorded sensor value for this driver load for the sensor.
++ * @status: The sensor status.
++ * @units: The sensor units.
++ * @unitm: Translates value member variables into the correct unit via (pow(10, unitm) * value).
++ * @type: The sensor type from enum amdxdna_sensor_type.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_sensor {
++	__u8  label[64];
++	__u32 input;
++	__u32 max;
++	__u32 average;
++	__u32 highest;
++	__u8  status[64];
++	__u8  units[16];
++	__s8  unitm;
++	__u8  type;
++	__u8  pad[6];
++};
++
++/**
++ * struct amdxdna_drm_query_hwctx - The data for single context.
++ * @context_id: The ID for this context.
++ * @start_col: The starting column for the partition assigned to this context.
++ * @num_col: The number of columns in the partition assigned to this context.
++ * @pad: Structure padding.
++ * @pid: The Process ID of the process that created this context.
++ * @command_submissions: The number of commands submitted to this context.
++ * @command_completions: The number of commands completed by this context.
++ * @migrations: The number of times this context has been moved to a different partition.
++ * @preemptions: The number of times this context has been preempted by another context in the
++ *               same partition.
++ * @errors: The errors for this context.
++ */
++struct amdxdna_drm_query_hwctx {
++	__u32 context_id;
++	__u32 start_col;
++	__u32 num_col;
++	__u32 pad;
++	__s64 pid;
++	__u64 command_submissions;
++	__u64 command_completions;
++	__u64 migrations;
++	__u64 preemptions;
++	__u64 errors;
++};
++
++enum amdxdna_drm_get_param {
++	DRM_AMDXDNA_QUERY_AIE_STATUS,
++	DRM_AMDXDNA_QUERY_AIE_METADATA,
++	DRM_AMDXDNA_QUERY_AIE_VERSION,
++	DRM_AMDXDNA_QUERY_CLOCK_METADATA,
++	DRM_AMDXDNA_QUERY_SENSORS,
++	DRM_AMDXDNA_QUERY_HW_CONTEXTS,
++	DRM_AMDXDNA_NUM_GET_PARAM,
++};
++
++/**
++ * struct amdxdna_drm_get_info - Get some information from the AIE hardware.
++ * @param: Value in enum amdxdna_drm_get_param. Specifies the structure passed in the buffer.
++ * @buffer_size: Size of the input buffer. Size needed/written by the kernel.
++ * @buffer: A structure specified by the param struct member.
++ */
++struct amdxdna_drm_get_info {
++	__u32 param; /* in */
++	__u32 buffer_size; /* in/out */
++	__u64 buffer; /* in/out */
++};
++
+ #define DRM_IOCTL_AMDXDNA_CREATE_HWCTX \
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_HWCTX, \
+ 		 struct amdxdna_drm_create_hwctx)
+@@ -263,6 +425,10 @@ struct amdxdna_drm_exec_cmd {
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_EXEC_CMD, \
+ 		 struct amdxdna_drm_exec_cmd)
+ 
++#define DRM_IOCTL_AMDXDNA_GET_INFO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_INFO, \
++		 struct amdxdna_drm_get_info)
++
+ #if defined(__cplusplus)
+ } /* extern c end */
+ #endif
+-- 
+2.25.1
+

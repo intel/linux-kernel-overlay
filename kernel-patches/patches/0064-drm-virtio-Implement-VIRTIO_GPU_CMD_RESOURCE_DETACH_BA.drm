@@ -1,0 +1,143 @@
+From fcf94f885325f3d9ceee09e69906c8c121db0248 Mon Sep 17 00:00:00 2001
+From: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Date: Mon, 25 Nov 2024 19:13:42 -0800
+Subject: [PATCH 064/708] drm/virtio: Implement
+ VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING cmd
+
+This cmd is useful to let the VMM (i.e, Qemu) know that the backing
+store associated with a resource is no longer valid, so that the VMM
+can perform any cleanup or unmap operations.
+
+The fence related changes and virtio_gpu_object_detach()/
+virtio_gpu_detach_object_fenced() routines are extracted from a
+patch by Dmitry Osipenko <dmitry.osipenko@collabora.com>.
+
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Gurchetan Singh <gurchetansingh@chromium.org>
+Cc: Chia-I Wu <olvaffe@gmail.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Tested-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Reviewed-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241126031643.3490496-2-vivek.kasireddy@intel.com
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h    |  5 ++++
+ drivers/gpu/drm/virtio/virtgpu_object.c | 21 +++++++++++++++
+ drivers/gpu/drm/virtio/virtgpu_vq.c     | 35 +++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 96eb576bc1b8..77892fa01ef0 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -92,6 +92,7 @@ struct virtio_gpu_object {
+ 	uint32_t hw_res_handle;
+ 	bool dumb;
+ 	bool created;
++	bool attached;
+ 	bool host3d_blob, guest_blob;
+ 	uint32_t blob_mem, blob_flags;
+ 
+@@ -353,6 +354,10 @@ void virtio_gpu_object_attach(struct virtio_gpu_device *vgdev,
+ 			      struct virtio_gpu_object *obj,
+ 			      struct virtio_gpu_mem_entry *ents,
+ 			      unsigned int nents);
++void virtio_gpu_object_detach(struct virtio_gpu_device *vgdev,
++			      struct virtio_gpu_object *obj,
++			      struct virtio_gpu_fence *fence);
++int virtio_gpu_detach_object_fenced(struct virtio_gpu_object *bo);
+ void virtio_gpu_cursor_ping(struct virtio_gpu_device *vgdev,
+ 			    struct virtio_gpu_output *output);
+ int virtio_gpu_cmd_get_display_info(struct virtio_gpu_device *vgdev);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_object.c b/drivers/gpu/drm/virtio/virtgpu_object.c
+index c7e74cf13022..d18263ddd972 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_object.c
++++ b/drivers/gpu/drm/virtio/virtgpu_object.c
+@@ -97,6 +97,27 @@ static void virtio_gpu_free_object(struct drm_gem_object *obj)
+ 	virtio_gpu_cleanup_object(bo);
+ }
+ 
++int virtio_gpu_detach_object_fenced(struct virtio_gpu_object *bo)
++{
++	struct virtio_gpu_device *vgdev = bo->base.base.dev->dev_private;
++	struct virtio_gpu_fence *fence;
++
++	if (!bo->attached)
++		return 0;
++
++	fence = virtio_gpu_fence_alloc(vgdev, vgdev->fence_drv.context, 0);
++	if (!fence)
++		return -ENOMEM;
++
++	virtio_gpu_object_detach(vgdev, bo, fence);
++	virtio_gpu_notify(vgdev);
++
++	dma_fence_wait(&fence->f, false);
++	dma_fence_put(&fence->f);
++
++	return 0;
++}
++
+ static const struct drm_gem_object_funcs virtio_gpu_shmem_funcs = {
+ 	.free = virtio_gpu_free_object,
+ 	.open = virtio_gpu_gem_object_open,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+index 0d3d0d09f39b..ad91624df42d 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -645,6 +645,23 @@ virtio_gpu_cmd_resource_attach_backing(struct virtio_gpu_device *vgdev,
+ 	virtio_gpu_queue_fenced_ctrl_buffer(vgdev, vbuf, fence);
+ }
+ 
++static void
++virtio_gpu_cmd_resource_detach_backing(struct virtio_gpu_device *vgdev,
++				       uint32_t resource_id,
++				       struct virtio_gpu_fence *fence)
++{
++	struct virtio_gpu_resource_detach_backing *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
++	cmd_p->resource_id = cpu_to_le32(resource_id);
++
++	virtio_gpu_queue_fenced_ctrl_buffer(vgdev, vbuf, fence);
++}
++
+ static void virtio_gpu_cmd_get_display_info_cb(struct virtio_gpu_device *vgdev,
+ 					       struct virtio_gpu_vbuffer *vbuf)
+ {
+@@ -1103,8 +1120,26 @@ void virtio_gpu_object_attach(struct virtio_gpu_device *vgdev,
+ 			      struct virtio_gpu_mem_entry *ents,
+ 			      unsigned int nents)
+ {
++	if (obj->attached)
++		return;
++
+ 	virtio_gpu_cmd_resource_attach_backing(vgdev, obj->hw_res_handle,
+ 					       ents, nents, NULL);
++
++	obj->attached = true;
++}
++
++void virtio_gpu_object_detach(struct virtio_gpu_device *vgdev,
++			      struct virtio_gpu_object *obj,
++			      struct virtio_gpu_fence *fence)
++{
++	if (!obj->attached)
++		return;
++
++	virtio_gpu_cmd_resource_detach_backing(vgdev, obj->hw_res_handle,
++					       fence);
++
++	obj->attached = false;
+ }
+ 
+ void virtio_gpu_cursor_ping(struct virtio_gpu_device *vgdev,
+-- 
+2.25.1
+

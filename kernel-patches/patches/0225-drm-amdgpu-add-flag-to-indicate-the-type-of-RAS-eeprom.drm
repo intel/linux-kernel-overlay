@@ -1,0 +1,128 @@
+From c5c99e4c97971786f79c3dc105f633ba0df22aa9 Mon Sep 17 00:00:00 2001
+From: Tao Zhou <tao.zhou1@amd.com>
+Date: Fri, 18 Oct 2024 17:52:59 +0800
+Subject: [PATCH 225/708] drm/amdgpu: add flag to indicate the type of RAS
+ eeprom record
+
+One UMC MCA address could map to multiply physical address (PA):
+
+AMDGPU_RAS_EEPROM_REC_PA: one record store one PA
+AMDGPU_RAS_EEPROM_REC_MCA: one record store one MCA address, PA
+is not cared about
+
+Signed-off-by: Tao Zhou <tao.zhou1@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c       | 33 +++++++++++++++----
+ .../gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.h    | 14 ++++++++
+ 2 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 4c9fa24dd972..e7eccc30c692 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -2821,10 +2821,20 @@ static int amdgpu_ras_load_bad_pages(struct amdgpu_device *adev)
+ 		return -ENOMEM;
+ 
+ 	ret = amdgpu_ras_eeprom_read(control, bps, control->ras_num_recs);
+-	if (ret)
++	if (ret) {
+ 		dev_err(adev->dev, "Failed to load EEPROM table records!");
+-	else
++	} else {
++		if (control->ras_num_recs > 1 &&
++		    adev->umc.ras && adev->umc.ras->convert_ras_err_addr) {
++			if ((bps[0].address == bps[1].address) &&
++			    (bps[0].mem_channel == bps[1].mem_channel))
++				control->rec_type = AMDGPU_RAS_EEPROM_REC_PA;
++			else
++				control->rec_type = AMDGPU_RAS_EEPROM_REC_MCA;
++		}
++
+ 		ret = amdgpu_ras_add_bad_pages(adev, bps, control->ras_num_recs);
++	}
+ 
+ 	kfree(bps);
+ 	return ret;
+@@ -3205,13 +3215,14 @@ static int amdgpu_ras_page_retirement_thread(void *param)
+ int amdgpu_ras_init_badpage_info(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
++	struct amdgpu_ras_eeprom_control *control;
+ 	int ret;
+ 
+ 	if (!con || amdgpu_sriov_vf(adev))
+ 		return 0;
+ 
+-	ret = amdgpu_ras_eeprom_init(&con->eeprom_control);
+-
++	control = &con->eeprom_control;
++	ret = amdgpu_ras_eeprom_init(control);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3219,17 +3230,25 @@ int amdgpu_ras_init_badpage_info(struct amdgpu_device *adev)
+ 	if (amdgpu_ras_is_rma(adev))
+ 		return -EHWPOISON;
+ 
+-	if (con->eeprom_control.ras_num_recs) {
++	if (!adev->umc.ras || !adev->umc.ras->convert_ras_err_addr)
++		control->rec_type = AMDGPU_RAS_EEPROM_REC_PA;
++
++	/* default status is MCA storage */
++	if (control->ras_num_recs <= 1 &&
++	    adev->umc.ras && adev->umc.ras->convert_ras_err_addr)
++		control->rec_type = AMDGPU_RAS_EEPROM_REC_MCA;
++
++	if (control->ras_num_recs) {
+ 		ret = amdgpu_ras_load_bad_pages(adev);
+ 		if (ret)
+ 			return ret;
+ 
+ 		amdgpu_dpm_send_hbm_bad_pages_num(
+-			adev, con->eeprom_control.ras_num_recs);
++			adev, control->ras_num_recs);
+ 
+ 		if (con->update_channel_flag == true) {
+ 			amdgpu_dpm_send_hbm_bad_channel_flag(
+-				adev, con->eeprom_control.bad_channel_bitmap);
++				adev, control->bad_channel_bitmap);
+ 			con->update_channel_flag = false;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.h
+index b9ebda577797..d3a6f7205a2f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.h
+@@ -43,6 +43,19 @@ enum amdgpu_ras_eeprom_err_type {
+ 	AMDGPU_RAS_EEPROM_ERR_COUNT,
+ };
+ 
++/*
++ * one UMC MCA address could map to multiply physical address (PA),
++ * such as 1:16, we use eeprom_table_record.address to store MCA
++ * address and use eeprom_table_record.retired_page to save PA.
++ *
++ * AMDGPU_RAS_EEPROM_REC_PA: one record store one PA
++ * AMDGPU_RAS_EEPROM_REC_MCA: one record store one MCA address
++ */
++enum amdgpu_ras_eeprom_rec_type {
++	AMDGPU_RAS_EEPROM_REC_PA,
++	AMDGPU_RAS_EEPROM_REC_MCA,
++};
++
+ struct amdgpu_ras_eeprom_table_header {
+ 	uint32_t header;
+ 	uint32_t version;
+@@ -102,6 +115,7 @@ struct amdgpu_ras_eeprom_control {
+ 	/* Record channel info which occurred bad pages
+ 	 */
+ 	u32 bad_channel_bitmap;
++	enum amdgpu_ras_eeprom_rec_type rec_type;
+ };
+ 
+ /*
+-- 
+2.25.1
+

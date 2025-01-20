@@ -1,0 +1,188 @@
+From 2e7ff9745e816ea23c69b884d401b64969fa2713 Mon Sep 17 00:00:00 2001
+From: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Date: Tue, 19 Nov 2024 18:03:15 -0500
+Subject: [PATCH 214/708] drm/amd/amdgpu: Add support for isp buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add support to create user BOs with MC address for isp using the dma-buf handle
+exported for the buffers allocated from system memory in isp driver.
+
+Export amdgpu_bo_create_kernel() and amdgpu_bo_free_kernel() as well for isp to
+allocate GTT internal buffers required for fw to run.
+
+Signed-off-by: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 101 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |   5 +
+ 2 files changed, 106 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 6852d50caa89..4e6d218839f9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -41,6 +41,7 @@
+ #include "amdgpu_amdkfd.h"
+ #include "amdgpu_vram_mgr.h"
+ #include "amdgpu_vm.h"
++#include "amdgpu_dma_buf.h"
+ 
+ /**
+  * DOC: amdgpu_object
+@@ -324,6 +325,9 @@ int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+  *
+  * Allocates and pins a BO for kernel internal use.
+  *
++ * This function is exported to allow the V4L2 isp device
++ * external to drm device to create and access the kernel BO.
++ *
+  * Note: For bo_ptr new BO is only created if bo_ptr points to NULL.
+  *
+  * Returns:
+@@ -347,6 +351,76 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(amdgpu_bo_create_kernel);
++
++/**
++ * amdgpu_bo_create_isp_user - create user BO for isp
++ *
++ * @adev: amdgpu device object
++ * @dma_buf: DMABUF handle for isp buffer
++ * @domain: where to place it
++ * @bo:  used to initialize BOs in structures
++ * @gpu_addr: GPU addr of the pinned BO
++ *
++ * Imports isp DMABUF to allocate and pin a user BO for isp internal use. It does
++ * GART alloc to generate gpu_addr for BO to make it accessible through the
++ * GART aperture for ISP HW.
++ *
++ * This function is exported to allow the V4L2 isp device external to drm device
++ * to create and access the isp user BO.
++ *
++ * Returns:
++ * 0 on success, negative error code otherwise.
++ */
++int amdgpu_bo_create_isp_user(struct amdgpu_device *adev,
++			   struct dma_buf *dbuf, u32 domain, struct amdgpu_bo **bo,
++			   u64 *gpu_addr)
++
++{
++	struct drm_gem_object *gem_obj;
++	int r;
++
++	gem_obj = amdgpu_gem_prime_import(&adev->ddev, dbuf);
++	*bo = gem_to_amdgpu_bo(gem_obj);
++	if (!(*bo)) {
++		dev_err(adev->dev, "failed to get valid isp user bo\n");
++		return -EINVAL;
++	}
++
++	r = amdgpu_bo_reserve(*bo, false);
++	if (r) {
++		dev_err(adev->dev, "(%d) failed to reserve isp user bo\n", r);
++		return r;
++	}
++
++	r = amdgpu_bo_pin(*bo, domain);
++	if (r) {
++		dev_err(adev->dev, "(%d) isp user bo pin failed\n", r);
++		goto error_unreserve;
++	}
++
++	r = amdgpu_ttm_alloc_gart(&(*bo)->tbo);
++	if (r) {
++		dev_err(adev->dev, "%p bind failed\n", *bo);
++		goto error_unpin;
++	}
++
++	if (!WARN_ON(!gpu_addr))
++		*gpu_addr = amdgpu_bo_gpu_offset(*bo);
++
++	amdgpu_bo_unreserve(*bo);
++
++	return 0;
++
++error_unpin:
++	amdgpu_bo_unpin(*bo);
++error_unreserve:
++	amdgpu_bo_unreserve(*bo);
++	amdgpu_bo_unref(bo);
++
++	return r;
++}
++EXPORT_SYMBOL(amdgpu_bo_create_isp_user);
+ 
+ /**
+  * amdgpu_bo_create_kernel_at - create BO for kernel use at specific location
+@@ -423,6 +497,9 @@ int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
+  * @cpu_addr: pointer to where the BO's CPU memory space address was stored
+  *
+  * unmaps and unpin a BO for kernel internal use.
++ *
++ * This function is exported to allow the V4L2 isp device
++ * external to drm device to free the kernel BO.
+  */
+ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
+ 			   void **cpu_addr)
+@@ -447,6 +524,30 @@ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
+ 	if (cpu_addr)
+ 		*cpu_addr = NULL;
+ }
++EXPORT_SYMBOL(amdgpu_bo_free_kernel);
++
++/**
++ * amdgpu_bo_free_isp_user - free BO for isp use
++ *
++ * @bo: amdgpu isp user BO to free
++ *
++ * unpin and unref BO for isp internal use.
++ *
++ * This function is exported to allow the V4L2 isp device
++ * external to drm device to free the isp user BO.
++ */
++void amdgpu_bo_free_isp_user(struct amdgpu_bo *bo)
++{
++	if (bo == NULL)
++		return;
++
++	if (amdgpu_bo_reserve(bo, true) == 0) {
++		amdgpu_bo_unpin(bo);
++		amdgpu_bo_unreserve(bo);
++	}
++	amdgpu_bo_unref(&bo);
++}
++EXPORT_SYMBOL(amdgpu_bo_free_isp_user);
+ 
+ /* Validate bo size is bit bigger than the request domain */
+ static bool amdgpu_bo_validate_size(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index be6769852ece..ce3314152d20 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -260,6 +260,10 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
+ 			    unsigned long size, int align,
+ 			    u32 domain, struct amdgpu_bo **bo_ptr,
+ 			    u64 *gpu_addr, void **cpu_addr);
++int amdgpu_bo_create_isp_user(struct amdgpu_device *adev,
++			   struct dma_buf *dbuf, u32 domain,
++			   struct amdgpu_bo **bo,
++			   u64 *gpu_addr);
+ int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
+ 			       uint64_t offset, uint64_t size,
+ 			       struct amdgpu_bo **bo_ptr, void **cpu_addr);
+@@ -271,6 +275,7 @@ int amdgpu_bo_create_vm(struct amdgpu_device *adev,
+ 			struct amdgpu_bo_vm **ubo_ptr);
+ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
+ 			   void **cpu_addr);
++void amdgpu_bo_free_isp_user(struct amdgpu_bo *bo);
+ int amdgpu_bo_kmap(struct amdgpu_bo *bo, void **ptr);
+ void *amdgpu_bo_kptr(struct amdgpu_bo *bo);
+ void amdgpu_bo_kunmap(struct amdgpu_bo *bo);
+-- 
+2.25.1
+

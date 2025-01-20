@@ -1,0 +1,231 @@
+From 11021a342b6e26226aece822333f4f2e26c4a74b Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Mon, 9 Dec 2024 15:27:39 -0800
+Subject: [PATCH 199/708] drm/xe: Apply whitelist to engine save-restore
+
+Instead of handling the whitelist directly in the GuC ADS
+initialization, make it follow the same logic as other engine registers
+that are save-restored. Main benefit is that then the SW tracking then
+shows it in debugfs and there's no risk of an engine workaround to write
+to the same nopriv register that is being passed directly to GuC.
+
+This means that xe_reg_whitelist_process_engine() only has to process
+the RTP and convert them to entries for the hwe.  With that all the
+registers should be covered by xe_reg_sr_apply_mmio() to write to the HW
+and there's no special handling in GuC ADS to also add these registers
+to the list of registers that is passed to GuC.
+
+Example for DG2:
+
+	# cat  /sys/kernel/debug/dri/0000\:03\:00.0/gt0/register-save-restore
+	...
+	Engine
+	rcs0
+		...
+		REG[0x24d0] clr=0xffffffff set=0x1000dafc masked=no mcr=no
+		REG[0x24d4] clr=0xffffffff set=0x1000db01 masked=no mcr=no
+		REG[0x24d8] clr=0xffffffff set=0x0000db1c masked=no mcr=no
+	...
+	Whitelist
+	rcs0
+		REG[0xdafc-0xdaff]: allow read access
+		REG[0xdb00-0xdb1f]: allow read access
+		REG[0xdb1c-0xdb1f]: allow rw access
+
+v2:
+  - Use ~0u for clr bits so it's just a write (Matt Roper)
+  - Simplify helpers now that unused slots are not written
+
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241209232739.147417-6-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/xe_gt.c            |  4 +--
+ drivers/gpu/drm/xe/xe_guc_ads.c       |  7 -----
+ drivers/gpu/drm/xe/xe_hw_engine.c     |  1 -
+ drivers/gpu/drm/xe/xe_reg_sr.c        | 45 ---------------------------
+ drivers/gpu/drm/xe/xe_reg_whitelist.c | 37 ++++++++++++++++++++++
+ 5 files changed, 38 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt.c b/drivers/gpu/drm/xe/xe_gt.c
+index d6744be01a68..41ab7fbebc19 100644
+--- a/drivers/gpu/drm/xe/xe_gt.c
++++ b/drivers/gpu/drm/xe/xe_gt.c
+@@ -748,10 +748,8 @@ static int do_gt_restart(struct xe_gt *gt)
+ 	if (err)
+ 		return err;
+ 
+-	for_each_hw_engine(hwe, gt, id) {
++	for_each_hw_engine(hwe, gt, id)
+ 		xe_reg_sr_apply_mmio(&hwe->reg_sr, gt);
+-		xe_reg_sr_apply_whitelist(hwe);
+-	}
+ 
+ 	/* Get CCS mode in sync between sw/hw */
+ 	xe_gt_apply_ccs_mode(gt);
+diff --git a/drivers/gpu/drm/xe/xe_guc_ads.c b/drivers/gpu/drm/xe/xe_guc_ads.c
+index b0afb89d9d90..943146e5b460 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ads.c
++++ b/drivers/gpu/drm/xe/xe_guc_ads.c
+@@ -243,8 +243,6 @@ static size_t calculate_regset_size(struct xe_gt *gt)
+ 		xa_for_each(&hwe->reg_sr.xa, sr_idx, sr_entry)
+ 			count++;
+ 
+-	count += RING_MAX_NONPRIV_SLOTS * XE_NUM_HW_ENGINES;
+-
+ 	count += ADS_REGSET_EXTRA_MAX * XE_NUM_HW_ENGINES;
+ 
+ 	if (XE_WA(gt, 1607983814))
+@@ -729,11 +727,6 @@ static unsigned int guc_mmio_regset_write(struct xe_guc_ads *ads,
+ 	xa_for_each(&hwe->reg_sr.xa, idx, entry)
+ 		guc_mmio_regset_write_one(ads, regset_map, entry->reg, count++);
+ 
+-	for (i = 0; i < RING_MAX_NONPRIV_SLOTS; i++)
+-		guc_mmio_regset_write_one(ads, regset_map,
+-					  RING_FORCE_TO_NONPRIV(hwe->mmio_base, i),
+-					  count++);
+-
+ 	for (e = extra_regs; e < extra_regs + ARRAY_SIZE(extra_regs); e++) {
+ 		if (e->skip)
+ 			continue;
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index c4b0dc3be39c..b19366744148 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -574,7 +574,6 @@ static int hw_engine_init(struct xe_gt *gt, struct xe_hw_engine *hwe,
+ 	xe_gt_assert(gt, gt->info.engine_mask & BIT(id));
+ 
+ 	xe_reg_sr_apply_mmio(&hwe->reg_sr, gt);
+-	xe_reg_sr_apply_whitelist(hwe);
+ 
+ 	hwe->hwsp = xe_managed_bo_create_pin_map(xe, tile, SZ_4K,
+ 						 XE_BO_FLAG_VRAM_IF_DGFX(tile) |
+diff --git a/drivers/gpu/drm/xe/xe_reg_sr.c b/drivers/gpu/drm/xe/xe_reg_sr.c
+index 0a5c0e62d6e8..9475e3f74958 100644
+--- a/drivers/gpu/drm/xe/xe_reg_sr.c
++++ b/drivers/gpu/drm/xe/xe_reg_sr.c
+@@ -24,7 +24,6 @@
+ #include "xe_hw_engine_types.h"
+ #include "xe_macros.h"
+ #include "xe_mmio.h"
+-#include "xe_reg_whitelist.h"
+ #include "xe_rtp_types.h"
+ 
+ static void reg_sr_fini(struct drm_device *drm, void *arg)
+@@ -192,50 +191,6 @@ void xe_reg_sr_apply_mmio(struct xe_reg_sr *sr, struct xe_gt *gt)
+ 	xe_gt_err(gt, "Failed to apply, err=-ETIMEDOUT\n");
+ }
+ 
+-void xe_reg_sr_apply_whitelist(struct xe_hw_engine *hwe)
+-{
+-	struct xe_reg_sr *sr = &hwe->reg_whitelist;
+-	struct xe_gt *gt = hwe->gt;
+-	struct xe_reg_sr_entry *entry;
+-	struct drm_printer p;
+-	u32 mmio_base = hwe->mmio_base;
+-	unsigned long reg;
+-	unsigned int slot = 0;
+-	unsigned int fw_ref;
+-
+-	if (xa_empty(&sr->xa))
+-		return;
+-
+-	xe_gt_dbg(gt, "Whitelisting %s registers\n", sr->name);
+-
+-	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FORCEWAKE_ALL);
+-	if (!xe_force_wake_ref_has_domain(fw_ref, XE_FORCEWAKE_ALL))
+-		goto err_force_wake;
+-
+-	p = xe_gt_dbg_printer(gt);
+-	xa_for_each(&sr->xa, reg, entry) {
+-		if (slot == RING_MAX_NONPRIV_SLOTS) {
+-			xe_gt_err(gt,
+-				  "hwe %s: maximum register whitelist slots (%d) reached, refusing to add more\n",
+-				  hwe->name, RING_MAX_NONPRIV_SLOTS);
+-			break;
+-		}
+-
+-		xe_reg_whitelist_print_entry(&p, 0, reg, entry);
+-		xe_mmio_write32(&gt->mmio, RING_FORCE_TO_NONPRIV(mmio_base, slot),
+-				reg | entry->set_bits);
+-		slot++;
+-	}
+-
+-	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+-
+-	return;
+-
+-err_force_wake:
+-	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+-	xe_gt_err(gt, "Failed to apply, err=-ETIMEDOUT\n");
+-}
+-
+ /**
+  * xe_reg_sr_dump - print all save/restore entries
+  * @sr: Save/restore entries
+diff --git a/drivers/gpu/drm/xe/xe_reg_whitelist.c b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+index 3996934974fa..edab5d4e3ba5 100644
+--- a/drivers/gpu/drm/xe/xe_reg_whitelist.c
++++ b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+@@ -10,7 +10,9 @@
+ #include "regs/xe_oa_regs.h"
+ #include "regs/xe_regs.h"
+ #include "xe_gt_types.h"
++#include "xe_gt_printk.h"
+ #include "xe_platform_types.h"
++#include "xe_reg_sr.h"
+ #include "xe_rtp.h"
+ #include "xe_step.h"
+ 
+@@ -89,6 +91,40 @@ static const struct xe_rtp_entry_sr register_whitelist[] = {
+ 	{}
+ };
+ 
++static void whitelist_apply_to_hwe(struct xe_hw_engine *hwe)
++{
++	struct xe_reg_sr *sr = &hwe->reg_whitelist;
++	struct xe_reg_sr_entry *entry;
++	struct drm_printer p;
++	unsigned long reg;
++	unsigned int slot;
++
++	xe_gt_dbg(hwe->gt, "Add %s whitelist to engine\n", sr->name);
++	p = xe_gt_dbg_printer(hwe->gt);
++
++	slot = 0;
++	xa_for_each(&sr->xa, reg, entry) {
++		struct xe_reg_sr_entry hwe_entry = {
++			.reg = RING_FORCE_TO_NONPRIV(hwe->mmio_base, slot),
++			.set_bits = entry->reg.addr | entry->set_bits,
++			.clr_bits = ~0u,
++			.read_mask = entry->read_mask,
++		};
++
++		if (slot == RING_MAX_NONPRIV_SLOTS) {
++			xe_gt_err(hwe->gt,
++				  "hwe %s: maximum register whitelist slots (%d) reached, refusing to add more\n",
++				  hwe->name, RING_MAX_NONPRIV_SLOTS);
++			break;
++		}
++
++		xe_reg_whitelist_print_entry(&p, 0, reg, entry);
++		xe_reg_sr_add(&hwe->reg_sr, &hwe_entry, hwe->gt);
++
++		slot++;
++	}
++}
++
+ /**
+  * xe_reg_whitelist_process_engine - process table of registers to whitelist
+  * @hwe: engine instance to process whitelist for
+@@ -102,6 +138,7 @@ void xe_reg_whitelist_process_engine(struct xe_hw_engine *hwe)
+ 	struct xe_rtp_process_ctx ctx = XE_RTP_PROCESS_CTX_INITIALIZER(hwe);
+ 
+ 	xe_rtp_process_to_sr(&ctx, register_whitelist, &hwe->reg_whitelist);
++	whitelist_apply_to_hwe(hwe);
+ }
+ 
+ /**
+-- 
+2.25.1
+
