@@ -1,0 +1,103 @@
+From db0bcc893d84b017d3cd3c7a1b156705e361c9d8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Sat, 8 Feb 2025 00:31:57 +0200
+Subject: [PATCH 0724/1107] drm/i915/vrr: Reorder the DSB "wait for safe
+ window" vs. TRANS_PUSH
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently we trigger the push send first, then follow it with
+a "wait for safe window". That approach no longer works on
+PTL+ because triggering the push send immediately ends the safe
+window. On prior hardware the safe window extended past the
+push being sent (presumably all the way to the pipe's delayed
+vblank).
+
+In order to deal with the new hardware behaviour we must reverse
+the order of these two operations: first wait for safe window,
+then trigger the push.
+
+The only slight danger with this approach is that if we mess up
+the vblank evasion around the vmax decision boundary the push
+might get postponed until after the next frame's vactive. But
+assuming we don't mess up the vblank evasion this approach is
+completely safe.
+
+As a slight bonus we can perform the push after we've done the
+LUT writes as well, meaning we no longer have to worry about
+extending the vblank delay to provide enough time for LUT
+programming. Instead we will now depend on the vblank evasion
+at vmax decision boundary to guarantee this.
+
+However vblank delay (or framestart delay) is still the only
+way to provide extra time for the LUT programming in the
+non-VRR use cases. Let's assume we don't need anything extra
+for now, but eventually we should come up with some proper
+estimates on how long the LUT programming can take and
+configure the vblank delay accordingly for the non-VRR use
+cases.
+
+Reviewed-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250207223159.14132-7-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_color.c   |  2 ++
+ drivers/gpu/drm/i915/display/intel_display.c | 12 ++----------
+ 2 files changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_color.c b/drivers/gpu/drm/i915/display/intel_color.c
+index 792cf7cef58a..4d8f6509cac4 100644
+--- a/drivers/gpu/drm/i915/display/intel_color.c
++++ b/drivers/gpu/drm/i915/display/intel_color.c
+@@ -29,6 +29,7 @@
+ #include "intel_de.h"
+ #include "intel_display_types.h"
+ #include "intel_dsb.h"
++#include "intel_vrr.h"
+ 
+ struct intel_color_funcs {
+ 	int (*color_check)(struct intel_atomic_state *state,
+@@ -1988,6 +1989,7 @@ void intel_color_prepare_commit(struct intel_atomic_state *state,
+ 	display->funcs.color->load_luts(crtc_state);
+ 
+ 	if (crtc_state->use_dsb) {
++		intel_vrr_send_push(crtc_state->dsb_color_vblank, crtc_state);
+ 		intel_dsb_wait_vblank_delay(state, crtc_state->dsb_color_vblank);
+ 		intel_dsb_interrupt(crtc_state->dsb_color_vblank);
+ 	}
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 7bb33b845e8c..9bb1bfe18aee 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -2633,14 +2633,6 @@ static int intel_crtc_vblank_delay(const struct intel_crtc_state *crtc_state)
+ 	if (intel_crtc_needs_wa_14015401596(crtc_state))
+ 		vblank_delay = max(vblank_delay, 1);
+ 
+-	/*
+-	 * Add a minimal vblank delay to make sure the push
+-	 * doesn't race with the "wait for safe window" used
+-	 * for frame completion with DSB.
+-	 */
+-	if (intel_vrr_possible(crtc_state))
+-		vblank_delay = max(vblank_delay, 1);
+-
+ 	return vblank_delay;
+ }
+ 
+@@ -7751,10 +7743,10 @@ static void intel_atomic_dsb_finish(struct intel_atomic_state *state,
+ 		intel_crtc_planes_update_arm(new_crtc_state->dsb_commit,
+ 					     state, crtc);
+ 
+-		intel_vrr_send_push(new_crtc_state->dsb_commit, new_crtc_state);
+-
+ 		if (!new_crtc_state->dsb_color_vblank) {
+ 			intel_dsb_wait_vblanks(new_crtc_state->dsb_commit, 1);
++
++			intel_vrr_send_push(new_crtc_state->dsb_commit, new_crtc_state);
+ 			intel_dsb_wait_vblank_delay(state, new_crtc_state->dsb_commit);
+ 			intel_dsb_interrupt(new_crtc_state->dsb_commit);
+ 		}
+-- 
+2.25.1
+

@@ -1,0 +1,165 @@
+From 3a7c6f3ad29343ede47823fd0abbb3eca019bd78 Mon Sep 17 00:00:00 2001
+From: Sathishkumar S <sathishkumar.sundararaju@amd.com>
+Date: Tue, 28 Jan 2025 23:57:03 +0530
+Subject: [PATCH 0389/1107] drm/amdgpu: Add helper funcs for jpeg devcoredump
+
+Add devcoredump helper functions that can be reused for all jpeg versions.
+
+V2: (Lijo)
+ - add amdgpu_jpeg_reg_dump_init() and amdgpu_jpeg_reg_dump_fini()
+ - use reg_list and reg_count from init() to dump and print registers
+ - memory allocation and freeing is moved to the init() and fini()
+
+V3: (Lijo)
+ - move amdgpu_jpeg_reg_dump_fini() to sw_fini()
+
+Signed-off-by: Sathishkumar S <sathishkumar.sundararaju@amd.com>
+Acked-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c | 84 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h |  9 +++
+ 2 files changed, 93 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
+index b6d2eb049f54..dda29132dfb2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
+@@ -33,6 +33,7 @@
+ #define JPEG_IDLE_TIMEOUT	msecs_to_jiffies(1000)
+ 
+ static void amdgpu_jpeg_idle_work_handler(struct work_struct *work);
++static void amdgpu_jpeg_reg_dump_fini(struct amdgpu_device *adev);
+ 
+ int amdgpu_jpeg_sw_init(struct amdgpu_device *adev)
+ {
+@@ -85,6 +86,9 @@ int amdgpu_jpeg_sw_fini(struct amdgpu_device *adev)
+ 			amdgpu_ring_fini(&adev->jpeg.inst[i].ring_dec[j]);
+ 	}
+ 
++	if (adev->jpeg.reg_list)
++		amdgpu_jpeg_reg_dump_fini(adev);
++
+ 	mutex_destroy(&adev->jpeg.jpeg_pg_lock);
+ 
+ 	return 0;
+@@ -452,3 +456,83 @@ void amdgpu_jpeg_sysfs_reset_mask_fini(struct amdgpu_device *adev)
+ 			device_remove_file(adev->dev, &dev_attr_jpeg_reset_mask);
+ 	}
+ }
++
++int amdgpu_jpeg_reg_dump_init(struct amdgpu_device *adev,
++			       const struct amdgpu_hwip_reg_entry *reg, u32 count)
++{
++	adev->jpeg.ip_dump = kcalloc(adev->jpeg.num_jpeg_inst * count,
++				     sizeof(uint32_t), GFP_KERNEL);
++	if (!adev->jpeg.ip_dump) {
++		DRM_ERROR("Failed to allocate memory for JPEG IP Dump\n");
++		return -ENOMEM;
++	}
++	adev->jpeg.reg_list = reg;
++	adev->jpeg.reg_count = count;
++
++	return 0;
++}
++
++static void amdgpu_jpeg_reg_dump_fini(struct amdgpu_device *adev)
++{
++	kfree(adev->jpeg.ip_dump);
++	adev->jpeg.reg_list = NULL;
++	adev->jpeg.reg_count = 0;
++}
++
++void amdgpu_jpeg_dump_ip_state(struct amdgpu_ip_block *ip_block)
++{
++	struct amdgpu_device *adev = ip_block->adev;
++	u32 inst_off, inst_id, is_powered;
++	int i, j;
++
++	if (!adev->jpeg.ip_dump)
++		return;
++
++	for (i = 0; i < adev->jpeg.num_jpeg_inst; i++) {
++		if (adev->jpeg.harvest_config & (1 << i))
++			continue;
++
++		inst_id = GET_INST(JPEG, i);
++		inst_off = i * adev->jpeg.reg_count;
++		/* check power status from UVD_JPEG_POWER_STATUS */
++		adev->jpeg.ip_dump[inst_off] =
++			RREG32(SOC15_REG_ENTRY_OFFSET_INST(adev->jpeg.reg_list[0],
++							   inst_id));
++		is_powered = ((adev->jpeg.ip_dump[inst_off] & 0x1) != 1);
++
++		if (is_powered)
++			for (j = 1; j < adev->jpeg.reg_count; j++)
++				adev->jpeg.ip_dump[inst_off + j] =
++					RREG32(SOC15_REG_ENTRY_OFFSET_INST(adev->jpeg.reg_list[j],
++									   inst_id));
++	}
++}
++
++void amdgpu_jpeg_print_ip_state(struct amdgpu_ip_block *ip_block, struct drm_printer *p)
++{
++	struct amdgpu_device *adev = ip_block->adev;
++	u32 inst_off, is_powered;
++	int i, j;
++
++	if (!adev->jpeg.ip_dump)
++		return;
++
++	drm_printf(p, "num_instances:%d\n", adev->jpeg.num_jpeg_inst);
++	for (i = 0; i < adev->jpeg.num_jpeg_inst; i++) {
++		if (adev->jpeg.harvest_config & (1 << i)) {
++			drm_printf(p, "\nHarvested Instance:JPEG%d Skipping dump\n", i);
++			continue;
++		}
++
++		inst_off = i * adev->jpeg.reg_count;
++		is_powered = ((adev->jpeg.ip_dump[inst_off] & 0x1) != 1);
++
++		if (is_powered) {
++			drm_printf(p, "Active Instance:JPEG%d\n", i);
++			for (j = 0; j < adev->jpeg.reg_count; j++)
++				drm_printf(p, "%-50s \t 0x%08x\n", adev->jpeg.reg_list[j].reg_name,
++					   adev->jpeg.ip_dump[inst_off + j]);
++		} else
++			drm_printf(p, "\nInactive Instance:JPEG%d\n", i);
++	}
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
+index eb2096dcf1a6..4f0775e39b54 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
+@@ -92,6 +92,8 @@
+ 		*adev->jpeg.inst[inst_idx].dpg_sram_curr_addr++ = value;	\
+ 	} while (0)
+ 
++struct amdgpu_hwip_reg_entry;
++
+ enum amdgpu_jpeg_caps {
+ 	AMDGPU_JPEG_RRMT_ENABLED,
+ };
+@@ -137,6 +139,9 @@ struct amdgpu_jpeg {
+ 	bool	indirect_sram;
+ 	uint32_t supported_reset;
+ 	uint32_t caps;
++	u32 *ip_dump;
++	u32 reg_count;
++	const struct amdgpu_hwip_reg_entry *reg_list;
+ };
+ 
+ int amdgpu_jpeg_sw_init(struct amdgpu_device *adev);
+@@ -161,5 +166,9 @@ int amdgpu_jpeg_psp_update_sram(struct amdgpu_device *adev, int inst_idx,
+ void amdgpu_debugfs_jpeg_sched_mask_init(struct amdgpu_device *adev);
+ int amdgpu_jpeg_sysfs_reset_mask_init(struct amdgpu_device *adev);
+ void amdgpu_jpeg_sysfs_reset_mask_fini(struct amdgpu_device *adev);
++int amdgpu_jpeg_reg_dump_init(struct amdgpu_device *adev,
++			       const struct amdgpu_hwip_reg_entry *reg, u32 count);
++void amdgpu_jpeg_dump_ip_state(struct amdgpu_ip_block *ip_block);
++void amdgpu_jpeg_print_ip_state(struct amdgpu_ip_block *ip_block, struct drm_printer *p);
+ 
+ #endif /*__AMDGPU_JPEG_H__*/
+-- 
+2.25.1
+

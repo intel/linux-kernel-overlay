@@ -1,0 +1,220 @@
+From ca6d953869a639365d77ef56795285e864143a1b Mon Sep 17 00:00:00 2001
+From: Tao Zhou <tao.zhou1@amd.com>
+Date: Wed, 22 Jan 2025 16:55:51 +0800
+Subject: [PATCH 0493/1107] drm/amdgpu: add RAS CPER ring buffer
+
+And initialize it, this is a pure software ring to store RAS CPER data.
+
+v2: change ring size to 0x100000
+v2: update the initialization of count_dw of cper ring, it's dword
+variable
+v3: skip VM inv eng for cper
+v3: init/fini when aca enabled
+
+Signed-off-by: Tao Zhou <tao.zhou1@amd.com>
+Signed-off-by: Xiang Liu <xiang.liu@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c   | 39 +++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  6 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c    |  3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c   | 29 ++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h   |  1 +
+ drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c |  3 +-
+ 7 files changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+index 6eb4e1bc3e7d..5a36d20c5ff7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+@@ -382,6 +382,39 @@ int amdgpu_cper_generate_ce_records(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++static u64 amdgpu_cper_ring_get_rptr(struct amdgpu_ring *ring)
++{
++	return *(ring->rptr_cpu_addr);
++}
++
++static u64 amdgpu_cper_ring_get_wptr(struct amdgpu_ring *ring)
++{
++	return ring->wptr;
++}
++
++static const struct amdgpu_ring_funcs cper_ring_funcs = {
++	.type = AMDGPU_RING_TYPE_CPER,
++	.align_mask = 0xff,
++	.support_64bit_ptrs = false,
++	.get_rptr = amdgpu_cper_ring_get_rptr,
++	.get_wptr = amdgpu_cper_ring_get_wptr,
++};
++
++static int amdgpu_cper_ring_init(struct amdgpu_device *adev)
++{
++	struct amdgpu_ring *ring = &(adev->cper.ring_buf);
++
++	ring->adev = NULL;
++	ring->ring_obj = NULL;
++	ring->use_doorbell = false;
++	ring->no_scheduler = true;
++	ring->funcs = &cper_ring_funcs;
++
++	sprintf(ring->name, "cper");
++	return amdgpu_ring_init(adev, ring, CPER_MAX_RING_SIZE, NULL, 0,
++				AMDGPU_RING_PRIO_DEFAULT, NULL);
++}
++
+ int amdgpu_cper_init(struct amdgpu_device *adev)
+ {
+ 	mutex_init(&adev->cper.cper_lock);
+@@ -389,16 +422,14 @@ int amdgpu_cper_init(struct amdgpu_device *adev)
+ 	adev->cper.enabled = true;
+ 	adev->cper.max_count = CPER_MAX_ALLOWED_COUNT;
+ 
+-	/*TODO: initialize cper ring*/
+-
+-	return 0;
++	return amdgpu_cper_ring_init(adev);
+ }
+ 
+ int amdgpu_cper_fini(struct amdgpu_device *adev)
+ {
+ 	adev->cper.enabled = false;
+ 
+-	/*TODO: free cper ring */
++	amdgpu_ring_fini(&(adev->cper.ring_buf));
+ 	adev->cper.count = 0;
+ 	adev->cper.wptr = 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
+index 6860a809f2f5..466ec59e5341 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
+@@ -29,6 +29,7 @@
+ #include "amdgpu_aca.h"
+ 
+ #define CPER_MAX_ALLOWED_COUNT		0x1000
++#define CPER_MAX_RING_SIZE		0X100000
+ #define HDR_LEN				(sizeof(struct cper_hdr))
+ #define SEC_DESC_LEN			(sizeof(struct cper_sec_desc))
+ 
+@@ -62,6 +63,7 @@ struct amdgpu_cper {
+ 	uint32_t wptr;
+ 
+ 	void *ring[CPER_MAX_ALLOWED_COUNT];
++	struct amdgpu_ring ring_buf;
+ };
+ 
+ void amdgpu_cper_entry_fill_hdr(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 35a8612667c4..6ae2972907ac 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -3097,7 +3097,8 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 
+ 	amdgpu_fru_get_product_info(adev);
+ 
+-	r = amdgpu_cper_init(adev);
++	if (amdgpu_aca_is_enabled(adev))
++		r = amdgpu_cper_init(adev);
+ 
+ init_failed:
+ 
+@@ -3459,7 +3460,8 @@ static int amdgpu_device_ip_fini(struct amdgpu_device *adev)
+ {
+ 	int i, r;
+ 
+-	amdgpu_cper_fini(adev);
++	if (amdgpu_aca_is_enabled(adev))
++		amdgpu_cper_fini(adev);
+ 
+ 	if (amdgpu_sriov_vf(adev) && adev->virt.ras_init_done)
+ 		amdgpu_virt_release_ras_err_handler_data(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index cb914ce82eb5..c6e5c50a3322 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -591,7 +591,8 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
+ 
+ 		if (ring == &adev->mes.ring[0] ||
+ 		    ring == &adev->mes.ring[1] ||
+-		    ring == &adev->umsch_mm.ring)
++		    ring == &adev->umsch_mm.ring ||
++		    ring == &adev->cper.ring_buf)
+ 			continue;
+ 
+ 		inv_eng = ffs(vm_inv_engs[vmhub]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index a6e28fe3f8d6..665c7b2b6436 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -324,20 +324,27 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
+ 	/* always set cond_exec_polling to CONTINUE */
+ 	*ring->cond_exe_cpu_addr = 1;
+ 
+-	r = amdgpu_fence_driver_start_ring(ring, irq_src, irq_type);
+-	if (r) {
+-		dev_err(adev->dev, "failed initializing fences (%d).\n", r);
+-		return r;
+-	}
++	if (ring->funcs->type != AMDGPU_RING_TYPE_CPER) {
++		r = amdgpu_fence_driver_start_ring(ring, irq_src, irq_type);
++		if (r) {
++			dev_err(adev->dev, "failed initializing fences (%d).\n", r);
++			return r;
++		}
+ 
+-	max_ibs_dw = ring->funcs->emit_frame_size +
+-		     amdgpu_ring_max_ibs(ring->funcs->type) * ring->funcs->emit_ib_size;
+-	max_ibs_dw = (max_ibs_dw + ring->funcs->align_mask) & ~ring->funcs->align_mask;
++		max_ibs_dw = ring->funcs->emit_frame_size +
++			     amdgpu_ring_max_ibs(ring->funcs->type) * ring->funcs->emit_ib_size;
++		max_ibs_dw = (max_ibs_dw + ring->funcs->align_mask) & ~ring->funcs->align_mask;
+ 
+-	if (WARN_ON(max_ibs_dw > max_dw))
+-		max_dw = max_ibs_dw;
++		if (WARN_ON(max_ibs_dw > max_dw))
++			max_dw = max_ibs_dw;
+ 
+-	ring->ring_size = roundup_pow_of_two(max_dw * 4 * sched_hw_submission);
++		ring->ring_size = roundup_pow_of_two(max_dw * 4 * sched_hw_submission);
++	} else {
++		ring->ring_size = roundup_pow_of_two(max_dw * 4);
++		ring->count_dw = (ring->ring_size - 4) >> 2;
++		/* ring buffer is empty now */
++		ring->wptr = *ring->rptr_cpu_addr = 0;
++	}
+ 
+ 	ring->buf_mask = (ring->ring_size / 4) - 1;
+ 	ring->ptr_mask = ring->funcs->support_64bit_ptrs ?
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 04af26536f97..7372e4aed6b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -82,6 +82,7 @@ enum amdgpu_ring_type {
+ 	AMDGPU_RING_TYPE_KIQ,
+ 	AMDGPU_RING_TYPE_MES,
+ 	AMDGPU_RING_TYPE_UMSCH_MM,
++	AMDGPU_RING_TYPE_CPER,
+ };
+ 
+ enum amdgpu_ib_pool_type {
+diff --git a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+index 2753f282e42d..3c07517be09a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
++++ b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+@@ -77,7 +77,8 @@ static void aqua_vanjaram_set_xcp_id(struct amdgpu_device *adev,
+ 	ring->xcp_id = AMDGPU_XCP_NO_PARTITION;
+ 	if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)
+ 		adev->gfx.enforce_isolation[0].xcp_id = ring->xcp_id;
+-	if (adev->xcp_mgr->mode == AMDGPU_XCP_MODE_NONE)
++	if ((adev->xcp_mgr->mode == AMDGPU_XCP_MODE_NONE) ||
++	    (ring->funcs->type == AMDGPU_RING_TYPE_CPER))
+ 		return;
+ 
+ 	inst_mask = 1 << inst_idx;
+-- 
+2.25.1
+

@@ -1,0 +1,146 @@
+From 69ae40450ad1a43930deb6e82adf97479916dc18 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Mon, 24 Feb 2025 08:33:06 +0000
+Subject: [PATCH 45/45] perf tools/tests: Fix topdown groups test on hybrid
+ platforms
+
+When running topdown groups test on hybrid platforms like LNL/ARL, we
+see the following 2 commands fail.
+
+perf stat $cputype -e '{instructions,slots},topdown-retiring' true
+perf stat $cputype -e '{instructions,slots},{topdown-retiring}' true
+
+Take the 1st command as an example, 5 events are created on hybrid
+platform. They are cpu_atom/instructions/, cpu_core/instructions/,
+cpu_core/slots/, cpu_atom/topdown-retiring/ and
+cpu_core/topdown-retiring/ events. The former 3 events are in a group
+and the latter 2 topdown-retiring events are independent events.
+
+As the limitation of current implementation, the
+cpu_core/topdown-retiring/ event can't be moved into previous group as
+long as there are other events before it. That's the reason why we see
+the failure.
+
+Thus add "--cputype core" option to limit only P-core events are tested.
+
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ tools/perf/arch/x86/util/evlist.c | 26 +++++++++++++++++++++++---
+ tools/perf/tests/shell/stat.sh    | 20 ++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/tools/perf/arch/x86/util/evlist.c b/tools/perf/arch/x86/util/evlist.c
+index 447a734e591c..0a71ba975871 100644
+--- a/tools/perf/arch/x86/util/evlist.c
++++ b/tools/perf/arch/x86/util/evlist.c
+@@ -9,7 +9,7 @@ int arch_evlist__cmp(const struct evsel *lhs, const struct evsel *rhs)
+ {
+ 	/*
+ 	 * Currently the following topdown events sequence are supported to
+-	 * move and regroup correctly.
++	 * move and regroup correctly on non-hybrid platforms.
+ 	 *
+ 	 * a. all events in a group
+ 	 *    perf stat -e "{instructions,topdown-retiring,slots}" -C0 sleep 1
+@@ -44,7 +44,7 @@ int arch_evlist__cmp(const struct evsel *lhs, const struct evsel *rhs)
+ 	 * topdown metrics events must be first event after the slots event group,
+ 	 * otherwise topdown metrics events can't be regrouped correctly, e.g.
+ 	 *
+-	 * a. perf stat -e "{instructions,slots},cycles,topdown-retiring" -C0 sleep 1
++	 * e. perf stat -e "{instructions,slots},cycles,topdown-retiring" -C0 sleep 1
+ 	 *    WARNING: events were regrouped to match PMUs
+ 	 *     Performance counter stats for 'CPU(s) 0':
+ 	 *         17,923,134      slots
+@@ -56,11 +56,31 @@ int arch_evlist__cmp(const struct evsel *lhs, const struct evsel *rhs)
+ 	 * has topdown metrics events must contain only the topdown metrics event,
+ 	 * otherwise topdown metrics event can't be regrouped correctly as well, e.g.
+ 	 *
+-	 * a. perf stat -e "{instructions,slots},{topdown-retiring,cycles}" -C0 sleep 1
++	 * f. perf stat -e "{instructions,slots},{topdown-retiring,cycles}" -C0 sleep 1
+ 	 *    WARNING: events were regrouped to match PMUs
+ 	 *    Error:
+ 	 *    The sys_perf_event_open() syscall returned with 22 (Invalid argument) for
+ 	 *    event (topdown-retiring)
++	 *
++	 * For hybrid platforms, the sequences 'c' and 'd' are not supported as well
++	 * besides above sequences 'e' and 'f'.
++	 *
++	 *    perf stat -e "{instructions,slots},topdown-retiring" -C0 sleep 1
++	 *    perf stat -e "{instructions,slots},{topdown-retiring}" -C0 sleep 1
++	 *
++	 * On hybrid platforms each event would create an instance on all types of PMU
++	 * if the event can be supported by the PMU, i.e., the "topdown-retiring" event
++	 * would create two instances on hybrid platforms with P-cores and E-cores,
++	 * "cpu_core/topdown-retiring/" and "cpu_atom/topdown_retiring".
++	 *
++	 * Take the first command as an example, the events list would be converted to
++	 * below list in fact.
++	 *
++	 * "{cpu_atom/instructions/,cpu_core/instructions/,cpu_core/slots/},
++	 *  cpu_atom/topdown-retiring/,cpu_core/topdown-retiring/"
++	 *
++	 * This is actually same with event list in case 'e', "cpu_core/topdown-retiring/"
++	 * event can't be moved into previous events group.
+ 	 */
+ 	if (topdown_sys_has_perf_metrics() &&
+ 	    (arch_evsel__must_be_in_group(lhs) || arch_evsel__must_be_in_group(rhs))) {
+diff --git a/tools/perf/tests/shell/stat.sh b/tools/perf/tests/shell/stat.sh
+index 68323d636fb7..cdfe27c25528 100755
+--- a/tools/perf/tests/shell/stat.sh
++++ b/tools/perf/tests/shell/stat.sh
+@@ -5,6 +5,16 @@
+ set -e
+ 
+ err=0
++is_hybrid=false
++
++check_hybrid_platform() {
++  pmus=$(ls /sys/bus/event_source/devices/*/cpus 2>/dev/null | wc -l)
++  if [ "$pmus" -gt 1 ]
++  then
++    is_hybrid=true
++  fi
++}
++
+ test_default_stat() {
+   echo "Basic stat command test"
+   if ! perf stat true 2>&1 | grep -E -q "Performance counter stats for 'true':"
+@@ -62,6 +72,11 @@ test_topdown_groups() {
+   # Topdown events must be grouped with the slots event first. Test that
+   # parse-events reorders this.
+   echo "Topdown event group test"
++  cputype=""
++  if $is_hybrid
++  then
++    cputype="--cputype core"
++  fi
+   if ! perf stat -e '{slots,topdown-retiring}' true > /dev/null 2>&1
+   then
+     echo "Topdown event group test [Skipped event parsing failed]"
+@@ -85,13 +100,13 @@ test_topdown_groups() {
+     err=1
+     return
+   fi
+-  if perf stat -e '{instructions,slots},topdown-retiring' true 2>&1 | grep -E -q "<not supported>"
++  if perf stat $cputype -e '{instructions,slots},topdown-retiring' true 2>&1 | grep -E -q "<not supported>"
+   then
+     echo "Topdown event group test [Failed topdown metrics event not move into slots group]"
+     err=1
+     return
+   fi
+-  if perf stat -e '{instructions,slots},{topdown-retiring}' true 2>&1 | grep -E -q "<not supported>"
++  if perf stat $cputype -e '{instructions,slots},{topdown-retiring}' true 2>&1 | grep -E -q "<not supported>"
+   then
+     echo "Topdown event group test [Failed topdown metrics group not merge into slots group]"
+     err=1
+@@ -200,6 +215,7 @@ test_hybrid() {
+   echo "hybrid test [Success]"
+ }
+ 
++check_hybrid_platform
+ test_default_stat
+ test_stat_record_report
+ test_stat_record_script
+-- 
+2.25.1
+

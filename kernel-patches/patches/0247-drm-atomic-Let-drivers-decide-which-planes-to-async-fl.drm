@@ -1,0 +1,226 @@
+From 0f988703d7ecf73bd70ee91622849b296018b53c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Andr=C3=A9=20Almeida?= <andrealmeid@igalia.com>
+Date: Mon, 27 Jan 2025 16:59:39 -0300
+Subject: [PATCH 0247/1107] drm/atomic: Let drivers decide which planes to
+ async flip
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, DRM atomic uAPI allows only primary planes to be flipped
+asynchronously. However, each driver might be able to perform async
+flips in other different plane types. To enable drivers to set their own
+restrictions on which type of plane they can or cannot flip, use the
+existing atomic_async_check() from struct drm_plane_helper_funcs to
+enhance this flexibility, thus allowing different plane types to be able
+to do async flips as well.
+
+Create a new parameter for the atomic_async_check(), `bool flip`. This
+parameter is used to distinguish when this function is being called from
+a plane update from a full page flip.
+
+In order to prevent regressions and such, we keep the current policy: we
+skip the driver check for the primary plane, because it is always
+allowed to do async flips on it.
+
+Signed-off-by: André Almeida <andrealmeid@igalia.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Christopher Snowhill <chris@kode54.net>
+Tested-by: Christopher Snowhill <chris@kode54.net>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250127-tonyk-async_flip-v12-1-0f7f8a8610d3@igalia.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ drivers/gpu/drm/drm_atomic_helper.c         |  2 +-
+ drivers/gpu/drm/drm_atomic_uapi.c           | 37 +++++++++++++++------
+ drivers/gpu/drm/loongson/lsdc_plane.c       |  3 +-
+ drivers/gpu/drm/mediatek/mtk_plane.c        |  2 +-
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c  |  2 +-
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c |  2 +-
+ drivers/gpu/drm/tegra/dc.c                  |  3 +-
+ drivers/gpu/drm/vc4/vc4_plane.c             |  2 +-
+ include/drm/drm_modeset_helper_vtables.h    |  7 +++-
+ 9 files changed, 42 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index d6a206fc9ddd..fd3d14592663 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -1966,7 +1966,7 @@ int drm_atomic_helper_async_check(struct drm_device *dev,
+ 		return -EBUSY;
+ 	}
+ 
+-	ret = funcs->atomic_async_check(plane, state);
++	ret = funcs->atomic_async_check(plane, state, false);
+ 	if (ret != 0)
+ 		drm_dbg_atomic(dev,
+ 			       "[PLANE:%d:%s] driver async check failed\n",
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index 370dc676e3aa..2765ba90ad8f 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -27,8 +27,9 @@
+  * Daniel Vetter <daniel.vetter@ffwll.ch>
+  */
+ 
+-#include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_drv.h>
+@@ -1063,6 +1064,7 @@ int drm_atomic_set_property(struct drm_atomic_state *state,
+ 		struct drm_plane *plane = obj_to_plane(obj);
+ 		struct drm_plane_state *plane_state;
+ 		struct drm_mode_config *config = &plane->dev->mode_config;
++		const struct drm_plane_helper_funcs *plane_funcs = plane->helper_private;
+ 
+ 		plane_state = drm_atomic_get_plane_state(state, plane);
+ 		if (IS_ERR(plane_state)) {
+@@ -1070,15 +1072,30 @@ int drm_atomic_set_property(struct drm_atomic_state *state,
+ 			break;
+ 		}
+ 
+-		if (async_flip &&
+-		    (plane_state->plane->type != DRM_PLANE_TYPE_PRIMARY ||
+-		     (prop != config->prop_fb_id &&
+-		      prop != config->prop_in_fence_fd &&
+-		      prop != config->prop_fb_damage_clips))) {
+-			ret = drm_atomic_plane_get_property(plane, plane_state,
+-							    prop, &old_val);
+-			ret = drm_atomic_check_prop_changes(ret, old_val, prop_value, prop);
+-			break;
++		if (async_flip) {
++			/* check if the prop does a nop change */
++			if ((prop != config->prop_fb_id &&
++			     prop != config->prop_in_fence_fd &&
++			     prop != config->prop_fb_damage_clips)) {
++				ret = drm_atomic_plane_get_property(plane, plane_state,
++								    prop, &old_val);
++				ret = drm_atomic_check_prop_changes(ret, old_val, prop_value, prop);
++			}
++
++			/* ask the driver if this non-primary plane is supported */
++			if (plane->type != DRM_PLANE_TYPE_PRIMARY) {
++				ret = -EINVAL;
++
++				if (plane_funcs && plane_funcs->atomic_async_check)
++					ret = plane_funcs->atomic_async_check(plane, state, true);
++
++				if (ret) {
++					drm_dbg_atomic(prop->dev,
++						       "[PLANE:%d:%s] does not support async flips\n",
++						       obj->id, plane->name);
++					break;
++				}
++			}
+ 		}
+ 
+ 		ret = drm_atomic_plane_set_property(plane,
+diff --git a/drivers/gpu/drm/loongson/lsdc_plane.c b/drivers/gpu/drm/loongson/lsdc_plane.c
+index d227a2c1dcf1..aa9a97f9c4dc 100644
+--- a/drivers/gpu/drm/loongson/lsdc_plane.c
++++ b/drivers/gpu/drm/loongson/lsdc_plane.c
+@@ -171,7 +171,8 @@ static const struct drm_plane_helper_funcs lsdc_primary_helper_funcs = {
+ };
+ 
+ static int lsdc_cursor_plane_atomic_async_check(struct drm_plane *plane,
+-						struct drm_atomic_state *state)
++						struct drm_atomic_state *state,
++						bool flip)
+ {
+ 	struct drm_plane_state *new_state;
+ 	struct drm_crtc_state *crtc_state;
+diff --git a/drivers/gpu/drm/mediatek/mtk_plane.c b/drivers/gpu/drm/mediatek/mtk_plane.c
+index 8a48b3b0a956..655106bbb76d 100644
+--- a/drivers/gpu/drm/mediatek/mtk_plane.c
++++ b/drivers/gpu/drm/mediatek/mtk_plane.c
+@@ -101,7 +101,7 @@ static void mtk_plane_destroy_state(struct drm_plane *plane,
+ }
+ 
+ static int mtk_plane_atomic_async_check(struct drm_plane *plane,
+-					struct drm_atomic_state *state)
++					struct drm_atomic_state *state, bool flip)
+ {
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+diff --git a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+index 62de248ed1b0..bb1601921938 100644
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+@@ -368,7 +368,7 @@ static void mdp5_plane_atomic_update(struct drm_plane *plane,
+ }
+ 
+ static int mdp5_plane_atomic_async_check(struct drm_plane *plane,
+-					 struct drm_atomic_state *state)
++					 struct drm_atomic_state *state, bool flip)
+ {
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 57747f1cff26..e3596e2b557d 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -1072,7 +1072,7 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ }
+ 
+ static int vop_plane_atomic_async_check(struct drm_plane *plane,
+-					struct drm_atomic_state *state)
++					struct drm_atomic_state *state, bool flip)
+ {
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+diff --git a/drivers/gpu/drm/tegra/dc.c b/drivers/gpu/drm/tegra/dc.c
+index 430b2eededb2..798507a8ae56 100644
+--- a/drivers/gpu/drm/tegra/dc.c
++++ b/drivers/gpu/drm/tegra/dc.c
+@@ -1025,7 +1025,8 @@ static void tegra_cursor_atomic_disable(struct drm_plane *plane,
+ 	tegra_dc_writel(dc, value, DC_DISP_DISP_WIN_OPTIONS);
+ }
+ 
+-static int tegra_cursor_atomic_async_check(struct drm_plane *plane, struct drm_atomic_state *state)
++static int tegra_cursor_atomic_async_check(struct drm_plane *plane, struct drm_atomic_state *state,
++					   bool flip)
+ {
+ 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
+ 	struct drm_crtc_state *crtc_state;
+diff --git a/drivers/gpu/drm/vc4/vc4_plane.c b/drivers/gpu/drm/vc4/vc4_plane.c
+index d608860d525f..c5e84d3494d2 100644
+--- a/drivers/gpu/drm/vc4/vc4_plane.c
++++ b/drivers/gpu/drm/vc4/vc4_plane.c
+@@ -2338,7 +2338,7 @@ static void vc4_plane_atomic_async_update(struct drm_plane *plane,
+ }
+ 
+ static int vc4_plane_atomic_async_check(struct drm_plane *plane,
+-					struct drm_atomic_state *state)
++					struct drm_atomic_state *state, bool flip)
+ {
+ 	struct vc4_dev *vc4 = to_vc4_dev(plane->dev);
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+diff --git a/include/drm/drm_modeset_helper_vtables.h b/include/drm/drm_modeset_helper_vtables.h
+index b62f41f48962..ce7c7aeac887 100644
+--- a/include/drm/drm_modeset_helper_vtables.h
++++ b/include/drm/drm_modeset_helper_vtables.h
+@@ -1400,13 +1400,18 @@ struct drm_plane_helper_funcs {
+ 	 * given update can be committed asynchronously, that is, if it can
+ 	 * jump ahead of the state currently queued for update.
+ 	 *
++	 * This function is also used by drm_atomic_set_property() to determine
++	 * if the plane can be flipped in async. The flip flag is used to
++	 * distinguish if the function is used for just the plane state or for a
++	 * flip.
++	 *
+ 	 * RETURNS:
+ 	 *
+ 	 * Return 0 on success and any error returned indicates that the update
+ 	 * can not be applied in asynchronous manner.
+ 	 */
+ 	int (*atomic_async_check)(struct drm_plane *plane,
+-				  struct drm_atomic_state *state);
++				  struct drm_atomic_state *state, bool flip);
+ 
+ 	/**
+ 	 * @atomic_async_update:
+-- 
+2.25.1
+

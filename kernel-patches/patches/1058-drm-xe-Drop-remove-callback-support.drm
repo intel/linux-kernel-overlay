@@ -1,0 +1,185 @@
+From df42c764c990e258786e1a3f5678680690da110f Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Fri, 21 Feb 2025 16:10:46 -0800
+Subject: [PATCH 1058/1107] drm/xe: Drop remove callback support
+
+Now that devres supports component driver cleanup during driver removal
+cleanup, the xe custom support for removal callbacks is not needed
+anymore. Drop it.
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250222001051.3012936-7-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/xe_device.c       | 68 ----------------------------
+ drivers/gpu/drm/xe/xe_device.h       |  3 --
+ drivers/gpu/drm/xe/xe_device_types.h | 14 ------
+ drivers/gpu/drm/xe/xe_pci.c          |  4 +-
+ 4 files changed, 1 insertion(+), 88 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 64d3a26ad4a3..e76d233025a6 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -65,12 +65,6 @@
+ 
+ #include <generated/xe_wa_oob.h>
+ 
+-struct xe_device_remove_action {
+-	struct list_head node;
+-	void (*action)(void *);
+-	void *data;
+-};
+-
+ static int xe_file_open(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct xe_device *xe = to_xe_device(dev);
+@@ -752,9 +746,6 @@ int xe_device_probe(struct xe_device *xe)
+ 	int err;
+ 	u8 id;
+ 
+-	xe->probing = true;
+-	INIT_LIST_HEAD(&xe->remove_action_list);
+-
+ 	xe_pat_init_early(xe);
+ 
+ 	err = xe_sriov_init(xe);
+@@ -904,8 +895,6 @@ int xe_device_probe(struct xe_device *xe)
+ 
+ 	xe_vsec_init(xe);
+ 
+-	xe->probing = false;
+-
+ 	return devm_add_action_or_reset(xe->drm.dev, xe_device_sanitize, xe);
+ 
+ err_unregister_display:
+@@ -916,61 +905,6 @@ int xe_device_probe(struct xe_device *xe)
+ 	return err;
+ }
+ 
+-/**
+- * xe_device_call_remove_actions - Call the remove actions
+- * @xe: xe device instance
+- *
+- * This is only to be used by xe_pci and xe_device to call the remove actions
+- * while removing the driver or handling probe failures.
+- */
+-void xe_device_call_remove_actions(struct xe_device *xe)
+-{
+-	struct xe_device_remove_action *ra, *tmp;
+-
+-	list_for_each_entry_safe(ra, tmp, &xe->remove_action_list, node) {
+-		ra->action(ra->data);
+-		list_del(&ra->node);
+-		kfree(ra);
+-	}
+-
+-	xe->probing = false;
+-}
+-
+-/**
+- * xe_device_add_action_or_reset - Add an action to run on driver removal
+- * @xe: xe device instance
+- * @action: Function that should be called on device remove
+- * @data: Pointer to data passed to @action implementation
+- *
+- * This adds a custom action to the list of remove callbacks executed on device
+- * remove, before any dev or drm managed resources are removed.  This is only
+- * needed if the action leads to component_del()/component_master_del() since
+- * that is not compatible with devres cleanup.
+- *
+- * Returns: 0 on success or a negative error code on failure, in which case
+- * @action is already called.
+- */
+-int xe_device_add_action_or_reset(struct xe_device *xe,
+-				  void (*action)(void *), void *data)
+-{
+-	struct xe_device_remove_action *ra;
+-
+-	drm_WARN_ON(&xe->drm, !xe->probing);
+-
+-	ra = kmalloc(sizeof(*ra), GFP_KERNEL);
+-	if (!ra) {
+-		action(data);
+-		return -ENOMEM;
+-	}
+-
+-	INIT_LIST_HEAD(&ra->node);
+-	ra->action = action;
+-	ra->data = data;
+-	list_add(&ra->node, &xe->remove_action_list);
+-
+-	return 0;
+-}
+-
+ void xe_device_remove(struct xe_device *xe)
+ {
+ 	xe_display_unregister(xe);
+@@ -980,8 +914,6 @@ void xe_device_remove(struct xe_device *xe)
+ 	xe_display_driver_remove(xe);
+ 
+ 	xe_heci_gsc_fini(xe);
+-
+-	xe_device_call_remove_actions(xe);
+ }
+ 
+ void xe_device_shutdown(struct xe_device *xe)
+diff --git a/drivers/gpu/drm/xe/xe_device.h b/drivers/gpu/drm/xe/xe_device.h
+index 079dad32a6f5..0bc3bc8e6803 100644
+--- a/drivers/gpu/drm/xe/xe_device.h
++++ b/drivers/gpu/drm/xe/xe_device.h
+@@ -45,9 +45,6 @@ struct xe_device *xe_device_create(struct pci_dev *pdev,
+ 				   const struct pci_device_id *ent);
+ int xe_device_probe_early(struct xe_device *xe);
+ int xe_device_probe(struct xe_device *xe);
+-int xe_device_add_action_or_reset(struct xe_device *xe,
+-				  void (*action)(void *), void *data);
+-void xe_device_call_remove_actions(struct xe_device *xe);
+ void xe_device_remove(struct xe_device *xe);
+ void xe_device_shutdown(struct xe_device *xe);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 0921e957d784..797a04f37048 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -428,20 +428,6 @@ struct xe_device {
+ 	/** @tiles: device tiles */
+ 	struct xe_tile tiles[XE_MAX_TILES_PER_DEVICE];
+ 
+-	/**
+-	 * @remove_action_list: list of actions to execute on device remove.
+-	 * Use xe_device_add_remove_action() for that. Actions can only be added
+-	 * during probe and are executed during the call from PCI subsystem to
+-	 * remove the driver from the device.
+-	 */
+-	struct list_head remove_action_list;
+-
+-	/**
+-	 * @probing: cover the section in which @remove_action_list can be used
+-	 * to post cleaning actions
+-	 */
+-	bool probing;
+-
+ 	/**
+ 	 * @mem_access: keep track of memory access in the device, possibly
+ 	 * triggering additional actions when they occur.
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index ec1e4548fd27..660c905c6532 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -897,10 +897,8 @@ static int xe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		return err;
+ 
+ 	err = xe_device_probe(xe);
+-	if (err) {
+-		xe_device_call_remove_actions(xe);
++	if (err)
+ 		return err;
+-	}
+ 
+ 	err = xe_pm_init(xe);
+ 	if (err)
+-- 
+2.25.1
+

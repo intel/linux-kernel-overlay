@@ -1,0 +1,130 @@
+From 973afc49e62c2243b0f6431e36dfbebf165f3c54 Mon Sep 17 00:00:00 2001
+From: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Date: Tue, 10 Dec 2024 22:43:43 -0800
+Subject: [PATCH 0041/1107] drm/virtio: Lock the VGA resources during
+ initialization
+
+If another driver for a VGA compatible GPU (that is passthrough'd)
+locks the VGA resources (by calling vga_get()), then virtio_gpu
+driver would encounter the following errors and fail to load during
+probe and initialization:
+
+Invalid read at addr 0x7200005014, size 1, region '(null)', reason: rejected
+Invalid write at addr 0x7200005014, size 1, region '(null)', reason: rejected
+virtio_gpu virtio0: virtio: device uses modern interface but does not have VIRTIO_F_VERSION_1
+virtio_gpu virtio0: probe with driver virtio_gpu failed with error -22
+
+This issue is only seen if virtio-gpu and the other GPU are on
+different PCI buses, which can happen if the user includes an
+additional PCIe port and associates the VGA compatible GPU with
+it while launching Qemu:
+qemu-system-x86_64...
+-device virtio-vga,max_outputs=1,xres=1920,yres=1080,blob=true
+-device pcie-root-port,id=pcie.1,bus=pcie.0,addr=1c.0,slot=1,chassis=1,multifunction=on
+-device vfio-pci,host=03:00.0,bus=pcie.1,addr=00.0 ...
+
+In the above example, the device 03:00.0 is an Intel DG2 card and
+this issue is seen when both i915 driver and virtio_gpu driver are
+loading (or initializing) concurrently or when i915 is loaded first.
+Note that during initalization, i915 driver does the following in
+intel_vga_reset_io_mem():
+vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+outb(inb(VGA_MIS_R), VGA_MIS_W);
+vga_put(pdev, VGA_RSRC_LEGACY_IO);
+
+Although, virtio-gpu might own the VGA resources initially, the
+above call (in i915) to vga_get_uninterruptible() would result in
+these resources being taken away, which means that virtio-gpu would
+not be able to decode VGA anymore. This happens in __vga_tryget()
+when it calls
+pci_set_vga_state(conflict->pdev, false, pci_bits, flags);
+where
+pci_bits = PCI_COMMAND_MEMORY | PCI_COMMAND_IO
+flags = PCI_VGA_STATE_CHANGE_DECODES | PCI_VGA_STATE_CHANGE_BRIDGE
+
+Therefore, to solve this issue, virtio-gpu driver needs to call
+vga_get() whenever it needs to reclaim and access VGA resources,
+which is during initial probe and setup. After that, a call to
+vga_put() would release the lock to allow other VGA compatible
+devices to access these shared VGA resources.
+
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Gurchetan Singh <gurchetansingh@chromium.org>
+Cc: Chia-I Wu <olvaffe@gmail.com>
+Reported-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241211064343.550153-1-vivek.kasireddy@intel.com
+Tested-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.c | 40 +++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index f4f62326a98f..b8a0f80814fe 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -30,6 +30,7 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/poll.h>
++#include <linux/vgaarb.h>
+ #include <linux/wait.h>
+ 
+ #include <drm/clients/drm_client_setup.h>
+@@ -41,6 +42,8 @@
+ 
+ #include "virtgpu_drv.h"
+ 
++#define PCI_DEVICE_ID_VIRTIO_GPU 0x1050
++
+ static const struct drm_driver driver;
+ 
+ static int virtio_gpu_modeset = -1;
+@@ -219,7 +222,42 @@ static struct virtio_driver virtio_gpu_driver = {
+ #endif
+ };
+ 
+-module_virtio_driver(virtio_gpu_driver);
++static int __init virtio_gpu_driver_init(void)
++{
++	struct pci_dev *pdev;
++	int ret;
++
++	pdev = pci_get_device(PCI_VENDOR_ID_REDHAT_QUMRANET,
++			      PCI_DEVICE_ID_VIRTIO_GPU,
++			      NULL);
++	if (!pdev)
++		return -ENODEV;
++
++	if (pci_is_vga(pdev)) {
++		ret = vga_get_interruptible(pdev,
++			VGA_RSRC_LEGACY_IO | VGA_RSRC_LEGACY_MEM);
++		if (ret)
++			goto error;
++	}
++
++	ret = register_virtio_driver(&virtio_gpu_driver);
++
++	if (pci_is_vga(pdev))
++		vga_put(pdev, VGA_RSRC_LEGACY_IO | VGA_RSRC_LEGACY_MEM);
++
++error:
++	pci_dev_put(pdev);
++
++	return ret;
++}
++
++static void __exit virtio_gpu_driver_exit(void)
++{
++	unregister_virtio_driver(&virtio_gpu_driver);
++}
++
++module_init(virtio_gpu_driver_init);
++module_exit(virtio_gpu_driver_exit);
+ 
+ MODULE_DEVICE_TABLE(virtio, id_table);
+ MODULE_DESCRIPTION("Virtio GPU driver");
+-- 
+2.25.1
+

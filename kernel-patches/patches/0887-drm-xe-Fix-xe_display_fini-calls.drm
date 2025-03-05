@@ -1,0 +1,178 @@
+From 39ec38e870491ea81219b30f6cc3bf3de3dc9d9b Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Thu, 13 Feb 2025 11:28:58 -0800
+Subject: [PATCH 0887/1107] drm/xe: Fix xe_display_fini() calls
+
+xe_display_fini() undoes things from xe_display_init() (technically from
+intel_display_driver_probe()). Those `goto err` in xe_device_probe()
+were wrong and being accumulated over time.
+
+Commit 65e366ace5ee ("drm/xe/display: Use a single early init call for
+display") made it easier to fix now that we don't have xe_display_* init
+calls spread on xe_device_probe(). Change xe_display_init() to use
+devm_add_action_or_reset() that will finalize display in the right
+order.
+
+While at it, also add a newline and comment about calling
+xe_driver_flr_fini.
+
+Cc: Maarten Lankhorst <dev@lankhorst.se>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250213192909.996148-2-lucas.demarchi@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/display/xe_display.c | 22 ++++++++++++----------
+ drivers/gpu/drm/xe/display/xe_display.h |  2 --
+ drivers/gpu/drm/xe/xe_device.c          | 21 +++++++++++----------
+ 3 files changed, 23 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 06982a44f44f..ac0804726e55 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -162,27 +162,29 @@ int xe_display_init_early(struct xe_device *xe)
+ 	return err;
+ }
+ 
+-int xe_display_init(struct xe_device *xe)
++static void xe_display_fini(void *arg)
+ {
++	struct xe_device *xe = arg;
+ 	struct intel_display *display = &xe->display;
+ 
+-	if (!xe->info.probe_display)
+-		return 0;
+-
+-	return intel_display_driver_probe(display);
++	intel_hpd_poll_fini(xe);
++	intel_hdcp_component_fini(display);
++	intel_audio_deinit(xe);
+ }
+ 
+-void xe_display_fini(struct xe_device *xe)
++int xe_display_init(struct xe_device *xe)
+ {
+ 	struct intel_display *display = &xe->display;
++	int err;
+ 
+ 	if (!xe->info.probe_display)
+-		return;
++		return 0;
+ 
+-	intel_hpd_poll_fini(xe);
++	err = intel_display_driver_probe(display);
++	if (err)
++		return err;
+ 
+-	intel_hdcp_component_fini(display);
+-	intel_audio_deinit(display);
++	return xe_device_add_action_or_reset(xe, xe_display_fini, xe);
+ }
+ 
+ void xe_display_register(struct xe_device *xe)
+diff --git a/drivers/gpu/drm/xe/display/xe_display.h b/drivers/gpu/drm/xe/display/xe_display.h
+index e2a99624f706..685dc74402fb 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.h
++++ b/drivers/gpu/drm/xe/display/xe_display.h
+@@ -22,7 +22,6 @@ int xe_display_probe(struct xe_device *xe);
+ 
+ int xe_display_init_early(struct xe_device *xe);
+ int xe_display_init(struct xe_device *xe);
+-void xe_display_fini(struct xe_device *xe);
+ 
+ void xe_display_register(struct xe_device *xe);
+ void xe_display_unregister(struct xe_device *xe);
+@@ -54,7 +53,6 @@ static inline int xe_display_probe(struct xe_device *xe) { return 0; }
+ 
+ static inline int xe_display_init_early(struct xe_device *xe) { return 0; }
+ static inline int xe_display_init(struct xe_device *xe) { return 0; }
+-static inline void xe_display_fini(struct xe_device *xe) {}
+ 
+ static inline void xe_display_register(struct xe_device *xe) {}
+ static inline void xe_display_unregister(struct xe_device *xe) {}
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 31da48d4fdb9..4f13cc4cd2ac 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -741,6 +741,7 @@ static int probe_has_flat_ccs(struct xe_device *xe)
+ 			"Flat CCS has been disabled in bios, May lead to performance impact");
+ 
+ 	xe_force_wake_put(gt_to_fw(gt), fw_ref);
++
+ 	return 0;
+ }
+ 
+@@ -812,22 +813,26 @@ int xe_device_probe(struct xe_device *xe)
+ 	err = xe_devcoredump_init(xe);
+ 	if (err)
+ 		return err;
++
++	/*
++	 * From here on, if a step fails, make sure a Driver-FLR is triggereed
++	 */
+ 	err = devm_add_action_or_reset(xe->drm.dev, xe_driver_flr_fini, xe);
+ 	if (err)
+ 		return err;
+ 
+ 	err = probe_has_flat_ccs(xe);
+ 	if (err)
+-		goto err;
++		return err;
+ 
+ 	err = xe_vram_probe(xe);
+ 	if (err)
+-		goto err;
++		return err;
+ 
+ 	for_each_tile(tile, xe, id) {
+ 		err = xe_tile_init_noalloc(tile);
+ 		if (err)
+-			goto err;
++			return err;
+ 	}
+ 
+ 	/* Allocate and map stolen after potential VRAM resize */
+@@ -841,17 +846,17 @@ int xe_device_probe(struct xe_device *xe)
+ 	 */
+ 	err = xe_display_init_early(xe);
+ 	if (err)
+-		goto err;
++		return err;
+ 
+ 	for_each_tile(tile, xe, id) {
+ 		err = xe_tile_init(tile);
+ 		if (err)
+-			goto err;
++			return err;
+ 	}
+ 
+ 	err = xe_irq_install(xe);
+ 	if (err)
+-		goto err;
++		return err;
+ 
+ 	for_each_gt(gt, xe, id) {
+ 		last_gt = id;
+@@ -913,8 +918,6 @@ int xe_device_probe(struct xe_device *xe)
+ 			break;
+ 	}
+ 
+-err:
+-	xe_display_fini(xe);
+ 	return err;
+ }
+ 
+@@ -990,8 +993,6 @@ void xe_device_remove(struct xe_device *xe)
+ 
+ 	xe_device_remove_display(xe);
+ 
+-	xe_display_fini(xe);
+-
+ 	xe_oa_fini(xe);
+ 
+ 	xe_heci_gsc_fini(xe);
+-- 
+2.25.1
+

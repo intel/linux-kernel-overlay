@@ -1,0 +1,212 @@
+From c2694e30921d1f8de7661cead9d2f8e66b531213 Mon Sep 17 00:00:00 2001
+From: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Date: Fri, 28 Feb 2025 11:38:00 +0200
+Subject: [PATCH 1027/1107] drm/i915/fbc: dirty rect support for FBC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dirty rectangle feature allows FBC to recompress a subsection
+of a frame. When this feature is enabled, display will read
+the scan lines between dirty rectangle start line and dirty
+rectangle end line in subsequent frames.
+
+Use the merged damage clip stored in the plane state to
+configure the FBC dirty rect areas.
+
+v2: - Move dirty rect handling to fbc state (Ville)
+
+v3: - Use intel_fbc_dirty_rect_update_noarm (Ville)
+    - Split plane damage collection and dirty rect preparation
+    - Handle case where dirty rect fall outside the visible region
+
+v4: - A state variable to check if we need to update dirty rect
+    registers in case intel_fbc_can_flip_nuke() (Ville)
+
+v5: - No need to use a separate valid flag, updates to the
+      conditions for prepare damage rect (Ville)
+    - Usage of locks in fbc dirty rect related functions (Ville)
+
+v6: - updates dirty rect handling (Ville)
+
+v7: - Loop through all planes in atomic state is good enough (Ville)
+
+Bspec: 68881, 71675, 73424
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Signed-off-by: Mika Kahola <mika.kahola@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250228093802.27091-8-vinod.govindapillai@intel.com
+---
+ .../gpu/drm/i915/display/intel_atomic_plane.c |  3 +
+ drivers/gpu/drm/i915/display/intel_display.c  |  2 +
+ drivers/gpu/drm/i915/display/intel_fbc.c      | 84 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_fbc.h      |  4 +
+ 4 files changed, 93 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.c b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+index 9ac3c008f375..a26b54185d5b 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+@@ -818,6 +818,9 @@ void intel_plane_update_noarm(struct intel_dsb *dsb,
+ 
+ 	trace_intel_plane_update_noarm(plane_state, crtc);
+ 
++	if (plane->fbc)
++		intel_fbc_dirty_rect_update_noarm(dsb, plane);
++
+ 	if (plane->update_noarm)
+ 		plane->update_noarm(dsb, plane, crtc_state, plane_state);
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 0966d5f26b36..f84cda000e41 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7254,6 +7254,8 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 
+ 	intel_atomic_prepare_plane_clear_colors(state);
+ 
++	intel_fbc_prepare_dirty_rect(state);
++
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
+ 		intel_atomic_dsb_finish(state, crtc);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc.c b/drivers/gpu/drm/i915/display/intel_fbc.c
+index ca44cec73fd2..ee2d75303e41 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc.c
++++ b/drivers/gpu/drm/i915/display/intel_fbc.c
+@@ -88,6 +88,7 @@ struct intel_fbc_state {
+ 	u16 override_cfb_stride;
+ 	u16 interval;
+ 	s8 fence_id;
++	struct drm_rect dirty_rect;
+ };
+ 
+ struct intel_fbc {
+@@ -523,6 +524,9 @@ static void ilk_fbc_deactivate(struct intel_fbc *fbc)
+ 	struct intel_display *display = fbc->display;
+ 	u32 dpfc_ctl;
+ 
++	if (HAS_FBC_DIRTY_RECT(display))
++		intel_de_write(display, XE3_FBC_DIRTY_CTL(fbc->id), 0);
++
+ 	/* Disable compression */
+ 	dpfc_ctl = intel_de_read(display, ILK_DPFC_CONTROL(fbc->id));
+ 	if (dpfc_ctl & DPFC_CTL_EN) {
+@@ -665,6 +669,10 @@ static void ivb_fbc_activate(struct intel_fbc *fbc)
+ 	if (DISPLAY_VER(display) >= 20)
+ 		intel_de_write(display, ILK_DPFC_CONTROL(fbc->id), dpfc_ctl);
+ 
++	if (HAS_FBC_DIRTY_RECT(display))
++		intel_de_write(display, XE3_FBC_DIRTY_CTL(fbc->id),
++			       FBC_DIRTY_RECT_EN);
++
+ 	intel_de_write(display, ILK_DPFC_CONTROL(fbc->id),
+ 		       DPFC_CTL_EN | dpfc_ctl);
+ }
+@@ -1196,6 +1204,82 @@ static bool tiling_is_valid(const struct intel_plane_state *plane_state)
+ 		return i8xx_fbc_tiling_valid(plane_state);
+ }
+ 
++static void
++intel_fbc_dirty_rect_update(struct intel_dsb *dsb, struct intel_fbc *fbc)
++{
++	struct intel_display *display = fbc->display;
++	const struct drm_rect *fbc_dirty_rect = &fbc->state.dirty_rect;
++
++	lockdep_assert_held(&fbc->lock);
++
++	intel_de_write_dsb(display, dsb, XE3_FBC_DIRTY_RECT(fbc->id),
++			   FBC_DIRTY_RECT_START_LINE(fbc_dirty_rect->y1) |
++			   FBC_DIRTY_RECT_END_LINE(fbc_dirty_rect->y2 - 1));
++}
++
++void
++intel_fbc_dirty_rect_update_noarm(struct intel_dsb *dsb,
++				  struct intel_plane *plane)
++{
++	struct intel_display *display = to_intel_display(plane);
++	struct intel_fbc *fbc = plane->fbc;
++
++	if (!HAS_FBC_DIRTY_RECT(display))
++		return;
++
++	mutex_lock(&fbc->lock);
++
++	if (fbc->state.plane == plane)
++		intel_fbc_dirty_rect_update(dsb, fbc);
++
++	mutex_unlock(&fbc->lock);
++}
++
++static void
++__intel_fbc_prepare_dirty_rect(const struct intel_plane_state *plane_state)
++{
++	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
++	struct intel_fbc *fbc = plane->fbc;
++	struct drm_rect *fbc_dirty_rect = &fbc->state.dirty_rect;
++	int width = drm_rect_width(&plane_state->uapi.src) >> 16;
++	const struct drm_rect *damage = &plane_state->damage;
++	int y_offset = plane_state->view.color_plane[0].y;
++
++	lockdep_assert_held(&fbc->lock);
++
++	if (drm_rect_visible(damage))
++		*fbc_dirty_rect = *damage;
++	else
++		/* dirty rect must cover at least one line */
++		*fbc_dirty_rect = DRM_RECT_INIT(0, y_offset, width, 1);
++}
++
++void
++intel_fbc_prepare_dirty_rect(struct intel_atomic_state *state)
++{
++	struct intel_display *display = to_intel_display(state);
++	struct intel_plane_state *plane_state;
++	struct intel_plane *plane;
++	int i;
++
++	if (!HAS_FBC_DIRTY_RECT(display))
++		return;
++
++	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
++		struct intel_fbc *fbc = plane->fbc;
++
++		if (!fbc)
++			continue;
++
++		mutex_lock(&fbc->lock);
++
++		if (fbc->state.plane == plane)
++			__intel_fbc_prepare_dirty_rect(plane_state);
++
++		mutex_unlock(&fbc->lock);
++	}
++}
++
+ static void intel_fbc_update_state(struct intel_atomic_state *state,
+ 				   struct intel_crtc *crtc,
+ 				   struct intel_plane *plane)
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc.h b/drivers/gpu/drm/i915/display/intel_fbc.h
+index 2e1dd7e8a18f..08743057ff14 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc.h
++++ b/drivers/gpu/drm/i915/display/intel_fbc.h
+@@ -13,6 +13,7 @@ struct intel_atomic_state;
+ struct intel_crtc;
+ struct intel_crtc_state;
+ struct intel_display;
++struct intel_dsb;
+ struct intel_fbc;
+ struct intel_plane;
+ struct intel_plane_state;
+@@ -47,5 +48,8 @@ void intel_fbc_handle_fifo_underrun_irq(struct intel_display *display);
+ void intel_fbc_reset_underrun(struct intel_display *display);
+ void intel_fbc_crtc_debugfs_add(struct intel_crtc *crtc);
+ void intel_fbc_debugfs_register(struct intel_display *display);
++void intel_fbc_prepare_dirty_rect(struct intel_atomic_state *state);
++void intel_fbc_dirty_rect_update_noarm(struct intel_dsb *dsb,
++				       struct intel_plane *plane);
+ 
+ #endif /* __INTEL_FBC_H__ */
+-- 
+2.25.1
+

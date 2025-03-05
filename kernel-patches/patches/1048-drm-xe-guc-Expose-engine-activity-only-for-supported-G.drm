@@ -1,0 +1,155 @@
+From b82c42a1f722e7c5a119c4884e1b46818501da0e Mon Sep 17 00:00:00 2001
+From: Riana Tauro <riana.tauro@intel.com>
+Date: Mon, 24 Feb 2025 11:09:00 +0530
+Subject: [PATCH 1048/1107] drm/xe/guc: Expose engine activity only for
+ supported GuC version
+
+Engine activity is supported only on GuC submission version >= 1.14.1
+Allow enabling/reading engine activity only on supported
+GuC versions. Warn once if not supported.
+
+v2: use guc interface version (John)
+v3: use debug log (Umesh)
+v4: use variable for supported and use gt logs
+    use a friendlier log message (Michal)
+v5: fix kernel-doc
+    do not continue in init if not supported (Michal)
+v6: remove hardcoding values (Michal)
+
+Cc: John Harrison <John.C.Harrison@Intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Signed-off-by: Riana Tauro <riana.tauro@intel.com>
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250224053903.2253539-4-riana.tauro@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/xe_guc_engine_activity.c   | 51 ++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_guc_engine_activity.h   |  1 +
+ .../gpu/drm/xe/xe_guc_engine_activity_types.h |  3 ++
+ 3 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_engine_activity.c b/drivers/gpu/drm/xe/xe_guc_engine_activity.c
+index a424527eddb6..2a457dcf31d5 100644
+--- a/drivers/gpu/drm/xe/xe_guc_engine_activity.c
++++ b/drivers/gpu/drm/xe/xe_guc_engine_activity.c
+@@ -95,6 +95,29 @@ static void free_engine_activity_buffers(struct engine_activity_buffer *buffer)
+ 	xe_bo_unpin_map_no_vm(buffer->activity_bo);
+ }
+ 
++static bool is_engine_activity_supported(struct xe_guc *guc)
++{
++	struct xe_uc_fw_version *version = &guc->fw.versions.found[XE_UC_FW_VER_COMPATIBILITY];
++	struct xe_uc_fw_version required = { 1, 14, 1 };
++	struct xe_gt *gt = guc_to_gt(guc);
++
++	if (IS_SRIOV_VF(gt_to_xe(gt))) {
++		xe_gt_info(gt, "engine activity stats not supported on VFs\n");
++		return false;
++	}
++
++	/* engine activity stats is supported from GuC interface version (1.14.1) */
++	if (GUC_SUBMIT_VER(guc) < MAKE_GUC_VER_STRUCT(required)) {
++		xe_gt_info(gt,
++			   "engine activity stats unsupported in GuC interface v%u.%u.%u, need v%u.%u.%u or higher\n",
++			   version->major, version->minor, version->patch, required.major,
++			   required.minor, required.patch);
++		return false;
++	}
++
++	return true;
++}
++
+ static struct engine_activity *hw_engine_to_engine_activity(struct xe_hw_engine *hwe)
+ {
+ 	struct xe_guc *guc = &hwe->gt->uc.guc;
+@@ -251,6 +274,9 @@ static u32 gpm_timestamp_shift(struct xe_gt *gt)
+  */
+ u64 xe_guc_engine_activity_active_ticks(struct xe_guc *guc, struct xe_hw_engine *hwe)
+ {
++	if (!xe_guc_engine_activity_supported(guc))
++		return 0;
++
+ 	return get_engine_active_ticks(guc, hwe);
+ }
+ 
+@@ -263,9 +289,27 @@ u64 xe_guc_engine_activity_active_ticks(struct xe_guc *guc, struct xe_hw_engine
+  */
+ u64 xe_guc_engine_activity_total_ticks(struct xe_guc *guc, struct xe_hw_engine *hwe)
+ {
++	if (!xe_guc_engine_activity_supported(guc))
++		return 0;
++
+ 	return get_engine_total_ticks(guc, hwe);
+ }
+ 
++/**
++ * xe_guc_engine_activity_supported - Check support for engine activity stats
++ * @guc: The GuC object
++ *
++ * Engine activity stats is supported from GuC interface version (1.14.1)
++ *
++ * Return: true if engine activity stats supported, false otherwise
++ */
++bool xe_guc_engine_activity_supported(struct xe_guc *guc)
++{
++	struct xe_guc_engine_activity *engine_activity = &guc->engine_activity;
++
++	return engine_activity->supported;
++}
++
+ /**
+  * xe_guc_engine_activity_enable_stats - Enable engine activity stats
+  * @guc: The GuC object
+@@ -276,6 +320,9 @@ void xe_guc_engine_activity_enable_stats(struct xe_guc *guc)
+ {
+ 	int ret;
+ 
++	if (!xe_guc_engine_activity_supported(guc))
++		return;
++
+ 	ret = enable_engine_activity_stats(guc);
+ 	if (ret)
+ 		xe_gt_err(guc_to_gt(guc), "failed to enable activity stats%d\n", ret);
+@@ -301,10 +348,10 @@ int xe_guc_engine_activity_init(struct xe_guc *guc)
+ {
+ 	struct xe_guc_engine_activity *engine_activity = &guc->engine_activity;
+ 	struct xe_gt *gt = guc_to_gt(guc);
+-	struct xe_device *xe = gt_to_xe(gt);
+ 	int ret;
+ 
+-	if (IS_SRIOV_VF(xe))
++	engine_activity->supported = is_engine_activity_supported(guc);
++	if (!engine_activity->supported)
+ 		return 0;
+ 
+ 	ret = allocate_engine_activity_group(guc);
+diff --git a/drivers/gpu/drm/xe/xe_guc_engine_activity.h b/drivers/gpu/drm/xe/xe_guc_engine_activity.h
+index e92d2456698d..a042d4cb404c 100644
+--- a/drivers/gpu/drm/xe/xe_guc_engine_activity.h
++++ b/drivers/gpu/drm/xe/xe_guc_engine_activity.h
+@@ -12,6 +12,7 @@ struct xe_hw_engine;
+ struct xe_guc;
+ 
+ int xe_guc_engine_activity_init(struct xe_guc *guc);
++bool xe_guc_engine_activity_supported(struct xe_guc *guc);
+ void xe_guc_engine_activity_enable_stats(struct xe_guc *guc);
+ u64 xe_guc_engine_activity_active_ticks(struct xe_guc *guc, struct xe_hw_engine *hwe);
+ u64 xe_guc_engine_activity_total_ticks(struct xe_guc *guc, struct xe_hw_engine *hwe);
+diff --git a/drivers/gpu/drm/xe/xe_guc_engine_activity_types.h b/drivers/gpu/drm/xe/xe_guc_engine_activity_types.h
+index a2ab327d3eec..5cdd034b6b70 100644
+--- a/drivers/gpu/drm/xe/xe_guc_engine_activity_types.h
++++ b/drivers/gpu/drm/xe/xe_guc_engine_activity_types.h
+@@ -79,6 +79,9 @@ struct xe_guc_engine_activity {
+ 	/** @num_activity_group: number of activity groups */
+ 	u32 num_activity_group;
+ 
++	/** @supported: indicates support for engine activity stats */
++	bool supported;
++
+ 	/** @eag: holds the device level engine activity data */
+ 	struct engine_activity_group *eag;
+ 
+-- 
+2.25.1
+

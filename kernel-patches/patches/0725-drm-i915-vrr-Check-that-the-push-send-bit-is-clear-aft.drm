@@ -1,0 +1,146 @@
+From cdce21afae52830dc92fc4583b59a157ece9bcd3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 10 Feb 2025 18:07:11 +0200
+Subject: [PATCH 0725/1107] drm/i915/vrr: Check that the push send bit is clear
+ after delayed vblank
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since we don't do mailbox updates the push send bit
+should alwyas clear by the time the delay vblank fires
+and the flip completes. Check for that to make sure we
+haven't screwed up the sequencing/vblank evasion/etc.
+
+On the DSB path we should be able to guarantee this
+since we don't have to deal with any scheduler latencies
+and whatnot. I suppose unexpected DMA/memory latencies
+might be the only thing that might trip us up here.
+
+For the MMIO path we do always have a non-zero chance
+that vblank evasion fails (since we can't really guarantee
+anything about the scheduling behaviour). That could trip
+up this check, but that seems fine since we already print
+errors for other types of vblank evasion failures.
+
+Should the CPU vblank evasion actually fail, then the push
+send bit can still be set when the next commit happens. But
+both the DSB and MMIO paths should handle that situation
+gracefully.
+
+v2: Only check once instead of polling for two scanlines
+    since we should now be guaranteed to be past the
+    delayed vblank.
+    Also check in the MMIO path for good measure
+v3: Skip the push send check when VRR is disabled.
+    With joiner the secondary pipe's DSBs doen't have access
+    to the transcoder registers, and so doing this check
+    there triggers a reponse timeout error on the DSB. VRR
+    is not currently allowed when using joiner, so this will
+    prevent the bogus register access.
+
+Reviewed-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250210160711.24010-1-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_color.c   |  1 +
+ drivers/gpu/drm/i915/display/intel_display.c |  4 +++
+ drivers/gpu/drm/i915/display/intel_vrr.c     | 34 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_vrr.h     |  2 ++
+ 4 files changed, 41 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_color.c b/drivers/gpu/drm/i915/display/intel_color.c
+index 4d8f6509cac4..cfe14162231d 100644
+--- a/drivers/gpu/drm/i915/display/intel_color.c
++++ b/drivers/gpu/drm/i915/display/intel_color.c
+@@ -1991,6 +1991,7 @@ void intel_color_prepare_commit(struct intel_atomic_state *state,
+ 	if (crtc_state->use_dsb) {
+ 		intel_vrr_send_push(crtc_state->dsb_color_vblank, crtc_state);
+ 		intel_dsb_wait_vblank_delay(state, crtc_state->dsb_color_vblank);
++		intel_vrr_check_push_sent(crtc_state->dsb_color_vblank, crtc_state);
+ 		intel_dsb_interrupt(crtc_state->dsb_color_vblank);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 9bb1bfe18aee..50c91a6142fd 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7748,6 +7748,7 @@ static void intel_atomic_dsb_finish(struct intel_atomic_state *state,
+ 
+ 			intel_vrr_send_push(new_crtc_state->dsb_commit, new_crtc_state);
+ 			intel_dsb_wait_vblank_delay(state, new_crtc_state->dsb_commit);
++			intel_vrr_check_push_sent(new_crtc_state->dsb_commit, new_crtc_state);
+ 			intel_dsb_interrupt(new_crtc_state->dsb_commit);
+ 		}
+ 	}
+@@ -7898,6 +7899,9 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 			intel_crtc_disable_flip_done(state, crtc);
+ 
+ 		intel_atomic_dsb_wait_commit(new_crtc_state);
++
++		if (!state->base.legacy_cursor_update && !new_crtc_state->use_dsb)
++			intel_vrr_check_push_sent(NULL, new_crtc_state);
+ 	}
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.c b/drivers/gpu/drm/i915/display/intel_vrr.c
+index adb51609d0a3..cac49319026d 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.c
++++ b/drivers/gpu/drm/i915/display/intel_vrr.c
+@@ -416,6 +416,40 @@ void intel_vrr_send_push(struct intel_dsb *dsb,
+ 		intel_dsb_nonpost_end(dsb);
+ }
+ 
++void intel_vrr_check_push_sent(struct intel_dsb *dsb,
++			       const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
++
++	if (!crtc_state->vrr.enable)
++		return;
++
++	/*
++	 * Make sure the push send bit has cleared. This should
++	 * already be the case as long as the caller makes sure
++	 * this is called after the delayed vblank has occurred.
++	 */
++	if (dsb) {
++		int wait_us, count;
++
++		wait_us = 2;
++		count = 1;
++
++		/*
++		 * If the bit hasn't cleared the DSB will
++		 * raise the poll error interrupt.
++		 */
++		intel_dsb_poll(dsb, TRANS_PUSH(display, cpu_transcoder),
++			       TRANS_PUSH_SEND, 0, wait_us, count);
++	} else {
++		if (intel_vrr_is_push_sent(crtc_state))
++			drm_err(display->drm, "[CRTC:%d:%s] VRR push send still pending\n",
++				crtc->base.base.id, crtc->base.name);
++	}
++}
++
+ bool intel_vrr_is_push_sent(const struct intel_crtc_state *crtc_state)
+ {
+ 	struct intel_display *display = to_intel_display(crtc_state);
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.h b/drivers/gpu/drm/i915/display/intel_vrr.h
+index 899cbf40f880..514822577e8a 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.h
++++ b/drivers/gpu/drm/i915/display/intel_vrr.h
+@@ -25,6 +25,8 @@ void intel_vrr_set_transcoder_timings(const struct intel_crtc_state *crtc_state)
+ void intel_vrr_enable(const struct intel_crtc_state *crtc_state);
+ void intel_vrr_send_push(struct intel_dsb *dsb,
+ 			 const struct intel_crtc_state *crtc_state);
++void intel_vrr_check_push_sent(struct intel_dsb *dsb,
++			       const struct intel_crtc_state *crtc_state);
+ bool intel_vrr_is_push_sent(const struct intel_crtc_state *crtc_state);
+ void intel_vrr_disable(const struct intel_crtc_state *old_crtc_state);
+ void intel_vrr_get_config(struct intel_crtc_state *crtc_state);
+-- 
+2.25.1
+

@@ -1,0 +1,190 @@
+From c270ab3611947233e77b92c2ec561a4847bb627f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 12 Feb 2025 18:43:23 +0200
+Subject: [PATCH 0764/1107] drm/i915: Rework joiner and Y plane dependency
+ handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current code tries to handle joiner vs. Y planes completely
+independently. That does not really work since each pipe selects
+its Y planes completely independently, and any plane pulled into
+the state by one of the secondary pipes needs to have the plane
+on the primary pipe also included in the state (for the uapi
+state copy). The current code sometimes forgets to pull in planes
+that we need, leading to weird things like the Y<->UV plane link
+only getting torn down from one side but not the other.
+
+Remedy the situation by pulling in the exact same set planes
+on all the joined pipes. To calculate the set we simply
+look through each joined crtc and any plane in the state gets
+added to the set. However due to the way the Y plane selection
+works we may not be able to determine the set in one go. One
+plane on one pipe may pull in a Y plane, which may have to pull
+in another plane because it's not acting in the same role on
+another pipe, etc. The simple approach taken here is to keep
+looping and adding planes to the set until it stops growing.
+
+I suppose if we tracked more of this Y plane stuff in the
+crtc state rather than the plane state we might be able to
+do it in one go. But this works, and it's not going to loop
+for long anyway since we only have so many pipes and Y planes
+to consider.
+
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250212164330.16891-4-ville.syrjala@linux.intel.com
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 104 ++++++++++---------
+ 1 file changed, 53 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index e7f76306d4e6..582aefd8a8a5 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -4405,31 +4405,6 @@ static bool check_single_encoder_cloning(struct intel_atomic_state *state,
+ 	return true;
+ }
+ 
+-static int icl_add_linked_planes(struct intel_atomic_state *state)
+-{
+-	struct intel_plane *plane, *linked;
+-	struct intel_plane_state *plane_state, *linked_plane_state;
+-	int i;
+-
+-	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
+-		linked = plane_state->planar_linked_plane;
+-
+-		if (!linked)
+-			continue;
+-
+-		linked_plane_state = intel_atomic_get_plane_state(state, linked);
+-		if (IS_ERR(linked_plane_state))
+-			return PTR_ERR(linked_plane_state);
+-
+-		drm_WARN_ON(state->base.dev,
+-			    linked_plane_state->planar_linked_plane != plane);
+-		drm_WARN_ON(state->base.dev,
+-			    linked_plane_state->planar_slave == plane_state->planar_slave);
+-	}
+-
+-	return 0;
+-}
+-
+ static int icl_check_nv12_planes(struct intel_atomic_state *state,
+ 				 struct intel_crtc *crtc)
+ {
+@@ -6180,44 +6155,75 @@ static bool active_planes_affects_min_cdclk(struct drm_i915_private *dev_priv)
+ 		IS_IVYBRIDGE(dev_priv);
+ }
+ 
+-static int intel_crtc_add_joiner_planes(struct intel_atomic_state *state,
+-					struct intel_crtc *crtc,
+-					struct intel_crtc *other)
++static u8 intel_joiner_affected_planes(struct intel_atomic_state *state,
++				       u8 joined_pipes)
+ {
+-	const struct intel_plane_state __maybe_unused *plane_state;
++	const struct intel_plane_state *plane_state;
+ 	struct intel_plane *plane;
+-	u8 plane_ids = 0;
++	u8 affected_planes = 0;
+ 	int i;
+ 
+ 	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
+-		if (plane->pipe == crtc->pipe)
+-			plane_ids |= BIT(plane->id);
++		struct intel_plane *linked = plane_state->planar_linked_plane;
++
++		if ((joined_pipes & BIT(plane->pipe)) == 0)
++			continue;
++
++		affected_planes |= BIT(plane->id);
++		if (linked)
++			affected_planes |= BIT(linked->id);
+ 	}
+ 
+-	return intel_crtc_add_planes_to_state(state, other, plane_ids);
++	return affected_planes;
+ }
+ 
+-static int intel_joiner_add_affected_planes(struct intel_atomic_state *state)
++static int intel_joiner_add_affected_planes(struct intel_atomic_state *state,
++					    u8 joined_pipes)
+ {
+-	struct drm_i915_private *i915 = to_i915(state->base.dev);
+-	const struct intel_crtc_state *crtc_state;
+-	struct intel_crtc *crtc;
+-	int i;
++	u8 prev_affected_planes, affected_planes = 0;
+ 
+-	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
+-		struct intel_crtc *other;
++	/*
++	 * We want all the joined pipes to have the same
++	 * set of planes in the atomic state, to make sure
++	 * state copying always works correctly, and the
++	 * UV<->Y plane linkage is always up to date.
++	 * Keep pulling planes in until we've determined
++	 * the full set of affected planes. A bit complicated
++	 * on account of each pipe being capable of selecting
++	 * their own Y planes independently of the other pipes,
++	 * and the selection being done from the set of
++	 * inactive planes.
++	 */
++	do {
++		struct intel_crtc *crtc;
+ 
+-		for_each_intel_crtc_in_pipe_mask(&i915->drm, other,
+-						 crtc_state->joiner_pipes) {
++		for_each_intel_crtc_in_pipe_mask(state->base.dev, crtc, joined_pipes) {
+ 			int ret;
+ 
+-			if (crtc == other)
+-				continue;
+-
+-			ret = intel_crtc_add_joiner_planes(state, crtc, other);
++			ret = intel_crtc_add_planes_to_state(state, crtc, affected_planes);
+ 			if (ret)
+ 				return ret;
+ 		}
++
++		prev_affected_planes = affected_planes;
++		affected_planes = intel_joiner_affected_planes(state, joined_pipes);
++	} while (affected_planes != prev_affected_planes);
++
++	return 0;
++}
++
++static int intel_add_affected_planes(struct intel_atomic_state *state)
++{
++	const struct intel_crtc_state *crtc_state;
++	struct intel_crtc *crtc;
++	int i;
++
++	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
++		int ret;
++
++		ret = intel_joiner_add_affected_planes(state, intel_crtc_joined_pipe_mask(crtc_state));
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	return 0;
+@@ -6232,11 +6238,7 @@ static int intel_atomic_check_planes(struct intel_atomic_state *state)
+ 	struct intel_crtc *crtc;
+ 	int i, ret;
+ 
+-	ret = icl_add_linked_planes(state);
+-	if (ret)
+-		return ret;
+-
+-	ret = intel_joiner_add_affected_planes(state);
++	ret = intel_add_affected_planes(state);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.25.1
+

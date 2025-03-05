@@ -1,0 +1,189 @@
+From 33e27876ae139b4470dbd59ce83a8849e70096b4 Mon Sep 17 00:00:00 2001
+From: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Date: Mon, 17 Feb 2025 20:03:30 -0500
+Subject: [PATCH 0904/1107] drm/xe/display: Spin-off xe_display runtime/d3cold
+ sequences
+
+No functional change. This patch only splits the xe_display_pm
+suspend/resume functions in the regular suspend/resume from the
+runtime/d3cold ones.
+
+v2: - Rename d3cold functions (Jonathan)
+    - Rebase
+
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250218010330.761340-1-rodrigo.vivi@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+---
+ drivers/gpu/drm/xe/display/xe_display.c | 87 +++++++++++++++++--------
+ 1 file changed, 59 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 215a50061485..7fef78f5606d 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -288,11 +288,58 @@ static void xe_display_flush_cleanup_work(struct xe_device *xe)
+ 	}
+ }
+ 
+-/* TODO: System and runtime suspend/resume sequences will be sanitized as a follow-up. */
+-static void __xe_display_pm_suspend(struct xe_device *xe, bool runtime)
++static void xe_display_enable_d3cold(struct xe_device *xe)
++{
++	struct intel_display *display = &xe->display;
++
++	if (!xe->info.probe_display)
++		return;
++
++	/*
++	 * We do a lot of poking in a lot of registers, make sure they work
++	 * properly.
++	 */
++	intel_power_domains_disable(display);
++
++	xe_display_flush_cleanup_work(xe);
++
++	intel_opregion_suspend(display, PCI_D3cold);
++
++	intel_dmc_suspend(display);
++
++	if (has_display(xe))
++		intel_hpd_poll_enable(xe);
++}
++
++static void xe_display_disable_d3cold(struct xe_device *xe)
++{
++	struct intel_display *display = &xe->display;
++
++	if (!xe->info.probe_display)
++		return;
++
++	intel_dmc_resume(display);
++
++	if (has_display(xe))
++		drm_mode_config_reset(&xe->drm);
++
++	intel_display_driver_init_hw(display);
++
++	intel_hpd_init(xe);
++
++	if (has_display(xe))
++		intel_hpd_poll_disable(xe);
++
++	intel_opregion_resume(display);
++
++	intel_power_domains_enable(display);
++}
++
++void xe_display_pm_suspend(struct xe_device *xe)
+ {
+ 	struct intel_display *display = &xe->display;
+ 	bool s2idle = suspend_to_idle();
++
+ 	if (!xe->info.probe_display)
+ 		return;
+ 
+@@ -301,10 +348,9 @@ static void __xe_display_pm_suspend(struct xe_device *xe, bool runtime)
+ 	 * properly.
+ 	 */
+ 	intel_power_domains_disable(display);
+-	if (!runtime)
+-		intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_SUSPENDED, true);
++	intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_SUSPENDED, true);
+ 
+-	if (!runtime && has_display(xe)) {
++	if (has_display(xe)) {
+ 		drm_kms_helper_poll_disable(&xe->drm);
+ 		intel_display_driver_disable_user_access(display);
+ 		intel_display_driver_suspend(display);
+@@ -312,10 +358,9 @@ static void __xe_display_pm_suspend(struct xe_device *xe, bool runtime)
+ 
+ 	xe_display_flush_cleanup_work(xe);
+ 
+-	if (!runtime)
+-		intel_hpd_cancel_work(xe);
++	intel_hpd_cancel_work(xe);
+ 
+-	if (!runtime && has_display(xe)) {
++	if (has_display(xe)) {
+ 		intel_display_driver_suspend_access(display);
+ 		intel_encoder_suspend_all(&xe->display);
+ 	}
+@@ -323,14 +368,6 @@ static void __xe_display_pm_suspend(struct xe_device *xe, bool runtime)
+ 	intel_opregion_suspend(display, s2idle ? PCI_D1 : PCI_D3cold);
+ 
+ 	intel_dmc_suspend(display);
+-
+-	if (runtime && has_display(xe))
+-		intel_hpd_poll_enable(xe);
+-}
+-
+-void xe_display_pm_suspend(struct xe_device *xe)
+-{
+-	__xe_display_pm_suspend(xe, false);
+ }
+ 
+ void xe_display_pm_shutdown(struct xe_device *xe)
+@@ -369,7 +406,7 @@ void xe_display_pm_runtime_suspend(struct xe_device *xe)
+ 		return;
+ 
+ 	if (xe->d3cold.allowed) {
+-		__xe_display_pm_suspend(xe, true);
++		xe_display_enable_d3cold(xe);
+ 		return;
+ 	}
+ 
+@@ -430,7 +467,7 @@ void xe_display_pm_resume_early(struct xe_device *xe)
+ 	intel_display_power_resume_early(display);
+ }
+ 
+-static void __xe_display_pm_resume(struct xe_device *xe, bool runtime)
++void xe_display_pm_resume(struct xe_device *xe)
+ {
+ 	struct intel_display *display = &xe->display;
+ 
+@@ -444,12 +481,12 @@ static void __xe_display_pm_resume(struct xe_device *xe, bool runtime)
+ 
+ 	intel_display_driver_init_hw(display);
+ 
+-	if (!runtime && has_display(xe))
++	if (has_display(xe))
+ 		intel_display_driver_resume_access(display);
+ 
+ 	intel_hpd_init(xe);
+ 
+-	if (!runtime && has_display(xe)) {
++	if (has_display(xe)) {
+ 		intel_display_driver_resume(display);
+ 		drm_kms_helper_poll_enable(&xe->drm);
+ 		intel_display_driver_enable_user_access(display);
+@@ -460,24 +497,18 @@ static void __xe_display_pm_resume(struct xe_device *xe, bool runtime)
+ 
+ 	intel_opregion_resume(display);
+ 
+-	if (!runtime)
+-		intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_RUNNING, false);
++	intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_RUNNING, false);
+ 
+ 	intel_power_domains_enable(display);
+ }
+ 
+-void xe_display_pm_resume(struct xe_device *xe)
+-{
+-	__xe_display_pm_resume(xe, false);
+-}
+-
+ void xe_display_pm_runtime_resume(struct xe_device *xe)
+ {
+ 	if (!xe->info.probe_display)
+ 		return;
+ 
+ 	if (xe->d3cold.allowed) {
+-		__xe_display_pm_resume(xe, true);
++		xe_display_disable_d3cold(xe);
+ 		return;
+ 	}
+ 
+-- 
+2.25.1
+
