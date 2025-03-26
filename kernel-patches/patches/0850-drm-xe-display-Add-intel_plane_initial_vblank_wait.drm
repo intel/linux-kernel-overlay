@@ -1,0 +1,145 @@
+From 16c8bc7dfe04ab62db9381cf8fb9534feca92c01 Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <dev@lankhorst.se>
+Date: Tue, 21 Jan 2025 15:28:48 +0100
+Subject: [PATCH 0850/1107] drm/xe/display: Add intel_plane_initial_vblank_wait
+
+We're changing the driver to have no interrupts during early init for
+Xe, so we poll the PIPE_FRMSTMSMP counter instead.
+
+Interrupts cannot be enabled during FB readout because memirq's requires
+an allocation. This would overwrite the FB we want to read out.
+
+While it might be possible to also run do the same in i915 and run
+it without interrupts, the platforms i915 supports had a less clear
+distinction between display and graphics. For this reason I choose
+only to touch Xe for now.
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250121142850.4960-1-dev@lankhorst.se
+Signed-off-by: Maarten Lankhorst <dev@lankhorst.se>
+---
+ drivers/gpu/drm/i915/display/intel_display.c  |  6 +++---
+ .../drm/i915/display/intel_plane_initial.c    |  7 ++++++-
+ .../drm/i915/display/intel_plane_initial.h    |  2 ++
+ drivers/gpu/drm/xe/display/xe_plane_initial.c | 19 ++++++++++++++++++-
+ 4 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 8061cf64140d..a78602855d0c 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -685,7 +685,7 @@ void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+ 	if ((crtc_state->active_planes & ~BIT(PLANE_CURSOR)) == 0 &&
+ 	    hsw_ips_disable(crtc_state)) {
+ 		crtc_state->ips_enabled = false;
+-		intel_crtc_wait_for_next_vblank(crtc);
++		intel_plane_initial_vblank_wait(crtc);
+ 	}
+ 
+ 	/*
+@@ -699,7 +699,7 @@ void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+ 	 */
+ 	if (HAS_GMCH(dev_priv) &&
+ 	    intel_set_memory_cxsr(dev_priv, false))
+-		intel_crtc_wait_for_next_vblank(crtc);
++		intel_plane_initial_vblank_wait(crtc);
+ 
+ 	/*
+ 	 * Gen2 reports pipe underruns whenever all planes are disabled.
+@@ -709,7 +709,7 @@ void intel_plane_disable_noatomic(struct intel_crtc *crtc,
+ 		intel_set_cpu_fifo_underrun_reporting(display, crtc->pipe, false);
+ 
+ 	intel_plane_disable_arm(NULL, plane, crtc_state);
+-	intel_crtc_wait_for_next_vblank(crtc);
++	intel_plane_initial_vblank_wait(crtc);
+ }
+ 
+ unsigned int
+diff --git a/drivers/gpu/drm/i915/display/intel_plane_initial.c b/drivers/gpu/drm/i915/display/intel_plane_initial.c
+index 6789b7f14095..b1675b46e06c 100644
+--- a/drivers/gpu/drm/i915/display/intel_plane_initial.c
++++ b/drivers/gpu/drm/i915/display/intel_plane_initial.c
+@@ -14,6 +14,11 @@
+ #include "intel_frontbuffer.h"
+ #include "intel_plane_initial.h"
+ 
++void intel_plane_initial_vblank_wait(struct intel_crtc *crtc)
++{
++	intel_crtc_wait_for_next_vblank(crtc);
++}
++
+ static bool
+ intel_reuse_initial_plane_obj(struct intel_crtc *this,
+ 			      const struct intel_initial_plane_config plane_configs[],
+@@ -442,7 +447,7 @@ void intel_initial_plane_config(struct intel_display *display)
+ 		intel_find_initial_plane_obj(crtc, plane_configs);
+ 
+ 		if (display->funcs.display->fixup_initial_plane_config(crtc, plane_config))
+-			intel_crtc_wait_for_next_vblank(crtc);
++			intel_plane_initial_vblank_wait(crtc);
+ 
+ 		plane_config_fini(plane_config);
+ 	}
+diff --git a/drivers/gpu/drm/i915/display/intel_plane_initial.h b/drivers/gpu/drm/i915/display/intel_plane_initial.h
+index 6c6aa717ed21..5c315acda210 100644
+--- a/drivers/gpu/drm/i915/display/intel_plane_initial.h
++++ b/drivers/gpu/drm/i915/display/intel_plane_initial.h
+@@ -6,8 +6,10 @@
+ #ifndef __INTEL_PLANE_INITIAL_H__
+ #define __INTEL_PLANE_INITIAL_H__
+ 
++struct intel_crtc;
+ struct intel_display;
+ 
+ void intel_initial_plane_config(struct intel_display *display);
++void intel_plane_initial_vblank_wait(struct intel_crtc *crtc);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/display/xe_plane_initial.c b/drivers/gpu/drm/xe/display/xe_plane_initial.c
+index 25c80dd6d386..4ca0cb571194 100644
+--- a/drivers/gpu/drm/xe/display/xe_plane_initial.c
++++ b/drivers/gpu/drm/xe/display/xe_plane_initial.c
+@@ -8,7 +8,9 @@
+ 
+ #include "regs/xe_gtt_defs.h"
+ #include "xe_ggtt.h"
++#include "xe_mmio.h"
+ 
++#include "i915_reg.h"
+ #include "intel_atomic_plane.h"
+ #include "intel_crtc.h"
+ #include "intel_display.h"
+@@ -22,6 +24,21 @@
+ 
+ #include <generated/xe_wa_oob.h>
+ 
++void intel_plane_initial_vblank_wait(struct intel_crtc *crtc)
++{
++	/* Early xe has no irq */
++	struct xe_device *xe = to_xe_device(crtc->base.dev);
++	struct xe_reg pipe_frmtmstmp = XE_REG(i915_mmio_reg_offset(PIPE_FRMTMSTMP(crtc->pipe)));
++	u32 timestamp;
++	int ret;
++
++	timestamp = xe_mmio_read32(xe_root_tile_mmio(xe), pipe_frmtmstmp);
++
++	ret = xe_mmio_wait32_not(xe_root_tile_mmio(xe), pipe_frmtmstmp, ~0U, timestamp, 40000U, &timestamp, false);
++	if (ret < 0)
++		drm_warn(&xe->drm, "waiting for early vblank failed with %i\n", ret);
++}
++
+ static bool
+ intel_reuse_initial_plane_obj(struct intel_crtc *this,
+ 			      const struct intel_initial_plane_config plane_configs[],
+@@ -293,7 +310,7 @@ void intel_initial_plane_config(struct intel_display *display)
+ 		intel_find_initial_plane_obj(crtc, plane_configs);
+ 
+ 		if (display->funcs.display->fixup_initial_plane_config(crtc, plane_config))
+-			intel_crtc_wait_for_next_vblank(crtc);
++			intel_plane_initial_vblank_wait(crtc);
+ 
+ 		plane_config_fini(plane_config);
+ 	}
+-- 
+2.25.1
+

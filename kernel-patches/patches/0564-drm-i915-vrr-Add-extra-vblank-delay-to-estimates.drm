@@ -1,0 +1,103 @@
+From 2974e63cf1cd2f0816eef611d401d375016a2b9f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 10 Dec 2024 23:10:04 +0200
+Subject: [PATCH 0564/1107] drm/i915/vrr: Add extra vblank delay to estimates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On ICL/TGL the VRR hardware injects an extra scanline just after
+vactive. This essentically behaves the same as an extra line of
+vblank delay, except it only appears in this one specific spot.
+
+Consider our DSB interrupt signalling scheme:
+1. arm the update
+2. wait for undelayed vblank (or rather safe window with VRR)
+3. wait for enough usecs to get past the delayed vblank
+4. signal interrupt to indicate that arming has latched
+
+If step 2 waits for end of vactive step 3 needs to account for
+the extra one scanline, or else we risk signalling the interrupt
+before the delayed vblank has actually elapsed. So include the
+extra scanline in our vblank delay estimates.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241210211007.5976-16-ville.syrjala@linux.intel.com
+Reviewed-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_vrr.c | 33 +++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.c b/drivers/gpu/drm/i915/display/intel_vrr.c
+index 1110f0e65e88..b5e30bfe1791 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.c
++++ b/drivers/gpu/drm/i915/display/intel_vrr.c
+@@ -75,12 +75,33 @@ intel_vrr_check_modeset(struct intel_atomic_state *state)
+ 	}
+ }
+ 
+-int intel_vrr_vblank_delay(const struct intel_crtc_state *crtc_state)
++static int intel_vrr_real_vblank_delay(const struct intel_crtc_state *crtc_state)
+ {
+ 	return crtc_state->hw.adjusted_mode.crtc_vblank_start -
+ 		crtc_state->hw.adjusted_mode.crtc_vdisplay;
+ }
+ 
++static int intel_vrr_extra_vblank_delay(struct intel_display *display)
++{
++	/*
++	 * On ICL/TGL VRR hardware inserts one extra scanline
++	 * just after vactive, which pushes the vmin decision
++	 * boundary ahead accordingly. We'll include the extra
++	 * scanline in our vblank delay estimates to make sure
++	 * that we never underestimate how long we have until
++	 * the delayed vblank has passed.
++	 */
++	return DISPLAY_VER(display) < 13 ? 1 : 0;
++}
++
++int intel_vrr_vblank_delay(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++
++	return intel_vrr_real_vblank_delay(crtc_state) +
++		intel_vrr_extra_vblank_delay(display);
++}
++
+ static int intel_vrr_flipline_offset(struct intel_display *display)
+ {
+ 	/* ICL/TGL hardware imposes flipline>=vmin+1 */
+@@ -130,7 +151,7 @@ int intel_vrr_vmin_vtotal(const struct intel_crtc_state *crtc_state)
+ 		return intel_vrr_vmin_flipline(crtc_state);
+ 	else
+ 		return intel_vrr_vmin_flipline(crtc_state) +
+-			intel_vrr_vblank_delay(crtc_state);
++			intel_vrr_real_vblank_delay(crtc_state);
+ }
+ 
+ int intel_vrr_vmax_vtotal(const struct intel_crtc_state *crtc_state)
+@@ -141,7 +162,7 @@ int intel_vrr_vmax_vtotal(const struct intel_crtc_state *crtc_state)
+ 		return crtc_state->vrr.vmax;
+ 	else
+ 		return crtc_state->vrr.vmax +
+-			intel_vrr_vblank_delay(crtc_state);
++			intel_vrr_real_vblank_delay(crtc_state);
+ }
+ 
+ int intel_vrr_vmin_vblank_start(const struct intel_crtc_state *crtc_state)
+@@ -309,9 +330,9 @@ void intel_vrr_compute_config_late(struct intel_crtc_state *crtc_state)
+ 		 * vmin/vmax/flipline also need to be adjusted by
+ 		 * the vblank delay to maintain correct vtotals.
+ 		 */
+-		crtc_state->vrr.vmin -= intel_vrr_vblank_delay(crtc_state);
+-		crtc_state->vrr.vmax -= intel_vrr_vblank_delay(crtc_state);
+-		crtc_state->vrr.flipline -= intel_vrr_vblank_delay(crtc_state);
++		crtc_state->vrr.vmin -= intel_vrr_real_vblank_delay(crtc_state);
++		crtc_state->vrr.vmax -= intel_vrr_real_vblank_delay(crtc_state);
++		crtc_state->vrr.flipline -= intel_vrr_real_vblank_delay(crtc_state);
+ 	}
+ }
+ 
+-- 
+2.25.1
+

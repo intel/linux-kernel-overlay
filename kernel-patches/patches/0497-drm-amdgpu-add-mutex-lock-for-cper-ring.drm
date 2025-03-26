@@ -1,0 +1,114 @@
+From 99ee38b4c26533e31ac1e42d8ad583d1b02dcc11 Mon Sep 17 00:00:00 2001
+From: Tao Zhou <tao.zhou1@amd.com>
+Date: Mon, 10 Feb 2025 15:28:37 +0800
+Subject: [PATCH 0497/1107] drm/amdgpu: add mutex lock for cper ring
+
+Avoid the confliction between read and write of ring buffer.
+
+Signed-off-by: Tao Zhou <tao.zhou1@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c | 21 ++++++++++++++++-----
+ 3 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+index b70cf13aa9c0..57775546e64b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+@@ -440,6 +440,7 @@ void amdgpu_cper_ring_write(struct amdgpu_ring *ring,
+ 
+ 	wptr_old = ring->wptr;
+ 
++	mutex_lock(&ring->adev->cper.ring_lock);
+ 	while (count) {
+ 		ent_sz = amdgpu_cper_ring_get_ent_sz(ring, ring->wptr);
+ 		chunk = umin(ent_sz, count);
+@@ -468,6 +469,7 @@ void amdgpu_cper_ring_write(struct amdgpu_ring *ring,
+ 			pos = rptr;
+ 		} while (!amdgpu_cper_is_hdr(ring, rptr));
+ 	}
++	mutex_unlock(&ring->adev->cper.ring_lock);
+ 
+ 	if (ring->count_dw >= (count >> 2))
+ 		ring->count_dw -= (count >> 2);
+@@ -497,6 +499,8 @@ static int amdgpu_cper_ring_init(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ring *ring = &(adev->cper.ring_buf);
+ 
++	mutex_init(&adev->cper.ring_lock);
++
+ 	ring->adev = NULL;
+ 	ring->ring_obj = NULL;
+ 	ring->use_doorbell = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
+index add25975d4f6..d35d1ddac7cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.h
+@@ -64,6 +64,7 @@ struct amdgpu_cper {
+ 
+ 	void *ring[CPER_MAX_ALLOWED_COUNT];
+ 	struct amdgpu_ring ring_buf;
++	struct mutex ring_lock;
+ };
+ 
+ void amdgpu_cper_entry_fill_hdr(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index cb92d41e0ae6..f53887e2f528 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -510,13 +510,18 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
+ 	result = 0;
+ 
+ 	if (*pos < 12) {
++		if (ring->funcs->type == AMDGPU_RING_TYPE_CPER)
++			mutex_lock(&ring->adev->cper.ring_lock);
++
+ 		early[0] = amdgpu_ring_get_rptr(ring) & ring->buf_mask;
+ 		early[1] = amdgpu_ring_get_wptr(ring) & ring->buf_mask;
+ 		early[2] = ring->wptr & ring->buf_mask;
+ 		for (i = *pos / 4; i < 3 && size; i++) {
+ 			r = put_user(early[i], (uint32_t *)buf);
+-			if (r)
+-				return r;
++			if (r) {
++				result = r;
++				goto out;
++			}
+ 			buf += 4;
+ 			result += 4;
+ 			size -= 4;
+@@ -547,12 +552,14 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
+ 
+ 		while (size) {
+ 			if (p == early[1])
+-				return result;
++				goto out;
+ 
+ 			value = ring->ring[p];
+ 			r = put_user(value, (uint32_t *)buf);
+-			if (r)
+-				return r;
++			if (r) {
++				result = r;
++				goto out;
++			}
+ 
+ 			buf += 4;
+ 			result += 4;
+@@ -562,6 +569,10 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
+ 		}
+ 	}
+ 
++out:
++	if (ring->funcs->type == AMDGPU_RING_TYPE_CPER)
++		mutex_unlock(&ring->adev->cper.ring_lock);
++
+ 	return result;
+ }
+ 
+-- 
+2.25.1
+

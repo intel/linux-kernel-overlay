@@ -1,0 +1,168 @@
+From d5789d9347f487fc0d8beae926915988550beed9 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Fri, 21 Feb 2025 10:50:33 +0000
+Subject: [PATCH 0916/1107] drm/sched: Add internal job peek/pop API
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Idea is to add helpers for peeking and popping jobs from entities with
+the goal of decoupling the hidden assumption in the code that queue_node
+is the first element in struct drm_sched_job.
+
+That assumption usually comes in the form of:
+
+  while ((job = to_drm_sched_job(spsc_queue_pop(&entity->job_queue))))
+
+Which breaks if the queue_node is re-positioned due to_drm_sched_job
+being implemented with a container_of.
+
+This also allows us to remove duplicate definitions of to_drm_sched_job.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Philipp Stanner <phasta@kernel.org>
+Signed-off-by: Philipp Stanner <phasta@kernel.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250221105038.79665-2-tvrtko.ursulin@igalia.com
+---
+ drivers/gpu/drm/scheduler/sched_entity.c   | 11 +++--
+ drivers/gpu/drm/scheduler/sched_internal.h | 48 ++++++++++++++++++++++
+ drivers/gpu/drm/scheduler/sched_main.c     |  7 ++--
+ 3 files changed, 56 insertions(+), 10 deletions(-)
+ create mode 100644 drivers/gpu/drm/scheduler/sched_internal.h
+
+diff --git a/drivers/gpu/drm/scheduler/sched_entity.c b/drivers/gpu/drm/scheduler/sched_entity.c
+index 69bcf0e99d57..a171f05ad761 100644
+--- a/drivers/gpu/drm/scheduler/sched_entity.c
++++ b/drivers/gpu/drm/scheduler/sched_entity.c
+@@ -28,10 +28,9 @@
+ #include <drm/drm_print.h>
+ #include <drm/gpu_scheduler.h>
+ 
+-#include "gpu_scheduler_trace.h"
++#include "sched_internal.h"
+ 
+-#define to_drm_sched_job(sched_job)		\
+-		container_of((sched_job), struct drm_sched_job, queue_node)
++#include "gpu_scheduler_trace.h"
+ 
+ /**
+  * drm_sched_entity_init - Init a context entity used by scheduler when
+@@ -255,7 +254,7 @@ static void drm_sched_entity_kill(struct drm_sched_entity *entity)
+ 	/* The entity is guaranteed to not be used by the scheduler */
+ 	prev = rcu_dereference_check(entity->last_scheduled, true);
+ 	dma_fence_get(prev);
+-	while ((job = to_drm_sched_job(spsc_queue_pop(&entity->job_queue)))) {
++	while ((job = drm_sched_entity_queue_pop(entity))) {
+ 		struct drm_sched_fence *s_fence = job->s_fence;
+ 
+ 		dma_fence_get(&s_fence->finished);
+@@ -477,7 +476,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
+ {
+ 	struct drm_sched_job *sched_job;
+ 
+-	sched_job = to_drm_sched_job(spsc_queue_peek(&entity->job_queue));
++	sched_job = drm_sched_entity_queue_peek(entity);
+ 	if (!sched_job)
+ 		return NULL;
+ 
+@@ -513,7 +512,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
+ 	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO) {
+ 		struct drm_sched_job *next;
+ 
+-		next = to_drm_sched_job(spsc_queue_peek(&entity->job_queue));
++		next = drm_sched_entity_queue_peek(entity);
+ 		if (next) {
+ 			struct drm_sched_rq *rq;
+ 
+diff --git a/drivers/gpu/drm/scheduler/sched_internal.h b/drivers/gpu/drm/scheduler/sched_internal.h
+new file mode 100644
+index 000000000000..bd34898911d7
+--- /dev/null
++++ b/drivers/gpu/drm/scheduler/sched_internal.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef _DRM_GPU_SCHEDULER_INTERNAL_H_
++#define _DRM_GPU_SCHEDULER_INTERNAL_H_
++
++/**
++ * drm_sched_entity_queue_pop - Low level helper for popping queued jobs
++ *
++ * @entity: scheduler entity
++ *
++ * Low level helper for popping queued jobs.
++ *
++ * Returns: The job dequeued or NULL.
++ */
++static inline struct drm_sched_job *
++drm_sched_entity_queue_pop(struct drm_sched_entity *entity)
++{
++	struct spsc_node *node;
++
++	node = spsc_queue_pop(&entity->job_queue);
++	if (!node)
++		return NULL;
++
++	return container_of(node, struct drm_sched_job, queue_node);
++}
++
++/**
++ * drm_sched_entity_queue_peek - Low level helper for peeking at the job queue
++ *
++ * @entity: scheduler entity
++ *
++ * Low level helper for peeking at the job queue
++ *
++ * Returns: The job at the head of the queue or NULL.
++ */
++static inline struct drm_sched_job *
++drm_sched_entity_queue_peek(struct drm_sched_entity *entity)
++{
++	struct spsc_node *node;
++
++	node = spsc_queue_peek(&entity->job_queue);
++	if (!node)
++		return NULL;
++
++	return container_of(node, struct drm_sched_job, queue_node);
++}
++
++#endif
+diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
+index 8c36a59afb72..c634993f1346 100644
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -78,6 +78,8 @@
+ #include <drm/gpu_scheduler.h>
+ #include <drm/spsc_queue.h>
+ 
++#include "sched_internal.h"
++
+ #define CREATE_TRACE_POINTS
+ #include "gpu_scheduler_trace.h"
+ 
+@@ -87,9 +89,6 @@ static struct lockdep_map drm_sched_lockdep_map = {
+ };
+ #endif
+ 
+-#define to_drm_sched_job(sched_job)		\
+-		container_of((sched_job), struct drm_sched_job, queue_node)
+-
+ int drm_sched_policy = DRM_SCHED_POLICY_FIFO;
+ 
+ /**
+@@ -123,7 +122,7 @@ static bool drm_sched_can_queue(struct drm_gpu_scheduler *sched,
+ {
+ 	struct drm_sched_job *s_job;
+ 
+-	s_job = to_drm_sched_job(spsc_queue_peek(&entity->job_queue));
++	s_job = drm_sched_entity_queue_peek(entity);
+ 	if (!s_job)
+ 		return false;
+ 
+-- 
+2.25.1
+

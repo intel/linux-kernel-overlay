@@ -1,0 +1,191 @@
+From 027501553ce22124e90a7d98aad7499f5914999a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 13 Feb 2025 17:02:09 +0200
+Subject: [PATCH 0772/1107] drm/i915: Move modeset_retry stuff into
+ intel_connector.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Most of the modeset retry stuff looks to be entirely generic,
+and so there doesn't seem to any reason to keep it in intel_dp.c.
+Move the generic bits into intel_connector.c.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250213150220.13580-2-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+---
+ .../gpu/drm/i915/display/intel_connector.c    | 39 ++++++++++++++++
+ .../gpu/drm/i915/display/intel_connector.h    |  2 +
+ drivers/gpu/drm/i915/display/intel_dp.c       | 44 ++-----------------
+ drivers/gpu/drm/i915/display/intel_dp_mst.c   |  2 +-
+ 4 files changed, 45 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_connector.c b/drivers/gpu/drm/i915/display/intel_connector.c
+index c65887870ddc..4f54c9249a84 100644
+--- a/drivers/gpu/drm/i915/display/intel_connector.c
++++ b/drivers/gpu/drm/i915/display/intel_connector.c
+@@ -28,6 +28,7 @@
+ 
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_probe_helper.h>
+ 
+ #include "i915_drv.h"
+ #include "intel_backlight.h"
+@@ -37,6 +38,44 @@
+ #include "intel_hdcp.h"
+ #include "intel_panel.h"
+ 
++static void intel_connector_modeset_retry_work_fn(struct work_struct *work)
++{
++	struct intel_connector *connector = container_of(work, typeof(*connector),
++							 modeset_retry_work);
++	struct intel_display *display = to_intel_display(connector);
++
++	drm_dbg_kms(display->drm, "[CONNECTOR:%d:%s]\n", connector->base.base.id,
++		    connector->base.name);
++
++	/* Grab the locks before changing connector property*/
++	mutex_lock(&display->drm->mode_config.mutex);
++	/* Set connector link status to BAD and send a Uevent to notify
++	 * userspace to do a modeset.
++	 */
++	drm_connector_set_link_status_property(&connector->base,
++					       DRM_MODE_LINK_STATUS_BAD);
++	mutex_unlock(&display->drm->mode_config.mutex);
++	/* Send Hotplug uevent so userspace can reprobe */
++	drm_kms_helper_connector_hotplug_event(&connector->base);
++
++	drm_connector_put(&connector->base);
++}
++
++void intel_connector_queue_modeset_retry_work(struct intel_connector *connector)
++{
++	struct drm_i915_private *i915 = to_i915(connector->base.dev);
++
++	drm_connector_get(&connector->base);
++	if (!queue_work(i915->unordered_wq, &connector->modeset_retry_work))
++		drm_connector_put(&connector->base);
++}
++
++void intel_connector_init_modeset_retry_work(struct intel_connector *connector)
++{
++	INIT_WORK(&connector->modeset_retry_work,
++		  intel_connector_modeset_retry_work_fn);
++}
++
+ int intel_connector_init(struct intel_connector *connector)
+ {
+ 	struct intel_digital_connector_state *conn_state;
+diff --git a/drivers/gpu/drm/i915/display/intel_connector.h b/drivers/gpu/drm/i915/display/intel_connector.h
+index bafde3f11ff4..929646a639b2 100644
+--- a/drivers/gpu/drm/i915/display/intel_connector.h
++++ b/drivers/gpu/drm/i915/display/intel_connector.h
+@@ -33,5 +33,7 @@ void intel_attach_aspect_ratio_property(struct drm_connector *connector);
+ void intel_attach_hdmi_colorspace_property(struct drm_connector *connector);
+ void intel_attach_dp_colorspace_property(struct drm_connector *connector);
+ void intel_attach_scaling_mode_property(struct drm_connector *connector);
++void intel_connector_init_modeset_retry_work(struct intel_connector *connector);
++void intel_connector_queue_modeset_retry_work(struct intel_connector *connector);
+ 
+ #endif /* __INTEL_CONNECTOR_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 29970baaf03e..8bcf400b0239 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -3056,15 +3056,6 @@ intel_dp_audio_compute_config(struct intel_encoder *encoder,
+ 					intel_dp_is_uhbr(pipe_config);
+ }
+ 
+-static void intel_dp_queue_modeset_retry_work(struct intel_connector *connector)
+-{
+-	struct drm_i915_private *i915 = to_i915(connector->base.dev);
+-
+-	drm_connector_get(&connector->base);
+-	if (!queue_work(i915->unordered_wq, &connector->modeset_retry_work))
+-		drm_connector_put(&connector->base);
+-}
+-
+ void
+ intel_dp_queue_modeset_retry_for_link(struct intel_atomic_state *state,
+ 				      struct intel_encoder *encoder,
+@@ -3081,7 +3072,7 @@ intel_dp_queue_modeset_retry_for_link(struct intel_atomic_state *state,
+ 	intel_dp->needs_modeset_retry = true;
+ 
+ 	if (!intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DP_MST)) {
+-		intel_dp_queue_modeset_retry_work(intel_dp->attached_connector);
++		intel_connector_queue_modeset_retry_work(intel_dp->attached_connector);
+ 
+ 		return;
+ 	}
+@@ -3091,7 +3082,7 @@ intel_dp_queue_modeset_retry_for_link(struct intel_atomic_state *state,
+ 			continue;
+ 
+ 		if (connector->mst_port == intel_dp)
+-			intel_dp_queue_modeset_retry_work(connector);
++			intel_connector_queue_modeset_retry_work(connector);
+ 	}
+ }
+ 
+@@ -6485,35 +6476,6 @@ static bool intel_edp_init_connector(struct intel_dp *intel_dp,
+ 	return false;
+ }
+ 
+-static void intel_dp_modeset_retry_work_fn(struct work_struct *work)
+-{
+-	struct intel_connector *connector = container_of(work, typeof(*connector),
+-							 modeset_retry_work);
+-	struct intel_display *display = to_intel_display(connector);
+-
+-	drm_dbg_kms(display->drm, "[CONNECTOR:%d:%s]\n", connector->base.base.id,
+-		    connector->base.name);
+-
+-	/* Grab the locks before changing connector property*/
+-	mutex_lock(&display->drm->mode_config.mutex);
+-	/* Set connector link status to BAD and send a Uevent to notify
+-	 * userspace to do a modeset.
+-	 */
+-	drm_connector_set_link_status_property(&connector->base,
+-					       DRM_MODE_LINK_STATUS_BAD);
+-	mutex_unlock(&display->drm->mode_config.mutex);
+-	/* Send Hotplug uevent so userspace can reprobe */
+-	drm_kms_helper_connector_hotplug_event(&connector->base);
+-
+-	drm_connector_put(&connector->base);
+-}
+-
+-void intel_dp_init_modeset_retry_work(struct intel_connector *connector)
+-{
+-	INIT_WORK(&connector->modeset_retry_work,
+-		  intel_dp_modeset_retry_work_fn);
+-}
+-
+ bool
+ intel_dp_init_connector(struct intel_digital_port *dig_port,
+ 			struct intel_connector *connector)
+@@ -6526,7 +6488,7 @@ intel_dp_init_connector(struct intel_digital_port *dig_port,
+ 	int type;
+ 
+ 	/* Initialize the work for modeset in case of link train failure */
+-	intel_dp_init_modeset_retry_work(connector);
++	intel_connector_init_modeset_retry_work(connector);
+ 
+ 	if (drm_WARN(dev, dig_port->max_lanes < 1,
+ 		     "Not enough lanes (%d) for DP on [ENCODER:%d:%s]\n",
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 73a0a0f9b3d0..0044b2a9a16b 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -1747,7 +1747,7 @@ mst_topology_add_connector(struct drm_dp_mst_topology_mgr *mgr,
+ 	connector->port = port;
+ 	drm_dp_mst_get_port_malloc(port);
+ 
+-	intel_dp_init_modeset_retry_work(connector);
++	intel_connector_init_modeset_retry_work(connector);
+ 
+ 	ret = drm_connector_dynamic_init(display->drm, &connector->base, &mst_connector_funcs,
+ 					 DRM_MODE_CONNECTOR_DisplayPort, NULL);
+-- 
+2.25.1
+

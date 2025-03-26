@@ -1,0 +1,243 @@
+From c5509ed1ff06a4f96d70f1280fdf653f50df9049 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Mon, 17 Feb 2025 13:22:05 +0100
+Subject: [PATCH 0292/1107] drm/ast: cursor: Move format conversion to shared
+ helper
+
+User-space cursor-image data is encoded in ARBG8888, while hardware
+supports ARGB4444. Implement the format conversion as part of the
+format-helper framework, so that other drivers can benefit.
+
+This allows to respect the damage area of the cursor update. In
+previous code, all cursor image data had to be converted on each
+update. Now, only the changed areas require an update. The hardware
+image is always updated completely, as it is required for the
+checksum update.
+
+The format-conversion helper still contains the old implementation's
+optimization of writing 2 output pixels at the same time.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Jocelyn Falempe <jfalempe@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250217122336.230067-3-tzimmermann@suse.de
+---
+ drivers/gpu/drm/ast/ast_drv.h       |  4 +-
+ drivers/gpu/drm/ast/ast_mode.c      | 71 +++++++----------------------
+ drivers/gpu/drm/drm_format_helper.c | 69 ++++++++++++++++++++++++++++
+ include/drm/drm_format_helper.h     |  3 ++
+ 4 files changed, 92 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/ast/ast_drv.h b/drivers/gpu/drm/ast/ast_drv.h
+index d3115b31b032..973abd0cbd42 100644
+--- a/drivers/gpu/drm/ast/ast_drv.h
++++ b/drivers/gpu/drm/ast/ast_drv.h
+@@ -113,7 +113,9 @@ enum ast_config_mode {
+ #define AST_MAX_HWC_WIDTH	64
+ #define AST_MAX_HWC_HEIGHT	64
+ 
+-#define AST_HWC_SIZE		(AST_MAX_HWC_WIDTH * AST_MAX_HWC_HEIGHT * 2)
++#define AST_HWC_PITCH		(AST_MAX_HWC_WIDTH * SZ_2)
++#define AST_HWC_SIZE		(AST_MAX_HWC_HEIGHT * AST_HWC_PITCH)
++
+ #define AST_HWC_SIGNATURE_SIZE	32
+ 
+ /* define for signature structure */
+diff --git a/drivers/gpu/drm/ast/ast_mode.c b/drivers/gpu/drm/ast/ast_mode.c
+index d25852b0ce03..8ab006e6bc32 100644
+--- a/drivers/gpu/drm/ast/ast_mode.c
++++ b/drivers/gpu/drm/ast/ast_mode.c
+@@ -659,61 +659,16 @@ static u32 ast_cursor_calculate_checksum(const void *src, unsigned int width, un
+ 	return csum;
+ }
+ 
+-static void ast_update_cursor_image(u8 __iomem *dst, const u8 *src, u8 *tmp, int width, int height)
++static void ast_set_cursor_image(struct ast_device *ast, const u8 *src,
++				 unsigned int width, unsigned int height)
+ {
+-	union {
+-		u32 ul;
+-		u8 b[4];
+-	} srcdata32[2], data32;
+-	union {
+-		u16 us;
+-		u8 b[2];
+-	} data16;
++	u8 __iomem *dst = ast->cursor_plane.base.vaddr;
+ 	u32 csum;
+-	s32 alpha_dst_delta, last_alpha_dst_delta;
+-	u8 *dstxor;
+-	const u8 *srcxor;
+-	int i, j;
+-	u32 per_pixel_copy, two_pixel_copy;
+-
+-	alpha_dst_delta = AST_MAX_HWC_WIDTH << 1;
+-	last_alpha_dst_delta = alpha_dst_delta - (width << 1);
+-
+-	srcxor = src;
+-	dstxor = tmp + last_alpha_dst_delta + (AST_MAX_HWC_HEIGHT - height) * alpha_dst_delta;
+-	per_pixel_copy = width & 1;
+-	two_pixel_copy = width >> 1;
+-
+-	for (j = 0; j < height; j++) {
+-		for (i = 0; i < two_pixel_copy; i++) {
+-			srcdata32[0].ul = *((u32 *)srcxor) & 0xf0f0f0f0;
+-			srcdata32[1].ul = *((u32 *)(srcxor + 4)) & 0xf0f0f0f0;
+-			data32.b[0] = srcdata32[0].b[1] | (srcdata32[0].b[0] >> 4);
+-			data32.b[1] = srcdata32[0].b[3] | (srcdata32[0].b[2] >> 4);
+-			data32.b[2] = srcdata32[1].b[1] | (srcdata32[1].b[0] >> 4);
+-			data32.b[3] = srcdata32[1].b[3] | (srcdata32[1].b[2] >> 4);
+-			memcpy(dstxor, &data32, 4);
+-
+-			dstxor += 4;
+-			srcxor += 8;
+-		}
+-
+-		for (i = 0; i < per_pixel_copy; i++) {
+-			srcdata32[0].ul = *((u32 *)srcxor) & 0xf0f0f0f0;
+-			data16.b[0] = srcdata32[0].b[1] | (srcdata32[0].b[0] >> 4);
+-			data16.b[1] = srcdata32[0].b[3] | (srcdata32[0].b[2] >> 4);
+-			memcpy(dstxor, &data16, 2);
+-
+-			dstxor += 2;
+-			srcxor += 4;
+-		}
+-		dstxor += last_alpha_dst_delta;
+-	}
+ 
+-	csum = ast_cursor_calculate_checksum(tmp, width, height);
++	csum = ast_cursor_calculate_checksum(src, width, height);
+ 
+ 	/* write pixel data */
+-	memcpy_toio(dst, tmp, AST_HWC_SIZE);
++	memcpy_toio(dst, src, AST_HWC_SIZE);
+ 
+ 	/* write checksum + signature */
+ 	dst += AST_HWC_SIZE;
+@@ -802,9 +757,7 @@ static void ast_cursor_plane_helper_atomic_update(struct drm_plane *plane,
+ 	struct drm_framebuffer *fb = plane_state->fb;
+ 	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+ 	struct ast_device *ast = to_ast_device(plane->dev);
+-	struct iosys_map src_map = shadow_plane_state->data[0];
+ 	struct drm_rect damage;
+-	const u8 *src = src_map.vaddr; /* TODO: Use mapping abstraction properly */
+ 	u64 dst_off = ast_plane->offset;
+ 	u8 __iomem *dst = ast_plane->vaddr; /* TODO: Use mapping abstraction properly */
+ 	u8 __iomem *sig = dst + AST_HWC_SIZE; /* TODO: Use mapping abstraction properly */
+@@ -818,8 +771,18 @@ static void ast_cursor_plane_helper_atomic_update(struct drm_plane *plane,
+ 	 */
+ 
+ 	if (drm_atomic_helper_damage_merged(old_plane_state, plane_state, &damage)) {
+-		ast_update_cursor_image(dst, src, ast_cursor_plane->argb4444,
+-					fb->width, fb->height);
++		u8 *argb4444 = ast_cursor_plane->argb4444;
++		struct iosys_map argb4444_dst[DRM_FORMAT_MAX_PLANES] = {
++			IOSYS_MAP_INIT_VADDR(argb4444),
++		};
++		unsigned int argb4444_dst_pitch[DRM_FORMAT_MAX_PLANES] = {
++			AST_HWC_PITCH,
++		};
++
++		drm_fb_argb8888_to_argb4444(argb4444_dst, argb4444_dst_pitch,
++					    shadow_plane_state->data, fb, &damage,
++					    &shadow_plane_state->fmtcnv_state);
++		ast_set_cursor_image(ast, argb4444, fb->width, fb->height);
+ 		ast_set_cursor_base(ast, dst_off);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/drm_format_helper.c b/drivers/gpu/drm/drm_format_helper.c
+index b1be458ed4dd..ecb278b63e8c 100644
+--- a/drivers/gpu/drm/drm_format_helper.c
++++ b/drivers/gpu/drm/drm_format_helper.c
+@@ -978,6 +978,75 @@ void drm_fb_xrgb8888_to_gray8(struct iosys_map *dst, const unsigned int *dst_pit
+ }
+ EXPORT_SYMBOL(drm_fb_xrgb8888_to_gray8);
+ 
++static void drm_fb_argb8888_to_argb4444_line(void *dbuf, const void *sbuf, unsigned int pixels)
++{
++	unsigned int pixels2 = pixels & ~GENMASK_ULL(0, 0);
++	__le32 *dbuf32 = dbuf;
++	__le16 *dbuf16 = dbuf + pixels2 * sizeof(*dbuf16);
++	const __le32 *sbuf32 = sbuf;
++	unsigned int x;
++	u32 val32;
++	u16 val16;
++	u32 pix[2];
++
++	for (x = 0; x < pixels2; x += 2, ++dbuf32) {
++		pix[0] = le32_to_cpu(sbuf32[x]);
++		pix[1] = le32_to_cpu(sbuf32[x + 1]);
++		val32 = ((pix[0] & 0xf0000000) >> 16) |
++			((pix[0] & 0x00f00000) >> 12) |
++			((pix[0] & 0x0000f000) >> 8) |
++			((pix[0] & 0x000000f0) >> 4) |
++			((pix[1] & 0xf0000000) >> 0) |
++			((pix[1] & 0x00f00000) << 4) |
++			((pix[1] & 0x0000f000) << 8) |
++			((pix[1] & 0x000000f0) << 12);
++		*dbuf32 = cpu_to_le32(val32);
++	}
++	for (; x < pixels; x++) {
++		pix[0] = le32_to_cpu(sbuf32[x]);
++		val16 = ((pix[0] & 0xf0000000) >> 16) |
++			((pix[0] & 0x00f00000) >> 12) |
++			((pix[0] & 0x0000f000) >> 8) |
++			((pix[0] & 0x000000f0) >> 4);
++		dbuf16[x] = cpu_to_le16(val16);
++	}
++}
++
++/**
++ * drm_fb_argb8888_to_argb4444 - Convert ARGB8888 to ARGB4444 clip buffer
++ * @dst: Array of ARGB4444 destination buffers
++ * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
++ *             within @dst; can be NULL if scanlines are stored next to each other.
++ * @src: Array of ARGB8888 source buffer
++ * @fb: DRM framebuffer
++ * @clip: Clip rectangle area to copy
++ * @state: Transform and conversion state
++ *
++ * This function copies parts of a framebuffer to display memory and converts
++ * the color format during the process. The parameters @dst, @dst_pitch and
++ * @src refer to arrays. Each array must have at least as many entries as
++ * there are planes in @fb's format. Each entry stores the value for the
++ * format's respective color plane at the same index.
++ *
++ * This function does not apply clipping on @dst (i.e. the destination is at the
++ * top-left corner).
++ *
++ * Drivers can use this function for ARGB4444 devices that don't support
++ * ARGB8888 natively.
++ */
++void drm_fb_argb8888_to_argb4444(struct iosys_map *dst, const unsigned int *dst_pitch,
++				 const struct iosys_map *src, const struct drm_framebuffer *fb,
++				 const struct drm_rect *clip, struct drm_format_conv_state *state)
++{
++	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
++		2,
++	};
++
++	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
++		    drm_fb_argb8888_to_argb4444_line);
++}
++EXPORT_SYMBOL(drm_fb_argb8888_to_argb4444);
++
+ /**
+  * drm_fb_blit - Copy parts of a framebuffer to display memory
+  * @dst:	Array of display-memory addresses to copy to
+diff --git a/include/drm/drm_format_helper.h b/include/drm/drm_format_helper.h
+index 428d81afe215..a1347e47e9d5 100644
+--- a/include/drm/drm_format_helper.h
++++ b/include/drm/drm_format_helper.h
+@@ -110,6 +110,9 @@ void drm_fb_xrgb8888_to_argb2101010(struct iosys_map *dst, const unsigned int *d
+ void drm_fb_xrgb8888_to_gray8(struct iosys_map *dst, const unsigned int *dst_pitch,
+ 			      const struct iosys_map *src, const struct drm_framebuffer *fb,
+ 			      const struct drm_rect *clip, struct drm_format_conv_state *state);
++void drm_fb_argb8888_to_argb4444(struct iosys_map *dst, const unsigned int *dst_pitch,
++				 const struct iosys_map *src, const struct drm_framebuffer *fb,
++				 const struct drm_rect *clip, struct drm_format_conv_state *state);
+ 
+ int drm_fb_blit(struct iosys_map *dst, const unsigned int *dst_pitch, uint32_t dst_format,
+ 		const struct iosys_map *src, const struct drm_framebuffer *fb,
+-- 
+2.25.1
+

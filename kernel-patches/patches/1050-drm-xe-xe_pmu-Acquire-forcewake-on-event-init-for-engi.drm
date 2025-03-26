@@ -1,0 +1,110 @@
+From 2fc30b7131b72dcab2587a8d53511b61e70ef95f Mon Sep 17 00:00:00 2001
+From: Riana Tauro <riana.tauro@intel.com>
+Date: Mon, 24 Feb 2025 11:09:02 +0530
+Subject: [PATCH 1050/1107] drm/xe/xe_pmu: Acquire forcewake on event init for
+ engine events
+
+When the engine events are created, acquire GT forcewake to read gpm
+timestamp required for the events and release on event destroy. This
+cannot be done during read due to the raw spinlock held my pmu.
+
+v2: remove forcewake counting (Umesh)
+v3: remove extra space (Umesh)
+v4: use event pmu private data (Lucas)
+    free local copy (Umesh)
+
+Signed-off-by: Riana Tauro <riana.tauro@intel.com>
+Reviewed-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250224053903.2253539-6-riana.tauro@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+---
+ drivers/gpu/drm/xe/xe_pmu.c | 50 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_pmu.c b/drivers/gpu/drm/xe/xe_pmu.c
+index d2c035c1924e..4f62a6e515d6 100644
+--- a/drivers/gpu/drm/xe/xe_pmu.c
++++ b/drivers/gpu/drm/xe/xe_pmu.c
+@@ -7,6 +7,7 @@
+ #include <linux/device.h>
+ 
+ #include "xe_device.h"
++#include "xe_force_wake.h"
+ #include "xe_gt_idle.h"
+ #include "xe_guc_engine_activity.h"
+ #include "xe_hw_engine.h"
+@@ -102,6 +103,41 @@ static struct xe_hw_engine *event_to_hwe(struct perf_event *event)
+ 	return hwe;
+ }
+ 
++static bool is_engine_event(u64 config)
++{
++	unsigned int event_id = config_to_event_id(config);
++
++	return (event_id == XE_PMU_EVENT_ENGINE_TOTAL_TICKS ||
++		event_id == XE_PMU_EVENT_ENGINE_ACTIVE_TICKS);
++}
++
++static bool event_gt_forcewake(struct perf_event *event)
++{
++	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
++	u64 config = event->attr.config;
++	struct xe_gt *gt;
++	unsigned int *fw_ref;
++
++	if (!is_engine_event(config))
++		return true;
++
++	gt = xe_device_get_gt(xe, config_to_gt_id(config));
++
++	fw_ref = kzalloc(sizeof(*fw_ref), GFP_KERNEL);
++	if (!fw_ref)
++		return false;
++
++	*fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++	if (!*fw_ref) {
++		kfree(fw_ref);
++		return false;
++	}
++
++	event->pmu_private = fw_ref;
++
++	return true;
++}
++
+ static bool event_supported(struct xe_pmu *pmu, unsigned int gt,
+ 			    unsigned int id)
+ {
+@@ -144,6 +180,15 @@ static bool event_param_valid(struct perf_event *event)
+ static void xe_pmu_event_destroy(struct perf_event *event)
+ {
+ 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
++	struct xe_gt *gt;
++	unsigned int *fw_ref = event->pmu_private;
++
++	if (fw_ref) {
++		gt = xe_device_get_gt(xe, config_to_gt_id(event->attr.config));
++		xe_force_wake_put(gt_to_fw(gt), *fw_ref);
++		kfree(fw_ref);
++		event->pmu_private = NULL;
++	}
+ 
+ 	drm_WARN_ON(&xe->drm, event->parent);
+ 	xe_pm_runtime_put(xe);
+@@ -183,6 +228,11 @@ static int xe_pmu_event_init(struct perf_event *event)
+ 	if (!event->parent) {
+ 		drm_dev_get(&xe->drm);
+ 		xe_pm_runtime_get(xe);
++		if (!event_gt_forcewake(event)) {
++			xe_pm_runtime_put(xe);
++			drm_dev_put(&xe->drm);
++			return -EINVAL;
++		}
+ 		event->destroy = xe_pmu_event_destroy;
+ 	}
+ 
+-- 
+2.25.1
+

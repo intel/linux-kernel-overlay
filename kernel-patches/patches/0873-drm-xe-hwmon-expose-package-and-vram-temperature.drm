@@ -1,0 +1,204 @@
+From 01f4cb13f24d513827c5b22f5bd28910cf436162 Mon Sep 17 00:00:00 2001
+From: Raag Jadav <raag.jadav@intel.com>
+Date: Fri, 31 Jan 2025 11:15:02 +0530
+Subject: [PATCH 0873/1107] drm/xe/hwmon: expose package and vram temperature
+
+Add hwmon support for temp2_input and temp3_input attributes, which will
+expose package and vram temperature in millidegree Celsius. With this in
+place we can monitor temperature using lm-sensors tool.
+
+v2: Reuse existing channels (Badal, Karthik)
+
+Signed-off-by: Raag Jadav <raag.jadav@intel.com>
+Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+Reviewed-by: Badal Nilawar <badal.nilawar@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250131054502.1528555-1-raag.jadav@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+---
+ .../ABI/testing/sysfs-driver-intel-xe-hwmon   | 16 +++++
+ drivers/gpu/drm/xe/regs/xe_mchbar_regs.h      |  3 +
+ drivers/gpu/drm/xe/regs/xe_pcode_regs.h       |  2 +
+ drivers/gpu/drm/xe/xe_hwmon.c                 | 60 +++++++++++++++++++
+ 4 files changed, 81 insertions(+)
+
+diff --git a/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon b/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
+index d792a56f59ac..9bce281314df 100644
+--- a/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
++++ b/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
+@@ -108,3 +108,19 @@ Contact:	intel-xe@lists.freedesktop.org
+ Description:	RO. Package current voltage in millivolt.
+ 
+ 		Only supported for particular Intel Xe graphics platforms.
++
++What:		/sys/bus/pci/drivers/xe/.../hwmon/hwmon<i>/temp2_input
++Date:		March 2025
++KernelVersion:	6.14
++Contact:	intel-xe@lists.freedesktop.org
++Description:	RO. Package temperature in millidegree Celsius.
++
++		Only supported for particular Intel Xe graphics platforms.
++
++What:		/sys/bus/pci/drivers/xe/.../hwmon/hwmon<i>/temp3_input
++Date:		March 2025
++KernelVersion:	6.14
++Contact:	intel-xe@lists.freedesktop.org
++Description:	RO. VRAM temperature in millidegree Celsius.
++
++		Only supported for particular Intel Xe graphics platforms.
+diff --git a/drivers/gpu/drm/xe/regs/xe_mchbar_regs.h b/drivers/gpu/drm/xe/regs/xe_mchbar_regs.h
+index 519dd1067a19..f5e5234857c1 100644
+--- a/drivers/gpu/drm/xe/regs/xe_mchbar_regs.h
++++ b/drivers/gpu/drm/xe/regs/xe_mchbar_regs.h
+@@ -34,6 +34,9 @@
+ 
+ #define PCU_CR_PACKAGE_ENERGY_STATUS		XE_REG(MCHBAR_MIRROR_BASE_SNB + 0x593c)
+ 
++#define PCU_CR_PACKAGE_TEMPERATURE		XE_REG(MCHBAR_MIRROR_BASE_SNB + 0x5978)
++#define   TEMP_MASK				REG_GENMASK(7, 0)
++
+ #define PCU_CR_PACKAGE_RAPL_LIMIT		XE_REG(MCHBAR_MIRROR_BASE_SNB + 0x59a0)
+ #define   PKG_PWR_LIM_1				REG_GENMASK(14, 0)
+ #define   PKG_PWR_LIM_1_EN			REG_BIT(15)
+diff --git a/drivers/gpu/drm/xe/regs/xe_pcode_regs.h b/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
+index 0b0b49d850ae..8846eb9ce2a4 100644
+--- a/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
++++ b/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
+@@ -21,6 +21,8 @@
+ #define BMG_PACKAGE_POWER_SKU			XE_REG(0x138098)
+ #define BMG_PACKAGE_POWER_SKU_UNIT		XE_REG(0x1380dc)
+ #define BMG_PACKAGE_ENERGY_STATUS		XE_REG(0x138120)
++#define BMG_VRAM_TEMPERATURE			XE_REG(0x1382c0)
++#define BMG_PACKAGE_TEMPERATURE			XE_REG(0x138434)
+ #define BMG_PACKAGE_RAPL_LIMIT			XE_REG(0x138440)
+ #define BMG_PLATFORM_ENERGY_STATUS		XE_REG(0x138458)
+ #define BMG_PLATFORM_POWER_LIMIT		XE_REG(0x138460)
+diff --git a/drivers/gpu/drm/xe/xe_hwmon.c b/drivers/gpu/drm/xe/xe_hwmon.c
+index fde56dad3ab7..7f327e334212 100644
+--- a/drivers/gpu/drm/xe/xe_hwmon.c
++++ b/drivers/gpu/drm/xe/xe_hwmon.c
+@@ -6,6 +6,7 @@
+ #include <linux/hwmon-sysfs.h>
+ #include <linux/hwmon.h>
+ #include <linux/types.h>
++#include <linux/units.h>
+ 
+ #include <drm/drm_managed.h>
+ #include "regs/xe_gt_regs.h"
+@@ -20,6 +21,7 @@
+ #include "xe_pm.h"
+ 
+ enum xe_hwmon_reg {
++	REG_TEMP,
+ 	REG_PKG_RAPL_LIMIT,
+ 	REG_PKG_POWER_SKU,
+ 	REG_PKG_POWER_SKU_UNIT,
+@@ -36,6 +38,7 @@ enum xe_hwmon_reg_operation {
+ enum xe_hwmon_channel {
+ 	CHANNEL_CARD,
+ 	CHANNEL_PKG,
++	CHANNEL_VRAM,
+ 	CHANNEL_MAX,
+ };
+ 
+@@ -84,6 +87,19 @@ static struct xe_reg xe_hwmon_get_reg(struct xe_hwmon *hwmon, enum xe_hwmon_reg
+ 	struct xe_device *xe = hwmon->xe;
+ 
+ 	switch (hwmon_reg) {
++	case REG_TEMP:
++		if (xe->info.platform == XE_BATTLEMAGE) {
++			if (channel == CHANNEL_PKG)
++				return BMG_PACKAGE_TEMPERATURE;
++			else if (channel == CHANNEL_VRAM)
++				return BMG_VRAM_TEMPERATURE;
++		} else if (xe->info.platform == XE_DG2) {
++			if (channel == CHANNEL_PKG)
++				return PCU_CR_PACKAGE_TEMPERATURE;
++			else if (channel == CHANNEL_VRAM)
++				return BMG_VRAM_TEMPERATURE;
++		}
++		break;
+ 	case REG_PKG_RAPL_LIMIT:
+ 		if (xe->info.platform == XE_BATTLEMAGE) {
+ 			if (channel == CHANNEL_PKG)
+@@ -431,6 +447,8 @@ static const struct attribute_group *hwmon_groups[] = {
+ };
+ 
+ static const struct hwmon_channel_info * const hwmon_info[] = {
++	HWMON_CHANNEL_INFO(temp, HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
+ 	HWMON_CHANNEL_INFO(power, HWMON_P_MAX | HWMON_P_RATED_MAX | HWMON_P_LABEL,
+ 			   HWMON_P_MAX | HWMON_P_RATED_MAX | HWMON_P_CRIT | HWMON_P_LABEL),
+ 	HWMON_CHANNEL_INFO(curr, HWMON_C_LABEL, HWMON_C_CRIT | HWMON_C_LABEL),
+@@ -506,6 +524,36 @@ static void xe_hwmon_get_voltage(struct xe_hwmon *hwmon, int channel, long *valu
+ 	*value = DIV_ROUND_CLOSEST(REG_FIELD_GET(VOLTAGE_MASK, reg_val) * 2500, SF_VOLTAGE);
+ }
+ 
++static umode_t
++xe_hwmon_temp_is_visible(struct xe_hwmon *hwmon, u32 attr, int channel)
++{
++	switch (attr) {
++	case hwmon_temp_input:
++	case hwmon_temp_label:
++		return xe_reg_is_valid(xe_hwmon_get_reg(hwmon, REG_TEMP, channel)) ? 0444 : 0;
++	default:
++		return 0;
++	}
++}
++
++static int
++xe_hwmon_temp_read(struct xe_hwmon *hwmon, u32 attr, int channel, long *val)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(hwmon->xe);
++	u64 reg_val;
++
++	switch (attr) {
++	case hwmon_temp_input:
++		reg_val = xe_mmio_read32(mmio, xe_hwmon_get_reg(hwmon, REG_TEMP, channel));
++
++		/* HW register value is in degrees Celsius, convert to millidegrees. */
++		*val = REG_FIELD_GET(TEMP_MASK, reg_val) * MILLIDEGREE_PER_DEGREE;
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static umode_t
+ xe_hwmon_power_is_visible(struct xe_hwmon *hwmon, u32 attr, int channel)
+ {
+@@ -667,6 +715,9 @@ xe_hwmon_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 	xe_pm_runtime_get(hwmon->xe);
+ 
+ 	switch (type) {
++	case hwmon_temp:
++		ret = xe_hwmon_temp_is_visible(hwmon, attr, channel);
++		break;
+ 	case hwmon_power:
+ 		ret = xe_hwmon_power_is_visible(hwmon, attr, channel);
+ 		break;
+@@ -699,6 +750,9 @@ xe_hwmon_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 	xe_pm_runtime_get(hwmon->xe);
+ 
+ 	switch (type) {
++	case hwmon_temp:
++		ret = xe_hwmon_temp_read(hwmon, attr, channel, val);
++		break;
+ 	case hwmon_power:
+ 		ret = xe_hwmon_power_read(hwmon, attr, channel, val);
+ 		break;
+@@ -752,6 +806,12 @@ static int xe_hwmon_read_label(struct device *dev,
+ 			       u32 attr, int channel, const char **str)
+ {
+ 	switch (type) {
++	case hwmon_temp:
++		if (channel == CHANNEL_PKG)
++			*str = "pkg";
++		else if (channel == CHANNEL_VRAM)
++			*str = "vram";
++		return 0;
+ 	case hwmon_power:
+ 	case hwmon_energy:
+ 	case hwmon_curr:
+-- 
+2.25.1
+

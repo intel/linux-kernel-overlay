@@ -1,0 +1,117 @@
+From 3687ce58e67594c4351dad489efd84683607facc Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Fri, 15 Nov 2024 10:21:51 +0000
+Subject: [PATCH 0044/1107] dma-fence: Add a single fence fast path for fence
+ merging
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Testing some workloads in two different scenarios, such as games running
+under Gamescope on a Steam Deck, or vkcube under a Plasma desktop, shows
+that in a significant portion of calls the dma_fence_unwrap_merge helper
+is called with just a single unsignalled fence.
+
+Therefore it is worthile to add a fast path for that case and so bypass
+the memory allocation and insertion sort attempts.
+
+Tested scenarios:
+
+1) Hogwarts Legacy under Gamescope
+
+~1500 calls per second to __dma_fence_unwrap_merge.
+
+Percentages per number of fences buckets, before and after checking for
+signalled status, sorting and flattening:
+
+   N       Before      After
+   0       0.85%
+   1      69.80%        ->   The new fast path.
+  2-9     29.36%        9%   (Ie. 91% of this bucket flattened to 1 fence)
+ 10-19
+ 20-40
+  50+
+
+2) Cyberpunk 2077 under Gamescope
+
+~2400 calls per second.
+
+   N       Before      After
+   0       0.71%
+   1      52.53%        ->    The new fast path.
+  2-9     44.38%      50.60%  (Ie. half resolved to a single fence)
+ 10-19     2.34%
+ 20-40     0.06%
+  50+
+
+3) vkcube under Plasma
+
+90 calls per second.
+
+   N       Before      After
+   0
+   1
+  2-9      100%         0%   (Ie. all resolved to a single fence)
+ 10-19
+ 20-40
+  50+
+
+In the case of vkcube all invocations in the 2-9 bucket were actually
+just two input fences.
+
+v2:
+ * Correct local variable name and hold on to unsignaled reference. (Chistian)
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Friedrich Vock <friedrich.vock@gmx.de>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241115102153.1980-4-tursulin@igalia.com
+---
+ drivers/dma-buf/dma-fence-unwrap.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma-buf/dma-fence-unwrap.c b/drivers/dma-buf/dma-fence-unwrap.c
+index 6345062731f1..2a059ac0ed27 100644
+--- a/drivers/dma-buf/dma-fence-unwrap.c
++++ b/drivers/dma-buf/dma-fence-unwrap.c
+@@ -84,8 +84,8 @@ struct dma_fence *__dma_fence_unwrap_merge(unsigned int num_fences,
+ 					   struct dma_fence **fences,
+ 					   struct dma_fence_unwrap *iter)
+ {
++	struct dma_fence *tmp, *unsignaled = NULL, **array;
+ 	struct dma_fence_array *result;
+-	struct dma_fence *tmp, **array;
+ 	ktime_t timestamp;
+ 	int i, j, count;
+ 
+@@ -94,6 +94,8 @@ struct dma_fence *__dma_fence_unwrap_merge(unsigned int num_fences,
+ 	for (i = 0; i < num_fences; ++i) {
+ 		dma_fence_unwrap_for_each(tmp, &iter[i], fences[i]) {
+ 			if (!dma_fence_is_signaled(tmp)) {
++				dma_fence_put(unsignaled);
++				unsignaled = dma_fence_get(tmp);
+ 				++count;
+ 			} else {
+ 				ktime_t t = dma_fence_timestamp(tmp);
+@@ -107,9 +109,16 @@ struct dma_fence *__dma_fence_unwrap_merge(unsigned int num_fences,
+ 	/*
+ 	 * If we couldn't find a pending fence just return a private signaled
+ 	 * fence with the timestamp of the last signaled one.
++	 *
++	 * Or if there was a single unsignaled fence left we can return it
++	 * directly and early since that is a major path on many workloads.
+ 	 */
+ 	if (count == 0)
+ 		return dma_fence_allocate_private_stub(timestamp);
++	else if (count == 1)
++		return unsignaled;
++
++	dma_fence_put(unsignaled);
+ 
+ 	array = kmalloc_array(count, sizeof(*array), GFP_KERNEL);
+ 	if (!array)
+-- 
+2.25.1
+

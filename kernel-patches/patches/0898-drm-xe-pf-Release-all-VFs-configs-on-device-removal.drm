@@ -1,0 +1,120 @@
+From 0beb0a74ead10dbeb9ab8217dbcf538f8da1643d Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Tue, 11 Feb 2025 16:50:34 +0100
+Subject: [PATCH 0898/1107] drm/xe/pf: Release all VFs configs on device
+ removal
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If we try to manually provision VFs using debugfs and then we
+try to unload the driver, we will see complains like:
+
+ [ ] Memory manager not clean during takedown.
+ [ ] RIP: 0010:drm_mm_takedown+0x3f/0x100
+ [ ] [drm:drm_mm_takedown] *ERROR* node [fedff000 + 00001000]: inserted at
+      drm_mm_insert_node_in_range+0x2bd/0x520
+      xe_ggtt_node_insert+0x52/0x90 [xe]
+      pf_provision_vf_ggtt+0x1fa/0xac0 [xe]
+      xe_gt_sriov_pf_config_set_ggtt+0x79/0x7a0 [xe]
+      ggtt_set+0x53/0x80 [xe]
+      simple_attr_write_xsigned.isra.0+0xd2/0x150
+      simple_attr_write+0x14/0x30
+      debugfs_attr_write+0x4e/0x80
+
+ [ ] xe 0000:00:02.0: [drm] *ERROR* GT0: GUC ID manager unclean (1/65535)
+ [ ] xe 0000:00:02.0: [drm] GT0:      total 65535
+ [ ] xe 0000:00:02.0: [drm] GT0:      used 1
+ [ ] xe 0000:00:02.0: [drm] GT0:      range 65534..65534 (1)
+
+ [ ] xe 0000:00:02.0: [drm] *ERROR* GT0: GuC doorbells manager unclean (1/256)
+ [ ] xe 0000:00:02.0: [drm] GT0:      count: 256
+ [ ] xe 0000:00:02.0: [drm] GT0:      available range: 1..255 (255)
+ [ ] xe 0000:00:02.0: [drm] GT0:      available total: 255
+ [ ] xe 0000:00:02.0: [drm] GT0:      reserved range: 0..0 (1)
+ [ ] xe 0000:00:02.0: [drm] GT0:      reserved total: 1
+
+This could be easily fixed by adding config release action.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Piotr Piórkowski <piotr.piorkowski@intel.com>
+Reviewed-by: Piotr Piórkowski <piotr.piorkowski@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250211155034.1028-1-michal.wajdeczko@intel.com
+---
+ drivers/gpu/drm/xe/xe_gt_sriov_pf.c        |  6 +++++
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c | 29 ++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_config.h |  1 +
+ 3 files changed, 36 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
+index d66478deab98..c08efca6420e 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
+@@ -89,6 +89,12 @@ int xe_gt_sriov_pf_init_early(struct xe_gt *gt)
+  */
+ int xe_gt_sriov_pf_init(struct xe_gt *gt)
+ {
++	int err;
++
++	err = xe_gt_sriov_pf_config_init(gt);
++	if (err)
++		return err;
++
+ 	return xe_gt_sriov_pf_migration_init(gt);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
+index 88bd9d97ba5c..10be109bf357 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
+@@ -2356,6 +2356,35 @@ int xe_gt_sriov_pf_config_restore(struct xe_gt *gt, unsigned int vfid,
+ 	return err;
+ }
+ 
++static void fini_config(void *arg)
++{
++	struct xe_gt *gt = arg;
++	struct xe_device *xe = gt_to_xe(gt);
++	unsigned int n, total_vfs = xe_sriov_pf_get_totalvfs(xe);
++
++	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
++	for (n = 1; n <= total_vfs; n++)
++		pf_release_vf_config(gt, n);
++	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
++}
++
++/**
++ * xe_gt_sriov_pf_config_init - Initialize SR-IOV configuration data.
++ * @gt: the &xe_gt
++ *
++ * This function can only be called on PF.
++ *
++ * Return: 0 on success or a negative error code on failure.
++ */
++int xe_gt_sriov_pf_config_init(struct xe_gt *gt)
++{
++	struct xe_device *xe = gt_to_xe(gt);
++
++	xe_gt_assert(gt, IS_SRIOV_PF(xe));
++
++	return devm_add_action_or_reset(xe->drm.dev, fini_config, gt);
++}
++
+ /**
+  * xe_gt_sriov_pf_config_restart - Restart SR-IOV configurations after a GT reset.
+  * @gt: the &xe_gt
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.h
+index f894e9d4abba..513e6512a575 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.h
+@@ -63,6 +63,7 @@ int xe_gt_sriov_pf_config_restore(struct xe_gt *gt, unsigned int vfid,
+ 
+ bool xe_gt_sriov_pf_config_is_empty(struct xe_gt *gt, unsigned int vfid);
+ 
++int xe_gt_sriov_pf_config_init(struct xe_gt *gt);
+ void xe_gt_sriov_pf_config_restart(struct xe_gt *gt);
+ 
+ int xe_gt_sriov_pf_config_print_ggtt(struct xe_gt *gt, struct drm_printer *p);
+-- 
+2.25.1
+

@@ -1,0 +1,175 @@
+From 1b181adb7d83a123da5c1ca93a8930748457140a Mon Sep 17 00:00:00 2001
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Wed, 22 Jan 2025 11:25:42 +0530
+Subject: [PATCH 0657/1107] drm/i915/dp: Guarantee a minimum HBlank time
+
+Mandate a minimum Hblank symbol cycle count between BlankingStart and
+BlankingEnd in 8b/10b MST and 128b/132b mode.
+
+v2: Affine calculation/updation of min HBlank to dp_mst (Jani)
+v3: moved min_hblank from struct intel_dp to intel_crtc_state (Jani)
+v4: use max/min functions, change intel_xx *intel_xx to intel_xx *xx
+    (Jani)
+    Limit hblank to 511 and accommodate BS/BE in calculated value
+    (Srikanth)
+v5: Some spelling corrections (Suraj)
+v6: Removed DP2.1 in comment as this is applicable for both DP2.1 and
+    DP1.4 (Suraj)
+v7: crtc_state holds the logical values and the register value
+    computation is moved to mst_enable() (Jani)
+v8: Limit max hblank to 0x10, disable min_hblank on mst_disable (Jani)
+
+Bspec: 74379
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Reviewed-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250122-hblank-v9-1-90afda006685@intel.com
+---
+ .../drm/i915/display/intel_crtc_state_dump.c  |  1 +
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_dp_mst.c   | 53 ++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_reg.h               |  4 ++
+ 4 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_crtc_state_dump.c b/drivers/gpu/drm/i915/display/intel_crtc_state_dump.c
+index 36076e8d639b..ecd0d9853c60 100644
+--- a/drivers/gpu/drm/i915/display/intel_crtc_state_dump.c
++++ b/drivers/gpu/drm/i915/display/intel_crtc_state_dump.c
+@@ -249,6 +249,7 @@ void intel_crtc_state_dump(const struct intel_crtc_state *pipe_config,
+ 			   str_enabled_disabled(pipe_config->has_sel_update),
+ 			   str_enabled_disabled(pipe_config->has_panel_replay),
+ 			   str_enabled_disabled(pipe_config->enable_psr2_sel_fetch));
++		drm_printf(&p, "minimum HBlank: %d\n", pipe_config->min_hblank);
+ 	}
+ 
+ 	drm_printf(&p, "audio: %i, infoframes: %i, infoframes enabled: 0x%x\n",
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index cb51b7936f93..f1a9ab4ae85a 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1097,6 +1097,7 @@ struct intel_crtc_state {
+ 
+ 	int max_link_bpp_x16;	/* in 1/16 bpp units */
+ 	int pipe_bpp;		/* in 1 bpp units */
++	int min_hblank;
+ 	struct intel_link_m_n dp_m_n;
+ 
+ 	/* m2_n2 for eDP downclock */
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 3a3eba77953c..158e52f783b9 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -209,6 +209,28 @@ static int intel_dp_mst_dsc_get_slice_count(const struct intel_connector *connec
+ 					    num_joined_pipes);
+ }
+ 
++static void intel_dp_mst_compute_min_hblank(struct intel_crtc_state *crtc_state,
++					    struct intel_connector *connector,
++					    int bpp_x16)
++{
++	struct intel_encoder *encoder = connector->encoder;
++	struct intel_display *display = to_intel_display(encoder);
++	const struct drm_display_mode *adjusted_mode =
++					&crtc_state->hw.adjusted_mode;
++	int symbol_size = intel_dp_is_uhbr(crtc_state) ? 32 : 8;
++	int hblank;
++
++	if (DISPLAY_VER(display) < 20)
++		return;
++
++	/* Calculate min Hblank Link Layer Symbol Cycle Count for 8b/10b MST & 128b/132b */
++	hblank = DIV_ROUND_UP((DIV_ROUND_UP
++			       (adjusted_mode->htotal - adjusted_mode->hdisplay, 4) * bpp_x16),
++			      symbol_size);
++
++	crtc_state->min_hblank = hblank;
++}
++
+ int intel_dp_mtp_tu_compute_config(struct intel_dp *intel_dp,
+ 				   struct intel_crtc_state *crtc_state,
+ 				   struct drm_connector_state *conn_state,
+@@ -278,6 +300,9 @@ int intel_dp_mtp_tu_compute_config(struct intel_dp *intel_dp,
+ 
+ 		local_bw_overhead = intel_dp_mst_bw_overhead(crtc_state,
+ 							     false, dsc_slice_count, link_bpp_x16);
++
++		intel_dp_mst_compute_min_hblank(crtc_state, connector, link_bpp_x16);
++
+ 		intel_dp_mst_compute_m_n(crtc_state,
+ 					 local_bw_overhead,
+ 					 link_bpp_x16,
+@@ -971,6 +996,7 @@ static void mst_stream_disable(struct intel_atomic_state *state,
+ 	struct intel_dp *intel_dp = to_primary_dp(encoder);
+ 	struct intel_connector *connector =
+ 		to_intel_connector(old_conn_state->connector);
++	enum transcoder trans = old_crtc_state->cpu_transcoder;
+ 
+ 	drm_dbg_kms(display->drm, "active links %d\n",
+ 		    intel_dp->active_mst_links);
+@@ -981,6 +1007,8 @@ static void mst_stream_disable(struct intel_atomic_state *state,
+ 	intel_hdcp_disable(intel_mst->connector);
+ 
+ 	intel_dp_sink_disable_decompression(state, connector, old_crtc_state);
++
++	intel_de_write(display, DP_MIN_HBLANK_CTL(trans), 0x00);
+ }
+ 
+ static void mst_stream_post_disable(struct intel_atomic_state *state,
+@@ -1253,7 +1281,7 @@ static void mst_stream_enable(struct intel_atomic_state *state,
+ 	enum transcoder trans = pipe_config->cpu_transcoder;
+ 	bool first_mst_stream = intel_dp->active_mst_links == 1;
+ 	struct intel_crtc *pipe_crtc;
+-	int ret, i;
++	int ret, i, min_hblank;
+ 
+ 	drm_WARN_ON(display->drm, pipe_config->has_pch_encoder);
+ 
+@@ -1268,6 +1296,29 @@ static void mst_stream_enable(struct intel_atomic_state *state,
+ 			       TRANS_DP2_VFREQ_PIXEL_CLOCK(crtc_clock_hz & 0xffffff));
+ 	}
+ 
++	if (DISPLAY_VER(display) >= 20) {
++		/*
++		 * adjust the BlankingStart/BlankingEnd framing control from
++		 * the calculated value
++		 */
++		min_hblank = pipe_config->min_hblank - 2;
++
++		/* Maximum value to be programmed is limited to 0x10 */
++		min_hblank = min(0x10, min_hblank);
++
++		/*
++		 * Minimum hblank accepted for 128b/132b would be 5 and for
++		 * 8b/10b would be 3 symbol count
++		 */
++		if (intel_dp_is_uhbr(pipe_config))
++			min_hblank = max(min_hblank, 5);
++		else
++			min_hblank = max(min_hblank, 3);
++
++		intel_de_write(display, DP_MIN_HBLANK_CTL(trans),
++			       min_hblank);
++	}
++
+ 	enable_bs_jitter_was(pipe_config);
+ 
+ 	intel_ddi_enable_transcoder_func(encoder, pipe_config);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 04e47d0a8ab9..3eea191f2017 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3198,6 +3198,10 @@
+ #define _TRANS_DP2_VFREQLOW_D			0x630a8
+ #define TRANS_DP2_VFREQLOW(trans)		_MMIO_TRANS(trans, _TRANS_DP2_VFREQLOW_A, _TRANS_DP2_VFREQLOW_B)
+ 
++#define _DP_MIN_HBLANK_CTL_A			0x600ac
++#define _DP_MIN_HBLANK_CTL_B			0x610ac
++#define DP_MIN_HBLANK_CTL(trans)		_MMIO_TRANS(trans, _DP_MIN_HBLANK_CTL_A, _DP_MIN_HBLANK_CTL_B)
++
+ /* SNB eDP training params */
+ /* SNB A-stepping */
+ #define  EDP_LINK_TRAIN_400MV_0DB_SNB_A		(0x38 << 22)
+-- 
+2.25.1
+

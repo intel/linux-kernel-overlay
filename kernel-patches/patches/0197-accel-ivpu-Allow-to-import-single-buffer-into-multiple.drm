@@ -1,0 +1,112 @@
+From 256ebc076ea7a57e301e3f0c27272850328138fd Mon Sep 17 00:00:00 2001
+From: Tomasz Rusinowicz <tomasz.rusinowicz@intel.com>
+Date: Tue, 4 Feb 2025 09:46:20 +0100
+Subject: [PATCH 0197/1107] accel/ivpu: Allow to import single buffer into
+ multiple contexts
+
+Use ivpu_gem_prime_import() based on drm_gem_prime_import_dev()
+for importing buffers, removing optimization for same device
+imports. This optimization reused the same ivpu_bo object in multiple
+contexts but a single buffer can be MMU-mapped only to a single context.
+Each import now creates a new instance of ivpu_bo object that shares
+the same sg_table but have separate MMU mappings.
+
+Reviewed-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Signed-off-by: Tomasz Rusinowicz <tomasz.rusinowicz@intel.com>
+Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250204084622.2422544-5-jacek.lawrynowicz@linux.intel.com
+---
+ drivers/accel/ivpu/ivpu_drv.c |  2 +-
+ drivers/accel/ivpu/ivpu_gem.c | 43 +++++++++++++++++++++++++++++++++++
+ drivers/accel/ivpu/ivpu_gem.h |  1 +
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/accel/ivpu/ivpu_drv.c b/drivers/accel/ivpu/ivpu_drv.c
+index bcc568800e79..4fa73189502e 100644
+--- a/drivers/accel/ivpu/ivpu_drv.c
++++ b/drivers/accel/ivpu/ivpu_drv.c
+@@ -456,7 +456,7 @@ static const struct drm_driver driver = {
+ 	.postclose = ivpu_postclose,
+ 
+ 	.gem_create_object = ivpu_gem_create_object,
+-	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
++	.gem_prime_import = ivpu_gem_prime_import,
+ 
+ 	.ioctls = ivpu_drm_ioctls,
+ 	.num_ioctls = ARRAY_SIZE(ivpu_drm_ioctls),
+diff --git a/drivers/accel/ivpu/ivpu_gem.c b/drivers/accel/ivpu/ivpu_gem.c
+index 16178054e629..8741c73b92ce 100644
+--- a/drivers/accel/ivpu/ivpu_gem.c
++++ b/drivers/accel/ivpu/ivpu_gem.c
+@@ -20,6 +20,8 @@
+ #include "ivpu_mmu.h"
+ #include "ivpu_mmu_context.h"
+ 
++MODULE_IMPORT_NS("DMA_BUF");
++
+ static const struct drm_gem_object_funcs ivpu_gem_funcs;
+ 
+ static inline void ivpu_dbg_bo(struct ivpu_device *vdev, struct ivpu_bo *bo, const char *action)
+@@ -172,6 +174,47 @@ struct drm_gem_object *ivpu_gem_create_object(struct drm_device *dev, size_t siz
+ 	return &bo->base.base;
+ }
+ 
++struct drm_gem_object *ivpu_gem_prime_import(struct drm_device *dev,
++					     struct dma_buf *dma_buf)
++{
++	struct device *attach_dev = dev->dev;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	struct drm_gem_object *obj;
++	int ret;
++
++	attach = dma_buf_attach(dma_buf, attach_dev);
++	if (IS_ERR(attach))
++		return ERR_CAST(attach);
++
++	get_dma_buf(dma_buf);
++
++	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto fail_detach;
++	}
++
++	obj = drm_gem_shmem_prime_import_sg_table(dev, attach, sgt);
++	if (IS_ERR(obj)) {
++		ret = PTR_ERR(obj);
++		goto fail_unmap;
++	}
++
++	obj->import_attach = attach;
++	obj->resv = dma_buf->resv;
++
++	return obj;
++
++fail_unmap:
++	dma_buf_unmap_attachment_unlocked(attach, sgt, DMA_BIDIRECTIONAL);
++fail_detach:
++	dma_buf_detach(dma_buf, attach);
++	dma_buf_put(dma_buf);
++
++	return ERR_PTR(ret);
++}
++
+ static struct ivpu_bo *ivpu_bo_alloc(struct ivpu_device *vdev, u64 size, u32 flags)
+ {
+ 	struct drm_gem_shmem_object *shmem;
+diff --git a/drivers/accel/ivpu/ivpu_gem.h b/drivers/accel/ivpu/ivpu_gem.h
+index d975000abd78..a222a9ec9d61 100644
+--- a/drivers/accel/ivpu/ivpu_gem.h
++++ b/drivers/accel/ivpu/ivpu_gem.h
+@@ -28,6 +28,7 @@ int ivpu_bo_pin(struct ivpu_bo *bo);
+ void ivpu_bo_unbind_all_bos_from_context(struct ivpu_device *vdev, struct ivpu_mmu_context *ctx);
+ 
+ struct drm_gem_object *ivpu_gem_create_object(struct drm_device *dev, size_t size);
++struct drm_gem_object *ivpu_gem_prime_import(struct drm_device *dev, struct dma_buf *dma_buf);
+ struct ivpu_bo *ivpu_bo_create(struct ivpu_device *vdev, struct ivpu_mmu_context *ctx,
+ 			       struct ivpu_addr_range *range, u64 size, u32 flags);
+ struct ivpu_bo *ivpu_bo_create_global(struct ivpu_device *vdev, u64 size, u32 flags);
+-- 
+2.25.1
+

@@ -1,0 +1,196 @@
+From 31773f16e83441253b99a5de56ddc07e1bc3a93c Mon Sep 17 00:00:00 2001
+From: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Date: Wed, 29 Jan 2025 13:56:31 +0100
+Subject: [PATCH 0144/1107] accel/ivpu: Add support for hardware fault
+ injection
+
+Introduces the capability to simulate hardware faults for testing
+purposes. The new `fail_hw` fault can be injected in
+`ivpu_hw_reg_poll_fld()`, which is used in various parts of the driver
+to wait for the hardware to reach a specific state. This allows to test
+failures during NPU boot and shutdown, IPC message handling and more.
+
+Fault injection can be enabled using debugfs or a module parameter.
+
+Reviewed-by: Maciej Falkowski <maciej.falkowski@linux.intel.com>
+Reviewed-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250129125636.1047413-2-jacek.lawrynowicz@linux.intel.com
+---
+ drivers/accel/ivpu/ivpu_debugfs.c   |  5 +++
+ drivers/accel/ivpu/ivpu_hw.c        | 14 +++++++
+ drivers/accel/ivpu/ivpu_hw_ip.c     |  4 +-
+ drivers/accel/ivpu/ivpu_hw_reg_io.h | 64 +++++++++++++++++------------
+ 4 files changed, 58 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/accel/ivpu/ivpu_debugfs.c b/drivers/accel/ivpu/ivpu_debugfs.c
+index 8180b95ed69d..e79715c53f2a 100644
+--- a/drivers/accel/ivpu/ivpu_debugfs.c
++++ b/drivers/accel/ivpu/ivpu_debugfs.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/debugfs.h>
++#include <linux/fault-inject.h>
+ 
+ #include <drm/drm_debugfs.h>
+ #include <drm/drm_file.h>
+@@ -430,4 +431,8 @@ void ivpu_debugfs_init(struct ivpu_device *vdev)
+ 				    debugfs_root, vdev, &fw_profiling_freq_fops);
+ 		debugfs_create_file("dct", 0644, debugfs_root, vdev, &ivpu_dct_fops);
+ 	}
++
++#ifdef CONFIG_FAULT_INJECTION
++	fault_create_debugfs_attr("fail_hw", debugfs_root, &ivpu_hw_failure);
++#endif
+ }
+diff --git a/drivers/accel/ivpu/ivpu_hw.c b/drivers/accel/ivpu/ivpu_hw.c
+index e332f19ab51d..8099ab047bfe 100644
+--- a/drivers/accel/ivpu/ivpu_hw.c
++++ b/drivers/accel/ivpu/ivpu_hw.c
+@@ -9,6 +9,15 @@
+ #include "ivpu_hw_ip.h"
+ 
+ #include <linux/dmi.h>
++#include <linux/fault-inject.h>
++
++#ifdef CONFIG_FAULT_INJECTION
++DECLARE_FAULT_ATTR(ivpu_hw_failure);
++
++static char *ivpu_fail_hw;
++module_param_named_unsafe(fail_hw, ivpu_fail_hw, charp, 0444);
++MODULE_PARM_DESC(fail_hw, "<interval>,<probability>,<space>,<times>");
++#endif
+ 
+ static char *platform_to_str(u32 platform)
+ {
+@@ -247,6 +256,11 @@ int ivpu_hw_init(struct ivpu_device *vdev)
+ 	timeouts_init(vdev);
+ 	atomic_set(&vdev->hw->firewall_irq_counter, 0);
+ 
++#ifdef CONFIG_FAULT_INJECTION
++	if (ivpu_fail_hw)
++		setup_fault_attr(&ivpu_hw_failure, ivpu_fail_hw);
++#endif
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/accel/ivpu/ivpu_hw_ip.c b/drivers/accel/ivpu/ivpu_hw_ip.c
+index 029dd065614b..823f6a57dc54 100644
+--- a/drivers/accel/ivpu/ivpu_hw_ip.c
++++ b/drivers/accel/ivpu/ivpu_hw_ip.c
+@@ -968,14 +968,14 @@ void ivpu_hw_ip_wdt_disable(struct ivpu_device *vdev)
+ 
+ static u32 ipc_rx_count_get_37xx(struct ivpu_device *vdev)
+ {
+-	u32 count = REGV_RD32_SILENT(VPU_37XX_HOST_SS_TIM_IPC_FIFO_STAT);
++	u32 count = readl(vdev->regv + VPU_37XX_HOST_SS_TIM_IPC_FIFO_STAT);
+ 
+ 	return REG_GET_FLD(VPU_37XX_HOST_SS_TIM_IPC_FIFO_STAT, FILL_LEVEL, count);
+ }
+ 
+ static u32 ipc_rx_count_get_40xx(struct ivpu_device *vdev)
+ {
+-	u32 count = REGV_RD32_SILENT(VPU_40XX_HOST_SS_TIM_IPC_FIFO_STAT);
++	u32 count = readl(vdev->regv + VPU_40XX_HOST_SS_TIM_IPC_FIFO_STAT);
+ 
+ 	return REG_GET_FLD(VPU_40XX_HOST_SS_TIM_IPC_FIFO_STAT, FILL_LEVEL, count);
+ }
+diff --git a/drivers/accel/ivpu/ivpu_hw_reg_io.h b/drivers/accel/ivpu/ivpu_hw_reg_io.h
+index 79b3f441eac4..66259b0ead02 100644
+--- a/drivers/accel/ivpu/ivpu_hw_reg_io.h
++++ b/drivers/accel/ivpu/ivpu_hw_reg_io.h
+@@ -7,6 +7,7 @@
+ #define __IVPU_HW_REG_IO_H__
+ 
+ #include <linux/bitfield.h>
++#include <linux/fault-inject.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ 
+@@ -16,13 +17,11 @@
+ #define REG_IO_ERROR      0xffffffff
+ 
+ #define REGB_RD32(reg)          ivpu_hw_reg_rd32(vdev, vdev->regb, (reg), #reg, __func__)
+-#define REGB_RD32_SILENT(reg)   readl(vdev->regb + (reg))
+ #define REGB_RD64(reg)          ivpu_hw_reg_rd64(vdev, vdev->regb, (reg), #reg, __func__)
+ #define REGB_WR32(reg, val)     ivpu_hw_reg_wr32(vdev, vdev->regb, (reg), (val), #reg, __func__)
+ #define REGB_WR64(reg, val)     ivpu_hw_reg_wr64(vdev, vdev->regb, (reg), (val), #reg, __func__)
+ 
+ #define REGV_RD32(reg)          ivpu_hw_reg_rd32(vdev, vdev->regv, (reg), #reg, __func__)
+-#define REGV_RD32_SILENT(reg)   readl(vdev->regv + (reg))
+ #define REGV_RD64(reg)          ivpu_hw_reg_rd64(vdev, vdev->regv, (reg), #reg, __func__)
+ #define REGV_WR32(reg, val)     ivpu_hw_reg_wr32(vdev, vdev->regv, (reg), (val), #reg, __func__)
+ #define REGV_WR64(reg, val)     ivpu_hw_reg_wr64(vdev, vdev->regv, (reg), (val), #reg, __func__)
+@@ -47,31 +46,42 @@
+ #define REG_TEST_FLD_NUM(REG, FLD, num, val) \
+ 	((num) == FIELD_GET(REG##_##FLD##_MASK, val))
+ 
+-#define REGB_POLL_FLD(reg, fld, val, timeout_us) \
+-({ \
+-	u32 var; \
+-	int r; \
+-	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) Polling field %s started (expected 0x%x)\n", \
+-		 __func__, #reg, reg, #fld, val); \
+-	r = read_poll_timeout(REGB_RD32_SILENT, var, (FIELD_GET(reg##_##fld##_MASK, var) == (val)),\
+-			      REG_POLL_SLEEP_US, timeout_us, false, (reg)); \
+-	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) Polling field %s %s (reg val 0x%08x)\n", \
+-		 __func__, #reg, reg, #fld, r ? "ETIMEDOUT" : "OK", var); \
+-	r; \
+-})
+-
+-#define REGV_POLL_FLD(reg, fld, val, timeout_us) \
+-({ \
+-	u32 var; \
+-	int r; \
+-	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) Polling field %s started (expected 0x%x)\n", \
+-		 __func__, #reg, reg, #fld, val); \
+-	r = read_poll_timeout(REGV_RD32_SILENT, var, (FIELD_GET(reg##_##fld##_MASK, var) == (val)),\
+-			      REG_POLL_SLEEP_US, timeout_us, false, (reg)); \
+-	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) Polling field %s %s (reg val 0x%08x)\n", \
+-		 __func__, #reg, reg, #fld, r ? "ETIMEDOUT" : "OK", var); \
+-	r; \
+-})
++#define REGB_POLL_FLD(reg, fld, exp_fld_val, timeout_us) \
++	ivpu_hw_reg_poll_fld(vdev, vdev->regb, reg, reg##_##fld##_MASK, \
++			     FIELD_PREP(reg##_##fld##_MASK, exp_fld_val), timeout_us, \
++			     __func__, #reg, #fld)
++
++#define REGV_POLL_FLD(reg, fld, exp_fld_val, timeout_us) \
++	ivpu_hw_reg_poll_fld(vdev, vdev->regv, reg, reg##_##fld##_MASK, \
++			     FIELD_PREP(reg##_##fld##_MASK, exp_fld_val), timeout_us, \
++			     __func__, #reg, #fld)
++
++extern struct fault_attr ivpu_hw_failure;
++
++static inline int __must_check
++ivpu_hw_reg_poll_fld(struct ivpu_device *vdev, void __iomem *base,
++		     u32 reg_offset, u32 reg_mask, u32 exp_masked_val, u32 timeout_us,
++		     const char *func_name, const char *reg_name, const char *fld_name)
++{
++	u32 reg_val;
++	int ret;
++
++	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) POLL %s started (exp_val 0x%x)\n",
++		 func_name, reg_name, reg_offset, fld_name, exp_masked_val);
++
++	ret = read_poll_timeout(readl, reg_val, (reg_val & reg_mask) == exp_masked_val,
++				REG_POLL_SLEEP_US, timeout_us, false, base + reg_offset);
++
++#ifdef CONFIG_FAULT_INJECTION
++	if (should_fail(&ivpu_hw_failure, 1))
++		ret = -ETIMEDOUT;
++#endif
++
++	ivpu_dbg(vdev, REG, "%s : %s (0x%08x) POLL %s %s (reg_val 0x%08x)\n",
++		 func_name, reg_name, reg_offset, fld_name, ret ? "ETIMEDOUT" : "OK", reg_val);
++
++	return ret;
++}
+ 
+ static inline u32
+ ivpu_hw_reg_rd32(struct ivpu_device *vdev, void __iomem *base, u32 reg,
+-- 
+2.25.1
+

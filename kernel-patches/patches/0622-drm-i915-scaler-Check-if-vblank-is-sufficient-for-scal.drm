@@ -1,0 +1,138 @@
+From 4f1b53b99a26f8e75eb7d04a29f3fc2c13ed588e Mon Sep 17 00:00:00 2001
+From: Mitul Golani <mitulkumar.ajitkumar.golani@intel.com>
+Date: Mon, 20 Jan 2025 22:52:07 +0530
+Subject: [PATCH 0622/1107] drm/i915/scaler: Check if vblank is sufficient for
+ scaler
+
+High refresh rate panels which may have small line times
+and vblank sizes, Check if vblank size is sufficient for
+enabled scaler users.
+
+--v2:
+- Use hweight* family of functions for counting bits. [Jani]
+- Update precision handling for hscale and vscale. [Ankit]
+- Consider chroma downscaling factor during latency
+calculation. [Ankit]
+- Replace function name from scaler_prefill_time to
+scaler_prefill_latency.
+
+--v3:
+- hscale_k and vscale_k values are already left shifted
+by 16, after multiplying by 1000, those need to be right
+shifted to 16. [Ankit]
+- Replace YCBCR444 to YCBCR420. [Ankit]
+- Divide by 1000 * 1000 in end to get correct precision. [Ankit]
+- Initialise latency to 0 to avoid any garbage.
+
+--v4:
+- Elaborate commit message and add Bspec number. [Ankit]
+- Improvise latency calculation. [Ankit]
+- Use ceiling value for down scaling factor when less than 1
+as per bspec. [Ankit]
+- Correct linetime calculation. [Ankit]
+- Consider cdclk prefill adjustment while prefill
+computation.[Ankit]
+
+--v5:
+- Add Bspec link in commit message trailer. [Ankit]
+- Correct hscale, vscale data type.
+- Use intel_crtc_compute_min_cdclk. [Ankit]
+
+--v6:
+- Update FIXME comment.
+- Use cdclk_state->logical.cdclk instead of
+intel_crtc_compute_min_cdclk. [Ankit]
+
+--v7:
+- Handle error return from cdclk_prefill_adjustment. [Ankit]
+- Avoid incorrect round off for linetime. [Ankit]
+- Correct precision. [Ankit]
+
+--v8:
+- Remove redundancy calculation added from previous patch. [Ankit]
+
+Bspec: 70151
+Signed-off-by: Mitul Golani <mitulkumar.ajitkumar.golani@intel.com>
+Reviewed-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250120172209.188488-7-mitulkumar.ajitkumar.golani@intel.com
+---
+ drivers/gpu/drm/i915/display/skl_watermark.c | 53 +++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index 2bc6251e93d6..a2580112b50b 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -2292,6 +2292,56 @@ static int icl_build_plane_wm(struct intel_crtc_state *crtc_state,
+ 	return 0;
+ }
+ 
++static int
++cdclk_prefill_adjustment(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++	struct intel_atomic_state *state =
++		to_intel_atomic_state(crtc_state->uapi.state);
++	const struct intel_cdclk_state *cdclk_state;
++
++	cdclk_state = intel_atomic_get_cdclk_state(state);
++	if (IS_ERR(cdclk_state)) {
++		drm_WARN_ON(display->drm, PTR_ERR(cdclk_state));
++		return 1;
++	}
++
++	return min(1, DIV_ROUND_UP(crtc_state->pixel_rate,
++				   2 * cdclk_state->logical.cdclk));
++}
++
++static int
++scaler_prefill_latency(const struct intel_crtc_state *crtc_state)
++{
++	const struct intel_crtc_scaler_state *scaler_state =
++					&crtc_state->scaler_state;
++	int num_scaler_users = hweight32(scaler_state->scaler_users);
++	int scaler_prefill_latency = 0;
++	int linetime = DIV_ROUND_UP(1000 * crtc_state->hw.adjusted_mode.htotal,
++				    crtc_state->hw.adjusted_mode.clock);
++
++	if (!num_scaler_users)
++		return scaler_prefill_latency;
++
++	scaler_prefill_latency = 4 * linetime;
++
++	if (num_scaler_users > 1) {
++		u64 hscale_k = max(1000, mul_u32_u32(scaler_state->scalers[0].hscale, 1000) >> 16);
++		u64 vscale_k = max(1000, mul_u32_u32(scaler_state->scalers[0].vscale, 1000) >> 16);
++		int chroma_downscaling_factor =
++			crtc_state->output_format == INTEL_OUTPUT_FORMAT_YCBCR420 ? 2 : 1;
++		int latency;
++
++		latency = DIV_ROUND_UP_ULL((4 * linetime * hscale_k * vscale_k *
++					    chroma_downscaling_factor), 1000000);
++		scaler_prefill_latency += latency;
++	}
++
++	scaler_prefill_latency *= cdclk_prefill_adjustment(crtc_state);
++
++	return intel_usecs_to_scanlines(&crtc_state->hw.adjusted_mode, scaler_prefill_latency);
++}
++
+ static bool
+ skl_is_vblank_too_short(const struct intel_crtc_state *crtc_state,
+ 			int wm0_lines, int latency)
+@@ -2299,9 +2349,10 @@ skl_is_vblank_too_short(const struct intel_crtc_state *crtc_state,
+ 	const struct drm_display_mode *adjusted_mode =
+ 		&crtc_state->hw.adjusted_mode;
+ 
+-	/* FIXME missing scaler and DSC pre-fill time */
++	/* FIXME missing DSC pre-fill time */
+ 	return crtc_state->framestart_delay +
+ 		intel_usecs_to_scanlines(adjusted_mode, latency) +
++		scaler_prefill_latency(crtc_state) +
+ 		wm0_lines >
+ 		adjusted_mode->crtc_vtotal - adjusted_mode->crtc_vblank_start;
+ }
+-- 
+2.25.1
+

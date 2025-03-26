@@ -1,0 +1,124 @@
+From 8cfba9f028a372e65a421e3f47c30a519fe822c9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 17 Feb 2025 09:00:44 +0200
+Subject: [PATCH 0788/1107] drm/i915: Hook in display GTT faults for ILK/SNB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hook up display GTT fault interrupts for ILK/SNB.
+
+Bspec: 8559
+Reviewed-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250217070047.953-6-ville.syrjala@linux.intel.com
+---
+ .../gpu/drm/i915/display/intel_display_irq.c  | 56 ++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_reg.h               | 10 ++++
+ 2 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+index cd53008ab590..1fa44f6bf880 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -844,6 +844,56 @@ static void cpt_irq_handler(struct drm_i915_private *dev_priv, u32 pch_iir)
+ 		cpt_serr_int_handler(dev_priv);
+ }
+ 
++static u32 ilk_gtt_fault_pipe_fault_mask(enum pipe pipe)
++{
++	switch (pipe) {
++	case PIPE_A:
++		return GTT_FAULT_SPRITE_A_FAULT |
++			GTT_FAULT_PRIMARY_A_FAULT |
++			GTT_FAULT_CURSOR_A_FAULT;
++	case PIPE_B:
++		return GTT_FAULT_SPRITE_B_FAULT |
++			GTT_FAULT_PRIMARY_B_FAULT |
++			GTT_FAULT_CURSOR_B_FAULT;
++	default:
++		return 0;
++	}
++}
++
++static const struct pipe_fault_handler ilk_pipe_fault_handlers[] = {
++	{ .fault = GTT_FAULT_SPRITE_A_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_SPRITE0, },
++	{ .fault = GTT_FAULT_SPRITE_B_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_SPRITE0, },
++	{ .fault = GTT_FAULT_PRIMARY_A_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_PRIMARY, },
++	{ .fault = GTT_FAULT_PRIMARY_B_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_PRIMARY, },
++	{ .fault = GTT_FAULT_CURSOR_A_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_CURSOR, },
++	{ .fault = GTT_FAULT_CURSOR_B_FAULT, .handle = handle_plane_fault, .plane_id = PLANE_CURSOR, },
++	{}
++};
++
++static void ilk_gtt_fault_irq_handler(struct intel_display *display)
++{
++	enum pipe pipe;
++	u32 gtt_fault;
++
++	gtt_fault = intel_de_read(display, ILK_GTT_FAULT);
++	intel_de_write(display, ILK_GTT_FAULT, gtt_fault);
++
++	if (gtt_fault & GTT_FAULT_INVALID_GTT_PTE)
++		drm_err_ratelimited(display->drm, "Invalid GTT PTE\n");
++
++	if (gtt_fault & GTT_FAULT_INVALID_PTE_DATA)
++		drm_err_ratelimited(display->drm, "Invalid PTE data\n");
++
++	for_each_pipe(display, pipe) {
++		u32 fault_errors;
++
++		fault_errors = gtt_fault & ilk_gtt_fault_pipe_fault_mask(pipe);
++		if (fault_errors)
++			intel_pipe_fault_irq_handler(display, ilk_pipe_fault_handlers,
++						     pipe, fault_errors);
++	}
++}
++
+ void ilk_display_irq_handler(struct drm_i915_private *dev_priv, u32 de_iir)
+ {
+ 	struct intel_display *display = &dev_priv->display;
+@@ -862,6 +912,9 @@ void ilk_display_irq_handler(struct drm_i915_private *dev_priv, u32 de_iir)
+ 	if (de_iir & DE_POISON)
+ 		drm_err(&dev_priv->drm, "Poison interrupt\n");
+ 
++	if (de_iir & DE_GTT_FAULT)
++		ilk_gtt_fault_irq_handler(display);
++
+ 	for_each_pipe(dev_priv, pipe) {
+ 		if (de_iir & DE_PIPE_VBLANK(pipe))
+ 			intel_handle_vblank(dev_priv, pipe);
+@@ -1988,7 +2041,8 @@ void ilk_de_irq_postinstall(struct drm_i915_private *i915)
+ 			      DE_PLANE_FLIP_DONE_IVB(PLANE_A) |
+ 			      DE_DP_A_HOTPLUG_IVB);
+ 	} else {
+-		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
++		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE |
++				DE_PCH_EVENT | DE_GTT_FAULT |
+ 				DE_AUX_CHANNEL_A | DE_PIPEB_CRC_DONE |
+ 				DE_PIPEA_CRC_DONE | DE_POISON);
+ 		extra_mask = (DE_PIPEA_VBLANK | DE_PIPEB_VBLANK |
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index b8756e5d2cae..5e91fcf40a0f 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -372,6 +372,16 @@
+ #define GEN7_MEDIA_MAX_REQ_COUNT	_MMIO(0x4070)
+ #define GEN7_GFX_MAX_REQ_COUNT		_MMIO(0x4074)
+ 
++#define ILK_GTT_FAULT	_MMIO(0x44040) /* ilk/snb */
++#define   GTT_FAULT_INVALID_GTT_PTE	(1 << 7)
++#define   GTT_FAULT_INVALID_PTE_DATA	(1 << 6)
++#define   GTT_FAULT_CURSOR_B_FAULT	(1 << 5)
++#define   GTT_FAULT_CURSOR_A_FAULT	(1 << 4)
++#define   GTT_FAULT_SPRITE_B_FAULT	(1 << 3)
++#define   GTT_FAULT_SPRITE_A_FAULT	(1 << 2)
++#define   GTT_FAULT_PRIMARY_B_FAULT	(1 << 1)
++#define   GTT_FAULT_PRIMARY_A_FAULT	(1 << 0)
++
+ #define GEN7_ERR_INT	_MMIO(0x44040)
+ #define   ERR_INT_POISON		(1 << 31)
+ #define   ERR_INT_INVALID_GTT_PTE	(1 << 29)
+-- 
+2.25.1
+

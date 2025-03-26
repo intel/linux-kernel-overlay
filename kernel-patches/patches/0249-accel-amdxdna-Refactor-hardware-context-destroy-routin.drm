@@ -1,0 +1,132 @@
+From bdbbc092d8d4984e4501d58b029ce63d57d53588 Mon Sep 17 00:00:00 2001
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Fri, 24 Jan 2025 09:35:36 -0800
+Subject: [PATCH 0249/1107] accel/amdxdna: Refactor hardware context destroy
+ routine
+
+It is required by firmware to wait up to 2 seconds for pending commands
+before sending the destroy hardware context command. After 2 seconds
+wait, if there are still pending commands, driver needs to cancel them.
+
+So the context destroy steps need to be:
+  1. Stop drm scheduler. (drm_sched_entity_destroy)
+  2. Wait up to 2 seconds for pending commands.
+  3. Destroy hardware context and cancel the rest pending requests.
+  4. Wait all jobs associated with the hwctx are freed.
+  5. Free job resources.
+
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Reviewed-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Signed-off-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250124173536.148676-1-lizhi.hou@amd.com
+---
+ drivers/accel/amdxdna/aie2_ctx.c    | 29 ++++++++++++++++-------------
+ drivers/accel/amdxdna/amdxdna_ctx.c |  2 ++
+ drivers/accel/amdxdna/amdxdna_ctx.h |  3 +++
+ 3 files changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 8ac01bc2f0db..00d215ac866e 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -34,6 +34,8 @@ static void aie2_job_release(struct kref *ref)
+ 
+ 	job = container_of(ref, struct amdxdna_sched_job, refcnt);
+ 	amdxdna_sched_job_cleanup(job);
++	atomic64_inc(&job->hwctx->job_free_cnt);
++	wake_up(&job->hwctx->priv->job_free_wq);
+ 	if (job->out_fence)
+ 		dma_fence_put(job->out_fence);
+ 	kfree(job);
+@@ -134,7 +136,8 @@ static void aie2_hwctx_wait_for_idle(struct amdxdna_hwctx *hwctx)
+ 	if (!fence)
+ 		return;
+ 
+-	dma_fence_wait(fence, false);
++	/* Wait up to 2 seconds for fw to finish all pending requests */
++	dma_fence_wait_timeout(fence, false, msecs_to_jiffies(2000));
+ 	dma_fence_put(fence);
+ }
+ 
+@@ -622,6 +625,7 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
+ 	hwctx->status = HWCTX_STAT_INIT;
+ 	ndev = xdna->dev_handle;
+ 	ndev->hwctx_num++;
++	init_waitqueue_head(&priv->job_free_wq);
+ 
+ 	XDNA_DBG(xdna, "hwctx %s init completed", hwctx->name);
+ 
+@@ -658,25 +662,23 @@ void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
+ 	xdna = hwctx->client->xdna;
+ 	ndev = xdna->dev_handle;
+ 	ndev->hwctx_num--;
+-	drm_sched_wqueue_stop(&hwctx->priv->sched);
+ 
+-	/* Now, scheduler will not send command to device. */
++	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
++	drm_sched_entity_destroy(&hwctx->priv->entity);
++
++	aie2_hwctx_wait_for_idle(hwctx);
++
++	/* Request fw to destroy hwctx and cancel the rest pending requests */
+ 	aie2_release_resource(hwctx);
+ 
+-	/*
+-	 * All submitted commands are aborted.
+-	 * Restart scheduler queues to cleanup jobs. The amdxdna_sched_job_run()
+-	 * will return NODEV if it is called.
+-	 */
+-	drm_sched_wqueue_start(&hwctx->priv->sched);
++	/* Wait for all submitted jobs to be completed or canceled */
++	wait_event(hwctx->priv->job_free_wq,
++		   atomic64_read(&hwctx->job_submit_cnt) ==
++		   atomic64_read(&hwctx->job_free_cnt));
+ 
+-	aie2_hwctx_wait_for_idle(hwctx);
+-	drm_sched_entity_destroy(&hwctx->priv->entity);
+ 	drm_sched_fini(&hwctx->priv->sched);
+ 	aie2_ctx_syncobj_destroy(hwctx);
+ 
+-	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
+-
+ 	for (idx = 0; idx < ARRAY_SIZE(hwctx->priv->cmd_buf); idx++)
+ 		drm_gem_object_put(to_gobj(hwctx->priv->cmd_buf[idx]));
+ 	amdxdna_gem_unpin(hwctx->priv->heap);
+@@ -885,6 +887,7 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 	drm_gem_unlock_reservations(job->bos, job->bo_cnt, &acquire_ctx);
+ 
+ 	aie2_job_put(job);
++	atomic64_inc(&hwctx->job_submit_cnt);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/accel/amdxdna/amdxdna_ctx.c b/drivers/accel/amdxdna/amdxdna_ctx.c
+index d11b1c83d9c3..43442b9e273b 100644
+--- a/drivers/accel/amdxdna/amdxdna_ctx.c
++++ b/drivers/accel/amdxdna/amdxdna_ctx.c
+@@ -220,6 +220,8 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
+ 	args->syncobj_handle = hwctx->syncobj_hdl;
+ 	mutex_unlock(&xdna->dev_lock);
+ 
++	atomic64_set(&hwctx->job_submit_cnt, 0);
++	atomic64_set(&hwctx->job_free_cnt, 0);
+ 	XDNA_DBG(xdna, "PID %d create HW context %d, ret %d", client->pid, args->handle, ret);
+ 	drm_dev_exit(idx);
+ 	return 0;
+diff --git a/drivers/accel/amdxdna/amdxdna_ctx.h b/drivers/accel/amdxdna/amdxdna_ctx.h
+index 80b0304193ec..f0a4a8586d85 100644
+--- a/drivers/accel/amdxdna/amdxdna_ctx.h
++++ b/drivers/accel/amdxdna/amdxdna_ctx.h
+@@ -87,6 +87,9 @@ struct amdxdna_hwctx {
+ 	struct amdxdna_qos_info		     qos;
+ 	struct amdxdna_hwctx_param_config_cu *cus;
+ 	u32				syncobj_hdl;
++
++	atomic64_t			job_submit_cnt;
++	atomic64_t			job_free_cnt ____cacheline_aligned_in_smp;
+ };
+ 
+ #define drm_job_to_xdna_job(j) \
+-- 
+2.25.1
+

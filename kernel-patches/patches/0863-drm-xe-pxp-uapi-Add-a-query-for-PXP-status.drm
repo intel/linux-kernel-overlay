@@ -1,0 +1,201 @@
+From f83bc51ec9b9d59efab692dc87bd37c6b4b7c7d6 Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Wed, 29 Jan 2025 09:41:33 -0800
+Subject: [PATCH 0863/1107] drm/xe/pxp/uapi: Add a query for PXP status
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PXP prerequisites (SW proxy and HuC auth via GSC) are completed
+asynchronously from driver load, which means that userspace can start
+submitting before we're ready to start a PXP session. Therefore, we need
+a query that userspace can use to check not only if PXP is supported but
+also to wait until the prerequisites are done.
+
+v2: Improve doc, do not report TYPE_NONE as supported (José)
+v3: Better comments, remove unneeded copy_from_user (John)
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: José Roberto de Souza <jose.souza@intel.com>
+Cc: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: John Harrison <John.C.Harrison@Intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250129174140.948829-10-daniele.ceraolospurio@intel.com
+---
+ drivers/gpu/drm/xe/xe_pxp.c   | 32 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_pxp.h   |  1 +
+ drivers/gpu/drm/xe/xe_query.c | 29 +++++++++++++++++++++++++++++
+ include/uapi/drm/xe_drm.h     | 35 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 97 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_pxp.c b/drivers/gpu/drm/xe/xe_pxp.c
+index b32121273e0d..24aef5c0f04a 100644
+--- a/drivers/gpu/drm/xe/xe_pxp.c
++++ b/drivers/gpu/drm/xe/xe_pxp.c
+@@ -80,6 +80,38 @@ static bool pxp_prerequisites_done(const struct xe_pxp *pxp)
+ 	return ready;
+ }
+ 
++/**
++ * xe_pxp_get_readiness_status - check whether PXP is ready for userspace use
++ * @pxp: the xe_pxp pointer (can be NULL if PXP is disabled)
++ *
++ * Returns: 0 if PXP is not ready yet, 1 if it is ready, a negative errno value
++ * if PXP is not supported/enabled or if something went wrong in the
++ * initialization of the prerequisites. Note that the return values of this
++ * function follow the uapi (see drm_xe_query_pxp_status), so they can be used
++ * directly in the query ioctl.
++ */
++int xe_pxp_get_readiness_status(struct xe_pxp *pxp)
++{
++	int ret = 0;
++
++	if (!xe_pxp_is_enabled(pxp))
++		return -ENODEV;
++
++	/* if the GSC or HuC FW are in an error state, PXP will never work */
++	if (xe_uc_fw_status_to_error(pxp->gt->uc.huc.fw.status) ||
++	    xe_uc_fw_status_to_error(pxp->gt->uc.gsc.fw.status))
++		return -EIO;
++
++	xe_pm_runtime_get(pxp->xe);
++
++	/* PXP requires both HuC loaded and GSC proxy initialized */
++	if (pxp_prerequisites_done(pxp))
++		ret = 1;
++
++	xe_pm_runtime_put(pxp->xe);
++	return ret;
++}
++
+ static bool pxp_session_is_in_play(struct xe_pxp *pxp, u32 id)
+ {
+ 	struct xe_gt *gt = pxp->gt;
+diff --git a/drivers/gpu/drm/xe/xe_pxp.h b/drivers/gpu/drm/xe/xe_pxp.h
+index 2e0ab186072a..868813cc84b9 100644
+--- a/drivers/gpu/drm/xe/xe_pxp.h
++++ b/drivers/gpu/drm/xe/xe_pxp.h
+@@ -14,6 +14,7 @@ struct xe_pxp;
+ 
+ bool xe_pxp_is_supported(const struct xe_device *xe);
+ bool xe_pxp_is_enabled(const struct xe_pxp *pxp);
++int xe_pxp_get_readiness_status(struct xe_pxp *pxp);
+ 
+ int xe_pxp_init(struct xe_device *xe);
+ void xe_pxp_irq_handler(struct xe_device *xe, u16 iir);
+diff --git a/drivers/gpu/drm/xe/xe_query.c b/drivers/gpu/drm/xe/xe_query.c
+index c059639613f7..042f87a688e7 100644
+--- a/drivers/gpu/drm/xe/xe_query.c
++++ b/drivers/gpu/drm/xe/xe_query.c
+@@ -24,6 +24,7 @@
+ #include "xe_macros.h"
+ #include "xe_mmio.h"
+ #include "xe_oa.h"
++#include "xe_pxp.h"
+ #include "xe_ttm_vram_mgr.h"
+ #include "xe_wa.h"
+ 
+@@ -698,6 +699,33 @@ static int query_oa_units(struct xe_device *xe,
+ 	return ret ? -EFAULT : 0;
+ }
+ 
++static int query_pxp_status(struct xe_device *xe, struct drm_xe_device_query *query)
++{
++	struct drm_xe_query_pxp_status __user *query_ptr = u64_to_user_ptr(query->data);
++	size_t size = sizeof(struct drm_xe_query_pxp_status);
++	struct drm_xe_query_pxp_status resp = { 0 };
++	int ret;
++
++	if (query->size == 0) {
++		query->size = size;
++		return 0;
++	} else if (XE_IOCTL_DBG(xe, query->size != size)) {
++		return -EINVAL;
++	}
++
++	ret = xe_pxp_get_readiness_status(xe->pxp);
++	if (ret < 0)
++		return ret;
++
++	resp.status = ret;
++	resp.supported_session_types = BIT(DRM_XE_PXP_TYPE_HWDRM);
++
++	if (copy_to_user(query_ptr, &resp, size))
++		return -EFAULT;
++
++	return 0;
++}
++
+ static int (* const xe_query_funcs[])(struct xe_device *xe,
+ 				      struct drm_xe_device_query *query) = {
+ 	query_engines,
+@@ -709,6 +737,7 @@ static int (* const xe_query_funcs[])(struct xe_device *xe,
+ 	query_engine_cycles,
+ 	query_uc_fw_version,
+ 	query_oa_units,
++	query_pxp_status,
+ };
+ 
+ int xe_query_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+diff --git a/include/uapi/drm/xe_drm.h b/include/uapi/drm/xe_drm.h
+index 9d53834c4c0a..112fd27f3c75 100644
+--- a/include/uapi/drm/xe_drm.h
++++ b/include/uapi/drm/xe_drm.h
+@@ -629,6 +629,39 @@ struct drm_xe_query_uc_fw_version {
+ 	__u64 reserved;
+ };
+ 
++/**
++ * struct drm_xe_query_pxp_status - query if PXP is ready
++ *
++ * If PXP is enabled and no fatal error has occurred, the status will be set to
++ * one of the following values:
++ * 0: PXP init still in progress
++ * 1: PXP init complete
++ *
++ * If PXP is not enabled or something has gone wrong, the query will be failed
++ * with one of the following error codes:
++ * -ENODEV: PXP not supported or disabled;
++ * -EIO: fatal error occurred during init, so PXP will never be enabled;
++ * -EINVAL: incorrect value provided as part of the query;
++ * -EFAULT: error copying the memory between kernel and userspace.
++ *
++ * The status can only be 0 in the first few seconds after driver load. If
++ * everything works as expected, the status will transition to init complete in
++ * less than 1 second, while in case of errors the driver might take longer to
++ * start returning an error code, but it should still take less than 10 seconds.
++ *
++ * The supported session type bitmask is based on the values in
++ * enum drm_xe_pxp_session_type. TYPE_NONE is always supported and therefore
++ * is not reported in the bitmask.
++ *
++ */
++struct drm_xe_query_pxp_status {
++	/** @status: current PXP status */
++	__u32 status;
++
++	/** @supported_session_types: bitmask of supported PXP session types */
++	__u32 supported_session_types;
++};
++
+ /**
+  * struct drm_xe_device_query - Input of &DRM_IOCTL_XE_DEVICE_QUERY - main
+  * structure to query device information
+@@ -648,6 +681,7 @@ struct drm_xe_query_uc_fw_version {
+  *    attributes.
+  *  - %DRM_XE_DEVICE_QUERY_GT_TOPOLOGY
+  *  - %DRM_XE_DEVICE_QUERY_ENGINE_CYCLES
++ *  - %DRM_XE_DEVICE_QUERY_PXP_STATUS
+  *
+  * If size is set to 0, the driver fills it with the required size for
+  * the requested type of data to query. If size is equal to the required
+@@ -700,6 +734,7 @@ struct drm_xe_device_query {
+ #define DRM_XE_DEVICE_QUERY_ENGINE_CYCLES	6
+ #define DRM_XE_DEVICE_QUERY_UC_FW_VERSION	7
+ #define DRM_XE_DEVICE_QUERY_OA_UNITS		8
++#define DRM_XE_DEVICE_QUERY_PXP_STATUS		9
+ 	/** @query: The type of data to query */
+ 	__u32 query;
+ 
+-- 
+2.25.1
+

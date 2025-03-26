@@ -1,0 +1,258 @@
+From a3cab2902faa04faae2db8a7256e68abe26006c4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 22 Jan 2025 17:17:53 +0200
+Subject: [PATCH 0675/1107] drm/i915: Calculate the VT-d guard size in the
+ display code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently i915_gem_object_pin_to_display_plane() uses
+i915_gem_object_get_tile_row_size() to calculate the tile row
+size for the VT-d guard w/a. That's not really proper since
+i915_gem_object_get_tile_row_size() only works for fenced BOs,
+nor does it take rotation into account.
+
+Remedy the situation by calculating the VT-d guard size in the
+display code where we have more information readily available.
+Although the default guard size (168 PTEs now) should cover
+the more typical fb size use cases anyway, and only very large
+Y/Yf-tiled framebuffers might have tile row size that exceeds it.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250122151755.6928-4-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_fb.c       | 33 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_fb.h       |  3 ++
+ drivers/gpu/drm/i915/display/intel_fb_pin.c   | 12 ++++++-
+ drivers/gpu/drm/i915/display/intel_fb_pin.h   |  1 +
+ drivers/gpu/drm/i915/display/intel_fbdev.c    |  2 ++
+ drivers/gpu/drm/i915/display/intel_overlay.c  |  2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_domain.c    | 15 ++-------
+ drivers/gpu/drm/i915/gem/i915_gem_object.h    |  2 +-
+ drivers/gpu/drm/xe/display/xe_fb_pin.c        |  1 +
+ drivers/gpu/drm/xe/display/xe_plane_initial.c |  2 +-
+ 10 files changed, 57 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.c b/drivers/gpu/drm/i915/display/intel_fb.c
+index 9f7f1b9f3275..ea8c8a99c5c7 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@ -1761,6 +1761,39 @@ int intel_fill_fb_info(struct drm_i915_private *i915, struct intel_framebuffer *
+ 	return 0;
+ }
+ 
++unsigned int intel_fb_view_vtd_guard(const struct drm_framebuffer *fb,
++				     const struct intel_fb_view *view,
++				     unsigned int rotation)
++{
++	struct drm_i915_private *i915 = to_i915(fb->dev);
++	unsigned int vtd_guard;
++	int color_plane;
++
++	if (!intel_scanout_needs_vtd_wa(i915))
++		return 0;
++
++	vtd_guard = 168;
++
++	for (color_plane = 0; color_plane < fb->format->num_planes; color_plane++) {
++		unsigned int stride, tile;
++
++		if (intel_fb_is_ccs_aux_plane(fb, color_plane) ||
++		    is_gen12_ccs_cc_plane(fb, color_plane))
++			continue;
++
++		stride = view->color_plane[color_plane].mapping_stride;
++
++		if (drm_rotation_90_or_270(rotation))
++			tile = intel_tile_height(fb, color_plane);
++		else
++			tile = intel_tile_width_bytes(fb, color_plane);
++
++		vtd_guard = max(vtd_guard, DIV_ROUND_UP(stride, tile));
++	}
++
++	return vtd_guard;
++}
++
+ static void intel_plane_remap_gtt(struct intel_plane_state *plane_state)
+ {
+ 	struct drm_i915_private *i915 =
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.h b/drivers/gpu/drm/i915/display/intel_fb.h
+index d78993e5eb62..026e9f7f98f7 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.h
++++ b/drivers/gpu/drm/i915/display/intel_fb.h
+@@ -83,6 +83,9 @@ bool intel_fb_supports_90_270_rotation(const struct intel_framebuffer *fb);
+ int intel_fill_fb_info(struct drm_i915_private *i915, struct intel_framebuffer *fb);
+ void intel_fb_fill_view(const struct intel_framebuffer *fb, unsigned int rotation,
+ 			struct intel_fb_view *view);
++unsigned int intel_fb_view_vtd_guard(const struct drm_framebuffer *fb,
++				     const struct intel_fb_view *view,
++				     unsigned int rotation);
+ int intel_plane_compute_gtt(struct intel_plane_state *plane_state);
+ 
+ int intel_framebuffer_init(struct intel_framebuffer *ifb,
+diff --git a/drivers/gpu/drm/i915/display/intel_fb_pin.c b/drivers/gpu/drm/i915/display/intel_fb_pin.c
+index 2b9ad46eaef7..204e7e3e48ca 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb_pin.c
++++ b/drivers/gpu/drm/i915/display/intel_fb_pin.c
+@@ -107,6 +107,7 @@ intel_fb_pin_to_ggtt(const struct drm_framebuffer *fb,
+ 		     const struct i915_gtt_view *view,
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
++		     unsigned int vtd_guard,
+ 		     bool uses_fence,
+ 		     unsigned long *out_flags)
+ {
+@@ -162,7 +163,7 @@ intel_fb_pin_to_ggtt(const struct drm_framebuffer *fb,
+ 		goto err;
+ 
+ 	vma = i915_gem_object_pin_to_display_plane(obj, &ww, alignment,
+-						   view, pinctl);
++						   vtd_guard, view, pinctl);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+ 		goto err_unpin;
+@@ -244,6 +245,14 @@ intel_plane_fb_min_phys_alignment(const struct intel_plane_state *plane_state)
+ 	return plane->min_alignment(plane, fb, 0);
+ }
+ 
++static unsigned int
++intel_plane_fb_vtd_guard(const struct intel_plane_state *plane_state)
++{
++	return intel_fb_view_vtd_guard(plane_state->hw.fb,
++				       &plane_state->view,
++				       plane_state->hw.rotation);
++}
++
+ int intel_plane_pin_fb(struct intel_plane_state *plane_state,
+ 		       const struct intel_plane_state *old_plane_state)
+ {
+@@ -256,6 +265,7 @@ int intel_plane_pin_fb(struct intel_plane_state *plane_state,
+ 		vma = intel_fb_pin_to_ggtt(&fb->base, &plane_state->view.gtt,
+ 					   intel_plane_fb_min_alignment(plane_state),
+ 					   intel_plane_fb_min_phys_alignment(plane_state),
++					   intel_plane_fb_vtd_guard(plane_state),
+ 					   intel_plane_uses_fence(plane_state),
+ 					   &plane_state->flags);
+ 		if (IS_ERR(vma))
+diff --git a/drivers/gpu/drm/i915/display/intel_fb_pin.h b/drivers/gpu/drm/i915/display/intel_fb_pin.h
+index 0fc6d9044638..01770dbba2e0 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb_pin.h
++++ b/drivers/gpu/drm/i915/display/intel_fb_pin.h
+@@ -18,6 +18,7 @@ intel_fb_pin_to_ggtt(const struct drm_framebuffer *fb,
+ 		     const struct i915_gtt_view *view,
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
++		     unsigned int vtd_guard,
+ 		     bool uses_fence,
+ 		     unsigned long *out_flags);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_fbdev.c b/drivers/gpu/drm/i915/display/intel_fbdev.c
+index 6c0808133397..833cded53d37 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -228,6 +228,8 @@ static int intelfb_create(struct drm_fb_helper *helper,
+ 	 */
+ 	vma = intel_fb_pin_to_ggtt(&fb->base, &view,
+ 				   fb->min_alignment, 0,
++				   intel_fb_view_vtd_guard(&fb->base, &fb->normal_view,
++							   DRM_MODE_ROTATE_0),
+ 				   false, &flags);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+diff --git a/drivers/gpu/drm/i915/display/intel_overlay.c b/drivers/gpu/drm/i915/display/intel_overlay.c
+index bbb0db33740e..4d00db86131b 100644
+--- a/drivers/gpu/drm/i915/display/intel_overlay.c
++++ b/drivers/gpu/drm/i915/display/intel_overlay.c
+@@ -778,7 +778,7 @@ static struct i915_vma *intel_overlay_pin_fb(struct drm_i915_gem_object *new_bo)
+ retry:
+ 	ret = i915_gem_object_lock(new_bo, &ww);
+ 	if (!ret) {
+-		vma = i915_gem_object_pin_to_display_plane(new_bo, &ww, 0,
++		vma = i915_gem_object_pin_to_display_plane(new_bo, &ww, 0, 0,
+ 							   NULL, PIN_MAPPABLE);
+ 		ret = PTR_ERR_OR_ZERO(vma);
+ 	}
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_domain.c b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+index ee55caca67a1..75a143d996e0 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_domain.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_domain.c
+@@ -18,8 +18,6 @@
+ #include "i915_gem_object_frontbuffer.h"
+ #include "i915_vma.h"
+ 
+-#define VTD_GUARD (168u * I915_GTT_PAGE_SIZE) /* 168 or tile-row PTE padding */
+-
+ static bool gpu_write_needs_clflush(struct drm_i915_gem_object *obj)
+ {
+ 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+@@ -424,7 +422,7 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
+ struct i915_vma *
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 				     struct i915_gem_ww_ctx *ww,
+-				     u32 alignment,
++				     u32 alignment, unsigned int guard,
+ 				     const struct i915_gtt_view *view,
+ 				     unsigned int flags)
+ {
+@@ -453,15 +451,8 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 		return ERR_PTR(ret);
+ 
+ 	/* VT-d may overfetch before/after the vma, so pad with scratch */
+-	if (intel_scanout_needs_vtd_wa(i915)) {
+-		unsigned int guard = VTD_GUARD;
+-
+-		if (i915_gem_object_is_tiled(obj))
+-			guard = max(guard,
+-				    i915_gem_object_get_tile_row_size(obj));
+-
+-		flags |= PIN_OFFSET_GUARD | guard;
+-	}
++	if (guard)
++		flags |= PIN_OFFSET_GUARD | (guard * I915_GTT_PAGE_SIZE);
+ 
+ 	/*
+ 	 * As the user may map the buffer once pinned in the display plane
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.h b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+index bb713e096db2..a5f34542135c 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.h
+@@ -776,7 +776,7 @@ i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write);
+ struct i915_vma * __must_check
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 				     struct i915_gem_ww_ctx *ww,
+-				     u32 alignment,
++				     u32 alignment, unsigned int guard,
+ 				     const struct i915_gtt_view *view,
+ 				     unsigned int flags);
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.c b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+index 25ce032bb293..11a6b996d739 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -369,6 +369,7 @@ intel_fb_pin_to_ggtt(const struct drm_framebuffer *fb,
+ 		     const struct i915_gtt_view *view,
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
++		     unsigned int vtd_guard,
+ 		     bool uses_fence,
+ 		     unsigned long *out_flags)
+ {
+diff --git a/drivers/gpu/drm/xe/display/xe_plane_initial.c b/drivers/gpu/drm/xe/display/xe_plane_initial.c
+index 2a2f250fa495..25c80dd6d386 100644
+--- a/drivers/gpu/drm/xe/display/xe_plane_initial.c
++++ b/drivers/gpu/drm/xe/display/xe_plane_initial.c
+@@ -215,7 +215,7 @@ intel_find_initial_plane_obj(struct intel_crtc *crtc,
+ 			   plane_state->uapi.rotation, &plane_state->view);
+ 
+ 	vma = intel_fb_pin_to_ggtt(fb, &plane_state->view.gtt,
+-				   0, 0, false, &plane_state->flags);
++				   0, 0, 0, false, &plane_state->flags);
+ 	if (IS_ERR(vma))
+ 		goto nofb;
+ 
+-- 
+2.25.1
+
