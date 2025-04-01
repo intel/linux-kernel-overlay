@@ -1,11 +1,10 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 source config.sh
 
 function usage()
 {
-	echo "Four paramaters: is-rt(yes/no), linux kernel tag, build id and customized_kvesion_string"
-	echo "usage: $0 -r {is-rt} -t { linux_kernel_tag } -b { build-id } -c { customized_kver_string }"
+	echo "usage: $0 -r {yes/no, yes if build realtime kernel. otherwise no.} -t { linux_kernel_tag } -b { build-id } -c { customized_kver_string }"
 }
 
 function setup()
@@ -106,7 +105,7 @@ is_rt=no
 linux_kernel_tag=
 customized_kver_string=
 
-while getopts "r:t:b:c:" opt; do
+while getopts "r:t:b:c:h" opt; do
   case $opt in
     r)
       is_rt="$OPTARG"
@@ -116,6 +115,10 @@ while getopts "r:t:b:c:" opt; do
       ;;
     b)
       build_id="$OPTARG"
+      ;;
+    h)
+      usage
+      exit 0
       ;;
     c)
       customized_kver_string="$OPTARG"
@@ -134,6 +137,16 @@ KSRC_OOT_PATCHES=$cur_dir/kernel-patches/
 KCFG_BASE_OS=$cur_dir/kernel-config/$KCFG_BASE_OS
 KCFG_FEATURES_DIR=$cur_dir/kernel-config/$KCFG_FEATURES_DIR
 KCFG_OVERLAY=$cur_dir/kernel-config/$KCFG_OVERLAY
+
+# Avoid the illegal value of is_rt, and set customized_kver_string if it's empty.
+if [ "$is_rt" == "yes" ]; then
+	[ -z "$customized_kver_string" ] && customized_kver_string="rt"
+elif [ "$is_rt" == "no" ]; then
+	[ -z "$customized_kver_string" ] && customized_kver_string="nonrt"
+else
+	echo "Incorrect parameter for -r, it must be yes or no."
+	exit 1
+fi
 
 # Possible tags: v5.14 v5.14.1 v5.14-rc7 v5.9.1-rt19 v4.19.127-rt55-rebase v5.15-rc5-rt10
 if [ -n "${KEXTRAVERSION}" ]; then
