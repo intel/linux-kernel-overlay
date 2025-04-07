@@ -31,14 +31,20 @@ for this release.
 # How it works
 Run the build.sh script, and it will generate the debian package.
 
-usage: ./build.sh -r {yes/no, yes if build realtime kernel. otherwise no.}
-		  -t { linux_kernel_tag }
-                  -b { build-id }
-                  -c { customized_kver_string }
+usage:
 
-Example:
-	Build non-rt kenrel: ./build.sh -r no
-	built rt kernel: ./build.sh -r yes
+	./build.sh -r {yes/no, yes if build realtime kernel. otherwise no.}
+		   -t { linux_kernel_tag }
+		   -b { build-id }
+		   -c { customized_kver_string }
+
+Build non-rt kenrel:
+
+	./build.sh -r no
+
+built rt kernel:
+
+	./build.sh -r yes
 
 notes, the default value of -r is no. that means ./build.sh (without -r) would
 generate the non-rt binary kernel.
@@ -49,7 +55,12 @@ use -c parameters. for example:
 	./build.sh -c my-rt-build
 
 -t and -b can be used to add tag and build-id information into the name string
-of binary kernel image.
+of binary kernel image. 
+
+We normally have below commands to build the non-rt and rt .deb image:
+
+	./build.sh -r no  -t 20250501-b 1
+	./build.sh -r yes -t 20250501-b 2
 
 # Notes
 This should only be used for platform feature evaluation and not for production 
