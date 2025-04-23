@@ -1,0 +1,103 @@
+From b5f8d3b5a4e4b90a9110e17da403047246d0b1fb Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 31 Jan 2025 17:55:16 -0800
+Subject: [PATCH 03/53] KVM: nVMX: Allow the caller to provide instruction
+ length on nested VM-Exit
+
+Rework the nested VM-Exit helper to take the instruction length as a
+parameter, and convert nested_vmx_vmexit() into a "default" wrapper that
+grabs the length from vmcs02 as appropriate.  This will allow KVM to set
+the correct instruction length when synthesizing a nested VM-Exit when
+emulating an instruction that L1 wants to intercept.
+
+No functional change intended, as the path to prepare_vmcs12()'s reading
+of vmcs02.VM_EXIT_INSTRUCTION_LEN is gated on the same set of conditions
+as the VMREAD in the new nested_vmx_vmexit().
+
+Link: https://lore.kernel.org/r/20250201015518.689704-10-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+---
+ arch/x86/kvm/vmx/nested.c | 12 +++++++-----
+ arch/x86/kvm/vmx/nested.h | 22 ++++++++++++++++++++--
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index ed8a3cb53961..56a436944307 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4618,7 +4618,7 @@ static void sync_vmcs02_to_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+  */
+ static void prepare_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
+ 			   u32 vm_exit_reason, u32 exit_intr_info,
+-			   unsigned long exit_qualification)
++			   unsigned long exit_qualification, u32 exit_insn_len)
+ {
+ 	/* update exit information fields: */
+ 	vmcs12->vm_exit_reason = vm_exit_reason;
+@@ -4646,7 +4646,7 @@ static void prepare_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
+ 					  vm_exit_reason, exit_intr_info);
+ 
+ 		vmcs12->vm_exit_intr_info = exit_intr_info;
+-		vmcs12->vm_exit_instruction_len = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
++		vmcs12->vm_exit_instruction_len = exit_insn_len;
+ 		vmcs12->vmx_instruction_info = vmcs_read32(VMX_INSTRUCTION_INFO);
+ 
+ 		/*
+@@ -4930,8 +4930,9 @@ static void nested_vmx_restore_host_state(struct kvm_vcpu *vcpu)
+  * and modify vmcs12 to make it see what it would expect to see there if
+  * L2 was its real guest. Must only be called when in L2 (is_guest_mode())
+  */
+-void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+-		       u32 exit_intr_info, unsigned long exit_qualification)
++void __nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
++			 u32 exit_intr_info, unsigned long exit_qualification,
++			 u32 exit_insn_len)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+@@ -4981,7 +4982,8 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 
+ 		if (vm_exit_reason != -1)
+ 			prepare_vmcs12(vcpu, vmcs12, vm_exit_reason,
+-				       exit_intr_info, exit_qualification);
++				       exit_intr_info, exit_qualification,
++				       exit_insn_len);
+ 
+ 		/*
+ 		 * Must happen outside of sync_vmcs02_to_vmcs12() as it will
+diff --git a/arch/x86/kvm/vmx/nested.h b/arch/x86/kvm/vmx/nested.h
+index 2c296b6abb8c..6eedcfc91070 100644
+--- a/arch/x86/kvm/vmx/nested.h
++++ b/arch/x86/kvm/vmx/nested.h
+@@ -26,8 +26,26 @@ void nested_vmx_free_vcpu(struct kvm_vcpu *vcpu);
+ enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
+ 						     bool from_vmentry);
+ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu);
+-void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+-		       u32 exit_intr_info, unsigned long exit_qualification);
++void __nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
++			 u32 exit_intr_info, unsigned long exit_qualification,
++			 u32 exit_insn_len);
++
++static inline void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
++				     u32 exit_intr_info,
++				     unsigned long exit_qualification)
++{
++	u32 exit_insn_len;
++
++	if (to_vmx(vcpu)->fail || vm_exit_reason == -1 ||
++	    (vm_exit_reason & VMX_EXIT_REASONS_FAILED_VMENTRY))
++		exit_insn_len = 0;
++	else
++		exit_insn_len = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
++
++	__nested_vmx_vmexit(vcpu, vm_exit_reason, exit_intr_info,
++			    exit_qualification, exit_insn_len);
++}
++
+ void nested_sync_vmcs12_to_shadow(struct kvm_vcpu *vcpu);
+ int vmx_set_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 data);
+ int vmx_get_vmx_msr(struct nested_vmx_msrs *msrs, u32 msr_index, u64 *pdata);
+-- 
+2.34.1
+

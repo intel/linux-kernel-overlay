@@ -1,0 +1,119 @@
+From 27dd23ce2ff9042e7478280c7f98b907d50b3ef5 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 26 Feb 2025 16:53:53 -0800
+Subject: [PATCH 01/53] KVM: VMX: Extract checks on entry/exit control pairs to
+ a helper macro
+
+Extract the checking of entry/exit pairs to a helper macro so that the
+code can be reused to process the upcoming "secondary" exit controls (the
+primary exit controls field is out of bits).  Use a macro instead of a
+function to support different sized variables (all secondary exit controls
+will be optional and so the MSR doesn't have the fixed-0/fixed-1 split).
+Taking the largest size as input is trivial, but handling the modification
+of KVM's to-be-used controls is much trickier, e.g. would require bitmap
+games to clear bits from a 32-bit bitmap vs. a 64-bit bitmap.
+
+Opportunistically add sanity checks to ensure the size of the controls
+match (yay, macro!), e.g. to detect bugs where KVM passes in the pairs for
+primary exit controls, but its variable for the secondary exit controls.
+
+To help users triage mismatches, print the control bits that are checked,
+not just the actual value.  For the foreseeable future, that provides
+enough information for a user to determine which fields mismatched.  E.g.
+until secondary entry controls comes along, all entry bits and thus all
+error messages are guaranteed to be unique.
+
+To avoid returning from a macro, which can get quite dangerous, simply
+process all pairs even if error_on_inconsistent_vmcs_config is set.  The
+speed at which KVM rejects module load is not at all interesting.
+
+Keep the error message a "once" printk, even though it would be nice to
+print out all mismatching pairs.  In practice, the most likely scenario is
+that a single pair will mismatch on all CPUs.  Printing all mismatches
+generates redundant messages in that situation, and can be extremely noisy
+on systems with large numbers of CPUs.  If a CPU has multiple mismatches,
+not printing every bad pair is the least of the user's concerns.
+
+Cc: Xin Li (Intel) <xin@zytor.com>
+Link: https://lore.kernel.org/r/20250227005353.3216123-1-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+---
+ arch/x86/kvm/vmx/vmx.c | 48 +++++++++++++++++++++++++++---------------
+ 1 file changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 3b92f893b239..32b64b92e79b 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2578,6 +2578,34 @@ static u64 adjust_vmx_controls64(u64 ctl_opt, u32 msr)
+ 	return  ctl_opt & allowed;
+ }
+ 
++#define vmx_check_entry_exit_pairs(pairs, entry_controls, exit_controls)	\
++({										\
++	int i, r = 0;								\
++										\
++	BUILD_BUG_ON(sizeof(pairs[0].entry_control) != sizeof(entry_controls));	\
++	BUILD_BUG_ON(sizeof(pairs[0].exit_control)  != sizeof(exit_controls));	\
++										\
++	for (i = 0; i < ARRAY_SIZE(pairs); i++) {				\
++		typeof(entry_controls) n_ctrl = pairs[i].entry_control;		\
++		typeof(exit_controls) x_ctrl = pairs[i].exit_control;		\
++										\
++		if (!(entry_controls & n_ctrl) == !(exit_controls & x_ctrl))	\
++			continue;						\
++										\
++		pr_warn_once("Inconsistent VM-Entry/VM-Exit pair, "		\
++			     "entry = %llx (%llx), exit = %llx (%llx)\n",	\
++			     (u64)(entry_controls & n_ctrl), (u64)n_ctrl,	\
++			     (u64)(exit_controls & x_ctrl), (u64)x_ctrl);	\
++										\
++		if (error_on_inconsistent_vmcs_config)				\
++			r = -EIO;						\
++										\
++		entry_controls &= ~n_ctrl;					\
++		exit_controls &= ~x_ctrl;					\
++	}									\
++	r;									\
++})
++
+ static int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+ 			     struct vmx_capability *vmx_cap)
+ {
+@@ -2589,7 +2617,6 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+ 	u32 _vmentry_control = 0;
+ 	u64 basic_msr;
+ 	u64 misc_msr;
+-	int i;
+ 
+ 	/*
+ 	 * LOAD/SAVE_DEBUG_CONTROLS are absent because both are mandatory.
+@@ -2693,22 +2720,9 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+ 				&_vmentry_control))
+ 		return -EIO;
+ 
+-	for (i = 0; i < ARRAY_SIZE(vmcs_entry_exit_pairs); i++) {
+-		u32 n_ctrl = vmcs_entry_exit_pairs[i].entry_control;
+-		u32 x_ctrl = vmcs_entry_exit_pairs[i].exit_control;
+-
+-		if (!(_vmentry_control & n_ctrl) == !(_vmexit_control & x_ctrl))
+-			continue;
+-
+-		pr_warn_once("Inconsistent VM-Entry/VM-Exit pair, entry = %x, exit = %x\n",
+-			     _vmentry_control & n_ctrl, _vmexit_control & x_ctrl);
+-
+-		if (error_on_inconsistent_vmcs_config)
+-			return -EIO;
+-
+-		_vmentry_control &= ~n_ctrl;
+-		_vmexit_control &= ~x_ctrl;
+-	}
++	if (vmx_check_entry_exit_pairs(vmcs_entry_exit_pairs,
++				       _vmentry_control, _vmexit_control))
++		return -EIO;
+ 
+ 	/*
+ 	 * Some cpus support VM_{ENTRY,EXIT}_IA32_PERF_GLOBAL_CTRL but they
+-- 
+2.34.1
+

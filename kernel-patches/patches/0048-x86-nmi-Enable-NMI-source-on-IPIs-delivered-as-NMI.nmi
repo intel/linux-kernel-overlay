@@ -1,0 +1,277 @@
+From 2a6cd07842460aff9751ab619870ea5450a49205 Mon Sep 17 00:00:00 2001
+From: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Date: Tue, 9 Jul 2024 07:39:04 -0700
+Subject: [PATCH 48/53] x86/nmi: Enable NMI-source on IPIs delivered as NMI
+
+Program designated NMI source vectors for all NMI delivered IPIs
+such that their handlers can be selectively invoked.
+
+[ Xin: Refactor based on Sean's suggestions ]
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Signed-off-by: Xin Li (Intel) <xin@zytor.com>
+---
+ arch/x86/include/asm/apic.h         | 29 +++++++++++++++++++++++++++++
+ arch/x86/include/asm/apicdef.h      |  2 +-
+ arch/x86/kernel/apic/hw_nmi.c       |  2 +-
+ arch/x86/kernel/apic/ipi.c          |  4 ++--
+ arch/x86/kernel/apic/local.h        | 25 +++++++++++++------------
+ arch/x86/kernel/cpu/mce/inject.c    |  2 +-
+ arch/x86/kernel/kgdb.c              |  2 +-
+ arch/x86/kernel/kvm.c               | 11 ++---------
+ arch/x86/kernel/nmi_selftest.c      |  2 +-
+ arch/x86/kernel/reboot.c            |  2 +-
+ arch/x86/kernel/smp.c               |  2 +-
+ drivers/thermal/intel/therm_throt.c |  2 +-
+ 12 files changed, 54 insertions(+), 31 deletions(-)
+
+diff --git a/arch/x86/include/asm/apic.h b/arch/x86/include/asm/apic.h
+index 18f9783ed479..19af63df126f 100644
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@ -23,7 +23,13 @@
+ #define APIC_EXTNMI_ALL		1
+ #define APIC_EXTNMI_NONE	2
+ 
++#define REBOOT_NMI		(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_REBOOT)
++#define SMP_STOP_NMI		(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_SMP_STOP)
++#define BT_NMI			(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_BT)
+ #define PERF_NMI		(APIC_DM_NMI | NMI_SOURCE_VEC_PMI)
++#define KGDB_NMI		(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_KGDB)
++#define MCE_NMI			(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_MCE)
++#define TEST_NMI		(APIC_DM_NMI | NMI_SOURCE_VEC_IPI_TEST)
+ 
+ /*
+  * Debugging macros
+@@ -472,6 +478,29 @@ static __always_inline bool apic_id_valid(u32 apic_id)
+ 	return apic_id <= apic->max_apic_id;
+ }
+ 
++/*
++ * Encode the NMI source into the vector field for FRED NMI source.
++ */
++static inline u16 __prepare_ICR_dm_and_vector(u16 dm, u8 vector)
++{
++	if (dm == APIC_DM_NMI) {
++		/*
++		 * Pre-FRED, the actual vector is ignored for NMIs, but zero it
++		 * if NMI source reporting is unsupported so as not to risk
++		 * breakage on misbehaving hardware/hypervisors.
++		 */
++		if (!cpu_feature_enabled(X86_FEATURE_NMI_SOURCE))
++			vector = 0;
++
++		return dm | vector;
++	}
++
++	if (vector == NMI_VECTOR)
++		return APIC_DM_NMI;
++	else
++		return APIC_DM_FIXED | vector;
++}
++
+ #else /* CONFIG_X86_LOCAL_APIC */
+ 
+ static inline u32 apic_read(u32 reg) { return 0; }
+diff --git a/arch/x86/include/asm/apicdef.h b/arch/x86/include/asm/apicdef.h
+index 094106b6a538..3fb8fa73f6aa 100644
+--- a/arch/x86/include/asm/apicdef.h
++++ b/arch/x86/include/asm/apicdef.h
+@@ -87,8 +87,8 @@
+ #define		APIC_ICR_BUSY		0x01000
+ #define		APIC_DEST_LOGICAL	0x00800
+ #define		APIC_DEST_PHYSICAL	0x00000
++#define		APIC_DM_MASK		0x00700
+ #define		APIC_DM_FIXED		0x00000
+-#define		APIC_DM_FIXED_MASK	0x00700
+ #define		APIC_DM_LOWEST		0x00100
+ #define		APIC_DM_SMI		0x00200
+ #define		APIC_DM_REMRD		0x00300
+diff --git a/arch/x86/kernel/apic/hw_nmi.c b/arch/x86/kernel/apic/hw_nmi.c
+index 4eb419ed7c78..23d6f372372c 100644
+--- a/arch/x86/kernel/apic/hw_nmi.c
++++ b/arch/x86/kernel/apic/hw_nmi.c
+@@ -33,7 +33,7 @@ u64 hw_nmi_get_sample_period(int watchdog_thresh)
+ #ifdef arch_trigger_cpumask_backtrace
+ static void nmi_raise_cpu_backtrace(cpumask_t *mask)
+ {
+-	__apic_send_IPI_mask(mask, NMI_VECTOR);
++	__apic_send_IPI_mask(mask, BT_NMI);
+ }
+ 
+ void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)
+diff --git a/arch/x86/kernel/apic/ipi.c b/arch/x86/kernel/apic/ipi.c
+index 5da693d633b7..4d4716e9bbd1 100644
+--- a/arch/x86/kernel/apic/ipi.c
++++ b/arch/x86/kernel/apic/ipi.c
+@@ -157,7 +157,7 @@ static void __default_send_IPI_shortcut(unsigned int shortcut, int vector)
+ 	 * issues where otherwise the system hangs when the panic CPU tries
+ 	 * to stop the others before launching the kdump kernel.
+ 	 */
+-	if (unlikely(vector == NMI_VECTOR))
++	if (unlikely(is_nmi(vector)))
+ 		apic_mem_wait_icr_idle_timeout();
+ 	else
+ 		apic_mem_wait_icr_idle();
+@@ -174,7 +174,7 @@ void __default_send_IPI_dest_field(unsigned int dest_mask, int vector,
+ 				   unsigned int dest_mode)
+ {
+ 	/* See comment in __default_send_IPI_shortcut() */
+-	if (unlikely(vector == NMI_VECTOR))
++	if (unlikely(is_nmi(vector)))
+ 		apic_mem_wait_icr_idle_timeout();
+ 	else
+ 		apic_mem_wait_icr_idle();
+diff --git a/arch/x86/kernel/apic/local.h b/arch/x86/kernel/apic/local.h
+index 842fe28496be..c28efad4d749 100644
+--- a/arch/x86/kernel/apic/local.h
++++ b/arch/x86/kernel/apic/local.h
+@@ -22,24 +22,25 @@ void x2apic_send_IPI_allbutself(int vector);
+ void x2apic_send_IPI_self(int vector);
+ extern u32 x2apic_max_apicid;
+ 
++u16 __prepare_ICR_dm_and_vector(u16 dm, u8 vector);
++
+ /* IPI */
+ 
+ DECLARE_STATIC_KEY_FALSE(apic_use_ipi_shorthand);
+ 
+-static inline unsigned int __prepare_ICR(unsigned int shortcut, int vector,
+-					 unsigned int dest)
++static inline bool is_nmi(u16 dm_vector)
+ {
+-	unsigned int icr = shortcut | dest;
++	if ((dm_vector & APIC_DM_MASK) == APIC_DM_NMI)
++		return true;
++	if ((dm_vector & APIC_VECTOR_MASK) == NMI_VECTOR)
++		return true;
++	return false;
++}
+ 
+-	switch (vector) {
+-	default:
+-		icr |= APIC_DM_FIXED | vector;
+-		break;
+-	case NMI_VECTOR:
+-		icr |= APIC_DM_NMI;
+-		break;
+-	}
+-	return icr;
++static inline u32 __prepare_ICR(u32 shortcut, u16 dm_vector, u32 dest)
++{
++	return shortcut | dest |
++	       __prepare_ICR_dm_and_vector(dm_vector & APIC_DM_MASK, dm_vector);
+ }
+ 
+ void default_init_apic_ldr(void);
+diff --git a/arch/x86/kernel/cpu/mce/inject.c b/arch/x86/kernel/cpu/mce/inject.c
+index 522bc643d753..0aa358da06fd 100644
+--- a/arch/x86/kernel/cpu/mce/inject.c
++++ b/arch/x86/kernel/cpu/mce/inject.c
+@@ -270,7 +270,7 @@ static void __maybe_unused raise_mce(struct mce *m)
+ 					mce_irq_ipi, NULL, 0);
+ 				preempt_enable();
+ 			} else if (m->inject_flags & MCJ_NMI_BROADCAST)
+-				__apic_send_IPI_mask(mce_inject_cpumask, NMI_VECTOR);
++				__apic_send_IPI_mask(mce_inject_cpumask, MCE_NMI);
+ 		}
+ 		start = jiffies;
+ 		while (!cpumask_empty(mce_inject_cpumask)) {
+diff --git a/arch/x86/kernel/kgdb.c b/arch/x86/kernel/kgdb.c
+index 451878090ee1..7658cc913f3c 100644
+--- a/arch/x86/kernel/kgdb.c
++++ b/arch/x86/kernel/kgdb.c
+@@ -416,7 +416,7 @@ static void kgdb_disable_hw_debug(struct pt_regs *regs)
+  */
+ void kgdb_roundup_cpus(void)
+ {
+-	apic_send_IPI_allbutself(NMI_VECTOR);
++	apic_send_IPI_allbutself(KGDB_NMI);
+ }
+ #endif
+ 
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index 7a422a6c5983..fc0ae3ed8ab8 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -500,7 +500,7 @@ static bool pv_sched_yield_supported(void)
+ 
+ #define KVM_IPI_CLUSTER_SIZE	(2 * BITS_PER_LONG)
+ 
+-static void __send_ipi_mask(const struct cpumask *mask, int vector)
++static void __send_ipi_mask(const struct cpumask *mask, u16 dm_vector)
+ {
+ 	unsigned long flags;
+ 	int cpu, min = 0, max = 0;
+@@ -517,14 +517,7 @@ static void __send_ipi_mask(const struct cpumask *mask, int vector)
+ 
+ 	local_irq_save(flags);
+ 
+-	switch (vector) {
+-	default:
+-		icr = APIC_DM_FIXED | vector;
+-		break;
+-	case NMI_VECTOR:
+-		icr = APIC_DM_NMI;
+-		break;
+-	}
++	icr = __prepare_ICR_dm_and_vector(dm_vector & APIC_DM_MASK, dm_vector);
+ 
+ 	for_each_cpu(cpu, mask) {
+ 		apic_id = per_cpu(x86_cpu_to_apicid, cpu);
+diff --git a/arch/x86/kernel/nmi_selftest.c b/arch/x86/kernel/nmi_selftest.c
+index 0f5ea753bfd6..031a3a31800c 100644
+--- a/arch/x86/kernel/nmi_selftest.c
++++ b/arch/x86/kernel/nmi_selftest.c
+@@ -72,7 +72,7 @@ static void __init test_nmi_ipi(struct cpumask *mask)
+ 	/* sync above data before sending NMI */
+ 	wmb();
+ 
+-	__apic_send_IPI_mask(mask, NMI_VECTOR);
++	__apic_send_IPI_mask(mask, TEST_NMI);
+ 
+ 	/* Don't wait longer than a second */
+ 	timeout = USEC_PER_SEC;
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index 586e8de53dab..cb99d7df7f71 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -936,7 +936,7 @@ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ 	 */
+ 	wmb();
+ 
+-	apic_send_IPI_allbutself(NMI_VECTOR);
++	apic_send_IPI_allbutself(REBOOT_NMI);
+ 
+ 	/* Kick CPUs looping in NMI context. */
+ 	WRITE_ONCE(crash_ipi_issued, 1);
+diff --git a/arch/x86/kernel/smp.c b/arch/x86/kernel/smp.c
+index 090f40684f0a..4350fc748618 100644
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -217,7 +217,7 @@ static void native_stop_other_cpus(int wait)
+ 			pr_emerg("Shutting down cpus with NMI\n");
+ 
+ 			for_each_cpu(cpu, &cpus_stop_mask)
+-				__apic_send_IPI(cpu, NMI_VECTOR);
++				__apic_send_IPI(cpu, SMP_STOP_NMI);
+ 		}
+ 		/*
+ 		 * Don't wait longer than 10 ms if the caller didn't
+diff --git a/drivers/thermal/intel/therm_throt.c b/drivers/thermal/intel/therm_throt.c
+index 9d18f2fba7a0..316a859c6196 100644
+--- a/drivers/thermal/intel/therm_throt.c
++++ b/drivers/thermal/intel/therm_throt.c
+@@ -740,7 +740,7 @@ void intel_init_thermal(struct cpuinfo_x86 *c)
+ 	 * BIOS has programmed on AP based on BSP's info we saved since BIOS
+ 	 * is always setting the same value for all threads/cores.
+ 	 */
+-	if ((h & APIC_DM_FIXED_MASK) != APIC_DM_FIXED)
++	if ((h & APIC_DM_MASK) != APIC_DM_FIXED)
+ 		apic_write(APIC_LVTTHMR, lvtthmr_init);
+ 
+ 
+-- 
+2.34.1
+
