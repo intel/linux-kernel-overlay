@@ -1,0 +1,152 @@
+From b4c4f502084ee6fab5c9357977cd88e3748cdaa5 Mon Sep 17 00:00:00 2001
+From: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Date: Thu, 13 Mar 2025 22:24:46 +0800
+Subject: [PATCH 02/19] EDAC/igen6: Skip the absent memory controllers
+
+Some BIOS versions may fuse off certain memory controllers and set the
+registers of these absent memory controllers to ~0. The current igen6_edac
+mistakenly enumerates these absent memory controllers and registers them
+with the EDAC core.
+
+Skip the absent memory controllers to avoid mistakenly enumerating them.
+
+Signed-off-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+---
+ drivers/edac/igen6_edac.c | 78 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 62 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/edac/igen6_edac.c b/drivers/edac/igen6_edac.c
+index 2595203be9e5..610c72fc70f5 100644
+--- a/drivers/edac/igen6_edac.c
++++ b/drivers/edac/igen6_edac.c
+@@ -127,6 +127,7 @@
+ 
+ static const struct res_config {
+ 	bool machine_check;
++	/* The number of present memory controllers. */
+ 	int num_imc;
+ 	u32 imc_base;
+ 	u32 cmf_base;
+@@ -1211,23 +1212,21 @@ static void igen6_check(struct mem_ctl_info *mci)
+ 		irq_work_queue(&ecclog_irq_work);
+ }
+ 
+-static int igen6_register_mci(int mc, u64 mchbar, struct pci_dev *pdev)
++/* Check whether the memory controller is absent. */
++static bool igen6_imc_absent(void __iomem *window)
++{
++	return readl(window + MAD_INTER_CHANNEL_OFFSET) == ~0;
++}
++
++static int igen6_register_mci(int mc, void __iomem *window, struct pci_dev *pdev)
+ {
+ 	struct edac_mc_layer layers[2];
+ 	struct mem_ctl_info *mci;
+ 	struct igen6_imc *imc;
+-	void __iomem *window;
+ 	int rc;
+ 
+ 	edac_dbg(2, "\n");
+ 
+-	mchbar += mc * MCHBAR_SIZE;
+-	window = ioremap(mchbar, MCHBAR_SIZE);
+-	if (!window) {
+-		igen6_printk(KERN_ERR, "Failed to ioremap 0x%llx\n", mchbar);
+-		return -ENODEV;
+-	}
+-
+ 	layers[0].type = EDAC_MC_LAYER_CHANNEL;
+ 	layers[0].size = NUM_CHANNELS;
+ 	layers[0].is_virt_csrow = false;
+@@ -1293,7 +1292,6 @@ static int igen6_register_mci(int mc, u64 mchbar, struct pci_dev *pdev)
+ fail2:
+ 	edac_mc_free(mci);
+ fail:
+-	iounmap(window);
+ 	return rc;
+ }
+ 
+@@ -1319,6 +1317,56 @@ static void igen6_unregister_mcis(void)
+ 	}
+ }
+ 
++static int igen6_register_mcis(struct pci_dev *pdev, u64 mchbar)
++{
++	void __iomem *window;
++	int lmc, pmc, rc;
++	u64 base;
++
++	for (lmc = 0, pmc = 0; pmc < NUM_IMC; pmc++) {
++		base   = mchbar + pmc * MCHBAR_SIZE;
++		window = ioremap(base, MCHBAR_SIZE);
++		if (!window) {
++			igen6_printk(KERN_ERR, "Failed to ioremap 0x%llx for mc%d\n", base, pmc);
++			rc = -ENOMEM;
++			goto out_unregister_mcis;
++		}
++
++		if (igen6_imc_absent(window)) {
++			iounmap(window);
++			edac_dbg(2, "Skip absent mc%d\n", pmc);
++			continue;
++		}
++
++		rc = igen6_register_mci(lmc, window, pdev);
++		if (rc)
++			goto out_iounmap;
++
++		/* Done, if all present MCs are detected and registered. */
++		if (++lmc >= res_cfg->num_imc)
++			break;
++	}
++
++	if (!lmc) {
++		igen6_printk(KERN_ERR, "No mc found.\n");
++		return -ENODEV;
++	}
++
++	if (lmc < res_cfg->num_imc)
++		igen6_printk(KERN_WARNING, "Expected %d mcs, but only %d detected.",
++			     res_cfg->num_imc, lmc);
++
++	return 0;
++
++out_iounmap:
++	iounmap(window);
++
++out_unregister_mcis:
++	igen6_unregister_mcis();
++
++	return rc;
++}
++
+ static int igen6_mem_slice_setup(u64 mchbar)
+ {
+ 	struct igen6_imc *imc = &igen6_pvt->imc[0];
+@@ -1414,7 +1462,7 @@ static void opstate_set(const struct res_config *cfg, const struct pci_device_id
+ static int igen6_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	u64 mchbar;
+-	int i, rc;
++	int rc;
+ 
+ 	edac_dbg(2, "\n");
+ 
+@@ -1430,11 +1478,9 @@ static int igen6_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	opstate_set(res_cfg, ent);
+ 
+-	for (i = 0; i < res_cfg->num_imc; i++) {
+-		rc = igen6_register_mci(i, mchbar, pdev);
+-		if (rc)
+-			goto fail2;
+-	}
++	rc = igen6_register_mcis(pdev, mchbar);
++	if (rc)
++		goto fail;
+ 
+ 	if (res_cfg->num_imc > 1) {
+ 		rc = igen6_mem_slice_setup(mchbar);
+-- 
+2.34.1
+

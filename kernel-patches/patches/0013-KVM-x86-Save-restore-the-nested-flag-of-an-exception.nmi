@@ -1,0 +1,187 @@
+From 187cc14166f9b356be3f75a3a1be8003299d7ac2 Mon Sep 17 00:00:00 2001
+From: "Xin Li (Intel)" <xin@zytor.com>
+Date: Thu, 13 Jun 2024 09:48:43 -0700
+Subject: [PATCH 13/49] KVM: x86: Save/restore the nested flag of an exception
+
+Save/restore the nested flag of an exception during VM save/restore
+and live migration to ensure a correct event stack level is chosen
+when a nested exception is injected through FRED event delivery.
+
+Signed-off-by: Xin Li (Intel) <xin@zytor.com>
+---
+
+Change in v4:
+* Add live migration support for exception nested flag (Chao Gao).
+---
+ Documentation/virt/kvm/api.rst  | 19 +++++++++++++++++++
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/include/uapi/asm/kvm.h |  4 +++-
+ arch/x86/kvm/x86.c              | 19 ++++++++++++++++++-
+ include/uapi/linux/kvm.h        |  1 +
+ 5 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 58478b470860..d344a8f6047a 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -1184,6 +1184,10 @@ The following bits are defined in the flags field:
+   fields contain a valid state. This bit will be set whenever
+   KVM_CAP_EXCEPTION_PAYLOAD is enabled.
+ 
++- KVM_VCPUEVENT_VALID_NESTED_FLAG may be set to inform that the
++  exception is a nested exception. This bit will be set whenever
++  KVM_CAP_EXCEPTION_NESTED_FLAG is enabled.
++
+ - KVM_VCPUEVENT_VALID_TRIPLE_FAULT may be set to signal that the
+   triple_fault_pending field contains a valid state. This bit will
+   be set whenever KVM_CAP_X86_TRIPLE_FAULT_EVENT is enabled.
+@@ -1283,6 +1287,10 @@ can be set in the flags field to signal that the
+ exception_has_payload, exception_payload, and exception.pending fields
+ contain a valid state and shall be written into the VCPU.
+ 
++If KVM_CAP_EXCEPTION_NESTED_FLAG is enabled, KVM_VCPUEVENT_VALID_NESTED_FLAG
++can be set in the flags field to inform that the exception is a nested
++exception and exception_is_nested shall be written into the VCPU.
++
+ If KVM_CAP_X86_TRIPLE_FAULT_EVENT is enabled, KVM_VCPUEVENT_VALID_TRIPLE_FAULT
+ can be set in flags field to signal that the triple_fault field contains
+ a valid state and shall be written into the VCPU.
+@@ -8496,6 +8504,17 @@ aforementioned registers before the first KVM_RUN. These registers are VM
+ scoped, meaning that the same set of values are presented on all vCPUs in a
+ given VM.
+ 
++7.43 KVM_CAP_EXCEPTION_NESTED_FLAG
++----------------------------------
++
++:Architectures: x86
++:Parameters: args[0] whether feature should be enabled or not
++
++With this capability enabled, an exception is save/restored with the
++additional information of whether it was nested or not. FRED event
++delivery uses this information to ensure a correct event stack level
++is chosen when a VM entry injects a nested exception.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f06e3de82bc1..59785876dedc 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1444,6 +1444,7 @@ struct kvm_arch {
+ 
+ 	bool guest_can_read_msr_platform_info;
+ 	bool exception_payload_enabled;
++	bool exception_nested_flag_enabled;
+ 
+ 	bool triple_fault_event;
+ 
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 460306b35a4b..6a3a39d04843 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -326,6 +326,7 @@ struct kvm_reinject_control {
+ #define KVM_VCPUEVENT_VALID_SMM		0x00000008
+ #define KVM_VCPUEVENT_VALID_PAYLOAD	0x00000010
+ #define KVM_VCPUEVENT_VALID_TRIPLE_FAULT	0x00000020
++#define KVM_VCPUEVENT_VALID_NESTED_FLAG	0x00000040
+ 
+ /* Interrupt shadow states */
+ #define KVM_X86_SHADOW_INT_MOV_SS	0x01
+@@ -363,7 +364,8 @@ struct kvm_vcpu_events {
+ 	struct {
+ 		__u8 pending;
+ 	} triple_fault;
+-	__u8 reserved[26];
++	__u8 reserved[25];
++	__u8 exception_is_nested;
+ 	__u8 exception_has_payload;
+ 	__u64 exception_payload;
+ };
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index d9604f6a2f7f..2b1a44b3a525 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4710,6 +4710,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_GET_MSR_FEATURES:
+ 	case KVM_CAP_MSR_PLATFORM_INFO:
+ 	case KVM_CAP_EXCEPTION_PAYLOAD:
++	case KVM_CAP_EXCEPTION_NESTED_FLAG:
+ 	case KVM_CAP_X86_TRIPLE_FAULT_EVENT:
+ 	case KVM_CAP_SET_GUEST_DEBUG:
+ 	case KVM_CAP_LAST_CPU:
+@@ -5437,6 +5438,7 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 	events->exception.error_code = ex->error_code;
+ 	events->exception_has_payload = ex->has_payload;
+ 	events->exception_payload = ex->payload;
++	events->exception_is_nested = ex->nested;
+ 
+ 	events->interrupt.injected =
+ 		vcpu->arch.interrupt.injected && !vcpu->arch.interrupt.soft;
+@@ -5462,6 +5464,8 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 			 | KVM_VCPUEVENT_VALID_SMM);
+ 	if (vcpu->kvm->arch.exception_payload_enabled)
+ 		events->flags |= KVM_VCPUEVENT_VALID_PAYLOAD;
++	if (vcpu->kvm->arch.exception_nested_flag_enabled)
++		events->flags |= KVM_VCPUEVENT_VALID_NESTED_FLAG;
+ 	if (vcpu->kvm->arch.triple_fault_event) {
+ 		events->triple_fault.pending = kvm_test_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+ 		events->flags |= KVM_VCPUEVENT_VALID_TRIPLE_FAULT;
+@@ -5476,7 +5480,8 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 			      | KVM_VCPUEVENT_VALID_SHADOW
+ 			      | KVM_VCPUEVENT_VALID_SMM
+ 			      | KVM_VCPUEVENT_VALID_PAYLOAD
+-			      | KVM_VCPUEVENT_VALID_TRIPLE_FAULT))
++			      | KVM_VCPUEVENT_VALID_TRIPLE_FAULT
++			      | KVM_VCPUEVENT_VALID_NESTED_FLAG))
+ 		return -EINVAL;
+ 
+ 	if (events->flags & KVM_VCPUEVENT_VALID_PAYLOAD) {
+@@ -5491,6 +5496,13 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 		events->exception_has_payload = 0;
+ 	}
+ 
++	if (events->flags & KVM_VCPUEVENT_VALID_NESTED_FLAG) {
++		if (!vcpu->kvm->arch.exception_nested_flag_enabled)
++			return -EINVAL;
++	} else {
++		events->exception_is_nested = 0;
++	}
++
+ 	if ((events->exception.injected || events->exception.pending) &&
+ 	    (events->exception.nr > 31 || events->exception.nr == NMI_VECTOR))
+ 		return -EINVAL;
+@@ -5522,6 +5534,7 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 	vcpu->arch.exception.error_code = events->exception.error_code;
+ 	vcpu->arch.exception.has_payload = events->exception_has_payload;
+ 	vcpu->arch.exception.payload = events->exception_payload;
++	vcpu->arch.exception.nested = events->exception_is_nested;
+ 
+ 	vcpu->arch.interrupt.injected = events->interrupt.injected;
+ 	vcpu->arch.interrupt.nr = events->interrupt.nr;
+@@ -6644,6 +6657,10 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		kvm->arch.exception_payload_enabled = cap->args[0];
+ 		r = 0;
+ 		break;
++	case KVM_CAP_EXCEPTION_NESTED_FLAG:
++		kvm->arch.exception_nested_flag_enabled = cap->args[0];
++		r = 0;
++		break;
+ 	case KVM_CAP_X86_TRIPLE_FAULT_EVENT:
+ 		kvm->arch.triple_fault_event = cap->args[0];
+ 		r = 0;
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index b6ae8ad8934b..5ef33256858f 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -930,6 +930,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_X86_APIC_BUS_CYCLES_NS 237
+ #define KVM_CAP_X86_GUEST_MODE 238
+ #define KVM_CAP_ARM_WRITABLE_IMP_ID_REGS 239
++#define KVM_CAP_EXCEPTION_NESTED_FLAG 240
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;
+-- 
+2.34.1
+
