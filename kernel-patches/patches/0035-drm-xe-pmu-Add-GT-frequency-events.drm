@@ -1,0 +1,196 @@
+From e4ac8c2fc521d24ccb82d90f4085ba925927d8b3 Mon Sep 17 00:00:00 2001
+From: Vinay Belgaumkar <vinay.belgaumkar@intel.com>
+Date: Mon, 31 Mar 2025 13:48:27 -0700
+Subject: [PATCH 35/46] drm/xe/pmu: Add GT frequency events
+
+Define PMU events for GT frequency (actual and requested). The
+instantaneous values for these frequencies will be displayed.
+
+Following PMU events are being added:
+  xe_0000_00_02.0/gt-actual-frequency/              [Kernel PMU event]
+  xe_0000_00_02.0/gt-requested-frequency/           [Kernel PMU event]
+
+Standard perf commands can be used to monitor GT frequency:
+  $ perf stat -e xe_0000_00_02.0/gt-requested-frequency,gt=0/ -I1000
+
+  1.001229762       1483 Mhz  xe_0000_00_02.0/gt-requested-frequency,gt=0/
+  2.006175406       1483 Mhz  xe_0000_00_02.0/gt-requested-frequency,gt=0/
+
+v2: Use locks while storing/reading samples, keep track of multiple
+clients (Lucas) and other general cleanup.
+v3: Review comments (Lucas) and use event counts instead of mask for
+active events.
+v4: Add freq events to event_param_valid method (Riana)
+v5: Use instantaneous values instead of aggregating (Lucas)
+v6: Obtain fwake at init for freq events as well and use non fwake
+variant method for reading requested freq to avoid lockdep issues (Lucas)
+v7: Review comments (Rodrigo, Lucas)
+
+Cc: Riana Tauro <riana.tauro@intel.com>
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Signed-off-by: Vinay Belgaumkar <vinay.belgaumkar@intel.com>
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Link: https://lore.kernel.org/r/20250331204827.2535393-1-vinay.belgaumkar@intel.com
+---
+ drivers/gpu/drm/xe/xe_guc_pc.c | 15 +++++++++++++
+ drivers/gpu/drm/xe/xe_guc_pc.h |  1 +
+ drivers/gpu/drm/xe/xe_pmu.c    | 39 +++++++++++++++++++++++++++++++---
+ 3 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
+index 43b1192ba61c..e2453e40586c 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.c
++++ b/drivers/gpu/drm/xe/xe_guc_pc.c
+@@ -461,6 +461,21 @@ static u32 get_cur_freq(struct xe_gt *gt)
+ 	return decode_freq(freq);
+ }
+ 
++/**
++ * xe_guc_pc_get_cur_freq_fw - With fw held, get requested frequency
++ * @pc: The GuC PC
++ *
++ * Returns: the requested frequency for that GT instance
++ */
++u32 xe_guc_pc_get_cur_freq_fw(struct xe_guc_pc *pc)
++{
++	struct xe_gt *gt = pc_to_gt(pc);
++
++	xe_force_wake_assert_held(gt_to_fw(gt), XE_FW_GT);
++
++	return get_cur_freq(gt);
++}
++
+ /**
+  * xe_guc_pc_get_cur_freq - Get Current requested frequency
+  * @pc: The GuC PC
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.h b/drivers/gpu/drm/xe/xe_guc_pc.h
+index 39102b79602f..0a2664d5c811 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.h
++++ b/drivers/gpu/drm/xe/xe_guc_pc.h
+@@ -22,6 +22,7 @@ void xe_guc_pc_print(struct xe_guc_pc *pc, struct drm_printer *p);
+ 
+ u32 xe_guc_pc_get_act_freq(struct xe_guc_pc *pc);
+ int xe_guc_pc_get_cur_freq(struct xe_guc_pc *pc, u32 *freq);
++u32 xe_guc_pc_get_cur_freq_fw(struct xe_guc_pc *pc);
+ u32 xe_guc_pc_get_rp0_freq(struct xe_guc_pc *pc);
+ u32 xe_guc_pc_get_rpa_freq(struct xe_guc_pc *pc);
+ u32 xe_guc_pc_get_rpe_freq(struct xe_guc_pc *pc);
+diff --git a/drivers/gpu/drm/xe/xe_pmu.c b/drivers/gpu/drm/xe/xe_pmu.c
+index fde4222675fd..69df0e3520a5 100644
+--- a/drivers/gpu/drm/xe/xe_pmu.c
++++ b/drivers/gpu/drm/xe/xe_pmu.c
+@@ -10,6 +10,7 @@
+ #include "xe_force_wake.h"
+ #include "xe_gt_idle.h"
+ #include "xe_guc_engine_activity.h"
++#include "xe_guc_pc.h"
+ #include "xe_hw_engine.h"
+ #include "xe_pm.h"
+ #include "xe_pmu.h"
+@@ -84,6 +85,8 @@ static unsigned int config_to_gt_id(u64 config)
+ #define XE_PMU_EVENT_GT_C6_RESIDENCY		0x01
+ #define XE_PMU_EVENT_ENGINE_ACTIVE_TICKS	0x02
+ #define XE_PMU_EVENT_ENGINE_TOTAL_TICKS		0x03
++#define XE_PMU_EVENT_GT_ACTUAL_FREQUENCY	0x04
++#define XE_PMU_EVENT_GT_REQUESTED_FREQUENCY	0x05
+ 
+ static struct xe_gt *event_to_gt(struct perf_event *event)
+ {
+@@ -119,6 +122,14 @@ static bool is_engine_event(u64 config)
+ 		event_id == XE_PMU_EVENT_ENGINE_ACTIVE_TICKS);
+ }
+ 
++static bool is_gt_frequency_event(struct perf_event *event)
++{
++	u32 id = config_to_event_id(event->attr.config);
++
++	return id == XE_PMU_EVENT_GT_ACTUAL_FREQUENCY ||
++	       id == XE_PMU_EVENT_GT_REQUESTED_FREQUENCY;
++}
++
+ static bool event_gt_forcewake(struct perf_event *event)
+ {
+ 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
+@@ -126,7 +137,7 @@ static bool event_gt_forcewake(struct perf_event *event)
+ 	struct xe_gt *gt;
+ 	unsigned int *fw_ref;
+ 
+-	if (!is_engine_event(config))
++	if (!is_engine_event(config) && !is_gt_frequency_event(event))
+ 		return true;
+ 
+ 	gt = xe_device_get_gt(xe, config_to_gt_id(config));
+@@ -173,6 +184,8 @@ static bool event_param_valid(struct perf_event *event)
+ 
+ 	switch (config_to_event_id(config)) {
+ 	case XE_PMU_EVENT_GT_C6_RESIDENCY:
++	case XE_PMU_EVENT_GT_ACTUAL_FREQUENCY:
++	case XE_PMU_EVENT_GT_REQUESTED_FREQUENCY:
+ 		if (engine_class || engine_instance || function_id)
+ 			return false;
+ 		break;
+@@ -288,6 +301,10 @@ static u64 __xe_pmu_event_read(struct perf_event *event)
+ 	case XE_PMU_EVENT_ENGINE_ACTIVE_TICKS:
+ 	case XE_PMU_EVENT_ENGINE_TOTAL_TICKS:
+ 		return read_engine_events(gt, event);
++	case XE_PMU_EVENT_GT_ACTUAL_FREQUENCY:
++		return xe_guc_pc_get_act_freq(&gt->uc.guc.pc);
++	case XE_PMU_EVENT_GT_REQUESTED_FREQUENCY:
++		return xe_guc_pc_get_cur_freq_fw(&gt->uc.guc.pc);
+ 	}
+ 
+ 	return 0;
+@@ -303,7 +320,14 @@ static void xe_pmu_event_update(struct perf_event *event)
+ 		new = __xe_pmu_event_read(event);
+ 	} while (!local64_try_cmpxchg(&hwc->prev_count, &prev, new));
+ 
+-	local64_add(new - prev, &event->count);
++	/*
++	 * GT frequency is not a monotonically increasing counter, so add the
++	 * instantaneous value instead.
++	 */
++	if (is_gt_frequency_event(event))
++		local64_add(new, &event->count);
++	else
++		local64_add(new - prev, &event->count);
+ }
+ 
+ static void xe_pmu_event_read(struct perf_event *event)
+@@ -443,6 +467,10 @@ static ssize_t event_attr_show(struct device *dev,
+ XE_EVENT_ATTR_SIMPLE(gt-c6-residency, gt_c6_residency, XE_PMU_EVENT_GT_C6_RESIDENCY, "ms");
+ XE_EVENT_ATTR_NOUNIT(engine-active-ticks, engine_active_ticks, XE_PMU_EVENT_ENGINE_ACTIVE_TICKS);
+ XE_EVENT_ATTR_NOUNIT(engine-total-ticks, engine_total_ticks, XE_PMU_EVENT_ENGINE_TOTAL_TICKS);
++XE_EVENT_ATTR_SIMPLE(gt-actual-frequency, gt_actual_frequency,
++		     XE_PMU_EVENT_GT_ACTUAL_FREQUENCY, "MHz");
++XE_EVENT_ATTR_SIMPLE(gt-requested-frequency, gt_requested_frequency,
++		     XE_PMU_EVENT_GT_REQUESTED_FREQUENCY, "MHz");
+ 
+ static struct attribute *pmu_empty_event_attrs[] = {
+ 	/* Empty - all events are added as groups with .attr_update() */
+@@ -458,6 +486,8 @@ static const struct attribute_group *pmu_events_attr_update[] = {
+ 	&pmu_group_gt_c6_residency,
+ 	&pmu_group_engine_active_ticks,
+ 	&pmu_group_engine_total_ticks,
++	&pmu_group_gt_actual_frequency,
++	&pmu_group_gt_requested_frequency,
+ 	NULL,
+ };
+ 
+@@ -466,8 +496,11 @@ static void set_supported_events(struct xe_pmu *pmu)
+ 	struct xe_device *xe = container_of(pmu, typeof(*xe), pmu);
+ 	struct xe_gt *gt = xe_device_get_gt(xe, 0);
+ 
+-	if (!xe->info.skip_guc_pc)
++	if (!xe->info.skip_guc_pc) {
+ 		pmu->supported_events |= BIT_ULL(XE_PMU_EVENT_GT_C6_RESIDENCY);
++		pmu->supported_events |= BIT_ULL(XE_PMU_EVENT_GT_ACTUAL_FREQUENCY);
++		pmu->supported_events |= BIT_ULL(XE_PMU_EVENT_GT_REQUESTED_FREQUENCY);
++	}
+ 
+ 	if (xe_guc_engine_activity_supported(&gt->uc.guc)) {
+ 		pmu->supported_events |= BIT_ULL(XE_PMU_EVENT_ENGINE_ACTIVE_TICKS);
+-- 
+2.43.0
+
