@@ -1,0 +1,161 @@
+From 2f76f2737c08bf12ae0292560ad1bf35784209f4 Mon Sep 17 00:00:00 2001
+From: Raag Jadav <raag.jadav@intel.com>
+Date: Thu, 27 Mar 2025 00:57:07 +0530
+Subject: [PATCH 5/5] drm/xe/mcu_i2c: Wire up suspend/resume for I2C controller
+
+Signed-off-by: Raag Jadav <raag.jadav@intel.com>
+---
+ drivers/gpu/drm/xe/xe_device_types.h |  4 +++
+ drivers/gpu/drm/xe/xe_mcu_i2c.c      | 40 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_mcu_i2c.h      |  4 +++
+ drivers/gpu/drm/xe/xe_pm.c           |  9 +++++++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 9f8667ebba85..1fe52bb6bd60 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -16,6 +16,7 @@
+ #include "xe_devcoredump_types.h"
+ #include "xe_heci_gsc.h"
+ #include "xe_lmtt_types.h"
++#include "xe_mcu_i2c.h"
+ #include "xe_memirq_types.h"
+ #include "xe_oa_types.h"
+ #include "xe_platform_types.h"
+@@ -552,6 +553,9 @@ struct xe_device {
+ 	/** @pmu: performance monitoring unit */
+ 	struct xe_pmu pmu;
+ 
++	/** @i2c: I2C host controller */
++	struct xe_i2c *i2c;
++
+ #ifdef TEST_VM_OPS_ERROR
+ 	/**
+ 	 * @vm_inject_error_position: inject errors at different places in VM
+diff --git a/drivers/gpu/drm/xe/xe_mcu_i2c.c b/drivers/gpu/drm/xe/xe_mcu_i2c.c
+index 77353832ecd8..d5e54cf5eb2f 100644
+--- a/drivers/gpu/drm/xe/xe_mcu_i2c.c
++++ b/drivers/gpu/drm/xe/xe_mcu_i2c.c
+@@ -167,6 +167,42 @@ static const struct regmap_config i2c_regmap_config = {
+ 	.fast_io = true,
+ };
+ 
++void xe_i2c_pm_suspend(struct xe_device *xe)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(xe);
++	struct xe_reg pmcsr = XE_REG(I2C_CONFIG_SPACE_OFFSET + 0x84);
++
++	if (!xe->i2c || xe->i2c->ep.cookie != XE_I2C_EP_COOKIE_DEVICE)
++		return;
++
++	xe_mmio_rmw32(mmio, pmcsr, PCI_PM_CTRL_STATE_MASK, PCI_D3hot);
++	drm_dbg(&xe->drm, "pmcsr: 0x%08x\n", xe_mmio_read32(mmio, pmcsr));
++}
++
++void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(xe);
++	struct xe_reg pmcsr = XE_REG(I2C_CONFIG_SPACE_OFFSET + 0x84);
++
++	if (!xe->i2c || xe->i2c->ep.cookie != XE_I2C_EP_COOKIE_DEVICE)
++		return;
++
++	if (d3cold) {
++		xe_mmio_rmw32(mmio, XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_COMMAND), 0, PCI_COMMAND_MEMORY);
++
++		drm_dbg(&xe->drm, "vid: 0x%04x\n", xe_mmio_read16(mmio, XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_VENDOR_ID)));
++		drm_dbg(&xe->drm, "did: 0x%04x\n", xe_mmio_read16(mmio, XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_DEVICE_ID)));
++		drm_dbg(&xe->drm, "com: 0x%04x\n", xe_mmio_read16(mmio, XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_COMMAND)));
++		drm_dbg(&xe->drm, "stat: 0x%04x\n", xe_mmio_read16(mmio, XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_STATUS)));
++		drm_dbg(&xe->drm, "cookie: 0x%08x\n", xe_mmio_read32(mmio, CLIENT_DISC_COOKIE));
++		drm_dbg(&xe->drm, "addr: 0x%08x\n", xe_mmio_read32(mmio, CLIENT_DISC_ADDRESS));
++	}
++
++	xe_mmio_rmw32(mmio, pmcsr, PCI_PM_CTRL_STATE_MASK, PCI_D0);
++	drm_dbg(&xe->drm, "pmcsr: 0x%08x\n", xe_mmio_read32(mmio, pmcsr));
++	drm_dbg(&xe->drm, "dw: 0x%08x\n", xe_mmio_read32(mmio, XE_REG(I2C_MEM_SPACE_OFFSET + 0xfc)));
++}
++
+ static void xe_i2c_remove(void *data)
+ {
+ 	struct xe_i2c *i2c = data;
+@@ -201,6 +237,10 @@ int xe_i2c_probe(struct xe_device *xe)
+ 	i2c->mmio = xe_root_tile_mmio(xe);
+ 	i2c->drm_dev = xe->drm.dev;
+ 	i2c->ep = ep;
++	xe->i2c = i2c;
++
++	/* PCI PM isn't aware of this device, bring it up and match it with SGUnit state */
++	xe_i2c_pm_resume(xe, true);
+ 
+ 	regmap = devm_regmap_init(i2c->drm_dev, NULL, i2c, &i2c_regmap_config);
+ 	if (IS_ERR(regmap))
+diff --git a/drivers/gpu/drm/xe/xe_mcu_i2c.h b/drivers/gpu/drm/xe/xe_mcu_i2c.h
+index f5723f48b99a..cb8ec9a1e148 100644
+--- a/drivers/gpu/drm/xe/xe_mcu_i2c.h
++++ b/drivers/gpu/drm/xe/xe_mcu_i2c.h
+@@ -46,8 +46,12 @@ struct xe_i2c {
+ 
+ #if IS_ENABLED(CONFIG_I2C)
+ int xe_i2c_probe(struct xe_device *xe);
++void xe_i2c_pm_suspend(struct xe_device *xe);
++void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold);
+ #else
+ static inline int xe_i2c_probe(struct xe_device *xe) { return 0; }
++static inline void xe_i2c_pm_suspend(struct xe_device *xe) { }
++static inline void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold) { }
+ #endif
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_pm.c b/drivers/gpu/drm/xe/xe_pm.c
+index 7b6b754ad6eb..36d0d79098b7 100644
+--- a/drivers/gpu/drm/xe/xe_pm.c
++++ b/drivers/gpu/drm/xe/xe_pm.c
+@@ -21,6 +21,7 @@
+ #include "xe_gt.h"
+ #include "xe_guc.h"
+ #include "xe_irq.h"
++#include "xe_mcu_i2c.h"
+ #include "xe_pcode.h"
+ #include "xe_pxp.h"
+ #include "xe_trace.h"
+@@ -147,6 +148,8 @@ int xe_pm_suspend(struct xe_device *xe)
+ 
+ 	xe_display_pm_suspend_late(xe);
+ 
++	xe_i2c_pm_suspend(xe);
++
+ 	drm_dbg(&xe->drm, "Device suspended\n");
+ 	return 0;
+ 
+@@ -192,6 +195,8 @@ int xe_pm_resume(struct xe_device *xe)
+ 	if (err)
+ 		goto err;
+ 
++	xe_i2c_pm_resume(xe, xe->d3cold.allowed);
++
+ 	xe_irq_resume(xe);
+ 
+ 	for_each_gt(gt, xe, id)
+@@ -442,6 +447,8 @@ int xe_pm_runtime_suspend(struct xe_device *xe)
+ 
+ 	xe_display_pm_runtime_suspend_late(xe);
+ 
++	xe_i2c_pm_suspend(xe);
++
+ 	xe_rpm_lockmap_release(xe);
+ 	xe_pm_write_callback_task(xe, NULL);
+ 	return 0;
+@@ -489,6 +496,8 @@ int xe_pm_runtime_resume(struct xe_device *xe)
+ 			goto out;
+ 	}
+ 
++	xe_i2c_pm_resume(xe, xe->d3cold.allowed);
++
+ 	xe_irq_resume(xe);
+ 
+ 	for_each_gt(gt, xe, id)
+-- 
+2.43.0
+

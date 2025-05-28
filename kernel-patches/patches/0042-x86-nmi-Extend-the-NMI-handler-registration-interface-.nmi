@@ -1,0 +1,323 @@
+From d04357581443937c1526c96bbd7e0e1aa8c640bc Mon Sep 17 00:00:00 2001
+From: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Date: Tue, 9 Jul 2024 07:38:58 -0700
+Subject: [PATCH 42/49] x86/nmi: Extend the NMI handler registration interface
+ to include NMI-source vector
+
+Add a source vector argument to register_nmi_handler() such that designated
+NMI originators can leverage NMI source reporting feature.  For those which
+do not use NMI-source reporting, 0 is used as their source vector.
+
+<Platform NMIs should use source vector as #2>
+
+<Check if this patch should be split into two?>
+
+Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+---
+ arch/x86/events/amd/ibs.c         |  2 +-
+ arch/x86/events/core.c            |  2 +-
+ arch/x86/include/asm/nmi.h        |  5 ++++-
+ arch/x86/kernel/apic/hw_nmi.c     |  4 ++--
+ arch/x86/kernel/cpu/mce/inject.c  |  2 +-
+ arch/x86/kernel/cpu/mshyperv.c    |  2 +-
+ arch/x86/kernel/kgdb.c            |  7 +++----
+ arch/x86/kernel/nmi.c             | 16 ++++++++++------
+ arch/x86/kernel/nmi_selftest.c    |  8 ++++----
+ arch/x86/kernel/smp.c             |  4 ++--
+ arch/x86/platform/uv/uv_nmi.c     |  4 ++--
+ drivers/acpi/apei/ghes.c          |  2 +-
+ drivers/char/ipmi/ipmi_watchdog.c |  3 +--
+ drivers/edac/igen6_edac.c         |  3 +--
+ drivers/watchdog/hpwdt.c          |  6 +++---
+ 15 files changed, 37 insertions(+), 33 deletions(-)
+
+diff --git a/arch/x86/events/amd/ibs.c b/arch/x86/events/amd/ibs.c
+index 0252b7ea8bca..45dece8bee84 100644
+--- a/arch/x86/events/amd/ibs.c
++++ b/arch/x86/events/amd/ibs.c
+@@ -1486,7 +1486,7 @@ static __init int perf_event_ibs_init(void)
+ 	if (ret)
+ 		goto err_op;
+ 
+-	ret = register_nmi_handler(NMI_LOCAL, perf_ibs_nmi_handler, 0, "perf_ibs");
++	ret = register_nmi_handler(NMI_LOCAL, perf_ibs_nmi_handler, 0, "perf_ibs", 0);
+ 	if (ret)
+ 		goto err_nmi;
+ 
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 6866cc5acb0b..666bf7b51ae5 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -2115,7 +2115,7 @@ static int __init init_hw_perf_events(void)
+ 		x86_pmu.config_mask = X86_RAW_EVENT_MASK;
+ 
+ 	perf_events_lapic_init();
+-	register_nmi_handler(NMI_LOCAL, perf_event_nmi_handler, 0, "PMI");
++	register_nmi_handler(NMI_LOCAL, perf_event_nmi_handler, 0, "PMI", NMI_SOURCE_VEC_PMI);
+ 
+ 	unconstrained = (struct event_constraint)
+ 		__EVENT_CONSTRAINT(0, x86_pmu.cntr_mask64,
+diff --git a/arch/x86/include/asm/nmi.h b/arch/x86/include/asm/nmi.h
+index 79d88d12c8fb..f0a577bf7bba 100644
+--- a/arch/x86/include/asm/nmi.h
++++ b/arch/x86/include/asm/nmi.h
+@@ -54,6 +54,7 @@ struct nmiaction {
+ 	u64			max_duration;
+ 	unsigned long		flags;
+ 	const char		*name;
++	u8			source_vector;
+ };
+ 
+ /**
+@@ -62,6 +63,7 @@ struct nmiaction {
+  * @fn:   The NMI handler
+  * @fg:   Flags associated with the NMI handler
+  * @n:    Name of the NMI handler
++ * @src:  NMI-source based vector for the NMI handler
+  * @init: Optional __init* attributes for struct nmiaction
+  *
+  * Adds the provided handler to the list of handlers for the specified
+@@ -75,13 +77,14 @@ struct nmiaction {
+  *
+  * Return: 0 on success, or an error code on failure.
+  */
+-#define register_nmi_handler(t, fn, fg, n, init...)	\
++#define register_nmi_handler(t, fn, fg, n, src, init...)	\
+ ({							\
+ 	static struct nmiaction init fn##_na = {	\
+ 		.list = LIST_HEAD_INIT(fn##_na.list),	\
+ 		.handler = (fn),			\
+ 		.name = (n),				\
+ 		.flags = (fg),				\
++		.source_vector = (src),			\
+ 	};						\
+ 	__register_nmi_handler((t), &fn##_na);		\
+ })
+diff --git a/arch/x86/kernel/apic/hw_nmi.c b/arch/x86/kernel/apic/hw_nmi.c
+index 45af535c44a0..4eb419ed7c78 100644
+--- a/arch/x86/kernel/apic/hw_nmi.c
++++ b/arch/x86/kernel/apic/hw_nmi.c
+@@ -53,8 +53,8 @@ NOKPROBE_SYMBOL(nmi_cpu_backtrace_handler);
+ 
+ static int __init register_nmi_cpu_backtrace_handler(void)
+ {
+-	register_nmi_handler(NMI_LOCAL, nmi_cpu_backtrace_handler,
+-				0, "arch_bt");
++	register_nmi_handler(NMI_LOCAL, nmi_cpu_backtrace_handler, 0, "arch_bt",
++			     NMI_SOURCE_VEC_IPI_BT);
+ 	return 0;
+ }
+ early_initcall(register_nmi_cpu_backtrace_handler);
+diff --git a/arch/x86/kernel/cpu/mce/inject.c b/arch/x86/kernel/cpu/mce/inject.c
+index 06e3cf7229ce..5d2eadef8792 100644
+--- a/arch/x86/kernel/cpu/mce/inject.c
++++ b/arch/x86/kernel/cpu/mce/inject.c
+@@ -774,7 +774,7 @@ static int __init inject_init(void)
+ 
+ 	debugfs_init();
+ 
+-	register_nmi_handler(NMI_LOCAL, mce_raise_notify, 0, "mce_notify");
++	register_nmi_handler(NMI_LOCAL, mce_raise_notify, 0, "mce_notify", NMI_SOURCE_VEC_IPI_MCE);
+ 	mce_register_injector_chain(&inject_nb);
+ 
+ 	setup_inj_struct(&i_mce);
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index 3e2533954675..d718cbf36716 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -549,7 +549,7 @@ static void __init ms_hyperv_init_platform(void)
+ 	}
+ 
+ 	register_nmi_handler(NMI_UNKNOWN, hv_nmi_unknown, NMI_FLAG_FIRST,
+-			     "hv_nmi_unknown");
++			     "hv_nmi_unknown", 0);
+ #endif
+ 
+ #ifdef CONFIG_X86_IO_APIC
+diff --git a/arch/x86/kernel/kgdb.c b/arch/x86/kernel/kgdb.c
+index 102641fd2172..65d52426ac87 100644
+--- a/arch/x86/kernel/kgdb.c
++++ b/arch/x86/kernel/kgdb.c
+@@ -602,13 +602,12 @@ int kgdb_arch_init(void)
+ 	if (retval)
+ 		goto out;
+ 
+-	retval = register_nmi_handler(NMI_LOCAL, kgdb_nmi_handler,
+-					0, "kgdb");
++	retval = register_nmi_handler(NMI_LOCAL, kgdb_nmi_handler, 0, "kgdb",
++				      NMI_SOURCE_VEC_IPI_KGDB);
+ 	if (retval)
+ 		goto out1;
+ 
+-	retval = register_nmi_handler(NMI_UNKNOWN, kgdb_nmi_handler,
+-					0, "kgdb");
++	retval = register_nmi_handler(NMI_UNKNOWN, kgdb_nmi_handler, 0, "kgdb", 0);
+ 
+ 	if (retval)
+ 		goto out2;
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index be93ec7255bf..253cbabe7945 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -184,6 +184,9 @@ int __register_nmi_handler(unsigned int type, struct nmiaction *action)
+ 
+ 	raw_spin_lock_irqsave(&desc->lock, flags);
+ 
++	if (!cpu_feature_enabled(X86_FEATURE_NMI_SOURCE) || type != NMI_LOCAL)
++		action->source_vector = 0;
++
+ 	/*
+ 	 * Indicate if there are multiple registrations on the
+ 	 * internal NMI handler call chains (SERR and IO_CHECK).
+@@ -208,21 +211,22 @@ EXPORT_SYMBOL(__register_nmi_handler);
+ void unregister_nmi_handler(unsigned int type, const char *name)
+ {
+ 	struct nmi_desc *desc = nmi_to_desc(type);
+-	struct nmiaction *n, *found = NULL;
++	struct nmiaction *action, *found = NULL;
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&desc->lock, flags);
+ 
+-	list_for_each_entry_rcu(n, &desc->head, list) {
++	list_for_each_entry_rcu(action, &desc->head, list) {
+ 		/*
+ 		 * the name passed in to describe the nmi handler
+ 		 * is used as the lookup key
+ 		 */
+-		if (!strcmp(n->name, name)) {
++		if (!strcmp(action->name, name)) {
+ 			WARN(in_nmi(),
+-				"Trying to free NMI (%s) from NMI context!\n", n->name);
+-			list_del_rcu(&n->list);
+-			found = n;
++				"Trying to free NMI (%s) from NMI context!\n", action->name);
++
++			list_del_rcu(&action->list);
++			found = action;
+ 			break;
+ 		}
+ 	}
+diff --git a/arch/x86/kernel/nmi_selftest.c b/arch/x86/kernel/nmi_selftest.c
+index a010e9d062bf..0f5ea753bfd6 100644
+--- a/arch/x86/kernel/nmi_selftest.c
++++ b/arch/x86/kernel/nmi_selftest.c
+@@ -40,8 +40,7 @@ static int __init nmi_unk_cb(unsigned int val, struct pt_regs *regs)
+ static void __init init_nmi_testsuite(void)
+ {
+ 	/* trap all the unknown NMIs we may generate */
+-	register_nmi_handler(NMI_UNKNOWN, nmi_unk_cb, 0, "nmi_selftest_unk",
+-			__initdata);
++	register_nmi_handler(NMI_UNKNOWN, nmi_unk_cb, 0, "nmi_selftest_unk", 0, __initdata);
+ }
+ 
+ static void __init cleanup_nmi_testsuite(void)
+@@ -63,8 +62,9 @@ static void __init test_nmi_ipi(struct cpumask *mask)
+ {
+ 	unsigned long timeout;
+ 
+-	if (register_nmi_handler(NMI_LOCAL, test_nmi_ipi_callback,
+-				 NMI_FLAG_FIRST, "nmi_selftest", __initdata)) {
++	if (register_nmi_handler(NMI_LOCAL, test_nmi_ipi_callback, NMI_FLAG_FIRST,
++				 "nmi_selftest", NMI_SOURCE_VEC_IPI_TEST,
++				 __initdata)) {
+ 		nmi_fail = FAILURE;
+ 		return;
+ 	}
+diff --git a/arch/x86/kernel/smp.c b/arch/x86/kernel/smp.c
+index 18266cc3d98c..090f40684f0a 100644
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -142,8 +142,8 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
+ 
+ static int register_stop_handler(void)
+ {
+-	return register_nmi_handler(NMI_LOCAL, smp_stop_nmi_callback,
+-				    NMI_FLAG_FIRST, "smp_stop");
++	return register_nmi_handler(NMI_LOCAL, smp_stop_nmi_callback, NMI_FLAG_FIRST,
++				    "smp_stop", NMI_SOURCE_VEC_IPI_SMP_STOP);
+ }
+ 
+ static void native_stop_other_cpus(int wait)
+diff --git a/arch/x86/platform/uv/uv_nmi.c b/arch/x86/platform/uv/uv_nmi.c
+index 5c50e550ab63..473c34eb264c 100644
+--- a/arch/x86/platform/uv/uv_nmi.c
++++ b/arch/x86/platform/uv/uv_nmi.c
+@@ -1029,10 +1029,10 @@ static int uv_handle_nmi_ping(unsigned int reason, struct pt_regs *regs)
+ 
+ static void uv_register_nmi_notifier(void)
+ {
+-	if (register_nmi_handler(NMI_UNKNOWN, uv_handle_nmi, 0, "uv"))
++	if (register_nmi_handler(NMI_UNKNOWN, uv_handle_nmi, 0, "uv", 0))
+ 		pr_warn("UV: NMI handler failed to register\n");
+ 
+-	if (register_nmi_handler(NMI_LOCAL, uv_handle_nmi_ping, 0, "uvping"))
++	if (register_nmi_handler(NMI_LOCAL, uv_handle_nmi_ping, 0, "uvping", 0))
+ 		pr_warn("UV: PING NMI handler failed to register\n");
+ }
+ 
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index 289e365f84b2..1f797d975d53 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -1421,7 +1421,7 @@ static void ghes_nmi_add(struct ghes *ghes)
+ {
+ 	mutex_lock(&ghes_list_mutex);
+ 	if (list_empty(&ghes_nmi))
+-		register_nmi_handler(NMI_LOCAL, ghes_notify_nmi, 0, "ghes");
++		register_nmi_handler(NMI_LOCAL, ghes_notify_nmi, 0, "ghes", 0);
+ 	list_add_rcu(&ghes->list, &ghes_nmi);
+ 	mutex_unlock(&ghes_list_mutex);
+ }
+diff --git a/drivers/char/ipmi/ipmi_watchdog.c b/drivers/char/ipmi/ipmi_watchdog.c
+index f1875b2bebbc..5db402c4b9e7 100644
+--- a/drivers/char/ipmi/ipmi_watchdog.c
++++ b/drivers/char/ipmi/ipmi_watchdog.c
+@@ -1267,8 +1267,7 @@ static void check_parms(void)
+ 		}
+ 	}
+ 	if (do_nmi && !nmi_handler_registered) {
+-		rv = register_nmi_handler(NMI_UNKNOWN, ipmi_nmi, 0,
+-						"ipmi");
++		rv = register_nmi_handler(NMI_UNKNOWN, ipmi_nmi, 0, "ipmi", 0);
+ 		if (rv) {
+ 			pr_warn("Can't register nmi handler\n");
+ 			return;
+diff --git a/drivers/edac/igen6_edac.c b/drivers/edac/igen6_edac.c
+index 5807517ee32d..3a6e7334e94c 100644
+--- a/drivers/edac/igen6_edac.c
++++ b/drivers/edac/igen6_edac.c
+@@ -1363,8 +1363,7 @@ static int register_err_handler(void)
+ 		return 0;
+ 	}
+ 
+-	rc = register_nmi_handler(NMI_SERR, ecclog_nmi_handler,
+-				  0, IGEN6_NMI_NAME);
++	rc = register_nmi_handler(NMI_SERR, ecclog_nmi_handler, 0, IGEN6_NMI_NAME, 0);
+ 	if (rc) {
+ 		igen6_printk(KERN_ERR, "Failed to register NMI handler\n");
+ 		return rc;
+diff --git a/drivers/watchdog/hpwdt.c b/drivers/watchdog/hpwdt.c
+index ae30e394d176..5246706afcf6 100644
+--- a/drivers/watchdog/hpwdt.c
++++ b/drivers/watchdog/hpwdt.c
+@@ -242,13 +242,13 @@ static int hpwdt_init_nmi_decoding(struct pci_dev *dev)
+ 	/*
+ 	 * Only one function can register for NMI_UNKNOWN
+ 	 */
+-	retval = register_nmi_handler(NMI_UNKNOWN, hpwdt_pretimeout, 0, "hpwdt");
++	retval = register_nmi_handler(NMI_UNKNOWN, hpwdt_pretimeout, 0, "hpwdt", 0);
+ 	if (retval)
+ 		goto error;
+-	retval = register_nmi_handler(NMI_SERR, hpwdt_pretimeout, 0, "hpwdt");
++	retval = register_nmi_handler(NMI_SERR, hpwdt_pretimeout, 0, "hpwdt", 0);
+ 	if (retval)
+ 		goto error1;
+-	retval = register_nmi_handler(NMI_IO_CHECK, hpwdt_pretimeout, 0, "hpwdt");
++	retval = register_nmi_handler(NMI_IO_CHECK, hpwdt_pretimeout, 0, "hpwdt", 0);
+ 	if (retval)
+ 		goto error2;
+ 
+-- 
+2.34.1
+
