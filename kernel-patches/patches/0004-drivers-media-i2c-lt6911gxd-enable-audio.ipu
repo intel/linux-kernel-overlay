@@ -1,0 +1,192 @@
+From fa10d6ba41edd0314fa2b718830ecea9a689ed9a Mon Sep 17 00:00:00 2001
+From: "Lui, Jonathan" <jonathan.ming.jun.lui@intel.com>
+Date: Wed, 28 May 2025 14:57:12 +0800
+Subject: [PATCH 4/5] drivers: media: i2c: lt6911gxd enable audio
+
+Enable audio for lt6911gxd in interrupt mode.
+
+Signed-off-by: Lui, Jonathan <jonathan.ming.jun.lui@intel.com>
+---
+ drivers/media/i2c/lt6911gxd.c | 103 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/i2c/lt6911gxd.c b/drivers/media/i2c/lt6911gxd.c
+index 3fbd0ea07e8a..d4878205e444 100644
+--- a/drivers/media/i2c/lt6911gxd.c
++++ b/drivers/media/i2c/lt6911gxd.c
+@@ -35,6 +35,12 @@
+ #define REG_INT_HDMI			CCI_REG8(0xe084)
+ #define INT_VIDEO_DISAPPEAR		0x0
+ #define INT_VIDEO_READY			0x1
++#define REG_INT_AUDIO				CCI_REG8(0x86a5)
++#define REG_AUDIO_FS_H				CCI_REG8(0xe090)
++#define REG_AUDIO_FS_L				CCI_REG8(0xe091)
++#define AUDIO_SR_HIGH				0x55
++#define AUDIO_SR_LOW				0xaa
++#define INT_AUDIO_DISCONNECT		0x3
+ 
+ #define LT6911GXD_DEFAULT_WIDTH		3840
+ #define LT6911GXD_DEFAULT_HEIGHT	2160
+@@ -45,6 +51,9 @@
+ #define BPP_MODE_BIT			4
+ #define YUV16_BIT			2
+ 
++#define LT6911GXD_CID_AUDIO_SAMPLING_RATE	(V4L2_CID_USER_BASE | 0x1001)
++#define LT6911GXD_CID_AUDIO_PRESENT		(V4L2_CID_USER_BASE | 0x1002)
++
+ static const struct regmap_range_cfg lt6911gxd_ranges[] = {
+ 	{
+ 		.name = "register_range",
+@@ -73,6 +82,9 @@ struct lt6911gxd_mode {
+ 	u32 fps;
+ 	u32 lanes;
+ 	s64 link_freq;
++
++	/* Audio sample rate*/
++	u32 sample_rate;
+ };
+ 
+ struct lt6911gxd {
+@@ -81,6 +93,8 @@ struct lt6911gxd {
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct v4l2_ctrl *pixel_rate;
+ 	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *sampling_rate;
++	struct v4l2_ctrl *audio_present;
+ 
+ 	struct lt6911gxd_mode cur_mode;
+ 	struct regmap *regmap;
+@@ -108,6 +122,28 @@ static inline struct lt6911gxd *to_lt6911gxd(struct v4l2_subdev *sd)
+ 	return container_of(sd, struct lt6911gxd, sd);
+ }
+ 
++static const struct v4l2_ctrl_config lt6911gxd_audio_sampling_rate = {
++	.id = LT6911GXD_CID_AUDIO_SAMPLING_RATE,
++	.name = "Audio Sampling Rate",
++	.type = V4L2_CTRL_TYPE_INTEGER,
++	.min = 32000,
++	.max = 192000,
++	.step = 100,
++	.def = 48000,
++	.flags = V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static const struct v4l2_ctrl_config lt6911gxd_audio_present = {
++	.id = LT6911GXD_CID_AUDIO_PRESENT,
++	.name = "Audio Present",
++	.type = V4L2_CTRL_TYPE_BOOLEAN,
++	.min = 0,
++	.max = 1,
++	.step = 1,
++	.def = 0,
++	.flags = V4L2_CTRL_FLAG_READ_ONLY,
++};
++
+ static const struct lt6911gxd_mode default_mode = {
+ 	.width = LT6911GXD_DEFAULT_WIDTH,
+ 	.height = LT6911GXD_DEFAULT_HEIGHT,
+@@ -129,7 +165,30 @@ static s64 get_pixel_rate(struct lt6911gxd *lt6911gxd)
+ 	return pixel_rate;
+ }
+ 
+-static int lt6911gxd_status_update(struct lt6911gxd *lt6911gxd)
++static int lt6911gxd_get_audio_sampling_rate(struct lt6911gxd *lt6911gxd)
++{
++	int audio_fs, idx;
++	u64 fs_h, fs_l;
++	static const int eps = 1500;
++	static const int rates_default[] = {
++		32000, 44100, 48000, 88200, 96000, 176400, 192000
++	};
++
++	cci_read(lt6911gxd->regmap, REG_AUDIO_FS_H, &fs_h, NULL);
++	cci_read(lt6911gxd->regmap, REG_AUDIO_FS_L, &fs_l, NULL);
++	audio_fs = ((fs_h << 8) | fs_l);
++
++	/* audio_fs is an approximation of sample rate - search nearest */
++	for (idx = 0; idx < ARRAY_SIZE(rates_default); ++idx) {
++		if ((rates_default[idx] - eps < audio_fs) &&
++		    (rates_default[idx] + eps > audio_fs))
++			return rates_default[idx];
++	}
++
++	return 0;
++}
++
++static int lt6911gxd_video_status_update(struct lt6911gxd *lt6911gxd)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&lt6911gxd->sd);
+ 	u64 int_event;
+@@ -212,6 +271,31 @@ static int lt6911gxd_status_update(struct lt6911gxd *lt6911gxd)
+ 	return ret;
+ }
+ 
++static void lt6911gxd_audio_status_update(struct lt6911gxd *lt6911gxd)
++{
++	u64 int_event;
++	int audio_fs;
++
++	/* Read interrupt event */
++	cci_read(lt6911gxd->regmap, REG_INT_AUDIO, &int_event, NULL);
++	switch (int_event) {
++	case AUDIO_SR_HIGH:
++	case AUDIO_SR_LOW:
++		audio_fs = lt6911gxd_get_audio_sampling_rate(lt6911gxd);
++		lt6911gxd->cur_mode.sample_rate = audio_fs;
++		break;
++
++	case INT_AUDIO_DISCONNECT:
++		lt6911gxd->cur_mode.sample_rate = 0;
++		break;
++	default:
++		/* use the default value to avoid problems */
++		lt6911gxd->cur_mode.sample_rate = 0;
++		break;
++	}
++
++}
++
+ /* TODO: add audio sampling rate and present control */
+ static int lt6911gxd_init_controls(struct lt6911gxd *lt6911gxd)
+ {
+@@ -235,6 +319,17 @@ static int lt6911gxd_init_controls(struct lt6911gxd *lt6911gxd)
+ 						  pixel_rate, pixel_rate, 1,
+ 						  pixel_rate);
+ 
++	/* custom v4l2 audio controls */
++	lt6911gxd->sampling_rate =
++		v4l2_ctrl_new_custom(ctrl_hdlr,
++				     &lt6911gxd_audio_sampling_rate,
++				     NULL);
++
++	lt6911gxd->audio_present =
++		v4l2_ctrl_new_custom(ctrl_hdlr,
++				     &lt6911gxd_audio_present,
++				     NULL);
++
+ 	if (ctrl_hdlr->error) {
+ 		ret = ctrl_hdlr->error;
+ 		goto hdlr_free;
+@@ -314,6 +409,9 @@ static int lt6911gxd_set_format(struct v4l2_subdev *sd,
+ 	__v4l2_ctrl_modify_range(lt6911gxd->pixel_rate, pixel_rate,
+ 				 pixel_rate, 1, pixel_rate);
+ 
++	__v4l2_ctrl_s_ctrl(lt6911gxd->audio_present,
++			   (lt6911gxd->cur_mode.sample_rate != 0));
++
+ 	link_freq = lt6911gxd->cur_mode.link_freq;
+ 	__v4l2_ctrl_modify_range(lt6911gxd->link_freq, link_freq,
+ 				 link_freq, 1, link_freq);
+@@ -498,7 +596,8 @@ static irqreturn_t lt6911gxd_threaded_irq_fn(int irq, void *dev_id)
+ 	};
+ 
+ 	state = v4l2_subdev_lock_and_get_active_state(sd);
+-	lt6911gxd_status_update(lt6911gxd);
++	lt6911gxd_video_status_update(lt6911gxd);
++	lt6911gxd_audio_status_update(lt6911gxd);
+ 	lt6911gxd_set_format(sd, state, &fmt);
+ 	v4l2_subdev_unlock_state(state);
+ 
+-- 
+2.43.0
+
