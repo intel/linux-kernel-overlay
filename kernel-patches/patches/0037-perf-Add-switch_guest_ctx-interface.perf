@@ -1,0 +1,206 @@
+From 2eb08fa11011c48c99212ca2005c8100a274f074 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Thu, 17 Oct 2024 08:42:56 -0700
+Subject: [PATCH 37/44] perf: Add switch_guest_ctx() interface
+
+When entering/exiting a guest, some contexts for a guest have to be
+switched. For examples, there is a dedicated interrupt vector for
+guests on Intel platforms.
+
+When PMI switch into a new guest vector, guest_lvtpc value need to be
+reflected onto HW, e,g., guest clear PMI mask bit, the HW PMI mask
+bit should be cleared also, then PMI can be generated continuously
+for guest. So guest_lvtpc parameter is added into perf_guest_enter()
+and switch_guest_ctx().
+
+Add a dedicated list to track all the pmus with the PASSTHROUGH cap, which
+may require switching the guest context. It can avoid going through the
+huge pmus list.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+---
+ include/linux/perf_event.h | 17 ++++++++++--
+ kernel/events/core.c       | 54 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 93fc5338d7b5..c8112dce5602 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -591,6 +591,11 @@ struct pmu {
+ 	 * Check period value for PERF_EVENT_IOC_PERIOD ioctl.
+ 	 */
+ 	int (*check_period)		(struct perf_event *event, u64 value); /* optional */
++
++	/*
++	 * Switch guest context when a guest enter/exit, e.g., interrupt vectors.
++	 */
++	void (*switch_guest_ctx)	(bool enter, void *data); /* optional */
+ };
+ 
+ enum perf_addr_filter_action_t {
+@@ -1112,6 +1117,11 @@ struct perf_ctx_data {
+ 	void				*data;
+ };
+ 
++struct mediated_pmus_list {
++	raw_spinlock_t		lock;
++	struct list_head	list;
++};
++
+ struct perf_cpu_pmu_context {
+ 	struct perf_event_pmu_context	epc;
+ 	struct perf_event_pmu_context	*task_epc;
+@@ -1127,6 +1137,9 @@ struct perf_cpu_pmu_context {
+ 	struct hrtimer			hrtimer;
+ 	ktime_t				hrtimer_interval;
+ 	unsigned int			hrtimer_active;
++
++	/* Track the PMU with PERF_PMU_CAP_MEDIATED_VPMU cap */
++	struct list_head		mediated_entry;
+ };
+ 
+ /**
+@@ -1928,7 +1941,7 @@ extern int perf_event_period(struct perf_event *event, u64 value);
+ extern u64 perf_event_pause(struct perf_event *event, bool reset);
+ extern int perf_get_mediated_pmu(void);
+ extern void perf_put_mediated_pmu(void);
+-extern void perf_guest_enter(void);
++extern void perf_guest_enter(u32 guest_lvtpc);
+ extern void perf_guest_exit(void);
+ 
+ #else /* !CONFIG_PERF_EVENTS: */
+@@ -2018,7 +2031,7 @@ static inline int
+ perf_exclude_event(struct perf_event *event, struct pt_regs *regs)	{ return 0; }
+ static inline int perf_get_mediated_pmu(void)				{ return 0; }
+ static inline void perf_put_mediated_pmu(void)				{ }
+-static inline void perf_guest_enter(void)				{ }
++static inline void perf_guest_enter(u32 guest_lvtpc)			{ }
+ static inline void perf_guest_exit(void)				{ }
+ 
+ #endif /* !CONFIG_PERF_EVENTS */
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 61718bad0f2e..9a90e882b88f 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -465,6 +465,7 @@ static inline bool is_include_guest_event(struct perf_event *event)
+ static LIST_HEAD(pmus);
+ static DEFINE_MUTEX(pmus_lock);
+ static struct srcu_struct pmus_srcu;
++static DEFINE_PER_CPU(struct mediated_pmus_list, mediated_pmus);
+ static cpumask_var_t perf_online_mask;
+ static cpumask_var_t perf_online_core_mask;
+ static cpumask_var_t perf_online_die_mask;
+@@ -6339,7 +6340,26 @@ void perf_put_mediated_pmu(void)
+ }
+ EXPORT_SYMBOL_GPL(perf_put_mediated_pmu);
+ 
+-static inline void perf_host_exit(struct perf_cpu_context *cpuctx)
++static void perf_switch_guest_ctx(bool enter, u32 guest_lvtpc)
++{
++	struct mediated_pmus_list *pmus = this_cpu_ptr(&mediated_pmus);
++	struct perf_cpu_pmu_context *cpc;
++	struct pmu *pmu;
++
++	lockdep_assert_irqs_disabled();
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(cpc, &pmus->list, mediated_entry) {
++		pmu = cpc->epc.pmu;
++
++		if (pmu->switch_guest_ctx)
++			pmu->switch_guest_ctx(enter, (void *)&guest_lvtpc);
++	}
++	rcu_read_unlock();
++}
++
++static inline void perf_host_exit(struct perf_cpu_context *cpuctx,
++				  u32 guest_lvtpc)
+ {
+ 	perf_ctx_disable(&cpuctx->ctx, EVENT_GUEST);
+ 	ctx_sched_out(&cpuctx->ctx, NULL, EVENT_GUEST);
+@@ -6348,6 +6368,7 @@ static inline void perf_host_exit(struct perf_cpu_context *cpuctx)
+ 		task_ctx_sched_out(cpuctx->task_ctx, NULL, EVENT_GUEST);
+ 	}
+ 
++	perf_switch_guest_ctx(true, guest_lvtpc);
+ 	__this_cpu_write(perf_in_guest, true);
+ 
+ 	perf_ctx_enable(&cpuctx->ctx, EVENT_GUEST);
+@@ -6356,7 +6377,7 @@ static inline void perf_host_exit(struct perf_cpu_context *cpuctx)
+ }
+ 
+ /* When entering a guest, schedule out all exclude_guest events. */
+-void perf_guest_enter(void)
++void perf_guest_enter(u32 guest_lvtpc)
+ {
+ 	struct perf_cpu_context *cpuctx = this_cpu_ptr(&perf_cpu_context);
+ 
+@@ -6367,7 +6388,7 @@ void perf_guest_enter(void)
+ 	if (WARN_ON_ONCE(__this_cpu_read(perf_in_guest)))
+ 		goto unlock;
+ 
+-	perf_host_exit(cpuctx);
++	perf_host_exit(cpuctx, guest_lvtpc);
+ 
+ unlock:
+ 	perf_ctx_unlock(cpuctx, cpuctx->task_ctx);
+@@ -6380,6 +6401,7 @@ static inline void perf_host_enter(struct perf_cpu_context *cpuctx)
+ 	if (cpuctx->task_ctx)
+ 		perf_ctx_disable(cpuctx->task_ctx, EVENT_GUEST);
+ 
++	perf_switch_guest_ctx(false, 0);
+ 	__this_cpu_write(perf_in_guest, false);
+ 
+ 	perf_event_sched_in(cpuctx, cpuctx->task_ctx, NULL, EVENT_GUEST);
+@@ -12634,6 +12656,15 @@ int perf_pmu_register(struct pmu *_pmu, const char *name, int type)
+ 		*per_cpu_ptr(pmu->cpu_pmu_context, cpu) = cpc;
+ 		__perf_init_event_pmu_context(&cpc->epc, pmu);
+ 		__perf_mux_hrtimer_init(cpc, cpu);
++
++		if (pmu->capabilities & PERF_PMU_CAP_MEDIATED_VPMU) {
++			struct mediated_pmus_list *pmus;
++
++			pmus = per_cpu_ptr(&mediated_pmus, cpu);
++			raw_spin_lock(&pmus->lock);
++			list_add_rcu(&cpc->mediated_entry, &pmus->list);
++			raw_spin_unlock(&pmus->lock);
++		}
+ 	}
+ 
+ 	if (!pmu->start_txn) {
+@@ -12779,6 +12810,20 @@ int perf_pmu_unregister(struct pmu *pmu)
+ 		list_del_rcu(&pmu->entry);
+ 	}
+ 
++	if (pmu->capabilities & PERF_PMU_CAP_MEDIATED_VPMU) {
++		struct mediated_pmus_list *pmus;
++		struct perf_cpu_pmu_context *cpc;
++		int cpu;
++
++		for_each_possible_cpu(cpu) {
++			cpc = *per_cpu_ptr(pmu->cpu_pmu_context, cpu);
++			pmus = per_cpu_ptr(&mediated_pmus, cpu);
++			raw_spin_lock(&pmus->lock);
++			list_del_rcu(&cpc->mediated_entry);
++			raw_spin_unlock(&pmus->lock);
++		}
++	}
++
+ 	/*
+ 	 * We dereference the pmu list under both SRCU and regular RCU, so
+ 	 * synchronize against both of those.
+@@ -14906,6 +14951,9 @@ static void __init perf_event_init_all_cpus(void)
+ 
+ 		INIT_LIST_HEAD(&per_cpu(sched_cb_list, cpu));
+ 
++		INIT_LIST_HEAD(&per_cpu(mediated_pmus.list, cpu));
++		raw_spin_lock_init(&per_cpu(mediated_pmus.lock, cpu));
++
+ 		cpuctx = per_cpu_ptr(&perf_cpu_context, cpu);
+ 		__perf_event_init_context(&cpuctx->ctx);
+ 		lockdep_set_class(&cpuctx->ctx.mutex, &cpuctx_mutex);
+-- 
+2.43.0
+

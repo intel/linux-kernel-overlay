@@ -1,0 +1,168 @@
+From 1ce45e00059f23ceaad7c7cc0957ce5712f32cdb Mon Sep 17 00:00:00 2001
+From: Xiong Zhang <xiong.y.zhang@linux.intel.com>
+Date: Thu, 20 Jun 2024 09:09:15 +0800
+Subject: [PATCH 35/44] perf: core/x86: Register a new vector for KVM GUEST PMI
+
+Create a new vector in the host IDT for kvm guest PMI handling within
+mediated passthrough vPMU. In addition, guest PMI handler registration
+is added into x86_set_kvm_irq_handler().
+
+This is the preparation work to support mediated passthrough vPMU to
+handle kvm guest PMIs without interference from PMI handler of the host
+PMU.
+
+Signed-off-by: Xiong Zhang <xiong.y.zhang@linux.intel.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/entry/entry_fred.c                   |  3 +++
+ arch/x86/include/asm/hardirq.h                |  1 +
+ arch/x86/include/asm/idtentry.h               |  2 ++
+ arch/x86/include/asm/irq_vectors.h            |  5 ++++-
+ arch/x86/kernel/idt.c                         |  1 +
+ arch/x86/kernel/irq.c                         | 21 +++++++++++++++++++
+ .../beauty/arch/x86/include/asm/irq_vectors.h |  5 ++++-
+ 7 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/entry/entry_fred.c b/arch/x86/entry/entry_fred.c
+index a5f5bdd16ad8..8f224895048c 100644
+--- a/arch/x86/entry/entry_fred.c
++++ b/arch/x86/entry/entry_fred.c
+@@ -117,6 +117,9 @@ static idtentry_t sysvec_table[NR_SYSTEM_VECTORS] __ro_after_init = {
+ 	SYSVEC(POSTED_INTR_VECTOR,		kvm_posted_intr_ipi),
+ 	SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	kvm_posted_intr_wakeup_ipi),
+ 	SYSVEC(POSTED_INTR_NESTED_VECTOR,	kvm_posted_intr_nested_ipi),
++#if IS_ENABLED(CONFIG_KVM)
++	SYSVEC(KVM_GUEST_PMI_VECTOR,		kvm_guest_pmi_handler),
++#endif
+ 
+ 	SYSVEC(POSTED_MSI_NOTIFICATION_VECTOR,	posted_msi_notification),
+ };
+diff --git a/arch/x86/include/asm/hardirq.h b/arch/x86/include/asm/hardirq.h
+index f00c09ffe6a9..d1b9cd3765db 100644
+--- a/arch/x86/include/asm/hardirq.h
++++ b/arch/x86/include/asm/hardirq.h
+@@ -18,6 +18,7 @@ typedef struct {
+ 	unsigned int kvm_posted_intr_ipis;
+ 	unsigned int kvm_posted_intr_wakeup_ipis;
+ 	unsigned int kvm_posted_intr_nested_ipis;
++	unsigned int kvm_guest_pmis;
+ #endif
+ 	unsigned int x86_platform_ipis;	/* arch dependent */
+ 	unsigned int apic_perf_irqs;
+diff --git a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+index a4ec27c67988..a42efde8fb84 100644
+--- a/arch/x86/include/asm/idtentry.h
++++ b/arch/x86/include/asm/idtentry.h
+@@ -745,10 +745,12 @@ DECLARE_IDTENTRY_SYSVEC(IRQ_WORK_VECTOR,		sysvec_irq_work);
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_NESTED_VECTOR,	sysvec_kvm_posted_intr_nested_ipi);
++DECLARE_IDTENTRY_SYSVEC(KVM_GUEST_PMI_VECTOR,	        sysvec_kvm_guest_pmi_handler);
+ #else
+ # define fred_sysvec_kvm_posted_intr_ipi		NULL
+ # define fred_sysvec_kvm_posted_intr_wakeup_ipi		NULL
+ # define fred_sysvec_kvm_posted_intr_nested_ipi		NULL
++# define fred_sysvec_kvm_guest_pmi_handler		NULL
+ #endif
+ 
+ # ifdef CONFIG_X86_POSTED_MSI
+diff --git a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+index 47051871b436..250cdab11306 100644
+--- a/arch/x86/include/asm/irq_vectors.h
++++ b/arch/x86/include/asm/irq_vectors.h
+@@ -77,7 +77,10 @@
+  */
+ #define IRQ_WORK_VECTOR			0xf6
+ 
+-/* 0xf5 - unused, was UV_BAU_MESSAGE */
++#if IS_ENABLED(CONFIG_KVM)
++#define KVM_GUEST_PMI_VECTOR		0xf5
++#endif
++
+ #define DEFERRED_ERROR_VECTOR		0xf4
+ 
+ /* Vector on which hypervisor callbacks will be delivered */
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index f445bec516a0..0bec4c7e2308 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -157,6 +157,7 @@ static const __initconst struct idt_data apic_idts[] = {
+ 	INTG(POSTED_INTR_VECTOR,		asm_sysvec_kvm_posted_intr_ipi),
+ 	INTG(POSTED_INTR_WAKEUP_VECTOR,		asm_sysvec_kvm_posted_intr_wakeup_ipi),
+ 	INTG(POSTED_INTR_NESTED_VECTOR,		asm_sysvec_kvm_posted_intr_nested_ipi),
++	INTG(KVM_GUEST_PMI_VECTOR,		asm_sysvec_kvm_guest_pmi_handler),
+ # endif
+ # ifdef CONFIG_IRQ_WORK
+ 	INTG(IRQ_WORK_VECTOR,			asm_sysvec_irq_work),
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index e0ad8b1394ca..6c607c1b02ec 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -190,6 +190,12 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 		seq_printf(p, "%10u ",
+ 			   irq_stats(j)->kvm_posted_intr_wakeup_ipis);
+ 	seq_puts(p, "  Posted-interrupt wakeup event\n");
++
++	seq_printf(p, "%*s: ", prec, "VPMU");
++	for_each_online_cpu(j)
++		seq_printf(p, "%10u ",
++			   irq_stats(j)->kvm_guest_pmis);
++	seq_puts(p, " KVM GUEST PMI\n");
+ #endif
+ #ifdef CONFIG_X86_POSTED_MSI
+ 	seq_printf(p, "%*s: ", prec, "PMN");
+@@ -318,6 +324,7 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_x86_platform_ipi)
+ #if IS_ENABLED(CONFIG_KVM)
+ static void dummy_handler(void) {}
+ static void (*kvm_posted_intr_wakeup_handler)(void) = dummy_handler;
++static void (*kvm_guest_pmi_handler)(void) = dummy_handler;
+ 
+ void x86_set_kvm_irq_handler(u8 vector, void (*handler)(void))
+ {
+@@ -328,6 +335,10 @@ void x86_set_kvm_irq_handler(u8 vector, void (*handler)(void))
+ 	    (handler == dummy_handler ||
+ 	     kvm_posted_intr_wakeup_handler == dummy_handler))
+ 		kvm_posted_intr_wakeup_handler = handler;
++	else if (vector == KVM_GUEST_PMI_VECTOR &&
++		 (handler == dummy_handler ||
++		  kvm_guest_pmi_handler == dummy_handler))
++		kvm_guest_pmi_handler = handler;
+ 	else
+ 		WARN_ON_ONCE(1);
+ 
+@@ -363,6 +374,16 @@ DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_nested_ipi)
+ 	apic_eoi();
+ 	inc_irq_stat(kvm_posted_intr_nested_ipis);
+ }
++
++/*
++ * Handler for KVM_GUEST_PMI_VECTOR.
++ */
++DEFINE_IDTENTRY_SYSVEC(sysvec_kvm_guest_pmi_handler)
++{
++	apic_eoi();
++	inc_irq_stat(kvm_guest_pmis);
++	kvm_guest_pmi_handler();
++}
+ #endif
+ 
+ #ifdef CONFIG_X86_POSTED_MSI
+diff --git a/tools/perf/trace/beauty/arch/x86/include/asm/irq_vectors.h b/tools/perf/trace/beauty/arch/x86/include/asm/irq_vectors.h
+index 47051871b436..250cdab11306 100644
+--- a/tools/perf/trace/beauty/arch/x86/include/asm/irq_vectors.h
++++ b/tools/perf/trace/beauty/arch/x86/include/asm/irq_vectors.h
+@@ -77,7 +77,10 @@
+  */
+ #define IRQ_WORK_VECTOR			0xf6
+ 
+-/* 0xf5 - unused, was UV_BAU_MESSAGE */
++#if IS_ENABLED(CONFIG_KVM)
++#define KVM_GUEST_PMI_VECTOR		0xf5
++#endif
++
+ #define DEFERRED_ERROR_VECTOR		0xf4
+ 
+ /* Vector on which hypervisor callbacks will be delivered */
+-- 
+2.43.0
+

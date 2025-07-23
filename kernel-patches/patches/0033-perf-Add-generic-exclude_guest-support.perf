@@ -1,0 +1,160 @@
+From 4140de30d21d197ffd8ca431d1223a2f2c32688b Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Wed, 16 Oct 2024 12:57:44 -0700
+Subject: [PATCH 33/44] perf: Add generic exclude_guest support
+
+Only KVM knows the exact time when a guest is entering/exiting. Expose
+two interfaces to KVM to switch the ownership of the PMU resources.
+
+All the pinned events must be scheduled in first. Extend the
+perf_event_sched_in() helper to support extra flag, e.g., EVENT_GUEST.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+---
+ include/linux/perf_event.h |  4 ++
+ kernel/events/core.c       | 83 ++++++++++++++++++++++++++++++++++----
+ 2 files changed, 80 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 5587b9db19c3..93fc5338d7b5 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1928,6 +1928,8 @@ extern int perf_event_period(struct perf_event *event, u64 value);
+ extern u64 perf_event_pause(struct perf_event *event, bool reset);
+ extern int perf_get_mediated_pmu(void);
+ extern void perf_put_mediated_pmu(void);
++extern void perf_guest_enter(void);
++extern void perf_guest_exit(void);
+ 
+ #else /* !CONFIG_PERF_EVENTS: */
+ 
+@@ -2016,6 +2018,8 @@ static inline int
+ perf_exclude_event(struct perf_event *event, struct pt_regs *regs)	{ return 0; }
+ static inline int perf_get_mediated_pmu(void)				{ return 0; }
+ static inline void perf_put_mediated_pmu(void)				{ }
++static inline void perf_guest_enter(void)				{ }
++static inline void perf_guest_exit(void)				{ }
+ 
+ #endif /* !CONFIG_PERF_EVENTS */
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 214fffbffb84..61718bad0f2e 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -2943,14 +2943,15 @@ static void task_ctx_sched_out(struct perf_event_context *ctx,
+ 
+ static void perf_event_sched_in(struct perf_cpu_context *cpuctx,
+ 				struct perf_event_context *ctx,
+-				struct pmu *pmu)
++				struct pmu *pmu,
++				enum event_type_t event_type)
+ {
+-	ctx_sched_in(&cpuctx->ctx, pmu, EVENT_PINNED);
++	ctx_sched_in(&cpuctx->ctx, pmu, EVENT_PINNED | event_type);
+ 	if (ctx)
+-		 ctx_sched_in(ctx, pmu, EVENT_PINNED);
+-	ctx_sched_in(&cpuctx->ctx, pmu, EVENT_FLEXIBLE);
++		ctx_sched_in(ctx, pmu, EVENT_PINNED | event_type);
++	ctx_sched_in(&cpuctx->ctx, pmu, EVENT_FLEXIBLE | event_type);
+ 	if (ctx)
+-		 ctx_sched_in(ctx, pmu, EVENT_FLEXIBLE);
++		ctx_sched_in(ctx, pmu, EVENT_FLEXIBLE | event_type);
+ }
+ 
+ /*
+@@ -3006,7 +3007,7 @@ static void ctx_resched(struct perf_cpu_context *cpuctx,
+ 	else if (event_type & EVENT_PINNED)
+ 		ctx_sched_out(&cpuctx->ctx, pmu, EVENT_FLEXIBLE);
+ 
+-	perf_event_sched_in(cpuctx, task_ctx, pmu);
++	perf_event_sched_in(cpuctx, task_ctx, pmu, 0);
+ 
+ 	for_each_epc(epc, &cpuctx->ctx, pmu, 0)
+ 		perf_pmu_enable(epc->pmu);
+@@ -4271,7 +4272,7 @@ static void perf_event_context_sched_in(struct task_struct *task)
+ 		ctx_sched_out(&cpuctx->ctx, NULL, EVENT_FLEXIBLE);
+ 	}
+ 
+-	perf_event_sched_in(cpuctx, ctx, NULL);
++	perf_event_sched_in(cpuctx, ctx, NULL, 0);
+ 
+ 	perf_ctx_sched_task_cb(cpuctx->task_ctx, task, true);
+ 
+@@ -6338,6 +6339,74 @@ void perf_put_mediated_pmu(void)
+ }
+ EXPORT_SYMBOL_GPL(perf_put_mediated_pmu);
+ 
++static inline void perf_host_exit(struct perf_cpu_context *cpuctx)
++{
++	perf_ctx_disable(&cpuctx->ctx, EVENT_GUEST);
++	ctx_sched_out(&cpuctx->ctx, NULL, EVENT_GUEST);
++	if (cpuctx->task_ctx) {
++		perf_ctx_disable(cpuctx->task_ctx, EVENT_GUEST);
++		task_ctx_sched_out(cpuctx->task_ctx, NULL, EVENT_GUEST);
++	}
++
++	__this_cpu_write(perf_in_guest, true);
++
++	perf_ctx_enable(&cpuctx->ctx, EVENT_GUEST);
++	if (cpuctx->task_ctx)
++		perf_ctx_enable(cpuctx->task_ctx, EVENT_GUEST);
++}
++
++/* When entering a guest, schedule out all exclude_guest events. */
++void perf_guest_enter(void)
++{
++	struct perf_cpu_context *cpuctx = this_cpu_ptr(&perf_cpu_context);
++
++	lockdep_assert_irqs_disabled();
++
++	perf_ctx_lock(cpuctx, cpuctx->task_ctx);
++
++	if (WARN_ON_ONCE(__this_cpu_read(perf_in_guest)))
++		goto unlock;
++
++	perf_host_exit(cpuctx);
++
++unlock:
++	perf_ctx_unlock(cpuctx, cpuctx->task_ctx);
++}
++EXPORT_SYMBOL_GPL(perf_guest_enter);
++
++static inline void perf_host_enter(struct perf_cpu_context *cpuctx)
++{
++	perf_ctx_disable(&cpuctx->ctx, EVENT_GUEST);
++	if (cpuctx->task_ctx)
++		perf_ctx_disable(cpuctx->task_ctx, EVENT_GUEST);
++
++	__this_cpu_write(perf_in_guest, false);
++
++	perf_event_sched_in(cpuctx, cpuctx->task_ctx, NULL, EVENT_GUEST);
++
++	if (cpuctx->task_ctx)
++		perf_ctx_enable(cpuctx->task_ctx, EVENT_GUEST);
++	perf_ctx_enable(&cpuctx->ctx, EVENT_GUEST);
++}
++
++void perf_guest_exit(void)
++{
++	struct perf_cpu_context *cpuctx = this_cpu_ptr(&perf_cpu_context);
++
++	lockdep_assert_irqs_disabled();
++
++	perf_ctx_lock(cpuctx, cpuctx->task_ctx);
++
++	if (WARN_ON_ONCE(!__this_cpu_read(perf_in_guest)))
++		goto unlock;
++
++	perf_host_enter(cpuctx);
++
++unlock:
++	perf_ctx_unlock(cpuctx, cpuctx->task_ctx);
++}
++EXPORT_SYMBOL_GPL(perf_guest_exit);
++
+ /*
+  * Holding the top-level event's child_mutex means that any
+  * descendant process that has inherited this event will block
+-- 
+2.43.0
+
