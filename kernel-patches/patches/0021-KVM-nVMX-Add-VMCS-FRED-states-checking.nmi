@@ -1,0 +1,160 @@
+From d2f13af1cad2f8afd127a8539465797ce002cb39 Mon Sep 17 00:00:00 2001
+From: Xin Li <xin3.li@intel.com>
+Date: Sun, 4 Jun 2023 23:58:33 -0700
+Subject: [PATCH 21/45] KVM: nVMX: Add VMCS FRED states checking
+
+As real hardware, nested VMX performs checks on various VMCS fields,
+including both controls and guest/host states.  Add FRED related VMCS
+field checkings with the addition of nested FRED.
+
+Signed-off-by: Xin Li <xin3.li@intel.com>
+Signed-off-by: Xin Li (Intel) <xin@zytor.com>
+Tested-by: Shan Kang <shan.kang@intel.com>
+Tested-by: Xuelian Guo <xuelian.guo@intel.com>
+---
+
+Change in v5:
+* Add TB from Xuelian Guo.
+---
+ arch/x86/kvm/vmx/nested.c | 80 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index d32a36ddd109..3ba516a1d7c4 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -2959,6 +2959,8 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
+ 					  struct vmcs12 *vmcs12)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	bool fred_enabled = (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE) &&
++			    (vmcs12->guest_cr4 & X86_CR4_FRED);
+ 
+ 	if (CC(!vmx_control_verify(vmcs12->vm_entry_controls,
+ 				    vmx->nested.msrs.entry_ctls_low,
+@@ -2977,6 +2979,7 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
+ 		u32 intr_type = intr_info & INTR_INFO_INTR_TYPE_MASK;
+ 		bool has_error_code = intr_info & INTR_INFO_DELIVER_CODE_MASK;
+ 		bool should_have_error_code;
++		bool has_nested_exception = vmx->nested.msrs.basic & VMX_BASIC_NESTED_EXCEPTION;
+ 		bool urg = nested_cpu_has2(vmcs12,
+ 					   SECONDARY_EXEC_UNRESTRICTED_GUEST);
+ 		bool prot_mode = !urg || vmcs12->guest_cr0 & X86_CR0_PE;
+@@ -2990,7 +2993,9 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
+ 		/* VM-entry interruption-info field: vector */
+ 		if (CC(intr_type == INTR_TYPE_NMI_INTR && vector != NMI_VECTOR) ||
+ 		    CC(intr_type == INTR_TYPE_HARD_EXCEPTION && vector > 31) ||
+-		    CC(intr_type == INTR_TYPE_OTHER_EVENT && vector != 0))
++		    CC(intr_type == INTR_TYPE_OTHER_EVENT &&
++		       ((!fred_enabled && vector > 0) ||
++			(fred_enabled && vector > 2))))
+ 			return -EINVAL;
+ 
+ 		/* VM-entry interruption-info field: deliver error code */
+@@ -3009,6 +3014,15 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
+ 		if (CC(intr_info & INTR_INFO_RESVD_BITS_MASK))
+ 			return -EINVAL;
+ 
++		/*
++		 * When the CPU enumerates VMX nested-exception support, bit 13
++		 * (set to indicate a nested exception) of the intr info field
++		 * may have value 1. Otherwise bit 13 is reserved.
++		 */
++		if (CC(!has_nested_exception &&
++		       (intr_info & INTR_INFO_NESTED_EXCEPTION_MASK)))
++			return -EINVAL;
++
+ 		/* VM-entry instruction length */
+ 		switch (intr_type) {
+ 		case INTR_TYPE_SOFT_EXCEPTION:
+@@ -3018,6 +3032,12 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
+ 			    CC(vmcs12->vm_entry_instruction_len == 0 &&
+ 			    CC(!nested_cpu_has_zero_length_injection(vcpu))))
+ 				return -EINVAL;
++			break;
++		case INTR_TYPE_OTHER_EVENT:
++			if (fred_enabled && (vector == 1 || vector == 2))
++				if (CC(vmcs12->vm_entry_instruction_len > 15))
++					return -EINVAL;
++			break;
+ 		}
+ 	}
+ 
+@@ -3091,9 +3111,30 @@ static int nested_vmx_check_host_state(struct kvm_vcpu *vcpu,
+ 	if (ia32e) {
+ 		if (CC(!(vmcs12->host_cr4 & X86_CR4_PAE)))
+ 			return -EINVAL;
++		if (vmcs12->vm_exit_controls & VM_EXIT_ACTIVATE_SECONDARY_CONTROLS &&
++		    vmcs12->secondary_vm_exit_controls & SECONDARY_VM_EXIT_LOAD_IA32_FRED) {
++			/* Bit 11, bits 5:4, and bit 2 of the IA32_FRED_CONFIG must be zero */
++			if (CC(vmcs12->host_ia32_fred_config &
++			       (BIT_ULL(11) | GENMASK_ULL(5, 4) | BIT_ULL(2))) ||
++			    CC(vmcs12->host_ia32_fred_rsp1 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->host_ia32_fred_rsp2 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->host_ia32_fred_rsp3 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->host_ia32_fred_ssp1 & GENMASK_ULL(2, 0)) ||
++			    CC(vmcs12->host_ia32_fred_ssp2 & GENMASK_ULL(2, 0)) ||
++			    CC(vmcs12->host_ia32_fred_ssp3 & GENMASK_ULL(2, 0)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_config & PAGE_MASK, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_rsp1, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_rsp2, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_rsp3, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_ssp1, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_ssp2, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->host_ia32_fred_ssp3, vcpu)))
++				return -EINVAL;
++		}
+ 	} else {
+ 		if (CC(vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE) ||
+ 		    CC(vmcs12->host_cr4 & X86_CR4_PCIDE) ||
++		    CC(vmcs12->host_cr4 & X86_CR4_FRED) ||
+ 		    CC((vmcs12->host_rip) >> 32))
+ 			return -EINVAL;
+ 	}
+@@ -3237,6 +3278,43 @@ static int nested_vmx_check_guest_state(struct kvm_vcpu *vcpu,
+ 	     CC((vmcs12->guest_bndcfgs & MSR_IA32_BNDCFGS_RSVD))))
+ 		return -EINVAL;
+ 
++	if (ia32e) {
++		if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_FRED) {
++			/* Bit 11, bits 5:4, and bit 2 of the IA32_FRED_CONFIG must be zero */
++			if (CC(vmcs12->guest_ia32_fred_config &
++			       (BIT_ULL(11) | GENMASK_ULL(5, 4) | BIT_ULL(2))) ||
++			    CC(vmcs12->guest_ia32_fred_rsp1 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->guest_ia32_fred_rsp2 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->guest_ia32_fred_rsp3 & GENMASK_ULL(5, 0)) ||
++			    CC(vmcs12->guest_ia32_fred_ssp1 & GENMASK_ULL(2, 0)) ||
++			    CC(vmcs12->guest_ia32_fred_ssp2 & GENMASK_ULL(2, 0)) ||
++			    CC(vmcs12->guest_ia32_fred_ssp3 & GENMASK_ULL(2, 0)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_config & PAGE_MASK, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_rsp1, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_rsp2, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_rsp3, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_ssp1, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_ssp2, vcpu)) ||
++			    CC(is_noncanonical_msr_address(vmcs12->guest_ia32_fred_ssp3, vcpu)))
++				return -EINVAL;
++		}
++		if (vmcs12->guest_cr4 & X86_CR4_FRED) {
++			unsigned int ss_dpl = VMX_AR_DPL(vmcs12->guest_ss_ar_bytes);
++			if (CC(ss_dpl == 1 || ss_dpl == 2))
++				return -EINVAL;
++			if (ss_dpl == 0 &&
++			    CC(!(vmcs12->guest_cs_ar_bytes & VMX_AR_L_MASK)))
++				return -EINVAL;
++			if (ss_dpl == 3 &&
++			    (CC(vmcs12->guest_rflags & X86_EFLAGS_IOPL) ||
++			     CC(vmcs12->guest_interruptibility_info & GUEST_INTR_STATE_STI)))
++				return -EINVAL;
++		}
++	} else {
++		if (CC(vmcs12->guest_cr4 & X86_CR4_FRED))
++			return -EINVAL;
++	}
++
+ 	if (nested_check_guest_non_reg_state(vmcs12))
+ 		return -EINVAL;
+ 
+-- 
+2.43.0
+

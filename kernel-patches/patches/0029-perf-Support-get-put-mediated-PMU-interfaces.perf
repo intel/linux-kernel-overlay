@@ -1,0 +1,182 @@
+From 4e05c3bf8e936390e3e71d521737680761556afc Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Wed, 16 Oct 2024 08:03:57 -0700
+Subject: [PATCH 29/44] perf: Support get/put mediated PMU interfaces
+
+Currently, the guest and host share the PMU resources when a guest is
+running. KVM has to create an extra virtual event to simulate the
+guest's event, which brings several issues, e.g., high overhead, not
+accuracy and etc.
+
+A new mediated PMU method is proposed to address the issue. It requires
+that the PMU resources can be fully occupied by the guest while it's
+running. Two new interfaces are implemented to fulfill the requirement.
+The hypervisor should invoke the interface while creating a guest which
+wants the mediated PMU capability.
+
+The PMU resources should only be temporarily occupied as a whole when a
+guest is running. When the guest is out, the PMU resources are still
+shared among different users.
+
+The exclude_guest event modifier is used to guarantee the exclusive
+occupation of the PMU resources. When creating a guest, the hypervisor
+should check whether there are !exclude_guest events in the system.
+If yes, the creation should fail. Because some PMU resources have been
+occupied by other users.
+If no, the PMU resources can be safely accessed by the guest directly.
+Perf guarantees that no new !exclude_guest events are created when a
+guest is running.
+
+Only the mediated PMU is affected, but not for other PMU e.g., uncore
+and SW PMU. The behavior of those PMUs are not changed. The guest
+enter/exit interfaces should only impact the supported PMUs.
+Add a new PERF_PMU_CAP_MEDIATED_VPMU flag to indicate the PMUs that
+support the feature.
+
+Add nr_include_guest_events to track the !exclude_guest events of PMU
+with PERF_PMU_CAP_MEDIATED_VPMU.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+---
+ include/linux/perf_event.h |  6 ++++
+ kernel/events/core.c       | 64 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index dd9bfe42c011..ae381cb90732 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -306,6 +306,8 @@ struct perf_event_pmu_context;
+ #define PERF_PMU_CAP_AUX_PAUSE		0x0200
+ #define PERF_PMU_CAP_AUX_PREFER_LARGE	0x0400
+ #define PERF_PMU_CAP_MORE_EXT_REGS	0x0800
++/* Support to passthrough whole PMU resoure to guest */
++#define PERF_PMU_CAP_MEDIATED_VPMU	0x1000
+ 
+ /**
+  * pmu::scope
+@@ -1917,6 +1919,8 @@ extern void perf_event_task_tick(void);
+ extern int perf_event_account_interrupt(struct perf_event *event);
+ extern int perf_event_period(struct perf_event *event, u64 value);
+ extern u64 perf_event_pause(struct perf_event *event, bool reset);
++extern int perf_get_mediated_pmu(void);
++extern void perf_put_mediated_pmu(void);
+ 
+ #else /* !CONFIG_PERF_EVENTS: */
+ 
+@@ -2003,6 +2007,8 @@ static inline u64
+ perf_event_pause(struct perf_event *event, bool reset)			{ return 0; }
+ static inline int
+ perf_exclude_event(struct perf_event *event, struct pt_regs *regs)	{ return 0; }
++static inline int perf_get_mediated_pmu(void)				{ return 0; }
++static inline void perf_put_mediated_pmu(void)				{ }
+ 
+ #endif /* !CONFIG_PERF_EVENTS */
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 145e3e859806..56ba7cb38fe2 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -445,6 +445,20 @@ static atomic_t nr_bpf_events __read_mostly;
+ static atomic_t nr_cgroup_events __read_mostly;
+ static atomic_t nr_text_poke_events __read_mostly;
+ static atomic_t nr_build_id_events __read_mostly;
++static atomic_t nr_include_guest_events __read_mostly;
++
++static atomic_t nr_mediated_pmu_vms;
++static DEFINE_MUTEX(perf_mediated_pmu_mutex);
++
++/* !exclude_guest event of PMU with PERF_PMU_CAP_MEDIATED_VPMU */
++static inline bool is_include_guest_event(struct perf_event *event)
++{
++	if ((event->pmu->capabilities & PERF_PMU_CAP_MEDIATED_VPMU) &&
++	    !event->attr.exclude_guest)
++		return true;
++
++	return false;
++}
+ 
+ static LIST_HEAD(pmus);
+ static DEFINE_MUTEX(pmus_lock);
+@@ -5652,6 +5666,9 @@ static void _free_event(struct perf_event *event)
+ 
+ 	unaccount_event(event);
+ 
++	if (is_include_guest_event(event))
++		atomic_dec(&nr_include_guest_events);
++
+ 	security_perf_event_free(event);
+ 
+ 	if (event->rb) {
+@@ -6175,6 +6192,36 @@ u64 perf_event_pause(struct perf_event *event, bool reset)
+ }
+ EXPORT_SYMBOL_GPL(perf_event_pause);
+ 
++/*
++ * Currently invoked at VM creation to
++ * - Check whether there are existing !exclude_guest events of PMU with
++ *   PERF_PMU_CAP_MEDIATED_VPMU
++ * - Set nr_mediated_pmu_vms to prevent !exclude_guest event creation on
++ *   PMUs with PERF_PMU_CAP_MEDIATED_VPMU
++ *
++ * No impact for the PMU without PERF_PMU_CAP_MEDIATED_VPMU. The perf
++ * still owns all the PMU resources.
++ */
++int perf_get_mediated_pmu(void)
++{
++	guard(mutex)(&perf_mediated_pmu_mutex);
++	if (atomic_inc_not_zero(&nr_mediated_pmu_vms))
++		return 0;
++
++	if (atomic_read(&nr_include_guest_events))
++		return -EBUSY;
++
++	atomic_inc(&nr_mediated_pmu_vms);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(perf_get_mediated_pmu);
++
++void perf_put_mediated_pmu(void)
++{
++	atomic_dec(&nr_mediated_pmu_vms);
++}
++EXPORT_SYMBOL_GPL(perf_put_mediated_pmu);
++
+ /*
+  * Holding the top-level event's child_mutex means that any
+  * descendant process that has inherited this event will block
+@@ -12857,6 +12904,17 @@ static void account_event(struct perf_event *event)
+ 	account_pmu_sb_event(event);
+ }
+ 
++static int perf_account_include_guest_event(void)
++{
++	guard(mutex)(&perf_mediated_pmu_mutex);
++
++	if (atomic_read(&nr_mediated_pmu_vms))
++		return -EOPNOTSUPP;
++
++	atomic_inc(&nr_include_guest_events);
++	return 0;
++}
++
+ /*
+  * Allocate and initialize an event structure
+  */
+@@ -13078,6 +13136,12 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ 		}
+ 	}
+ 
++	if (is_include_guest_event(event)) {
++		err = perf_account_include_guest_event();
++		if (err)
++			return ERR_PTR(err);
++	}
++
+ 	err = security_perf_event_alloc(event);
+ 	if (err)
+ 		return ERR_PTR(err);
+-- 
+2.43.0
+

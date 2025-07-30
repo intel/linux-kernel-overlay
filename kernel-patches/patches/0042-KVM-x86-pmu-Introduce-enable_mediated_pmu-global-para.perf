@@ -1,0 +1,228 @@
+From 2f87208884d3311c57cef2738695a12a77541b65 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Tue, 3 Dec 2024 09:54:24 +0000
+Subject: [PATCH 42/44] KVM: x86/pmu: Introduce enable_mediated_pmu global
+ parameter
+
+Introduce enable_mediated_pmu global parameter to control if mediated
+vPMU can be enabled on KVM level. Even enable_mediated_pmu is set to
+true in KVM, user space hypervisor still need to enable mediated vPMU
+explicitly by calling KVM_CAP_PMU_CAPABILITY ioctl. This gives
+hypervisor flexibility to enable or disable mediated vPMU for each VM.
+
+Mediated vPMU depends on some PMU features on higher PMU version, like
+PERF_GLOBAL_STATUS_SET MSR in v4+ for Intel PMU. Thus introduce a
+pmu_ops variable MIN_MEDIATED_PMU_VERSION to indicates the minimum host
+PMU version which mediated vPMU needs.
+
+Currently enable_mediated_pmu is not exposed to user space as a module
+parameter until all mediated vPMU code are in place.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Co-developed-by: Mingwei Zhang <mizhang@google.com>
+Signed-off-by: Mingwei Zhang <mizhang@google.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/kvm/pmu.c              |  3 ++-
+ arch/x86/kvm/pmu.h              | 11 +++++++++
+ arch/x86/kvm/svm/pmu.c          |  1 +
+ arch/x86/kvm/vmx/capabilities.h |  3 ++-
+ arch/x86/kvm/vmx/pmu_intel.c    |  5 ++++
+ arch/x86/kvm/vmx/vmx.c          |  3 ++-
+ arch/x86/kvm/x86.c              | 44 ++++++++++++++++++++++++++++++---
+ arch/x86/kvm/x86.h              |  1 +
+ 8 files changed, 64 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index 75e9cfc689f8..4f455afe4009 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -775,7 +775,8 @@ void kvm_pmu_refresh(struct kvm_vcpu *vcpu)
+ 	pmu->pebs_data_cfg_rsvd = ~0ull;
+ 	bitmap_zero(pmu->all_valid_pmc_idx, X86_PMC_IDX_MAX);
+ 
+-	if (!vcpu->kvm->arch.enable_pmu)
++	if (!vcpu->kvm->arch.enable_pmu ||
++	    (!lapic_in_kernel(vcpu) && enable_mediated_pmu))
+ 		return;
+ 
+ 	kvm_pmu_call(refresh)(vcpu);
+diff --git a/arch/x86/kvm/pmu.h b/arch/x86/kvm/pmu.h
+index ad89d0bd6005..dd45a0c6be74 100644
+--- a/arch/x86/kvm/pmu.h
++++ b/arch/x86/kvm/pmu.h
+@@ -45,6 +45,7 @@ struct kvm_pmu_ops {
+ 	const u64 EVENTSEL_EVENT;
+ 	const int MAX_NR_GP_COUNTERS;
+ 	const int MIN_NR_GP_COUNTERS;
++	const int MIN_MEDIATED_PMU_VERSION;
+ };
+ 
+ void kvm_pmu_ops_update(const struct kvm_pmu_ops *pmu_ops);
+@@ -63,6 +64,12 @@ static inline bool kvm_pmu_has_perf_global_ctrl(struct kvm_pmu *pmu)
+ 	return pmu->version > 1;
+ }
+ 
++static inline bool kvm_mediated_pmu_enabled(struct kvm_vcpu *vcpu)
++{
++	return vcpu->kvm->arch.enable_pmu &&
++	       enable_mediated_pmu && vcpu_to_pmu(vcpu)->version;
++}
++
+ /*
+  * KVM tracks all counters in 64-bit bitmaps, with general purpose counters
+  * mapped to bits 31:0 and fixed counters mapped to 63:32, e.g. fixed counter 0
+@@ -210,6 +217,10 @@ static inline void kvm_init_pmu_capability(const struct kvm_pmu_ops *pmu_ops)
+ 			enable_pmu = false;
+ 	}
+ 
++	if (!enable_pmu || !kvm_pmu_cap.mediated ||
++	    pmu_ops->MIN_MEDIATED_PMU_VERSION > kvm_pmu_cap.version)
++		enable_mediated_pmu = false;
++
+ 	if (!enable_pmu) {
+ 		memset(&kvm_pmu_cap, 0, sizeof(kvm_pmu_cap));
+ 		return;
+diff --git a/arch/x86/kvm/svm/pmu.c b/arch/x86/kvm/svm/pmu.c
+index 288f7f2a46f2..c8b9fd9b5350 100644
+--- a/arch/x86/kvm/svm/pmu.c
++++ b/arch/x86/kvm/svm/pmu.c
+@@ -239,4 +239,5 @@ struct kvm_pmu_ops amd_pmu_ops __initdata = {
+ 	.EVENTSEL_EVENT = AMD64_EVENTSEL_EVENT,
+ 	.MAX_NR_GP_COUNTERS = KVM_MAX_NR_AMD_GP_COUNTERS,
+ 	.MIN_NR_GP_COUNTERS = AMD64_NUM_COUNTERS,
++	.MIN_MEDIATED_PMU_VERSION = 2,
+ };
+diff --git a/arch/x86/kvm/vmx/capabilities.h b/arch/x86/kvm/vmx/capabilities.h
+index 3b6fb6863f81..9aa53a756d53 100644
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -403,7 +403,8 @@ static inline bool vmx_pt_mode_is_host_guest(void)
+ 
+ static inline bool vmx_pebs_supported(void)
+ {
+-	return boot_cpu_has(X86_FEATURE_PEBS) && kvm_pmu_cap.pebs_ept;
++	return boot_cpu_has(X86_FEATURE_PEBS) &&
++	       !enable_mediated_pmu && kvm_pmu_cap.pebs_ept;
+ }
+ 
+ static inline bool cpu_has_vmx_fred(void)
+diff --git a/arch/x86/kvm/vmx/pmu_intel.c b/arch/x86/kvm/vmx/pmu_intel.c
+index 73684a1a8425..8106af53d4cf 100644
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@ -790,4 +790,9 @@ struct kvm_pmu_ops intel_pmu_ops __initdata = {
+ 	.EVENTSEL_EVENT = ARCH_PERFMON_EVENTSEL_EVENT,
+ 	.MAX_NR_GP_COUNTERS = KVM_MAX_NR_INTEL_GP_COUNTERS,
+ 	.MIN_NR_GP_COUNTERS = 1,
++	/*
++	 * Intel mediated vPMU support depends on
++	 * MSR_CORE_PERF_GLOBAL_STATUS_SET which is supported from 4+.
++	 */
++	.MIN_MEDIATED_PMU_VERSION = 4,
+ };
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 59955896542d..2199ea262347 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -8119,7 +8119,8 @@ static __init u64 vmx_get_perf_capabilities(void)
+ 	if (boot_cpu_has(X86_FEATURE_PDCM))
+ 		rdmsrq(MSR_IA32_PERF_CAPABILITIES, host_perf_cap);
+ 
+-	if (!cpu_feature_enabled(X86_FEATURE_ARCH_LBR)) {
++	if (!cpu_feature_enabled(X86_FEATURE_ARCH_LBR) &&
++	    !enable_mediated_pmu) {
+ 		x86_perf_get_lbr(&vmx_lbr_caps);
+ 
+ 		/*
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 25b937312b8a..b45b541d4900 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -187,6 +187,14 @@ bool __read_mostly enable_pmu = true;
+ EXPORT_SYMBOL_GPL(enable_pmu);
+ module_param(enable_pmu, bool, 0444);
+ 
++/*
++ * Enable/disable mediated passthrough PMU virtualization.
++ * Don't expose it to userspace as a module paramerter until
++ * all mediated vPMU code is in place.
++ */
++bool __read_mostly enable_mediated_pmu;
++EXPORT_SYMBOL_GPL(enable_mediated_pmu);
++
+ bool __read_mostly eager_page_split = true;
+ module_param(eager_page_split, bool, 0644);
+ 
+@@ -6799,9 +6807,28 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 			break;
+ 
+ 		mutex_lock(&kvm->lock);
+-		if (!kvm->created_vcpus) {
+-			kvm->arch.enable_pmu = !(cap->args[0] & KVM_PMU_CAP_DISABLE);
+-			r = 0;
++		/*
++		 * To keep PMU configuration "simple", setting vPMU support is
++		 * disallowed if vCPUs are created, or if mediated PMU support
++		 * was already enabled for the VM.
++		 */
++		if (!kvm->created_vcpus &&
++		    (!enable_mediated_pmu || !kvm->arch.enable_pmu)) {
++			bool pmu_enable = !(cap->args[0] & KVM_PMU_CAP_DISABLE);
++
++			if (enable_mediated_pmu && pmu_enable) {
++				char *err_msg = "Fail to enable mediated vPMU, " \
++					"please disable system wide perf events or nmi_watchdog " \
++					"(echo 0 > /proc/sys/kernel/nmi_watchdog).\n";
++
++				r = perf_get_mediated_pmu();
++				if (r)
++					kvm_err("%s", err_msg);
++			} else
++				r = 0;
++
++			if (!r)
++				kvm->arch.enable_pmu = pmu_enable;
+ 		}
+ 		mutex_unlock(&kvm->lock);
+ 		break;
+@@ -12917,7 +12944,14 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
+ 	kvm->arch.apic_bus_cycle_ns = APIC_BUS_CYCLE_NS_DEFAULT;
+ 	kvm->arch.guest_can_read_msr_platform_info = true;
+-	kvm->arch.enable_pmu = enable_pmu;
++
++	/*
++	 * PMU virtualization is opt-in when mediated PMU support is enabled.
++	 * KVM_CAP_PMU_CAPABILITY ioctl must be called explicitly to enable
++	 * mediated vPMU. For legacy perf-based vPMU, its behavior isn't changed,
++	 * KVM_CAP_PMU_CAPABILITY ioctl is optional.
++	 */
++	kvm->arch.enable_pmu = enable_pmu && !enable_mediated_pmu;
+ 
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	spin_lock_init(&kvm->arch.hv_root_tdp_lock);
+@@ -13057,6 +13091,8 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 		__x86_set_memory_region(kvm, TSS_PRIVATE_MEMSLOT, 0, 0);
+ 		mutex_unlock(&kvm->slots_lock);
+ 	}
++	if (kvm->arch.enable_pmu && enable_mediated_pmu)
++		perf_put_mediated_pmu();
+ 	kvm_destroy_vcpus(kvm);
+ 	kvm_free_msr_filter(srcu_dereference_check(kvm->arch.msr_filter, &kvm->srcu, 1));
+ 	kvm_pic_destroy(kvm);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 3364462ce386..76bc842aa4b2 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -426,6 +426,7 @@ extern struct kvm_caps kvm_caps;
+ extern struct kvm_host_values kvm_host;
+ 
+ extern bool enable_pmu;
++extern bool enable_mediated_pmu;
+ 
+ /*
+  * Get a filtered version of KVM's supported XCR0 that strips out dynamic
+-- 
+2.43.0
+

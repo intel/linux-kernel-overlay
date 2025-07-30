@@ -1,0 +1,85 @@
+From 482bd7f0c9d45a09db9d4623499af2644ae37c3b Mon Sep 17 00:00:00 2001
+From: Mingwei Zhang <mizhang@google.com>
+Date: Thu, 24 Oct 2024 08:12:45 +0000
+Subject: [PATCH 39/44] perf/x86: Forbid PMI handler when guest own PMU
+
+If a guest PMI is delivered after VM-exit, the KVM maskable interrupt will
+be held pending until EFLAGS.IF is set. In the meantime, if the logical
+processor receives an NMI for any reason at all, perf_event_nmi_handler()
+will be invoked. If there is any active perf event anywhere on the system,
+x86_pmu_handle_irq() will be invoked, and it will clear
+IA32_PERF_GLOBAL_STATUS. By the time KVM's PMI handler is invoked, it will
+be a mystery which counter(s) overflowed.
+
+When LVTPC is using KVM PMI vecotr, PMU is owned by guest, Host NMI let
+x86_pmu_handle_irq() run, x86_pmu_handle_irq() restore PMU vector to NMI
+and clear IA32_PERF_GLOBAL_STATUS, this breaks guest vPMU passthrough
+environment.
+
+So modify perf_event_nmi_handler() to check perf_in_guest per cpu variable,
+and if so, to simply return without calling x86_pmu_handle_irq().
+
+Suggested-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Mingwei Zhang <mizhang@google.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/core.c | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index c36859ddcaf5..9bed026fb0b6 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -55,6 +55,8 @@ DEFINE_PER_CPU(struct cpu_hw_events, cpu_hw_events) = {
+ 	.pmu = &pmu,
+ };
+ 
++static DEFINE_PER_CPU(bool, pmi_vector_is_nmi) = true;
++
+ DEFINE_STATIC_KEY_FALSE(rdpmc_never_available_key);
+ DEFINE_STATIC_KEY_FALSE(rdpmc_always_available_key);
+ DEFINE_STATIC_KEY_FALSE(perf_is_hybrid);
+@@ -1863,6 +1865,24 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ 	u64 finish_clock;
+ 	int ret;
+ 
++	/*
++	 * When guest pmu context is loaded this handler should be forbidden from
++	 * running, the reasons are:
++	 * 1. After perf_guest_enter() is called, and before cpu enter into
++	 *    non-root mode, host non-PMI NMI could happen, but x86_pmu_handle_irq()
++	 *    restore PMU to use NMI vector, which destroy KVM PMI vector setting.
++	 * 2. When VM is running, host non-PMI NMI causes VM exit, KVM will
++	 *    call host NMI handler (vmx_vcpu_enter_exit()) first before KVM save
++	 *    guest PMU context (kvm_pmu_put_guest_context()), as x86_pmu_handle_irq()
++	 *    clear global_status MSR which has guest status now, then this destroy
++	 *    guest PMU status.
++	 * 3. After VM exit, but before KVM save guest PMU context, host non-PMI NMI
++	 *    could happen, x86_pmu_handle_irq() clear global_status MSR which has
++	 *    guest status now, then this destroy guest PMU status.
++	 */
++	if (!this_cpu_read(pmi_vector_is_nmi))
++		return NMI_DONE;
++
+ 	/*
+ 	 * All PMUs/events that share this PMI handler should make sure to
+ 	 * increment active_events for their events.
+@@ -2810,10 +2830,13 @@ static void x86_pmu_switch_guest_ctx(bool enter, void *data)
+ {
+ 	u32 guest_lvtpc = *(u32 *)data;
+ 
+-	if (enter)
++	if (enter) {
+ 		apic_write(APIC_LVTPC, guest_lvtpc);
+-	else
++		this_cpu_write(pmi_vector_is_nmi, false);
++	} else {
+ 		apic_write(APIC_LVTPC, APIC_DM_NMI);
++		this_cpu_write(pmi_vector_is_nmi, true);
++	}
+ }
+ 
+ static struct pmu pmu = {
+-- 
+2.43.0
+
