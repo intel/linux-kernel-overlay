@@ -1,0 +1,193 @@
+From ce2eab87a869484c268c2bebdd634ff07c45eb47 Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Tue, 3 Jun 2025 16:54:37 -0700
+Subject: [PATCH 13/27] drm/xe/vf: Store the GuC FW info in guc->fw
+
+The GuC compatibility version that we read from the CSS header in
+native/PF and the GuC VF version that we get when a VF handshakes with
+the GuC are the same version number, so we should store it into the same
+structure. This makes all the checks based on the compatibility version
+automatically work for VFs without having to copy the value over.
+
+For completion, also copy the wanted version and set the path to a known
+string to indicate that the FW is PF-loaded. This way all the info will
+be coherent when dumped from debugfs.
+
+v2: several code cleanups and style changes (Michal), rebase on
+bootstrap changes.
+
+v3: s/min/wanted/, clarify that handshake must happen before we can get
+the VF versions (Michal)
+
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Lukasz Laguna <lukasz.laguna@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+---
+ drivers/gpu/drm/xe/xe_gt_sriov_vf.c       | 33 ++++++++++++++++++--
+ drivers/gpu/drm/xe/xe_gt_sriov_vf.h       |  4 +++
+ drivers/gpu/drm/xe/xe_gt_sriov_vf_types.h |  2 ++
+ drivers/gpu/drm/xe/xe_uc_fw.c             | 37 ++++++++++++++++++-----
+ 4 files changed, 66 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_vf.c b/drivers/gpu/drm/xe/xe_gt_sriov_vf.c
+index 632ae6b33d3d..1fcc73043c05 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_vf.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_vf.c
+@@ -173,6 +173,9 @@ static int vf_handshake_with_guc(struct xe_gt *gt)
+ 	} else {
+ 		vf_wanted_guc_version(gt, &wanted);
+ 		xe_gt_assert(gt, wanted.major != GUC_VERSION_MAJOR_ANY);
++
++		/* First time we handshake, so record the minimum wanted */
++		gt->sriov.vf.wanted_guc_version = wanted;
+ 	}
+ 
+ 	err = guc_action_match_version(guc, &wanted, guc_version);
+@@ -265,6 +268,31 @@ int xe_gt_sriov_vf_bootstrap(struct xe_gt *gt)
+ 	return 0;
+ }
+ 
++/**
++ * xe_gt_sriov_vf_guc_versions - Minimum required and found GuC ABI versions
++ * @gt: the &xe_gt
++ * @wanted: pointer to the xe_uc_fw_version to be filled with the wanted version
++ * @found: pointer to the xe_uc_fw_version to be filled with the found version
++ *
++ * This function is for VF use only and it can only be used after successful
++ * version handshake with the GuC.
++ */
++void xe_gt_sriov_vf_guc_versions(struct xe_gt *gt,
++				 struct xe_uc_fw_version *wanted,
++				 struct xe_uc_fw_version *found)
++{
++	xe_gt_assert(gt, IS_SRIOV_VF(gt_to_xe(gt)));
++	xe_gt_assert(gt, gt->sriov.vf.guc_version.major);
++
++	if (wanted)
++		*wanted =  gt->sriov.vf.wanted_guc_version;
++
++	if (found)
++		*found = gt->sriov.vf.guc_version;
++
++	return;
++}
++
+ static int guc_action_vf_notify_resfix_done(struct xe_guc *guc)
+ {
+ 	u32 request[GUC_HXG_REQUEST_MSG_MIN_LEN] = {
+@@ -1048,6 +1076,7 @@ void xe_gt_sriov_vf_print_runtime(struct xe_gt *gt, struct drm_printer *p)
+ void xe_gt_sriov_vf_print_version(struct xe_gt *gt, struct drm_printer *p)
+ {
+ 	struct xe_uc_fw_version *guc_version = &gt->sriov.vf.guc_version;
++	struct xe_uc_fw_version *wanted = &gt->sriov.vf.wanted_guc_version;
+ 	struct xe_gt_sriov_vf_relay_version *pf_version = &gt->sriov.vf.pf_version;
+ 	struct xe_uc_fw_version ver;
+ 
+@@ -1058,8 +1087,8 @@ void xe_gt_sriov_vf_print_version(struct xe_gt *gt, struct drm_printer *p)
+ 	vf_minimum_guc_version(gt, &ver);
+ 	drm_printf(p, "\tbase:\t%u.%u.%u.*\n", ver.branch, ver.major, ver.minor);
+ 
+-	vf_wanted_guc_version(gt, &ver);
+-	drm_printf(p, "\twanted:\t%u.%u.%u.*\n", ver.branch, ver.major, ver.minor);
++	drm_printf(p, "\twanted:\t%u.%u.%u.*\n",
++		   wanted->branch, wanted->major, wanted->minor);
+ 
+ 	drm_printf(p, "\thandshake:\t%u.%u.%u.%u\n",
+ 		   guc_version->branch, guc_version->major,
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_vf.h b/drivers/gpu/drm/xe/xe_gt_sriov_vf.h
+index 6250fe774d89..e0357f341a2d 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_vf.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_vf.h
+@@ -11,9 +11,13 @@
+ struct drm_printer;
+ struct xe_gt;
+ struct xe_reg;
++struct xe_uc_fw_version;
+ 
+ int xe_gt_sriov_vf_reset(struct xe_gt *gt);
+ int xe_gt_sriov_vf_bootstrap(struct xe_gt *gt);
++void xe_gt_sriov_vf_guc_versions(struct xe_gt *gt,
++				 struct xe_uc_fw_version *wanted,
++				 struct xe_uc_fw_version *found);
+ int xe_gt_sriov_vf_query_config(struct xe_gt *gt);
+ int xe_gt_sriov_vf_connect(struct xe_gt *gt);
+ int xe_gt_sriov_vf_query_runtime(struct xe_gt *gt);
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_vf_types.h b/drivers/gpu/drm/xe/xe_gt_sriov_vf_types.h
+index d614acbe0b5f..ef041679e9d4 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_vf_types.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_vf_types.h
+@@ -60,6 +60,8 @@ struct xe_gt_sriov_vf_runtime {
+  * struct xe_gt_sriov_vf - GT level VF virtualization data.
+  */
+ struct xe_gt_sriov_vf {
++	/** @wanted_guc_version: minimum wanted GuC ABI version. */
++	struct xe_uc_fw_version wanted_guc_version;
+ 	/** @guc_version: negotiated GuC ABI version. */
+ 	struct xe_uc_fw_version guc_version;
+ 	/** @self_config: resource configurations. */
+diff --git a/drivers/gpu/drm/xe/xe_uc_fw.c b/drivers/gpu/drm/xe/xe_uc_fw.c
+index 7e1908a80fc4..515d2ec4f639 100644
+--- a/drivers/gpu/drm/xe/xe_uc_fw.c
++++ b/drivers/gpu/drm/xe/xe_uc_fw.c
+@@ -16,6 +16,7 @@
+ #include "xe_gsc.h"
+ #include "xe_gt.h"
+ #include "xe_gt_printk.h"
++#include "xe_gt_sriov_vf.h"
+ #include "xe_guc.h"
+ #include "xe_map.h"
+ #include "xe_mmio.h"
+@@ -664,6 +665,33 @@ do { \
+ 			  ver_->major, ver_->minor, ver_->patch); \
+ } while (0)
+ 
++static void uc_fw_vf_override(struct xe_uc_fw *uc_fw)
++{
++	struct xe_uc_fw_version *compat = &uc_fw->versions.found[XE_UC_FW_VER_COMPATIBILITY];
++	struct xe_uc_fw_version *wanted = &uc_fw->versions.wanted;
++
++	/* Only GuC/HuC are supported */
++	if (uc_fw->type != XE_UC_FW_TYPE_GUC && uc_fw->type != XE_UC_FW_TYPE_HUC)
++		uc_fw->path = NULL;
++
++	/* VF will support only firmwares that driver can autoselect */
++	xe_uc_fw_change_status(uc_fw, uc_fw->path ?
++			       XE_UC_FIRMWARE_PRELOADED :
++			       XE_UC_FIRMWARE_NOT_SUPPORTED);
++
++	if (!xe_uc_fw_is_supported(uc_fw))
++		return;
++
++	/* PF is doing the loading, so we don't need a path on the VF */
++	uc_fw->path = "Loaded by PF";
++
++	/* The GuC versions are set up during the VF bootstrap */
++	if (uc_fw->type == XE_UC_FW_TYPE_GUC) {
++		uc_fw->versions.wanted_type = XE_UC_FW_VER_COMPATIBILITY;
++		xe_gt_sriov_vf_guc_versions(uc_fw_to_gt(uc_fw), wanted, compat);
++	}
++}
++
+ static int uc_fw_request(struct xe_uc_fw *uc_fw, const struct firmware **firmware_p)
+ {
+ 	struct xe_device *xe = uc_fw_to_xe(uc_fw);
+@@ -683,14 +711,7 @@ static int uc_fw_request(struct xe_uc_fw *uc_fw, const struct firmware **firmwar
+ 	uc_fw_auto_select(xe, uc_fw);
+ 
+ 	if (IS_SRIOV_VF(xe)) {
+-		/* Only GuC/HuC are supported */
+-		if (uc_fw->type != XE_UC_FW_TYPE_GUC &&
+-		    uc_fw->type != XE_UC_FW_TYPE_HUC)
+-			uc_fw->path = NULL;
+-		/* VF will support only firmwares that driver can autoselect */
+-		xe_uc_fw_change_status(uc_fw, uc_fw->path ?
+-				       XE_UC_FIRMWARE_PRELOADED :
+-				       XE_UC_FIRMWARE_NOT_SUPPORTED);
++		uc_fw_vf_override(uc_fw);
+ 		return 0;
+ 	}
+ 
+-- 
+2.43.0
+

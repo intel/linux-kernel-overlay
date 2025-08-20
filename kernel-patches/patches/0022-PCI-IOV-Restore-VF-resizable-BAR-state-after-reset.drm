@@ -1,0 +1,156 @@
+From 6139a3c118f692a11bf76060e4b4a30986ddb588 Mon Sep 17 00:00:00 2001
+From: "Kooran Paul, Princy" <princy.kooran.paul@intel.com>
+Date: Fri, 15 Aug 2025 12:30:54 +0800
+Subject: [PATCH 22/27] PCI/IOV: Restore VF resizable BAR state after reset
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Similar to regular resizable BAR, VF BAR can also be resized, e.g. by
+the system firmware or the PCI subsystem itself.
+
+The capability layout is the same as PCI_EXT_CAP_ID_REBAR.
+
+Add the capability ID and restore it as a part of IOV state.
+
+See PCIe r6.2, sec 7.8.7.
+
+Signed-off-by: Michał Winiarski <michal.winiarski@intel.com>
+Reviewed-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/pci/iov.c             | 30 +++++++++++++++++++++++++++++-
+ drivers/pci/pci.h             | 12 ++++++++++++
+ include/uapi/linux/pci_regs.h |  9 +++++++++
+ 3 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/iov.c b/drivers/pci/iov.c
+index 10693b5d7eb6..10ccef8afe14 100644
+--- a/drivers/pci/iov.c
++++ b/drivers/pci/iov.c
+@@ -7,6 +7,7 @@
+  * Copyright (C) 2009 Intel Corporation, Yu Zhao <yu.zhao@intel.com>
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/export.h>
+@@ -850,6 +851,7 @@ static int sriov_init(struct pci_dev *dev, int pos)
+ 	pci_read_config_byte(dev, pos + PCI_SRIOV_FUNC_LINK, &iov->link);
+ 	if (pci_pcie_type(dev) == PCI_EXP_TYPE_RC_END)
+ 		iov->link = PCI_DEVFN(PCI_SLOT(dev->devfn), iov->link);
++	iov->vf_rebar_cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_VF_REBAR);
+ 
+ 	if (pdev)
+ 		iov->dev = pci_dev_get(pdev);
+@@ -888,6 +890,30 @@ static void sriov_release(struct pci_dev *dev)
+ 	dev->sriov = NULL;
+ }
+ 
++static void sriov_restore_vf_rebar_state(struct pci_dev *dev)
++{
++	unsigned int pos, nbars, i;
++	u32 ctrl;
++
++	pos = pci_iov_vf_rebar_cap(dev);
++	if (!pos)
++		return;
++
++	pci_read_config_dword(dev, pos + PCI_VF_REBAR_CTRL, &ctrl);
++	nbars = FIELD_GET(PCI_VF_REBAR_CTRL_NBAR_MASK, ctrl);
++
++	for (i = 0; i < nbars; i++, pos += 8) {
++		int bar_idx, size;
++
++		pci_read_config_dword(dev, pos + PCI_VF_REBAR_CTRL, &ctrl);
++		bar_idx = FIELD_GET(PCI_VF_REBAR_CTRL_BAR_IDX, ctrl);
++		size = pci_rebar_bytes_to_size(dev->sriov->barsz[bar_idx]);
++		ctrl &= ~PCI_VF_REBAR_CTRL_BAR_SIZE;
++		ctrl |= FIELD_PREP(PCI_VF_REBAR_CTRL_BAR_SIZE, size);
++		pci_write_config_dword(dev, pos + PCI_VF_REBAR_CTRL, ctrl);
++	}
++}
++
+ static void sriov_restore_state(struct pci_dev *dev)
+ {
+ 	int i;
+@@ -1047,8 +1073,10 @@ resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno)
+  */
+ void pci_restore_iov_state(struct pci_dev *dev)
+ {
+-	if (dev->is_physfn)
++	if (dev->is_physfn) {
++		sriov_restore_vf_rebar_state(dev);
+ 		sriov_restore_state(dev);
++	}
+ }
+ 
+ /**
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index 12215ee72afb..69258c445b28 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -486,6 +486,7 @@ struct pci_sriov {
+ 	u16		subsystem_vendor; /* VF subsystem vendor */
+ 	u16		subsystem_device; /* VF subsystem device */
+ 	resource_size_t	barsz[PCI_SRIOV_NUM_BARS];	/* VF BAR size */
++	u16		vf_rebar_cap;	/* VF Resizable BAR capability offset */
+ 	bool		drivers_autoprobe; /* Auto probing of VFs by driver */
+ };
+ 
+@@ -710,6 +711,13 @@ void pci_iov_update_resource(struct pci_dev *dev, int resno);
+ resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno);
+ void pci_restore_iov_state(struct pci_dev *dev);
+ int pci_iov_bus_range(struct pci_bus *bus);
++static inline u16 pci_iov_vf_rebar_cap(struct pci_dev *dev)
++{
++	if (!dev->is_physfn)
++		return 0;
++
++	return dev->sriov->vf_rebar_cap;
++}
+ static inline bool pci_resource_is_iov(int resno)
+ {
+ 	return resno >= PCI_IOV_RESOURCES && resno <= PCI_IOV_RESOURCE_END;
+@@ -734,6 +742,10 @@ static inline int pci_iov_bus_range(struct pci_bus *bus)
+ {
+ 	return 0;
+ }
++static inline u16 pci_iov_vf_rebar_cap(struct pci_dev *dev)
++{
++	return 0;
++}
+ static inline bool pci_resource_is_iov(int resno)
+ {
+ 	return false;
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index a3a3e942dedf..f5b17745de60 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -745,6 +745,7 @@
+ #define PCI_EXT_CAP_ID_L1SS	0x1E	/* L1 PM Substates */
+ #define PCI_EXT_CAP_ID_PTM	0x1F	/* Precision Time Measurement */
+ #define PCI_EXT_CAP_ID_DVSEC	0x23	/* Designated Vendor-Specific */
++#define PCI_EXT_CAP_ID_VF_REBAR 0x24	/* VF Resizable BAR */
+ #define PCI_EXT_CAP_ID_DLF	0x25	/* Data Link Feature */
+ #define PCI_EXT_CAP_ID_PL_16GT	0x26	/* Physical Layer 16.0 GT/s */
+ #define PCI_EXT_CAP_ID_NPEM	0x29	/* Native PCIe Enclosure Management */
+@@ -1141,6 +1142,14 @@
+ #define PCI_DVSEC_HEADER2		0x8 /* Designated Vendor-Specific Header2 */
+ #define  PCI_DVSEC_HEADER2_ID(x)		((x) & 0xffff)
+ 
++/* VF Resizable BARs, same layout as PCI_REBAR */
++#define PCI_VF_REBAR_CAP	PCI_REBAR_CAP
++#define  PCI_VF_REBAR_CAP_SIZES		PCI_REBAR_CAP_SIZES
++#define PCI_VF_REBAR_CTRL	PCI_REBAR_CTRL
++#define  PCI_VF_REBAR_CTRL_BAR_IDX	PCI_REBAR_CTRL_BAR_IDX
++#define  PCI_VF_REBAR_CTRL_NBAR_MASK	PCI_REBAR_CTRL_NBAR_MASK
++#define  PCI_VF_REBAR_CTRL_BAR_SIZE	PCI_REBAR_CTRL_BAR_SIZE
++
+ /* Data Link Feature */
+ #define PCI_DLF_CAP		0x04	/* Capabilities Register */
+ #define  PCI_DLF_EXCHANGE_ENABLE	0x80000000  /* Data Link Feature Exchange Enable */
+-- 
+2.43.0
+
