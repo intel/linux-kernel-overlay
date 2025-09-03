@@ -1,10 +1,10 @@
 #!/bin/bash -x
 # Global configurations which are used to build kernel overlay
 
-KVERSION=
-KPATCHLEVEL=
-KSUBLEVEL=
-KEXTRAVERSION=
+KVERSION=6
+KPATCHLEVEL=17
+KSUBLEVEL=0
+KEXTRAVERSION=-rc3
 KRTV=
 
 KSRC_MIRROR=
