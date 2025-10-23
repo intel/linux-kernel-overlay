@@ -1,7 +1,7 @@
-From adf4b9b46405758f3311009ff199119debcd8533 Mon Sep 17 00:00:00 2001
+From 5bdce02f216d9519ec9615248ff5363811fbac2c Mon Sep 17 00:00:00 2001
 From: Jarkko Nikula <jarkko.nikula@linux.intel.com>
-Date: Fri, 15 Aug 2025 13:36:42 +0300
-Subject: [PATCH 12/16] i3c: master: Add helpers for DMA mapping and bounce
+Date: Fri, 22 Aug 2025 13:56:27 +0300
+Subject: [PATCH 02/11] i3c: master: Add helpers for DMA mapping and bounce
  buffer handling
 
 Some I3C controllers such as MIPI I3C HCI may pad the last DWORD (32-bit)
@@ -21,13 +21,16 @@ Helper i3c_master_dma_unmap_single() does the needed cleanups and
 data copying from the bounce buffer.
 
 Signed-off-by: Jarkko Nikula <jarkko.nikula@linux.intel.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://lore.kernel.org/r/20250822105630.2820009-2-jarkko.nikula@linux.intel.com
+Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
 ---
- drivers/i3c/master.c       | 69 ++++++++++++++++++++++++++++++++++++++
+ drivers/i3c/master.c       | 74 ++++++++++++++++++++++++++++++++++++++
  include/linux/i3c/master.h | 26 ++++++++++++++
- 2 files changed, 95 insertions(+)
+ 2 files changed, 100 insertions(+)
 
 diff --git a/drivers/i3c/master.c b/drivers/i3c/master.c
-index 2ef898a8fd80..497bff57248a 100644
+index 2ef898a8fd80..033d06cabca2 100644
 --- a/drivers/i3c/master.c
 +++ b/drivers/i3c/master.c
 @@ -8,6 +8,7 @@
@@ -38,7 +41,7 @@ index 2ef898a8fd80..497bff57248a 100644
  #include <linux/err.h>
  #include <linux/export.h>
  #include <linux/kernel.h>
-@@ -1727,6 +1728,74 @@ int i3c_master_do_daa(struct i3c_master_controller *master)
+@@ -1727,6 +1728,79 @@ int i3c_master_do_daa(struct i3c_master_controller *master)
  }
  EXPORT_SYMBOL_GPL(i3c_master_do_daa);
  
@@ -47,7 +50,8 @@ index 2ef898a8fd80..497bff57248a 100644
 + * @dev: device object of a device doing DMA
 + * @buf: destination/source buffer for DMA
 + * @len: length of transfer
-+ * @need_bounce: true if buffer is not DMA safe and need a bounce buffer
++ * @force_bounce: true, force to use a bounce buffer,
++ *                false, function will auto check is a bounce buffer required
 + * @dir: DMA direction
 + *
 + * Map buffer for a DMA transfer and allocate a bounce buffer if required.
@@ -55,7 +59,7 @@ index 2ef898a8fd80..497bff57248a 100644
 + * Return: I3C DMA transfer descriptor or NULL in case of error.
 + */
 +struct i3c_dma *i3c_master_dma_map_single(struct device *dev, void *buf,
-+	size_t len, bool need_bounce, enum dma_data_direction dir)
++	size_t len, bool force_bounce, enum dma_data_direction dir)
 +{
 +	struct i3c_dma *dma_xfer __free(kfree) = NULL;
 +	void *bounce __free(kfree) = NULL;
@@ -64,6 +68,7 @@ index 2ef898a8fd80..497bff57248a 100644
 +	dma_xfer = kzalloc(sizeof(*dma_xfer), GFP_KERNEL);
 +	if (!dma_xfer)
 +		return NULL;
++
 +	dma_xfer->dev = dev;
 +	dma_xfer->buf = buf;
 +	dma_xfer->dir = dir;
@@ -71,9 +76,9 @@ index 2ef898a8fd80..497bff57248a 100644
 +	dma_xfer->map_len = len;
 +
 +	if (is_vmalloc_addr(buf))
-+		need_bounce = true;
++		force_bounce = true;
 +
-+	if (need_bounce) {
++	if (force_bounce) {
 +		dma_xfer->map_len = ALIGN(len, cache_line_size());
 +		if (dir == DMA_FROM_DEVICE)
 +			bounce = kzalloc(dma_xfer->map_len, GFP_KERNEL);
@@ -101,12 +106,15 @@ index 2ef898a8fd80..497bff57248a 100644
 + */
 +void i3c_master_dma_unmap_single(struct i3c_dma *dma_xfer)
 +{
-+	struct i3c_dma *d __free(kfree) = dma_xfer;
-+	void *bounce __free(kfree) = d->bounce_buf;
-+
-+	dma_unmap_single(d->dev, d->addr, d->map_len, d->dir);
-+	if (bounce && d->dir == DMA_FROM_DEVICE)
-+		memcpy(d->buf, bounce, d->len);
++	dma_unmap_single(dma_xfer->dev, dma_xfer->addr,
++			 dma_xfer->map_len, dma_xfer->dir);
++	if (dma_xfer->bounce_buf) {
++		if (dma_xfer->dir == DMA_FROM_DEVICE)
++			memcpy(dma_xfer->buf, dma_xfer->bounce_buf,
++			       dma_xfer->len);
++		kfree(dma_xfer->bounce_buf);
++	}
++	kfree(dma_xfer);
 +}
 +EXPORT_SYMBOL_GPL(i3c_master_dma_unmap_single);
 +
@@ -114,7 +122,7 @@ index 2ef898a8fd80..497bff57248a 100644
   * i3c_master_set_info() - set master device information
   * @master: master used to send frames on the bus
 diff --git a/include/linux/i3c/master.h b/include/linux/i3c/master.h
-index 043f5c7ff398..80a621034ad0 100644
+index 043f5c7ff398..c52a82dd79a6 100644
 --- a/include/linux/i3c/master.h
 +++ b/include/linux/i3c/master.h
 @@ -558,6 +558,26 @@ struct i3c_master_controller {
@@ -149,7 +157,7 @@ index 043f5c7ff398..80a621034ad0 100644
  				  u8 addr);
  int i3c_master_do_daa(struct i3c_master_controller *master);
 +struct i3c_dma *i3c_master_dma_map_single(struct device *dev, void *ptr,
-+					  size_t len, bool dma_safe,
++					  size_t len, bool force_bounce,
 +					  enum dma_data_direction dir);
 +void i3c_master_dma_unmap_single(struct i3c_dma *dma_xfer);
 +DEFINE_FREE(i3c_master_dma_unmap_single, void *,
