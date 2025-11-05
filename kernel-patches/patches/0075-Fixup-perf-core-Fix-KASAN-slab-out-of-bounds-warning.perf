@@ -1,0 +1,201 @@
+From b3e8fb20dcc7611a0cc59f81c84fe81c47131666 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Mon, 20 Oct 2025 17:21:50 +0800
+Subject: [PATCH 75/76] Fixup! perf/core: Fix KASAN slab-out-of-bounds warning
+
+For SIMD registers, PMI or PEBS sampling doesn't always return the
+required number and width, e.g., require to sample YMM registers but
+only XMM registers are sampled as XSAVE's limitition.
+
+Thus enhance perf_simd_reg_check() function to update the real sampled
+SIMD registers mask and vector width.
+
+Fixes: d244eb67a95b ("perf: Support SIMD registers")
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/core.c      | 11 +++++------
+ arch/x86/kernel/perf_regs.c | 36 ++++++++++++++++--------------------
+ include/linux/perf_regs.h   | 17 +++++++----------
+ kernel/events/core.c        | 26 +++++++++++++++-----------
+ 4 files changed, 43 insertions(+), 47 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 5b1ca0427370..04f5289eb173 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1840,13 +1840,12 @@ x86_pmu_update_ext_regs_size(struct perf_event_attr *attr,
+ {
+ 	u16 pred_qwords = attr->sample_simd_pred_reg_qwords;
+ 	u16 vec_qwords = attr->sample_simd_vec_reg_qwords;
+-	u16 nr_pred = hweight16(pred_mask);
+-	u16 nr_vectors = hweight64(mask);
++	u64 pred_bitmap = pred_mask;
++	u64 bitmap = mask;
+ 
+-	perf_simd_reg_check(regs, ignore,
+-			    mask, &nr_vectors, &vec_qwords,
+-			    pred_mask, &nr_pred, &pred_qwords);
+-	data->dyn_size += (nr_vectors * vec_qwords + nr_pred * pred_qwords) * sizeof(u64);
++	perf_simd_reg_check(regs, &bitmap, &vec_qwords, &pred_bitmap, &pred_qwords);
++	data->dyn_size += (hweight64(bitmap) * vec_qwords +
++			   hweight64(pred_bitmap) * pred_qwords) * sizeof(u64);
+ }
+ 
+ static void x86_pmu_setup_basic_regs_data(struct perf_event *event,
+diff --git a/arch/x86/kernel/perf_regs.c b/arch/x86/kernel/perf_regs.c
+index 6a61cdbc1cd4..01027a16c8d3 100644
+--- a/arch/x86/kernel/perf_regs.c
++++ b/arch/x86/kernel/perf_regs.c
+@@ -57,35 +57,31 @@ static unsigned int pt_regs_offset[PERF_REG_X86_MAX] = {
+ #endif
+ };
+ 
+-void perf_simd_reg_check(struct pt_regs *regs, u64 ignore,
+-			 u64 mask, u16 *nr_vectors, u16 *vec_qwords,
+-			 u16 pred_mask, u16 *nr_pred, u16 *pred_qwords)
++void perf_simd_reg_check(struct pt_regs *regs, u64 *mask, u16 *vec_qwords,
++			 u64 *pred_mask, u16 *pred_qwords)
+ {
+ 	struct x86_perf_regs *perf_regs = container_of(regs, struct x86_perf_regs, regs);
+ 
+-	if (!(ignore & XFEATURE_MASK_SSE) &&
+-	    *vec_qwords >= PERF_X86_XMM_QWORDS &&
+-	    !perf_regs->xmm_regs)
+-		*nr_vectors = 0;
++	if (*vec_qwords >= PERF_X86_XMM_QWORDS && !perf_regs->xmm_regs)
++		*mask = 0;
+ 
+-	if (!(ignore & XFEATURE_MASK_YMM) &&
+-	    *vec_qwords >= PERF_X86_YMM_QWORDS &&
+-	    !perf_regs->ymmh_regs)
++	if (*vec_qwords >= PERF_X86_YMM_QWORDS && !perf_regs->ymmh_regs) {
++		*mask = BIT_ULL(PERF_X86_SIMD_XMM_REGS) - 1;
+ 		*vec_qwords = PERF_X86_XMM_QWORDS;
++	}
+ 
+-	if (!(ignore & XFEATURE_MASK_ZMM_Hi256) &&
+-	    *vec_qwords >= PERF_X86_ZMM_QWORDS &&
+-	    !perf_regs->zmmh_regs)
++	if (*vec_qwords >= PERF_X86_ZMM_QWORDS && !perf_regs->zmmh_regs) {
++		*mask = BIT_ULL(PERF_X86_SIMD_YMM_REGS) - 1;
+ 		*vec_qwords = PERF_X86_YMM_QWORDS;
++	}
+ 
+-	if (!(ignore & XFEATURE_MASK_Hi16_ZMM) &&
+-	    *nr_vectors > PERF_X86_H16ZMM_BASE &&
+-	    !perf_regs->h16zmm_regs)
+-		*nr_vectors = PERF_X86_H16ZMM_BASE;
++	if (hweight64(*mask) > PERF_X86_H16ZMM_BASE && !perf_regs->h16zmm_regs) {
++		*mask = BIT_ULL(PERF_X86_SIMD_ZMMH_REGS) - 1;
++		*vec_qwords = PERF_X86_ZMM_QWORDS;
++	}
+ 
+-	if (!(ignore & XFEATURE_MASK_OPMASK) &&
+-	    *nr_pred && !perf_regs->opmask_regs)
+-		*nr_pred = 0;
++	if (*pred_mask && !perf_regs->opmask_regs)
++		*pred_mask = 0;
+ }
+ 
+ u64 perf_reg_value(struct pt_regs *regs, int idx)
+diff --git a/include/linux/perf_regs.h b/include/linux/perf_regs.h
+index 11d198cbb33a..261fe4c6eb30 100644
+--- a/include/linux/perf_regs.h
++++ b/include/linux/perf_regs.h
+@@ -17,22 +17,19 @@ u64 perf_simd_reg_value(struct pt_regs *regs, int idx,
+  * Check and update the configuration of the requested SIMD registers
+  *
+  * regs: Used to locate the SIMD registers
+- * ignore: A mask to ignore the check of some configuration
+  * mask: The requested vector mask
+- * nr_vectors: Number of the vector registers
+  * vec_qwords: The QWORD of the vector registers
+  * pred_mask: The requested predicate mask
+- * nr_pred: Number of the predicate registers
+  * pred_qwords: The QWORD of the predicate registers
+  *
+- * It's possible (e.g., ARM) that the number and width of the dumped
+- * SIMD registers are a little different from the request.
+- * The function is to calculate the real number and width before dumping
+- * the data.
++ * It's possible that the mask and width of the really sampled
++ * SIMD registers are different from the request mask and width, e.g.,
++ * user requires to sample YMM registers (x86) but only XMM registers
++ * are sampled as the XSAVE's configuration. The function is to
++ * calculate the real mask and width before dumping the data.
+  */
+-void perf_simd_reg_check(struct pt_regs *regs, u64 ignore,
+-			 u64 mask, u16 *nr_vectors, u16 *vec_qwords,
+-			 u16 pred_mask, u16 *nr_pred, u16 *pred_qwords);
++void perf_simd_reg_check(struct pt_regs *regs, u64 *mask, u16 *vec_qwords,
++			 u64 *pred_mask, u16 *pred_qwords);
+ 
+ 
+ #ifdef CONFIG_HAVE_PERF_REGS
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index b2ba51719827..ba0e786428fc 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7733,15 +7733,18 @@ perf_output_sample_simd_regs(struct perf_output_handle *handle,
+ {
+ 	u16 pred_qwords = event->attr.sample_simd_pred_reg_qwords;
+ 	u16 vec_qwords = event->attr.sample_simd_vec_reg_qwords;
+-	u16 nr_pred = hweight16(pred_mask);
+-	u16 nr_vectors = hweight64(mask);
++	u64 pred_bitmap = pred_mask;
++	u64 bitmap = mask;
++	u16 nr_vectors;
++	u16 nr_pred;
+ 	int bit;
+ 	u64 val;
+ 	u16 i;
+ 
+ 	/* Get the number of available regs */
+-	perf_simd_reg_check(regs, 0, mask, &nr_vectors, &vec_qwords,
+-			    pred_mask, &nr_pred, &pred_qwords);
++	perf_simd_reg_check(regs, &bitmap, &vec_qwords, &pred_bitmap, &pred_qwords);
++	nr_vectors = hweight64(bitmap);
++	nr_pred = hweight64(pred_bitmap);
+ 
+ 	perf_output_put(handle, nr_vectors);
+ 	perf_output_put(handle, vec_qwords);
+@@ -7749,7 +7752,8 @@ perf_output_sample_simd_regs(struct perf_output_handle *handle,
+ 	perf_output_put(handle, pred_qwords);
+ 
+ 	if (nr_vectors) {
+-		for_each_set_bit(bit, (unsigned long *)&mask, sizeof(mask) * BITS_PER_BYTE) {
++		for_each_set_bit(bit, (unsigned long *)&bitmap,
++				 sizeof(bitmap) * BITS_PER_BYTE) {
+ 			for (i = 0; i < vec_qwords; i++) {
+ 				val = perf_simd_reg_value(regs, bit, i, false);
+ 				perf_output_put(handle, val);
+@@ -7757,7 +7761,8 @@ perf_output_sample_simd_regs(struct perf_output_handle *handle,
+ 		}
+ 	}
+ 	if (nr_pred) {
+-		for_each_set_bit(bit, (unsigned long *)&pred_mask, sizeof(pred_mask) * BITS_PER_BYTE) {
++		for_each_set_bit(bit, (unsigned long *)&pred_bitmap,
++				 sizeof(pred_bitmap) * BITS_PER_BYTE) {
+ 			for (i = 0; i < pred_qwords; i++) {
+ 				val = perf_simd_reg_value(regs, bit, i, true);
+ 				perf_output_put(handle, val);
+@@ -7799,12 +7804,11 @@ u64 __weak perf_simd_reg_value(struct pt_regs *regs, int idx,
+ 	return 0;
+ }
+ 
+-void __weak perf_simd_reg_check(struct pt_regs *regs, u64 ignore,
+-				u64 mask, u16 *nr_vectors, u16 *vec_qwords,
+-				u16 pred_mask, u16 *nr_pred, u16 *pred_qwords)
++void __weak perf_simd_reg_check(struct pt_regs *regs, u64 *mask, u16 *vec_qwords,
++				u64 *pred_mask, u16 *pred_qwords)
+ {
+-	*nr_vectors = 0;
+-	*nr_pred = 0;
++	*mask = 0;
++	*pred_mask = 0;
+ }
+ 
+ /*
+-- 
+2.43.0
+
