@@ -1,23 +1,36 @@
-From 5e5067c6e5de75bfad5eacbd5898b18ea27c9ecd Mon Sep 17 00:00:00 2001
-From: "Pawlicki, AdamX" <adamx.pawlicki@intel.com>
-Date: Wed, 12 Feb 2025 17:02:06 +0800
-Subject: [PATCH] x86/boot/tboot: Add TPR support
+From 0ce1a92c53175748350c54b86f63fccc66d37491 Mon Sep 17 00:00:00 2001
+From: Adam Pawlicki <adamx.pawlicki@intel.com>
+Date: Thu, 13 Nov 2025 10:32:40 +0100
+Subject: [PATCH] Add updated TPR (TXT Protected Regions) support to kernel.
 
-Signed-off-by: Pawlicki, AdamX <adamx.pawlicki@intel.com>
-Signed-off-by: Lili Li <lili.li@intel.com>
+This commit applies a TPR-support patch from Tboot Live Image project.
+Its intent is to make kernel aware of the TPR memory and to disable
+it before proceeding with system boot so that kernel can establish its
+own DMA protection.
+
+Signed-off-by: AdamX Pawlicki <adamx.pawlicki@intel.com>
+Signed-off-by: Mateusz Mowka <mateusz.mowka@intel.com>
 ---
- arch/x86/kernel/tboot.c     | 106 +++++++++++++++++++++++++++++++++++-
+ arch/x86/kernel/tboot.c     | 109 +++++++++++++++++++++++++++++++++++-
  drivers/iommu/intel/dmar.c  |   8 +++
  drivers/iommu/intel/iommu.c |   7 ++-
- include/acpi/actbl1.h       |  85 +++++++++++++++++++++++++++++
+ include/acpi/actbl1.h       |  86 ++++++++++++++++++++++++++++
  include/linux/tboot.h       |   6 ++
- 5 files changed, 210 insertions(+), 2 deletions(-)
+ 5 files changed, 214 insertions(+), 2 deletions(-)
 
 diff --git a/arch/x86/kernel/tboot.c b/arch/x86/kernel/tboot.c
-index 46b8f1f16676..88095f3ef987 100644
+index 46b8f1f16676..04929aba6a5c 100644
 --- a/arch/x86/kernel/tboot.c
 +++ b/arch/x86/kernel/tboot.c
-@@ -453,8 +453,14 @@ struct sha1_hash {
+@@ -18,6 +18,7 @@
+ #include <linux/mm.h>
+ #include <linux/tboot.h>
+ #include <linux/debugfs.h>
++#include <linux/printk.h>
+ 
+ #include <asm/realmode.h>
+ #include <asm/processor.h>
+@@ -453,8 +454,14 @@ struct sha1_hash {
  	u8 hash[SHA1_SIZE];
  };
  
@@ -33,7 +46,7 @@ index 46b8f1f16676..88095f3ef987 100644
  	struct sha1_hash  bios_acm_id;
  	u32               edx_senter_flags;
  	u64               mseg_valid;
-@@ -469,8 +475,18 @@ struct sinit_mle_data {
+@@ -469,8 +476,18 @@ struct sinit_mle_data {
  	u32               mdrs_off;
  	u32               num_vtd_dmars;
  	u32               vtd_dmars_off;
@@ -52,7 +65,7 @@ index 46b8f1f16676..88095f3ef987 100644
  struct acpi_table_header *tboot_get_dmar_table(struct acpi_table_header *dmar_tbl)
  {
  	void *heap_base, *heap_ptr, *config;
-@@ -514,3 +530,91 @@ struct acpi_table_header *tboot_get_dmar_table(struct acpi_table_header *dmar_tb
+@@ -514,3 +531,93 @@ struct acpi_table_header *tboot_get_dmar_table(struct acpi_table_header *dmar_tb
  
  	return dmar_tbl;
  }
@@ -63,6 +76,7 @@ index 46b8f1f16676..88095f3ef987 100644
 +	struct sinit_mle_data *sinit_mle;
 +	struct heap_ext_data_elt *elt;
 +	u64 sinit_mle_size;
++
 +	if (!tboot_enabled())
 +		return NULL;
 +	/*
@@ -95,16 +109,14 @@ index 46b8f1f16676..88095f3ef987 100644
 +	heap_ptr += sizeof(u64);
 +
 +	sinit_mle = (struct sinit_mle_data *)heap_ptr;
-+	if (sinit_mle->version < 9) {
++	if (sinit_mle->version < 9)
 +		return NULL;
-+	}
 +
 +	elt = sinit_mle->ext_data_elts;
 +	while (elt->type != HEAP_EXTDATA_TYPE_DTPR) {
 +		elt = (void *)elt + elt->size;
-+		if ((u64)elt > (u64)sinit_mle + sinit_mle_size) {
++		if ((u64)elt > (u64)sinit_mle + sinit_mle_size)
 +			return NULL;
-+		}
 +	}
 +	return (struct acpi_table_dtpr *)elt->data;
 +}
@@ -112,29 +124,32 @@ index 46b8f1f16676..88095f3ef987 100644
 +static bool tboot_tpr_enabled;
 +void tboot_parse_dtpr_table(void)
 +{
-+	struct acpi_table_dtpr *dtpr; //header plus 4 bajty flag
-+	struct acpi_dtpr_instance *tpr_inst; //flagi count + array
++	struct acpi_table_dtpr *dtpr;
++	struct acpi_dtpr_instance *tpr_inst;
 +	u32 *instance_cnt;
 +	u32 i, j;
++
 +	if (!tboot_enabled())
 +		return;
 +	dtpr = tboot_get_dtpr_table();
-+	if (dtpr == NULL) {
++	if (dtpr == NULL)
 +		return;
-+	}
 +	tboot_tpr_enabled = 1;
 +	instance_cnt = (u32 *)(dtpr + 1);
 +	tpr_inst = (struct acpi_dtpr_instance *)(instance_cnt + 1);
 +	for (i = 0; i < *instance_cnt; ++i) {
 +		for (j = 0; j < tpr_inst->tpr_cnt; ++j) {
 +			uint64_t *base = ioremap(tpr_inst->tpr_array[j].base, 16);
++
 +			if (base != NULL) {
-+				printk("TPR instance %d, TPR %d:base %x limit %x\n", i, j, readl(base), readl(base + 1));
++				pr_info("TPR instance %d, TPR %d:base %llx limit %llx\n",
++					   i, j, readq(base), readq(base + 1));
 +				*base |= (1 << 4);
 +				iounmap(base);
 +			}
 +		}
-+		tpr_inst += sizeof(*tpr_inst) + j*sizeof(*(tpr_inst->tpr_array));
++		tpr_inst = (struct acpi_dtpr_instance *)((u8 *)tpr_inst
++		 + sizeof(*tpr_inst) + j*sizeof(*(tpr_inst->tpr_array)));
 +	}
 +	if (tboot_tpr_enabled)
 +		pr_debug("TPR protection detected, PMR will be disabled\n");
@@ -196,7 +211,7 @@ index e236c7ec221f..5847fb589c89 100644
  				iommu_disable_protect_mem_regions(iommu);
  		}
 diff --git a/include/acpi/actbl1.h b/include/acpi/actbl1.h
-index 7f35eb0e8458..135e9de13593 100644
+index 7f35eb0e8458..c77b0890970c 100644
 --- a/include/acpi/actbl1.h
 +++ b/include/acpi/actbl1.h
 @@ -47,6 +47,7 @@
@@ -207,7 +222,7 @@ index 7f35eb0e8458..135e9de13593 100644
  
  #define ACPI_SIG_S3PT           "S3PT"	/* S3 Performance (sub)Table */
  #define ACPI_SIG_PCCS           "PCC"	/* PCC Shared Memory Region */
-@@ -1973,6 +1974,90 @@ struct acpi_ibft_target {
+@@ -1973,6 +1974,91 @@ struct acpi_ibft_target {
  	u16 reverse_chap_secret_offset;
  };
  
@@ -243,17 +258,18 @@ index 7f35eb0e8458..135e9de13593 100644
 + * be with 1MB resolution. These bits are compared with the result of the
 + * TPRn_LIMIT[63:20] * applied to the incoming address, to determine if an
 + * access fall within the TPRn defined region.
-+******************************************************************************/
++ ******************************************************************************/
 +struct acpi_dtprn_base_reg {
 +	u64 reserved0 : 3;
 +	u64 rw : 1; // access: 1 == RO, 0 == RW (for TPR must be RW)
 +	u64 enable : 1; // 0 == range enabled, 1 == range disabled
 +	u64 reserved1 : 15;
-+	u64 tpr_base_rw : 44; // Minimal TPRn_Base resolution is 1MB.
-+						  // Applied to the incoming address, to determine if an access
-+						  // fall within the TPRn defined region.
-+						  // Width is determined by a bus width which can be obtained
-+						  // via CPUID function 0x80000008.
++	// Minimal TPRn_Base resolution is 1MB.
++	// Applied to the incoming address, to determine if an access
++	// fall within the TPRn defined region.
++	// Width is determined by a bus width which can be obtained
++	// via CPUID function 0x80000008.
++	u64 tpr_base_rw : 44;
 +	//u64 unused : 1;
 +};
 +
@@ -264,17 +280,17 @@ index 7f35eb0e8458..135e9de13593 100644
 + * to prohibit certain system agents from accessing memory. When an agent
 + * sends a request upstream, whether snooped or not, a TPR prevents that
 + * transaction from changing the state of memory.
-+******************************************************************************/
++ ******************************************************************************/
 +
 +struct acpi_dtprn_limit_reg {
 +	u64 reserved0 : 3;
 +	u64 rw : 1; // access: 1 == RO, 0 == RW (for TPR must be RW)
 +	u64 enable : 1; // 0 == range enabled, 1 == range disabled
 +	u64 reserved1 : 15;
-+	u64 tpr_limit_rw : 44; // Minimal TPRn_Limit resolution is 1MB.
-+						   // These bits define TPR limit address.
-+						   // Width is determined by a bus width.
-+
++	// Minimal TPRn_Limit resolution is 1MB.
++	// These bits define TPR limit address.
++	// Width is determined by a bus width.
++	u64 tpr_limit_rw : 44;
 +	//u64 unused : 1;
 +};
 +
@@ -284,13 +300,13 @@ index 7f35eb0e8458..135e9de13593 100644
 + * This register is used to request serialization of non-coherent DMA
 + * transactions. OS shall  issue it before changing of TPR settings
 + * (base / size).
-+******************************************************************************/
++ ******************************************************************************/
 +
 +struct acpi_tpr_serialize_request {
 +	u64 sts : 1; // Status of serialization request (RO)
-+		     // 0 == register idle, 1 == serialization in progress
++				// 0 == register idle, 1 == serialization in progress
 +	u64 ctrl : 1; // Control field to initiate serialization (RW)
-+		      // 0 == normal, 1 == initialize serialization
++				// 0 == normal, 1 == initialize serialization
 +				  // (self-clear to allow multiple serialization requests)
 +	u64 unused : 62;
 +};
