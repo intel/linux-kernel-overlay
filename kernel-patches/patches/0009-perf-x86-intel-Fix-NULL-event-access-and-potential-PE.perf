@@ -1,0 +1,143 @@
+From 7796cb3a6bbbdd6f4c142a7304ec4a96ff7c2ecc Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Tue, 26 Aug 2025 13:28:17 +0800
+Subject: [PATCH 09/76] perf/x86/intel: Fix NULL event access and potential
+ PEBS record loss
+
+When intel_pmu_drain_pebs_icl() is called to drain PEBS records, the
+perf_event_overflow() could be called to process the last PEBS record.
+
+While perf_event_overflow() could trigger the interrupt throttle and
+stop all events of the group, like what the below call-chain shows.
+
+perf_event_overflow()
+  -> __perf_event_overflow()
+    ->__perf_event_account_interrupt()
+      -> perf_event_throttle_group()
+        -> perf_event_throttle()
+          -> event->pmu->stop()
+            -> x86_pmu_stop()
+
+The side effect of stopping the events is that all corresponding event
+pointers in cpuc->events[] array are cleared to NULL.
+
+Assume there are two PEBS events (event a and event b) in a group. When
+intel_pmu_drain_pebs_icl() calls perf_event_overflow() to process the
+last PEBS record of PEBS event a, interrupt throttle is triggered and
+all pointers of event a and event b are cleared to NULL. Then
+intel_pmu_drain_pebs_icl() tries to process the last PEBS record of
+event b and encounters NULL pointer access.
+
+To avoid this NULL event access and potential PEBS record loss, snapshot
+cpuc->events[] into a local events[] before drian_pebs() helper calling
+perf_event_overflow() and then use the local events[] to process the
+left PEBS records.
+
+Besides intel_pmu_drain_pebs_nhm() has similar issue and fix it as well.
+
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202507042103.a15d2923-lkp@intel.com
+Fixes: 9734e25fbf5a ("perf: Fix the throttle logic for a group")
+Suggested-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/intel/ds.c | 36 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index c0b7ac1c7594..259a0ff807eb 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -2487,6 +2487,7 @@ static void intel_pmu_pebs_event_update_no_drain(struct cpu_hw_events *cpuc, u64
+ 
+ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs, struct perf_sample_data *data)
+ {
++	struct perf_event *events[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {NULL};
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 	struct debug_store *ds = cpuc->ds;
+ 	struct perf_event *event;
+@@ -2526,9 +2527,11 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs, struct perf_sample_d
+ 
+ 		/* PEBS v3 has more accurate status bits */
+ 		if (x86_pmu.intel_cap.pebs_format >= 3) {
+-			for_each_set_bit(bit, (unsigned long *)&pebs_status, size)
++			for_each_set_bit(bit, (unsigned long *)&pebs_status, size) {
+ 				counts[bit]++;
+-
++				if (counts[bit] && !events[bit])
++					events[bit] = cpuc->events[bit];
++			}
+ 			continue;
+ 		}
+ 
+@@ -2566,19 +2569,31 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs, struct perf_sample_d
+ 		 * If collision happened, the record will be dropped.
+ 		 */
+ 		if (pebs_status != (1ULL << bit)) {
+-			for_each_set_bit(i, (unsigned long *)&pebs_status, size)
++			for_each_set_bit(i, (unsigned long *)&pebs_status, size) {
+ 				error[i]++;
++				if (error[i] && !events[i])
++					events[i] = cpuc->events[i];
++			}
+ 			continue;
+ 		}
+ 
+ 		counts[bit]++;
++		/*
++		 * perf_event_overflow() called by below __intel_pmu_pebs_events()
++		 * could trigger interrupt throttle and clear all event pointers of
++		 * the group in cpuc->events[] to NULL. So snapshot the event[] before
++		 * it could be cleared. This avoids the possible NULL event pointer
++		 * access and PEBS record loss.
++		 */
++		if (counts[bit] && !events[bit])
++			events[bit] = cpuc->events[bit];
+ 	}
+ 
+ 	for_each_set_bit(bit, (unsigned long *)&mask, size) {
+ 		if ((counts[bit] == 0) && (error[bit] == 0))
+ 			continue;
+ 
+-		event = cpuc->events[bit];
++		event = events[bit];
+ 		if (WARN_ON_ONCE(!event))
+ 			continue;
+ 
+@@ -2603,6 +2618,7 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs, struct perf_sample_d
+ 
+ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_data *data)
+ {
++	struct perf_event *events[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {NULL};
+ 	short counts[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};
+ 	void *last[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS];
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+@@ -2655,6 +2671,16 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
+ 						       setup_pebs_adaptive_sample_data);
+ 			}
+ 			last[bit] = at;
++
++			/*
++			 * perf_event_overflow() called by below __intel_pmu_pebs_last_event()
++			 * could trigger interrupt throttle and clear all event pointers of
++			 * the group in cpuc->events[] to NULL. So snapshot the event[] before
++			 * it could be cleared. This avoids the possible NULL event pointer
++			 * access and PEBS record loss.
++			 */
++			if (counts[bit] && !events[bit])
++				events[bit] = cpuc->events[bit];
+ 		}
+ 	}
+ 
+@@ -2662,7 +2688,7 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
+ 		if (!counts[bit])
+ 			continue;
+ 
+-		event = cpuc->events[bit];
++		event = events[bit];
+ 
+ 		__intel_pmu_pebs_last_event(event, iregs, regs, data, last[bit],
+ 					    counts[bit], setup_pebs_adaptive_sample_data);
+-- 
+2.43.0
+

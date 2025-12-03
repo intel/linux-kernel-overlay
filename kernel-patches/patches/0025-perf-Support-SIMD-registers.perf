@@ -1,0 +1,362 @@
+From a1109c5b5cadc04c5a0ea1ff1d5b6fd1f9588013 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 9 Sep 2025 14:04:48 -0700
+Subject: [PATCH 25/76] perf: Support SIMD registers
+
+The users may be interested in the SIMD registers in a sample while
+profiling. The current sample_regs_XXX doesn't have enough space for all
+SIMD registers.
+
+Add sets of the sample_simd_{pred,vec}_reg_* in the
+struct perf_event_attr to define a set of SIMD registers to dump on
+samples.
+The current X86 supports the XMM registers in sample_regs_XXX. To
+utilize the new SIMD registers configuration method, the
+sample_simd_regs_enabled should always be set. If so, the XMM space in
+the sample_regs_XXX is reserved for other usage.
+
+The SIMD registers are wider than 64. A new output format is introduced.
+The number and width of SIMD registers will be dumped first, following
+the register values. The number and width are the same as the user's
+configuration now. If, for some reason (e.g., ARM) they are different,
+an ARCH-specific perf_output_sample_simd_regs can be implemented later
+separately.
+Add a new ABI, PERF_SAMPLE_REGS_ABI_SIMD, to indicate the new format.
+The enum perf_sample_regs_abi becomes a bitmap now. There should be no
+impact on the existing tool, since the version and bitmap are the same
+for 1 and 2.
+
+Add three new __weak functions:
+perf_simd_reg_value: Retrieve the value of the request SIMD register.
+perf_simd_reg_validate: Validate the configuration of the SIMD
+registers.
+perf_simd_reg_check: Check and update the configuration of the requested
+SIMD registers.
+
+Add a new flag PERF_PMU_CAP_SIMD_REGS to indicate that the PMU has the
+capability to support SIMD registers dumping. Error out if the
+sample_simd_{pred,vec}_reg_* mistakenly set for a PMU that doesn't have
+the capability.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ include/linux/perf_event.h      |   8 +++
+ include/linux/perf_regs.h       |  26 ++++++++
+ include/uapi/linux/perf_event.h |  45 ++++++++++++--
+ kernel/events/core.c            | 101 +++++++++++++++++++++++++++++++-
+ 4 files changed, 173 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 1a647a1e6d08..8e995e6a4319 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -305,6 +305,7 @@ struct perf_event_pmu_context;
+ #define PERF_PMU_CAP_EXTENDED_HW_TYPE	0x0100
+ #define PERF_PMU_CAP_AUX_PAUSE		0x0200
+ #define PERF_PMU_CAP_AUX_PREFER_LARGE	0x0400
++#define PERF_PMU_CAP_SIMD_REGS		0x0800
+ 
+ /**
+  * pmu::scope
+@@ -1526,6 +1527,13 @@ perf_event__output_id_sample(struct perf_event *event,
+ extern void
+ perf_log_lost_samples(struct perf_event *event, u64 lost);
+ 
++static inline bool event_has_simd_regs(struct perf_event *event)
++{
++	struct perf_event_attr *attr = &event->attr;
++
++	return attr->sample_simd_regs_enabled != 0;
++}
++
+ static inline bool event_has_extended_regs(struct perf_event *event)
+ {
+ 	struct perf_event_attr *attr = &event->attr;
+diff --git a/include/linux/perf_regs.h b/include/linux/perf_regs.h
+index f632c5725f16..11d198cbb33a 100644
+--- a/include/linux/perf_regs.h
++++ b/include/linux/perf_regs.h
+@@ -9,6 +9,32 @@ struct perf_regs {
+ 	struct pt_regs	*regs;
+ };
+ 
++int perf_simd_reg_validate(u16 vec_qwords, u64 vec_mask,
++			   u16 pred_qwords, u32 pred_mask);
++u64 perf_simd_reg_value(struct pt_regs *regs, int idx,
++			u16 qwords_idx, bool pred);
++/*
++ * Check and update the configuration of the requested SIMD registers
++ *
++ * regs: Used to locate the SIMD registers
++ * ignore: A mask to ignore the check of some configuration
++ * mask: The requested vector mask
++ * nr_vectors: Number of the vector registers
++ * vec_qwords: The QWORD of the vector registers
++ * pred_mask: The requested predicate mask
++ * nr_pred: Number of the predicate registers
++ * pred_qwords: The QWORD of the predicate registers
++ *
++ * It's possible (e.g., ARM) that the number and width of the dumped
++ * SIMD registers are a little different from the request.
++ * The function is to calculate the real number and width before dumping
++ * the data.
++ */
++void perf_simd_reg_check(struct pt_regs *regs, u64 ignore,
++			 u64 mask, u16 *nr_vectors, u16 *vec_qwords,
++			 u16 pred_mask, u16 *nr_pred, u16 *pred_qwords);
++
++
+ #ifdef CONFIG_HAVE_PERF_REGS
+ #include <asm/perf_regs.h>
+ 
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 78a362b80027..e69bc3b7a815 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -314,8 +314,9 @@ enum {
+  */
+ enum perf_sample_regs_abi {
+ 	PERF_SAMPLE_REGS_ABI_NONE		= 0,
+-	PERF_SAMPLE_REGS_ABI_32			= 1,
+-	PERF_SAMPLE_REGS_ABI_64			= 2,
++	PERF_SAMPLE_REGS_ABI_32			= (1 << 0),
++	PERF_SAMPLE_REGS_ABI_64			= (1 << 1),
++	PERF_SAMPLE_REGS_ABI_SIMD		= (1 << 2),
+ };
+ 
+ /*
+@@ -382,6 +383,7 @@ enum perf_event_read_format {
+ #define PERF_ATTR_SIZE_VER6			120	/* Add: aux_sample_size */
+ #define PERF_ATTR_SIZE_VER7			128	/* Add: sig_data */
+ #define PERF_ATTR_SIZE_VER8			136	/* Add: config3 */
++#define PERF_ATTR_SIZE_VER9			168	/* Add: sample_simd_{pred,vec}_reg_* */
+ 
+ /*
+  * 'struct perf_event_attr' contains various attributes that define
+@@ -543,6 +545,25 @@ struct perf_event_attr {
+ 	__u64	sig_data;
+ 
+ 	__u64	config3; /* extension of config2 */
++
++
++	/*
++	 * Defines set of SIMD registers to dump on samples.
++	 * The sample_simd_regs_enabled !=0 implies the
++	 * set of SIMD registers is used to config all SIMD registers.
++	 * If !sample_simd_regs_enabled, sample_regs_XXX may be used to
++	 * config some SIMD registers on X86.
++	 */
++	union {
++		__u16 sample_simd_regs_enabled;
++		__u16 sample_simd_pred_reg_qwords;
++	};
++	__u32 sample_simd_pred_reg_intr;
++	__u32 sample_simd_pred_reg_user;
++	__u16 sample_simd_vec_reg_qwords;
++	__u64 sample_simd_vec_reg_intr;
++	__u64 sample_simd_vec_reg_user;
++	__u32 __reserved_4;
+ };
+ 
+ /*
+@@ -1016,7 +1037,15 @@ enum perf_event_type {
+ 	 *      } && PERF_SAMPLE_BRANCH_STACK
+ 	 *
+ 	 *	{ u64			abi; # enum perf_sample_regs_abi
+-	 *	  u64			regs[weight(mask)]; } && PERF_SAMPLE_REGS_USER
++	 *	  u64			regs[weight(mask)];
++	 *	  struct {
++	 *		u16 nr_vectors;
++	 *		u16 vector_qwords;
++	 *		u16 nr_pred;
++	 *		u16 pred_qwords;
++	 *		u64 data[nr_vectors * vector_qwords + nr_pred * pred_qwords];
++	 *	  } && (abi & PERF_SAMPLE_REGS_ABI_SIMD)
++	 *	} && PERF_SAMPLE_REGS_USER
+ 	 *
+ 	 *	{ u64			size;
+ 	 *	  char			data[size];
+@@ -1043,7 +1072,15 @@ enum perf_event_type {
+ 	 *	{ u64			data_src; } && PERF_SAMPLE_DATA_SRC
+ 	 *	{ u64			transaction; } && PERF_SAMPLE_TRANSACTION
+ 	 *	{ u64			abi; # enum perf_sample_regs_abi
+-	 *	  u64			regs[weight(mask)]; } && PERF_SAMPLE_REGS_INTR
++	 *	  u64			regs[weight(mask)];
++	 *	  struct {
++	 *		u16 nr_vectors;
++	 *		u16 vector_qwords;
++	 *		u16 nr_pred;
++	 *		u16 pred_qwords;
++	 *		u64 data[nr_vectors * vector_qwords + nr_pred * pred_qwords];
++	 *	  } && (abi & PERF_SAMPLE_REGS_ABI_SIMD)
++	 *	} && PERF_SAMPLE_REGS_INTR
+ 	 *	{ u64			phys_addr;} && PERF_SAMPLE_PHYS_ADDR
+ 	 *	{ u64			cgroup;} && PERF_SAMPLE_CGROUP
+ 	 *	{ u64			data_page_size;} && PERF_SAMPLE_DATA_PAGE_SIZE
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 68ea03065c15..9c79b5789588 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7446,6 +7446,47 @@ perf_output_sample_regs(struct perf_output_handle *handle,
+ 	}
+ }
+ 
++static void
++perf_output_sample_simd_regs(struct perf_output_handle *handle,
++			     struct perf_event *event,
++			     struct pt_regs *regs,
++			     u64 mask, u16 pred_mask)
++{
++	u16 pred_qwords = event->attr.sample_simd_pred_reg_qwords;
++	u16 vec_qwords = event->attr.sample_simd_vec_reg_qwords;
++	u16 nr_pred = hweight16(pred_mask);
++	u16 nr_vectors = hweight64(mask);
++	int bit;
++	u64 val;
++	u16 i;
++
++	/* Get the number of available regs */
++	perf_simd_reg_check(regs, 0, mask, &nr_vectors, &vec_qwords,
++			    pred_mask, &nr_pred, &pred_qwords);
++
++	perf_output_put(handle, nr_vectors);
++	perf_output_put(handle, vec_qwords);
++	perf_output_put(handle, nr_pred);
++	perf_output_put(handle, pred_qwords);
++
++	if (nr_vectors) {
++		for_each_set_bit(bit, (unsigned long *)&mask, sizeof(mask) * BITS_PER_BYTE) {
++			for (i = 0; i < vec_qwords; i++) {
++				val = perf_simd_reg_value(regs, bit, i, false);
++				perf_output_put(handle, val);
++			}
++		}
++	}
++	if (nr_pred) {
++		for_each_set_bit(bit, (unsigned long *)&pred_mask, sizeof(pred_mask) * BITS_PER_BYTE) {
++			for (i = 0; i < pred_qwords; i++) {
++				val = perf_simd_reg_value(regs, bit, i, true);
++				perf_output_put(handle, val);
++			}
++		}
++	}
++}
++
+ static void perf_sample_regs_user(struct perf_regs *regs_user,
+ 				  struct pt_regs *regs)
+ {
+@@ -7467,6 +7508,25 @@ static void perf_sample_regs_intr(struct perf_regs *regs_intr,
+ 	regs_intr->abi  = perf_reg_abi(current);
+ }
+ 
++int __weak perf_simd_reg_validate(u16 vec_qwords, u64 vec_mask,
++				  u16 pred_qwords, u32 pred_mask)
++{
++	return vec_qwords || vec_mask || pred_qwords || pred_mask ? -ENOSYS : 0;
++}
++
++u64 __weak perf_simd_reg_value(struct pt_regs *regs, int idx,
++			       u16 qwords_idx, bool pred)
++{
++	return 0;
++}
++
++void __weak perf_simd_reg_check(struct pt_regs *regs, u64 ignore,
++				u64 mask, u16 *nr_vectors, u16 *vec_qwords,
++				u16 pred_mask, u16 *nr_pred, u16 *pred_qwords)
++{
++	*nr_vectors = 0;
++	*nr_pred = 0;
++}
+ 
+ /*
+  * Get remaining task size from user stack pointer.
+@@ -7999,10 +8059,17 @@ void perf_output_sample(struct perf_output_handle *handle,
+ 		perf_output_put(handle, abi);
+ 
+ 		if (abi) {
+-			u64 mask = event->attr.sample_regs_user;
++			struct perf_event_attr *attr = &event->attr;
++			u64 mask = attr->sample_regs_user;
+ 			perf_output_sample_regs(handle,
+ 						data->regs_user.regs,
+ 						mask);
++			if (abi & PERF_SAMPLE_REGS_ABI_SIMD) {
++				perf_output_sample_simd_regs(handle, event,
++							     data->regs_user.regs,
++							     attr->sample_simd_vec_reg_user,
++							     attr->sample_simd_pred_reg_user);
++			}
+ 		}
+ 	}
+ 
+@@ -8030,11 +8097,18 @@ void perf_output_sample(struct perf_output_handle *handle,
+ 		perf_output_put(handle, abi);
+ 
+ 		if (abi) {
+-			u64 mask = event->attr.sample_regs_intr;
++			struct perf_event_attr *attr = &event->attr;
++			u64 mask = attr->sample_regs_intr;
+ 
+ 			perf_output_sample_regs(handle,
+ 						data->regs_intr.regs,
+ 						mask);
++			if (abi & PERF_SAMPLE_REGS_ABI_SIMD) {
++				perf_output_sample_simd_regs(handle, event,
++							     data->regs_intr.regs,
++							     attr->sample_simd_vec_reg_intr,
++							     attr->sample_simd_pred_reg_intr);
++			}
+ 		}
+ 	}
+ 
+@@ -12604,6 +12678,12 @@ static int perf_try_init_event(struct pmu *pmu, struct perf_event *event)
+ 	if (ret)
+ 		goto err_pmu;
+ 
++	if (!(pmu->capabilities & PERF_PMU_CAP_SIMD_REGS) &&
++	    event_has_simd_regs(event)) {
++		ret = -EOPNOTSUPP;
++		goto err_destroy;
++	}
++
+ 	if (!(pmu->capabilities & PERF_PMU_CAP_EXTENDED_REGS) &&
+ 	    event_has_extended_regs(event)) {
+ 		ret = -EOPNOTSUPP;
+@@ -13145,6 +13225,12 @@ static int perf_copy_attr(struct perf_event_attr __user *uattr,
+ 		ret = perf_reg_validate(attr->sample_regs_user);
+ 		if (ret)
+ 			return ret;
++		ret = perf_simd_reg_validate(attr->sample_simd_vec_reg_qwords,
++					     attr->sample_simd_vec_reg_user,
++					     attr->sample_simd_pred_reg_qwords,
++					     attr->sample_simd_pred_reg_user);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (attr->sample_type & PERF_SAMPLE_STACK_USER) {
+@@ -13165,8 +13251,17 @@ static int perf_copy_attr(struct perf_event_attr __user *uattr,
+ 	if (!attr->sample_max_stack)
+ 		attr->sample_max_stack = sysctl_perf_event_max_stack;
+ 
+-	if (attr->sample_type & PERF_SAMPLE_REGS_INTR)
++	if (attr->sample_type & PERF_SAMPLE_REGS_INTR) {
+ 		ret = perf_reg_validate(attr->sample_regs_intr);
++		if (ret)
++			return ret;
++		ret = perf_simd_reg_validate(attr->sample_simd_vec_reg_qwords,
++					     attr->sample_simd_vec_reg_intr,
++					     attr->sample_simd_pred_reg_qwords,
++					     attr->sample_simd_pred_reg_intr);
++		if (ret)
++			return ret;
++	}
+ 
+ #ifndef CONFIG_CGROUP_PERF
+ 	if (attr->sample_type & PERF_SAMPLE_CGROUP)
+-- 
+2.43.0
+

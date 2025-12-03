@@ -1,0 +1,124 @@
+From 40e97a32741d73d25e19a4d4b5ee56608e36a61a Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@linux.intel.com>
+Date: Tue, 9 Sep 2025 14:04:44 -0700
+Subject: [PATCH 21/76] perf/x86: Setup the regs data
+
+The current code relies on the generic code to setup the regs data.
+It will not work well when there are more regs introduced.
+Introduce a X86-specific x86_pmu_setup_regs_data().
+Now, it's the same as the generic code. More X86-specific codes will be
+added later when the new regs.
+
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/core.c       | 32 ++++++++++++++++++++++++++++++++
+ arch/x86/events/intel/ds.c   | 11 +++++++----
+ arch/x86/events/perf_event.h |  4 ++++
+ 3 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 9f4a4e4f572f..d973294e234e 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1693,6 +1693,38 @@ static void x86_pmu_del(struct perf_event *event, int flags)
+ 	static_call_cond(x86_pmu_del)(event);
+ }
+ 
++void x86_pmu_setup_regs_data(struct perf_event *event,
++			     struct perf_sample_data *data,
++			     struct pt_regs *regs)
++{
++	u64 sample_type = event->attr.sample_type;
++
++	if (sample_type & PERF_SAMPLE_REGS_USER) {
++		if (user_mode(regs)) {
++			data->regs_user.abi = perf_reg_abi(current);
++			data->regs_user.regs = regs;
++		} else if (!(current->flags & PF_KTHREAD)) {
++			perf_get_regs_user(&data->regs_user, regs);
++		} else {
++			data->regs_user.abi = PERF_SAMPLE_REGS_ABI_NONE;
++			data->regs_user.regs = NULL;
++		}
++		data->dyn_size += sizeof(u64);
++		if (data->regs_user.regs)
++			data->dyn_size += hweight64(event->attr.sample_regs_user) * sizeof(u64);
++		data->sample_flags |= PERF_SAMPLE_REGS_USER;
++	}
++
++	if (sample_type & PERF_SAMPLE_REGS_INTR) {
++		data->regs_intr.regs = regs;
++		data->regs_intr.abi = perf_reg_abi(current);
++		data->dyn_size += sizeof(u64);
++		if (data->regs_intr.regs)
++			data->dyn_size += hweight64(event->attr.sample_regs_intr) * sizeof(u64);
++		data->sample_flags |= PERF_SAMPLE_REGS_INTR;
++	}
++}
++
+ int x86_pmu_handle_irq(struct pt_regs *regs)
+ {
+ 	struct perf_sample_data data;
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 3dedf7a0acf6..e63b882f12a7 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -2180,6 +2180,7 @@ static inline void __setup_pebs_basic_group(struct perf_event *event,
+ }
+ 
+ static inline void __setup_pebs_gpr_group(struct perf_event *event,
++					  struct perf_sample_data *data,
+ 					  struct pt_regs *regs,
+ 					  struct pebs_gprs *gprs,
+ 					  u64 sample_type)
+@@ -2189,8 +2190,10 @@ static inline void __setup_pebs_gpr_group(struct perf_event *event,
+ 		regs->flags &= ~PERF_EFLAGS_EXACT;
+ 	}
+ 
+-	if (sample_type & (PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER))
++	if (sample_type & (PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER)) {
+ 		adaptive_pebs_save_regs(regs, gprs);
++		x86_pmu_setup_regs_data(event, data, regs);
++	}
+ }
+ 
+ static inline void __setup_pebs_meminfo_group(struct perf_event *event,
+@@ -2283,7 +2286,7 @@ static void setup_pebs_adaptive_sample_data(struct perf_event *event,
+ 		gprs = next_record;
+ 		next_record = gprs + 1;
+ 
+-		__setup_pebs_gpr_group(event, regs, gprs, sample_type);
++		__setup_pebs_gpr_group(event, data, regs, gprs, sample_type);
+ 	}
+ 
+ 	if (format_group & PEBS_DATACFG_MEMINFO) {
+@@ -2406,8 +2409,8 @@ static void setup_arch_pebs_sample_data(struct perf_event *event,
+ 		gprs = next_record;
+ 		next_record = gprs + 1;
+ 
+-		__setup_pebs_gpr_group(event, regs, (struct pebs_gprs *)gprs,
+-				       sample_type);
++		__setup_pebs_gpr_group(event, data, regs,
++				      (struct pebs_gprs *)gprs, sample_type);
+ 	}
+ 
+ 	if (header->aux) {
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 3161ec0a3416..80e52e937638 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -1294,6 +1294,10 @@ void x86_pmu_enable_event(struct perf_event *event);
+ 
+ int x86_pmu_handle_irq(struct pt_regs *regs);
+ 
++void x86_pmu_setup_regs_data(struct perf_event *event,
++			     struct perf_sample_data *data,
++			     struct pt_regs *regs);
++
+ void x86_pmu_show_pmu_cap(struct pmu *pmu);
+ 
+ static inline int x86_pmu_num_counters(struct pmu *pmu)
+-- 
+2.43.0
+
