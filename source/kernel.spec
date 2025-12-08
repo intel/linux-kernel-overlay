@@ -1,24 +1,21 @@
 Summary:        Linux Kernel
 Name:           kernel
-Version:        6.12.33
-Release:        1%{?dist}
+Version:        6.12.44
+Release:        2%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
-URL:            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-Source0:        https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/linux-6.12.40.tar.gz
+URL:            https://www.kernel.org/pub/linux/kernel
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.44.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
 Source5:        cpupower
 Source6:        cpupower.service
 
-
 # Intel not-upstreamed kernel features
-
 # CVE Patches
-
 
 %global security_hardening none
 %global sha512hmac bash %{_sourcedir}/sha512hmac-openssl.sh
@@ -166,7 +163,9 @@ This package contains the bpftool, which allows inspection and simple
 manipulation of eBPF programs and maps.
 
 %prep
-%autosetup -p1 -n lts-v6.12.33-emt-250618T100026Z
+%define _default_patch_flags -p1 --fuzz=3 --force
+%setup -q -n linux-6.12.44
+%autosetup -p1 -n linux-6.12.44
 # %patch 0 -p1
 make mrproper
 
@@ -412,6 +411,21 @@ echo "initrd of kernel %{uname_r} removed" >&2
 %{_sysconfdir}/bash_completion.d/bpftool
 
 %changelog
+* Tue Sep 30 2025 Zhang Baoli <baoli.zhang@intel.com> -6.12.44-2
+- Fix the boot failure of ISO and raw image
+
+* Tue Sep 09 2025 Ren Jiaojiao <jiaojiaox.ren@intel.com> - 6.12.44-1
+- Update kernel to 6.12.44
+
+* Thu Jul 24 2025 Ren Jiaojiao <jiaojiaox.ren@intel.com> - 6.12.39-1
+- Update kernel to 6.12.39
+
+* Thu Jul 10 2025 Ren Jiaojiao <jiaojiaox.ren@intel.com> - 6.12.35-2
+- Update kernel to 6.12.35
+
+* Fri Jul 04 2025 Ren Jiaojiao <jiaojiaox.ren@intel.com> - 6.12.35-1
+- Update kernel to 6.12.35
+
 * Thu Jun 19 2025 Ren Jiaojiao <jiaojiaox.ren@intel.com> - 6.12.33-1
 - Update kernel to 6.12.33
 
