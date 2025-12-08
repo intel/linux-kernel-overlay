@@ -463,7 +463,6 @@ manipulation of eBPF programs and maps.
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
 %setup -q -n linux-6.17
-%setup -q -n mainline-tracking-mainline-tracking-pre-prod-v6.17-linux-251118T134731Z
 %autosetup -p1 -n linux-6.17
 # %patch 0 -p1
 make mrproper
