@@ -1,5 +1,5 @@
-Summary:        Linux Kernel
-Name:           kernel
+Summary:        Preempt RT Linux Kernel
+Name:           kernel-rt
 Version:        6.17.0
 Release:        251203T070700Z%{?dist}
 License:        GPLv2
