@@ -1,13 +1,13 @@
 Summary:        Linux Kernel
 Name:           kernel
-Version:        6.12.44
-Release:        2%{?dist}
+Version:        6.17.0
+Release:        3%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
-URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.44.tar.gz
+URL:            https://github.com/intel/mainline-tracking
+Source0:        https://github.com/intel/mainline-tracking/archive/refs/tags/mainline-tracking-pre-prod-v6.17-linux-251118T134731Z.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -164,8 +164,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.44
-%autosetup -p1 -n linux-6.12.44
+%setup -q -n mainline-tracking-mainline-tracking-pre-prod-v6.17-linux-251118T134731Z
+%autosetup -p1 -n mainline-tracking-mainline-tracking-pre-prod-v6.17-linux-251118T134731Z
 # %patch 0 -p1
 make mrproper
 
@@ -383,6 +383,7 @@ echo "initrd of kernel %{uname_r} removed" >&2
 %{_lib64dir}/libperf-jvmti.so
 %{_libdir}/libcpupower.so*
 %{_sysconfdir}/cpufreq-bench.conf
+%{_sysconfdir}/cpupower-service.conf
 %{_includedir}/cpuidle.h
 %{_includedir}/cpufreq.h
 %{_includedir}/powercap.h
@@ -396,8 +397,6 @@ echo "initrd of kernel %{uname_r} removed" >&2
 %endif
 %{_bindir}
 %{_sysconfdir}/bash_completion.d/*
-%{_datadir}/perf-core/strace/groups/file
-%{_datadir}/perf-core/strace/groups/string
 %{_docdir}/*
 %{_includedir}/perf/perf_dlfilter.h
 %{_unitdir}/cpupower.service
@@ -411,6 +410,33 @@ echo "initrd of kernel %{uname_r} removed" >&2
 %{_sysconfdir}/bash_completion.d/bpftool
 
 %changelog
+* Mon Dec 1 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-3
+- Update kernel to mainline-tracking-pre-prod-v6.17-linux-251118T134731Z
+
+* Tue Nov 25 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-2
+- Bump release version for rebase
+
+* Thu Oct 30 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-1
+- Upgate kernel to 6.17.0
+
+* Tue Nov 18 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.55-1
+- Update kernel to 6.12.55
+
+* Fri Nov 14 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-6
+- Update audio support in kernel config
+
+* Tue Nov 4 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-5
+- Update kernel config
+
+* Thu Oct 30 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-1
+- Upgate kernel to 6.17.0
+
+* Thu Oct 23 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-4
+- Revert to working kernel config
+
+* Fri Oct 10 2025 Zhang Baoli <baoli.zhang@intel.com> - 6.12.44-3
+- Fix ISO mouse detection and cmdline params in non-rt kernel
+
 * Tue Sep 30 2025 Zhang Baoli <baoli.zhang@intel.com> -6.12.44-2
 - Fix the boot failure of ISO and raw image
 

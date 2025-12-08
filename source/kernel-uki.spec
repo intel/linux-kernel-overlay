@@ -12,8 +12,8 @@
 
 Summary:        Unified Kernel Image
 Name:           kernel-uki
-Version:        6.12.44
-Release:        2%{?dist}
+Version:        6.17.0
+Release:        3%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -70,6 +70,33 @@ cp %{buildroot}/boot/vmlinuz-uki-%{kernelver}.efi %{buildroot}/boot/efi/EFI/Linu
 /boot/efi/EFI/Linux/vmlinuz-uki-%{kernelver}.efi
 
 %changelog
+* Mon Dec 1 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-3
+- Update kernel to mainline-tracking-pre-prod-v6.17-linux-251118T134731Z
+
+* Tue Nov 25 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-2
+- Bump release version for rebase
+
+* Thu Oct 30 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-1
+- Upgate kernel to 6.17.0
+
+* Fri Nov 21 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.55-1
+- Update kernel to 6.12.55
+
+* Fri Nov 14 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-6
+- Update audio support in kernel config
+
+* Tue Nov 4 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-5
+- Update kernel config
+
+* Thu Oct 30 2025 Lishan Liu <lishan.liu@intel.com> - 6.17.0-1
+- Upgate kernel to 6.17.0
+
+* Thu Oct 23 2025 Lishan Liu <lishan.liu@intel.com> - 6.12.44-4
+- Revert to working kernel config
+
+* Fri Oct 10 2025 Zhang Baoli <baoli.zhang@intel.com> - 6.12.44-3
+- Fix ISO mouse detection and cmdline params in non-rt kernel
+
 * Tue Sep 30 2025 Zhang Baoli <baoli.zhang@intel.com> - 6.12.44-2
 - Fix the boot failure of ISO and raw image
 
