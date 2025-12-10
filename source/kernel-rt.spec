@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.12.59
-Release:        251202T195146Z%{?dist}
+Version:        6.12.61
+Release:        251211T124904Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.59.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.61.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -411,15 +411,16 @@ Patch380:	0016-drm-i915-gt-Refactor-CCS-mode-handling-and-improve-app.drm
 Patch381:	0017-drm-i915-no-waiting-for-page-flip-in-vpp-case.drm
 Patch382:	0001-Remove-unneeded-files.patch
 Patch383:	0001-i915-gt-Upgrade-GuC-70.44.1-70.49.4.drm
+Patch384:	0001-drm-i915-no-force-probe-needed-for-mtl-platform.drm
 #rapl
-Patch384:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
+Patch385:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
 #misc
-Patch385:	0001-Add-security.md-file.misc
+Patch386:	0001-Add-security.md-file.misc
 #iommu
-Patch386:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
-Patch387:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
+Patch387:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
+Patch388:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
 #emt-drm
-Patch388:	0075-drm-xe-gsc-mei-interrupt-top-half-should-be-in-irq-d.patch
+Patch389:	0075-drm-xe-gsc-mei-interrupt-top-half-should-be-in-irq-d.patch
 # CVE Patches
 
 
@@ -570,8 +571,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.59
-%autosetup -p1 -n linux-6.12.59
+%setup -q -n linux-6.12.61
+%autosetup -p1 -n linux-6.12.61
 # %patch 0 -p1
 make mrproper
 
