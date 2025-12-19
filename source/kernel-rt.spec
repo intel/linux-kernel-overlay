@@ -1,7 +1,7 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
 Version:        6.17.11
-Release:        251215T020239Z%{?dist}
+Release:        251219T062114Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -268,34 +268,41 @@ Patch236: 0008-tools-bpf-Add-xdp-set-command-for-md-btf.ethernet
 Patch237: 0009-igc-Add-BTF-based-metadata-for-XDP.ethernet
 Patch238: 0010-igc-Enable-HW-RX-Timestamp-for-AF_XDP-ZC.ethernet
 Patch239: 0011-igc-Take-care-of-DMA-timestamp-rollover.ethernet
-Patch240: 0012-igc-Add-SO_TXTIME-for-AF_XDP-ZC.ethernet
-Patch241: 0013-igc-Reodering-the-empty-packet-buffers-and-descri.ethernet
-Patch242: 0014-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
-Patch243: 0015-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
-Patch244: 0016-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
-Patch245: 0017-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
-Patch246: 0018-xsk-add-txtime-field-in-xdp_desc-struct.ethernet
-Patch247: 0019-igc-fix-race-condition-in-TX-timestamp-read-for-r.ethernet
+Patch240: 0014-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
+Patch241: 0015-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
+Patch242: 0016-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
+Patch243: 0017-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
+Patch244: 0001-igc-Reduce-TSN-TX-packet-buffer-from-7KB-to-5KB-p.ethernet
+Patch245: 0001-igc-fix-race-condition-in-TX-timestamp-read-for-r.ethernet
 # audio
-Patch248: 0001-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
-Patch249: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
+Patch246: 0001-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+Patch247: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
 # rt
-Patch250: 0001-mei-gsc-add-dependency-on-Xe-driver.rt
-Patch251: 0002-drm-me-gsc-mei-interrupt-top-half-should-be-in-irq-disa.rt
+Patch248: 0001-mei-gsc-add-dependency-on-Xe-driver.rt
+Patch249: 0002-drm-me-gsc-mei-interrupt-top-half-should-be-in-irq-disa.rt
+Patch250: 0001-drm-i915-Use-preempt_disable-enable_rt-where-recommende.rt
+Patch251: 0002-drm-i915-Don-t-disable-interrupts-on-PREEMPT_RT-during-.rt
+Patch252: 0003-drm-i915-Don-t-check-for-atomic-context-on-PREEMPT_RT.rt
+Patch253: 0004-drm-i915-Disable-tracing-points-on-PREEMPT_RT.rt
+Patch254: 0005-drm-i915-gt-Use-spin_lock_irq-instead-of-local_irq_disa.rt
+Patch255: 0006-drm-i915-Drop-the-irqs_disabled-check.rt
+Patch256: 0007-drm-i915-guc-Consider-also-RCU-depth-in-busy-loop.rt
+Patch257: 0008-drm-i915-Consider-RCU-read-section-as-atomic.rt
+Patch258: 0009-Revert-drm-i915-Depend-on-PREEMPT_RT.rt
 # thermal
-Patch252: 0001-thermal-intel-int340x-Remove-redundant-acpi_has_me.thermal
-Patch253: 0002-thermal-intel-int340x-Add-support-for-power-slider.thermal
-Patch254: 0003-thermal-intel-int340x-Enable-power-slider-interfac.thermal
-Patch255: 0004-thermal-intel-int340x-Add-module-parameter-for-bal.thermal
-Patch256: 0005-thermal-intel-int340x-Add-module-parameter-to-chan.thermal
-Patch257: 0006-thermal-gov_step_wise-Clean-up-local-variable-init.thermal
-Patch258: 0007-thermal-gov_step_wise-Clarify-cooling-logic-descri.thermal
-Patch259: 0008-thermal-testing-Rearrange-variable-declarations-in.thermal
-Patch260: 0009-thermal-hwmon-replace-deprecated-strcpy-with-strsc.thermal
-Patch261: 0010-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
-Patch262: 0011-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
+Patch259: 0001-thermal-intel-int340x-Remove-redundant-acpi_has_me.thermal
+Patch260: 0002-thermal-intel-int340x-Add-support-for-power-slider.thermal
+Patch261: 0003-thermal-intel-int340x-Enable-power-slider-interfac.thermal
+Patch262: 0004-thermal-intel-int340x-Add-module-parameter-for-bal.thermal
+Patch263: 0005-thermal-intel-int340x-Add-module-parameter-to-chan.thermal
+Patch264: 0006-thermal-gov_step_wise-Clean-up-local-variable-init.thermal
+Patch265: 0007-thermal-gov_step_wise-Clarify-cooling-logic-descri.thermal
+Patch266: 0008-thermal-testing-Rearrange-variable-declarations-in.thermal
+Patch267: 0009-thermal-hwmon-replace-deprecated-strcpy-with-strsc.thermal
+Patch268: 0010-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
+Patch269: 0011-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
 # uncore-frequency
-Patch263: 0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
+Patch270: 0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
 # End of Patch section
 
 %global security_hardening none
