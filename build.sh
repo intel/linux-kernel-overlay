@@ -79,14 +79,34 @@ function build()
 	pushd "$BUILD_DIR"
 
 	echo "Building the .deb package"
+	local pkgver
+	local localver
+	local krelease
+	case "$customized_kver_string" in
+		mainline*)
+			localver="-mlt"
+			;;
+		iotg-next*)
+			localver="-next"
+			;;
+		lts*)
+			localver="-lts"
+			;;
+	esac
+	# KERNELRELEASE: <version>.<patchlevel>
+	krelease="${KVERSION}.${KPATCHLEVEL}"
+	# PKG NAME: linux-<image|headers>-<kernelrelease><localversion>
+	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>~<lts|mlt|next>[+cve]
+	pkgver="$(make kernelversion | sed 's/-/~/g')"
+	pkgver="${pkgver}-${timestamp,,}${localver/-/\~}"
+	[[ "$customized_kver_string" == *cve* ]] && pkgver="${pkgver}+cve"
 	make olddefconfig
-	KERNELRELEASE=$(make kernelversion)-${customized_kver_string}-${timestamp,,}
-	# KDEB_PKTVERSION has to start with digit, then we removed the first character (v) from KSRC_UPSTREAM_TAG
+	scripts/config --undefine LOCALVERSION
 	nice make -j"$(nproc)" bindeb-pkg \
-		LOCALVERSION= \
-		KDEB_PKGVERSION="${KSRC_UPSTREAM_TAG:1}"-"$build_id" \
-		KERNELRELEASE="$(make kernelversion)"-"${customized_kver_string}"-"${timestamp,,}" \
-		KDEB_SOURCENAME=linux-"${KERNELRELEASE}"
+		LOCALVERSION="${localver}" \
+		KERNELRELEASE="${krelease}" \
+		KDEB_PKGVERSION="${pkgver}" \
+		KDEB_SOURCENAME="${linux_kernel_tag,,}"
 
 	# Post-build action: move the config and deb package to cur_dir
 	cp .config "$cur_dir"/kernel.config
