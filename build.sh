@@ -99,7 +99,8 @@ function build()
 	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>~<lts|mlt|next>[+cve]
 	pkgver="$(make kernelversion | sed 's/-/~/g')"
 	pkgver="${pkgver}-${timestamp,,}${localver/-/\~}"
-	[[ "$customized_kver_string" == *cve* ]] && pkgver="${pkgver}+cve"
+	[ "$is_rt" = "yes" ] && pkgver="${pkgver}+rt"
+	[[ "$customized_kver_string" = *cve* ]] && pkgver="${pkgver}+cve"
 	make olddefconfig
 	scripts/config --undefine LOCALVERSION
 	nice make -j"$(nproc)" bindeb-pkg \
