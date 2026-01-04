@@ -14,9 +14,9 @@ In the kernel-config directory, there are three-level kernel configurations.
 
 	- base-os(ubuntu), 
 	- features (the .cfg file in kernel-config/features directory)
-	- kernel-config/overlay/overlay.cfg
+	- rt/rt.cfg
 
-The overlay.cfg overwrites the features configs (.cfg), and then they also
+The rt.cfg overwrites the features configs (.cfg), and then they also
 overwrite base-os kernel config.
 
 ## cmd-param
