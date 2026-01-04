@@ -39,22 +39,18 @@ function setup()
 	echo "Updating the kernel config"
 	cp "$KCFG_BASE_OS" "$BUILD_DIR"/.config
 	for cfg_file in "$KCFG_FEATURES_DIR"/*.cfg; do
-		if [[ "$cfg_file" == *rt.cfg ]]; then
-			if [ "$is_rt" = "yes"  ]; then
-				echo merging "$cfg_file"
-				./scripts/kconfig/merge_config.sh -m .config "$cfg_file"
-			fi
-		else
-			echo merging "$cfg_file"
-			./scripts/kconfig/merge_config.sh -m .config "$cfg_file"
-		fi
+		echo merging "$cfg_file"
+		./scripts/kconfig/merge_config.sh -m .config "$cfg_file"
 	done
-	./scripts/kconfig/merge_config.sh -m .config "$KCFG_OVERLAY"
 
-	# *** For RT kernel, we need to add some cmdlines to the boot options
+	# *** For RT kernel, we need to add some kernel config. furthermore, also need
+	# add rt cmdlines to the boot options.
+	#
 	# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
 	# *** After the kernel deb package is installed. cmd-params in /boot/;
 	if [ "$is_rt" = "yes"  ]; then
+		./scripts/kconfig/merge_config.sh -m .config "$KCFG_RT"
+
 		cp "$cur_dir"/cmd-params "$BUILD_DIR"
 		cat <<- EOF > insert_script_code
 	        cp cmd-params "\${pdir}/boot/cmd-params-\${KERNELRELEASE}"
@@ -147,7 +143,7 @@ cur_dir=$PWD
 KSRC_OOT_PATCHES=$cur_dir/kernel-patches/
 KCFG_BASE_OS=$cur_dir/kernel-config/$KCFG_BASE_OS
 KCFG_FEATURES_DIR=$cur_dir/kernel-config/$KCFG_FEATURES_DIR
-KCFG_OVERLAY=$cur_dir/kernel-config/$KCFG_OVERLAY
+KCFG_RT=$cur_dir/kernel-config/$KCFG_RT
 
 # Avoid the illegal value of is_rt, and set customized_kver_string if it's empty.
 if [ "$is_rt" == "yes" ]; then
