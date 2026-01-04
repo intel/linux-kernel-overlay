@@ -101,8 +101,8 @@ function build()
 	pkgver="${pkgver}-${timestamp,,}${localver/-/\~}"
 	[ "$is_rt" = "yes" ] && pkgver="${pkgver}+rt"
 	[[ "$customized_kver_string" = *cve* ]] && pkgver="${pkgver}+cve"
-	make olddefconfig
 	scripts/config --undefine LOCALVERSION
+	make olddefconfig
 	nice make -j"$(nproc)" bindeb-pkg \
 		LOCALVERSION="${localver}" \
 		KERNELRELEASE="${krelease}" \
