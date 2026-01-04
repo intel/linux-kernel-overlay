@@ -1,6 +1,7 @@
 #!/bin/bash -x
 # Global configurations which are used to build kernel overlay
 
+# shellcheck disable=SC2034
 KVERSION=6
 KPATCHLEVEL=18
 KSUBLEVEL=0
