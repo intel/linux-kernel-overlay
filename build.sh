@@ -11,7 +11,7 @@ function setup()
 {
 	# Setup the kernel source code that need be built.
 	if [ -d "$BUILD_DIR" ]; then rm -Rf "$BUILD_DIR"; fi
-	git clone --depth 1 --single-branch --branch $KSRC_UPSTREAM_TAG $KSRC_REPO $BUILD_DIR
+	git clone --depth 1 --single-branch --branch "$KSRC_UPSTREAM_TAG" "$KSRC_REPO" "$BUILD_DIR"
 
 	pushd "$BUILD_DIR"
 
