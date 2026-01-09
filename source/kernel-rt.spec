@@ -1,7 +1,7 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
 Version:        6.17.11
-Release:        260108T031458Z%{?dist}
+Release:        260108T031458Z_cve%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -309,6 +309,101 @@ Patch274: 0010-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
 Patch275: 0011-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
 # uncore-frequency
 Patch276: 0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
+#CVE-2025-68265
+Patch277: 0001-nvme-fix-admin-request_queue-lifetime.patch
+#CVE-2025-68263
+Patch278: 0002-ksmbd-ipc-fix-use-after-free-in-ipc_msg_send_request.patch
+#CVE-2025-68255
+Patch279: 0003-staging-rtl8723bs-fix-stack-buffer-overflow-in-OnAss.patch
+#CVE-2025-68256
+Patch280: 0004-staging-rtl8723bs-fix-out-of-bounds-read-in-rtw_get_.patch
+#CVE-2025-68281
+Patch281: 0007-ASoC-SDCA-bug-fix-while-parsing-mipi-sdca-control-cn.patch
+#CVE-2025-68262
+Patch282: 0008-crypto-zstd-fix-double-free-in-per-CPU-stream-cleanu.patch
+#CVE-2025-68261
+Patch283: 0009-ext4-add-i_data_sem-protection-in-ext4_destroy_inlin.patch
+#CVE-2025-68259
+Patch284: 0010-KVM-SVM-Don-t-skip-unrelated-instruction-if-INT3-INT.patch
+#CVE-2025-68254
+Patch285: 0011-staging-rtl8723bs-fix-out-of-bounds-read-in-OnBeacon.patch
+#CVE-2025-68264
+Patch286: 0013-ext4-refresh-inline-data-size-before-write-operation.patch
+#CVE-2025-68325
+Patch287: 0014-net-sched-sch_cake-Fix-incorrect-qlen-reduction-in-c.patch
+#CVE-2025-68323
+Patch288: 0016-usb-typec-ucsi-fix-use-after-free-caused-by-uec-work.patch
+#CVE-2025-68749
+Patch289: 0001-accel-ivpu-Fix-race-condition-when-unbinding-BOs.patch
+#CVE-2025-68745
+Patch290: 0003-scsi-qla2xxx-Clear-cmds-after-chip-reset.patch
+#CVE-2025-68349
+Patch291: 0004-NFSv4-pNFS-Clear-NFS_INO_LAYOUTCOMMIT-in-pnfs_mark_l.patch
+#CVE-2025-68366
+Patch292: 0005-nbd-defer-config-unlock-in-nbd_genl_connect.patch
+#CVE-2025-68744
+Patch293: 0006-bpf-Free-special-fields-when-update-lru_-percpu_hash.patch
+#CVE-2025-68363
+Patch294: 0009-bpf-Check-skb-transport_header-is-set-in-bpf_skb_che.patch
+#CVE-2025-68379
+Patch295: 0010-RDMA-rxe-Fix-null-deref-on-srq-rq.queue-after-resize.patch
+#CVE-2025-68375
+Patch296: 0011-perf-x86-Fix-NULL-event-access-and-potential-PEBS-re.patch
+#CVE-2025-68736
+Patch297: 0012-landlock-Fix-handling-of-disconnected-directories.patch
+#CVE-2025-68732
+Patch298: 0013-gpu-host1x-Fix-race-in-syncpt-alloc-free.patch
+#CVE-2025-68730
+Patch299: 0014-accel-ivpu-Fix-page-fault-in-ivpu_bo_unbind_all_bos_.patch
+#CVE-2025-68733
+Patch300: 0016-smack-fix-bug-unprivileged-task-can-create-labels.patch
+#CVE-2025-68333
+Patch301: 0017-sched_ext-Fix-possible-deadlock-in-the-deferred_irq_.patch
+#CVE-2025-68336
+Patch302: 0018-locking-spinlock-debug-Fix-data-race-in-do_raw_write.patch
+#CVE-2025-68345
+Patch303: 0019-ALSA-hda-cs35l41-Fix-NULL-pointer-dereference-in-cs3.patch
+#CVE-2025-68346
+Patch304: 0020-ALSA-dice-fix-buffer-overflow-in-detect_stream_forma.patch
+#CVE-2025-68347
+Patch305: 0021-ALSA-firewire-motu-fix-buffer-overflow-in-hwdep-read.patch
+#CVE-2025-68348
+Patch306: 0022-block-fix-memory-leak-in-__blkdev_issue_zero_pages.patch
+#CVE-2025-68353
+Patch307: 0023-net-vxlan-prevent-NULL-deref-in-vxlan_xmit_one.patch
+#CVE-2025-68358
+Patch308: 0025-btrfs-fix-racy-bitfield-write-in-btrfs_clear_space_i.patch
+#CVE-2025-68337
+Patch309: 0027-jbd2-avoid-bug_on-in-jbd2_journal_get_create_access-.patch
+#CVE-2025-68354
+Patch310: 0028-regulator-core-Protect-regulator_supply_alias_list-w.patch
+#CVE-2025-68359
+Patch311: 0030-btrfs-fix-double-free-of-qgroup-record-after-failure.patch
+#CVE-2025-68741
+Patch312: 0031-scsi-qla2xxx-Fix-improper-freeing-of-purex-item.patch
+#CVE-2025-68368
+Patch313: 0032-md-init-bioset-in-mddev_init.patch
+#CVE-2025-68371
+Patch314: 0033-scsi-smartpqi-Fix-device-resources-accessed-after-de.patch
+#CVE-2025-68373
+Patch315: 0036-md-delete-mddev-kobj-before-deleting-gendisk-kobj.patch
+Patch316: 0037-md-avoid-repeated-calls-to-del_gendisk.patch
+#CVE-2025-68740
+Patch317: 0038-ima-Handle-error-code-returned-by-ima_filter_rule_ma.patch
+#CVE-2025-68374
+Patch318: 0039-md-fix-rcu-protection-in-md_wakeup_thread.patch
+#CVE-2025-68742
+Patch319: 0040-bpf-Fix-invalid-prog-stats-access-when-update_effect.patch
+#CVE-2025-68743
+Patch320: 0045-mshv-Fix-create-memory-region-overlap-check.patch
+#CVE-2025-68724
+Patch321: 0046-crypto-asymmetric_keys-prevent-overflow-in-asymmetri.patch
+#CVE-2025-68378
+Patch322: 0049-bpf-Fix-stackmap-overflow-check-in-__bpf_get_stackid.patch
+#CVE-2025-68725
+Patch323: 0050-bpf-Do-not-let-BPF-test-infra-emit-invalid-GSO-types.patch
+#CVE-2025-68372
+Patch324: 0051-nbd-defer-config-put-in-recv_work.patch
 # End of Patch section
 
 %global security_hardening none
