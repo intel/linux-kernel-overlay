@@ -1,0 +1,188 @@
+From ab37d3eb4b0752e5725d3dfe635feda0e9b92210 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Mon, 24 Nov 2025 13:52:44 -0800
+Subject: [PATCH 82/94] KVM: nVMX: Don't update msr_autostore count when saving
+ TSC for vmcs12
+
+Rework nVMX's use of the MSR auto-store list to snapshot TSC to sneak
+MSR_IA32_TSC into the list _without_ updating KVM's software tracking,
+and drop the generic functionality so that future usage of the store list
+for nested specific logic needs to consider the implications of modifying
+the list.  Updating the list only for vmcs02 and only on nested VM-Enter
+is a disaster waiting to happen, as it means vmcs01 is stale relative to
+the software tracking, and KVM could unintentionally leave an MSR in the
+store list in perpetuity while running L1, e.g. if KVM addressed the first
+issue and updated vmcs01 on nested VM-Exit without removing TSC from the
+list.
+
+Furthermore, mixing KVM's desire to save an MSR with L1's desire to save
+an MSR result KVM clobbering/ignoring the needs of vmcs01 or vmcs02.
+E.g. if KVM added MSR_IA32_TSC to the store list for its own purposes, and
+then _removed_ MSR_IA32_TSC from the list after emulating nested VM-Enter,
+then KVM would remove MSR_IA32_TSC from the list even though saving TSC on
+VM-Exit from L2 is still desirable (to provide L1 with an accurate TSC).
+
+Similarly, removing an MSR from the list based on vmcs12's settings could
+drop an MSR that KVM wants to save for its own purposes.
+
+In practice, the issues are currently benign, because KVM doesn't use the
+store list for vmcs01.  But that will change with upcoming mediated PMU
+support.
+
+Alternatively, a "full" solution would be to track MSR list entries for
+vmcs12 separately from KVM's standard lists, but MSR_IA32_TSC is likely
+the only MSR that KVM would ever want to save on _every_ VM-Exit purely
+based on vmcs12.  I.e. the added complexity isn't remotely justified at
+this time.
+
+Opportunistically escalate from a pr_warn_ratelimited() to a full WARN as
+KVM reserves eight entries in each MSR list, and as above KVM uses at most
+one entry.
+
+Opportunistically make vmx_find_loadstore_msr_slot() local to vmx.c as
+using it directly from nested code is unsafe due to the potential for
+mixing vmcs01 and vmcs02 state (see above).
+
+Cc: Jim Mattson <jmattson@google.com>
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+---
+ arch/x86/kvm/vmx/nested.c | 71 ++++++++++++---------------------------
+ arch/x86/kvm/vmx/vmx.c    |  2 +-
+ arch/x86/kvm/vmx/vmx.h    |  2 +-
+ 3 files changed, 24 insertions(+), 51 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index f88bfc835a15..aa213f2be4a6 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -1076,16 +1076,12 @@ static bool nested_vmx_get_vmexit_msr_value(struct kvm_vcpu *vcpu,
+ 	 * does not include the time taken for emulation of the L2->L1
+ 	 * VM-exit in L0, use the more accurate value.
+ 	 */
+-	if (msr_index == MSR_IA32_TSC) {
+-		int i = vmx_find_loadstore_msr_slot(&vmx->msr_autostore,
+-						    MSR_IA32_TSC);
++	if (msr_index == MSR_IA32_TSC && vmx->nested.tsc_autostore_slot >= 0) {
++		int slot = vmx->nested.tsc_autostore_slot;
++		u64 host_tsc = vmx->msr_autostore.val[slot].value;
+ 
+-		if (i >= 0) {
+-			u64 val = vmx->msr_autostore.val[i].value;
+-
+-			*data = kvm_read_l1_tsc(vcpu, val);
+-			return true;
+-		}
++		*data = kvm_read_l1_tsc(vcpu, host_tsc);
++		return true;
+ 	}
+ 
+ 	if (kvm_emulate_msr_read(vcpu, msr_index, data)) {
+@@ -1164,42 +1160,6 @@ static bool nested_msr_store_list_has_msr(struct kvm_vcpu *vcpu, u32 msr_index)
+ 	return false;
+ }
+ 
+-static void prepare_vmx_msr_autostore_list(struct kvm_vcpu *vcpu,
+-					   u32 msr_index)
+-{
+-	struct vcpu_vmx *vmx = to_vmx(vcpu);
+-	struct vmx_msrs *autostore = &vmx->msr_autostore;
+-	bool in_vmcs12_store_list;
+-	int msr_autostore_slot;
+-	bool in_autostore_list;
+-	int last;
+-
+-	msr_autostore_slot = vmx_find_loadstore_msr_slot(autostore, msr_index);
+-	in_autostore_list = msr_autostore_slot >= 0;
+-	in_vmcs12_store_list = nested_msr_store_list_has_msr(vcpu, msr_index);
+-
+-	if (in_vmcs12_store_list && !in_autostore_list) {
+-		if (autostore->nr == MAX_NR_LOADSTORE_MSRS) {
+-			/*
+-			 * Emulated VMEntry does not fail here.  Instead a less
+-			 * accurate value will be returned by
+-			 * nested_vmx_get_vmexit_msr_value() by reading KVM's
+-			 * internal MSR state instead of reading the value from
+-			 * the vmcs02 VMExit MSR-store area.
+-			 */
+-			pr_warn_ratelimited(
+-				"Not enough msr entries in msr_autostore.  Can't add msr %x\n",
+-				msr_index);
+-			return;
+-		}
+-		last = autostore->nr++;
+-		autostore->val[last].index = msr_index;
+-	} else if (!in_vmcs12_store_list && in_autostore_list) {
+-		last = --autostore->nr;
+-		autostore->val[msr_autostore_slot] = autostore->val[last];
+-	}
+-}
+-
+ /*
+  * Load guest's/host's cr3 at nested entry/exit.  @nested_ept is true if we are
+  * emulating VM-Entry into a guest with EPT enabled.  On failure, the expected
+@@ -2700,12 +2660,25 @@ static void prepare_vmcs02_rare(struct vcpu_vmx *vmx, struct vmcs12 *vmcs12)
+ 	}
+ 
+ 	/*
+-	 * Make sure the msr_autostore list is up to date before we set the
+-	 * count in the vmcs02.
++	 * If vmcs12 is configured to save TSC on exit via the auto-store list,
++	 * append the MSR to vmcs02's auto-store list so that KVM effectively
++	 * reads TSC at the time of VM-Exit from L2.  The saved value will be
++	 * propagated to vmcs12's list on nested VM-Exit.
++	 *
++	 * Don't increment the number of MSRs in the vCPU structure, as saving
++	 * TSC is specific to this particular incarnation of vmcb02, i.e. must
++	 * not bleed into vmcs01.
+ 	 */
+-	prepare_vmx_msr_autostore_list(&vmx->vcpu, MSR_IA32_TSC);
++	if (nested_msr_store_list_has_msr(&vmx->vcpu, MSR_IA32_TSC) &&
++	    !WARN_ON_ONCE(vmx->msr_autostore.nr >= ARRAY_SIZE(vmx->msr_autostore.val))) {
++		vmx->nested.tsc_autostore_slot = vmx->msr_autostore.nr;
++		vmx->msr_autostore.val[vmx->msr_autostore.nr].index = MSR_IA32_TSC;
+ 
+-	vmcs_write32(VM_EXIT_MSR_STORE_COUNT, vmx->msr_autostore.nr);
++		vmcs_write32(VM_EXIT_MSR_STORE_COUNT, vmx->msr_autostore.nr + 1);
++	} else {
++		vmx->nested.tsc_autostore_slot = -1;
++		vmcs_write32(VM_EXIT_MSR_STORE_COUNT, vmx->msr_autostore.nr);
++	}
+ 	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.host.nr);
+ 	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_autoload.guest.nr);
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 46d8caefbad7..dc049596e26e 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1029,7 +1029,7 @@ static __always_inline void clear_atomic_switch_msr_special(struct vcpu_vmx *vmx
+ 	vm_exit_controls_clearbit(vmx, exit);
+ }
+ 
+-int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr)
++static int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr)
+ {
+ 	unsigned int i;
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 4ce653d729ca..3175fedb5a4d 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -191,6 +191,7 @@ struct nested_vmx {
+ 	u16 vpid02;
+ 	u16 last_vpid;
+ 
++	int tsc_autostore_slot;
+ 	struct nested_vmx_msrs msrs;
+ 
+ 	/* SMM related state */
+@@ -383,7 +384,6 @@ void vmx_spec_ctrl_restore_host(struct vcpu_vmx *vmx, unsigned int flags);
+ unsigned int __vmx_vcpu_run_flags(struct vcpu_vmx *vmx);
+ bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs,
+ 		    unsigned int flags);
+-int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
+ void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
+ 
+ void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr, int type, bool set);
+-- 
+2.43.0
+
