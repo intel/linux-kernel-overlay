@@ -76,34 +76,22 @@ function build()
 
 	echo "Building the .deb package"
 	local pkgver
-	local localver
 	local krelease
-	case "$customized_kver_string" in
-		mainline*)
-			localver="-mlt"
-			;;
-		iotg-next*)
-			localver="-next"
-			;;
-		lts*)
-			localver="-lts"
-			;;
-	esac
-	# KERNELRELEASE: <version>.<patchlevel>
-	krelease="${KVERSION}.${KPATCHLEVEL}"
-	# PKG NAME: linux-<image|headers>-<kernelrelease><localversion>
-	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>~<lts|mlt|next>[+cve]
-	pkgver="$(make kernelversion | sed 's/-/~/g')"
-	pkgver="${pkgver}-${timestamp,,}${localver/-/\~}"
-	[ "$is_rt" = "yes" ] && pkgver="${pkgver}+rt"
-	[[ "$customized_kver_string" = *cve* ]] && pkgver="${pkgver}+cve"
-	scripts/config --undefine LOCALVERSION
+	local kver="$(make kernelversion)"
+	local reltag="${linux_kernel_tag#sandbox-}"
+	reltag="${reltag,,}"
+	# PKG NAME: linux-<image|headers>-<kernel_version>-<staging_tag>[+rt][+cve]
+	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>
+	krelease="${kver}-${reltag}"
+	pkgver="${kver//-/\~}-${timestamp,,}"
+	[ "$is_rt" = "yes" ] && krelease="${krelease}+rt"
+	[[ "$customized_kver_string" = *cve* ]] && krelease="${krelease}+cve"
 	make olddefconfig
 	nice make -j"$(nproc)" bindeb-pkg \
-		LOCALVERSION="${localver}" \
+		LOCALVERSION="" \
 		KERNELRELEASE="${krelease}" \
 		KDEB_PKGVERSION="${pkgver}" \
-		KDEB_SOURCENAME="${linux_kernel_tag,,}"
+		KDEB_SOURCENAME="${reltag}"
 
 	# Post-build action: move the config and deb package to cur_dir
 	cp .config "$cur_dir"/kernel.config
