@@ -121,7 +121,7 @@ for k in $(printf '%s\n' "${!KCONF_PATHS[@]}" | sort); do
     case "$type" in
       dir)
         for cfg in "$path"/*.cfg; do
-            if [ "$cfg" != "rt.cfg" || $arg_is_rt -eq 0 ]; then
+            if [[ "$cfg" != "rt.cfg" || $arg_is_rt -eq 0 ]]; then
                 echo "Add $cfg to the merge list"
                 cfglist="$cfglist $cfg"
             fi
