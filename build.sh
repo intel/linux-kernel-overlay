@@ -81,13 +81,15 @@ function build()
 	echo "Building the .deb package"
 	local pkgver
 	local krelease
-	local kver="$(make kernelversion)"
-	local reltag="${linux_kernel_tag#sandbox-}"
+	local kver
+	local reltag
+	kver="$(make kernelversion)"
+	reltag="${linux_kernel_tag#sandbox-}"
 	reltag="${reltag,,}"
 	# PKG NAME: linux-<image|headers>-<kernel_version>-<staging_tag>[+rt][+cve]
-	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>
+	# KDEB_PKGVERSION: <kernel_version>[~rcN]-<timestamp>-<build_id>
 	krelease="${kver}-${reltag}"
-	pkgver="${kver//-/\~}-${timestamp,,}"
+	pkgver="${kver//-/\~}-${timestamp,,}-${build_id}"
 	[ "$is_rt" = "yes" ] && krelease="${krelease}+rt"
 	[[ "$customized_kver_string" = *cve* ]] && krelease="${krelease}+cve"
 	make olddefconfig
