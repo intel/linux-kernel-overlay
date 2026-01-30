@@ -1,7 +1,7 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
 Version:        6.17.11
-Release:        260108T031458Z_cve%{?dist}
+Release:        260128T080735Z_cve%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -240,170 +240,256 @@ Patch212: 0001-media-i2c-max9x-fix-S3-S4-error-for-max9x.ipu
 Patch213: 0002-media-i2c-max9x-uniform-serdes-driver-compilation.ipu
 Patch214: 0001-Revert-media-i2c-max9x-uniform-serdes-driver-compilati.ipu
 Patch215: 0002-Revert-media-i2c-max9x-fix-S3-S4-error-for-max9x.ipu
-Patch216: 0001-patch-staging-add-ipu7-isys-reset-code.ipu
-Patch217: 0002-media-ipu-invalidate-MMU-TLB-in-dma-buffers-creation.ipu
-Patch218: 0003-media-ipu-Update-firmware-ABI-version-to-1.2.1.2025121.ipu
-Patch219: 0004-media-ipu7-update-CDPHY-register-settings.ipu
+Patch216: 0001-Remove-IPU7-drivers-from-pci-directory.ipu
+Patch217: 0002-patch-staging-add-ipu7-isys-reset-code.ipu
+Patch218: 0003-patch-staging-add-enbaled-IPU8_INSYS_NEW_ABI.ipu
+Patch219: 0004-patch-staging-add-enable-CONFIG_DEBUG_FS.ipu
+Patch220: 0005-patch-staging-add-enable-CONFIG_INTEL_IPU_ACPI.ipu
+Patch221: 0006-patch-staging-add-enable-ENABLE_FW_OFFLINE_LOGGER.ipu
+Patch222: 0007-patch-staging-add-patch-for-use-DPHY-as-the-default-ph.ipu
+Patch223: 0008-media-ipu-invalidate-MMU-TLB-in-dma-buffers-creation.ipu
+Patch224: 0009-patch-staging-add-fixup-some-PCI-probe-and-release-iss.ipu
+Patch225: 0010-patch-staging-add-IPU8_PCI_ID-support.ipu
+Patch226: 0011-patch-staging-add-patch-for-ipu7-Kconfig-Makefile.ipu
+Patch227: 0012-media-ipu-Update-firmware-ABI-version-to-1.2.1.2025121.ipu
+Patch228: 0013-patch-staging-add-ipu7-isys-tpg-and-MGC-config.ipu
+Patch229: 0014-media-ipu-Dma-sync-at-buffer_prepare-callback-as-DMA-i.ipu
+Patch230: 0015-media-ipu7-update-CDPHY-register-settings.ipu
+Patch231: 0016-Port-over-IPU-ACPI-drivers-changes-from-VTG-github-rep.ipu
+Patch232: 0017-Copy-ACPI-header-files-from-VTG-IPU7-IPU6-repo.ipu
+Patch233: 0018-IPU7-PSYS-driver-addition.ipu
+Patch234: 0019-porting-gmsl-isx031-code-between-PTL-IPU7-beta-release.ipu
+Patch235: 0020-Update-lt6911gxd-sensor-driver-to-fix-timeout-issue-af.ipu
+Patch236: 0021-Update-compilation-path-for-IPU7-drivers.ipu
+Patch237: 0001-i2c-add-identifier-for-ATR-and-MUX-adapters.ipu
+Patch238: 0002-i2c-i2c-core-acpi-clear-dependency-for-MUX-or-ATR-adap.ipu
+Patch239: 0003-i2c-atr-Add-fwnode-handling.ipu
+Patch240: 0004-media-v4l2-async-Fix-error-handling-on-steps-after-fin.ipu
+Patch241: 0005-media-mc-Add-INTERNAL-pad-flag.ipu
+Patch242: 0006-i2c-atr-Remove-COMPILE_TEST-check.ipu
 # tbt
-Patch220: 0002-thunderbolt-Make-XDomain-lane-bonding-comply-with-the-.tbt
-Patch221: 0003-net-thunderbolt-Allow-changing-MTU-of-the-device.tbt
-Patch222: 0004-thunderbolt-Add-Kconfig-option-to-disable-PCIe-tunneli.tbt
+Patch243: 0002-thunderbolt-Make-XDomain-lane-bonding-comply-with-the-.tbt
+Patch244: 0003-net-thunderbolt-Allow-changing-MTU-of-the-device.tbt
+Patch245: 0004-thunderbolt-Add-Kconfig-option-to-disable-PCIe-tunneli.tbt
 # pmc_core
-Patch223: 0001-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
+Patch246: 0001-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
 # i3c
-Patch224: 0002-i3c-master-Add-helpers-for-DMA-mapping-and-bounce-buff.i3c
-Patch225: 0003-i3c-mipi-i3c-hci-Use-core-helpers-for-DMA-mapping-and-.i3c
-Patch226: 0004-i3c-mipi-i3c-hci-Use-physical-device-pointer-with-DMA-.i3c
-Patch227: 0005-i3c-mipi-i3c-hci-Use-own-DMA-bounce-buffer-management-.i3c
-Patch228: 0006-i3c-mipi-i3c-hci-Change-interrupt-status-prints-to-dev.i3c
-Patch229: 0007-i3c-mipi-i3c-hci-Remove-nonexistent-ring-interrupt.i3c
-Patch230: 0008-i3c-mipi-i3c-hci-Uniform-ring-number-printouts.i3c
-Patch231: 0009-i3c-mipi-i3c-hci-Remove-function-enter-DBG-printouts.i3c
-Patch232: 0010-i3c-mipi-i3c-hci-Convert-remaining-DBG-prints-to-dev_d.i3c
-Patch233: 0002-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
+Patch247: 0002-i3c-master-Add-helpers-for-DMA-mapping-and-bounce-buff.i3c
+Patch248: 0003-i3c-mipi-i3c-hci-Use-core-helpers-for-DMA-mapping-and-.i3c
+Patch249: 0004-i3c-mipi-i3c-hci-Use-physical-device-pointer-with-DMA-.i3c
+Patch250: 0005-i3c-mipi-i3c-hci-Use-own-DMA-bounce-buffer-management-.i3c
+Patch251: 0006-i3c-mipi-i3c-hci-Change-interrupt-status-prints-to-dev.i3c
+Patch252: 0007-i3c-mipi-i3c-hci-Remove-nonexistent-ring-interrupt.i3c
+Patch253: 0008-i3c-mipi-i3c-hci-Uniform-ring-number-printouts.i3c
+Patch254: 0009-i3c-mipi-i3c-hci-Remove-function-enter-DBG-printouts.i3c
+Patch255: 0010-i3c-mipi-i3c-hci-Convert-remaining-DBG-prints-to-dev_d.i3c
+Patch256: 0002-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
 # ethernet
-Patch234: 0001-igc-Only-dump-registers-if-configured-to-dump-HW-.ethernet
-Patch235: 0002-igc-Add-support-for-DMA-timestamp-for-non-PTP-pac.ethernet
-Patch236: 0003-bpf-add-btf-register-unregister-API.ethernet
-Patch237: 0004-net-core-XDP-metadata-BTF-netlink-API.ethernet
-Patch238: 0005-rtnetlink-Fix-unchecked-return-value-of-dev_xdp_q.ethernet
-Patch239: 0006-rtnetlink-Add-return-value-check.ethernet
-Patch240: 0007-tools-bpf-Query-XDP-metadata-BTF-ID.ethernet
-Patch241: 0008-tools-bpf-Add-xdp-set-command-for-md-btf.ethernet
-Patch242: 0009-igc-Add-BTF-based-metadata-for-XDP.ethernet
-Patch243: 0010-igc-Enable-HW-RX-Timestamp-for-AF_XDP-ZC.ethernet
-Patch244: 0011-igc-Take-care-of-DMA-timestamp-rollover.ethernet
-Patch245: 0014-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
-Patch246: 0015-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
-Patch247: 0016-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
-Patch248: 0017-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
-Patch249: 0001-igc-Reduce-TSN-TX-packet-buffer-from-7KB-to-5KB-p.ethernet
-Patch250: 0001-igc-fix-race-condition-in-TX-timestamp-read-for-r.ethernet
-Patch251: 0001-igc-Remove-XDP-metadata-invalidation.ethernet
+Patch257: 0001-igc-Only-dump-registers-if-configured-to-dump-HW-.ethernet
+Patch258: 0002-igc-Add-support-for-DMA-timestamp-for-non-PTP-pac.ethernet
+Patch259: 0003-bpf-add-btf-register-unregister-API.ethernet
+Patch260: 0004-net-core-XDP-metadata-BTF-netlink-API.ethernet
+Patch261: 0005-rtnetlink-Fix-unchecked-return-value-of-dev_xdp_q.ethernet
+Patch262: 0006-rtnetlink-Add-return-value-check.ethernet
+Patch263: 0007-tools-bpf-Query-XDP-metadata-BTF-ID.ethernet
+Patch264: 0008-tools-bpf-Add-xdp-set-command-for-md-btf.ethernet
+Patch265: 0009-igc-Add-BTF-based-metadata-for-XDP.ethernet
+Patch266: 0010-igc-Enable-HW-RX-Timestamp-for-AF_XDP-ZC.ethernet
+Patch267: 0011-igc-Take-care-of-DMA-timestamp-rollover.ethernet
+Patch268: 0014-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
+Patch269: 0015-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
+Patch270: 0016-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
+Patch271: 0017-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
+Patch272: 0001-igc-Reduce-TSN-TX-packet-buffer-from-7KB-to-5KB-p.ethernet
+Patch273: 0001-igc-fix-race-condition-in-TX-timestamp-read-for-r.ethernet
+Patch274: 0001-igc-Remove-XDP-metadata-invalidation.ethernet
 # audio
-Patch252: 0001-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
-Patch253: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
+Patch275: 0001-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+Patch276: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
 # rt
-Patch254: 0001-mei-gsc-add-dependency-on-Xe-driver.rt
-Patch255: 0002-drm-me-gsc-mei-interrupt-top-half-should-be-in-irq-disa.rt
-Patch256: 0001-drm-i915-Use-preempt_disable-enable_rt-where-recommende.rt
-Patch257: 0002-drm-i915-Don-t-disable-interrupts-on-PREEMPT_RT-during-.rt
-Patch258: 0003-drm-i915-Don-t-check-for-atomic-context-on-PREEMPT_RT.rt
-Patch259: 0004-drm-i915-Disable-tracing-points-on-PREEMPT_RT.rt
-Patch260: 0005-drm-i915-gt-Use-spin_lock_irq-instead-of-local_irq_disa.rt
-Patch261: 0006-drm-i915-Drop-the-irqs_disabled-check.rt
-Patch262: 0007-drm-i915-guc-Consider-also-RCU-depth-in-busy-loop.rt
-Patch263: 0008-drm-i915-Consider-RCU-read-section-as-atomic.rt
-Patch264: 0009-Revert-drm-i915-Depend-on-PREEMPT_RT.rt
+Patch277: 0001-mei-gsc-add-dependency-on-Xe-driver.rt
+Patch278: 0002-drm-me-gsc-mei-interrupt-top-half-should-be-in-irq-disa.rt
+Patch279: 0001-drm-i915-Use-preempt_disable-enable_rt-where-recommende.rt
+Patch280: 0002-drm-i915-Don-t-disable-interrupts-on-PREEMPT_RT-during-.rt
+Patch281: 0003-drm-i915-Don-t-check-for-atomic-context-on-PREEMPT_RT.rt
+Patch282: 0004-drm-i915-Disable-tracing-points-on-PREEMPT_RT.rt
+Patch283: 0005-drm-i915-gt-Use-spin_lock_irq-instead-of-local_irq_disa.rt
+Patch284: 0006-drm-i915-Drop-the-irqs_disabled-check.rt
+Patch285: 0007-drm-i915-guc-Consider-also-RCU-depth-in-busy-loop.rt
+Patch286: 0008-drm-i915-Consider-RCU-read-section-as-atomic.rt
+Patch287: 0009-Revert-drm-i915-Depend-on-PREEMPT_RT.rt
 # thermal
-Patch265: 0001-thermal-intel-int340x-Remove-redundant-acpi_has_me.thermal
-Patch266: 0002-thermal-intel-int340x-Add-support-for-power-slider.thermal
-Patch267: 0003-thermal-intel-int340x-Enable-power-slider-interfac.thermal
-Patch268: 0004-thermal-intel-int340x-Add-module-parameter-for-bal.thermal
-Patch269: 0005-thermal-intel-int340x-Add-module-parameter-to-chan.thermal
-Patch270: 0006-thermal-gov_step_wise-Clean-up-local-variable-init.thermal
-Patch271: 0007-thermal-gov_step_wise-Clarify-cooling-logic-descri.thermal
-Patch272: 0008-thermal-testing-Rearrange-variable-declarations-in.thermal
-Patch273: 0009-thermal-hwmon-replace-deprecated-strcpy-with-strsc.thermal
-Patch274: 0010-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
-Patch275: 0011-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
+Patch288: 0001-thermal-intel-int340x-Remove-redundant-acpi_has_me.thermal
+Patch289: 0002-thermal-intel-int340x-Add-support-for-power-slider.thermal
+Patch290: 0003-thermal-intel-int340x-Enable-power-slider-interfac.thermal
+Patch291: 0004-thermal-intel-int340x-Add-module-parameter-for-bal.thermal
+Patch292: 0005-thermal-intel-int340x-Add-module-parameter-to-chan.thermal
+Patch293: 0006-thermal-gov_step_wise-Clean-up-local-variable-init.thermal
+Patch294: 0007-thermal-gov_step_wise-Clarify-cooling-logic-descri.thermal
+Patch295: 0008-thermal-testing-Rearrange-variable-declarations-in.thermal
+Patch296: 0009-thermal-hwmon-replace-deprecated-strcpy-with-strsc.thermal
+Patch297: 0010-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
+Patch298: 0011-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
 # uncore-frequency
-Patch276: 0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
+Patch299: 0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
 #CVE-2025-68265
-Patch277: 0001-nvme-fix-admin-request_queue-lifetime.patch
+Patch300: CVE-2025-68265.patch
 #CVE-2025-68263
-Patch278: 0002-ksmbd-ipc-fix-use-after-free-in-ipc_msg_send_request.patch
+Patch301: CVE-2025-68263.patch
 #CVE-2025-68255
-Patch279: 0003-staging-rtl8723bs-fix-stack-buffer-overflow-in-OnAss.patch
+Patch302: CVE-2025-68255.patch
 #CVE-2025-68256
-Patch280: 0004-staging-rtl8723bs-fix-out-of-bounds-read-in-rtw_get_.patch
+Patch303: CVE-2025-68256.patch
 #CVE-2025-68281
-Patch281: 0007-ASoC-SDCA-bug-fix-while-parsing-mipi-sdca-control-cn.patch
+Patch304: CVE-2025-68281.patch
 #CVE-2025-68262
-Patch282: 0008-crypto-zstd-fix-double-free-in-per-CPU-stream-cleanu.patch
+Patch305: CVE-2025-68262.patch
 #CVE-2025-68261
-Patch283: 0009-ext4-add-i_data_sem-protection-in-ext4_destroy_inlin.patch
+Patch306: CVE-2025-68261.patch
 #CVE-2025-68259
-Patch284: 0010-KVM-SVM-Don-t-skip-unrelated-instruction-if-INT3-INT.patch
+Patch307: CVE-2025-68259.patch
 #CVE-2025-68254
-Patch285: 0011-staging-rtl8723bs-fix-out-of-bounds-read-in-OnBeacon.patch
+Patch308: CVE-2025-68254.patch
 #CVE-2025-68264
-Patch286: 0013-ext4-refresh-inline-data-size-before-write-operation.patch
+Patch309: CVE-2025-68264.patch
 #CVE-2025-68325
-Patch287: 0014-net-sched-sch_cake-Fix-incorrect-qlen-reduction-in-c.patch
+Patch310: CVE-2025-68325.patch
 #CVE-2025-68323
-Patch288: 0016-usb-typec-ucsi-fix-use-after-free-caused-by-uec-work.patch
+Patch311: CVE-2025-68323.patch
 #CVE-2025-68749
-Patch289: 0001-accel-ivpu-Fix-race-condition-when-unbinding-BOs.patch
+Patch312: CVE-2025-68749.patch
 #CVE-2025-68745
-Patch290: 0003-scsi-qla2xxx-Clear-cmds-after-chip-reset.patch
+Patch313: CVE-2025-68745.patch
 #CVE-2025-68349
-Patch291: 0004-NFSv4-pNFS-Clear-NFS_INO_LAYOUTCOMMIT-in-pnfs_mark_l.patch
+Patch314: CVE-2025-68349.patch
 #CVE-2025-68366
-Patch292: 0005-nbd-defer-config-unlock-in-nbd_genl_connect.patch
+Patch315: CVE-2025-68366.patch
 #CVE-2025-68744
-Patch293: 0006-bpf-Free-special-fields-when-update-lru_-percpu_hash.patch
+Patch316: CVE-2025-68744.patch
 #CVE-2025-68363
-Patch294: 0009-bpf-Check-skb-transport_header-is-set-in-bpf_skb_che.patch
+Patch317: CVE-2025-68363.patch
 #CVE-2025-68379
-Patch295: 0010-RDMA-rxe-Fix-null-deref-on-srq-rq.queue-after-resize.patch
+Patch318: CVE-2025-68379.patch
 #CVE-2025-68375
-Patch296: 0011-perf-x86-Fix-NULL-event-access-and-potential-PEBS-re.patch
+Patch319: CVE-2025-68375.patch
 #CVE-2025-68736
-Patch297: 0012-landlock-Fix-handling-of-disconnected-directories.patch
+Patch320: CVE-2025-68736.patch
 #CVE-2025-68732
-Patch298: 0013-gpu-host1x-Fix-race-in-syncpt-alloc-free.patch
+Patch321: CVE-2025-68732.patch
 #CVE-2025-68730
-Patch299: 0014-accel-ivpu-Fix-page-fault-in-ivpu_bo_unbind_all_bos_.patch
+Patch322: CVE-2025-68730.patch
 #CVE-2025-68733
-Patch300: 0016-smack-fix-bug-unprivileged-task-can-create-labels.patch
+Patch323: CVE-2025-68733.patch
 #CVE-2025-68333
-Patch301: 0017-sched_ext-Fix-possible-deadlock-in-the-deferred_irq_.patch
+Patch324: CVE-2025-68333.patch
 #CVE-2025-68336
-Patch302: 0018-locking-spinlock-debug-Fix-data-race-in-do_raw_write.patch
+Patch325: CVE-2025-68336.patch
 #CVE-2025-68345
-Patch303: 0019-ALSA-hda-cs35l41-Fix-NULL-pointer-dereference-in-cs3.patch
+Patch326: CVE-2025-68345.patch
 #CVE-2025-68346
-Patch304: 0020-ALSA-dice-fix-buffer-overflow-in-detect_stream_forma.patch
+Patch327: CVE-2025-68346.patch
 #CVE-2025-68347
-Patch305: 0021-ALSA-firewire-motu-fix-buffer-overflow-in-hwdep-read.patch
+Patch328: CVE-2025-68347.patch
 #CVE-2025-68348
-Patch306: 0022-block-fix-memory-leak-in-__blkdev_issue_zero_pages.patch
+Patch329: CVE-2025-68348.patch
 #CVE-2025-68353
-Patch307: 0023-net-vxlan-prevent-NULL-deref-in-vxlan_xmit_one.patch
+Patch330: CVE-2025-68353.patch
 #CVE-2025-68358
-Patch308: 0025-btrfs-fix-racy-bitfield-write-in-btrfs_clear_space_i.patch
+Patch331: CVE-2025-68358.patch
 #CVE-2025-68337
-Patch309: 0027-jbd2-avoid-bug_on-in-jbd2_journal_get_create_access-.patch
+Patch332: CVE-2025-68337.patch
 #CVE-2025-68354
-Patch310: 0028-regulator-core-Protect-regulator_supply_alias_list-w.patch
+Patch333: CVE-2025-68354.patch
 #CVE-2025-68359
-Patch311: 0030-btrfs-fix-double-free-of-qgroup-record-after-failure.patch
+Patch334: CVE-2025-68359.patch
 #CVE-2025-68741
-Patch312: 0031-scsi-qla2xxx-Fix-improper-freeing-of-purex-item.patch
+Patch335: CVE-2025-68741.patch
 #CVE-2025-68368
-Patch313: 0032-md-init-bioset-in-mddev_init.patch
+Patch336: CVE-2025-68368.patch
 #CVE-2025-68371
-Patch314: 0033-scsi-smartpqi-Fix-device-resources-accessed-after-de.patch
+Patch337: CVE-2025-68371.patch
 #CVE-2025-68373
-Patch315: 0036-md-delete-mddev-kobj-before-deleting-gendisk-kobj.patch
-Patch316: 0037-md-avoid-repeated-calls-to-del_gendisk.patch
+Patch338: CVE-2025-68373.patch
+Patch339: CVE-2025-68373-2.patch
 #CVE-2025-68740
-Patch317: 0038-ima-Handle-error-code-returned-by-ima_filter_rule_ma.patch
+Patch340: CVE-2025-68740.patch
 #CVE-2025-68374
-Patch318: 0039-md-fix-rcu-protection-in-md_wakeup_thread.patch
+Patch341: CVE-2025-68374.patch
 #CVE-2025-68742
-Patch319: 0040-bpf-Fix-invalid-prog-stats-access-when-update_effect.patch
+Patch342: CVE-2025-68742.patch
 #CVE-2025-68743
-Patch320: 0045-mshv-Fix-create-memory-region-overlap-check.patch
+Patch343: CVE-2025-68743.patch
 #CVE-2025-68724
-Patch321: 0046-crypto-asymmetric_keys-prevent-overflow-in-asymmetri.patch
+Patch344: CVE-2025-68724.patch
 #CVE-2025-68378
-Patch322: 0049-bpf-Fix-stackmap-overflow-check-in-__bpf_get_stackid.patch
+Patch345: CVE-2025-68378.patch
 #CVE-2025-68725
-Patch323: 0050-bpf-Do-not-let-BPF-test-infra-emit-invalid-GSO-types.patch
+Patch346: CVE-2025-68725.patch
 #CVE-2025-68372
-Patch324: 0051-nbd-defer-config-put-in-recv_work.patch
+Patch347: CVE-2025-68372.patch
+#CVE-2026-23007
+Patch348: CVE-2026-23007.patch
+#CVE-2026-23008
+Patch349: CVE-2026-23008.patch
+#CVE-2026-23009
+Patch350: CVE-2026-23009.patch
+#CVE-2026-23012
+Patch351: CVE-2026-23012.patch
+#CVE-2026-22993
+Patch352: CVE-2026-22993.patch
+#CVE-2026-22987
+Patch353: CVE-2026-22987.patch
+#CVE-2026-22981
+Patch354: CVE-2026-22981.patch
+#CVE-2025-71161
+Patch355: CVE-2025-71161.patch
+#CVE-2025-71117
+Patch356: CVE-2025-71117.patch
+#CVE-2025-71128
+Patch357: CVE-2025-71128.patch
+#CVE-2025-71139
+Patch358: CVE-2025-71139-1.patch
+Patch359: CVE-2025-71139-2.patch
+#CVE-2025-71142
+Patch360: CVE-2025-71142.patch
+#CVE-2025-71115
+Patch361: CVE-2025-71115.patch
+#CVE-2025-71090
+Patch362: CVE-2025-71090.patch
+#CVE-2025-71070
+Patch363: CVE-2025-71070-1.patch
+Patch364: CVE-2025-71070-2.patch
+#CVE-2025-71074
+Patch365: CVE-2025-71074.patch
+#CVE-2025-68823
+Patch366: CVE-2025-68823.patch
+#CVE-2025-68807
+Patch367: CVE-2025-68807.patch
+#CVE-2025-68805
+Patch368: CVE-2025-68805.patch
+#CVE-2025-68791
+Patch369: CVE-2025-68791.patch
+#CVE-2025-68768
+Patch370: CVE-2025-68768-1.patch
+Patch371: CVE-2025-68768-2.patch
+Patch372: CVE-2025-68768-3.patch
+#CVE-2025-68764
+Patch373: CVE-2025-68764.patch
+#CVE-2025-68762
+Patch374: CVE-2025-68762.patch
+#CVE-2025-68759
+Patch375: CVE-2025-68759.patch
+#CVE-2025-68756
+Patch376: CVE-2025-68756.patch
+#CVE-2025-68753
+Patch377: CVE-2025-68753.patch
+#CVE-2025-68752
+Patch378: CVE-2025-68752.patch
+#CVE-2026-23004
+Patch379: CVE-2026-23004.patch
+#CVE-2026-22985
+Patch380: CVE-2026-22985-1.patch
+Patch381: CVE-2026-22985-2.patch
 # End of Patch section
 
 %global security_hardening none
