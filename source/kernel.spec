@@ -1,13 +1,13 @@
 Summary:        Linux Kernel
 Name:           kernel
-Version:        6.12.61
-Release:        260106T193826Z_cve%{?dist}
+Version:        6.12.67
+Release:        260128T180434Z_cve%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.61.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.67.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -420,231 +420,157 @@ Patch387:	0001-Add-security.md-file.misc
 #iommu
 Patch388:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
 Patch389:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
-#emt-drm
-Patch390:	0075-drm-xe-gsc-mei-interrupt-top-half-should-be-in-irq-d.patch
 #CVE-2025-21709
-Patch391:	CVE-2025-21709.patch
+Patch390:	CVE-2025-21709.patch
 #CVE-2025-21817
-Patch392:	CVE-2025-21817.patch
+Patch391:	CVE-2025-21817.patch
 #CVE-2025-22104
-Patch393:	CVE-2025-22104.patch
+Patch392:	CVE-2025-22104.patch
 #CVE-2025-22108
-Patch394:	CVE-2025-22108.patch
-#CVE-2025-22111
-Patch395:	CVE-2025-22111.patch
+Patch393:	CVE-2025-22108.patch
 #CVE-2025-22116
-Patch396:	CVE-2025-22116.patch
+Patch394:	CVE-2025-22116.patch
 #CVE-2025-22117
-Patch397:	CVE-2025-22117.patch
+Patch395:	CVE-2025-22117.patch
 #CVE-2025-23131
-Patch398:	CVE-2025-23131.patch
+Patch396:	CVE-2025-23131.patch
 #CVE-2025-37746
-Patch399:	CVE-2025-37746.patch
-Patch400:	CVE-2025-37746-1.patch
+Patch397:	CVE-2025-37746.patch
+Patch398:	CVE-2025-37746-1.patch
 #CVE-2025-37906
-Patch401:	CVE-2025-37906.patch
+Patch399:	CVE-2025-37906.patch
 #CVE-2025-38041
-Patch402:	CVE-2025-38041.patch
-Patch403:	CVE-2025-38041-1.patch
-Patch404:	CVE-2025-38041-2.patch
+Patch400:	CVE-2025-38041.patch
+Patch401:	CVE-2025-38041-1.patch
+Patch402:	CVE-2025-38041-2.patch
 #CVE-2025-38029
-Patch405:	CVE-2025-38029.patch
+Patch403:	CVE-2025-38029.patch
 #CVE-2025-38311
-Patch406:	CVE-2025-38311.patch
-#CVE-2025-38248
-Patch407:	CVE-2025-38248.patch
-#CVE-2025-38234
-Patch408:	CVE-2025-38234.patch
+Patch404:	CVE-2025-38311.patch
 #CVE-2025-38207
-Patch409:	CVE-2025-38207.patch
+Patch405:	CVE-2025-38207.patch
 #CVE-2025-38137
-Patch410:	CVE-2025-38137.patch
-#CVE-2025-40325
-Patch411:	CVE-2025-40325.patch
+Patch406:	CVE-2025-38137.patch
 #CVE-2025-38284
-Patch412:	CVE-2025-38284.patch
-Patch413:	CVE-2025-38284-1.patch
-Patch414:	CVE-2025-38284-2.patch
+Patch407:	CVE-2025-38284.patch
+Patch408:	CVE-2025-38284-1.patch
+Patch409:	CVE-2025-38284-2.patch
 #CVE-2025-38199
-Patch415:	CVE-2025-38199.patch
+Patch410:	CVE-2025-38199.patch
 #CVE-2025-38140
-Patch416:	CVE-2025-38140.patch
+Patch411:	CVE-2025-38140.patch
 #CVE-2025-38132
-Patch417:	CVE-2025-38132.patch
-Patch418:	CVE-2025-38132-1.patch
+Patch412:	CVE-2025-38132.patch
+Patch413:	CVE-2025-38132-1.patch
 #CVE-2025-37743
-Patch419:	CVE-2025-37743.patch
+Patch414:	CVE-2025-37743.patch
 #CVE-2025-23132
-Patch420:	CVE-2025-23132.patch
+Patch415:	CVE-2025-23132.patch
 #CVE-2025-22127
-Patch421:	CVE-2025-22127.patch
+Patch416:	CVE-2025-22127.patch
 #CVE-2025-22109
-Patch422:	CVE-2025-22109.patch
+Patch417:	CVE-2025-22109.patch
 #CVE-2025-21752
-Patch423:	CVE-2025-21752.patch
-Patch424:	CVE-2025-21752-1.patch
+Patch418:	CVE-2025-21752.patch
+Patch419:	CVE-2025-21752-1.patch
 #CVE-2024-58095
-Patch425:	CVE-2024-58095.patch
+Patch420:	CVE-2024-58095.patch
 #CVE-2024-58094
-Patch426:	CVE-2024-58094.patch
+Patch421:	CVE-2024-58094.patch
 #CVE-2024-52560
-Patch427:	CVE-2024-52560.patch
-Patch428:	CVE-2024-52560-1.patch
+Patch422:	CVE-2024-52560.patch
+Patch423:	CVE-2024-52560-1.patch
 #CVE-2025-38621
-Patch429:	CVE-2025-38621.patch
+Patch424:	CVE-2025-38621.patch
 #CVE-2025-38627
-Patch430:	CVE-2025-38627.patch
+Patch425:	CVE-2025-38627.patch
 #CVE-2025-39789
-Patch431:	CVE-2025-39789.patch
+Patch426:	CVE-2025-39789.patch
 #CVE-2025-39764
-Patch432:	CVE-2025-39764.patch
+Patch427:	CVE-2025-39764.patch
 #CVE-2025-39745
-Patch433:	CVE-2025-39745.patch
+Patch428:	CVE-2025-39745.patch
 #CVE-2025-39677
-Patch434:	CVE-2025-39677.patch
+Patch429:	CVE-2025-39677.patch
 #CVE-2025-39933
-Patch435:	CVE-2025-39933.patch
+Patch430:	CVE-2025-39933.patch
 #CVE-2025-39833
-Patch436:	CVE-2025-39833.patch
+Patch431:	CVE-2025-39833.patch
 #CVE-2025-39925
-Patch437:	CVE-2025-39925.patch
+Patch432:	CVE-2025-39925.patch
 #CVE-2025-39905
-Patch438:	CVE-2025-39905.patch
+Patch433:	CVE-2025-39905.patch
 #CVE-2025-39859
-Patch439:	CVE-2025-39859.patch
+Patch434:	CVE-2025-39859.patch
 #CVE-2025-39910
-Patch440:	CVE-2025-39910.patch
+Patch435:	CVE-2025-39910.patch
 #CVE-2025-40098
-Patch441:	CVE-2025-40098.patch
-#CVE-2025-40075
-Patch442:	CVE-2025-40075.patch
-Patch443:	CVE-2025-40075-1.patch
+Patch436:	CVE-2025-40098.patch
 #CVE-2025-40074
-Patch444:	CVE-2025-40074.patch
+Patch437:	CVE-2025-40074.patch
 #CVE-2025-40064
-Patch445:	CVE-2025-40064.patch
+Patch438:	CVE-2025-40064.patch
 #CVE-2025-40086
-Patch446:	CVE-2025-40086.patch
-Patch447:	CVE-2025-40086-1.patch
+Patch439:	CVE-2025-40086.patch
+Patch440:	CVE-2025-40086-1.patch
 #CVE-2025-40168
-Patch448:	CVE-2025-40168.patch
-#CVE-2025-40170
-Patch449:	CVE-2025-40170.patch
-#CVE-2025-40164
-Patch450:	CVE-2025-40164.patch
-#CVE-2025-40158
-Patch451:	CVE-2025-40158.patch
-#CVE-2025-40149
-Patch452:	CVE-2025-40149.patch
+Patch441:	CVE-2025-40168.patch
 #CVE-2025-40147
-Patch453:	CVE-2025-40147.patch
+Patch442:	CVE-2025-40147.patch
 #CVE-2025-40139
-Patch454:	CVE-2025-40139.patch
+Patch443:	CVE-2025-40139.patch
 #CVE-2025-40136
-Patch455:	CVE-2025-40136.patch
-#CVE-2025-40135
-Patch456:	CVE-2025-40135.patch
+Patch444:	CVE-2025-40136.patch
 #CVE-2025-40130
-Patch457:	CVE-2025-40130.patch
+Patch445:	CVE-2025-40130.patch
 #CVE-2025-38656
-Patch458:	CVE-2025-38656.patch
-Patch459:	CVE-2025-38656-2.patch
-#CVE-2025-38591
-Patch460:	CVE-2025-38591.patch
+Patch446:	CVE-2025-38656.patch
+Patch447:	CVE-2025-38656-2.patch
 #CVE-2025-38584
-Patch461:	CVE-2025-38584.patch
-#CVE-2025-40215
-Patch462:	CVE-2025-40215.patch
+Patch448:	CVE-2025-38584.patch
 #CVE-2025-68749
-Patch463:	CVE-2025-68749.patch
+Patch449:	CVE-2025-68749.patch
 #CVE-2025-68745
-Patch464:	CVE-2025-68745.patch
-#CVE-2025-68744
-Patch465:	CVE-2025-68744.patch
-#CVE-2025-68742
-Patch466:	CVE-2025-68742.patch
-#CVE-2025-68741
-Patch467:	CVE-2025-68741.patch
+Patch450:	CVE-2025-68745.patch
 #CVE-2025-68736
-Patch468:	CVE-2025-68736.patch
-#CVE-2025-68733
-Patch469:	CVE-2025-68733.patch
-#CVE-2025-68740
-Patch470:	CVE-2025-68740.patch
+Patch451:	CVE-2025-68736.patch
 #CVE-2025-68725
-Patch471:	CVE-2025-68725.patch
-#CVE-2025-68379
-Patch472:	CVE-2025-68379.patch
-#CVE-2025-68732
-Patch473:	CVE-2025-68732.patch
-#CVE-2025-68354
-Patch474:	CVE-2025-68354.patch
-#CVE-2025-68357
-Patch475:	CVE-2025-68357.patch
-#CVE-2025-68724
-Patch476:	CVE-2025-68724.patch
+Patch452:	CVE-2025-68725.patch
 #CVE-2025-68358
-Patch477:	CVE-2025-68358.patch
+Patch453:	CVE-2025-68358.patch
 #CVE-2025-68359
-Patch478:	CVE-2025-68359.patch
-#CVE-2025-68363
-Patch479:	CVE-2025-68363.patch
-#CVE-2025-68366
-Patch480:	CVE-2025-68366.patch
+Patch454:	CVE-2025-68359.patch
 #CVE-2025-68368
-Patch481:	CVE-2025-68368.patch
-#CVE-2025-68372
-Patch482:	CVE-2025-68372.patch
-#CVE-2025-68374
-Patch483:	CVE-2025-68374.patch
-#CVE-2025-68378
-Patch484:	CVE-2025-68378.patch
-#CVE-2025-68337
-Patch485:	CVE-2025-68337.patch
-#CVE-2025-68345
-Patch486:	CVE-2025-68345.patch
-#CVE-2025-68346
-Patch487:	CVE-2025-68346.patch
-#CVE-2025-68347
-Patch488:	CVE-2025-68347.patch
-#CVE-2025-68348
-Patch489:	CVE-2025-68348.patch
-#CVE-2025-68349
-Patch490:	CVE-2025-68349.patch
+Patch455:	CVE-2025-68368.patch
 #CVE-2025-68353
-Patch491:	CVE-2025-68353.patch
-#CVE-2025-68371
-Patch492:	CVE-2025-68371.patch
-#CVE-2025-68261
-Patch493:	CVE-2025-68261.patch
-#CVE-2025-68263
-Patch494:	CVE-2025-68263.patch
-#CVE-2025-68264
-Patch495:	CVE-2025-68264.patch
-#CVE-2025-68265
-Patch496:	CVE-2025-68265.patch
+Patch456:	CVE-2025-68353.patch
 #CVE-2025-68319
-Patch497:	CVE-2025-68319.patch
+Patch457:	CVE-2025-68319.patch
 #CVE-2025-68333
-Patch498:	CVE-2025-68333.patch
-#CVE-2025-68336
-Patch499:	CVE-2025-68336.patch
-#CVE-2025-68259
-Patch500:	CVE-2025-68259.patch
-#CVE-2025-68256
-Patch501:	CVE-2025-68256.patch
-#CVE-2025-68255
-Patch502:	CVE-2025-68255.patch
-#CVE-2025-68254
-Patch503:	CVE-2025-68254.patch
-#CVE-2025-68206
-Patch504:	CVE-2025-68206.patch
+Patch458:	CVE-2025-68333.patch
 #CVE-2025-68193
-Patch505:	CVE-2025-68193.patch
+Patch459:	CVE-2025-68193.patch
 #CVE-2025-40355
-Patch506:	CVE-2025-40355.patch
+Patch460:	CVE-2025-40355.patch
 #CVE-2025-40338
-Patch507:	CVE-2025-40338.patch
+Patch461:	CVE-2025-40338.patch
+#CVE-2026-23004
+Patch462:	CVE-2026-23004.patch
+#CVE-2026-22981
+Patch463:	CVE-2026-22981.patch
+#CVE-2026-22985
+Patch464:	CVE-2026-22985.patch
+Patch465:	CVE-2026-22985_2.patch
+#CVE-2026-22993
+Patch466:	CVE-2026-22993.patch
+#CVE-2025-71161
+Patch467:	CVE-2025-71161.patch
+#CVE-2025-68823
+Patch468:	CVE-2025-68823.patch
+#CVE-2025-71074
+Patch469:	CVE-2025-71074.patch
+#CVE-2025-68768
+Patch470:	CVE-2025-68768.patch
 # CVE Patches
 
 
@@ -795,8 +721,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.61
-%autosetup -p1 -n linux-6.12.61
+%setup -q -n linux-6.12.67
+%autosetup -p1 -n linux-6.12.67
 # %patch 0 -p1
 make mrproper
 
