@@ -23,5 +23,6 @@ declare -A BASE_PATH=(
 #     3 the name of the path variable
 declare -A KCONF_PATHS=(
     [1,dir,features_dir]='overlay/features'
-    [2,cfg,overlay]='overlay/overlay/overlay.cfg'
+    [2,$RK,$RK]='overlay/features/rt.cfg'
+    [3,cfg,overlay]='overlay/overlay/overlay.cfg'
 )
