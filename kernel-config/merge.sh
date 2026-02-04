@@ -7,6 +7,7 @@ mydir="$(cd $(dirname ${BASH_SOURCE[0]}); pwd)"
 # Import constants/variables from conf.sh:
 #   DK
 #   RK
+#   XK
 #   DVK
 #   BASE_PATH
 #   KCONF_PATHS
@@ -19,10 +20,11 @@ merge_opts='-m'
 #
 function usage() {
     cat << EO_USAGE
-Usage: $(basename $0) [-r] [-P] [MERGE_BRANCH [OVERLAY_VARIANT]]
-       $(basename $0) [-r] [-M] [-p KSRC_PATH] [-O OUT_PATH] [MERGE_BRANCH [OVERLAY_VARIANT]]
+Usage: $(basename $0) [-r|x] [-P] [MERGE_BRANCH [OVERLAY_VARIANT]]
+       $(basename $0) [-r|x] [-M] [-p KSRC_PATH] [-O OUT_PATH] [MERGE_BRANCH [OVERLAY_VARIANT]]
   Options:
-    -r           (Optional) Flag for merging the rt kernel config.
+    -r           (Optional) Flag for merging the RT kernel configs.
+    -x           (Optional) Flag for merging both RT and Xenomai kernel configs.
     -M           (Optional) Flag for running 'make olddefconfig' at the end.
     -P           (Optional) Only print the key-value pairs of KCONF_PATHS.
     -p KSRC_PATH (Optional) Specify the kernel source path, default is CWD.
@@ -47,15 +49,20 @@ function print_kconf_paths() {
 
 # parse the arguments
 arg_is_rt=1
+arg_is_xnm=1
 arg_make_odc=1
 # flag for only printing the path infomation
 arg_ppo=1
 arg_ksrc_path=''
 arg_out_path=''
-while getopts "rMp:O:Ph" opt; do
+while getopts "rxMp:O:Ph" opt; do
     case "$opt" in
       r)
         arg_is_rt=0
+        ;;
+      x)
+        arg_is_rt=0
+        arg_is_xnm=0
         ;;
       M)
         arg_make_odc=0
@@ -136,6 +143,14 @@ for k in $(printf '%s\n' "${!KCONF_PATHS[@]}" | sort); do
         if [ $arg_is_rt -eq 0 ]; then
             echo "Add $path to the merge list"
             cfglist="$cfglist $path"
+        fi
+        ;;
+      $XK)
+        if [ $arg_is_xnm -eq 0 ]; then
+            for cfg in "$path"/*.cfg; do
+                echo "Add $cfg to the merge list"
+                cfglist="$cfglist $cfg"
+            done
         fi
         ;;
     esac

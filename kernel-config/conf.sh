@@ -3,10 +3,12 @@
 #
 # Constants
 #
-# default key
-DK='default'
 # rt key
 RK='rt'
+# xenomai key
+XK='xnm'
+# default key
+DK='default'
 # default variant key
 DVK='deb'
 declare -A BASE_PATH=(
@@ -24,4 +26,5 @@ declare -A BASE_PATH=(
 declare -A KCONF_PATHS=(
     [1,dir,features_dir]='features'
     [2,$RK,$RK]='rt/rt.cfg'
+    [3,$XK,$XK]='xenomai'
 )
