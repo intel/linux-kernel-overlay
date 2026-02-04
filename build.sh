@@ -21,20 +21,8 @@ function setup()
 	# Update the kernel overlay patches
 	echo "Applying the Linux kernel overlay patches (to $BUILD_DIR)"
 	[ -d "./.pc" ] && rm ./.pc -rf
-	[ -d "./patches" ] && rm ./patches -rf
-	cp "$KSRC_OOT_PATCHES"/patches "$BUILD_DIR" -r
-
-	quilt push -a
-	res=$(quilt unapplied 2>&1 | head -n1 | awk -F',' '{print $1}')
-	if [ "$res" = "File series fully applied" ]; then
-		echo "##### Patch file series fully applied."
-
-	elif [ "$res" = 'No patches in series' ]; then
-		echo "##### No patches in series, continue to build."
-	else
-		echo "##### The patches has not been fully applied: ${res}."
-		exit 1
-	fi
+	git update-index --refresh
+	git quiltimport --patches "$KSRC_OOT_PATCHES"/patches
 
 	echo "Updating the kernel config"
 	cp "$KCFG_BASE_OS" "$BUILD_DIR"/.config
