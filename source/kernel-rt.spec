@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.18.14
-Release:        260227T024626Z%{?dist}
+Version:        6.18.15
+Release:        260303T044832Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.18.14.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.18.15.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -194,8 +194,8 @@ Patch165: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
 # audio
 Patch166: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
 Patch167: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
-# storage
-Patch168: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.storage
+# lpss
+Patch168: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.lpss
 # End of Patch section
 
 %global security_hardening none
@@ -345,8 +345,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.18.14
-%autosetup -p1 -n linux-6.18.14
+%setup -q -n linux-6.18.15
+%autosetup -p1 -n linux-6.18.15
 # %patch 0 -p1
 make mrproper
 
