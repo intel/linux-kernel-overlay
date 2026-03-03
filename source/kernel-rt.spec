@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.17.0
-Release:        251203T070700Z%{?dist}
+Version:        6.18.14
+Release:        260227T024626Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.18.14.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -16,304 +16,187 @@ Source6:        cpupower.service
 
 # Intel not-upstreamed kernel features
 # security
-Patch0:	0001-Add-security.md-file.security
-Patch1:	0001-issei-initial-driver-skeleton.security
-Patch2:	0002-issei-add-firmware-and-host-clients-implementatio.security
-Patch3:	0003-issei-implement-main-thread-and-ham-messages.security
-Patch4:	0004-issei-add-heci-hardware-module.security
-Patch5:	0005-issei-update-MAINTAINERS-file.security
-Patch6:	0001-Add-updated-TPR-TXT-Protected-Regions-support-to-.security
-# lpss
-Patch7:	0001-PCI-Apply-ASPM-L1-latency-quirk-to-Intel-DG2-Audio-en.lpss
-Patch8:	0002-PCI-portdrv-Do-not-require-an-interrupt-for-all-AER-c.lpss
-Patch9:	0003-PCI-Add-sysfs-attribute-for-disabling-PCIe-link-to-do.lpss
-Patch10:	0004-ACPI-hotplug-PCI-Take-runtime-PM-autosuspend-into-acc.lpss
-Patch11:	0005-spi-intel-pci-Add-support-for-Arrow-Lake-H-SPI-serial.lpss
-Patch12:	0006-mtd-core-Don-t-fail-mtd_device_parse_register-if-OTP-.lpss
-Patch13:	0007-spi-intel-Add-support-for-Intel-Wildcat-Lake-SPI-seri.lpss
-Patch14:	0008-spi-intel-Add-support-for-128M-component-density.lpss
-Patch15:	0009-mfd-intel-lpss-Add-Intel-Wildcat-Lake-LPSS-PCI-IDs.lpss
-Patch16:	0010-i2c-i801-Add-support-for-Intel-Wildcat-Lake-U.lpss
-Patch17:	0011-i2c-designware-Preliminary-SMBus-support.lpss
-Patch18:	0001-Added-spi_set_cs-for-more-stable-r-w-operations-in-SP.lpss
-# drm
-Patch19:	0001-drm-virtio-freeze-and-restore-hooks-to-support-suspend.drm
-Patch20:	0002-drm-virtio-save-and-restore-virtio_gpu_objects.drm
-Patch21:	0001-drm-xe-Upgrade-XE-GuC-to-the-latest-upstream.drm
-# sriov
-Patch22:	0001-drm-xe-xe_vm-bypass-vm_bind-failure-as-wa-to-enable-.sriov
-Patch23:	0001-drm-virtio-Wait-until-the-control-and-cursor-queues-.sriov
-# edac
-Patch24:	0001-EDAC-i10nm-Skip-DIMM-enumeration-on-a-disabled-memory.edac
-Patch25:	0002-EDAC-skx_common-skx-Use-configuration-data-not-global.edac
-Patch26:	0003-EDAC-skx_common-Move-mc_mapping-to-be-a-field-inside-.edac
-Patch27:	0004-EDAC-skx_common-Swap-memory-controller-index-mapping.edac
-Patch28:	0005-EDAC-skx_common-Make-skx_dev-imc-a-flexible-array.edac
-Patch29:	0006-EDAC-skx_common-Remove-redundant-upper-bound-check-fo.edac
-Patch30:	0007-EDAC-i10nm-Reallocate-skx_dev-list-if-preconfigured-c.edac
-Patch31:	0008-EDAC-skx_common-Remove-unused-NUM-_IMC-macros.edac
-Patch32:	0009-x86-mce-Add-MCACOD-code-for-generic-I-O-error.edac
-Patch33:	0010-EDAC-ieh-Add-I-O-device-EDAC-driver-for-Intel-CPUs-wi.edac
-Patch34:	0011-EDAC-ieh-Add-I-O-device-EDAC-support-for-Intel-Tiger-.edac
-Patch35:	0012-EDAC-igen6-Add-registration-APIs-for-In-Band-ECC-erro.edac
-Patch36:	0001-EDAC-igen6-Add-more-Intel-Panther-Lake-H-SoCs-support.edac
-# perf
-Patch37:	0001-perf-x86-msr-Make-SMI-and-PPERF-on-by-default.perf
-Patch38:	0002-perf-x86-intel-Add-a-check-for-dynamic-constraints.perf
-Patch39:	0003-perf-x86-intel-Use-early_initcall-to-hook-bts_init.perf
-Patch40:	0004-perf-x86-intel-Fix-IA32_PMC_x_CFG_B-MSRs-access-error.perf
-Patch41:	0005-perf-x86-Check-if-cpuc-events-pointer-exists-before-a.perf
-Patch42:	0006-perf-x86-Add-PERF_CAP_PEBS_TIMING_INFO-flag.perf
-Patch43:	0007-perf-x86-intel-Change-macro-GLOBAL_CTRL_EN_PERF_METRI.perf
-Patch44:	0008-perf-x86-intel-Add-ICL_FIXED_0_ADAPTIVE-bit-into-INTE.perf
-Patch45:	0009-perf-x86-Remove-helper-perf_events_lapic_init-from-x8.perf
-Patch46:	0010-perf-x86-intel-Fix-typo-in-comments-of-intel_put_even.perf
-Patch47:	0011-perf-x86-Fix-typos-and-inconsistent-indents-in-perf_e.perf
-Patch48:	0012-perf-x86-intel-Print-more-information-in-x86_pmu_show.perf
-Patch49:	0013-perf-x86-intel-Initialize-architectural-PEBS.perf
-Patch50:	0014-perf-x86-intel-ds-Factor-out-PEBS-record-processing-c.perf
-Patch51:	0015-perf-x86-intel-ds-Factor-out-PEBS-group-processing-co.perf
-Patch52:	0016-perf-x86-intel-Process-arch-PEBS-records-or-record-fr.perf
-Patch53:	0017-perf-x86-intel-Allocate-arch-PEBS-buffer-and-initiali.perf
-Patch54:	0018-perf-x86-intel-Update-dyn_constranit-base-on-PEBS-eve.perf
-Patch55:	0019-perf-x86-intel-Setup-PEBS-data-configuration-and-enab.perf
-Patch56:	0020-perf-x86-intel-Add-counter-group-support-for-arch-PEB.perf
-Patch57:	0021-perf-x86-intel-Support-SSP-register-capturing-for-arc.perf
-Patch58:	0022-perf-core-Support-to-capture-higher-width-vector-regi.perf
-Patch59:	0023-perf-x86-intel-Support-arch-PEBS-vector-registers-gro.perf
-Patch60:	0024-perf-tools-Support-to-show-SSP-register.perf
-Patch61:	0025-perf-tools-Enhance-arch__intr-user_reg_mask-helpers.perf
-Patch62:	0026-perf-tools-Enhance-sample_regs_user-intr-to-capture-m.perf
-Patch63:	0027-perf-tools-Support-to-capture-more-vector-registers-x.perf
-Patch64:	0028-perf-tools-tests-Add-vector-registers-PEBS-sampling-t.perf
-Patch65:	0029-perf-x86-intel-Add-PMU-support-for-WildcatLake.perf
-Patch66:	0030-perf-x86-uncore-Add-WildcatLake-uncore-support.perf
-Patch67:	0031-perf-evsel-Update-the-hint-for-the-usage-of-the-load-.perf
-Patch68:	0032-perf-x86-intel-cstate-Add-Clearwater-Forrest-support.perf
-Patch69:	0033-KVM-x86-pmu-Correct-typo-_COUTNERS-to-_COUNTERS.perf
-Patch70:	0034-KVM-selftests-Add-timing_info-bit-support-in-vmx_pmu_.perf
-Patch71:	0035-KVM-Selftests-Validate-more-arch-events-in-pmu_counte.perf
-Patch72:	0036-KVM-selftests-Relax-precise-event-count-validation-as.perf
-Patch73:	0037-KVM-selftests-Relax-branches-event-count-check-for-ev.perf
-Patch74:	0038-KVM-SVM-Skip-fastpath-emulation-on-VM-Exit-if-next-RI.perf
-Patch75:	0039-KVM-x86-Add-kvm_icr_to_lapic_irq-helper-to-allow-for-.perf
-Patch76:	0040-KVM-x86-Only-allow-fast-IPIs-in-fastpath-WRMSR-X2APIC.perf
-Patch77:	0041-KVM-x86-Drop-semi-arbitrary-restrictions-on-IPI-type-.perf
-Patch78:	0042-KVM-x86-Unconditionally-handle-MSR_IA32_TSC_DEADLINE-.perf
-Patch79:	0043-KVM-x86-Acquire-SRCU-in-WRMSR-fastpath-iff-instructio.perf
-Patch80:	0044-KVM-x86-Unconditionally-grab-data-from-EDX-EAX-in-WRM.perf
-Patch81:	0045-KVM-x86-Fold-WRMSR-fastpath-helpers-into-the-main-han.perf
-Patch82:	0046-KVM-x86-pmu-Move-kvm_init_pmu_capability-to-pmu.c.perf
-Patch83:	0047-KVM-x86-pmu-Add-wrappers-for-counting-emulated-instru.perf
-Patch84:	0048-KVM-x86-pmu-Calculate-set-of-to-be-emulated-PMCs-at-t.perf
-Patch85:	0049-KVM-x86-pmu-Rename-pmc_speculative_in_use-to-pmc_is_l.perf
-Patch86:	0050-KVM-x86-pmu-Open-code-pmc_event_is_allowed-in-its-cal.perf
-Patch87:	0051-KVM-x86-pmu-Drop-redundant-check-on-PMC-being-globall.perf
-Patch88:	0052-KVM-x86-pmu-Drop-redundant-check-on-PMC-being-locally.perf
-Patch89:	0053-KVM-x86-pmu-Rename-check_pmu_event_filter-to-pmc_is_e.perf
-Patch90:	0054-KVM-x86-Push-acquisition-of-SRCU-in-fastpath-into-kvm.perf
-Patch91:	0055-KVM-x86-Add-a-fastpath-handler-for-INVD.perf
-Patch92:	0056-perf-Skip-pmu_ctx-based-on-event_type.perf
-Patch93:	0057-perf-Add-generic-exclude_guest-support.perf
-Patch94:	0058-perf-Move-security_perf_event_free-call-to-__free_eve.perf
-Patch95:	0059-perf-Add-APIs-to-create-release-mediated-guest-vPMUs.perf
-Patch96:	0060-perf-Clean-up-perf-ctx-time.perf
-Patch97:	0061-perf-Add-a-EVENT_GUEST-flag.perf
-Patch98:	0062-perf-Add-APIs-to-load-put-guest-mediated-PMU-context.perf
-Patch99:	0063-perf-core-x86-Register-a-new-vector-for-handling-medi.perf
-Patch100:	0064-perf-x86-Switch-LVTPC-to-from-mediated-PMI-vector-on-.perf
-Patch101:	0065-perf-x86-core-Do-not-set-bit-width-for-unavailable-co.perf
-Patch102:	0066-perf-x86-core-Plumb-mediated-PMU-capability-from-x86_.perf
-Patch103:	0067-perf-x86-intel-Support-PERF_PMU_CAP_MEDIATED_VPMU.perf
-Patch104:	0068-perf-x86-amd-Support-PERF_PMU_CAP_MEDIATED_VPMU-for-A.perf
-Patch105:	0069-KVM-VMX-Setup-canonical-VMCS-config-prior-to-kvm_x86_.perf
-Patch106:	0070-KVM-SVM-Check-pmu-version-not-enable_pmu-when-getting.perf
-Patch107:	0071-KVM-Add-a-simplified-wrapper-for-registering-perf-cal.perf
-Patch108:	0072-KVM-x86-pmu-Snapshot-host-i.e.-perf-s-reported-PMU-ca.perf
-Patch109:	0073-KVM-x86-pmu-Start-stubbing-in-mediated-PMU-support.perf
-Patch110:	0074-KVM-x86-pmu-Implement-Intel-mediated-PMU-requirements.perf
-Patch111:	0075-KVM-x86-pmu-Implement-AMD-mediated-PMU-requirements.perf
-Patch112:	0076-KVM-x86-pmu-Register-PMI-handler-for-mediated-vPMU.perf
-Patch113:	0077-KVM-x86-Rename-vmx_vmentry-vmexit_ctrl-helpers.perf
-Patch114:	0078-KVM-x86-pmu-Move-PMU_CAP_-FW_WRITES-LBR_FMT-into-msr-.perf
-Patch115:	0079-KVM-x86-Rework-KVM_REQ_MSR_FILTER_CHANGED-into-a-gene.perf
-Patch116:	0080-KVM-x86-Use-KVM_REQ_RECALC_INTERCEPTS-to-react-to-CPU.perf
-Patch117:	0081-KVM-VMX-Add-helpers-to-toggle-change-a-bit-in-VMCS-ex.perf
-Patch118:	0082-KVM-x86-pmu-Disable-RDPMC-interception-for-compatible.perf
-Patch119:	0083-KVM-x86-pmu-Load-save-GLOBAL_CTRL-via-entry-exit-fiel.perf
-Patch120:	0084-KVM-x86-pmu-Use-BIT_ULL-instead-of-open-coded-equival.perf
-Patch121:	0085-KVM-x86-pmu-Move-initialization-of-valid-PMCs-bitmask.perf
-Patch122:	0086-KVM-x86-pmu-Restrict-GLOBAL_-CTRL-STATUS-fixed-PMCs-a.perf
-Patch123:	0087-KVM-x86-pmu-Disable-interception-of-select-PMU-MSRs-f.perf
-Patch124:	0088-KVM-x86-pmu-Bypass-perf-checks-when-emulating-mediate.perf
-Patch125:	0089-KVM-x86-pmu-Introduce-eventsel_hw-to-prepare-for-pmu-.perf
-Patch126:	0090-KVM-x86-pmu-Reprogram-mediated-PMU-event-selectors-on.perf
-Patch127:	0091-KVM-x86-pmu-Always-stuff-GuestOnly-1-HostOnly-0-for-m.perf
-Patch128:	0092-KVM-x86-pmu-Load-put-mediated-PMU-context-when-enteri.perf
-Patch129:	0093-KVM-x86-pmu-Disallow-emulation-in-the-fastpath-if-med.perf
-Patch130:	0094-KVM-x86-pmu-Handle-emulated-instruction-for-mediated-.perf
-Patch131:	0095-KVM-nVMX-Add-macros-to-simplify-nested-MSR-intercepti.perf
-Patch132:	0096-KVM-nVMX-Disable-PMU-MSR-interception-as-appropriate-.perf
-Patch133:	0097-KVM-nSVM-Disable-PMU-MSR-interception-as-appropriate-.perf
-Patch134:	0098-KVM-x86-pmu-Expose-enable_mediated_pmu-parameter-to-u.perf
-Patch135:	0099-KVM-x86-pmu-Elide-WRMSRs-when-loading-guest-PMCs-if-v.perf
-Patch136:	0100-perf-x86-intel-Fix-KASAN-global-out-of-bounds-warning.perf
-Patch137:	0001-KVM-x86-pmu-Fix-the-warning-in-perf_get_x86_pmu_capab.perf
-# cet
-Patch138:	0001-KVM-x86-Rename-kvm_-g-s-et_msr-to-show-that-they-emula.cet
-Patch139:	0002-KVM-x86-Use-double-underscore-read-write-MSR-helpers-a.cet
-Patch140:	0003-KVM-x86-Add-kvm_msr_-read-write-helpers.cet
-Patch141:	0004-KVM-x86-Manually-clear-MPX-state-only-on-INIT.cet
-Patch142:	0005-KVM-x86-Zero-XSTATE-components-on-INIT-by-iterating-ov.cet
-Patch143:	0006-KVM-x86-Introduce-KVM_-G-S-ET_ONE_REG-uAPIs-support.cet
-Patch144:	0007-KVM-x86-Report-XSS-as-to-be-saved-if-there-are-support.cet
-Patch145:	0008-KVM-x86-Refresh-CPUID-on-write-to-guest-MSR_IA32_XSS.cet
-Patch146:	0009-KVM-x86-Initialize-kvm_caps.supported_xss.cet
-Patch147:	0010-KVM-x86-Load-guest-FPU-state-when-access-XSAVE-managed.cet
-Patch148:	0011-KVM-x86-Add-fault-checks-for-guest-CR4.CET-setting.cet
-Patch149:	0012-KVM-x86-Report-KVM-supported-CET-MSRs-as-to-be-saved.cet
-Patch150:	0013-KVM-VMX-Introduce-CET-VMCS-fields-and-control-bits.cet
-Patch151:	0014-KVM-x86-Enable-guest-SSP-read-write-interface-with-new.cet
-Patch152:	0015-KVM-VMX-Emulate-read-and-write-to-CET-MSRs.cet
-Patch153:	0016-KVM-x86-Save-and-reload-SSP-to-from-SMRAM.cet
-Patch154:	0017-KVM-VMX-Set-up-interception-for-CET-MSRs.cet
-Patch155:	0018-KVM-VMX-Set-host-constant-supervisor-states-to-VMCS-fi.cet
-Patch156:	0019-KVM-x86-Don-t-emulate-instructions-guarded-by-CET.cet
-Patch157:	0020-KVM-x86-Enable-CET-virtualization-for-VMX-and-advertis.cet
-Patch158:	0021-KVM-nVMX-Virtualize-NO_HW_ERROR_CODE_CC-for-L1-event-i.cet
-Patch159:	0022-KVM-nVMX-Enable-CET-support-for-nested-guest.cet
-Patch160:	0023-KVM-nVMX-Add-consistency-checks-for-CR0.WP-and-CR4.CET.cet
-Patch161:	0024-KVM-nVMX-Add-consistency-checks-for-CET-states.cet
-# nmi
-Patch162:	0001-KVM-VMX-Add-host-MSR-read-write-helpers-to-consolidate.nmi
-Patch163:	0002-KVM-VMX-Add-support-for-the-secondary-VM-exit-controls.nmi
-Patch164:	0003-KVM-VMX-Initialize-VM-entry-exit-FRED-controls-in-vmcs.nmi
-Patch165:	0004-KVM-VMX-Disable-FRED-if-FRED-consistency-checks-fail.nmi
-Patch166:	0005-x86-cea-Export-an-API-to-get-per-CPU-exception-stacks-.nmi
-Patch167:	0006-KVM-VMX-Initialize-VMCS-FRED-fields.nmi
-Patch168:	0007-KVM-VMX-Set-FRED-MSR-intercepts.nmi
-Patch169:	0008-KVM-VMX-Save-restore-guest-FRED-RSP0.nmi
-Patch170:	0009-KVM-VMX-Add-support-for-FRED-context-save-restore.nmi
-Patch171:	0010-KVM-x86-Add-a-helper-to-detect-if-FRED-is-enabled-for-.nmi
-Patch172:	0011-KVM-VMX-Virtualize-FRED-event_data.nmi
-Patch173:	0012-KVM-VMX-Virtualize-FRED-nested-exception-tracking.nmi
-Patch174:	0013-KVM-x86-Save-restore-the-nested-flag-of-an-exception.nmi
-Patch175:	0014-KVM-x86-Mark-CR4.FRED-as-not-reserved.nmi
-Patch176:	0015-KVM-VMX-Dump-FRED-context-in-dump_vmcs.nmi
-Patch177:	0016-KVM-x86-Advertise-support-for-FRED.nmi
-Patch178:	0017-KVM-nVMX-Add-support-for-the-secondary-VM-exit-control.nmi
-Patch179:	0018-KVM-nVMX-Add-FRED-VMCS-fields-to-nested-VMX-context-ha.nmi
-Patch180:	0019-KVM-nVMX-Add-FRED-related-VMCS-field-checks.nmi
-Patch181:	0020-KVM-nVMX-Add-prerequisites-to-SHADOW_FIELD_R-OW-macros.nmi
-Patch182:	0021-KVM-nVMX-Allow-VMX-FRED-controls.nmi
-Patch183:	0022-x86-fred-Enable-FRED-by-default.nmi
-Patch184:	0023-x86-entry-fred-Simply-push-__KERNEL_CS.nmi
-Patch185:	0024-KVM-selftests-Run-debug_regs-test-with-FRED-enabled.nmi
-Patch186:	0025-KVM-selftests-Add-a-new-VM-guest-mode-to-run-user-leve.nmi
-Patch187:	0026-KVM-selftests-Add-fred-exception-tests.nmi
-Patch188:	0027-KVM-selftests-Add-the-2nd-VM-exit-controls-MSR-to-the-.nmi
-Patch189:	0028-task_stack.h-Add-a-new-helper-task_empty_stack_pointer.nmi
-Patch190:	0029-x86-fred-Allow-variable-sized-event-frame.nmi
-Patch191:	0030-x86-Remove-the-padding-space-at-top-of-the-init-stack.nmi
-Patch192:	0031-x86-fred-Provide-separate-IRQ-vs.-NMI-wrappers-for-ent.nmi
-Patch193:	0032-x86-fred-Pass-event-data-to-the-NMI-entry-point-from-K.nmi
-Patch194:	0033-x86-cpufeatures-Add-the-CPUID-feature-bit-for-NMI-sour.nmi
-Patch195:	0034-x86-nmi-Extend-the-registration-interface-to-include-t.nmi
-Patch196:	0035-x86-nmi-Assign-and-register-NMI-source-vectors.nmi
-Patch197:	0036-x86-nmi-Add-support-to-handle-NMIs-with-source-informa.nmi
-Patch198:	0037-x86-nmi-Prepare-for-the-new-NMI-source-vector-encoding.nmi
-Patch199:	0038-x86-nmi-Enable-NMI-source-for-IPIs-delivered-as-NMIs.nmi
-Patch200:	0039-perf-x86-Enable-NMI-source-reporting-for-perfmon.nmi
-Patch201:	0040-x86-nmi-Print-source-information-with-the-unknown-NMI-.nmi
-Patch202:	0041-x86-nmi-Include-source-information-in-NMI-handler-trac.nmi
-Patch203:	0042-KVM-VMX-Implement-NMI-source-injection.nmi
-Patch204:	0043-KVM-x86-Advise-NMI-Source-to-user-space.nmi
-Patch205:	0044-EDAC-ieh-Fix-a-compile-error.nmi
-Patch206:	0001-x86-fred-Revert-x86-fred-Enable-FRED-by-default.nmi
-# ipu
-Patch207:	0001-media-ipu7-IPU7-driver-release-for-PTL-Beta-v6.17-iot.ipu
-Patch208:	0002-INT3472-Support-LT6911GXD.ipu
-Patch209:	0003-media-i2c-add-support-for-lt6911gxd.ipu
-Patch210:	0004-media-pci-enable-lt6911gxd-in-ipu-bridge.ipu
-Patch211:	0005-ipu-bridge-add-CPHY-support.ipu
-Patch212:	0006-media-ipu-Dma-sync-at-buffer_prepare-callback-as-DMA-i.ipu
-Patch213:	0007-staging-media-ipu7-remove-from-the-Makefile-Kconfig.ipu
-Patch214:	0008-media-pci-Enable-IPU7-in-Makefile-Kconfig.ipu
-Patch215:	0009-max9x-add-config-in-makefile-kconfig.ipu
-Patch216:	0010-drivers-media-set-v4l2_subdev_enable_streams_api-true-.ipu
-Patch217:	0011-ipu7-media-Fix-allyesconfig-allmodconfig.ipu
-Patch218:	0001-IPU7-media-pci-Add-platform-data-config.ipu
-Patch219:	0001-media-i2c-max9x-fix-S3-S4-error-for-max9x.ipu
-Patch220:	0002-media-i2c-max9x-uniform-serdes-driver-compilation.ipu
-Patch221:	0001-Revert-media-i2c-max9x-uniform-serdes-driver-compilati.ipu
-Patch222:	0002-Revert-media-i2c-max9x-fix-S3-S4-error-for-max9x.ipu
-# iaa
-Patch223:	0001-dmaengine-idxd-Add-a-new-IAA-device-ID-for-Wildcat-Lak.iaa
-# tbt
-Patch224:	0001-thunderbolt-Add-support-for-Intel-Wildcat-Lake.tbt
-Patch225:	0002-thunderbolt-Make-XDomain-lane-bonding-comply-with-the-.tbt
-Patch226:	0003-net-thunderbolt-Allow-changing-MTU-of-the-device.tbt
-Patch227:	0004-thunderbolt-Add-Kconfig-option-to-disable-PCIe-tunneli.tbt
-# conn
-Patch228:	0001-Bluetooth-btintel-Add-support-for-BlazarIW-core.conn
-# pmc_core
-Patch229:	0001-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
-# i3c
-Patch230:	0001-i3c-mipi-i3c-hci-pci-Add-support-for-Intel-Wildcat-Lak.i3c
-Patch231:	0002-i3c-master-Add-helpers-for-DMA-mapping-and-bounce-buff.i3c
-Patch232:	0003-i3c-mipi-i3c-hci-Use-core-helpers-for-DMA-mapping-and-.i3c
-Patch233:	0004-i3c-mipi-i3c-hci-Use-physical-device-pointer-with-DMA-.i3c
-Patch234:	0005-i3c-mipi-i3c-hci-Use-own-DMA-bounce-buffer-management-.i3c
-Patch235:	0006-i3c-mipi-i3c-hci-Change-interrupt-status-prints-to-dev.i3c
-Patch236:	0007-i3c-mipi-i3c-hci-Remove-nonexistent-ring-interrupt.i3c
-Patch237:	0008-i3c-mipi-i3c-hci-Uniform-ring-number-printouts.i3c
-Patch238:	0009-i3c-mipi-i3c-hci-Remove-function-enter-DBG-printouts.i3c
-Patch239:	0010-i3c-mipi-i3c-hci-Convert-remaining-DBG-prints-to-dev_d.i3c
-Patch240:	0011-i3c-Fix-default-I2C-adapter-timeout-value.i3c
-Patch241:	0002-platform-x86-intel-pmc-Add-Wildcat-Lake-support-t.pmc_core
+Patch0: 0001-Add-security.md-file.security
+Patch1: 0002-Add-updated-TPR-TXT-Protected-Regions-support-to-.security
+Patch2: 0001-mei-bus-fix-device-leak.security
+Patch3: 0002-mei-bus-add-api-to-query-capabilities-of-ME-clien.security
+Patch4: 0003-mei-expose-device-kind-for-ioe-device.security
+Patch5: 0004-mei-virtio-virtualization-frontend-driver.security
+Patch6: 0005-INTEL_DII-mei-avoid-reset-if-fw-is-down.security
+Patch7: 0006-INTEL_DII-mei-iaf-add-iaf-Intel-Accelerator-Fabri.security
+Patch8: 0007-INTEL_DII-mei-add-check-for-offline-bit-in-every-.security
+Patch9: 0008-INTEL_DII-mei-add-empty-handlers-for-ops-function.security
+Patch10: 0001-issei-initial-driver-skeleton.security
+Patch11: 0002-issei-add-firmware-and-host-clients-implementatio.security
+Patch12: 0003-issei-implement-main-thread-and-ham-messages.security
+Patch13: 0004-issei-add-heci-hardware-module.security
+Patch14: 0005-issei-update-MAINTAINERS-file.security
+Patch15: 0006-issei-host_client-add-dma-allocation-support.security
+Patch16: 0007-issei-add-driver-to-driver-interface.security
+# preempt-rt
+Patch17: 0001-drm-i915-Use-preempt_disable-enable_rt-where-recommende.rt
+Patch18: 0002-drm-i915-Don-t-disable-interrupts-on-PREEMPT_RT-during-.rt
+Patch19: 0003-drm-i915-Disable-tracing-points-on-PREEMPT_RT.rt
+Patch20: 0004-drm-i915-gt-Use-spin_lock_irq-instead-of-local_irq_disa.rt
+Patch21: 0005-drm-i915-Drop-the-irqs_disabled-check.rt
+Patch22: 0006-drm-i915-guc-Consider-also-RCU-depth-in-busy-loop.rt
+Patch23: 0007-drm-i915-Consider-RCU-read-section-as-atomic.rt
+Patch24: 0008-Revert-drm-i915-Depend-on-PREEMPT_RT.rt
+Patch25: 0009-sysfs-Add-sys-kernel-realtime-entry.rt
+# rapl
+Patch26: 0003-cpuidle-Add-sanity-check-for-exit-latency-and-target-.rapl
+Patch27: 0004-cpuidle-teo-Use-this_cpu_ptr-where-possible.rapl
+Patch28: 0006-cpuidle-governors-teo-Drop-redundant-function-paramet.rapl
+Patch29: 0007-cpuidle-governors-teo-Use-s64-consistently-in-teo_upd.rapl
+Patch30: 0008-cpuidle-governors-teo-Decay-metrics-below-DECAY_SHIFT.rapl
+Patch31: 0010-cpuidle-governors-teo-Rework-the-handling-of-tick-wak.rapl
+Patch32: 0011-cpuidle-governors-teo-Fix-tick_intercepts-handling-in.rapl
+Patch33: 0012-cpuidle-governors-teo-Simplify-intercepts-based-state.rapl
+Patch34: 0013-powercap-intel_rapl-Prepare-read_raw-interface-for-at.rapl
+Patch35: 0014-powercap-intel_rapl-Enable-MSR-based-RAPL-PMU-support.rapl
+Patch36: 0015-cpuidle-governors-teo-Add-missing-space-to-the-descri.rapl
+Patch37: 0016-cpuidle-Update-header-inclusion.rapl
+Patch38: 0017-cpuidle-Warn-instead-of-bailing-out-if-target-residen.rapl
+# turbo
+Patch39: 0002-tools-power-turbostat-Add-Wildcat-Lake-and-Nova-Lake.turbo
+Patch40: 0003-tools-power-turbostat-Refactor-added-column-header-p.turbo
+Patch41: 0004-tools-power-turbostat-Refactor-added-counter-value-p.turbo
+Patch42: 0005-tools-power-turbostat.8-Update-example.turbo
+Patch43: 0006-tools-power-turbostat-Refactor-floating-point-printo.turbo
+Patch44: 0007-tools-power-turbostat-Remove-dead-code.turbo
+Patch45: 0008-tools-power-turbostat-Add-LLC-stats.turbo
+Patch46: 0009-tools-power-turbostat-Set-per_cpu_msr_sum-to-NULL-af.turbo
+Patch47: 0010-tools-power-turbostat-Add-run-time-MSR-driver-probe.turbo
+Patch48: 0011-tools-power-x86_energy_perf_policy-Add-Android-MSR-d.turbo
+Patch49: 0012-tools-power-x86_energy_perf_policy-Simplify-Android-.turbo
+Patch50: 0013-tools-power-x86_energy_perf_policy-Fix-format-string.turbo
+Patch51: 0014-tools-power-x86_energy_perf_policy-Fix-potential-NUL.turbo
+Patch52: 0015-tools-power-turbostat-Validate-RAPL-MSRs-for-AWS-Nit.turbo
+Patch53: 0016-tools-power-turbostat-Enhance-perf-probe.turbo
+Patch54: 0017-tools-power-turbostat-Validate-APERF-access-for-VMWA.turbo
+Patch55: 0018-tools-power-turbostat-Print-nan-for-out-of-range-per.turbo
+Patch56: 0019-tools-power-turbostat-Print-percentages-in-8-columns.turbo
+Patch57: 0020-tools-power-turbostat-Print-wide-names-only-for-RAW-.turbo
+Patch58: 0021-tools-power-turbostat-version-2025.12.02.turbo
 # ethernet
-Patch242:	0001-igc-Only-dump-registers-if-configured-to-dump-HW-.ethernet
-Patch243:	0002-igc-Add-support-for-DMA-timestamp-for-non-PTP-pac.ethernet
-Patch244:	0003-bpf-add-btf-register-unregister-API.ethernet
-Patch245:	0004-net-core-XDP-metadata-BTF-netlink-API.ethernet
-Patch246:	0005-rtnetlink-Fix-unchecked-return-value-of-dev_xdp_q.ethernet
-Patch247:	0006-rtnetlink-Add-return-value-check.ethernet
-Patch248:	0007-tools-bpf-Query-XDP-metadata-BTF-ID.ethernet
-Patch249:	0008-tools-bpf-Add-xdp-set-command-for-md-btf.ethernet
-Patch250:	0009-igc-Add-BTF-based-metadata-for-XDP.ethernet
-Patch251:	0010-igc-Enable-HW-RX-Timestamp-for-AF_XDP-ZC.ethernet
-Patch252:	0011-igc-Take-care-of-DMA-timestamp-rollover.ethernet
-Patch253:	0012-igc-Add-SO_TXTIME-for-AF_XDP-ZC.ethernet
-Patch254:	0013-igc-Reodering-the-empty-packet-buffers-and-descri.ethernet
-Patch255:	0014-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
-Patch256:	0015-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
-Patch257:	0016-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
-Patch258:	0017-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
-Patch259:	0018-xsk-add-txtime-field-in-xdp_desc-struct.ethernet
-Patch260:	0019-igc-fix-race-condition-in-TX-timestamp-read-for-r.ethernet
+Patch59: 0001-igc-Only-dump-registers-if-configured-to-dump-HW-.ethernet
+Patch60: 0002-af_packet-Fix-wrong-timestamps-in-tcpdump.ethernet
+Patch61: 0001-igc-Add-support-for-DMA-timestamp-for-non-PTP-pac.ethernet
+Patch62: 0002-bpf-add-btf-register-unregister-API.ethernet
+Patch63: 0003-net-core-XDP-metadata-BTF-netlink-API.ethernet
+Patch64: 0004-rtnetlink-Fix-unchecked-return-value-of-dev_xdp_q.ethernet
+Patch65: 0005-rtnetlink-Add-return-value-check.ethernet
+Patch66: 0006-tools-bpf-Query-XDP-metadata-BTF-ID.ethernet
+Patch67: 0007-tools-bpf-Add-xdp-set-command-for-md-btf.ethernet
+Patch68: 0008-igc-Add-BTF-based-metadata-for-XDP.ethernet
+Patch69: 0009-igc-Enable-HW-RX-Timestamp-for-AF_XDP-ZC.ethernet
+Patch70: 0010-igc-Take-care-of-DMA-timestamp-rollover.ethernet
+Patch71: 0011-igc-Enable-HW-TX-Timestamp-for-AF_XDP-ZC.ethernet
+Patch72: 0012-igc-Enable-trace-for-HW-TX-Timestamp-AF_XDP-ZC.ethernet
+Patch73: 0013-igc-Remove-the-CONFIG_DEBUG_MISC-condition-for-tr.ethernet
+Patch74: 0014-igc-Remove-XDP-metadata-invalidation.ethernet
+Patch75: 0001-net-pcs-xpcs-enable-xpcs-reset-skipping.ethernet
+Patch76: 0002-net-stmmac-Bugfix-on-stmmac_interrupt-for-WOL.ethernet
+Patch77: 0003-net-phy-increase-gpy-loopback-test-delay.ethernet
+Patch78: 0004-net-stmmac-Resolve-poor-line-rate-after-switching.ethernet
+Patch79: 0005-net-phy-dp83867-perform-restart-AN-after-modifyin.ethernet
+Patch80: 0006-net-stmmac-Adjust-mac_capabilities-for-Intel-mGbE.ethernet
+Patch81: 0007-stmmac-intel-skip-xpcs-reset-for-2.5Gbps-on-Intel.ethernet
+Patch82: 0008-net-stmmac-add-check-for-2.5G-mode-to-prevent-MAC.ethernet
+Patch83: 0009-stmmac-intel-Enable-PHY-WoL-in-ADL-N.ethernet
+Patch84: 0010-net-phy-reconfigure-PHY-WoL-when-WoL-option-is-en.ethernet
+Patch85: 0011-net-stmmac-Set-mac_managed_pm-flag-from-stmmac-to.ethernet
+Patch86: 0012-net-phylink-Add-module_exit.ethernet
+Patch87: 0013-net-stmmac-restructure-Rx-Tx-hardware-timestampin.ethernet
+Patch88: 0014-net-stmmac-introduce-AF_XDP-ZC-RX-HW-timestamps.ethernet
+Patch89: 0015-net-stmmac-add-fsleep-in-HW-Rx-timestamp-checking.ethernet
+Patch90: 0016-net-stmmac-introduce-AF_XDP-ZC-TX-HW-timestamps.ethernet
+Patch91: 0017-net-phy-Set-eee_cfg.eee_enabled-according-to-PHY.ethernet
+Patch92: 0018-net-stmmac-intel-Initialize-plat-phy_interfaces-i.ethernet
+# nmi
+Patch93: 0001-KVM-VMX-Enable-support-for-secondary-VM-exit-controls.nmi
+Patch94: 0002-KVM-VMX-Initialize-VM-entry-exit-FRED-controls-in-vmcs.nmi
+Patch95: 0003-KVM-VMX-Disable-FRED-if-FRED-consistency-checks-fail.nmi
+Patch96: 0004-x86-cea-Prefix-event-stack-names-with-ESTACK_.nmi
+Patch97: 0005-x86-cea-Use-array-indexing-to-simplify-exception-stack.nmi
+Patch98: 0006-x86-cea-Export-__this_cpu_ist_top_va-to-KVM.nmi
+Patch99: 0007-KVM-VMX-Initialize-VMCS-FRED-fields.nmi
+Patch100: 0008-KVM-VMX-Set-FRED-MSR-intercepts.nmi
+Patch101: 0009-KVM-VMX-Save-restore-guest-FRED-RSP0.nmi
+Patch102: 0010-KVM-VMX-Add-support-for-saving-and-restoring-FRED-MSRs.nmi
+Patch103: 0011-KVM-x86-Add-a-helper-to-detect-if-FRED-is-enabled-for-.nmi
+Patch104: 0012-KVM-VMX-Virtualize-FRED-event_data.nmi
+Patch105: 0013-KVM-VMX-Virtualize-FRED-nested-exception-tracking.nmi
+Patch106: 0014-KVM-x86-Save-restore-the-nested-flag-of-an-exception.nmi
+Patch107: 0015-KVM-x86-Mark-CR4.FRED-as-not-reserved.nmi
+Patch108: 0016-KVM-VMX-Dump-FRED-context-in-dump_vmcs.nmi
+Patch109: 0017-KVM-x86-Advertise-support-for-FRED.nmi
+Patch110: 0018-KVM-nVMX-Enable-support-for-secondary-VM-exit-controls.nmi
+Patch111: 0019-KVM-nVMX-Handle-FRED-VMCS-fields-in-nested-VMX-context.nmi
+Patch112: 0020-KVM-nVMX-Validate-FRED-related-VMCS-fields.nmi
+Patch113: 0021-KVM-nVMX-Guard-SHADOW_FIELD_R-OW-macros-with-VMX-featu.nmi
+Patch114: 0022-KVM-nVMX-Enable-VMX-FRED-controls.nmi
+Patch115: 0023-KVM-selftests-Run-debug_regs-test-with-FRED-enabled.nmi
+Patch116: 0024-KVM-selftests-Add-a-new-VM-guest-mode-to-run-user-leve.nmi
+Patch117: 0025-KVM-selftests-Add-fred-exception-tests.nmi
+Patch118: 0026-KVM-selftests-Add-the-2nd-VM-exit-controls-MSR-to-the-.nmi
+Patch119: 0027-task_stack.h-Add-a-new-helper-task_empty_stack_pointer.nmi
+Patch120: 0028-x86-fred-Allow-variable-sized-event-frame.nmi
+Patch121: 0029-x86-Remove-the-padding-space-at-top-of-the-init-stack.nmi
+Patch122: 0030-x86-fred-Provide-separate-IRQ-vs.-NMI-wrappers-for-ent.nmi
+Patch123: 0031-x86-fred-Pass-event-data-to-the-NMI-entry-point-from-K.nmi
+Patch124: 0032-x86-cpufeatures-Add-the-CPUID-feature-bit-for-NMI-sour.nmi
+Patch125: 0033-x86-nmi-Extend-the-registration-interface-to-include-t.nmi
+Patch126: 0034-x86-nmi-Assign-and-register-NMI-source-vectors.nmi
+Patch127: 0035-x86-nmi-Add-support-to-handle-NMIs-with-source-informa.nmi
+Patch128: 0036-x86-nmi-Prepare-for-the-new-NMI-source-vector-encoding.nmi
+Patch129: 0037-x86-nmi-Enable-NMI-source-for-IPIs-delivered-as-NMIs.nmi
+Patch130: 0038-perf-x86-Enable-NMI-source-reporting-for-perfmon.nmi
+Patch131: 0039-x86-nmi-Print-source-information-with-the-unknown-NMI-.nmi
+Patch132: 0040-x86-nmi-Include-source-information-in-NMI-handler-trac.nmi
+Patch133: 0041-KVM-VMX-Implement-NMI-source-injection.nmi
+Patch134: 0042-KVM-x86-Advise-NMI-Source-to-user-space.nmi
+Patch135: 0043-x86-fred-Enable-FRED-by-default.nmi
+Patch136: 0044-fixup-KVM-VMX-Handle-MCs-on-VM-Enter-TD-Enter-outside-.nmi
+# drm
+Patch137: 0001-drm-xe-xe_vm-bypass-vm_bind-failure-as-wa-to-enable-hw.drm
+Patch138: 0002-drm-virtio-freeze-and-restore-hooks-to-support-suspend.drm
+Patch139: 0003-drm-virtio-save-and-restore-virtio_gpu_objects.drm
+Patch140: 0001-drm-xe-Upgrade-PTL-and-BMG-GuC-to-70.55.3-MTL-LNL-DG2-.drm
+Patch141: 0001-i915-gt-Upgrade-GuCs-accordingly-to-20260110-baselin.drm
+Patch142: 0001-i915-gt-GuC-for-legacy-platform.drm
+# edcac
+Patch143: 0001-EDAC-igen6-Add-two-Intel-Amston-Lake-SoCs-support.edac
+Patch144: 0002-EDAC-igen6-Add-more-Intel-Panther-Lake-H-SoCs-support.edac
+Patch145: 0003-EDAC-igen6-Fix-masks-of-MCHBAR-TOM-TOUUD-registers.edac
+# perf
+Patch146: 0001-perf-x86-intel-cstate-Add-Pantherlake-support.perf
+Patch147: 0002-perf-x86-intel-uncore-Move-uncore-discovery-init-stru.perf
+Patch148: 0003-perf-x86-intel-uncore-Support-per-platform-discovery-.perf
+Patch149: 0004-perf-x86-intel-uncore-Remove-has_generic_discovery_ta.perf
+Patch150: 0005-perf-x86-intel-uncore-Add-IMH-PMON-support-for-Diamon.perf
+Patch151: 0006-perf-x86-intel-uncore-Add-CBB-PMON-support-for-Diamon.perf
+Patch152: 0007-perf-x86-intel-uncore-Add-domain-global-init-callback.perf
+Patch153: 0008-perf-x86-intel-uncore-Add-freerunning-event-descripto.perf
+Patch154: 0009-perf-x86-intel-uncore-Support-IIO-free-running-counte.perf
+Patch155: 0010-perf-x86-intel-uncore-Support-uncore-constraint-range.perf
+Patch156: 0011-perf-x86-intel-uncore-Update-DMR-uncore-constraints-p.perf
+Patch157: 0012-perf-pmu-Relax-uncore-wildcard-matching-to-allow-nume.perf
+Patch158: 0013-perf-x86-intel-uncore-Add-missing-PMON-units-for-Pant.perf
+# pmt
+Patch159: 0001-platform-x86-intel-vsec-Add-support-for-Wildcat-Lake.pmt
+Patch160: 0001-platform-x86-intel-pmc-Add-support-for-multiple-DMU-GU.pmt
+Patch161: 0002-platform-x86-intel-pmc-Add-DMU-GUID-to-Arrow-Lake-U-H.pmt
+Patch162: 0003-platform-x86-intel-pmc-Rename-PMC-index-variable-to-pm.pmt
+Patch163: 0004-platform-x86-intel-pmc-Relocate-lpm_req_guid-to-pmc_re.pmt
+Patch164: 0005-platform-x86-intel-pmc-Remove-redundant-has_die_c6-var.pmt
+Patch165: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
 # audio
-Patch261:	0001-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
-Patch262:	0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
-# rt
-Patch263:	0001-mei-gsc-add-dependency-on-Xe-driver.rt
-Patch264:	0002-drm-me-gsc-mei-interrupt-top-half-should-be-in-irq-disa.rt
-# thermal
-Patch265:	0001-thermal-intel-int340x-Remove-redundant-acpi_has_me.thermal
-Patch266:	0002-thermal-intel-int340x-Add-support-for-power-slider.thermal
-Patch267:	0003-thermal-intel-int340x-Enable-power-slider-interfac.thermal
-Patch268:	0004-thermal-intel-int340x-Add-module-parameter-for-bal.thermal
-Patch269:	0005-thermal-intel-int340x-Add-module-parameter-to-chan.thermal
-Patch270:	0006-thermal-gov_step_wise-Clean-up-local-variable-init.thermal
-Patch271:	0007-thermal-gov_step_wise-Clarify-cooling-logic-descri.thermal
-Patch272:	0008-thermal-gov_step_wise-Allow-cooling-level-to-be-re.thermal
-Patch273:	0009-thermal-intel-selftests-workload_hint-Mask-unsuppo.thermal
-Patch274:	0010-thermal-testing-Rearrange-variable-declarations-in.thermal
-Patch275:	0011-thermal-hwmon-replace-deprecated-strcpy-with-strsc.thermal
-Patch276:	0012-thermal-intel-int340x-Power-Slider-Validate-slider.thermal
-Patch277:	0013-platform-x86-intel-hid-Add-Nova-Lake-support.thermal
-# uncore-frequency
-Patch278:	0001-platform-x86-intel-uncore-freq-Add-additi.uncore-frequency
-# CVE Patches
+Patch166: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
+Patch167: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+# storage
+Patch168: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.storage
+# End of Patch section
 
 %global security_hardening none
 %global sha512hmac bash %{_sourcedir}/sha512hmac-openssl.sh
@@ -395,7 +278,7 @@ Requires(postun): coreutils
 The kernel package contains the Linux kernel.
 
 %package devel
-Summary:        Kernel Dev
+Summary:        Preempt RT Linux Kernel
 Group:          System Environment/Kernel
 Requires:       %{name} = %{version}-%{release}
 Requires:       gawk
@@ -406,7 +289,7 @@ Obsoletes:      linux-dev
 This package contains the Linux kernel dev files
 
 %package drivers-accessibility
-Summary:        Kernel accessibility modules
+Summary:        Preempt RT Linux Kernel
 Group:          System Environment/Kernel
 Requires:       %{name} = %{version}-%{release}
 
@@ -414,7 +297,7 @@ Requires:       %{name} = %{version}-%{release}
 This package contains the Linux kernel accessibility support
 
 %package drivers-gpu
-Summary:        Kernel gpu modules
+Summary:        Preempt RT Linux Kernel
 Group:          System Environment/Kernel
 Requires:       %{name} = %{version}-%{release}
 
@@ -422,7 +305,7 @@ Requires:       %{name} = %{version}-%{release}
 This package contains the Linux kernel gpu support
 
 %package drivers-sound
-Summary:        Kernel Sound modules
+Summary:        Preempt RT Linux Kernel
 Group:          System Environment/Kernel
 Requires:       %{name} = %{version}-%{release}
 
@@ -430,7 +313,7 @@ Requires:       %{name} = %{version}-%{release}
 This package contains the Linux kernel sound support
 
 %package docs
-Summary:        Kernel docs
+Summary:        Preempt RT Linux Kernel
 Group:          System Environment/Kernel
 Requires:       python3
 
@@ -438,7 +321,7 @@ Requires:       python3
 This package contains the Linux kernel doc files
 
 %package tools
-Summary:        This package contains the 'perf' performance analysis tools for Linux kernel
+Summary:        Preempt RT Linux Kernel
 Group:          System/Tools
 Requires:       %{name} = %{version}-%{release}
 Requires:       audit
@@ -447,14 +330,14 @@ Requires:       audit
 This package contains the 'perf' performance analysis tools for Linux kernel.
 
 %package -n     python3-perf
-Summary:        Python 3 extension for perf tools
+Summary:        Preempt RT Linux Kernel
 Requires:       python3
 
 %description -n python3-perf
 This package contains the Python 3 extension for the 'perf' performance analysis tools for Linux kernel.
 
 %package -n     bpftool
-Summary:        Inspection and simple manipulation of eBPF programs and maps
+Summary:        Preempt RT Linux Kernel
 
 %description -n bpftool
 This package contains the bpftool, which allows inspection and simple
@@ -462,8 +345,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.17
-%autosetup -p1 -n linux-6.17
+%setup -q -n linux-6.18.14
+%autosetup -p1 -n linux-6.18.14
 # %patch 0 -p1
 make mrproper
 
