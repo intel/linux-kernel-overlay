@@ -1,7 +1,7 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
 Version:        6.18.15
-Release:        260303T044832Z%{?dist}
+Release:        260310T050801Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -165,37 +165,39 @@ Patch139: 0003-drm-virtio-save-and-restore-virtio_gpu_objects.drm
 Patch140: 0001-drm-xe-Upgrade-PTL-and-BMG-GuC-to-70.55.3-MTL-LNL-DG2-.drm
 Patch141: 0001-i915-gt-Upgrade-GuCs-accordingly-to-20260110-baselin.drm
 Patch142: 0001-i915-gt-GuC-for-legacy-platform.drm
+Patch143: 0001-i915-and-xe-gt-Update-GuC-versions-accordingly.drm
 # edcac
-Patch143: 0001-EDAC-igen6-Add-two-Intel-Amston-Lake-SoCs-support.edac
-Patch144: 0002-EDAC-igen6-Add-more-Intel-Panther-Lake-H-SoCs-support.edac
-Patch145: 0003-EDAC-igen6-Fix-masks-of-MCHBAR-TOM-TOUUD-registers.edac
+Patch144: 0001-EDAC-igen6-Add-two-Intel-Amston-Lake-SoCs-support.edac
+Patch145: 0002-EDAC-igen6-Add-more-Intel-Panther-Lake-H-SoCs-support.edac
+Patch146: 0003-EDAC-igen6-Fix-masks-of-MCHBAR-TOM-TOUUD-registers.edac
 # perf
-Patch146: 0001-perf-x86-intel-cstate-Add-Pantherlake-support.perf
-Patch147: 0002-perf-x86-intel-uncore-Move-uncore-discovery-init-stru.perf
-Patch148: 0003-perf-x86-intel-uncore-Support-per-platform-discovery-.perf
-Patch149: 0004-perf-x86-intel-uncore-Remove-has_generic_discovery_ta.perf
-Patch150: 0005-perf-x86-intel-uncore-Add-IMH-PMON-support-for-Diamon.perf
-Patch151: 0006-perf-x86-intel-uncore-Add-CBB-PMON-support-for-Diamon.perf
-Patch152: 0007-perf-x86-intel-uncore-Add-domain-global-init-callback.perf
-Patch153: 0008-perf-x86-intel-uncore-Add-freerunning-event-descripto.perf
-Patch154: 0009-perf-x86-intel-uncore-Support-IIO-free-running-counte.perf
-Patch155: 0010-perf-x86-intel-uncore-Support-uncore-constraint-range.perf
-Patch156: 0011-perf-x86-intel-uncore-Update-DMR-uncore-constraints-p.perf
-Patch157: 0012-perf-pmu-Relax-uncore-wildcard-matching-to-allow-nume.perf
-Patch158: 0013-perf-x86-intel-uncore-Add-missing-PMON-units-for-Pant.perf
+Patch147: 0001-perf-x86-intel-cstate-Add-Pantherlake-support.perf
+Patch148: 0002-perf-x86-intel-uncore-Move-uncore-discovery-init-stru.perf
+Patch149: 0003-perf-x86-intel-uncore-Support-per-platform-discovery-.perf
+Patch150: 0004-perf-x86-intel-uncore-Remove-has_generic_discovery_ta.perf
+Patch151: 0005-perf-x86-intel-uncore-Add-IMH-PMON-support-for-Diamon.perf
+Patch152: 0006-perf-x86-intel-uncore-Add-CBB-PMON-support-for-Diamon.perf
+Patch153: 0007-perf-x86-intel-uncore-Add-domain-global-init-callback.perf
+Patch154: 0008-perf-x86-intel-uncore-Add-freerunning-event-descripto.perf
+Patch155: 0009-perf-x86-intel-uncore-Support-IIO-free-running-counte.perf
+Patch156: 0010-perf-x86-intel-uncore-Support-uncore-constraint-range.perf
+Patch157: 0011-perf-x86-intel-uncore-Update-DMR-uncore-constraints-p.perf
+Patch158: 0012-perf-pmu-Relax-uncore-wildcard-matching-to-allow-nume.perf
+Patch159: 0013-perf-x86-intel-uncore-Add-missing-PMON-units-for-Pant.perf
 # pmt
-Patch159: 0001-platform-x86-intel-vsec-Add-support-for-Wildcat-Lake.pmt
-Patch160: 0001-platform-x86-intel-pmc-Add-support-for-multiple-DMU-GU.pmt
-Patch161: 0002-platform-x86-intel-pmc-Add-DMU-GUID-to-Arrow-Lake-U-H.pmt
-Patch162: 0003-platform-x86-intel-pmc-Rename-PMC-index-variable-to-pm.pmt
-Patch163: 0004-platform-x86-intel-pmc-Relocate-lpm_req_guid-to-pmc_re.pmt
-Patch164: 0005-platform-x86-intel-pmc-Remove-redundant-has_die_c6-var.pmt
-Patch165: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
+Patch160: 0001-platform-x86-intel-vsec-Add-support-for-Wildcat-Lake.pmt
+Patch161: 0001-platform-x86-intel-pmc-Add-support-for-multiple-DMU-GU.pmt
+Patch162: 0002-platform-x86-intel-pmc-Add-DMU-GUID-to-Arrow-Lake-U-H.pmt
+Patch163: 0003-platform-x86-intel-pmc-Rename-PMC-index-variable-to-pm.pmt
+Patch164: 0004-platform-x86-intel-pmc-Relocate-lpm_req_guid-to-pmc_re.pmt
+Patch165: 0005-platform-x86-intel-pmc-Remove-redundant-has_die_c6-var.pmt
+Patch166: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
 # audio
-Patch166: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
-Patch167: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+Patch167: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
+Patch168: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+Patch169: 0001-soundwire-fix-bug-in-sdw_add_element_group_count-fou.audio
 # lpss
-Patch168: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.lpss
+Patch170: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.lpss
 # End of Patch section
 
 %global security_hardening none
