@@ -1,0 +1,123 @@
+From 01e9fd540210b3575112cad7004b6c21c79530f0 Mon Sep 17 00:00:00 2001
+From: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Date: Mon, 3 Nov 2025 14:18:12 -0300
+Subject: [PATCH 11/39] drm/i915/xe3p_lpd: Enable system caching for FBC
+
+Configure one of the FBC instances to use system caching. FBC
+read/write requests are tagged as cacheable till a programmed
+limit is reached by the hw.
+
+Bspec: 74722
+Signed-off-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Signed-off-by: Gustavo Sousa <gustavo.sousa@intel.com>
+---
+ drivers/gpu/drm/i915/display/intel_fbc.c      | 47 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_fbc_regs.h |  9 ++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc.c b/drivers/gpu/drm/i915/display/intel_fbc.c
+index a4e2b54885a5..afbc2d054bfc 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc.c
++++ b/drivers/gpu/drm/i915/display/intel_fbc.c
+@@ -127,6 +127,9 @@ struct intel_fbc {
+ 	 */
+ 	struct intel_fbc_state state;
+ 	const char *no_fbc_reason;
++
++	/* Only one of FBC instances can use the system cache */
++	bool own_sys_cache;
+ };
+ 
+ static struct intel_fbc *intel_fbc_for_pipe(struct intel_display *display, enum pipe pipe)
+@@ -577,12 +580,51 @@ static bool ilk_fbc_is_compressing(struct intel_fbc *fbc)
+ 	return intel_de_read(fbc->display, ILK_DPFC_STATUS(fbc->id)) & DPFC_COMP_SEG_MASK;
+ }
+ 
++static void nvl_fbc_program_system_cache(struct intel_fbc *fbc, bool enable)
++{
++	struct intel_display *display = fbc->display;
++	u32 cfb_offset, usage;
++
++	lockdep_assert_held(&fbc->lock);
++
++	usage = intel_de_read(display, NVL_FBC_SYS_CACHE_USAGE_CFG);
++
++	/* System cache already being used by another pipe */
++	if (enable && (usage & FBC_SYS_CACHE_TAG_USE_RES_SPACE))
++		return;
++
++	/* Only the fbc instance which owns system cache can disable it */
++	if (!enable && !fbc->own_sys_cache)
++		return;
++
++	/*
++	 * Not programming the cache limit and cache reading enable bits explicitly
++	 * here. The default values should take care of those and that could leave
++	 * adjustments of those bits to the system hw policy
++	 *
++	 * TODO: check if we need to explicitly program these?
++	 */
++	cfb_offset = enable ? i915_gem_stolen_node_offset(fbc->compressed_fb) : 0;
++	usage |= FBC_SYS_CACHE_START_BASE(cfb_offset);
++	usage |= enable ? FBC_SYS_CACHE_TAG_USE_RES_SPACE : FBC_SYS_CACHE_TAG_DONT_CACHE;
++
++	intel_de_write(display, NVL_FBC_SYS_CACHE_USAGE_CFG, usage);
++
++	fbc->own_sys_cache = enable;
++
++	drm_dbg_kms(display->drm, "System caching for FBC[%d] %s\n",
++		    fbc->id, enable ? "configured" : "cleared");
++}
++
+ static void ilk_fbc_program_cfb(struct intel_fbc *fbc)
+ {
+ 	struct intel_display *display = fbc->display;
+ 
+ 	intel_de_write(display, ILK_DPFC_CB_BASE(fbc->id),
+ 		       i915_gem_stolen_node_offset(fbc->compressed_fb));
++
++	if (DISPLAY_VER(display) >= 35)
++		nvl_fbc_program_system_cache(fbc, true);
+ }
+ 
+ static const struct intel_fbc_funcs ilk_fbc_funcs = {
+@@ -960,6 +1002,8 @@ static void intel_fbc_program_workarounds(struct intel_fbc *fbc)
+ 
+ static void __intel_fbc_cleanup_cfb(struct intel_fbc *fbc)
+ {
++	struct intel_display *display = fbc->display;
++
+ 	if (WARN_ON(intel_fbc_hw_is_active(fbc)))
+ 		return;
+ 
+@@ -967,6 +1011,9 @@ static void __intel_fbc_cleanup_cfb(struct intel_fbc *fbc)
+ 		i915_gem_stolen_remove_node(fbc->compressed_llb);
+ 	if (i915_gem_stolen_node_allocated(fbc->compressed_fb))
+ 		i915_gem_stolen_remove_node(fbc->compressed_fb);
++
++	if (DISPLAY_VER(display) >= 35)
++		nvl_fbc_program_system_cache(fbc, false);
+ }
+ 
+ void intel_fbc_cleanup(struct intel_display *display)
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc_regs.h b/drivers/gpu/drm/i915/display/intel_fbc_regs.h
+index 77d8321c4fb3..592cd2384255 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc_regs.h
++++ b/drivers/gpu/drm/i915/display/intel_fbc_regs.h
+@@ -128,4 +128,13 @@
+ #define   FBC_REND_NUKE			REG_BIT(2)
+ #define   FBC_REND_CACHE_CLEAN		REG_BIT(1)
+ 
++#define NVL_FBC_SYS_CACHE_USAGE_CFG             _MMIO(0x1344E0)
++#define   FBC_SYS_CACHE_START_BASE_MASK         REG_GENMASK(31, 16)
++#define   FBC_SYS_CACHE_START_BASE(base)        REG_FIELD_PREP(FBC_SYS_CACHE_START_BASE_MASK, (base))
++#define   FBC_SYS_CACHEABLE_RANGE_MASK          REG_GENMASK(15, 4)
++#define   FBC_SYS_CACHEABLE_RANGE(range)        REG_FIELD_PREP(FBC_SYS_CACHEABLE_RANGE_MASK, (range))
++#define   FBC_SYS_CACHE_TAG_MASK                REG_GENMASK(3, 2)
++#define   FBC_SYS_CACHE_TAG_DONT_CACHE          REG_FIELD_PREP(FBC_SYS_CACHE_TAG_MASK, 0)
++#define   FBC_SYS_CACHE_TAG_USE_RES_SPACE       REG_FIELD_PREP(FBC_SYS_CACHE_TAG_MASK, 3)
++
+ #endif /* __INTEL_FBC_REGS__ */
+-- 
+2.43.0
+

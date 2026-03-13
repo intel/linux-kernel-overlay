@@ -1,0 +1,172 @@
+From 648d9176577de4a7d640517f4de14b2fbd7bc059 Mon Sep 17 00:00:00 2001
+From: Brian Nguyen <brian3.nguyen@intel.com>
+Date: Sat, 13 Dec 2025 05:32:32 +0800
+Subject: [PATCH 26/39] drm/xe: Suballocate BO for page reclaim
+
+Page reclamation feature needs the PRL to be suballocated into a
+GGTT-mapped BO. On allocation failure, fallback to default tlb
+invalidation with full PPC flush.
+
+PRL's BO allocation is managed in separate pool to ensure 4K alignment
+for proper GGTT address.
+
+With BO, pass into TLB invalidation backend and modify fence to
+accomadate accordingly.
+
+v2:
+ - Removed page reclaim related variables from TLB fence. (Matthew B)
+ - Allocate PRL bo size to num_entries. (Matthew B)
+ - Move PRL bo allocation to tlb_inval run_job. (Matthew B)
+
+v5:
+ - Use xe_page_reclaim_list_valid. (Matthew B)
+
+Signed-off-by: Brian Nguyen <brian3.nguyen@intel.com>
+Suggested-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+---
+ drivers/gpu/drm/xe/xe_device_types.h  |  7 +++++
+ drivers/gpu/drm/xe/xe_page_reclaim.c  | 39 +++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_page_reclaim.h  |  6 +++++
+ drivers/gpu/drm/xe/xe_tile.c          |  5 ++++
+ drivers/gpu/drm/xe/xe_tlb_inval_job.c |  9 +++++++
+ 5 files changed, 66 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 85714d48e56a..7f2c9d5ddcae 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -200,6 +200,13 @@ struct xe_tile {
+ 		 * Media GT shares a pool with its primary GT.
+ 		 */
+ 		struct xe_sa_manager *kernel_bb_pool;
++
++		/**
++		 * @mem.reclaim_pool: Pool for PRLs allocated.
++		 *
++		 * Only main GT has page reclaim list allocations.
++		 */
++		struct xe_sa_manager *reclaim_pool;
+ 	} mem;
+ 
+ 	/** @sriov: tile level virtualization data */
+diff --git a/drivers/gpu/drm/xe/xe_page_reclaim.c b/drivers/gpu/drm/xe/xe_page_reclaim.c
+index 018d546fcf50..0cce5ad2e33b 100644
+--- a/drivers/gpu/drm/xe/xe_page_reclaim.c
++++ b/drivers/gpu/drm/xe/xe_page_reclaim.c
+@@ -13,6 +13,45 @@
+ #include "regs/xe_gt_regs.h"
+ #include "xe_assert.h"
+ #include "xe_macros.h"
++#include "xe_sa.h"
++#include "xe_tlb_inval_types.h"
++
++/**
++ * xe_page_reclaim_create_prl_bo() - Back a PRL with a suballocated GGTT BO
++ * @tlb_inval: TLB invalidation frontend associated with the request
++ * @prl: page reclaim list data that bo will copy from
++ * @fence: tlb invalidation fence that page reclaim action is paired to
++ *
++ * Suballocates a 4K BO out of the tile reclaim pool, copies the PRL CPU
++ * copy into the BO and queues the buffer for release when @fence signals.
++ *
++ * Return: struct drm_suballoc pointer on success or ERR_PTR on failure.
++ */
++struct drm_suballoc *xe_page_reclaim_create_prl_bo(struct xe_tlb_inval *tlb_inval,
++						   struct xe_page_reclaim_list *prl,
++						   struct xe_tlb_inval_fence *fence)
++{
++	struct xe_gt *gt = container_of(tlb_inval, struct xe_gt, tlb_inval);
++	struct xe_tile *tile = gt_to_tile(gt);
++	/* (+1) for NULL page_reclaim_entry to indicate end of list */
++	int prl_size = min(prl->num_entries + 1, XE_PAGE_RECLAIM_MAX_ENTRIES) *
++		sizeof(struct xe_guc_page_reclaim_entry);
++	struct drm_suballoc *prl_sa;
++
++	/* Maximum size of PRL is 1 4K-page */
++	prl_sa = __xe_sa_bo_new(tile->mem.reclaim_pool,
++				prl_size, GFP_ATOMIC);
++	if (IS_ERR(prl_sa))
++		return prl_sa;
++
++	memcpy(xe_sa_bo_cpu_addr(prl_sa), prl->entries,
++	       prl_size);
++	xe_sa_bo_flush_write(prl_sa);
++	/* Queue up sa_bo_free on tlb invalidation fence signal */
++	xe_sa_bo_free(prl_sa, &fence->base);
++
++	return prl_sa;
++}
+ 
+ /**
+  * xe_page_reclaim_list_invalidate() - Mark a PRL as invalid
+diff --git a/drivers/gpu/drm/xe/xe_page_reclaim.h b/drivers/gpu/drm/xe/xe_page_reclaim.h
+index e776bad5189d..ded098298d72 100644
+--- a/drivers/gpu/drm/xe/xe_page_reclaim.h
++++ b/drivers/gpu/drm/xe/xe_page_reclaim.h
+@@ -16,6 +16,9 @@
+ #define XE_PAGE_RECLAIM_MAX_ENTRIES	512
+ #define XE_PAGE_RECLAIM_LIST_MAX_SIZE	SZ_4K
+ 
++struct xe_tlb_inval;
++struct xe_tlb_inval_fence;
++
+ struct xe_guc_page_reclaim_entry {
+ 	u64 qw;
+ /* valid reclaim entry bit */
+@@ -65,6 +68,9 @@ static inline bool xe_page_reclaim_list_valid(struct xe_page_reclaim_list *prl)
+ 	       prl->num_entries != XE_PAGE_RECLAIM_INVALID_LIST;
+ }
+ 
++struct drm_suballoc *xe_page_reclaim_create_prl_bo(struct xe_tlb_inval *tlb_inval,
++						   struct xe_page_reclaim_list *prl,
++						   struct xe_tlb_inval_fence *fence);
+ void xe_page_reclaim_list_invalidate(struct xe_page_reclaim_list *prl);
+ void xe_page_reclaim_list_init(struct xe_page_reclaim_list *prl);
+ int xe_page_reclaim_list_alloc_entries(struct xe_page_reclaim_list *prl);
+diff --git a/drivers/gpu/drm/xe/xe_tile.c b/drivers/gpu/drm/xe/xe_tile.c
+index 4f4f9a5c43af..63c060c2ea5c 100644
+--- a/drivers/gpu/drm/xe/xe_tile.c
++++ b/drivers/gpu/drm/xe/xe_tile.c
+@@ -209,6 +209,11 @@ int xe_tile_init(struct xe_tile *tile)
+ 	if (IS_ERR(tile->mem.kernel_bb_pool))
+ 		return PTR_ERR(tile->mem.kernel_bb_pool);
+ 
++	/* Optimistically anticipate at most 256 TLB fences with PRL */
++	tile->mem.reclaim_pool = xe_sa_bo_manager_init(tile, SZ_1M, XE_PAGE_RECLAIM_LIST_MAX_SIZE);
++	if (IS_ERR(tile->mem.reclaim_pool))
++		return PTR_ERR(tile->mem.reclaim_pool);
++
+ 	return 0;
+ }
+ void xe_tile_migrate_wait(struct xe_tile *tile)
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval_job.c b/drivers/gpu/drm/xe/xe_tlb_inval_job.c
+index f80c679273ab..651970e84bb0 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval_job.c
++++ b/drivers/gpu/drm/xe/xe_tlb_inval_job.c
+@@ -26,6 +26,8 @@ struct xe_tlb_inval_job {
+ 	struct xe_exec_queue *q;
+ 	/** @vm: VM which TLB invalidation is being issued for */
+ 	struct xe_vm *vm;
++	/** @prl: Embedded copy of page reclaim list */
++	struct xe_page_reclaim_list prl;
+ 	/** @refcount: ref count of this job */
+ 	struct kref refcount;
+ 	/**
+@@ -49,6 +51,13 @@ static struct dma_fence *xe_tlb_inval_job_run(struct xe_dep_job *dep_job)
+ 		container_of(dep_job, typeof(*job), dep);
+ 	struct xe_tlb_inval_fence *ifence =
+ 		container_of(job->fence, typeof(*ifence), base);
++	struct drm_suballoc *prl_sa = NULL;
++
++	if (xe_page_reclaim_list_valid(&job->prl)) {
++		prl_sa = xe_page_reclaim_create_prl_bo(job->tlb_inval, &job->prl, ifence);
++		if (IS_ERR(prl_sa))
++			prl_sa = NULL; /* Indicate fall back PPC flush with NULL */
++	}
+ 
+ 	xe_tlb_inval_range(job->tlb_inval, ifence, job->start,
+ 			   job->end, job->vm->usm.asid);
+-- 
+2.43.0
+
