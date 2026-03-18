@@ -2,10 +2,10 @@
 # Global configurations which are used to build kernel overlay
 
 # shellcheck disable=SC2034
-KVERSION=6
-KPATCHLEVEL=19
+KVERSION=7
+KPATCHLEVEL=0
 KSUBLEVEL=0
-KEXTRAVERSION=
+KEXTRAVERSION=-rc3
 KRTV=
 
 KSRC_MIRROR=
