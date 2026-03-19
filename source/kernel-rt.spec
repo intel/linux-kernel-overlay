@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.18.15
-Release:        260310T050801Z%{?dist}
+Version:        6.18.18
+Release:        260317T080950Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.18.15.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.18.18.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -167,37 +167,35 @@ Patch141: 0001-i915-gt-Upgrade-GuCs-accordingly-to-20260110-baselin.drm
 Patch142: 0001-i915-gt-GuC-for-legacy-platform.drm
 Patch143: 0001-i915-and-xe-gt-Update-GuC-versions-accordingly.drm
 # edcac
-Patch144: 0001-EDAC-igen6-Add-two-Intel-Amston-Lake-SoCs-support.edac
-Patch145: 0002-EDAC-igen6-Add-more-Intel-Panther-Lake-H-SoCs-support.edac
-Patch146: 0003-EDAC-igen6-Fix-masks-of-MCHBAR-TOM-TOUUD-registers.edac
+Patch144: 0003-EDAC-igen6-Fix-masks-of-MCHBAR-TOM-TOUUD-registers.edac
 # perf
-Patch147: 0001-perf-x86-intel-cstate-Add-Pantherlake-support.perf
-Patch148: 0002-perf-x86-intel-uncore-Move-uncore-discovery-init-stru.perf
-Patch149: 0003-perf-x86-intel-uncore-Support-per-platform-discovery-.perf
-Patch150: 0004-perf-x86-intel-uncore-Remove-has_generic_discovery_ta.perf
-Patch151: 0005-perf-x86-intel-uncore-Add-IMH-PMON-support-for-Diamon.perf
-Patch152: 0006-perf-x86-intel-uncore-Add-CBB-PMON-support-for-Diamon.perf
-Patch153: 0007-perf-x86-intel-uncore-Add-domain-global-init-callback.perf
-Patch154: 0008-perf-x86-intel-uncore-Add-freerunning-event-descripto.perf
-Patch155: 0009-perf-x86-intel-uncore-Support-IIO-free-running-counte.perf
-Patch156: 0010-perf-x86-intel-uncore-Support-uncore-constraint-range.perf
-Patch157: 0011-perf-x86-intel-uncore-Update-DMR-uncore-constraints-p.perf
-Patch158: 0012-perf-pmu-Relax-uncore-wildcard-matching-to-allow-nume.perf
-Patch159: 0013-perf-x86-intel-uncore-Add-missing-PMON-units-for-Pant.perf
+Patch145: 0001-perf-x86-intel-cstate-Add-Pantherlake-support.perf
+Patch146: 0002-perf-x86-intel-uncore-Move-uncore-discovery-init-stru.perf
+Patch147: 0003-perf-x86-intel-uncore-Support-per-platform-discovery-.perf
+Patch148: 0004-perf-x86-intel-uncore-Remove-has_generic_discovery_ta.perf
+Patch149: 0005-perf-x86-intel-uncore-Add-IMH-PMON-support-for-Diamon.perf
+Patch150: 0006-perf-x86-intel-uncore-Add-CBB-PMON-support-for-Diamon.perf
+Patch151: 0007-perf-x86-intel-uncore-Add-domain-global-init-callback.perf
+Patch152: 0008-perf-x86-intel-uncore-Add-freerunning-event-descripto.perf
+Patch153: 0009-perf-x86-intel-uncore-Support-IIO-free-running-counte.perf
+Patch154: 0010-perf-x86-intel-uncore-Support-uncore-constraint-range.perf
+Patch155: 0011-perf-x86-intel-uncore-Update-DMR-uncore-constraints-p.perf
+Patch156: 0012-perf-pmu-Relax-uncore-wildcard-matching-to-allow-nume.perf
+Patch157: 0013-perf-x86-intel-uncore-Add-missing-PMON-units-for-Pant.perf
 # pmt
-Patch160: 0001-platform-x86-intel-vsec-Add-support-for-Wildcat-Lake.pmt
-Patch161: 0001-platform-x86-intel-pmc-Add-support-for-multiple-DMU-GU.pmt
-Patch162: 0002-platform-x86-intel-pmc-Add-DMU-GUID-to-Arrow-Lake-U-H.pmt
-Patch163: 0003-platform-x86-intel-pmc-Rename-PMC-index-variable-to-pm.pmt
-Patch164: 0004-platform-x86-intel-pmc-Relocate-lpm_req_guid-to-pmc_re.pmt
-Patch165: 0005-platform-x86-intel-pmc-Remove-redundant-has_die_c6-var.pmt
-Patch166: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
+Patch158: 0001-platform-x86-intel-vsec-Add-support-for-Wildcat-Lake.pmt
+Patch159: 0001-platform-x86-intel-pmc-Add-support-for-multiple-DMU-GU.pmt
+Patch160: 0002-platform-x86-intel-pmc-Add-DMU-GUID-to-Arrow-Lake-U-H.pmt
+Patch161: 0003-platform-x86-intel-pmc-Rename-PMC-index-variable-to-pm.pmt
+Patch162: 0004-platform-x86-intel-pmc-Relocate-lpm_req_guid-to-pmc_re.pmt
+Patch163: 0005-platform-x86-intel-pmc-Remove-redundant-has_die_c6-var.pmt
+Patch164: 0006-platform-x86-intel-pmc-Enable-SSRAM-support-for-Wildca.pmt
 # audio
-Patch167: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
-Patch168: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
-Patch169: 0001-soundwire-fix-bug-in-sdw_add_element_group_count-fou.audio
+Patch165: 0001-ASoC-Intel-sof_rt5682-Add-quirk-override-support.audio
+Patch166: 0002-ASoC-SOF-Intel-hda-Only-check-SSP-MCLK-mask-in-case-.audio
+Patch167: 0001-soundwire-fix-bug-in-sdw_add_element_group_count-fou.audio
 # lpss
-Patch170: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.lpss
+Patch168: 0001-Added-spi_set_cs-for-more-stable-r-w-operations-in.lpss
 # End of Patch section
 
 %global security_hardening none
@@ -347,8 +345,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.18.15
-%autosetup -p1 -n linux-6.18.15
+%setup -q -n linux-6.18.18
+%autosetup -p1 -n linux-6.18.18
 # %patch 0 -p1
 make mrproper
 
