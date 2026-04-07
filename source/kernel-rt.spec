@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.12.76
-Release:        260307T183206Z%{?dist}
+Version:        6.12.80
+Release:        260407T181819Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.76.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.80.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -573,8 +573,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.76
-%autosetup -p1 -n linux-6.12.76
+%setup -q -n linux-6.12.80
+%autosetup -p1 -n linux-6.12.80
 # %patch 0 -p1
 make mrproper
 
