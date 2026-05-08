@@ -1,0 +1,133 @@
+From 313aa54cb6f8eb10c3d22ee1c2358d18c018f456 Mon Sep 17 00:00:00 2001
+From: Sabrina Dubroca <sd@queasysnail.net>
+Date: Tue, 24 Mar 2026 00:25:57 +0100
+Subject: [PATCH 01/10] mpls: add seqcount to protect the platform_label{,s}
+ pair
+
+The RCU-protected codepaths (mpls_forward, mpls_dump_routes) can have
+an inconsistent view of platform_labels vs platform_label in case of a
+concurrent resize (resize_platform_label_table, under
+platform_mutex). This can lead to OOB accesses.
+
+This patch adds a seqcount, so that we get a consistent snapshot.
+
+Note that mpls_label_ok is also susceptible to this, so the check
+against RTA_DST in rtm_to_route_config, done outside platform_mutex,
+is not sufficient. This value gets passed to mpls_label_ok once more
+in both mpls_route_add and mpls_route_del, so there is no issue, but
+that additional check must not be removed.
+
+Reported-by: Yuan Tan <tanyuan98@outlook.com>
+Reported-by: Yifan Wu <yifanwucs@gmail.com>
+Reported-by: Juefei Pu <tomapufckgml@gmail.com>
+Reported-by: Xin Liu <bird@lzu.edu.cn>
+Fixes: 7720c01f3f590 ("mpls: Add a sysctl to control the size of the mpls label table")
+Fixes: dde1b38e873c ("mpls: Convert mpls_dump_routes() to RCU.")
+Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/cd8fca15e3eb7e212b094064cd83652e20fd9d31.1774284088.git.sd@queasysnail.net
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ include/net/netns/mpls.h |  4 ++++
+ net/mpls/af_mpls.c       | 38 +++++++++++++++++++++++++++++---------
+ 2 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/include/net/netns/mpls.h b/include/net/netns/mpls.h
+index 19ad2574b267c..0957e8e4e4ec8 100644
+--- a/include/net/netns/mpls.h
++++ b/include/net/netns/mpls.h
+@@ -7,6 +7,8 @@
+ #define __NETNS_MPLS_H__
+ 
+ #include <linux/types.h>
++#include <linux/seqlock.h>
++#include <linux/spinlock.h>
+ 
+ struct mpls_route;
+ struct ctl_table_header;
+@@ -16,6 +18,8 @@ struct netns_mpls {
+ 	int default_ttl;
+ 	size_t platform_labels;
+ 	struct mpls_route __rcu * __rcu *platform_label;
++	spinlock_t platform_label_lock;
++	seqcount_spinlock_t platform_label_seq;
+ 
+ 	struct ctl_table_header *ctl;
+ };
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index 1c70cb26e7ba1..d9622be4a80b8 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -75,16 +75,31 @@ static void rtmsg_lfib(int event, u32 label, struct mpls_route *rt,
+ 		       struct nlmsghdr *nlh, struct net *net, u32 portid,
+ 		       unsigned int nlm_flags);
+ 
++static struct mpls_route __rcu **mpls_platform_label_rcu(struct net *net, size_t *platform_labels)
++{
++	struct mpls_route __rcu **platform_label;
++	unsigned int sequence;
++
++	do {
++		sequence = read_seqcount_begin(&net->mpls.platform_label_seq);
++		platform_label = rcu_dereference(net->mpls.platform_label);
++		*platform_labels = net->mpls.platform_labels;
++	} while (read_seqcount_retry(&net->mpls.platform_label_seq, sequence));
++
++	return platform_label;
++}
++
+ static struct mpls_route *mpls_route_input_rcu(struct net *net, unsigned index)
+ {
+-	struct mpls_route *rt = NULL;
++	struct mpls_route __rcu **platform_label;
++	size_t platform_labels;
+ 
+-	if (index < net->mpls.platform_labels) {
+-		struct mpls_route __rcu **platform_label =
+-			rcu_dereference_rtnl(net->mpls.platform_label);
+-		rt = rcu_dereference_rtnl(platform_label[index]);
+-	}
+-	return rt;
++	platform_label = mpls_platform_label_rcu(net, &platform_labels);
++
++	if (index >= platform_labels)
++		return NULL;
++
++	return rcu_dereference(platform_label[index]);
+ }
+ 
+ bool mpls_output_possible(const struct net_device *dev)
+@@ -2190,8 +2205,7 @@ static int mpls_dump_routes(struct sk_buff *skb, struct netlink_callback *cb)
+ 	if (index < MPLS_LABEL_FIRST_UNRESERVED)
+ 		index = MPLS_LABEL_FIRST_UNRESERVED;
+ 
+-	platform_label = rtnl_dereference(net->mpls.platform_label);
+-	platform_labels = net->mpls.platform_labels;
++	platform_label = mpls_platform_label_rcu(net, &platform_labels);
+ 
+ 	if (filter.filter_set)
+ 		flags |= NLM_F_DUMP_FILTERED;
+@@ -2576,8 +2590,12 @@ static int resize_platform_label_table(struct net *net, size_t limit)
+ 	}
+ 
+ 	/* Update the global pointers */
++	spin_lock_bh(&net->mpls.platform_label_lock);
++	write_seqcount_begin(&net->mpls.platform_label_seq);
+ 	net->mpls.platform_labels = limit;
+ 	rcu_assign_pointer(net->mpls.platform_label, labels);
++	write_seqcount_end(&net->mpls.platform_label_seq);
++	spin_unlock_bh(&net->mpls.platform_label_lock);
+ 
+ 	rtnl_unlock();
+ 
+@@ -2660,6 +2678,8 @@ static int mpls_net_init(struct net *net)
+ 
+ 	net->mpls.platform_labels = 0;
+ 	net->mpls.platform_label = NULL;
++	spin_lock_init(&net->mpls.platform_label_lock);
++	seqcount_spinlock_init(&net->mpls.platform_label_seq, &net->mpls.platform_label_lock);
+ 	net->mpls.ip_ttl_propagate = 1;
+ 	net->mpls.default_ttl = 255;
+ 
+-- 
+2.43.0
+
