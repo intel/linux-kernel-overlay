@@ -1,0 +1,317 @@
+# Makefile for Kernel Packaging System
+# Supports both Debian (.deb) and RPM (.rpm) package builds
+
+.PHONY: help deb rpm all clean clean-deb clean-rpm status
+
+# Default target
+help:
+	@echo "============================================================"
+	@echo "Kernel Packaging System - Unified Build Interface"
+	@echo "============================================================"
+	@echo ""
+	@echo "Targets:"
+	@echo "  deb              Build Debian packages (.deb)"
+	@echo "  rpm              Build RPM packages (.rpm)"
+	@echo "  all              Build both Debian and RPM packages"
+	@echo "  clean            Clean all build artifacts"
+	@echo "  clean-deb        Clean Debian build artifacts only"
+	@echo "  clean-rpm        Clean RPM build artifacts only"
+	@echo "  status           Show current build status"
+	@echo "  verify-deb-packages  Verify kernel package consistency"
+	@echo ""
+	@echo "Debian Targets:"
+	@echo "  deb-setup        Setup Debian build (first-time only)"
+	@echo "  deb-modules      Build Debian kernel module packages"
+	@echo ""
+	@echo "RPM Targets:"
+	@echo "  rpm-prepare      Prepare RPM source files (first-time only)"
+	@echo "  rpm-quick        Quick RPM build (binary only)"
+	@echo "  rpm-update       Update RPM version info"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make deb                    # Build Debian packages"
+	@echo "  make rpm                    # Build RPM packages"
+	@echo "  make all                    # Build both"
+	@echo "  make JOBS=8 deb             # Build with 8 parallel jobs"
+	@echo ""
+	@echo "For more details:"
+	@echo "  - Debian: see debian/README.md or README.md"
+	@echo "  - RPM:    see rpm/README.md"
+	@echo "============================================================"
+
+# Configuration
+JOBS ?= $(shell nproc)
+DEB_BUILD_FLAGS ?= -B -uc -us -j$(JOBS)
+RPM_BUILD_FLAGS ?=
+BUILD_DIR ?= $(CURDIR)/build/kernel
+BUILD_PACKAGES_DIR ?= $(CURDIR)/build/packages
+BUILD_PACKAGES_DEB_DIR ?= $(CURDIR)/build/packages/deb
+BUILD_PACKAGES_RPM_DIR ?= $(CURDIR)/build/packages/rpm
+BUILD_LOGS_DIR ?= $(CURDIR)/build/logs
+BUILD_CACHE_DIR ?= $(CURDIR)/build/cache
+
+# ============================================================
+# Debian Package Targets
+# ============================================================
+
+deb:
+	@if [ ! -d "$(BUILD_DIR)" ]; then \
+		echo "Error: Build directory not found. Run 'make deb-setup' first."; \
+		exit 1; \
+	fi
+	@echo "======================================================================"
+	@echo "Building Debian packages..."
+	@echo "======================================================================"
+	cd $(BUILD_DIR) && dpkg-buildpackage $(DEB_BUILD_FLAGS)
+	@# Move all packages and source files to packages/deb/ directory
+	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
+	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
+	@mv -f $(CURDIR)/build/*.deb $(CURDIR)/build/*.ddeb $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@echo ""
+	@echo "Debian packages built successfully!"
+	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
+	@$(MAKE) verify-deb-packages
+
+deb-setup:
+	@echo "======================================================================"
+	@echo "Setting up Debian build environment..."
+	@echo "======================================================================"
+	@# Create build directories
+	@mkdir -p $(BUILD_DIR) $(BUILD_PACKAGES_DEB_DIR) $(BUILD_LOGS_DIR) $(BUILD_CACHE_DIR)
+	@# Download or copy upstream source if not exists
+	@if [ ! -f $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz ]; then \
+		if ls rpm/linux-*.tar.xz >/dev/null 2>&1; then \
+			echo "Found existing source in rpm/, copying to cache..."; \
+			SRC=$$(ls rpm/linux-*.tar.xz | head -1); \
+			BASENAME=$$(basename $$SRC); \
+			cp $$SRC $(BUILD_CACHE_DIR)/; \
+			cd $(BUILD_CACHE_DIR) && \
+			NEWNAME=$$(echo $$BASENAME | sed 's/^linux-/linux_/') && \
+			mv $$BASENAME $$NEWNAME && \
+			if ! echo $$NEWNAME | grep -q '.orig.tar.xz$$'; then \
+				mv $$NEWNAME $$(echo $$NEWNAME | sed 's/.tar.xz$$/.orig.tar.xz/'); \
+			fi; \
+			echo "Created: $$(ls linux_*.orig.tar.xz)"; \
+		else \
+			echo "Downloading upstream kernel source..."; \
+			BASE_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([0-9.]*\).*/\1/p'); \
+			echo "Using base version: $$BASE_VERSION"; \
+			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$BASE_VERSION 2>/dev/null || \
+			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
+		fi; \
+	else \
+		echo "Source tarball already exists: $$(ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz 2>/dev/null || echo 'none')"; \
+	fi
+	@# Extract source to build/orig/ if not exists
+	@if [ ! -d $(CURDIR)/build/orig/linux-* ]; then \
+		echo "Extracting source to build/orig/..."; \
+		mkdir -p $(CURDIR)/build/orig; \
+		tar -C $(CURDIR)/build/orig -xaf $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz; \
+	else \
+		echo "Source already extracted: $$(ls -d $(CURDIR)/build/orig/linux-* 2>/dev/null)"; \
+	fi
+	@# Create build directory by copying source
+	@echo "Creating build directory: $(BUILD_DIR)..."; \
+	rm -rf $(BUILD_DIR); \
+	rsync -a --exclude='.git' $$(ls -d $(CURDIR)/build/orig/linux-*/)/ $(BUILD_DIR)/
+	@# Copy debian directory to build directory (dereference symlinks with -L)
+	@echo "Copying debian/ configuration to build directory..."
+	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
+	@# Auto-generate localversion and abi_suffix from changelog
+	@echo "Extracting version suffix from debian/changelog..."
+	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | sed 's/^[0-9.]*//'); \
+	if [ -n "$$SUFFIX" ]; then \
+		echo "$$SUFFIX" > $(BUILD_DIR)/localversion; \
+		echo "Created localversion file with: $$SUFFIX"; \
+		sed -i "s|abi_suffix = '.*'|abi_suffix = '$$SUFFIX'|g" $(BUILD_DIR)/debian/config/defines.toml; \
+		echo "Updated abi_suffix in defines.toml to: $$SUFFIX"; \
+	fi
+	@# Apply patches
+	@echo "Applying patches..."
+	@cd $(BUILD_DIR) && QUILT_PATCHES='$(CURDIR)/debian/patches' QUILT_PC=.pc quilt push --quiltrc - -a -q --fuzz=0 || true
+	@# Generate control file
+	@echo "Generating debian/control..."
+	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control || true
+	@echo ""
+	@echo "Setup completed!"
+	@echo "  Build directory: $(BUILD_DIR)"
+	@echo "  Packages directory: $(BUILD_PACKAGES_DEB_DIR)"
+	@echo "  Logs directory: $(BUILD_LOGS_DIR)"
+	@echo "  Cache directory: $(BUILD_CACHE_DIR)"
+
+deb-modules:
+	@echo "======================================================================"
+	@echo "Building Debian kernel module packages..."
+	@echo "======================================================================"
+	@echo "Available module packaging scripts:"
+	@ls -1 debian/bin/create-module-package.sh 2>/dev/null || echo "  (none found)"
+	@echo ""
+	@echo "See debian/MODULE_PACKAGING.md for instructions"
+
+# ============================================================
+# RPM Package Targets
+# ============================================================
+
+# Kernel version for RPM (can be overridden)
+RPM_KERNEL_VERSION ?= 6.18.20
+
+rpm-prepare:
+	@echo "======================================================================"
+	@echo "Preparing RPM source files..."
+	@echo "======================================================================"
+	@echo "Kernel Version: $(RPM_KERNEL_VERSION)"
+	@echo ""
+	cd rpm && ./scripts/prepare-sources.sh --version $(RPM_KERNEL_VERSION)
+	@echo ""
+	@echo "RPM sources prepared!"
+	@echo "  - linux-$(RPM_KERNEL_VERSION).tar.xz"
+	@echo "  - patches.tar.gz (332 patches)"
+	@echo "  - kernel-x86_64.config"
+	@echo "  - kernel-x86_64-rt.config"
+	@echo ""
+	@echo "Next: make rpm"
+
+rpm:
+	@echo "======================================================================"
+	@echo "Building RPM packages..."
+	@echo "======================================================================"
+	@# Check if source files exist
+	@if [ ! -f rpm/linux-*.tar.xz ]; then \
+		echo "Error: Source files not found."; \
+		echo "Run 'make rpm-prepare' first."; \
+		exit 1; \
+	fi
+	cd rpm && ./scripts/build.sh --jobs $(JOBS) $(RPM_BUILD_FLAGS)
+	@# Move packages to packages/rpm/ directory
+	@mkdir -p $(BUILD_PACKAGES_RPM_DIR)
+	@echo "Moving RPM packages to $(BUILD_PACKAGES_RPM_DIR)..."
+	@find ~/rpmbuild/RPMS/ -name "*.rpm" -type f -exec mv -f {} $(BUILD_PACKAGES_RPM_DIR)/ \; 2>/dev/null || true
+	@find ~/rpmbuild/SRPMS/ -name "*.rpm" -type f -exec mv -f {} $(BUILD_PACKAGES_RPM_DIR)/ \; 2>/dev/null || true
+	@echo ""
+	@echo "RPM packages built successfully!"
+	@echo "Packages are in: $(BUILD_PACKAGES_RPM_DIR)"
+
+rpm-quick:
+	@echo "======================================================================"
+	@echo "Quick RPM build (binary packages only)..."
+	@echo "======================================================================"
+	cd rpm && ./scripts/build.sh --skip-prep --jobs $(JOBS)
+
+rpm-update:
+	@echo "======================================================================"
+	@echo "Updating RPM version information..."
+	@echo "======================================================================"
+	@echo "Usage: make rpm-update VERSION=6.8.0 RELEASE=1"
+	@echo ""
+	@if [ -z "$(VERSION)" ] || [ -z "$(RELEASE)" ]; then \
+		echo "Error: VERSION and RELEASE are required"; \
+		echo "Example: make rpm-update VERSION=6.8.0 RELEASE=1"; \
+		exit 1; \
+	fi
+	cd rpm && ./scripts/update-version.sh -v $(VERSION) -r $(RELEASE)
+
+# ============================================================
+# Combined Targets
+# ============================================================
+
+all:
+	@echo "======================================================================"
+	@echo "Building all packages (Debian + RPM)..."
+	@echo "======================================================================"
+	@# Check and setup Debian build if needed
+	@if [ ! -d "$(BUILD_DIR)" ]; then \
+		echo "Debian build directory not found. Running deb-setup..."; \
+		$(MAKE) deb-setup; \
+	fi
+	@# Check and setup RPM build if needed
+	@if [ ! -f rpm/linux-*.tar.xz ]; then \
+		echo "RPM source files not found. Running rpm-prepare..."; \
+		$(MAKE) rpm-prepare; \
+	fi
+	@# Build both packages
+	$(MAKE) deb
+	$(MAKE) rpm
+	@echo ""
+	@echo "======================================================================"
+	@echo "All packages built successfully!"
+	@echo "======================================================================"
+	@echo "Debian packages: $(BUILD_PACKAGES_DEB_DIR)"
+	@echo "RPM packages:    $(BUILD_PACKAGES_RPM_DIR)"
+
+# ============================================================
+# Clean Targets
+# ============================================================
+
+clean: clean-deb clean-rpm
+	@echo "All build artifacts cleaned."
+
+clean-deb:
+	@echo "Cleaning Debian build artifacts..."
+	-rm -rf $(CURDIR)/build
+	@echo "Debian artifacts cleaned."
+
+clean-rpm:
+	@echo "Cleaning RPM build artifacts..."
+	-rm -rf ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SRPMS}/*kernel*
+	@echo "RPM artifacts cleaned."
+
+# ============================================================
+# Status and Info
+# ============================================================
+
+status:
+	@echo "======================================================================"
+	@echo "Build Environment Status"
+	@echo "======================================================================"
+	@echo ""
+	@echo "Git Branch:"
+	@git branch --show-current
+	@echo ""
+	@echo "Git Status:"
+	@git status --short
+	@echo ""
+	@echo "Debian Packages ($(BUILD_PACKAGES_DEB_DIR)):"
+	@ls -lh $(BUILD_PACKAGES_DEB_DIR)/*.deb 2>/dev/null | tail -5 || echo "  (none found)"
+	@echo ""
+	@echo "RPM Packages ($(BUILD_PACKAGES_RPM_DIR)):"
+	@ls -lh $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | tail -5 || echo "  (none found)"
+	@echo ""
+	@echo "Parallel Jobs: $(JOBS)"
+	@echo "======================================================================"
+
+# ============================================================
+# Package Verification
+# ============================================================
+
+verify-deb-packages:
+	@echo ""
+	@echo "======================================================================"
+	@echo "Verifying Debian package consistency..."
+	@echo "======================================================================"
+	@FAILED=0; \
+	for binary in $(BUILD_PACKAGES_DEB_DIR)/linux-binary-*.deb; do \
+		if [ -f "$$binary" ]; then \
+			modules=$$(echo $$binary | sed 's/linux-binary-/linux-modules-/'); \
+			if [ -f "$$modules" ]; then \
+				echo ""; \
+				if ! $(CURDIR)/scripts/verify-kernel-package.sh "$$binary" "$$modules"; then \
+					FAILED=1; \
+				fi; \
+			else \
+				echo "⚠️  Warning: No matching modules package for $$(basename $$binary)"; \
+			fi; \
+		fi; \
+	done; \
+	if [ $$FAILED -eq 1 ]; then \
+		echo ""; \
+		echo "❌ Package verification FAILED!"; \
+		echo "   Fix required before deployment."; \
+		echo ""; \
+		exit 1; \
+	else \
+		echo ""; \
+		echo "✅ All packages verified successfully!"; \
+		echo ""; \
+	fi
+
+.PHONY: verify-deb-packages

@@ -1,0 +1,354 @@
+#!/bin/bash
+# Docker-based kernel build script for Intel kernel packages
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_NAME="intel-kernel-builder"
+IMAGE_TAG="ubuntu24.04"
+CONTAINER_NAME="kernel-build-$$"
+FORCE_SETUP=false
+BUILD_DIR="${SCRIPT_DIR}/build"
+PACKAGES_DIR="${BUILD_DIR}/packages"
+PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
+PACKAGES_RPM_DIR="${PACKAGES_DIR}/rpm"
+LOG_DIR="${BUILD_DIR}/logs"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+format_duration() {
+    local seconds=$1
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+    local secs=$((seconds % 60))
+
+    if [ $hours -gt 0 ]; then
+        printf "%dh %dm %ds" $hours $minutes $secs
+    elif [ $minutes -gt 0 ]; then
+        printf "%dm %ds" $minutes $secs
+    else
+        printf "%ds" $secs
+    fi
+}
+
+show_usage() {
+    cat <<EOF
+Intel Kernel Docker Build Script
+
+Usage: $0 [OPTIONS] [COMMAND]
+
+OPTIONS:
+    -b, --build-image     Build Docker image (Ubuntu with Deb + RPM support)
+    -c, --clean           Remove Docker image
+    --clean-logs          Remove all build logs
+    -f, --force-setup     Force re-run setup (re-download source)
+    -h, --help            Show this help message
+
+COMMANDS:
+    shell                Open interactive shell in container
+    deb                  Build Debian packages
+    rpm                  Build RPM packages
+    rpm-prepare          Prepare RPM source files
+    all                  Build both Debian and RPM packages
+
+EXAMPLES:
+    # Build Docker image (supports both Deb and RPM)
+    $0 --build-image
+
+    # Build packages
+    $0 deb               # Build Debian packages
+    $0 rpm-prepare       # Prepare RPM sources
+    $0 rpm               # Build RPM packages
+    $0 all               # Build both
+
+    # Open shell
+    $0 shell             # Interactive shell in container
+
+LOGS:
+    Build logs are saved to: build/logs/
+    - setup-YYYYMMDD-HHMMSS.log   (setup phase)
+    - build-YYYYMMDD-HHMMSS.log   (Debian build)
+    - rpm-YYYYMMDD-HHMMSS.log     (RPM build)
+
+OUTPUT:
+    Debian packages: packages/deb/
+    RPM packages:    packages/rpm/
+
+EOF
+}
+
+build_image() {
+    cd "$SCRIPT_DIR/docker"
+
+    # Build with proxy settings from environment if available
+    BUILD_ARGS=""
+    if [ -n "$http_proxy" ]; then
+        BUILD_ARGS="$BUILD_ARGS --build-arg http_proxy=$http_proxy"
+        print_info "Using http_proxy: $http_proxy"
+    fi
+    if [ -n "$https_proxy" ]; then
+        BUILD_ARGS="$BUILD_ARGS --build-arg https_proxy=$https_proxy"
+        print_info "Using https_proxy: $https_proxy"
+    fi
+
+    print_info "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+    print_info "  Base: Ubuntu 24.04"
+    print_info "  Support: Debian (.deb) + RPM (.rpm) packages"
+    docker build $BUILD_ARGS -f Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+    print_info "Docker image built successfully!"
+}
+
+clean_image() {
+    print_info "Removing Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+    docker rmi "${IMAGE_NAME}:${IMAGE_TAG}" || print_warn "Image not found or already removed"
+}
+
+clean_logs() {
+    if [ -d "$LOG_DIR" ]; then
+        print_info "Cleaning build logs from: $LOG_DIR"
+        rm -rf "$LOG_DIR"
+        print_info "Logs cleaned."
+    else
+        print_warn "No log directory found"
+    fi
+}
+
+run_container() {
+    local cmd="$1"
+
+    print_info "Starting container: ${CONTAINER_NAME}"
+
+    docker run --rm -it \
+        --name "${CONTAINER_NAME}" \
+        --user "$(id -u):$(id -g)" \
+        -v "${SCRIPT_DIR}:/build/debian-kernel" \
+        -w /build/debian-kernel \
+        "${IMAGE_NAME}:${IMAGE_TAG}" \
+        bash -c "${cmd}"
+}
+
+check_image_exists() {
+    if ! docker images "${IMAGE_NAME}:${IMAGE_TAG}" | grep -q "${IMAGE_TAG}"; then
+        print_error "Docker image not found: ${IMAGE_NAME}:${IMAGE_TAG}"
+        print_info "Please build the image first: $0 --build-image"
+        exit 1
+    fi
+}
+
+# Parse arguments
+if [ $# -eq 0 ]; then
+    show_usage
+    exit 0
+fi
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--build-image)
+            build_image
+            exit 0
+            ;;
+        -c|--clean)
+            clean_image
+            exit 0
+            ;;
+        --clean-logs)
+            clean_logs
+            exit 0
+            ;;
+        -f|--force-setup)
+            FORCE_SETUP=true
+            shift
+            continue
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        shell)
+            check_image_exists
+            print_info "Opening interactive shell..."
+            print_info "Tip: Use 'make help' to see available build targets"
+            run_container "/bin/bash"
+            exit 0
+            ;;
+        deb)
+            check_image_exists
+            START_TIME=$(date +%s)
+            print_info "Building Debian packages..."
+
+            # Create log directory
+            mkdir -p "$LOG_DIR"
+            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
+            BUILD_LOG="$LOG_DIR/build-${TIMESTAMP}.log"
+
+            # Check if source needs to be prepared (run on host, not in container)
+            if [ "$FORCE_SETUP" = true ]; then
+                print_info "Step 1/2: Force setup (--force-setup) - running on host..."
+                print_info "Setup log: $SETUP_LOG"
+                cd "$SCRIPT_DIR"
+                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
+            elif [ ! -d "$BUILD_DIR/kernel" ] || [ ! -f "$BUILD_DIR/kernel/Makefile" ]; then
+                print_info "Step 1/2: First-time setup (download source, apply patches) - running on host..."
+                print_info "Setup log: $SETUP_LOG"
+                cd "$SCRIPT_DIR"
+                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
+            else
+                print_info "Step 1/2: Build directory exists, skipping setup..."
+            fi
+
+            print_info "Step 2/2: Building packages in container..."
+            print_info "Build log: $BUILD_LOG"
+            run_container "cd /build/debian-kernel/build/kernel && dpkg-buildpackage -B -uc -us -j\$(nproc) 2>&1" | tee "$BUILD_LOG"
+
+            BUILD_STATUS=${PIPESTATUS[0]}
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+
+            if [ $BUILD_STATUS -eq 0 ]; then
+                # Move packages to packages/deb/
+                mkdir -p "$PACKAGES_DEB_DIR"
+                print_info "Moving packages to $PACKAGES_DEB_DIR..."
+                mv -f "$BUILD_DIR"/*.deb "$BUILD_DIR"/*.ddeb "$BUILD_DIR"/*.dsc "$BUILD_DIR"/*.tar.* "$BUILD_DIR"/*.changes "$BUILD_DIR"/*.buildinfo "$PACKAGES_DEB_DIR"/ 2>/dev/null || true
+
+                print_info "Build completed successfully!"
+                print_info "Packages: $PACKAGES_DEB_DIR/"
+                print_info "Logs: $LOG_DIR/"
+                print_info "Build time: $(format_duration $DURATION)"
+            else
+                print_error "Build failed with exit code: $BUILD_STATUS"
+                print_error "Check log file: $BUILD_LOG"
+                print_error "Build time: $(format_duration $DURATION)"
+                exit $BUILD_STATUS
+            fi
+            exit 0
+            ;;
+        rpm-prepare)
+            print_info "Preparing RPM source files..."
+            cd "$SCRIPT_DIR"
+            make rpm-prepare
+            print_info "Setup completed!"
+            print_info "You can now build RPM packages: $0 rpm"
+            exit 0
+            ;;
+        rpm)
+            check_image_exists
+            START_TIME=$(date +%s)
+            print_info "Building RPM packages..."
+
+            mkdir -p "$LOG_DIR"
+            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
+            RPM_LOG="$LOG_DIR/rpm-${TIMESTAMP}.log"
+
+            # Check if source files exist, run rpm-prepare if needed
+            if [ ! -f "$SCRIPT_DIR/rpm/linux-"*.tar.xz ]; then
+                print_info "Step 1/2: RPM source files not found. Running rpm-prepare..."
+                print_info "Setup log: $SETUP_LOG"
+                cd "$SCRIPT_DIR"
+                make rpm-prepare 2>&1 | tee "$SETUP_LOG" || exit 1
+            else
+                print_info "Step 1/2: RPM source files exist, skipping setup..."
+            fi
+
+            print_info "Step 2/2: Building RPM packages..."
+            print_info "Build log: $RPM_LOG"
+
+            run_container "cd /build/debian-kernel && make rpm 2>&1" | tee "$RPM_LOG"
+
+            BUILD_STATUS=${PIPESTATUS[0]}
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+
+            if [ $BUILD_STATUS -eq 0 ]; then
+                print_info "RPM build completed successfully!"
+                print_info "Packages: $PACKAGES_RPM_DIR/"
+                print_info "Logs: $LOG_DIR/"
+                print_info "Build time: $(format_duration $DURATION)"
+            else
+                print_error "RPM build failed with exit code: $BUILD_STATUS"
+                print_error "Check log file: $RPM_LOG"
+                print_error "Build time: $(format_duration $DURATION)"
+                exit $BUILD_STATUS
+            fi
+            exit 0
+            ;;
+        all)
+            check_image_exists
+            START_TIME=$(date +%s)
+            print_info "Building all packages (Debian + RPM)..."
+
+            mkdir -p "$LOG_DIR"
+            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
+            ALL_LOG="$LOG_DIR/all-${TIMESTAMP}.log"
+
+            # Check if Debian source needs to be prepared (run on host, not in container)
+            if [ "$FORCE_SETUP" = true ]; then
+                print_info "Step 1/3: Force setup (--force-setup) - Debian setup on host..."
+                print_info "Setup log: $SETUP_LOG"
+                cd "$SCRIPT_DIR"
+                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
+            elif [ ! -d "$BUILD_DIR/kernel" ]; then
+                print_info "Step 1/3: Debian setup (download source, apply patches) - running on host..."
+                print_info "Setup log: $SETUP_LOG"
+                cd "$SCRIPT_DIR"
+                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
+            else
+                print_info "Step 1/3: Debian build directory exists, skipping setup..."
+            fi
+
+            # Check if RPM source files exist (run on host, not in container)
+            if [ ! -f "$SCRIPT_DIR/rpm/linux-"*.tar.xz ]; then
+                print_info "Step 2/3: RPM setup (prepare source files) - running on host..."
+                cd "$SCRIPT_DIR"
+                make rpm-prepare 2>&1 | tee -a "$SETUP_LOG" || exit 1
+            else
+                print_info "Step 2/3: RPM source files exist, skipping setup..."
+            fi
+
+            print_info "Step 3/3: Building all packages in container..."
+            print_info "Build log: $ALL_LOG"
+
+            run_container "make all 2>&1" | tee "$ALL_LOG"
+
+            BUILD_STATUS=${PIPESTATUS[0]}
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+
+            if [ $BUILD_STATUS -eq 0 ]; then
+                print_info "All packages built successfully!"
+                print_info "Debian packages: $PACKAGES_DEB_DIR/"
+                print_info "RPM packages: $PACKAGES_RPM_DIR/"
+                print_info "Logs: $LOG_DIR/"
+                print_info "Total build time: $(format_duration $DURATION)"
+            else
+                print_error "Build failed with exit code: $BUILD_STATUS"
+                print_error "Check log file: $ALL_LOG"
+                print_error "Total build time: $(format_duration $DURATION)"
+                exit $BUILD_STATUS
+            fi
+            exit 0
+            ;;
+        *)
+            print_error "Unknown command: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
