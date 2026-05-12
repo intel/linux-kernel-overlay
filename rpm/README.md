@@ -2,6 +2,8 @@
 
 RPM package building system for Linux kernel, based on Fedora kernel packaging practices.
 
+**Note**: RPM packages now use the same versioning scheme as Debian packages, with timestamps automatically extracted from `debian/changelog`. See [VERSION-NAMING.md](VERSION-NAMING.md) for details.
+
 ## Directory Structure (Fedora-style)
 
 This implementation follows Fedora's flat directory layout from [Fedora's kernel repository](https://src.fedoraproject.org/rpms/kernel):

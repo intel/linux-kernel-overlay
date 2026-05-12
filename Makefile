@@ -17,7 +17,9 @@ help:
 	@echo "  clean-deb        Clean Debian build artifacts only"
 	@echo "  clean-rpm        Clean RPM build artifacts only"
 	@echo "  status           Show current build status"
-	@echo "  verify-deb-packages  Verify kernel package consistency"
+	@echo "  verify-deb-packages  Verify Debian kernel package consistency"
+	@echo "  verify-rpm-packages  Verify RPM kernel package consistency"
+	@echo "  verify-packages      Verify all packages (DEB + RPM)"
 	@echo ""
 	@echo "Debian Targets:"
 	@echo "  deb-setup        Setup Debian build (first-time only)"
@@ -119,7 +121,7 @@ deb-setup:
 	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
 	@# Auto-generate localversion and abi_suffix from changelog
 	@echo "Extracting version suffix from debian/changelog..."
-	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | sed 's/^[0-9.]*//'); \
+	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | sed 's/^[0-9.]*//'); \
 	if [ -n "$$SUFFIX" ]; then \
 		echo "$$SUFFIX" > $(BUILD_DIR)/localversion; \
 		echo "Created localversion file with: $$SUFFIX"; \
@@ -151,20 +153,19 @@ deb-modules:
 # ============================================================
 # RPM Package Targets
 # ============================================================
-
-# Kernel version for RPM (can be overridden)
-RPM_KERNEL_VERSION ?= 6.18.20
+# Note: RPM kernel version is automatically extracted from debian/changelog
 
 rpm-prepare:
 	@echo "======================================================================"
 	@echo "Preparing RPM source files..."
 	@echo "======================================================================"
-	@echo "Kernel Version: $(RPM_KERNEL_VERSION)"
-	@echo ""
-	cd rpm && ./scripts/prepare-sources.sh --version $(RPM_KERNEL_VERSION)
-	@echo ""
-	@echo "RPM sources prepared!"
-	@echo "  - linux-$(RPM_KERNEL_VERSION).tar.xz"
+	@KVER=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | cut -d- -f1); \
+	echo "Kernel Version: $$KVER (from debian/changelog)"; \
+	echo ""; \
+	cd rpm && ./scripts/prepare-sources.sh --version $$KVER; \
+	echo ""; \
+	echo "RPM sources prepared!"; \
+	echo "  - linux-$$KVER.tar.xz"
 	@echo "  - patches.tar.gz (332 patches)"
 	@echo "  - kernel-x86_64.config"
 	@echo "  - kernel-x86_64-rt.config"
@@ -175,6 +176,9 @@ rpm:
 	@echo "======================================================================"
 	@echo "Building RPM packages..."
 	@echo "======================================================================"
+	@# Extract version from debian/changelog (convert to lowercase)
+	@FULL_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]'); \
+	echo "Version from changelog: $$FULL_VERSION"
 	@# Check if source files exist
 	@if [ ! -f rpm/linux-*.tar.xz ]; then \
 		echo "Error: Source files not found."; \
@@ -190,6 +194,11 @@ rpm:
 	@echo ""
 	@echo "RPM packages built successfully!"
 	@echo "Packages are in: $(BUILD_PACKAGES_RPM_DIR)"
+	@# Show generated package names
+	@echo ""
+	@echo "Generated packages:"
+	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
+	@$(MAKE) verify-rpm-packages
 
 rpm-quick:
 	@echo "======================================================================"
@@ -314,4 +323,47 @@ verify-deb-packages:
 		echo ""; \
 	fi
 
-.PHONY: verify-deb-packages
+verify-rpm-packages:
+	@echo ""
+	@echo "======================================================================"
+	@echo "Verifying RPM package consistency..."
+	@echo "======================================================================"
+	@FAILED=0; \
+	OLD_SPEC=0; \
+	for rpm in $(BUILD_PACKAGES_RPM_DIR)/kernel-[0-9]*.x86_64.rpm; do \
+		if [ -f "$$rpm" ]; then \
+			echo ""; \
+			if $(CURDIR)/scripts/verify-kernel-package-rpm.sh "$$rpm"; then \
+				continue; \
+			else \
+				EXIT_CODE=$$?; \
+				if [ $$EXIT_CODE -eq 2 ]; then \
+					OLD_SPEC=1; \
+				else \
+					FAILED=1; \
+				fi; \
+			fi; \
+		fi; \
+	done; \
+	echo ""; \
+	if [ $$FAILED -eq 1 ]; then \
+		echo "❌ Package verification FAILED!"; \
+		echo "   Fix required before deployment."; \
+		echo ""; \
+		exit 1; \
+	elif [ $$OLD_SPEC -eq 1 ]; then \
+		echo "⚠️  Package(s) need to be rebuilt with updated spec file"; \
+		echo "   Run: make clean-rpm && make rpm"; \
+		echo ""; \
+		exit 0; \
+	else \
+		echo "✅ All packages verified successfully!"; \
+		echo ""; \
+	fi
+
+verify-packages: verify-deb-packages verify-rpm-packages
+	@echo "======================================================================"
+	@echo "✅ All packages (DEB + RPM) verified successfully!"
+	@echo "======================================================================"
+
+.PHONY: verify-deb-packages verify-rpm-packages verify-packages

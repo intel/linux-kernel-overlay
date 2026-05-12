@@ -92,11 +92,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Extract full version from debian/changelog
+DEBIAN_CHANGELOG="$PROJECT_ROOT/debian/changelog"
+if [[ -f "$DEBIAN_CHANGELOG" ]]; then
+    FULL_VERSION=$(head -1 "$DEBIAN_CHANGELOG" | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]')
+    echo "Extracted version from debian/changelog: $FULL_VERSION"
+else
+    FULL_VERSION="6.18.20-intel+unknown"
+    echo "Warning: debian/changelog not found, using default version: $FULL_VERSION"
+fi
+
 echo "======================================================================"
 echo "Kernel RPM Build Script (Fedora-style)"
 echo "======================================================================"
 echo "RPM Directory:    $RPM_DIR"
 echo "Spec File:        $RPM_DIR/kernel.spec"
+echo "Full Version:     $FULL_VERSION"
 echo "Architecture:     $BUILD_ARCH"
 echo "Parallel Jobs:    $JOBS"
 echo "======================================================================"
@@ -206,6 +217,7 @@ echo ""
 # Note: Using --nodeps because we're on Ubuntu/Debian with equivalent packages installed
 # but rpmbuild doesn't recognize Debian packages as satisfying RPM dependencies
 rpmbuild $BUILD_TYPE kernel.spec \
+    --define "full_version $FULL_VERSION" \
     --define "_smp_mflags -j$JOBS" \
     --target="$BUILD_ARCH" \
     --nodeps

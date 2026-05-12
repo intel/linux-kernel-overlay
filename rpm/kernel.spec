@@ -12,9 +12,19 @@
 %define with_tools 1
 
 # Package version information
-%define kernel_version 6.18.20
-%define kernel_release 1
-%define pkg_release %{kernel_release}%{?dist}
+# Version can be passed at build time with --define 'full_version 6.18.20-intel+260417t093242z'
+# Otherwise defaults to basic version
+%{!?full_version: %define full_version 6.18.20-intel+unknown}
+%define kernel_version %(echo %{full_version} | cut -d- -f1)
+%define version_suffix %(echo %{full_version} | cut -d- -f2-)
+
+# Package release uses the full version suffix (e.g., intel+260417t093242z)
+%define pkg_release %{version_suffix}%{?dist}
+
+# Kernel build release string (used for uname -r and module paths)
+# This is the full version string that will appear in uname -r
+# Format: 6.18.20-intel+260417t093242z
+%define buildid %{full_version}
 
 # Architecture
 %define _target_cpu x86_64
@@ -162,6 +172,10 @@ fi
 echo "Processing kernel configuration..."
 make ARCH=%{_target_cpu} olddefconfig
 
+# Note: LOCALVERSION is set during make (not via localversion file)
+# to avoid double-appending the suffix
+echo "Kernel will be built with version: %{buildid}"
+
 # ======================================================================
 # Build section
 # ======================================================================
@@ -169,6 +183,7 @@ make ARCH=%{_target_cpu} olddefconfig
 echo "======================================================================"
 echo "Build: Compiling kernel"
 echo "======================================================================"
+echo "Kernel version string: %{buildid}"
 
 # Set C include path for Ubuntu/Debian multiarch compatibility
 # This is needed for perf tools to find gnu/libc-version.h
@@ -176,7 +191,8 @@ export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu:$C_INCLUDE_PATH
 export CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu:$CPLUS_INCLUDE_PATH
 
 # Build the kernel
-make ARCH=%{_target_cpu} %{?_smp_mflags} all
+# Use KERNELRELEASE to ensure consistent version string
+make ARCH=%{_target_cpu} LOCALVERSION="-%{version_suffix}" %{?_smp_mflags} all
 
 %if %{with_tools}
 # Build kernel tools (perf, turbostat, etc.)
@@ -204,39 +220,44 @@ echo "Skipping kernel tools build (with_tools=0)"
 echo "======================================================================"
 echo "Install: Installing kernel and modules"
 echo "======================================================================"
+echo "Installing kernel version: %{buildid}"
 
 mkdir -p %{buildroot}/boot
-mkdir -p %{buildroot}/lib/modules/%{kernel_version}-%{kernel_release}.%{_target_cpu}
+mkdir -p %{buildroot}/lib/modules/%{buildid}
 mkdir -p %{buildroot}%{_prefix}
 
 # Install kernel image
-cp -v arch/x86/boot/bzImage %{buildroot}/boot/vmlinuz-%{kernel_version}-%{kernel_release}.%{_target_cpu}
-cp -v System.map %{buildroot}/boot/System.map-%{kernel_version}-%{kernel_release}.%{_target_cpu}
-cp -v .config %{buildroot}/boot/config-%{kernel_version}-%{kernel_release}.%{_target_cpu}
+cp -v arch/x86/boot/bzImage %{buildroot}/boot/vmlinuz-%{buildid}
+cp -v System.map %{buildroot}/boot/System.map-%{buildid}
+cp -v .config %{buildroot}/boot/config-%{buildid}
 
-# Install modules
-make ARCH=%{_target_cpu} INSTALL_MOD_PATH=%{buildroot} modules_install
+# Install modules with correct version string
+make ARCH=%{_target_cpu} LOCALVERSION="-%{version_suffix}" INSTALL_MOD_PATH=%{buildroot} modules_install
+
+# Verify module installation path
+echo "Checking installed module path..."
+ls -ld %{buildroot}/lib/modules/%{buildid} || echo "ERROR: Module path mismatch!"
 
 # Install kernel development files
-mkdir -p %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}
+mkdir -p %{buildroot}/usr/src/kernels/%{buildid}
 
 # Copy essential files for module building
-cp -v Makefile %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/
-cp -v .config %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/
-cp -v Module.symvers %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/
+cp -v Makefile %{buildroot}/usr/src/kernels/%{buildid}/
+cp -v .config %{buildroot}/usr/src/kernels/%{buildid}/
+cp -v Module.symvers %{buildroot}/usr/src/kernels/%{buildid}/
 
 # Copy headers and scripts
 rsync -av --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-    include/ %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/include/
+    include/ %{buildroot}/usr/src/kernels/%{buildid}/include/
 rsync -av --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-    scripts/ %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/scripts/
+    scripts/ %{buildroot}/usr/src/kernels/%{buildid}/scripts/
 
 # Copy arch-specific files
-mkdir -p %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/arch/x86
+mkdir -p %{buildroot}/usr/src/kernels/%{buildid}/arch/x86
 rsync -av --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-    arch/x86/include/ %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/arch/x86/include/
+    arch/x86/include/ %{buildroot}/usr/src/kernels/%{buildid}/arch/x86/include/
 rsync -av --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-    arch/x86/kernel/asm-offsets.s %{buildroot}/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}/arch/x86/kernel/ || true
+    arch/x86/kernel/asm-offsets.s %{buildroot}/usr/src/kernels/%{buildid}/arch/x86/kernel/ || true
 
 %if %{with_tools}
 # Install kernel tools
@@ -262,13 +283,13 @@ echo "Skipping kernel tools installation (with_tools=0)"
 # Files section
 # ======================================================================
 %files
-/boot/vmlinuz-%{kernel_version}-%{kernel_release}.%{_target_cpu}
-/boot/System.map-%{kernel_version}-%{kernel_release}.%{_target_cpu}
-/boot/config-%{kernel_version}-%{kernel_release}.%{_target_cpu}
-/lib/modules/%{kernel_version}
+/boot/vmlinuz-%{buildid}
+/boot/System.map-%{buildid}
+/boot/config-%{buildid}
+/lib/modules/%{buildid}
 
 %files devel
-/usr/src/kernels/%{kernel_version}-%{kernel_release}.%{_target_cpu}
+/usr/src/kernels/%{buildid}
 
 %if %{with_tools}
 %files tools
