@@ -17,8 +17,9 @@ if [ ! -f "$KERNEL_RPM" ]; then
 fi
 
 # Check if this is a kernel package (not kernel-devel, kernel-tools, etc.)
-if [[ ! "$(basename "$KERNEL_RPM")" =~ ^kernel-[0-9]+\.[0-9]+\.[0-9]+-.*\.rpm$ ]]; then
-    echo "Error: Not a kernel package (should be kernel-VERSION-RELEASE.ARCH.rpm)"
+# Supports both kernel-* and kernel-rt-* packages
+if [[ ! "$(basename "$KERNEL_RPM")" =~ ^kernel(-rt)?-[0-9]+\.[0-9]+\.[0-9]+-.*\.rpm$ ]]; then
+    echo "Error: Not a kernel package (should be kernel-VERSION-RELEASE.ARCH.rpm or kernel-rt-VERSION-RELEASE.ARCH.rpm)"
     echo "Given: $(basename "$KERNEL_RPM")"
     exit 1
 fi

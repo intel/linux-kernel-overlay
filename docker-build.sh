@@ -64,7 +64,7 @@ OPTIONS:
 COMMANDS:
     shell                Open interactive shell in container
     deb                  Build Debian packages
-    rpm                  Build RPM packages
+    rpm                  Build RPM packages (both standard and RT)
     rpm-prepare          Prepare RPM source files
     all                  Build both Debian and RPM packages
 
@@ -75,7 +75,7 @@ EXAMPLES:
     # Build packages
     $0 deb               # Build Debian packages
     $0 rpm-prepare       # Prepare RPM sources
-    $0 rpm               # Build RPM packages
+    $0 rpm               # Build RPM packages (standard + RT)
     $0 all               # Build both
 
     # Open shell
@@ -251,7 +251,7 @@ while [[ $# -gt 0 ]]; do
         rpm)
             check_image_exists
             START_TIME=$(date +%s)
-            print_info "Building RPM packages..."
+            print_info "Building RPM packages (standard + RT)..."
 
             mkdir -p "$LOG_DIR"
             SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
@@ -267,24 +267,26 @@ while [[ $# -gt 0 ]]; do
                 print_info "Step 1/2: RPM source files exist, skipping setup..."
             fi
 
-            print_info "Step 2/2: Building RPM packages..."
+            print_info "Step 2/2: Building RPM packages (standard + RT)..."
             print_info "Build log: $RPM_LOG"
 
-            run_container "cd /build/debian-kernel && make rpm 2>&1" | tee "$RPM_LOG"
+            run_container "cd /build/debian-kernel && make rpm-all 2>&1" | tee "$RPM_LOG"
 
             BUILD_STATUS=${PIPESTATUS[0]}
             END_TIME=$(date +%s)
             DURATION=$((END_TIME - START_TIME))
 
             if [ $BUILD_STATUS -eq 0 ]; then
-                print_info "RPM build completed successfully!"
+                print_info "All RPM packages built successfully!"
+                print_info "  Standard kernel: kernel-*"
+                print_info "  RT kernel:       kernel-rt-*"
                 print_info "Packages: $PACKAGES_RPM_DIR/"
                 print_info "Logs: $LOG_DIR/"
-                print_info "Build time: $(format_duration $DURATION)"
+                print_info "Total build time: $(format_duration $DURATION)"
             else
                 print_error "RPM build failed with exit code: $BUILD_STATUS"
                 print_error "Check log file: $RPM_LOG"
-                print_error "Build time: $(format_duration $DURATION)"
+                print_error "Total build time: $(format_duration $DURATION)"
                 exit $BUILD_STATUS
             fi
             exit 0

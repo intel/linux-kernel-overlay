@@ -11,6 +11,10 @@
 # Set to 0 to skip building kernel-tools (perf, cpupower, etc.)
 %define with_tools 1
 
+# RT kernel build option
+# Set to 1 to build RT kernel (uses kernel-x86_64-rt.config)
+%{!?with_rt: %define with_rt 0}
+
 # Package version information
 # Version can be passed at build time with --define 'full_version 6.18.20-intel+260417t093242z'
 # Otherwise defaults to basic version
@@ -36,7 +40,11 @@
 %{!?_sysconfdir: %define _sysconfdir /etc}
 
 Summary: The Linux kernel (mainline with custom patches)
+%if %{with_rt}
+Name: kernel-rt
+%else
 Name: kernel
+%endif
 Version: %{kernel_version}
 Release: %{pkg_release}
 License: GPL-2.0
@@ -45,7 +53,11 @@ Vendor: Custom Build
 
 # Sources
 Source0: linux-%{kernel_version}.tar.xz
+%if %{with_rt}
+Source1: kernel-x86_64-rt.config
+%else
 Source1: kernel-x86_64.config
+%endif
 Source2: kernel-local
 Source3: patches.tar.gz
 
@@ -75,6 +87,9 @@ BuildRequires: zlib-devel
 %description
 The Linux kernel package contains the Linux kernel (vmlinuz), the core of your
 Linux operating system. This is a mainline kernel build with custom patches.
+%if %{with_rt}
+This is the PREEMPT_RT real-time kernel variant.
+%endif
 
 %package devel
 Summary: Development files for the kernel

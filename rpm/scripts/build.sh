@@ -57,6 +57,9 @@ PREREQUISITES:
 EOF
 }
 
+# Extra defines for rpmbuild (e.g., --define "with_rt 1")
+EXTRA_DEFINES=()
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,6 +81,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -a|--arch)
             BUILD_ARCH="$2"
+            shift 2
+            ;;
+        --define)
+            EXTRA_DEFINES+=("--define" "$2")
             shift 2
             ;;
         -h|--help)
@@ -220,6 +227,7 @@ rpmbuild $BUILD_TYPE kernel.spec \
     --define "full_version $FULL_VERSION" \
     --define "_smp_mflags -j$JOBS" \
     --target="$BUILD_ARCH" \
+    "${EXTRA_DEFINES[@]}" \
     --nodeps
 
 BUILD_STATUS=$?

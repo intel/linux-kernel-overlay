@@ -1,7 +1,7 @@
 # Makefile for Kernel Packaging System
 # Supports both Debian (.deb) and RPM (.rpm) package builds
 
-.PHONY: help deb rpm all clean clean-deb clean-rpm status
+.PHONY: help deb rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
 
 # Default target
 help:
@@ -11,7 +11,9 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  deb              Build Debian packages (.deb)"
-	@echo "  rpm              Build RPM packages (.rpm)"
+	@echo "  rpm              Build RPM packages (standard kernel)"
+	@echo "  rpm-rt           Build RPM packages (RT kernel)"
+	@echo "  rpm-all          Build RPM packages (standard + RT)"
 	@echo "  all              Build both Debian and RPM packages"
 	@echo "  clean            Clean all build artifacts"
 	@echo "  clean-deb        Clean Debian build artifacts only"
@@ -32,7 +34,9 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make deb                    # Build Debian packages"
-	@echo "  make rpm                    # Build RPM packages"
+	@echo "  make rpm                    # Build RPM packages (standard only)"
+	@echo "  make rpm-rt                 # Build RPM packages (RT only)"
+	@echo "  make rpm-all                # Build RPM packages (standard + RT)"
 	@echo "  make all                    # Build both"
 	@echo "  make JOBS=8 deb             # Build with 8 parallel jobs"
 	@echo ""
@@ -200,6 +204,68 @@ rpm:
 	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
 	@$(MAKE) verify-rpm-packages
 
+rpm-rt:
+	@echo "======================================================================"
+	@echo "Building RPM packages (RT kernel)..."
+	@echo "======================================================================"
+	@# Extract version from debian/changelog (convert to lowercase)
+	@FULL_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]'); \
+	echo "Version from changelog: $$FULL_VERSION"
+	@# Check if source files exist
+	@if [ ! -f rpm/linux-*.tar.xz ]; then \
+		echo "Error: Source files not found."; \
+		echo "Run 'make rpm-prepare' first."; \
+		exit 1; \
+	fi
+	@# Check if RT config exists
+	@if [ ! -f rpm/kernel-x86_64-rt.config ]; then \
+		echo "Error: RT config not found: rpm/kernel-x86_64-rt.config"; \
+		echo "Run 'make rpm-prepare' to generate configs."; \
+		exit 1; \
+	fi
+	cd rpm && ./scripts/build.sh --jobs $(JOBS) --define "with_rt 1" $(RPM_BUILD_FLAGS)
+	@# Move packages to packages/rpm/ directory
+	@mkdir -p $(BUILD_PACKAGES_RPM_DIR)
+	@echo "Moving RPM packages to $(BUILD_PACKAGES_RPM_DIR)..."
+	@find ~/rpmbuild/RPMS/ -name "*.rpm" -type f -exec mv -f {} $(BUILD_PACKAGES_RPM_DIR)/ \; 2>/dev/null || true
+	@find ~/rpmbuild/SRPMS/ -name "*.rpm" -type f -exec mv -f {} $(BUILD_PACKAGES_RPM_DIR)/ \; 2>/dev/null || true
+	@echo ""
+	@echo "RPM packages (RT kernel) built successfully!"
+	@echo "Packages are in: $(BUILD_PACKAGES_RPM_DIR)"
+	@# Show generated package names
+	@echo ""
+	@echo "Generated packages:"
+	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/kernel-rt*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
+	@$(MAKE) verify-rpm-packages
+
+rpm-all:
+	@echo "======================================================================"
+	@echo "Building all RPM packages (standard + RT)..."
+	@echo "======================================================================"
+	@# Check if source files exist
+	@if [ ! -f rpm/linux-*.tar.xz ]; then \
+		echo "Error: Source files not found."; \
+		echo "Run 'make rpm-prepare' first."; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "[1/2] Building standard kernel packages..."
+	@echo ""
+	@$(MAKE) rpm
+	@echo ""
+	@echo "[2/2] Building RT kernel packages..."
+	@echo ""
+	@$(MAKE) rpm-rt
+	@echo ""
+	@echo "======================================================================"
+	@echo "All RPM packages built successfully!"
+	@echo "======================================================================"
+	@echo "Standard kernel: kernel-*"
+	@echo "RT kernel:       kernel-rt-*"
+	@echo "Packages are in: $(BUILD_PACKAGES_RPM_DIR)"
+	@echo ""
+	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
+
 rpm-quick:
 	@echo "======================================================================"
 	@echo "Quick RPM build (binary packages only)..."
@@ -225,7 +291,7 @@ rpm-update:
 
 all:
 	@echo "======================================================================"
-	@echo "Building all packages (Debian + RPM)..."
+	@echo "Building all packages (Debian + RPM standard + RPM RT)..."
 	@echo "======================================================================"
 	@# Check and setup Debian build if needed
 	@if [ ! -d "$(BUILD_DIR)" ]; then \
@@ -237,15 +303,17 @@ all:
 		echo "RPM source files not found. Running rpm-prepare..."; \
 		$(MAKE) rpm-prepare; \
 	fi
-	@# Build both packages
+	@# Build all packages
 	$(MAKE) deb
-	$(MAKE) rpm
+	$(MAKE) rpm-all
 	@echo ""
 	@echo "======================================================================"
 	@echo "All packages built successfully!"
 	@echo "======================================================================"
 	@echo "Debian packages: $(BUILD_PACKAGES_DEB_DIR)"
 	@echo "RPM packages:    $(BUILD_PACKAGES_RPM_DIR)"
+	@echo "  - kernel-* (standard)"
+	@echo "  - kernel-rt-* (RT)"
 
 # ============================================================
 # Clean Targets
@@ -330,7 +398,7 @@ verify-rpm-packages:
 	@echo "======================================================================"
 	@FAILED=0; \
 	OLD_SPEC=0; \
-	for rpm in $(BUILD_PACKAGES_RPM_DIR)/kernel-[0-9]*.x86_64.rpm; do \
+	for rpm in $(BUILD_PACKAGES_RPM_DIR)/kernel-[0-9]*.x86_64.rpm $(BUILD_PACKAGES_RPM_DIR)/kernel-rt-[0-9]*.x86_64.rpm; do \
 		if [ -f "$$rpm" ]; then \
 			echo ""; \
 			if $(CURDIR)/scripts/verify-kernel-package-rpm.sh "$$rpm"; then \
