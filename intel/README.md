@@ -1,6 +1,6 @@
-# Common Kernel Resources
+# Intel Linux Kernel Resources
 
-This directory contains shared kernel resources used by both Debian and RPM packaging systems.
+This directory contains Intel-specific kernel resources used by both Debian and RPM packaging systems.
 
 ## Directory Structure
 
