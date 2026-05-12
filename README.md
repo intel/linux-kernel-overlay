@@ -32,7 +32,7 @@ This repository uses an **overlay system** to manage Intel-specific patches and 
 
 ```
 debian-kernel/
-├── common/                         # OVERLAY: Intel patches & configs (shared)
+├── intel/                         # OVERLAY: Intel patches & configs (shared)
 │   ├── patches/                   # Intel kernel patches
 │   │   ├── intel/                # Intel-specific patches
 │   │   │   ├── 0001-ippu-driver.patch
@@ -51,24 +51,24 @@ debian-kernel/
 │
 ├── debian/                         # Debian/Ubuntu packaging
 │   ├── config/
-│   │   └── amd64/intel -> ../../../common/config/intel  # Symlink to overlay
+│   │   └── amd64/intel -> ../../../intel/config/intel  # Symlink to overlay
 │   ├── patches/
-│   │   └── intel -> ../../common/patches/intel          # Symlink to overlay
+│   │   └── intel -> ../../intel/patches/intel          # Symlink to overlay
 │   └── README.md     # Debian package guide
 │
 └── rpm/                            # Fedora/CentOS/RHEL packaging
     ├── kernel-config/
-    │   └── intel -> ../../common/config/intel           # Symlink to overlay
-    ├── patches -> ../common/patches                     # Symlink to overlay
+    │   └── intel -> ../../intel/config/intel           # Symlink to overlay
+    ├── patches -> ../intel/patches                     # Symlink to overlay
     └── README.md                   # RPM package guide
 ```
 
 ### How the Overlay Works
 
-1. **Single Source of Truth**: All Intel-specific patches and configurations are in `common/`
+1. **Single Source of Truth**: All Intel-specific patches and configurations are in `intel/`
 2. **Symbolic Links**: Both Debian and RPM packaging access overlay via symlinks
 3. **Automatic Integration**: Build systems automatically apply patches and merge configs
-4. **Easy Maintenance**: Update once in `common/`, applies to all packaging formats
+4. **Easy Maintenance**: Update once in `intel/`, applies to all packaging formats
 
 ### Intel Platform Features
 
@@ -83,7 +83,7 @@ The overlay includes optimizations and drivers for Intel hardware:
 
 ### Managing Patches and Configurations
 
-For detailed information on adding, organizing, and managing Intel patches and configuration fragments, see **[common/README.md](common/README.md)**. This includes:
+For detailed information on adding, organizing, and managing Intel patches and configuration fragments, see **[intel/README.md](intel/README.md)**. This includes:
 
 - How to add and register patches
 - Creating configuration fragments
@@ -188,12 +188,12 @@ See [docker/README.md](docker/README.md) for Docker build details.
 
 ### Quick Workflow Overview
 
-1. **Add/modify patches** in `common/patches/intel/`
-2. **Add/modify configs** in `common/config/intel/`
+1. **Add/modify patches** in `intel/patches/intel/`
+2. **Add/modify configs** in `intel/config/intel/`
 3. **Test build** with `make deb` or `make rpm`
 4. **Commit changes** to git
 
-For detailed step-by-step instructions on adding Intel features, including patch management, configuration fragments, and best practices, see **[common/README.md](common/README.md)**.
+For detailed step-by-step instructions on adding Intel features, including patch management, configuration fragments, and best practices, see **[intel/README.md](intel/README.md)**.
 
 ## Version Information
 
@@ -237,7 +237,7 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
   - Customization options
   - Fedora integration
 
-- **[Intel Overlay](common/README.md)** - Shared patches and configurations
+- **[Intel Overlay](intel/README.md)** - Shared patches and configurations
   - Patch management
   - Configuration fragments
   - Intel platform features
@@ -282,7 +282,7 @@ See package-specific documentation for detailed troubleshooting:
 
 ## Contributing
 
-For detailed information on adding Intel features, patch management, and configuration guidelines, see **[common/README.md](common/README.md)**.
+For detailed information on adding Intel features, patch management, and configuration guidelines, see **[intel/README.md](intel/README.md)**.
 
 ### General Guidelines
 

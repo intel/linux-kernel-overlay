@@ -364,7 +364,7 @@ dpkg -L package-name          # List installed files
 - **[Main README](../README.md)** - Project overview, Intel overlay system
 - **[Module Packaging](MODULE_PACKAGING.md)** - Standalone module packages
 - **[RPM Packages](../rpm/README.md)** - RPM build system
-- **[Intel Overlay](../common/README.md)** - Shared patches and configs
+- **[Intel Overlay](../intel/README.md)** - Shared patches and configs
 
 ---
 

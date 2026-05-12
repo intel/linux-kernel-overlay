@@ -52,8 +52,8 @@ kernel-rt-tools-devel-6.18.20-intel+260417t093242z.x86_64.rpm
 The RT kernel config is generated from:
 
 1. **Base config**: `rpm/kernel-x86_64-base.config` (Fedora base)
-2. **Intel config fragments**: `common/config/amd64/intel/*.cfg`
-3. **RT config**: `common/config/config.rt` (PREEMPT_RT settings)
+2. **Intel config fragments**: `intel/config/amd64/intel/*.cfg`
+3. **RT config**: `intel/config/config.rt` (PREEMPT_RT settings)
 
 The merge order is defined in `debian/config/amd64/defines.toml` under the `rt-amd64` flavour.
 
@@ -129,7 +129,7 @@ rpmbuild -ba kernel.spec \
 
 Edit the RT-specific config:
 ```bash
-vim common/config/config.rt
+vim intel/config/config.rt
 ```
 
 Then regenerate configs:
@@ -169,4 +169,4 @@ grep PREEMPT boot/config-*
 - `rpm/README.md`: General RPM packaging guide
 - `rpm/VERSION-NAMING.md`: Package naming conventions
 - `rpm/KERNEL-VERSION.md`: Kernel version consistency
-- `common/config/config.rt`: RT-specific kernel options
+- `intel/config/config.rt`: RT-specific kernel options

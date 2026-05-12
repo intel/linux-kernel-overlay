@@ -13,9 +13,9 @@ rpm/
 ├── kernel.spec                      # RPM spec file
 ├── kernel-local                     # User customization file (optional)
 │
-├── patches -> ../common/patches     # Symlink to patches (for reference)
+├── patches -> ../intel/patches     # Symlink to patches (for reference)
 ├── linux-6.18.20.tar.xz            # Kernel source tarball (generated)
-├── patches.tar.gz                   # Patches archive (generated from common/patches)
+├── patches.tar.gz                   # Patches archive (generated from intel/patches)
 │
 ├── kernel-x86_64-base.config       # Base config from Fedora (9566 lines, tracked in git)
 ├── kernel-x86_64.config            # Generated: base + fragments (9984 lines)
@@ -37,7 +37,7 @@ rpm/
 
 - **Fedora-compatible**: Uses the same flat directory structure as Fedora's kernel packaging
 - **Mainline kernel**: Builds from upstream kernel.org releases (e.g., v6.18.20)
-- **Individual patch application**: Applies patches one-by-one from `common/patches/series` for better debugging
+- **Individual patch application**: Applies patches one-by-one from `intel/patches/series` for better debugging
 - **Complete kernel configs**: Base config + fragments = full .config (~10K lines) for reproducible builds
 - **Shared config logic**: Uses `debian/config/amd64/defines.toml` for consistent merge order with Debian
 - **Multiple packages**: Builds kernel, kernel-devel, kernel-tools, and kernel-tools-libs
@@ -60,10 +60,10 @@ cd rpm
 
 This will:
 - Download `linux-6.18.20.tar.xz` from kernel.org
-- Create `patches.tar.gz` archive from `common/patches/` (containing series + individual patches)
+- Create `patches.tar.gz` archive from `intel/patches/` (containing series + individual patches)
 - Generate complete `.config` files by merging:
   - **Base config** (9566 lines from Fedora)
-  - **Config fragments** from `common/config/` (following `debian/config/amd64/defines.toml` order)
+  - **Config fragments** from `intel/config/` (following `debian/config/amd64/defines.toml` order)
   - Result: ~10K line complete configs for reproducible builds
 - Download Fedora build scripts (`mod-sign.sh`, etc.)
 
@@ -125,7 +125,7 @@ You can also prepare sources individually:
 ./scripts/setup-fedora-sources.sh
 
 # Create patches tarball manually
-tar -czf rpm/patches.tar.gz -C common patches/
+tar -czf rpm/patches.tar.gz -C intel patches/
 ```
 
 ### Build Options
@@ -150,7 +150,7 @@ The config generation uses a base + fragments approach:
 ```
 kernel-x86_64-base.config (9566 lines, Fedora base)
     +
-common/config/amd64/intel/*.cfg (30 fragments, ~400 lines)
+intel/config/amd64/intel/*.cfg (30 fragments, ~400 lines)
     =
 kernel-x86_64.config (9984 lines, complete .config)
 ```
@@ -159,9 +159,9 @@ kernel-x86_64.config (9984 lines, complete .config)
 
 To customize kernel config:
 
-1. **Option A (Recommended)**: Edit config fragments in `common/config/`
+1. **Option A (Recommended)**: Edit config fragments in `intel/config/`
    ```bash
-   echo "CONFIG_MY_DRIVER=m" >> common/config/amd64/intel/mydriver.cfg
+   echo "CONFIG_MY_DRIVER=m" >> intel/config/amd64/intel/mydriver.cfg
    # Add to debian/config/amd64/defines.toml under config = [...]
    ./scripts/generate-configs.sh
    ```
@@ -180,14 +180,14 @@ To customize kernel config:
 
 ### Adding Patches
 
-Add patches to `common/patches/intel/` and update `common/patches/series`:
+Add patches to `intel/patches/intel/` and update `intel/patches/series`:
 
 ```bash
 # Add new patch
-cp my-feature.patch common/patches/intel/9999-my-feature.patch
+cp my-feature.patch intel/patches/intel/9999-my-feature.patch
 
 # Update series file
-echo "intel/9999-my-feature.patch" >> common/patches/series
+echo "intel/9999-my-feature.patch" >> intel/patches/series
 
 # Regenerate patches tarball
 ./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force
@@ -328,7 +328,7 @@ less ~/rpmbuild/BUILD/linux-6.18.20/build.log
 cd ~/rpmbuild/BUILD/linux-6.18.20
 patch -p1 --dry-run < patches/intel/0123-some-feature.patch
 
-# Fix the patch in common/patches/intel/0123-some-feature.patch
+# Fix the patch in intel/patches/intel/0123-some-feature.patch
 # Then regenerate patches tarball
 ./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force
 ```
@@ -349,14 +349,14 @@ This RPM packaging shares the repository with Debian packaging:
 
 ```
 debian-kernel/
-├── common/          # Shared patches and configs
+├── intel/          # Shared patches and configs
 │   ├── patches/
 │   └── config/
 ├── debian/          # Debian/Ubuntu packaging
 └── rpm/            # Fedora/RHEL packaging (this directory)
 ```
 
-Both use the same patches and configs from `common/`.
+Both use the same patches and configs from `intel/`.
 
 ## Resources
 

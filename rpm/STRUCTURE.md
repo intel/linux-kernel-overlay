@@ -9,14 +9,14 @@ rpm/
 ├── kernel.spec                          # Main RPM spec file (9.7K)
 ├── kernel-local                         # User customization file (empty by default)
 │
-├── patches -> ../common/patches         # Symlink for reference
+├── patches -> ../intel/patches         # Symlink for reference
 ├── patches.tar.gz                       # Patches archive (335 files, 799K)
 ├── kernel-x86_64.config                # Standard kernel config (24K)
 ├── kernel-x86_64-rt.config             # Real-time kernel config (25K)
 │
 ├── scripts/                             # Build automation scripts
 │   ├── prepare-sources.sh               # Main orchestration script
-│   ├── generate-configs.sh              # Generate configs from common/config/*
+│   ├── generate-configs.sh              # Generate configs from intel/config/*
 │   ├── build.sh                         # Build RPM packages
 │   ├── setup-fedora-sources.sh          # Download Fedora build scripts
 │   └── update-version.sh                # Version management
@@ -72,14 +72,14 @@ When a patch fails:
 # Output: ERROR: Failed to apply patch: intel/0123-my-feature.patch
 
 # 2. Check the failing patch
-cat common/patches/intel/0123-my-feature.patch
+cat intel/patches/intel/0123-my-feature.patch
 
 # 3. Test it manually
 cd ~/rpmbuild/BUILD/linux-6.18.20
 patch -p1 --dry-run < patches/intel/0123-my-feature.patch
 
-# 4. Fix the patch in common/patches
-vi common/patches/intel/0123-my-feature.patch
+# 4. Fix the patch in intel/patches
+vi intel/patches/intel/0123-my-feature.patch
 
 # 5. Regenerate patches tarball only
 ./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force

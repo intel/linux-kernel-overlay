@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RPM_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$RPM_DIR")"
 DEBIAN_CONFIG="$PROJECT_ROOT/debian/config"
-COMMON_CONFIG="$PROJECT_ROOT/common/config"
+INTEL_CONFIG="$PROJECT_ROOT/intel/config"
 
 # Colors
 GREEN='\033[0;32m'
@@ -50,7 +50,7 @@ OPTIONS:
 DESCRIPTION:
     Generates complete .config files by merging:
       1. Base config (rpm/kernel-x86_64-base.config)
-      2. Config fragments from common/config/
+      2. Config fragments from intel/config/
 
     The merge order is defined in debian/config/amd64/defines.toml
     to ensure consistency between Debian and RPM builds.
@@ -115,7 +115,7 @@ echo "======================================================================"
 echo "Architecture:     $ARCH"
 echo "Flavour:          $FLAVOUR"
 echo "Debian Config:    $DEBIAN_CONFIG"
-echo "Common Config:    $COMMON_CONFIG"
+echo "Common Config:    $INTEL_CONFIG"
 echo "Output Directory: $OUTPUT_DIR"
 echo "======================================================================"
 echo ""
@@ -257,9 +257,9 @@ generate_flavour_config() {
         # Construct full path
         local cfg_path=""
 
-        # Check in common/config first
-        if [ -f "$COMMON_CONFIG/$cfg" ]; then
-            cfg_path="$COMMON_CONFIG/$cfg"
+        # Check in intel/config first
+        if [ -f "$INTEL_CONFIG/$cfg" ]; then
+            cfg_path="$INTEL_CONFIG/$cfg"
         # Then check debian/config
         elif [ -f "$DEBIAN_CONFIG/$cfg" ]; then
             cfg_path="$DEBIAN_CONFIG/$cfg"

@@ -349,5 +349,5 @@ echo "Skipping kernel tools installation (with_tools=0)"
 %changelog
 * %(date "+%a %b %d %Y") Kernel Builder <builder@localhost> - %{kernel_version}-%{kernel_release}
 - Custom kernel build based on mainline %{kernel_version}
-- Applied custom patches from common/patches
-- Built with configuration from common/config
+- Applied custom patches from intel/patches
+- Built with configuration from intel/config

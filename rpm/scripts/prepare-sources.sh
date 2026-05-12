@@ -6,8 +6,8 @@
 #
 # Prepare all source files for RPM build (Fedora-style flat layout)
 # - Downloads kernel tarball
-# - Creates patches tarball from common/patches (series + individual patches)
-# - Generates kernel config files from common/config
+# - Creates patches tarball from intel/patches (series + individual patches)
+# - Generates kernel config files from intel/config
 # - Downloads Fedora build scripts
 
 set -e
@@ -15,7 +15,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RPM_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$RPM_DIR")"
-COMMON_DIR="$PROJECT_ROOT/common"
+INTEL_DIR="$PROJECT_ROOT/intel"
 
 # Colors
 GREEN='\033[0;32m'
@@ -77,15 +77,15 @@ EXAMPLES:
 
 WHAT IT DOES:
     1. Downloads linux-VERSION.tar.xz to rpm/
-    2. Creates rpm/patches.tar.gz from common/patches/ (series + patches)
-    3. Generates rpm/kernel-*.config from common/config/
+    2. Creates rpm/patches.tar.gz from intel/patches/ (series + patches)
+    3. Generates rpm/kernel-*.config from intel/config/
     4. Downloads Fedora build scripts (mod-sign.sh, etc.) to rpm/
 
 OUTPUT STRUCTURE (Fedora-style flat layout):
     rpm/
     ├── linux-6.18.20.tar.xz           # Kernel source
     ├── patches.tar.gz                 # Patches (extracted during build)
-    ├── patches -> ../common/patches   # Symlink for reference
+    ├── patches -> ../intel/patches   # Symlink for reference
     ├── kernel-x86_64.config           # Generated configs
     ├── mod-sign.sh                    # Fedora scripts
     └── kernel.spec                    # Spec file (create separately)
@@ -141,7 +141,7 @@ echo "Prepare RPM Build Sources (Fedora-style)"
 echo "======================================================================"
 echo "Kernel Version:   $KERNEL_VERSION"
 echo "RPM Directory:    $RPM_DIR"
-echo "Common Directory: $COMMON_DIR"
+echo "Common Directory: $INTEL_DIR"
 echo "Fedora Branch:    $FEDORA_BRANCH"
 echo "======================================================================"
 echo ""
@@ -187,17 +187,17 @@ if [ "$SKIP_PATCHES" = false ]; then
         # Check if patches directory (symlink) exists
         if [ ! -L "$RPM_DIR/patches" ] && [ ! -d "$RPM_DIR/patches" ]; then
             print_error "patches directory/symlink not found: $RPM_DIR/patches"
-            print_warn "Expected symlink: rpm/patches -> ../common/patches"
+            print_warn "Expected symlink: rpm/patches -> ../intel/patches"
             exit 1
         fi
 
-        # Create tarball from common/patches
-        print_info "Creating tarball from common/patches/..."
-        tar -czf "$PATCHES_TARBALL" -C "$COMMON_DIR" \
+        # Create tarball from intel/patches
+        print_info "Creating tarball from intel/patches/..."
+        tar -czf "$PATCHES_TARBALL" -C "$INTEL_DIR" \
             --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
             patches/
 
-        PATCH_COUNT=$(grep -v "^#\|^$" "$COMMON_DIR/patches/series" | wc -l)
+        PATCH_COUNT=$(grep -v "^#\|^$" "$INTEL_DIR/patches/series" | wc -l)
         print_info "Created: $PATCHES_TARBALL ($(du -h "$PATCHES_TARBALL" | cut -f1))"
         print_info "  Contains: $PATCH_COUNT patches + series file"
     fi

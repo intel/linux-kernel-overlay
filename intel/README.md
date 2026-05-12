@@ -5,7 +5,7 @@ This directory contains shared kernel resources used by both Debian and RPM pack
 ## Directory Structure
 
 ```
-common/
+intel/
 ├── patches/                    # Shared kernel patches
 │   ├── series                 # Patch application order
 │   └── intel/                 # Intel-specific patches
@@ -35,12 +35,12 @@ common/
 
 The Debian packaging system accesses these resources via symbolic links:
 
-- `debian/patches/series` → `../../common/patches/series`
-- `debian/patches/intel` → `../../common/patches/intel`
-- `debian/config/config.rt` → `../../common/config/config.rt`
-- `debian/config/config.test` → `../../common/config/config.test`
-- `debian/config/amd64/config.test` → `../../../common/config/amd64/config.test`
-- `debian/config/amd64/intel` → `../../../common/config/amd64/intel`
+- `debian/patches/series` → `../../intel/patches/series`
+- `debian/patches/intel` → `../../intel/patches/intel`
+- `debian/config/config.rt` → `../../intel/config/config.rt`
+- `debian/config/config.test` → `../../intel/config/config.test`
+- `debian/config/amd64/config.test` → `../../../intel/config/amd64/config.test`
+- `debian/config/amd64/intel` → `../../../intel/config/amd64/intel`
 
 Configuration fragments are referenced in `debian/config/amd64/defines.toml`:
 
@@ -57,11 +57,11 @@ config = [
 
 The RPM packaging system also uses symbolic links:
 
-- `rpm/SOURCES/patches` → `../../common/patches` (includes `series` file)
-- `rpm/SOURCES/kernel-config/config.rt` → `../../../common/config/config.rt`
-- `rpm/SOURCES/kernel-config/config.test` → `../../../common/config/config.test`
-- `rpm/SOURCES/kernel-config/amd64/config.test` → `../../../../common/config/amd64/config.test`
-- `rpm/SOURCES/kernel-config/intel` → `../../../common/config/amd64/intel`
+- `rpm/SOURCES/patches` → `../../intel/patches` (includes `series` file)
+- `rpm/SOURCES/kernel-config/config.rt` → `../../../intel/config/config.rt`
+- `rpm/SOURCES/kernel-config/config.test` → `../../../intel/config/config.test`
+- `rpm/SOURCES/kernel-config/amd64/config.test` → `../../../../intel/config/amd64/config.test`
+- `rpm/SOURCES/kernel-config/intel` → `../../../intel/config/amd64/intel`
 
 The RPM spec file references patches in the `%prep` section and configs in the configuration merge section.
 
@@ -69,14 +69,14 @@ The RPM spec file references patches in the `%prep` section and configs in the c
 
 ### Adding a New Patch
 
-1. Place the patch file in `common/patches/intel/`:
+1. Place the patch file in `intel/patches/intel/`:
    ```bash
-   cp my-fix.patch common/patches/intel/0042-my-fix.patch
+   cp my-fix.patch intel/patches/intel/0042-my-fix.patch
    ```
 
-2. Add it to the shared `common/patches/series` file:
+2. Add it to the shared `intel/patches/series` file:
    ```bash
-   echo "intel/0042-my-fix.patch" >> common/patches/series
+   echo "intel/0042-my-fix.patch" >> intel/patches/series
    ```
    
    This change will automatically be visible to both Debian and RPM packaging systems through symbolic links.
@@ -85,9 +85,9 @@ The RPM spec file references patches in the `%prep` section and configs in the c
 
 ### Adding a New Config Fragment
 
-1. Create the config file in `common/config/intel/`:
+1. Create the config file in `intel/config/intel/`:
    ```bash
-   cat > common/config/intel/myfeature.cfg <<EOF
+   cat > intel/config/intel/myfeature.cfg <<EOF
    CONFIG_MY_FEATURE=m
    CONFIG_MY_FEATURE_OPTION=y
    EOF
@@ -106,7 +106,7 @@ The RPM spec file references patches in the `%prep` section and configs in the c
 
 ### Managing the Patch Series File
 
-The `common/patches/series` file defines the order in which patches are applied. This is crucial because:
+The `intel/patches/series` file defines the order in which patches are applied. This is crucial because:
 - Some patches may depend on others
 - Patch order affects the final kernel state
 - Both Debian and RPM must apply patches in the same order
@@ -114,7 +114,7 @@ The `common/patches/series` file defines the order in which patches are applied.
 **Editing the series file:**
 ```bash
 # Edit the shared series file
-vim common/patches/series
+vim intel/patches/series
 
 # The changes are immediately visible to both Debian and RPM
 # through symbolic links
@@ -131,7 +131,7 @@ intel/0002-second-patch.drm
 
 ### Modifying Existing Resources
 
-Simply edit the files in `common/` — changes will automatically be visible to both packaging systems due to the symbolic links.
+Simply edit the files in `intel/` — changes will automatically be visible to both packaging systems due to the symbolic links.
 
 ## Design Principles
 
@@ -202,12 +202,12 @@ ls -l rpm/SOURCES/kernel-config/intel
 
 ```bash
 # Should show the same content
-ls common/patches/intel/
+ls intel/patches/intel/
 ls debian/patches/intel/
 ls rpm/SOURCES/patches/intel/
 
 # Should show the same config files
-ls common/config/intel/
+ls intel/config/intel/
 ls debian/config/amd64/intel/
 ls rpm/SOURCES/kernel-config/intel/
 ```
@@ -215,14 +215,14 @@ ls rpm/SOURCES/kernel-config/intel/
 ## Migration History
 
 **2026-04-28**: Initial creation
-- Moved patches from `debian/patches/intel/` to `common/patches/intel/`
-- Moved configs from `debian/config/amd64/intel/` to `common/config/amd64/intel/`
-- Moved patch series file from `debian/patches/series` to `common/patches/series`
+- Moved patches from `debian/patches/intel/` to `intel/patches/intel/`
+- Moved configs from `debian/config/amd64/intel/` to `intel/config/amd64/intel/`
+- Moved patch series file from `debian/patches/series` to `intel/patches/series`
 - Moved RT and test configs:
-  - `debian/config/config.rt` → `common/config/config.rt`
-  - `debian/config/config.test` → `common/config/config.test`
-  - `debian/config/amd64/config.test` → `common/config/amd64/config.test`
-- Organized architecture-specific configs under `common/config/amd64/`
+  - `debian/config/config.rt` → `intel/config/config.rt`
+  - `debian/config/config.test` → `intel/config/config.test`
+  - `debian/config/amd64/config.test` → `intel/config/amd64/config.test`
+- Organized architecture-specific configs under `intel/config/amd64/`
 - Created symbolic links in both Debian and RPM packaging directories
 - Maintained backward compatibility with existing build scripts
 - Both Debian and RPM now share the same patch application order and kernel configurations
