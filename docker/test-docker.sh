@@ -38,11 +38,11 @@ fi
 echo "✅ docker-build.sh found"
 
 # Check if Dockerfile exists
-if [ ! -f "./Dockerfile" ]; then
-    echo "❌ Dockerfile not found"
+if [ ! -f "./Dockerfile.ubuntu24.04" ]; then
+    echo "❌ Dockerfile.ubuntu24.04 not found"
     exit 1
 fi
-echo "✅ Dockerfile found"
+echo "✅ Dockerfile.ubuntu24.04 found"
 
 echo ""
 echo "=== All checks passed! ==="

@@ -8,6 +8,7 @@ IMAGE_NAME="intel-kernel-builder"
 IMAGE_TAG="ubuntu24.04"
 CONTAINER_NAME="kernel-build-$$"
 FORCE_SETUP=false
+DOCKERFILE="Dockerfile.ubuntu24.04"
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -59,6 +60,7 @@ OPTIONS:
     -c, --clean           Remove Docker image
     --clean-logs          Remove all build logs
     -f, --force-setup     Force re-run setup (re-download source)
+    --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu24.04)
     -h, --help            Show this help message
 
 COMMANDS:
@@ -71,6 +73,7 @@ COMMANDS:
 EXAMPLES:
     # Build Docker image (supports both Deb and RPM)
     $0 --build-image
+    $0 --build-image --dockerfile Dockerfile.ubuntu26.04  # Use Ubuntu 26.04
 
     # Build packages
     $0 deb               # Build Debian packages
@@ -108,10 +111,16 @@ build_image() {
         print_info "Using https_proxy: $https_proxy"
     fi
 
+    # Check if Dockerfile exists
+    if [ ! -f "$DOCKERFILE" ]; then
+        print_error "Dockerfile not found: $DOCKERFILE"
+        exit 1
+    fi
+
     print_info "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
-    print_info "  Base: Ubuntu 24.04"
+    print_info "  Dockerfile: $DOCKERFILE"
     print_info "  Support: Debian (.deb) + RPM (.rpm) packages"
-    docker build $BUILD_ARGS -f Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+    docker build $BUILD_ARGS -f "$DOCKERFILE" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
     print_info "Docker image built successfully!"
 }
 
@@ -158,7 +167,27 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
-# Parse options
+# First pass: parse option-setting arguments (--dockerfile, -f)
+ORIGINAL_ARGS=("$@")
+for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
+    case "${ORIGINAL_ARGS[i]}" in
+        --dockerfile)
+            DOCKERFILE="${ORIGINAL_ARGS[i+1]}"
+            # Auto-detect IMAGE_TAG from Dockerfile name
+            # Dockerfile.ubuntu24.04 -> ubuntu24.04
+            # Dockerfile.ubuntu26.04 -> ubuntu26.04
+            if [[ "$DOCKERFILE" =~ Dockerfile\.(.+)$ ]]; then
+                IMAGE_TAG="${BASH_REMATCH[1]}"
+                print_info "Using Dockerfile: $DOCKERFILE (image tag: $IMAGE_TAG)"
+            fi
+            ;;
+        -f|--force-setup)
+            FORCE_SETUP=true
+            ;;
+    esac
+done
+
+# Second pass: execute commands
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -b|--build-image)
@@ -174,8 +203,15 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -f|--force-setup)
-            FORCE_SETUP=true
             shift
+            continue
+            ;;
+        --dockerfile)
+            if [ -z "$2" ]; then
+                print_error "Error: --dockerfile requires a filename argument"
+                exit 1
+            fi
+            shift 2
             continue
             ;;
         -h|--help)

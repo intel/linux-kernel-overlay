@@ -4,7 +4,7 @@ Docker-based build environment for Intel kernel packages, supporting both Debian
 
 ## Files
 
-- **[Dockerfile](Dockerfile)** - Ubuntu 24.04 image for Debian builds
+- **[Dockerfile.ubuntu24.04](Dockerfile.ubuntu24.04)** - Ubuntu 24.04 image for Debian builds
 - **[Dockerfile.fedora](Dockerfile.fedora)** - Fedora Rawhide image for RPM builds
 - **[.dockerignore](.dockerignore)** - Files to exclude from Docker build context
 - **[test-docker.sh](test-docker.sh)** - Script to test Docker environment

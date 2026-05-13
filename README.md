@@ -172,8 +172,11 @@ make status
 For clean, reproducible builds without installing dependencies:
 
 ```bash
-# Build Docker image (first time only)
-./docker-build.sh --build-image deb
+# Build Docker image (first time only, Ubuntu 24.04 by default)
+./docker-build.sh --build-image
+
+# Or specify Ubuntu version explicitly
+./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu26.04
 
 # Build packages in container
 ./docker-build.sh deb
