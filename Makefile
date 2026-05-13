@@ -123,6 +123,12 @@ deb-setup:
 	@# Copy debian directory to build directory (dereference symlinks with -L)
 	@echo "Copying debian/ configuration to build directory..."
 	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
+	@# Auto-detect GCC version based on Ubuntu version
+	@echo "Detecting GCC version for current Ubuntu..."
+	@GCC_VER=$$(bash debian/bin/detect-gcc-version.sh 2>/dev/null || echo "14"); \
+	echo "Detected GCC version: gcc-$$GCC_VER"; \
+	sed -i "s|c_compiler = 'gcc-[0-9]*'|c_compiler = 'gcc-$$GCC_VER'|g" $(BUILD_DIR)/debian/config/defines.toml; \
+	echo "Updated c_compiler in defines.toml to: gcc-$$GCC_VER"
 	@# Auto-generate localversion and abi_suffix from changelog
 	@echo "Extracting version suffix from debian/changelog..."
 	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | sed 's/^[0-9.]*//'); \

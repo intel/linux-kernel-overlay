@@ -4,7 +4,8 @@ Docker-based build environment for Intel kernel packages, supporting both Debian
 
 ## Files
 
-- **[Dockerfile.ubuntu24.04](Dockerfile.ubuntu24.04)** - Ubuntu 24.04 image for Debian builds
+- **[Dockerfile.ubuntu24.04](Dockerfile.ubuntu24.04)** - Ubuntu 24.04 image for Debian builds (default)
+- **[Dockerfile.ubuntu26.04](Dockerfile.ubuntu26.04)** - Ubuntu 26.04 image for Debian builds
 - **[Dockerfile.fedora](Dockerfile.fedora)** - Fedora Rawhide image for RPM builds
 - **[.dockerignore](.dockerignore)** - Files to exclude from Docker build context
 - **[test-docker.sh](test-docker.sh)** - Script to test Docker environment
@@ -14,14 +15,17 @@ Docker-based build environment for Intel kernel packages, supporting both Debian
 ### Debian Packages
 
 ```bash
-# 1. Build Docker image (first time only)
-./docker-build.sh --build-image deb
+# 1. Build Docker image (first time only, Ubuntu 24.04 by default)
+./docker-build.sh --build-image
+
+# Or use Ubuntu 26.04
+./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu26.04
 
 # 2. Build packages
 ./docker-build.sh deb
 ```
 
-**Output**: `build/packages/*.deb`
+**Output**: `build/packages/deb/*.deb`
 
 ### RPM Packages
 
@@ -40,13 +44,23 @@ Docker-based build environment for Intel kernel packages, supporting both Debian
 
 ## Docker Images
 
-### Debian Image: `intel-kernel-builder:ubuntu24.04`
+### Debian Images
+
+#### `intel-kernel-builder:ubuntu24.04` (default)
 
 - **Base**: Ubuntu 24.04 LTS (Noble Numbat)
 - **Compiler**: GCC 14
 - **Tools**: dpkg-buildpackage, debhelper, quilt
 - **Size**: ~3-4 GB
 - **Status**: ✅ Fully tested
+
+#### `intel-kernel-builder:ubuntu26.04`
+
+- **Base**: Ubuntu 26.04 LTS
+- **Compiler**: GCC 15
+- **Tools**: dpkg-buildpackage, debhelper, quilt
+- **Size**: ~3-4 GB
+- **Status**: 🚧 Experimental (Ubuntu 26.04 not yet released)
 
 ### RPM Image: `intel-kernel-builder-rpm:fedora-rawhide`
 

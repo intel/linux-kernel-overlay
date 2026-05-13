@@ -5,10 +5,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="intel-kernel-builder"
-IMAGE_TAG="ubuntu24.04"
 CONTAINER_NAME="kernel-build-$$"
 FORCE_SETUP=false
 DOCKERFILE="Dockerfile.ubuntu24.04"
+IMAGE_TAG="ubuntu24.04"  # Will be auto-detected from DOCKERFILE
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -100,6 +100,20 @@ EOF
 build_image() {
     cd "$SCRIPT_DIR/docker"
 
+    # Check if Dockerfile exists
+    if [ ! -f "$DOCKERFILE" ]; then
+        print_error "Dockerfile not found: $DOCKERFILE"
+        exit 1
+    fi
+
+    # Auto-detect IMAGE_TAG from Dockerfile name
+    # Dockerfile.ubuntu24.04 -> ubuntu24.04
+    # Dockerfile.ubuntu26.04 -> ubuntu26.04
+    if [[ "$DOCKERFILE" =~ Dockerfile\.(.+)$ ]]; then
+        IMAGE_TAG="${BASH_REMATCH[1]}"
+        print_info "Auto-detected image tag from Dockerfile: $IMAGE_TAG"
+    fi
+
     # Build with proxy settings from environment if available
     BUILD_ARGS=""
     if [ -n "$http_proxy" ]; then
@@ -109,12 +123,6 @@ build_image() {
     if [ -n "$https_proxy" ]; then
         BUILD_ARGS="$BUILD_ARGS --build-arg https_proxy=$https_proxy"
         print_info "Using https_proxy: $https_proxy"
-    fi
-
-    # Check if Dockerfile exists
-    if [ ! -f "$DOCKERFILE" ]; then
-        print_error "Dockerfile not found: $DOCKERFILE"
-        exit 1
     fi
 
     print_info "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"

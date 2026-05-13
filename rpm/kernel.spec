@@ -39,6 +39,10 @@
 %{!?_datadir: %define _datadir /usr/share}
 %{!?_sysconfdir: %define _sysconfdir /etc}
 
+# Auto-detect Python version for perf Python extension
+%define python3_version %(python3 -c "import sys; print('%d.%d' % (sys.version_info.major, sys.version_info.minor))")
+%define python3_sitearch %(python3 -c "import site; print(site.getsitepackages()[0])")
+
 Summary: The Linux kernel (mainline with custom patches)
 %if %{with_rt}
 Name: kernel-rt
@@ -327,8 +331,8 @@ echo "Skipping kernel tools installation (with_tools=0)"
 %{_datadir}/bash-completion/completions/cpupower
 %{_datadir}/locale/*/LC_MESSAGES/cpupower.mo
 %{_datadir}/doc/perf-tip/tips.txt
-/usr/local/lib/python3.12/dist-packages/perf-0.1.egg-info
-/usr/local/lib/python3.12/dist-packages/perf.cpython-312-x86_64-linux-gnu.so
+%{python3_sitearch}/perf-*.egg-info
+%{python3_sitearch}/perf.cpython-*-x86_64-linux-gnu.so
 
 %files tools-libs
 %defattr(-,root,root)

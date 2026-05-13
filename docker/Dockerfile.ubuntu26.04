@@ -1,0 +1,214 @@
+# Ubuntu 26.04 LTS based Dockerfile for Intel Kernel Build
+FROM ubuntu:26.04
+
+LABEL maintainer="Intel Corporation"
+LABEL description="Build environment for Intel custom kernel packages (Debian and RPM)"
+LABEL version="2.1"
+LABEL ubuntu.version="26.04"
+
+# Accept proxy settings as build arguments
+ARG http_proxy
+ARG https_proxy
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install basic build dependencies and tools
+RUN apt-get update && apt-get install -y \
+    # Version control
+    git \
+    # Basic build tools
+    build-essential \
+    fakeroot \
+    dpkg-dev \
+    libc6-dev \
+    linux-libc-dev \
+    # Kernel build essentials
+    libncurses-dev \
+    flex \
+    bison \
+    libssl-dev \
+    libelf-dev \
+    bc \
+    rsync \
+    kmod \
+    cpio \
+    xz-utils \
+    # Debian packaging tools
+    debhelper \
+    devscripts \
+    quilt \
+    lintian \
+    # Python support
+    python3 \
+    python3-dev \
+    python3-setuptools \
+    python3-dacite \
+    python3-jinja2 \
+    dh-python \
+    python3-docutils \
+    # Documentation build dependencies
+    python3-sphinx \
+    python3-sphinx-rtd-theme \
+    python3-yaml \
+    sphinx-common \
+    dvipng \
+    graphviz \
+    # Additional build dependencies for full kernel build
+    asciidoctor \
+    gcc-15 \
+    gcc-multilib \
+    libconfig-dev \
+    libnewt-dev \
+    libnl-3-dev \
+    libnl-genl-3-dev \
+    libglib2.0-dev \
+    libnuma-dev \
+    # Additional perf and tools dependencies
+    libaudit-dev \
+    libcap-dev \
+    libdw-dev \
+    libdebuginfod-dev \
+    libpci-dev \
+    libperl-dev \
+    libpython3-dev \
+    libudev-dev \
+    libunwind-dev \
+    # RPM build dependencies
+    rpm \
+    binutils-dev \
+    libslang2-dev \
+    zlib1g-dev \
+    asciidoc \
+    xmlto \
+    libzstd-dev \
+    lz4 \
+    zstd \
+    pahole \
+    # Perl dependencies for RPM builds
+    perl \
+    perl-base \
+    # Utilities
+    vim \
+    wget \
+    curl \
+    sudo \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Try to install optional packages (may not be available in Ubuntu 26.04)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rustc cargo rustfmt || true \
+    && apt-get install -y --no-install-recommends \
+    bindgen || true \
+    && apt-get install -y --no-install-recommends \
+    libopencsd-dev || true \
+    && apt-get install -y --no-install-recommends \
+    libtracefs-dev || true \
+    && apt-get install -y --no-install-recommends \
+    libtraceevent-dev || true \
+    && apt-get install -y --no-install-recommends \
+    libbabeltrace-dev || true \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up RPM build environment
+# rpmbuild checks for RPM package names, but we have Debian packages installed
+# We need to set up rpm macros to disable dependency checks or satisfy them
+RUN mkdir -p /etc/rpm && \
+    echo '%_missing_build_ids_terminate_build 0' >> /etc/rpm/macros && \
+    echo '%__requires_exclude_from ^/usr/lib/debug' >> /etc/rpm/macros && \
+    echo '%_build_id_links none' >> /etc/rpm/macros
+
+# Fix multiarch header paths for perf build
+# Ubuntu uses /usr/include/x86_64-linux-gnu but perf looks in /usr/include
+# Create symlink for gnu directory (perf needs gnu/libc-version.h)
+RUN if [ ! -e /usr/include/gnu ] || [ -L /usr/include/gnu ]; then \
+        rm -f /usr/include/gnu && \
+        ln -sf x86_64-linux-gnu/gnu /usr/include/gnu; \
+    fi
+
+# Note: gcc-*-for-host, rust-src, and libwrap0-dev are not available in Ubuntu 26.04
+# Create dummy packages and stub libraries to satisfy build dependencies
+RUN apt-get update && apt-get install -y equivs && \
+    # Create gcc-15-for-host dummy package (primary for Ubuntu 26.04)
+    echo "Section: misc\nPriority: optional\nStandards-Version: 4.6.0\nPackage: gcc-15-for-host\nVersion: 15.0.0\nDepends: gcc-15\nDescription: Dummy package for gcc-15-for-host\n This is a dummy package to satisfy build dependencies." > /tmp/gcc-15-for-host && \
+    equivs-build /tmp/gcc-15-for-host && \
+    dpkg -i /gcc-15-for-host_*.deb && \
+    # Also create gcc-14-for-host for backward compatibility (points to gcc-15)
+    echo "Section: misc\nPriority: optional\nStandards-Version: 4.6.0\nPackage: gcc-14-for-host\nVersion: 14.0.0+compat\nDepends: gcc-15\nDescription: Dummy package for gcc-14-for-host (compatibility)\n This is a compatibility dummy package that depends on gcc-15." > /tmp/gcc-14-for-host && \
+    equivs-build /tmp/gcc-14-for-host && \
+    dpkg -i /gcc-14-for-host_*.deb && \
+    # Create libwrap stub library (libwrap is deprecated but some tools still check for it)
+    mkdir -p /usr/local/lib /usr/local/include && \
+    # Create stub library with required functions
+    printf '%s\n' \
+        'struct request_info { int dummy; };' \
+        'int hosts_access(struct request_info *req) { return 1; }' \
+        'void request_init(void *req, ...) { }' \
+        'void fromhost(void *req) { }' \
+        > /tmp/libwrap_stub.c && \
+    gcc -x c -fPIC -shared -o /usr/local/lib/libwrap.so /tmp/libwrap_stub.c && \
+    # Create tcpd.h header with required definitions
+    printf '%s\n' \
+        '#ifndef TCPD_H' \
+        '#define TCPD_H' \
+        'struct request_info { int dummy; };' \
+        '#define RQ_DAEMON 1' \
+        '#define RQ_FILE 2' \
+        'extern int hosts_access(struct request_info *req);' \
+        'extern void request_init(void *req, ...);' \
+        'extern void fromhost(void *req);' \
+        '#endif' \
+        > /usr/local/include/tcpd.h && \
+    echo '/usr/local/lib' > /etc/ld.so.conf.d/libwrap-stub.conf && \
+    ldconfig && \
+    # Create libwrap0-dev dummy package
+    echo "Section: misc\nPriority: optional\nStandards-Version: 4.6.0\nPackage: libwrap0-dev\nVersion: 1.0\nDescription: Stub libwrap library\n Provides minimal libwrap stub for compatibility." > /tmp/libwrap0-dev && \
+    equivs-build /tmp/libwrap0-dev && \
+    dpkg -i /libwrap0-dev_*.deb && \
+    rm -f /tmp/gcc-15-for-host /tmp/gcc-14-for-host /tmp/libwrap0-dev /*.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for building
+RUN useradd -m -s /bin/bash builder && \
+    echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Set working directory
+WORKDIR /build/debian-kernel
+
+# Configure git to treat the build directory as safe
+RUN git config --global --add safe.directory /build/debian-kernel
+
+# Switch to builder user
+USER builder
+
+# Set default shell
+SHELL ["/bin/bash", "-c"]
+
+# Create a helper script for building
+RUN echo '#!/bin/bash' > /home/builder/build-kernel.sh && \
+    echo 'set -e' >> /home/builder/build-kernel.sh && \
+    echo 'cd /build/debian-kernel' >> /home/builder/build-kernel.sh && \
+    echo 'echo "=== Intel Kernel Build Environment ==="' >> /home/builder/build-kernel.sh && \
+    echo 'echo "Available commands:"' >> /home/builder/build-kernel.sh && \
+    echo 'echo "  make deb         - Build Debian packages"' >> /home/builder/build-kernel.sh && \
+    echo 'echo "  make rpm         - Build RPM packages"' >> /home/builder/build-kernel.sh && \
+    echo 'echo "  make all         - Build both Debian and RPM"' >> /home/builder/build-kernel.sh && \
+    echo 'echo "  make help        - Show all available targets"' >> /home/builder/build-kernel.sh && \
+    echo 'echo ""' >> /home/builder/build-kernel.sh && \
+    echo 'echo "Manual build:"' >> /home/builder/build-kernel.sh && \
+    echo 'echo "  dpkg-buildpackage -B -uc -us -j\$(nproc)"' >> /home/builder/build-kernel.sh && \
+    echo 'echo ""' >> /home/builder/build-kernel.sh && \
+    echo 'exec /bin/bash' >> /home/builder/build-kernel.sh && \
+    chmod +x /home/builder/build-kernel.sh
+
+# Environment variables for build optimization
+ENV MAKEFLAGS="-j$(nproc)"
+ENV CCACHE_DIR=/build/.ccache
+# Disable LTO to avoid perf link errors
+ENV DEB_BUILD_MAINT_OPTIONS="optimize=-lto"
+
+# Default command: show build instructions
+CMD ["/home/builder/build-kernel.sh"]
