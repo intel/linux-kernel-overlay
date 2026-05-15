@@ -9,6 +9,7 @@ CONTAINER_NAME="kernel-build-$$"
 FORCE_SETUP=false
 DOCKERFILE="Dockerfile.ubuntu24.04"
 IMAGE_TAG="ubuntu24.04"  # Will be auto-detected from DOCKERFILE
+BUILD_MODE="full"  # full or minimal
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -61,11 +62,13 @@ OPTIONS:
     --clean-logs          Remove all build logs
     -f, --force-setup     Force re-run setup (re-download source)
     --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu24.04)
+    --mode MODE           Build mode: minimal or full (default: full)
     -h, --help            Show this help message
 
 COMMANDS:
     shell                Open interactive shell in container
     deb                  Build Debian packages
+    deb-minimal          Build Debian packages (minimal: kernel image only)
     rpm                  Build RPM packages (both standard and RT)
     rpm-prepare          Prepare RPM source files
     all                  Build both Debian and RPM packages
@@ -76,13 +79,19 @@ EXAMPLES:
     $0 --build-image --dockerfile Dockerfile.ubuntu26.04  # Use Ubuntu 26.04
 
     # Build packages
-    $0 deb               # Build Debian packages
+    $0 deb               # Build Debian packages (full: kernel + tools)
+    $0 deb --mode minimal    # Build kernel image only (faster, no tools)
+    $0 deb-minimal       # Same as above
     $0 rpm-prepare       # Prepare RPM sources
     $0 rpm               # Build RPM packages (standard + RT)
     $0 all               # Build both
 
     # Open shell
     $0 shell             # Interactive shell in container
+
+BUILD MODES (for Debian packages):
+    full     - Build kernel image + tools + headers (default)
+    minimal  - Build kernel image only (faster, no linux-kbuild/perf/cpupower)
 
 LOGS:
     Build logs are saved to: build/logs/
@@ -175,7 +184,7 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
-# First pass: parse option-setting arguments (--dockerfile, -f)
+# First pass: parse option-setting arguments (--dockerfile, -f, --mode)
 ORIGINAL_ARGS=("$@")
 for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
     case "${ORIGINAL_ARGS[i]}" in
@@ -191,6 +200,13 @@ for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
             ;;
         -f|--force-setup)
             FORCE_SETUP=true
+            ;;
+        --mode)
+            BUILD_MODE="${ORIGINAL_ARGS[i+1]}"
+            if [[ "$BUILD_MODE" != "minimal" && "$BUILD_MODE" != "full" ]]; then
+                print_error "Invalid build mode: $BUILD_MODE (must be 'minimal' or 'full')"
+                exit 1
+            fi
             ;;
     esac
 done
@@ -222,6 +238,14 @@ while [[ $# -gt 0 ]]; do
             shift 2
             continue
             ;;
+        --mode)
+            if [ -z "$2" ]; then
+                print_error "Error: --mode requires an argument (minimal or full)"
+                exit 1
+            fi
+            shift 2
+            continue
+            ;;
         -h|--help)
             show_usage
             exit 0
@@ -233,15 +257,27 @@ while [[ $# -gt 0 ]]; do
             run_container "/bin/bash"
             exit 0
             ;;
-        deb)
+        deb|deb-minimal)
             check_image_exists
             START_TIME=$(date +%s)
-            print_info "Building Debian packages..."
+
+            # Determine build mode
+            if [ "$1" = "deb-minimal" ]; then
+                BUILD_MODE="minimal"
+            fi
+
+            if [ "$BUILD_MODE" = "minimal" ]; then
+                print_info "Building Debian packages (minimal mode: kernel image only)..."
+                MAKE_TARGET="deb-minimal"
+            else
+                print_info "Building Debian packages (full mode: kernel + tools + headers)..."
+                MAKE_TARGET="deb"
+            fi
 
             # Create log directory
             mkdir -p "$LOG_DIR"
             SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
-            BUILD_LOG="$LOG_DIR/build-${TIMESTAMP}.log"
+            BUILD_LOG="$LOG_DIR/build-${BUILD_MODE}-${TIMESTAMP}.log"
 
             # Check if source needs to be prepared (run on host, not in container)
             if [ "$FORCE_SETUP" = true ]; then
@@ -258,9 +294,14 @@ while [[ $# -gt 0 ]]; do
                 print_info "Step 1/2: Build directory exists, skipping setup..."
             fi
 
-            print_info "Step 2/2: Building packages in container..."
+            print_info "Step 2/2: Building packages in container (mode: $BUILD_MODE)..."
             print_info "Build log: $BUILD_LOG"
-            run_container "cd /build/debian-kernel/build/kernel && dpkg-buildpackage -B -uc -us -j\$(nproc) 2>&1" | tee "$BUILD_LOG"
+
+            if [ "$BUILD_MODE" = "minimal" ]; then
+                print_info "Minimal build will skip: linux-kbuild, linux-perf, linux-cpupower, and other tools"
+            fi
+
+            run_container "cd /build/debian-kernel && make $MAKE_TARGET 2>&1" | tee "$BUILD_LOG"
 
             BUILD_STATUS=${PIPESTATUS[0]}
             END_TIME=$(date +%s)
@@ -273,6 +314,7 @@ while [[ $# -gt 0 ]]; do
                 mv -f "$BUILD_DIR"/*.deb "$BUILD_DIR"/*.ddeb "$BUILD_DIR"/*.dsc "$BUILD_DIR"/*.tar.* "$BUILD_DIR"/*.changes "$BUILD_DIR"/*.buildinfo "$PACKAGES_DEB_DIR"/ 2>/dev/null || true
 
                 print_info "Build completed successfully!"
+                print_info "Build mode: $BUILD_MODE"
                 print_info "Packages: $PACKAGES_DEB_DIR/"
                 print_info "Logs: $LOG_DIR/"
                 print_info "Build time: $(format_duration $DURATION)"

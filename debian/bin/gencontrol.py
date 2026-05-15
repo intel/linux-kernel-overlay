@@ -34,6 +34,7 @@ locale.setlocale(locale.LC_CTYPE, "C.UTF-8")
 class Gencontrol(Base):
     disable_installer: bool
     disable_signed: bool
+    disable_tools: bool
 
     env_flags = [
         ('DEBIAN_KERNEL_DISABLE_INSTALLER', 'disable_installer', 'installer modules'),
@@ -74,6 +75,14 @@ class Gencontrol(Base):
                 else:
                     raise RuntimeError(
                         f'Unable to disable {desc} in release build ({env} set)')
+
+        # Check DEB_BUILD_PROFILES for pkg.linux.notools
+        self.disable_tools = False
+        build_profiles = os.getenv('DEB_BUILD_PROFILES', '').split()
+        if 'pkg.linux.notools' in build_profiles:
+            import warnings
+            warnings.warn('Disable kernel tools on request (pkg.linux.notools profile)')
+            self.disable_tools = True
 
     def _setup_makeflags(self, names, makeflags, data) -> None:
         for src, dst, optional in names:
@@ -244,10 +253,10 @@ linux-signed-{vars['arch']} (@signedtemplate_sourceversion@) {dist}; urgency={ur
         if config.packages.source and list(config.featuresets):
             self.bundle.add('config', (arch, ), makeflags, vars)
 
-        if config.packages.tools_unversioned:
+        if config.packages.tools_unversioned and not self.disable_tools:
             self.bundle.add('tools-unversioned', (arch, ), makeflags, vars)
 
-        if config.packages.tools_versioned:
+        if config.packages.tools_versioned and not self.disable_tools:
             self.bundle.add('tools-versioned', (arch, ), makeflags, vars)
 
     def do_featureset_setup(

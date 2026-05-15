@@ -10,7 +10,8 @@ help:
 	@echo "============================================================"
 	@echo ""
 	@echo "Targets:"
-	@echo "  deb              Build Debian packages (.deb)"
+	@echo "  deb              Build Debian packages (full: kernel + tools)"
+	@echo "  deb-minimal      Build Debian packages (minimal: kernel image only)"
 	@echo "  rpm              Build RPM packages (standard kernel)"
 	@echo "  rpm-rt           Build RPM packages (RT kernel)"
 	@echo "  rpm-all          Build RPM packages (standard + RT)"
@@ -26,6 +27,7 @@ help:
 	@echo "Debian Targets:"
 	@echo "  deb-setup        Setup Debian build (first-time only)"
 	@echo "  deb-modules      Build Debian kernel module packages"
+	@echo "  deb-minimal      Build kernel image only (fast, no tools)"
 	@echo ""
 	@echo "RPM Targets:"
 	@echo "  rpm-prepare      Prepare RPM source files (first-time only)"
@@ -33,7 +35,8 @@ help:
 	@echo "  rpm-update       Update RPM version info"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make deb                    # Build Debian packages"
+	@echo "  make deb                    # Build all Debian packages (kernel + tools)"
+	@echo "  make deb-minimal            # Build kernel image only (faster)"
 	@echo "  make rpm                    # Build RPM packages (standard only)"
 	@echo "  make rpm-rt                 # Build RPM packages (RT only)"
 	@echo "  make rpm-all                # Build RPM packages (standard + RT)"
@@ -48,6 +51,7 @@ help:
 # Configuration
 JOBS ?= $(shell nproc)
 DEB_BUILD_FLAGS ?= -B -uc -us -j$(JOBS)
+DEB_BUILD_PROFILES ?=
 RPM_BUILD_FLAGS ?=
 BUILD_DIR ?= $(CURDIR)/build/kernel
 BUILD_PACKAGES_DIR ?= $(CURDIR)/build/packages
@@ -66,15 +70,39 @@ deb:
 		exit 1; \
 	fi
 	@echo "======================================================================"
-	@echo "Building Debian packages..."
+	@echo "Building Debian packages (full: kernel image + tools + headers)..."
 	@echo "======================================================================"
-	cd $(BUILD_DIR) && dpkg-buildpackage $(DEB_BUILD_FLAGS)
+	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS)
 	@# Move all packages and source files to packages/deb/ directory
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
 	@mv -f $(CURDIR)/build/*.deb $(CURDIR)/build/*.ddeb $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
 	@echo ""
 	@echo "Debian packages built successfully!"
+	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
+	@$(MAKE) verify-deb-packages
+
+deb-minimal:
+	@if [ ! -d "$(BUILD_DIR)" ]; then \
+		echo "Error: Build directory not found. Run 'make deb-setup' first."; \
+		exit 1; \
+	fi
+	@echo "======================================================================"
+	@echo "Building Debian packages (minimal: kernel image only, no tools)..."
+	@echo "======================================================================"
+	@echo "This build will skip:"
+	@echo "  - linux-kbuild packages (kernel build tools)"
+	@echo "  - linux-perf packages (perf profiling tools)"
+	@echo "  - linux-cpupower packages (CPU frequency tools)"
+	@echo "  - other kernel tools"
+	@echo ""
+	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS)
+	@# Move all packages and source files to packages/deb/ directory
+	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
+	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
+	@mv -f $(CURDIR)/build/*.deb $(CURDIR)/build/*.ddeb $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@echo ""
+	@echo "Debian packages (minimal) built successfully!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
 	@$(MAKE) verify-deb-packages
 

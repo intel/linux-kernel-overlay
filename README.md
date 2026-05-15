@@ -107,7 +107,8 @@ For detailed information on adding, organizing, and managing Intel patches and c
 make deb-setup
 
 # 2. Build packages
-make deb
+make deb              # Full build (kernel + tools + headers)
+make deb-minimal      # Minimal build (kernel image only, faster)
 
 # 3. Install
 sudo dpkg -i build/packages/deb/linux-image-*-amd64_*.deb
@@ -116,6 +117,10 @@ sudo reboot
 ```
 
 **Output**: Packages in `build/packages/deb/`
+
+**Build Modes**:
+- **Full build** (default): Builds kernel image + tools (perf, cpupower, etc.) + headers (~2-4 hours)
+- **Minimal build**: Builds kernel image only, skips tools (~1-2 hours, faster for testing)
 
 See [debian/README.md](debian/README.md) for detailed Debian package documentation including:
 - Package types and descriptions
@@ -152,7 +157,8 @@ make help
 
 # Debian builds
 make deb-setup     # First-time setup
-make deb           # Build packages
+make deb           # Build packages (full: kernel + tools)
+make deb-minimal   # Build packages (minimal: kernel only, faster)
 make clean-deb     # Clean Debian artifacts
 
 # RPM builds
@@ -179,7 +185,10 @@ For clean, reproducible builds without installing dependencies:
 ./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu26.04
 
 # Build packages in container
-./docker-build.sh deb
+./docker-build.sh deb              # Full build (kernel + tools)
+./docker-build.sh deb-minimal      # Minimal build (kernel only, faster)
+# Or use --mode option
+./docker-build.sh deb --mode minimal
 
 # Or open interactive shell
 ./docker-build.sh shell
