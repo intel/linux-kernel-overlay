@@ -18,6 +18,8 @@ intel/
     ├── config.rt              # Real-time (PREEMPT_RT) kernel config
     ├── config.test            # Test kernel configuration
     └── amd64/                 # AMD64 architecture configs
+        ├── base/              # Base kernel configurations
+        │   └── config.noble-6.8.0-31-generic  # Ubuntu Noble base config
         ├── config.test        # AMD64-specific test config
         └── intel/             # Intel platform configs (amd64)
             ├── bt.cfg         # Bluetooth configuration
@@ -37,6 +39,7 @@ The Debian packaging system accesses these resources via symbolic links:
 
 - `debian/patches/series` → `../../intel/patches/series`
 - `debian/patches/intel` → `../../intel/patches/intel`
+- `debian/config/config` → `../../intel/config/amd64/base/config.noble-6.8.0-31-generic`
 - `debian/config/config.rt` → `../../intel/config/config.rt`
 - `debian/config/config.test` → `../../intel/config/config.test`
 - `debian/config/amd64/config.test` → `../../../intel/config/amd64/config.test`
