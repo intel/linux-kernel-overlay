@@ -19,7 +19,8 @@ intel/
     ├── config.test            # Test kernel configuration
     └── amd64/                 # AMD64 architecture configs
         ├── base/              # Base kernel configurations
-        │   └── config.noble-6.8.0-31-generic  # Ubuntu Noble base config
+        │   ├── config.noble-6.8.0-31-generic    # Ubuntu 24.04 Noble (kernel 6.8.0)
+        │   └── config.resolute-7.0.0-14-generic # Ubuntu 26.04 Resolute (kernel 7.0.0)
         ├── config.test        # AMD64-specific test config
         └── intel/             # Intel platform configs (amd64)
             ├── bt.cfg         # Bluetooth configuration
