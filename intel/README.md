@@ -40,7 +40,7 @@ The Debian packaging system accesses these resources via symbolic links:
 
 - `debian/patches/series` → `../../intel/patches/series`
 - `debian/patches/intel` → `../../intel/patches/intel`
-- `debian/config/config` → `../../intel/config/amd64/base/config.noble-6.8.0-31-generic`
+- `debian/config/config` → `../../intel/config/amd64/base/config.resolute-7.0.0-14-generic`
 - `debian/config/config.rt` → `../../intel/config/config.rt`
 - `debian/config/config.test` → `../../intel/config/config.test`
 - `debian/config/amd64/config.test` → `../../../intel/config/amd64/config.test`
