@@ -21,6 +21,7 @@ This repository provides tools and configuration for building custom kernel pack
 - ✅ **Intel Platform Optimization**: Customized configuration for Intel processors and hardware
 - ✅ **Shared Overlay System**: Single source of truth for patches and configurations
 - ✅ **Multiple Kernel Flavours**: Standard (amd64), Real-Time (rt-amd64), Test kernels
+- ✅ **RT Kernel Auto-Configuration**: Automatic boot parameter setup for RT kernels
 - ✅ **Module Packaging Tools**: Create standalone packages for individual kernel modules
 - ✅ **Docker Support**: Clean, reproducible builds in containers
 
@@ -47,6 +48,7 @@ debian-kernel/
 │   │       ├── security.cfg      # Intel security features
 │   │       ├── npu.cfg           # Neural Processing Unit
 │   │       └── ...
+│   ├── kernel-rt-parameter        # RT kernel boot parameters (auto-applied)
 │   └── README.md                  # Overlay documentation
 │
 ├── debian/                         # Debian/Ubuntu packaging
@@ -113,6 +115,11 @@ make deb-minimal      # Minimal build (kernel image only, faster)
 # 3. Install
 sudo dpkg -i build/packages/deb/linux-image-*-amd64_*.deb
 sudo update-grub
+sudo reboot
+
+# For RT kernel (auto-configures boot parameters)
+sudo dpkg -i build/packages/deb/linux-image-*-rt-amd64_*.deb
+# RT parameters are automatically applied to /etc/default/grub
 sudo reboot
 ```
 
@@ -243,6 +250,7 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
   - Installation scenarios
   - Troubleshooting
   - Standard vs RT kernel comparison
+  - RT kernel auto-configuration
 
 - **[RPM Packages](rpm/README.md)** - Complete guide to RPM packages
   - RPM build system
@@ -253,6 +261,17 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
   - Patch management
   - Configuration fragments
   - Intel platform features
+  - RT kernel boot parameters
+
+- **[RT Kernel Parameters](docs/RT-KERNEL-PARAMETERS.md)** - RT kernel auto-configuration
+  - Automatic boot parameter setup
+  - Parameter customization
+  - Installation and removal process
+
+- **[RT Package Structure](docs/RT-PACKAGE-STRUCTURE.md)** - RT kernel package details
+  - Package composition
+  - Installation flow
+  - Which package does what
 
 ## Troubleshooting
 

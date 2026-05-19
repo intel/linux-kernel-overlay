@@ -22,6 +22,8 @@ For project overview and Intel overlay system, see [Main README](../README.md).
 
 - **Standard** (`-amd64`): General purpose, desktop, server
 - **Real-Time** (`-rt-amd64`): Low-latency, PREEMPT_RT, industrial control
+  - **Auto-configures boot parameters**: RT kernel packages automatically apply optimized boot parameters to `/etc/default/grub` during installation
+  - See [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) for details
 
 ---
 
@@ -47,9 +49,16 @@ Must install in this exact order:
 | `linux-base-*` | Configuration, maintenance scripts, hooks | Required dependency for all |
 | `linux-binary-*` | `/boot/vmlinuz-*`, `System.map` | The bootable kernel image |
 | `linux-modules-*` | `/lib/modules/<VERSION>/` with all .ko files | **Module directory must match `uname -r`** |
-| `linux-image-*` | Meta, triggers initramfs + GRUB update | Coordinates installation |
+| `linux-image-*` | Meta, triggers initramfs + GRUB update | Coordinates installation; **RT variant auto-applies boot parameters** |
 
 **Critical**: Module directory name must exactly match kernel version string or `modprobe` will fail to find modules.
+
+**RT Kernel Note**: When installing `linux-image-*-rt-amd64`, the package automatically:
+- Reads RT boot parameters from `/usr/share/doc/linux-image-VERSION/kernel-rt-parameter`
+- Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt`
+- Adds RT parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
+- Runs `update-grub`
+- See [RT Kernel Parameters Guide](../docs/RT-KERNEL-PARAMETERS.md) for details
 
 ---
 
@@ -194,7 +203,37 @@ sudo dpkg -i \
   linux-modules-*-rt-amd64_*.deb \
   linux-image-*-rt-amd64_*.deb \
   linux-image-rt-amd64_*.deb
+sudo apt-get install -f
+sudo reboot
 ```
+
+**RT Kernel Auto-Configuration:**
+
+When installing `linux-image-*-rt-amd64`, the package automatically:
+1. Reads RT boot parameters from `intel/kernel-rt-parameter`
+2. Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt` (first time only)
+3. Adds RT-optimized parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
+4. Runs `update-grub` to update bootloader configuration
+5. Notifies that a reboot is required
+
+**RT Parameters include:**
+- CPU isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
+- Power management optimization (`intel_pstate=disable`, `idle=poll`)
+- Graphics configuration (`i915.enable_guc`, `i915.max_vfs`)
+- Clock source (`clocksource=tsc`, `tsc=reliable`)
+- IOMMU settings (`intel_iommu=on`, `iommu=pt`)
+- And many more for RT performance
+
+**Manual verification:**
+```bash
+# View applied parameters
+cat /proc/cmdline
+
+# View original backup
+cat /etc/default/grub.pre-rt
+```
+
+See [RT Kernel Parameters Documentation](../docs/RT-KERNEL-PARAMETERS.md) for complete details.
 
 ### Scenario 5: Kernel Debugging (~1.4GB)
 
@@ -341,10 +380,23 @@ dpkg -L package-name          # List installed files
 | Throughput | Higher | 5-10% lower |
 | Preemption | Voluntary | Full (PREEMPT_RT) |
 | Use case | General purpose | Deterministic timing |
+| Boot parameters | Manual configuration | **Auto-configured on install** |
+| GRUB backup | Not applicable | Automatic (`/etc/default/grub.pre-rt`) |
 
 **Choose RT for**: Robotics, industrial control, CNC, pro audio, financial trading
 
 **Choose Standard for**: Desktop, server, general computing
+
+### RT Kernel Features
+
+The RT kernel packages include automatic boot parameter configuration:
+- **CPU isolation**: Dedicated CPU cores for RT tasks
+- **Power management**: Disabled C-states and frequency scaling for predictable performance
+- **Interrupt handling**: Thread all interrupts, configure IRQ affinity
+- **Clock source**: TSC as reliable clock source
+- **Graphics optimization**: GPU configuration for low-latency operation
+
+See [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) for the complete list of automatically applied parameters and customization options.
 
 ---
 
@@ -365,9 +417,12 @@ dpkg -L package-name          # List installed files
 - **[Module Packaging](MODULE_PACKAGING.md)** - Standalone module packages
 - **[RPM Packages](../rpm/README.md)** - RPM build system
 - **[Intel Overlay](../intel/README.md)** - Shared patches and configs
+- **[RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md)** - RT kernel auto-configuration
+- **[RT Package Structure](../docs/RT-PACKAGE-STRUCTURE.md)** - RT kernel package details
+- **[DKMS Packages](../dkms/README.md)** - Dynamic kernel module packages
 
 ---
 
-**Version**: 1.0  
-**Updated**: 2026-05-12  
+**Version**: 1.1  
+**Updated**: 2026-05-19  
 **For**: Intel kernel Debian packages

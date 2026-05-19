@@ -14,22 +14,23 @@ intel/
 │       ├── *.audio           # Audio subsystem patches
 │       ├── *.ethernet        # Network driver patches
 │       └── ...
-└── config/                    # Shared kernel configurations
-    ├── config.rt              # Real-time (PREEMPT_RT) kernel config
-    ├── config.test            # Test kernel configuration
-    └── amd64/                 # AMD64 architecture configs
-        ├── base/              # Base kernel configurations
-        │   ├── config.noble-6.8.0-31-generic    # Ubuntu 24.04 Noble (kernel 6.8.0)
-        │   └── config.resolute-7.0.0-14-generic # Ubuntu 26.04 Resolute (kernel 7.0.0)
-        ├── config.test        # AMD64-specific test config
-        └── intel/             # Intel platform configs (amd64)
-            ├── bt.cfg         # Bluetooth configuration
-            ├── camera.cfg     # Camera support
-            ├── drm.cfg        # Graphics (DRM/KMS)
-            ├── ethernet.cfg   # Ethernet drivers
-            ├── features.cfg   # General features
-            ├── security.cfg   # Security features
-            └── ...
+├── config/                    # Shared kernel configurations
+│   ├── config.rt              # Real-time (PREEMPT_RT) kernel config
+│   ├── config.test            # Test kernel configuration
+│   └── amd64/                 # AMD64 architecture configs
+│       ├── base/              # Base kernel configurations
+│       │   ├── config.noble-6.8.0-31-generic    # Ubuntu 24.04 Noble (kernel 6.8.0)
+│       │   └── config.resolute-7.0.0-14-generic # Ubuntu 26.04 Resolute (kernel 7.0.0)
+│       ├── config.test        # AMD64-specific test config
+│       └── intel/             # Intel platform configs (amd64)
+│           ├── bt.cfg         # Bluetooth configuration
+│           ├── camera.cfg     # Camera support
+│           ├── drm.cfg        # Graphics (DRM/KMS)
+│           ├── ethernet.cfg   # Ethernet drivers
+│           ├── features.cfg   # General features
+│           ├── security.cfg   # Security features
+│           └── ...
+└── kernel-rt-parameter        # RT kernel boot parameters (auto-applied on install)
 ```
 
 ## Usage
@@ -69,6 +70,16 @@ The RPM packaging system also uses symbolic links:
 
 The RPM spec file references patches in the `%prep` section and configs in the configuration merge section.
 
+### RT Kernel Boot Parameters
+
+The `intel/kernel-rt-parameter` file contains boot parameters that are automatically applied when installing RT kernel packages:
+
+- **Debian**: The `linux-image-*-rt-amd64.deb` package's postinst script reads this file and updates `/etc/default/grub` automatically
+- **Location in package**: Installed to `/usr/share/doc/linux-image-VERSION/kernel-rt-parameter`
+- **Format**: Single line with space-separated kernel parameters
+
+The parameters are applied during package installation and removed when the last RT kernel is uninstalled. See [RT Kernel Parameters Documentation](../docs/RT-KERNEL-PARAMETERS.md) for details.
+
 ## Maintaining Shared Resources
 
 ### Adding a New Patch
@@ -107,6 +118,37 @@ The RPM spec file references patches in the `%prep` section and configs in the c
    ```
 
 3. For RPM, reference it in the kernel config merge process.
+
+### Modifying RT Kernel Parameters
+
+The RT kernel boot parameters are stored in `intel/kernel-rt-parameter`. To customize them:
+
+1. Edit the parameter file:
+   ```bash
+   vim intel/kernel-rt-parameter
+   ```
+
+2. Parameters should be on a single line, space-separated:
+   ```
+   parameter1=value1 parameter2=value2 parameter3 ...
+   ```
+
+3. Rebuild the RT kernel packages:
+   ```bash
+   make deb
+   ```
+
+4. The new parameters will be automatically applied when installing the RT kernel image package (`linux-image-*-rt-amd64.deb`).
+
+**Current RT parameters include:**
+- CPU isolation: `isolcpus`, `nohz_full`, `rcu_nocbs`
+- Power management: `intel_pstate=disable`, `idle=poll`, `*_cstate=0`
+- Graphics optimization: `i915.enable_guc`, `i915.max_vfs`, `i915.force_probe`
+- Clock source: `clocksource=tsc`, `tsc=reliable`
+- IOMMU: `intel_iommu=on`, `iommu=pt`
+- And many more for RT performance optimization
+
+See the [RT Kernel Parameters Documentation](../docs/RT-KERNEL-PARAMETERS.md) for a complete list and detailed explanation.
 
 ### Managing the Patch Series File
 
@@ -169,9 +211,10 @@ Examples:
 
 ### Config Files
 
-**Top-level configs:**
+**Top-level files:**
 - `config.rt` - Real-time (PREEMPT_RT) kernel configuration
 - `config.test` - Test kernel configuration for validation
+- `kernel-rt-parameter` - RT kernel boot parameters (auto-applied on package install)
 
 **Architecture-specific configs:**
 - `amd64/config.test` - AMD64-specific test configuration
@@ -218,6 +261,15 @@ ls rpm/SOURCES/kernel-config/intel/
 
 ## Migration History
 
+**2026-05-19**: RT kernel parameter auto-configuration
+- Added `intel/kernel-rt-parameter` file containing boot parameters for RT kernels
+- Modified `debian/templates/image.postinst.in` to automatically apply RT parameters on package install
+- Modified `debian/templates/image.postrm.in` to automatically remove RT parameters on package removal
+- Modified `debian/rules.real` to include RT parameter file in the `linux-image-*-rt-amd64` package
+- RT parameters are automatically applied to `/etc/default/grub` during RT kernel installation
+- Parameters are removed when the last RT kernel is uninstalled
+- Original GRUB config is backed up to `/etc/default/grub.pre-rt`
+
 **2026-04-28**: Initial creation
 - Moved patches from `debian/patches/intel/` to `intel/patches/intel/`
 - Moved configs from `debian/config/amd64/intel/` to `intel/config/amd64/intel/`
@@ -237,3 +289,5 @@ ls rpm/SOURCES/kernel-config/intel/
 - [Debian Packaging](../debian/README.Intel) - Debian-specific documentation
 - [RPM Packaging](../rpm/README.md) - RPM-specific documentation
 - [Module Packaging](../debian/MODULE_PACKAGING.md) - Kernel module packaging guide
+- [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) - RT kernel parameter auto-configuration documentation
+- [RT Package Structure](../docs/RT-PACKAGE-STRUCTURE.md) - RT kernel package structure and installation flow
