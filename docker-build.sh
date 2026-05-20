@@ -142,8 +142,32 @@ build_image() {
 }
 
 clean_image() {
-    print_info "Removing Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
-    docker rmi "${IMAGE_NAME}:${IMAGE_TAG}" || print_warn "Image not found or already removed"
+    print_info "Removing all Docker images for project: ${IMAGE_NAME}"
+
+    # Get all tags for this image
+    local images=$(docker images "${IMAGE_NAME}" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null)
+
+    if [ -z "$images" ]; then
+        print_warn "No images found for ${IMAGE_NAME}"
+        return 0
+    fi
+
+    # Remove each image
+    local removed=0
+    local failed=0
+    while IFS= read -r image; do
+        if [ -n "$image" ]; then
+            print_info "  Removing: $image"
+            if docker rmi "$image" 2>/dev/null; then
+                removed=$((removed + 1))
+            else
+                print_warn "  Failed to remove: $image"
+                failed=$((failed + 1))
+            fi
+        fi
+    done <<< "$images"
+
+    print_info "Summary: $removed image(s) removed, $failed failed"
 }
 
 clean_logs() {
