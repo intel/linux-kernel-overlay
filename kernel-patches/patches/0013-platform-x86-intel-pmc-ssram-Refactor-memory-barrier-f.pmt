@@ -1,0 +1,132 @@
+From 6e4c04c64e761ae611346325741b0532103bb0fb Mon Sep 17 00:00:00 2001
+From: Xi Pardee <xi.pardee@linux.intel.com>
+Date: Fri, 1 May 2026 16:10:50 -0700
+Subject: [PATCH 13/16] platform/x86/intel/pmc/ssram: Refactor memory barrier
+ for reentrant probe
+
+Previously, a single global 'device_probed' flag with memory barriers was
+used to prevent callers from reading PMC info before probe completion.  The
+write barrier in probe ensured all data, devid and base_addr, was visible
+before signaling completion, and the read barrier in callers ensured they
+checked the flag before reading data.
+
+A following commit will make probe reentrant, requiring that a different
+synchronization flag be used since a single global flag cannot coordinate
+multiple concurrent probes.
+
+Switch to per-index devid publication. Each probe instance writes base_addr
+first, then a write barrier ensures visibility before devid is written as
+the completion signal. Callers check devid first, then use a read barrier
+before reading base_addr. This per-index approach allows multiple probes to
+work independently while maintaining the same memory ordering guarantees.
+
+Signed-off-by: Xi Pardee <xi.pardee@linux.intel.com>
+Signed-off-by: David E. Box <david.e.box@linux.intel.com>
+---
+ .../platform/x86/intel/pmc/ssram_telemetry.c  | 40 ++++++++-----------
+ 1 file changed, 16 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/platform/x86/intel/pmc/ssram_telemetry.c b/drivers/platform/x86/intel/pmc/ssram_telemetry.c
+index 6917a10cbc80..597bfb7ad822 100644
+--- a/drivers/platform/x86/intel/pmc/ssram_telemetry.c
++++ b/drivers/platform/x86/intel/pmc/ssram_telemetry.c
+@@ -40,7 +40,6 @@ static const struct ssram_type pci_main = {
+ };
+ 
+ static struct pmc_ssram_telemetry pmc_ssram_telems[MAX_NUM_PMC];
+-static bool device_probed;
+ 
+ static inline u64 get_base(void __iomem *addr, u32 offset)
+ {
+@@ -55,8 +54,13 @@ static void pmc_ssram_get_devid_pwrmbase(void __iomem *ssram, unsigned int pmc_i
+ 	pwrm_base = get_base(ssram, SSRAM_PWRM_OFFSET);
+ 	devid = readw(ssram + SSRAM_DEVID_OFFSET);
+ 
+-	pmc_ssram_telems[pmc_idx].devid = devid;
+ 	pmc_ssram_telems[pmc_idx].base_addr = pwrm_base;
++	/*
++	 * Memory barrier is used to ensure the correct write order between base_addr
++	 * and devid.
++	 */
++	smp_wmb();
++	pmc_ssram_telems[pmc_idx].devid = devid;
+ }
+ 
+ static int
+@@ -154,32 +158,28 @@ static int pmc_ssram_telemetry_pci_init(struct pci_dev *pcidev)
+  * * 0           - Success
+  * * -EAGAIN     - Probe function has not finished yet. Try again.
+  * * -EINVAL     - Invalid pmc_idx
+- * * -ENODEV     - PMC device is not available
+  */
+ int pmc_ssram_telemetry_get_pmc_info(unsigned int pmc_idx,
+ 				     struct pmc_ssram_telemetry *pmc_ssram_telemetry)
+ {
++	if (pmc_idx >= MAX_NUM_PMC)
++		return -EINVAL;
++
+ 	/*
+ 	 * PMCs are discovered in probe function. If this function is called before
+-	 * probe function complete, the result would be invalid. Use device_probed
+-	 * variable to avoid this case. Return -EAGAIN to inform the consumer to call
++	 * probe function complete, the result would be invalid. Use devid to avoid
++	 * this case. Return -EAGAIN to inform the consumer to call
+ 	 * again later.
+ 	 */
+-	if (!device_probed)
++	if (!pmc_ssram_telems[pmc_idx].devid)
+ 		return -EAGAIN;
+ 
++	pmc_ssram_telemetry->devid = pmc_ssram_telems[pmc_idx].devid;
+ 	/*
+ 	 * Memory barrier is used to ensure the correct read order between
+-	 * device_probed variable and PMC info.
++	 * devid variable and base_addr.
+ 	 */
+ 	smp_rmb();
+-	if (pmc_idx >= MAX_NUM_PMC)
+-		return -EINVAL;
+-
+-	if (!pmc_ssram_telems[pmc_idx].devid)
+-		return -ENODEV;
+-
+-	pmc_ssram_telemetry->devid = pmc_ssram_telems[pmc_idx].devid;
+ 	pmc_ssram_telemetry->base_addr = pmc_ssram_telems[pmc_idx].base_addr;
+ 	return 0;
+ }
+@@ -194,8 +194,7 @@ static int pmc_ssram_telemetry_probe(struct pci_dev *pcidev, const struct pci_de
+ 	ssram_type = (const struct ssram_type *)id->driver_data;
+ 	if (!ssram_type) {
+ 		dev_dbg(&pcidev->dev, "missing driver data\n");
+-		ret = -EINVAL;
+-		goto probe_finish;
++		return -EINVAL;
+ 	}
+ 
+ 	method = ssram_type->method;
+@@ -203,7 +202,7 @@ static int pmc_ssram_telemetry_probe(struct pci_dev *pcidev, const struct pci_de
+ 	ret = pcim_enable_device(pcidev);
+ 	if (ret) {
+ 		dev_dbg(&pcidev->dev, "failed to enable PMC SSRAM device\n");
+-		goto probe_finish;
++		return ret;
+ 	}
+ 
+ 	if (method == RES_METHOD_PCI)
+@@ -211,13 +210,6 @@ static int pmc_ssram_telemetry_probe(struct pci_dev *pcidev, const struct pci_de
+ 	else
+ 		ret = -EINVAL;
+ 
+-probe_finish:
+-	/*
+-	 * Memory barrier is used to ensure the correct write order between PMC info
+-	 * and device_probed variable.
+-	 */
+-	smp_wmb();
+-	device_probed = true;
+ 	return ret;
+ }
+ 
+-- 
+2.43.0
+
