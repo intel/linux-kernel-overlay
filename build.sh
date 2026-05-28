@@ -37,20 +37,13 @@ function setup()
 	fi
 
 	echo "Updating the kernel config"
-	cp "$KCFG_BASE_OS" "$BUILD_DIR"/.config
-	for cfg_file in "$KCFG_FEATURES_DIR"/*.cfg; do
-		echo merging "$cfg_file"
-		./scripts/kconfig/merge_config.sh -m .config "$cfg_file"
-	done
-
-	# *** For RT kernel, we need to add some kernel config. furthermore, also need
-	# add rt cmdlines to the boot options.
-	#
-	# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
-	# *** After the kernel deb package is installed. cmd-params in /boot/;
+	# Use kernel-config/merge.sh to handle config merging
 	if [ "$is_rt" = "yes"  ]; then
-		./scripts/kconfig/merge_config.sh -m .config "$KCFG_RT"
+		"$cur_dir"/kernel-config/merge.sh -r -p "$BUILD_DIR"
 
+		# *** For RT kernel, add rt cmdlines to the boot options.
+		# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
+		# *** After the kernel deb package is installed. cmd-params in /boot/;
 		cp "$cur_dir"/cmd-params "$BUILD_DIR"
 		cat <<- EOF > insert_script_code
 	        cp cmd-params "\${pdir}/boot/cmd-params-\${KERNELRELEASE}"
@@ -64,8 +57,9 @@ EOF
 			exit 1
 		fi
 		rm insert_script_code
+	else
+		"$cur_dir"/kernel-config/merge.sh -p "$BUILD_DIR"
 	fi
-	# *** For RT kernel --end
 
 	popd
 }
