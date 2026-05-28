@@ -25,20 +25,14 @@ function setup()
 	git quiltimport --patches "$KSRC_OOT_PATCHES"/patches
 
 	echo "Updating the kernel config"
-	cp "$KCFG_BASE_OS" "$BUILD_DIR"/.config
-	for cfg_file in "$KCFG_FEATURES_DIR"/*.cfg; do
-		echo merging "$cfg_file"
-		./scripts/kconfig/merge_config.sh -m .config "$cfg_file"
-	done
-
-	# *** For RT kernel, we need to add some kernel config. furthermore, also need
-	# add rt cmdlines to the boot options.
-	#
-	# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
-	# *** After the kernel deb package is installed. cmd-params in /boot/;
+	# Use kernel-config/merge.sh to handle config merging
+	# Pass merge branch (default) and overlay variant (deb) explicitly
 	if [ "$is_rt" = "yes"  ]; then
-		./scripts/kconfig/merge_config.sh -m .config "$KCFG_RT"
+		"$cur_dir"/kernel-config/merge.sh -r -p "$BUILD_DIR" default deb
 
+		# *** For RT kernel, add rt cmdlines to the boot options.
+		# *** File 1. cmd-params: Before building, you can add the cmdline to this file.
+		# *** After the kernel deb package is installed. cmd-params in /boot/;
 		cp "$cur_dir"/cmd-params "$BUILD_DIR"
 		cat <<- EOF > insert_script_code
 	        cp cmd-params "\${pdir}/boot/cmd-params-\${KERNELRELEASE}"
@@ -52,8 +46,9 @@ EOF
 			exit 1
 		fi
 		rm insert_script_code
+	else
+		"$cur_dir"/kernel-config/merge.sh -p "$BUILD_DIR" default deb
 	fi
-	# *** For RT kernel --end
 
 	popd
 }
@@ -129,9 +124,6 @@ done
 # Local macros
 cur_dir=$PWD
 KSRC_OOT_PATCHES=$cur_dir/kernel-patches/
-KCFG_BASE_OS=$cur_dir/kernel-config/$KCFG_BASE_OS
-KCFG_FEATURES_DIR=$cur_dir/kernel-config/$KCFG_FEATURES_DIR
-KCFG_RT=$cur_dir/kernel-config/$KCFG_RT
 
 # Avoid the illegal value of is_rt, and set customized_kver_string if it's empty.
 if [ "$is_rt" == "yes" ]; then

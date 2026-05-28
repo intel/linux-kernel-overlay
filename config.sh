@@ -10,9 +10,8 @@ KRTV=
 
 KSRC_MIRROR=
 
-
-KCFG_BASE_OS=base-os/noble.config-6.8.0-31-generic
-KCFG_FEATURES_DIR=features
-KCFG_RT=rt/rt.cfg
+# NOTE: Kernel config merging is now handled by kernel-config/merge.sh and kernel-config/conf.sh
+# The merge branch and overlay variant (default, deb) are passed explicitly from build.sh
+# To customize base/features/rt configs, edit kernel-config/conf.sh
 
 KSRC_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux

@@ -19,6 +19,11 @@ In the kernel-config directory, there are three-level kernel configurations.
 The rt.cfg overwrites the features configs (.cfg), and then they also
 overwrite base-os kernel config.
 
+Configuration merging is handled by `kernel-config/merge.sh`, which reads
+its settings from `kernel-config/conf.sh`. To customize which base config
+or feature configs are used, edit the `BASE_PATH` and `KCONF_PATHS` arrays
+in `kernel-config/conf.sh`.
+
 ## cmd-param
 cmd-param file has the kernel command line which is ONLY for the preempt-rt
 kernel. 
