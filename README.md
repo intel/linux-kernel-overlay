@@ -33,6 +33,32 @@ build.sh is provided to compile the kernel image. normally user only need run
 it in Ubuntu OS to get the .deb image. In config.sh, there are configurations
 for this release.
 
+# System Requirements
+
+## File Descriptor Limit
+The build process applies a large number of kernel patches using quilt, which may
+hit the default system file descriptor limit. The build script will automatically
+attempt to raise the soft limit to 65536 (capped by the hard limit) on a best-effort
+basis without failing the build.
+
+If you encounter "Too many open files" errors, you can manually increase the limit:
+
+	# Check current limit
+	ulimit -n
+
+	# Temporarily increase for current shell session
+	ulimit -n 65536
+
+	# Permanently increase for current user (recommended - add to /etc/security/limits.conf)
+	echo "$(whoami) soft nofile 65536" | sudo tee -a /etc/security/limits.conf
+	echo "$(whoami) hard nofile 65536" | sudo tee -a /etc/security/limits.conf
+
+	# OR apply to all users (use with caution on multi-user systems)
+	# echo "* soft nofile 65536" | sudo tee -a /etc/security/limits.conf
+	# echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
+
+After modifying limits.conf, log out and log back in for changes to take effect.
+
 # How it works
 Run the build.sh script, and it will generate the debian package.
 
