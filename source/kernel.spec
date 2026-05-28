@@ -1,13 +1,13 @@
 Summary:        Linux Kernel
 Name:           kernel
-Version:        6.12.84
-Release:        260429T081924Z%{?dist}
+Version:        6.12.91
+Release:        260528T062705Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.84.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.91.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -409,17 +409,16 @@ Patch378:	0013-drm-i915-gt-Isolate-single-sysfs-engine-file-creation.drm
 Patch379:	0014-drm-i915-gt-Implement-creation-and-removal-routines-fo.drm
 Patch380:	0015-drm-i915-gt-Allow-the-user-to-change-the-CCS-mode-thro.drm
 Patch381:	0016-drm-i915-gt-Refactor-CCS-mode-handling-and-improve-app.drm
-Patch382:	0017-drm-i915-no-waiting-for-page-flip-in-vpp-case.drm
-Patch383:	0001-Remove-unneeded-files.patch
-Patch384:	0001-i915-gt-Upgrade-GuC-70.44.1-70.49.4.drm
-Patch385:	0001-drm-i915-no-force-probe-needed-for-mtl-platform.drm
+Patch382:	0001-Remove-unneeded-files.patch
+Patch383:	0001-i915-gt-Upgrade-GuC-70.44.1-70.49.4.drm
+Patch384:	0001-drm-i915-no-force-probe-needed-for-mtl-platform.drm
 #rapl
-Patch386:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
+Patch385:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
 #misc
-Patch387:	0001-Add-security.md-file.misc
+Patch386:	0001-Add-security.md-file.misc
 #iommu
-Patch388:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
-Patch389:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
+Patch387:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
+Patch388:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
 # CVE Patches
 
 
@@ -570,8 +569,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.84
-%autosetup -p1 -n linux-6.12.84
+%setup -q -n linux-6.12.91
+%autosetup -p1 -n linux-6.12.91
 # %patch 0 -p1
 make mrproper
 
