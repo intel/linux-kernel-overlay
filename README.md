@@ -28,7 +28,33 @@ build.sh is provided to compile the kernel image. normally user only need run
 it in Ubuntu OS to get the .deb image. In config.sh, there are configurations
 for this release.
 
-# System Requirements
+# Prerequisites
+
+## System Requirements
+- Ubuntu OS (tested on Ubuntu Noble 24.04)
+- Sufficient disk space (~20GB recommended for kernel source and build artifacts)
+- Multi-core CPU recommended for parallel compilation
+
+## Required Packages
+Install the following packages before building:
+
+	sudo apt-get update
+	sudo apt-get install -y git build-essential bc bison flex libssl-dev \
+	    libelf-dev libncurses-dev dwarves debhelper quilt
+
+Package descriptions:
+- **git**: Required for cloning kernel source from upstream
+- **build-essential**: GCC compiler and basic build tools
+- **bc**: Calculator for kernel build scripts
+- **bison, flex**: Parser generators for kernel configuration
+- **libssl-dev**: SSL library for kernel crypto and module signing
+- **libelf-dev**: ELF library for building kernel with BTF support
+- **libncurses-dev**: For menuconfig (if needed)
+- **dwarves**: Provides pahole for BTF generation
+- **debhelper**: Required for Debian package creation (bindeb-pkg)
+- **quilt**: Required for applying kernel patches
+
+# Troubleshooting
 
 ## File Descriptor Limit
 The build process applies a large number of kernel patches using quilt, which may 
