@@ -1,5 +1,24 @@
 #!/bin/bash -e
 
+# Increase file descriptor limit for quilt patch application
+# Large patch sets can hit the default system limit
+# Best-effort: raise soft limit to at least 65536, capped by hard limit
+current_soft=$(ulimit -Sn)
+current_hard=$(ulimit -Hn)
+target=65536
+
+# Handle "unlimited" or non-numeric soft limit - nothing to do
+if [ "$current_soft" = "unlimited" ] || ! [[ "$current_soft" =~ ^[0-9]+$ ]]; then
+    : # Soft limit already unlimited or invalid, skip adjustment
+elif [ "$current_soft" -lt "$target" ]; then
+    # Soft limit is numeric and below target, try to raise it
+    if [ "$current_hard" = "unlimited" ] || { [[ "$current_hard" =~ ^[0-9]+$ ]] && [ "$current_hard" -ge "$target" ]; }; then
+        ulimit -Sn "$target" 2>/dev/null || true
+    elif [[ "$current_hard" =~ ^[0-9]+$ ]]; then
+        ulimit -Sn "$current_hard" 2>/dev/null || true
+    fi
+fi
+
 source config.sh
 
 function usage()
