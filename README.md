@@ -6,6 +6,29 @@ Custom Linux kernel packaging system supporting both Debian (.deb) and RPM (.rpm
 > 
 > This repository and its releases are provided for **reference and evaluation purposes only**. They are **not intended for production use**. Use at your own risk.
 
+## Version 2.0 - Major Upgrade
+
+**This is version 2.0** of the Intel kernel overlay system, representing a complete architectural redesign from v1.0.
+
+### What's New in v2.0
+
+**v1.0** (legacy: `iot-kernel-overlay`) was a simple overlay system with:
+- Single shell script (`build.sh`) for building
+- Basic quilt-based patch management
+- Debian packages only
+- Manual kernel configuration merging
+- Limited to Ubuntu OS
+
+**v2.0** (this repository) is a production-grade packaging system with:
+- ✅ **Multi-Format Support**: Both Debian (.deb) and RPM (.rpm) packages from one repository
+- ✅ **Unified Build System**: Comprehensive Makefile replacing simple shell scripts
+- ✅ **Kernel Tools Packaging**: Build kernel tools (perf, cpupower, bpftool, etc.) as separate deb packages
+- ✅ **Docker Integration**: Containerized builds for clean, reproducible environments
+- ✅ **Enhanced Overlay Architecture**: Shared Intel patches/configs via symlinks for both Debian and RPM
+- ✅ **Professional Packaging**: Follows Debian kernel team's modern build system (defines.toml, gencontrol.py)
+- ✅ **Automated Verification**: Package consistency checks to ensure correct installation
+- ✅ **Better Maintainability**: Organized documentation, structured scripts, comprehensive tooling
+
 ## Overview
 
 This repository provides tools and configuration for building custom kernel packages with Intel-specific features and optimizations. It supports:
