@@ -120,10 +120,57 @@ For detailed information on adding, organizing, and managing Intel patches and c
 
 ### Prerequisites
 
+**System Requirements:**
 - Linux distribution (Debian 12+, Ubuntu 22.04+, Fedora 40+, CentOS Stream 9)
 - 20GB+ free disk space
 - 8GB+ RAM (16GB recommended for parallel builds)
 - Multi-core processor
+
+**Required Software (Debian/Ubuntu):**
+
+Install build dependencies before starting:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    git build-essential bc bison flex libssl-dev libelf-dev \
+    libncurses-dev dwarves debhelper rsync quilt \
+    python3 python3-tomli cpio kmod
+```
+
+Package descriptions:
+- `git`: Version control system (for cloning repository and tracking changes)
+- `build-essential`: GCC compiler and basic build tools
+- `bc`, `bison`, `flex`: Build utilities required by kernel
+- `libssl-dev`: SSL library for kernel crypto and module signing
+- `libelf-dev`: ELF library for BTF (BPF Type Format) support
+- `libncurses-dev`: For menuconfig (optional)
+- `dwarves`: Provides pahole for BTF generation
+- `debhelper`: Debian package creation tools
+- `rsync`: File synchronization (used by Makefile)
+- `quilt`: Patch management tool
+- `python3`, `python3-tomli`: Required for gencontrol.py
+- `cpio`, `kmod`: Kernel packaging dependencies
+
+**Git Configuration:**
+
+Git configuration is **optional** for building (v2.0 uses `quilt` directly, not `git quiltimport`). Only configure git if you plan to commit changes:
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+```
+
+> **Note**: Unlike v1.0 which required git configuration for patch application (`git quiltimport`), v2.0 uses `quilt push` directly, so you can build without configuring git.
+
+**Required Software (Fedora/RHEL/CentOS):**
+
+```bash
+sudo dnf install -y \
+    git @development-tools bc bison flex openssl-devel elfutils-libelf-devel \
+    ncurses-devel dwarves rpm-build rsync quilt \
+    python3 python3-tomli cpio kmod
+```
 
 ### Building Debian Packages
 
@@ -239,7 +286,7 @@ For detailed step-by-step instructions on adding Intel features, including patch
 
 ## Version Information
 
-- **Current Version**: v1.0
+- **Current Version**: v2.0
 - **Base Kernel**: Upstream Linux kernel with Intel patches
 - **Supported Platforms**: Intel x86_64 processors
 - **Packaging Formats**: Debian (.deb), RPM (.rpm)
