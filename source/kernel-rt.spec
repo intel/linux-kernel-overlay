@@ -1,7 +1,7 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
 Version:        6.12.91
-Release:        260528T062705Z%{?dist}
+Release:        260601T101408Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -419,6 +419,8 @@ Patch386:	0001-Add-security.md-file.misc
 #iommu
 Patch387:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
 Patch388:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
+#fix for perf tools
+Patch389:	0001-perf-parse-events-Expose-rename-config_term_name.patch
 # CVE Patches
 
 
