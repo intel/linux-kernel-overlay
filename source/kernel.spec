@@ -1,7 +1,7 @@
 Summary:        Linux Kernel
 Name:           kernel
 Version:        6.12.91
-Release:        260601T101408Z%{?dist}
+Release:        260601T081719Z%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
@@ -421,6 +421,7 @@ Patch387:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
 Patch388:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
 #fix for perf tools
 Patch389:	0001-perf-parse-events-Expose-rename-config_term_name.patch
+Patch390:	0001-perf-parse-events-Use-wildcard-processing-to-set-an-.patch
 # CVE Patches
 
 
