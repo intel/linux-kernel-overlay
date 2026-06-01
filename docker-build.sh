@@ -52,7 +52,7 @@ format_duration() {
 
 show_usage() {
     cat <<EOF
-Intel Kernel Docker Build Script
+Intel Kernel Docker Build Script (Pure Docker - Zero Host Dependencies)
 
 Usage: $0 [OPTIONS] [COMMAND]
 
@@ -60,31 +60,33 @@ OPTIONS:
     -b, --build-image     Build Docker image (Ubuntu with Deb + RPM support)
     -c, --clean           Remove Docker image
     --clean-logs          Remove all build logs
-    -f, --force-setup     Force re-run setup (re-download source)
-    --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu24.04)
+    -f, --force-setup     Force re-run setup (clean build directory and re-extract source)
+    --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu26.04)
     --mode MODE           Build mode: minimal or full (default: full)
     -h, --help            Show this help message
 
 COMMANDS:
     shell                Open interactive shell in container
-    deb                  Build Debian packages
+    deb                  Build Debian packages (setup + build in container)
     deb-minimal          Build Debian packages (minimal: kernel image only)
-    rpm                  Build RPM packages (both standard and RT)
-    rpm-prepare          Prepare RPM source files
+    rpm                  Build RPM packages (prepare + build standard + RT)
+    rpm-prepare          Prepare RPM source files only
     all                  Build both Debian and RPM packages
 
 EXAMPLES:
     # Build Docker image (supports both Deb and RPM)
     $0 --build-image
-    $0 --build-image --dockerfile Dockerfile.ubuntu26.04  # Use Ubuntu 26.04
+    $0 --build-image --dockerfile Dockerfile.ubuntu24.04  # Use Ubuntu 24.04
 
-    # Build packages
+    # Build packages (all phases run in container)
     $0 deb               # Build Debian packages (full: kernel + tools)
     $0 deb --mode minimal    # Build kernel image only (faster, no tools)
     $0 deb-minimal       # Same as above
-    $0 rpm-prepare       # Prepare RPM sources
     $0 rpm               # Build RPM packages (standard + RT)
     $0 all               # Build both
+
+    # Force clean build
+    $0 --force-setup deb # Clean build/kernel/ and rebuild
 
     # Open shell
     $0 shell             # Interactive shell in container
@@ -93,15 +95,24 @@ BUILD MODES (for Debian packages):
     full     - Build kernel image + tools + headers (default)
     minimal  - Build kernel image only (faster, no linux-kbuild/perf/cpupower)
 
+CACHING:
+    - Kernel source is cached in build/cache/ (downloaded once)
+    - Build artifacts in build/ persist between runs for faster rebuilds
+    - Use --force-setup to force clean extraction
+
 LOGS:
     Build logs are saved to: build/logs/
-    - setup-YYYYMMDD-HHMMSS.log   (setup phase)
-    - build-YYYYMMDD-HHMMSS.log   (Debian build)
-    - rpm-YYYYMMDD-HHMMSS.log     (RPM build)
+    - build-full-YYYYMMDD-HHMMSS.log   (Debian full build)
+    - build-minimal-YYYYMMDD-HHMMSS.log (Debian minimal build)
+    - rpm-YYYYMMDD-HHMMSS.log          (RPM build)
+    - all-YYYYMMDD-HHMMSS.log          (All packages build)
 
 OUTPUT:
-    Debian packages: packages/deb/
-    RPM packages:    packages/rpm/
+    Debian packages: build/packages/deb/
+    RPM packages:    build/packages/rpm/
+
+HOST REQUIREMENTS:
+    - Docker only (no make, quilt, python3-tomli, or other build tools needed)
 
 EOF
 }
@@ -300,32 +311,24 @@ while [[ $# -gt 0 ]]; do
 
             # Create log directory
             mkdir -p "$LOG_DIR"
-            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
             BUILD_LOG="$LOG_DIR/build-${BUILD_MODE}-${TIMESTAMP}.log"
 
-            # Check if source needs to be prepared (run on host, not in container)
-            if [ "$FORCE_SETUP" = true ]; then
-                print_info "Step 1/2: Force setup (--force-setup) - running on host..."
-                print_info "Setup log: $SETUP_LOG"
-                cd "$SCRIPT_DIR"
-                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
-            elif [ ! -d "$BUILD_DIR/kernel" ] || [ ! -f "$BUILD_DIR/kernel/Makefile" ]; then
-                print_info "Step 1/2: First-time setup (download source, apply patches) - running on host..."
-                print_info "Setup log: $SETUP_LOG"
-                cd "$SCRIPT_DIR"
-                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
-            else
-                print_info "Step 1/2: Build directory exists, skipping setup..."
-            fi
-
-            print_info "Step 2/2: Building packages in container (mode: $BUILD_MODE)..."
+            print_info "Building packages in container (mode: $BUILD_MODE)..."
             print_info "Build log: $BUILD_LOG"
 
             if [ "$BUILD_MODE" = "minimal" ]; then
                 print_info "Minimal build will skip: linux-kbuild, linux-perf, linux-cpupower, and other tools"
             fi
 
-            run_container "cd /build/debian-kernel && make $MAKE_TARGET 2>&1" | tee "$BUILD_LOG"
+            # Build container command
+            if [ "$FORCE_SETUP" = true ]; then
+                print_info "Force setup enabled: will clean and re-extract source"
+                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make deb-setup && make $MAKE_TARGET"
+            else
+                CONTAINER_CMD="make deb-setup && make $MAKE_TARGET"
+            fi
+
+            run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$BUILD_LOG"
 
             BUILD_STATUS=${PIPESTATUS[0]}
             END_TIME=$(date +%s)
@@ -351,11 +354,21 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         rpm-prepare)
-            print_info "Preparing RPM source files..."
-            cd "$SCRIPT_DIR"
-            make rpm-prepare
-            print_info "Setup completed!"
-            print_info "You can now build RPM packages: $0 rpm"
+            check_image_exists
+            print_info "Preparing RPM source files in container..."
+
+            mkdir -p "$LOG_DIR"
+            SETUP_LOG="$LOG_DIR/rpm-prepare-${TIMESTAMP}.log"
+
+            run_container "cd /build/debian-kernel && make rpm-prepare 2>&1" | tee "$SETUP_LOG"
+
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+                print_info "RPM source preparation completed!"
+                print_info "You can now build RPM packages: $0 rpm"
+            else
+                print_error "RPM source preparation failed"
+                exit 1
+            fi
             exit 0
             ;;
         rpm)
@@ -364,23 +377,15 @@ while [[ $# -gt 0 ]]; do
             print_info "Building RPM packages (standard + RT)..."
 
             mkdir -p "$LOG_DIR"
-            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
             RPM_LOG="$LOG_DIR/rpm-${TIMESTAMP}.log"
 
-            # Check if source files exist, run rpm-prepare if needed
-            if [ ! -f "$SCRIPT_DIR/rpm/linux-"*.tar.xz ]; then
-                print_info "Step 1/2: RPM source files not found. Running rpm-prepare..."
-                print_info "Setup log: $SETUP_LOG"
-                cd "$SCRIPT_DIR"
-                make rpm-prepare 2>&1 | tee "$SETUP_LOG" || exit 1
-            else
-                print_info "Step 1/2: RPM source files exist, skipping setup..."
-            fi
-
-            print_info "Step 2/2: Building RPM packages (standard + RT)..."
+            print_info "Building RPM packages in container..."
             print_info "Build log: $RPM_LOG"
 
-            run_container "cd /build/debian-kernel && make rpm-all 2>&1" | tee "$RPM_LOG"
+            # Build container command with automatic rpm-prepare if needed
+            CONTAINER_CMD="make rpm-prepare && make rpm-all"
+
+            run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$RPM_LOG"
 
             BUILD_STATUS=${PIPESTATUS[0]}
             END_TIME=$(date +%s)
@@ -407,37 +412,20 @@ while [[ $# -gt 0 ]]; do
             print_info "Building all packages (Debian + RPM)..."
 
             mkdir -p "$LOG_DIR"
-            SETUP_LOG="$LOG_DIR/setup-${TIMESTAMP}.log"
             ALL_LOG="$LOG_DIR/all-${TIMESTAMP}.log"
 
-            # Check if Debian source needs to be prepared (run on host, not in container)
-            if [ "$FORCE_SETUP" = true ]; then
-                print_info "Step 1/3: Force setup (--force-setup) - Debian setup on host..."
-                print_info "Setup log: $SETUP_LOG"
-                cd "$SCRIPT_DIR"
-                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
-            elif [ ! -d "$BUILD_DIR/kernel" ]; then
-                print_info "Step 1/3: Debian setup (download source, apply patches) - running on host..."
-                print_info "Setup log: $SETUP_LOG"
-                cd "$SCRIPT_DIR"
-                make deb-setup 2>&1 | tee "$SETUP_LOG" || exit 1
-            else
-                print_info "Step 1/3: Debian build directory exists, skipping setup..."
-            fi
-
-            # Check if RPM source files exist (run on host, not in container)
-            if [ ! -f "$SCRIPT_DIR/rpm/linux-"*.tar.xz ]; then
-                print_info "Step 2/3: RPM setup (prepare source files) - running on host..."
-                cd "$SCRIPT_DIR"
-                make rpm-prepare 2>&1 | tee -a "$SETUP_LOG" || exit 1
-            else
-                print_info "Step 2/3: RPM source files exist, skipping setup..."
-            fi
-
-            print_info "Step 3/3: Building all packages in container..."
+            print_info "Building all packages in container..."
             print_info "Build log: $ALL_LOG"
 
-            run_container "make all 2>&1" | tee "$ALL_LOG"
+            # Build container command
+            if [ "$FORCE_SETUP" = true ]; then
+                print_info "Force setup enabled: will clean and re-extract source"
+                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make all"
+            else
+                CONTAINER_CMD="make all"
+            fi
+
+            run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$ALL_LOG"
 
             BUILD_STATUS=${PIPESTATUS[0]}
             END_TIME=$(date +%s)
