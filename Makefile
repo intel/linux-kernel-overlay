@@ -168,7 +168,7 @@ deb-setup:
 	fi
 	@# Apply patches
 	@echo "Applying patches..."
-	@cd $(BUILD_DIR) && QUILT_PATCHES='$(CURDIR)/debian/patches' QUILT_PC=.pc quilt push --quiltrc - -a -q --fuzz=0 || true
+	@cd $(BUILD_DIR) && QUILT_PATCHES='$(CURDIR)/debian/patches' QUILT_PC=.pc quilt push --quiltrc - -a -q --fuzz=2 || true
 	@# Generate control file
 	@echo "Generating debian/control..."
 	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control || true
