@@ -132,12 +132,24 @@ deb-setup:
 			echo "Using base version: $$BASE_VERSION"; \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$BASE_VERSION 2>/dev/null || \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
+			if ! ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz >/dev/null 2>&1; then \
+				echo "Error: Failed to download kernel source tarball"; \
+				echo "  Tried version: $$BASE_VERSION"; \
+				echo "  Please manually download to: $(BUILD_CACHE_DIR)/linux_$$BASE_VERSION.orig.tar.xz"; \
+				echo "  Or place source in rpm/ directory as: linux-$$BASE_VERSION.tar.xz"; \
+				exit 1; \
+			fi; \
 		fi; \
 	else \
 		echo "Source tarball already exists: $$(ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz 2>/dev/null || echo 'none')"; \
 	fi
 	@# Extract source to build/orig/ if not exists
 	@if [ ! -d $(CURDIR)/build/orig/linux-* ]; then \
+		if ! ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz >/dev/null 2>&1; then \
+			echo "Error: Source tarball not found in $(BUILD_CACHE_DIR)"; \
+			echo "  Run 'make deb-setup' failed to download source"; \
+			exit 1; \
+		fi; \
 		echo "Extracting source to build/orig/..."; \
 		mkdir -p $(CURDIR)/build/orig; \
 		tar -C $(CURDIR)/build/orig -xaf $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz; \
