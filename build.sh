@@ -31,7 +31,19 @@ function usage()
 function setup()
 {
 	# Setup the kernel source code that need be built.
-	if [ -d "$BUILD_DIR" ]; then rm -Rf "$BUILD_DIR"; fi
+	# Safety check: ensure BUILD_DIR is set and not a critical path
+	if [ -z "$BUILD_DIR" ]; then
+		echo "Error: BUILD_DIR is not set" >&2
+		exit 1
+	fi
+	if [ "$BUILD_DIR" = "/" ] || [ "$BUILD_DIR" = "$HOME" ] ||
+	   [ "$BUILD_DIR" = "$cur_dir" ]; then
+		echo "Error: BUILD_DIR points to a critical directory: $BUILD_DIR" >&2
+		exit 1
+	fi
+	if [ -d "$BUILD_DIR" ]; then
+		rm -rf "$BUILD_DIR"
+	fi
 	git clone --depth 1 --single-branch --branch "$KSRC_UPSTREAM_TAG" "$KSRC_REPO" "$BUILD_DIR"
 
 	pushd "$BUILD_DIR"
