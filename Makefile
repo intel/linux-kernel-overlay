@@ -145,9 +145,14 @@ deb-setup:
 		echo "Source already extracted: $$(ls -d $(CURDIR)/build/orig/linux-* 2>/dev/null)"; \
 	fi
 	@# Create build directory by copying source
-	@echo "Creating build directory: $(BUILD_DIR)..."; \
+	@SRC_DIR=$$(ls -d $(CURDIR)/build/orig/linux-* 2>/dev/null | head -1); \
+	if [ -z "$$SRC_DIR" ]; then \
+		echo "Error: Source directory not found in build/orig/"; \
+		exit 1; \
+	fi; \
+	echo "Creating build directory: $(BUILD_DIR)..."; \
 	rm -rf $(BUILD_DIR); \
-	rsync -a --exclude='.git' $$(ls -d $(CURDIR)/build/orig/linux-*/)/ $(BUILD_DIR)/
+	rsync -a --exclude='.git' "$$SRC_DIR/" $(BUILD_DIR)/
 	@# Copy debian directory to build directory (dereference symlinks with -L)
 	@echo "Copying debian/ configuration to build directory..."
 	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
