@@ -196,7 +196,18 @@ run_container() {
 
     print_info "Starting container: ${CONTAINER_NAME}"
 
-    docker run --rm -it \
+    # Detect if running in interactive terminal (TTY)
+    # Use -it for interactive shells, -i only for CI/Jenkins
+    local docker_flags="--rm"
+    if [ -t 0 ] && [ -t 1 ]; then
+        # Interactive terminal detected
+        docker_flags="$docker_flags -it"
+    else
+        # Non-interactive (CI/Jenkins) - use -i only to keep stdin open
+        docker_flags="$docker_flags -i"
+    fi
+
+    docker run $docker_flags \
         --name "${CONTAINER_NAME}" \
         --user "$(id -u):$(id -g)" \
         -v "${SCRIPT_DIR}:/build/debian-kernel" \
