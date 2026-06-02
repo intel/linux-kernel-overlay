@@ -9,16 +9,16 @@ target=65536
 
 # Handle "unlimited" or non-numeric soft limit - nothing to do
 if [ "$current_soft" = "unlimited" ] || ! [[ "$current_soft" =~ ^[0-9]+$ ]]; then
-    : # Soft limit already unlimited or invalid, skip adjustment
+	: # Soft limit already unlimited or invalid, skip adjustment
 elif [ "$current_soft" -lt "$target" ]; then
-    # Soft limit is numeric and below target, try to raise it
-    if [ "$current_hard" = "unlimited" ]; then
-        ulimit -Sn "$target" 2>/dev/null || true
-    elif [[ "$current_hard" =~ ^[0-9]+$ ]] && [ "$current_hard" -ge "$target" ]; then
-        ulimit -Sn "$target" 2>/dev/null || true
-    elif [[ "$current_hard" =~ ^[0-9]+$ ]]; then
-        ulimit -Sn "$current_hard" 2>/dev/null || true
-    fi
+	# Soft limit is numeric and below target, try to raise it
+	if [ "$current_hard" = "unlimited" ]; then
+		ulimit -Sn "$target" 2>/dev/null || true
+	elif [[ "$current_hard" =~ ^[0-9]+$ ]] && [ "$current_hard" -ge "$target" ]; then
+		ulimit -Sn "$target" 2>/dev/null || true
+	elif [[ "$current_hard" =~ ^[0-9]+$ ]]; then
+		ulimit -Sn "$current_hard" 2>/dev/null || true
+	fi
 fi
 
 source config.sh
@@ -30,7 +30,7 @@ function usage()
 
 function setup()
 {
-	# Setup the kernel source code that need be built.
+	# Setup the kernel source code that needs to be built.
 	# Safety check: ensure BUILD_DIR is set and not a critical path
 	if [ -z "$BUILD_DIR" ]; then
 		echo "Error: BUILD_DIR is not set" >&2
@@ -129,29 +129,29 @@ linux_kernel_tag=
 customized_kver_string=
 
 while getopts "r:t:b:c:h" opt; do
-  case $opt in
-    r)
-      is_rt="$OPTARG"
-      ;;
-    t)
-      linux_kernel_tag="$OPTARG"
-      ;;
-    b)
-      build_id="$OPTARG"
-      ;;
-    h)
-      usage
-      exit 0
-      ;;
-    c)
-      customized_kver_string="$OPTARG"
-      ;;
-    \?)
-      echo "Invalid option: -$OPTARG" >&2
-      usage
-      exit 1
-      ;;
-  esac
+	case $opt in
+	r)
+		is_rt="$OPTARG"
+		;;
+	t)
+		linux_kernel_tag="$OPTARG"
+		;;
+	b)
+		build_id="$OPTARG"
+		;;
+	h)
+		usage
+		exit 0
+		;;
+	c)
+		customized_kver_string="$OPTARG"
+		;;
+	\?)
+		echo "Invalid option: -$OPTARG" >&2
+		usage
+		exit 1
+		;;
+	esac
 done
 
 # Local macros
