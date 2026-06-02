@@ -166,10 +166,15 @@ if [ -f patches/series ]; then
             echo "  Applying: $patch_file"
             patch -p1 -i "patches/$patch_file" || {
                 echo "ERROR: Failed to apply patch: $patch_file"
+                echo "  Patch file: patches/$patch_file"
+                echo "  Working directory: $(pwd)"
                 exit 1
             }
         else
-            echo "WARNING: Patch not found: $patch_file"
+            echo "ERROR: Patch file not found: $patch_file"
+            echo "  Expected location: patches/$patch_file"
+            echo "  Series file: patches/series"
+            exit 1
         fi
     done < patches/series
     echo "All patches applied successfully!"

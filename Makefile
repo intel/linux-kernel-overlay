@@ -185,7 +185,19 @@ deb-setup:
 	fi
 	@# Apply patches
 	@echo "Applying patches..."
-	@cd $(BUILD_DIR) && QUILT_PATCHES='$(CURDIR)/debian/patches' QUILT_PC=.pc quilt push --quiltrc - -a -q --fuzz=2 || true
+	@cd $(BUILD_DIR) && \
+	if ! QUILT_PATCHES='$(CURDIR)/debian/patches' QUILT_PC=.pc quilt push --quiltrc - -a --fuzz=2; then \
+		echo ""; \
+		echo "Error: Failed to apply patches"; \
+		echo "  Patches directory: $(CURDIR)/debian/patches"; \
+		echo "  Series file: $(CURDIR)/debian/patches/series"; \
+		echo ""; \
+		echo "To debug:"; \
+		echo "  cd $(BUILD_DIR)"; \
+		echo "  QUILT_PATCHES='$(CURDIR)/debian/patches' quilt push -v"; \
+		echo ""; \
+		exit 1; \
+	fi
 	@# Generate control file
 	@echo "Generating debian/control..."
 	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control || true
