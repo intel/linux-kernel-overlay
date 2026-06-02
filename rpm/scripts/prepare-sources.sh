@@ -160,9 +160,17 @@ if [ "$SKIP_KERNEL" = false ]; then
     else
         print_info "Downloading from: $KERNEL_URL"
         if curl -L -o "$RPM_DIR/$KERNEL_TARBALL" "$KERNEL_URL"; then
+            # Verify the download is a valid tar.xz file
+            if ! file "$RPM_DIR/$KERNEL_TARBALL" | grep -q "XZ compressed data"; then
+                print_error "Downloaded file is not a valid XZ archive"
+                print_error "URL might be incorrect or kernel.org might be unavailable"
+                rm -f "$RPM_DIR/$KERNEL_TARBALL"
+                exit 1
+            fi
             print_info "Downloaded: $KERNEL_TARBALL ($(du -h "$RPM_DIR/$KERNEL_TARBALL" | cut -f1))"
         else
             print_error "Failed to download kernel tarball"
+            print_error "  URL: $KERNEL_URL"
             print_warn "You may need to download manually from https://kernel.org"
             exit 1
         fi
@@ -193,13 +201,21 @@ if [ "$SKIP_PATCHES" = false ]; then
 
         # Create tarball from intel/patches
         print_info "Creating tarball from intel/patches/..."
-        tar -czf "$PATCHES_TARBALL" -C "$INTEL_DIR" \
+        if tar -czf "$PATCHES_TARBALL" -C "$INTEL_DIR" \
             --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-            patches/
-
-        PATCH_COUNT=$(grep -v "^#\|^$" "$INTEL_DIR/patches/series" | wc -l)
-        print_info "Created: $PATCHES_TARBALL ($(du -h "$PATCHES_TARBALL" | cut -f1))"
-        print_info "  Contains: $PATCH_COUNT patches + series file"
+            patches/; then
+            # Verify tarball was created and is not empty
+            if [ ! -s "$PATCHES_TARBALL" ]; then
+                print_error "Patches tarball is empty or not created"
+                exit 1
+            fi
+            PATCH_COUNT=$(grep -v "^#\|^$" "$INTEL_DIR/patches/series" | wc -l)
+            print_info "Created: $PATCHES_TARBALL ($(du -h "$PATCHES_TARBALL" | cut -f1))"
+            print_info "  Contains: $PATCH_COUNT patches + series file"
+        else
+            print_error "Failed to create patches tarball"
+            exit 1
+        fi
     fi
     echo ""
 else
@@ -221,7 +237,17 @@ if [ "$SKIP_CONFIGS" = false ]; then
         # Call the generate-configs.sh script
         if [ -x "$SCRIPT_DIR/generate-configs.sh" ]; then
             print_info "Running generate-configs.sh..."
-            "$SCRIPT_DIR/generate-configs.sh"
+            if "$SCRIPT_DIR/generate-configs.sh"; then
+                # Verify config file was generated
+                if [ ! -s "$CONFIG_FILE" ]; then
+                    print_error "Config file not generated or is empty: $CONFIG_FILE"
+                    exit 1
+                fi
+                print_info "Config generated successfully: $(basename $CONFIG_FILE)"
+            else
+                print_error "Config generation failed"
+                exit 1
+            fi
         else
             print_error "generate-configs.sh not found or not executable"
             print_warn "Please run: chmod +x $SCRIPT_DIR/generate-configs.sh"
