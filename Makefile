@@ -114,18 +114,24 @@ deb-setup:
 	@mkdir -p $(BUILD_DIR) $(BUILD_PACKAGES_DEB_DIR) $(BUILD_LOGS_DIR) $(BUILD_CACHE_DIR)
 	@# Download or copy upstream source if not exists
 	@if [ ! -f $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz ]; then \
-		if ls rpm/linux-*.tar.xz >/dev/null 2>&1; then \
+		SRC=$$(find rpm/ -maxdepth 1 -type f -name "linux-*.tar.xz" 2>/dev/null | head -1); \
+		if [ -n "$$SRC" ] && [ -f "$$SRC" ]; then \
 			echo "Found existing source in rpm/, copying to cache..."; \
-			SRC=$$(ls rpm/linux-*.tar.xz | head -1); \
-			BASENAME=$$(basename $$SRC); \
-			cp $$SRC $(BUILD_CACHE_DIR)/; \
-			cd $(BUILD_CACHE_DIR) && \
-			NEWNAME=$$(echo $$BASENAME | sed 's/^linux-/linux_/') && \
-			mv $$BASENAME $$NEWNAME && \
-			if ! echo $$NEWNAME | grep -q '.orig.tar.xz$$'; then \
-				mv $$NEWNAME $$(echo $$NEWNAME | sed 's/.tar.xz$$/.orig.tar.xz/'); \
+			BASENAME=$$(basename -- "$$SRC"); \
+			if ! echo "$$BASENAME" | grep -qE '^linux-[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?\.tar\.xz$$'; then \
+				echo "Error: Invalid source filename format: $$BASENAME"; \
+				echo "  Expected: linux-X.Y[.Z][-rcN].tar.xz"; \
+				exit 1; \
 			fi; \
-			echo "Created: $$(ls linux_*.orig.tar.xz)"; \
+			cp -f -- "$$SRC" $(BUILD_CACHE_DIR)/; \
+			cd $(BUILD_CACHE_DIR) && \
+			NEWNAME=$$(echo "$$BASENAME" | sed 's/^linux-/linux_/') && \
+			mv -f -- "$$BASENAME" "$$NEWNAME" && \
+			if ! echo "$$NEWNAME" | grep -q '.orig.tar.xz$$'; then \
+				FINALNAME=$$(echo "$$NEWNAME" | sed 's/.tar.xz$$/.orig.tar.xz/'); \
+				mv -f -- "$$NEWNAME" "$$FINALNAME"; \
+			fi; \
+			echo "Created: $$(find . -maxdepth 1 -type f -name 'linux_*.orig.tar.xz' -printf '%f\n' 2>/dev/null | head -1)"; \
 		else \
 			echo "Downloading upstream kernel source..."; \
 			BASE_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([0-9.]*\).*/\1/p'); \
