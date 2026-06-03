@@ -129,6 +129,15 @@ deb-setup:
 		else \
 			echo "Downloading upstream kernel source..."; \
 			BASE_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([0-9.]*\).*/\1/p'); \
+			if [ -z "$$BASE_VERSION" ]; then \
+				echo "Error: Failed to extract version from debian/changelog"; \
+				exit 1; \
+			fi; \
+			if ! echo "$$BASE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
+				echo "Error: Invalid version format in debian/changelog: $$BASE_VERSION"; \
+				echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
+				exit 1; \
+			fi; \
 			echo "Using base version: $$BASE_VERSION"; \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$BASE_VERSION 2>/dev/null || \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
@@ -227,6 +236,15 @@ rpm-prepare:
 	@echo "Preparing RPM source files..."
 	@echo "======================================================================"
 	@KVER=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | cut -d- -f1); \
+	if [ -z "$$KVER" ]; then \
+		echo "Error: Failed to extract version from debian/changelog"; \
+		exit 1; \
+	fi; \
+	if ! echo "$$KVER" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
+		echo "Error: Invalid kernel version format: $$KVER"; \
+		echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
+		exit 1; \
+	fi; \
 	echo "Kernel Version: $$KVER (from debian/changelog)"; \
 	echo ""; \
 	cd rpm && ./scripts/prepare-sources.sh --version $$KVER; \
