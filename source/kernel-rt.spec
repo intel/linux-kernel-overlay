@@ -1,13 +1,13 @@
 Summary:        Preempt RT Linux Kernel
 Name:           kernel-rt
-Version:        6.12.84
-Release:        260429T081924Z_cve%{?dist}
+Version:        6.12.91
+Release:        260601T081719Z_cve%{?dist}
 License:        GPLv2
 Vendor:         Intel Corporation
 Distribution:   Edge Microvisor Toolkit
 Group:          System Environment/Kernel
 URL:            https://www.kernel.org/pub/linux/kernel
-Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.84.tar.gz
+Source0:        https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.91.tar.gz
 Source1:        config
 Source3:        sha512hmac-openssl.sh
 Source4:        emt-ca-20211013.pem
@@ -409,38 +409,38 @@ Patch378:	0013-drm-i915-gt-Isolate-single-sysfs-engine-file-creation.drm
 Patch379:	0014-drm-i915-gt-Implement-creation-and-removal-routines-fo.drm
 Patch380:	0015-drm-i915-gt-Allow-the-user-to-change-the-CCS-mode-thro.drm
 Patch381:	0016-drm-i915-gt-Refactor-CCS-mode-handling-and-improve-app.drm
-Patch382:	0017-drm-i915-no-waiting-for-page-flip-in-vpp-case.drm
-Patch383:	0001-Remove-unneeded-files.patch
-Patch384:	0001-i915-gt-Upgrade-GuC-70.44.1-70.49.4.drm
-Patch385:	0001-drm-i915-no-force-probe-needed-for-mtl-platform.drm
+Patch382:	0001-Remove-unneeded-files.patch
+Patch383:	0001-i915-gt-Upgrade-GuC-70.44.1-70.49.4.drm
+Patch384:	0001-drm-i915-no-force-probe-needed-for-mtl-platform.drm
 #rapl
-Patch386:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
+Patch385:	0001-powercap-intel_rapl-Add-support-for-Bartlett-Lake-pl.rapl
 #misc
-Patch387:	0001-Add-security.md-file.misc
+Patch386:	0001-Add-security.md-file.misc
 #iommu
-Patch388:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
-Patch389:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
+Patch387:	0001-driver-core-add-a-faux-bus-for-use-when-a-simple-dev.iommu
+Patch388:	0002-iommu-io-pgtable-arm-dynamically-allocate-selftest-d.iommu
+#fix for perf tools
+Patch389:	0001-perf-parse-events-Expose-rename-config_term_name.patch
+Patch390:	0001-perf-parse-events-Use-wildcard-processing-to-set-an-.patch
 #CVE-2025-21817
-Patch390:	CVE-2025-21817.patch
+Patch391:	CVE-2025-21817.patch
 #CVE-2025-22104
-Patch391:	CVE-2025-22104.patch
+Patch392:	CVE-2025-22104.patch
 #CVE-2025-22108
-Patch392:	CVE-2025-22108.patch
+Patch393:	CVE-2025-22108.patch
 #CVE-2025-23131
-Patch393:	CVE-2025-23131.patch
+Patch394:	CVE-2025-23131.patch
 #CVE-2025-37746
-Patch394:	CVE-2025-37746.patch
-Patch395:	CVE-2025-37746-1.patch
+Patch395:	CVE-2025-37746.patch
+Patch396:	CVE-2025-37746-1.patch
 #CVE-2025-37906
-Patch396:	CVE-2025-37906.patch
+Patch397:	CVE-2025-37906.patch
 #CVE-2025-38041
-Patch397:	CVE-2025-38041.patch
-Patch398:	CVE-2025-38041-1.patch
-Patch399:	CVE-2025-38041-2.patch
+Patch398:	CVE-2025-38041.patch
+Patch399:	CVE-2025-38041-1.patch
+Patch400:	CVE-2025-38041-2.patch
 #CVE-2025-38029
-Patch400:	CVE-2025-38029.patch
-#CVE-2025-38311
-Patch401:	CVE-2025-38311.patch
+Patch401:	CVE-2025-38029.patch
 #CVE-2025-38207
 Patch402:	CVE-2025-38207.patch
 #CVE-2025-38137
@@ -510,59 +510,105 @@ Patch436:	CVE-2025-40130.patch
 #CVE-2025-38656
 Patch437:	CVE-2025-38656.patch
 Patch438:	CVE-2025-38656-2.patch
-#CVE-2025-38584
-Patch439:	CVE-2025-38584.patch
 #CVE-2025-68745
-Patch440:	CVE-2025-68745.patch
+Patch439:	CVE-2025-68745.patch
 #CVE-2025-68359
-Patch441:	CVE-2025-68359.patch
+Patch440:	CVE-2025-68359.patch
 #CVE-2025-68368
-Patch442:	CVE-2025-68368.patch
+Patch441:	CVE-2025-68368.patch
 #CVE-2025-68353
-Patch443:	CVE-2025-68353.patch
+Patch442:	CVE-2025-68353.patch
 #CVE-2025-68319
-Patch444:	CVE-2025-68319.patch
+Patch443:	CVE-2025-68319.patch
 #CVE-2025-68193
-Patch445:	CVE-2025-68193.patch
+Patch444:	CVE-2025-68193.patch
 #CVE-2025-40355
-Patch446:	CVE-2025-40355.patch
+Patch445:	CVE-2025-40355.patch
 #CVE-2025-40338
-Patch447:	CVE-2025-40338.patch
+Patch446:	CVE-2025-40338.patch
 #CVE-2025-68768
-Patch448:	CVE-2025-68768.patch
+Patch447:	CVE-2025-68768.patch
 #CVE-2025-71074
-Patch449:	CVE-2025-71074.patch
+Patch448:	CVE-2025-71074.patch
 #CVE-2025-71117
-Patch450:	CVE-2025-71117.patch
-#CVE-2026-23171
-Patch451:	CVE-2026-23171.patch
+Patch449:	CVE-2025-71117.patch
 #CVE-2026-23327
-Patch452:	CVE-2026-23327.patch
-#CVE-2026-23272
-Patch453:	CVE-2026-23272.patch
+Patch450:	CVE-2026-23327.patch
 #CVE-2026-23371
-Patch454:	CVE-2026-23371.patch
+Patch451:	CVE-2026-23371.patch
 #CVE-2026-23259
-Patch455:	CVE-2026-23259.patch
+Patch452:	CVE-2026-23259.patch
 #CVE-2026-23181
-Patch456:	CVE-2026-23181.patch
+Patch453:	CVE-2026-23181.patch
 #CVE-2025-71227
-Patch457:	CVE-2025-71227_1.patch
-Patch458:	CVE-2025-71227_2.patch
-#CVE-2026-23473
-Patch459:	CVE-2026-23473.patch
+Patch454:	CVE-2025-71227_1.patch
+Patch455:	CVE-2025-71227_2.patch
 #CVE-2026-23394
-Patch460:	CVE-2026-23394.patch
-#CVE-2026-31419
-Patch461:	CVE-2026-31419.patch
+Patch456:	CVE-2026-23394.patch
 #CVE-2026-31420
-Patch462:	CVE-2026-31420.patch
-#CVE-2026-31431
-Patch463:	CVE-2026-31431.patch
+Patch457:	CVE-2026-31420.patch
 #CVE-2026-31435
-Patch464:	CVE-2026-31435.patch
+Patch458:	CVE-2026-31435.patch
 #CVE-2026-31526
-Patch465:	CVE-2026-31526.patch
+Patch459:	CVE-2026-31526.patch
+#CVE-2026-31591
+Patch460:	CVE-2026-31591.patch
+#CVE-2026-31592
+Patch461:	CVE-2026-31592.patch
+#CVE-2026-31688
+Patch462:	CVE-2026-31688.patch
+#CVE-2026-31717
+Patch463:	CVE-2026-31717.patch
+#CVE-2026-31771
+Patch464:	CVE-2026-31771.patch
+#CVE-2026-31777
+Patch465:	CVE-2026-31777_1.patch
+Patch466:	CVE-2026-31777_2.patch
+Patch467:	CVE-2026-31777_3.patch
+#CVE-2026-43010
+Patch468:	CVE-2026-43010.patch
+#CVE-2026-43022
+Patch469:	CVE-2026-43022.patch
+#CVE-2026-43034
+Patch470:	CVE-2026-43034.patch
+#CVE-2026-43053
+Patch471:	CVE-2026-43053_1.patch
+Patch472:	CVE-2026-43053_2.patch
+Patch473:	CVE-2026-43053_3.patch
+#CVE-2026-43116
+Patch474:	CVE-2026-43116.patch
+#CVE-2026-43172
+Patch475:	CVE-2026-43172.patch
+#CVE-2026-43185
+Patch476:	CVE-2026-43185.patch
+#CVE-2026-43197
+Patch477:	CVE-2026-43197.patch
+#CVE-2026-43198
+Patch478:	CVE-2026-43198.patch
+#CVE-2026-43216
+Patch479:	CVE-2026-43216.patch
+#CVE-2026-43299
+Patch480:	CVE-2026-43299.patch
+#CVE-2026-43301
+Patch481:	CVE-2026-43301.patch
+#CVE-2026-43303
+Patch482:	CVE-2026-43303.patch
+#CVE-2026-43308
+Patch483:	CVE-2026-43308.patch
+#CVE-2026-43309
+Patch484:	CVE-2026-43309.patch
+#CVE-2026-43325
+Patch485:	CVE-2026-43325.patch
+#CVE-2026-43331
+Patch486:	CVE-2026-43331.patch
+#CVE-2026-43344
+Patch487:	CVE-2026-43344.patch
+#CVE-2026-43346
+Patch488:	CVE-2026-43346.patch
+#CVE-2026-43464
+Patch489:	CVE-2026-43464.patch
+#CVE-2026-43465
+Patch490:	CVE-2026-43465.patch
 # CVE Patches
 
 
@@ -713,8 +759,8 @@ manipulation of eBPF programs and maps.
 
 %prep
 %define _default_patch_flags -p1 --fuzz=3 --force
-%setup -q -n linux-6.12.84
-%autosetup -p1 -n linux-6.12.84
+%setup -q -n linux-6.12.91
+%autosetup -p1 -n linux-6.12.91
 # %patch 0 -p1
 make mrproper
 
