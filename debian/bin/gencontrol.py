@@ -575,18 +575,20 @@ linux-signed-{vars['arch']} (@signedtemplate_sourceversion@) {dist}; urgency={ur
 
         if self.debianrelease.abi_version_full:
             self.abiname = version.linux_version_full + self.debianrelease.abi_suffix
-            # All Debian versions must have a distinct ABI version.
-            # So if this is not the first Debian version with its
-            # upstream version and Debian release, distinguish it by
-            # adding a serial number suffix.  This needs to be sorted
-            # higher than the flavour suffix by both 'sort -V' and
-            # 'linux-version sort'.
-            n = sum(1
-                    for entry in self.changelog
-                    if (entry.version.linux_version_full == version.linux_version_full
-                        and self.debianrelease.name_regex.fullmatch(entry.distribution)))
-            if n > 1:
-                self.abiname += f'.{n-1}'
+            # Disabled ABI serial number suffix for custom Intel kernel builds.
+            # The abi_suffix already carries a unique timestamp (-intel+TIMESTAMP),
+            # so abiname is naturally unique without the .{n-1} serial. Adding the
+            # serial caused the kernel image version (no .N) and module directory
+            # name (with .N) to mismatch when the changelog had multiple entries
+            # of the same upstream version + distribution.
+            #
+            # Original logic:
+            # n = sum(1
+            #         for entry in self.changelog
+            #         if (entry.version.linux_version_full == version.linux_version_full
+            #             and self.debianrelease.name_regex.fullmatch(entry.distribution)))
+            # if n > 1:
+            #     self.abiname += f'.{n-1}'
         else:
             self.abiname = version.linux_version + self.debianrelease.abi_suffix
 
