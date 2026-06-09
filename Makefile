@@ -73,10 +73,12 @@ deb:
 	@echo "Building Debian packages (full: kernel image + tools + headers)..."
 	@echo "======================================================================"
 	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS)
-	@# Move all packages and source files to packages/deb/ directory
+	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
-	@mv -f $(CURDIR)/build/*.deb $(CURDIR)/build/*.ddeb $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@find $(CURDIR)/build -maxdepth 1 -name "*.deb" ! -name "*.ddeb" -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
+	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@echo "Debug symbol packages (.ddeb) excluded"
 	@echo ""
 	@echo "Debian packages built successfully!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
@@ -97,10 +99,12 @@ deb-minimal:
 	@echo "  - other kernel tools"
 	@echo ""
 	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS)
-	@# Move all packages and source files to packages/deb/ directory
+	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
-	@mv -f $(CURDIR)/build/*.deb $(CURDIR)/build/*.ddeb $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@find $(CURDIR)/build -maxdepth 1 -name "*.deb" ! -name "*.ddeb" -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
+	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@echo "Debug symbol packages (.ddeb) excluded"
 	@echo ""
 	@echo "Debian packages (minimal) built successfully!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
