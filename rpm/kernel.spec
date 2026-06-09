@@ -156,8 +156,10 @@ echo "Applying patches from series file..."
 if [ -f patches/series ]; then
     while IFS= read -r patch_line || [ -n "$patch_line" ]; do
         # Skip empty lines and comments
-        [[ -z "$patch_line" ]] && continue
-        [[ "$patch_line" =~ ^[[:space:]]*# ]] && continue
+        [ -z "$patch_line" ] && continue
+        case "$patch_line" in
+            \#*|' '*\#*|'	'*\#*) continue ;;
+        esac
 
         # Extract patch filename (first field)
         patch_file=$(echo "$patch_line" | awk '{print $1}')
