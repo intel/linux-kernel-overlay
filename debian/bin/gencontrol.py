@@ -596,8 +596,8 @@ linux-signed-{vars['arch']} (@signedtemplate_sourceversion@) {dist}; urgency={ur
             'upstreamversion': self.version.linux_version_full,
             'version': self.version.linux_version,
             'version_complete': self.version.complete,
-            'source_basename': re.sub(r'-[\d.]+$', '',
-                                      self.changelog[0].source),
+            # Use 'linux' as basename, everything after is the suffix
+            'source_basename': 'linux',
             'source_upstream': self.version.upstream,
             'source_package': self.changelog[0].source,
             'abiname': self.abiname,

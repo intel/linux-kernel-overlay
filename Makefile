@@ -112,8 +112,42 @@ deb-setup:
 	@echo "======================================================================"
 	@# Create build directories
 	@mkdir -p $(BUILD_DIR) $(BUILD_PACKAGES_DEB_DIR) $(BUILD_LOGS_DIR) $(BUILD_CACHE_DIR)
+	@# Extract source package name and version from changelog
+	@SOURCE_PKG=$$(dpkg-parsechangelog -l debian/changelog --show-field Source 2>/dev/null || echo "linux"); \
+	if ! echo "$$SOURCE_PKG" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$$'; then \
+		echo "Error: Invalid source package name: $$SOURCE_PKG"; \
+		echo "  Source package names must start with alphanumeric and contain only: a-z A-Z 0-9 . + _ -"; \
+		exit 1; \
+	fi; \
+	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
+		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
+		exit 1; \
+	fi; \
+	echo "Expected source tarball: $$EXPECTED_TARBALL"
 	@# Download or copy upstream source if not exists
-	@if [ ! -f $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz ]; then \
+	@SOURCE_PKG=$$(dpkg-parsechangelog -l debian/changelog --show-field Source 2>/dev/null || echo "linux"); \
+	if ! echo "$$SOURCE_PKG" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$$'; then \
+		echo "Error: Invalid source package name: $$SOURCE_PKG"; \
+		exit 1; \
+	fi; \
+	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
+	if [ -z "$$BASE_VERSION" ]; then \
+		echo "Error: Failed to extract version from debian/changelog"; \
+		exit 1; \
+	fi; \
+	if ! echo "$$BASE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
+		echo "Error: Invalid version format in debian/changelog: $$BASE_VERSION"; \
+		echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
+		exit 1; \
+	fi; \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
+		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
+		exit 1; \
+	fi; \
+	if [ ! -f $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL ]; then \
 		SRC=$$(find rpm/ -maxdepth 1 -type f -name "linux-*.tar.xz" 2>/dev/null | head -1); \
 		if [ -n "$$SRC" ] && [ -f "$$SRC" ]; then \
 			echo "Found existing source in rpm/, copying to cache..."; \
@@ -123,51 +157,45 @@ deb-setup:
 				echo "  Expected: linux-X.Y[.Z][-rcN].tar.xz"; \
 				exit 1; \
 			fi; \
-			cp -f -- "$$SRC" $(BUILD_CACHE_DIR)/; \
-			cd $(BUILD_CACHE_DIR) && \
-			NEWNAME=$$(echo "$$BASENAME" | sed 's/^linux-/linux_/') && \
-			mv -f -- "$$BASENAME" "$$NEWNAME" && \
-			if ! echo "$$NEWNAME" | grep -q '.orig.tar.xz$$'; then \
-				FINALNAME=$$(echo "$$NEWNAME" | sed 's/.tar.xz$$/.orig.tar.xz/'); \
-				mv -f -- "$$NEWNAME" "$$FINALNAME"; \
-			fi; \
-			echo "Created: $$(find . -maxdepth 1 -type f -name 'linux_*.orig.tar.xz' -printf '%f\n' 2>/dev/null | head -1)"; \
+			cp -f -- "$$SRC" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
+			echo "Created: $$EXPECTED_TARBALL"; \
 		else \
 			echo "Downloading upstream kernel source..."; \
-			BASE_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([0-9.]*\).*/\1/p'); \
-			if [ -z "$$BASE_VERSION" ]; then \
-				echo "Error: Failed to extract version from debian/changelog"; \
-				exit 1; \
-			fi; \
-			if ! echo "$$BASE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
-				echo "Error: Invalid version format in debian/changelog: $$BASE_VERSION"; \
-				echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
-				exit 1; \
-			fi; \
 			echo "Using base version: $$BASE_VERSION"; \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$BASE_VERSION 2>/dev/null || \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
-			if ! ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz >/dev/null 2>&1; then \
+			if [ ! -f $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL ]; then \
 				echo "Error: Failed to download kernel source tarball"; \
 				echo "  Tried version: $$BASE_VERSION"; \
-				echo "  Please manually download to: $(BUILD_CACHE_DIR)/linux_$$BASE_VERSION.orig.tar.xz"; \
+				echo "  Expected file: $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL"; \
 				echo "  Or place source in rpm/ directory as: linux-$$BASE_VERSION.tar.xz"; \
 				exit 1; \
 			fi; \
 		fi; \
 	else \
-		echo "Source tarball already exists: $$(ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz 2>/dev/null || echo 'none')"; \
+		echo "Source tarball already exists: $$EXPECTED_TARBALL"; \
 	fi
 	@# Extract source to build/orig/ if not exists
-	@if [ ! -d $(CURDIR)/build/orig/linux-* ]; then \
-		if ! ls $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz >/dev/null 2>&1; then \
-			echo "Error: Source tarball not found in $(BUILD_CACHE_DIR)"; \
+	@SOURCE_PKG=$$(dpkg-parsechangelog -l debian/changelog --show-field Source 2>/dev/null || echo "linux"); \
+	if ! echo "$$SOURCE_PKG" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$$'; then \
+		echo "Error: Invalid source package name: $$SOURCE_PKG"; \
+		exit 1; \
+	fi; \
+	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
+		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
+		exit 1; \
+	fi; \
+	if [ ! -d $(CURDIR)/build/orig/linux-* ]; then \
+		if [ ! -f $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL ]; then \
+			echo "Error: Source tarball not found: $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL"; \
 			echo "  Run 'make deb-setup' failed to download source"; \
 			exit 1; \
 		fi; \
 		echo "Extracting source to build/orig/..."; \
 		mkdir -p $(CURDIR)/build/orig; \
-		tar -C $(CURDIR)/build/orig -xaf $(BUILD_CACHE_DIR)/linux_*.orig.tar.xz; \
+		tar -C $(CURDIR)/build/orig -xaf $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
 	else \
 		echo "Source already extracted: $$(ls -d $(CURDIR)/build/orig/linux-* 2>/dev/null)"; \
 	fi
