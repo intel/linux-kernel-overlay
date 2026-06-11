@@ -19,11 +19,11 @@ echo "=== Kernel Package Version Consistency Check ==="
 echo ""
 
 # Extract binary package
-echo "[1/4] Extracting binary package..."
+echo "[1/5] Extracting binary package..."
 dpkg-deb -x "$BINARY_DEB" "$TMPDIR/binary" >/dev/null 2>&1
 
 # Extract modules package
-echo "[2/4] Extracting modules package..."
+echo "[2/5] Extracting modules package..."
 dpkg-deb -x "$MODULES_DEB" "$TMPDIR/modules" >/dev/null 2>&1
 
 # Find kernel binary
@@ -34,7 +34,7 @@ if [ ! -f "$KERNEL_FILE" ]; then
 fi
 
 # Extract kernel version from binary
-echo "[3/4] Extracting kernel version from binary..."
+echo "[3/5] Extracting kernel version from binary..."
 KERNEL_VERSION=$(strings "$KERNEL_FILE" | grep -oE "^[0-9]+\.[0-9]+\.[0-9]+-[^ ]+" | head -1)
 
 if [ -z "$KERNEL_VERSION" ]; then
@@ -43,12 +43,25 @@ if [ -z "$KERNEL_VERSION" ]; then
 fi
 
 # Find module directory
-echo "[4/4] Checking module directory..."
+echo "[4/5] Checking module directory..."
 MODULE_DIR=$(ls "$TMPDIR/modules/usr/lib/modules/" 2>/dev/null || ls "$TMPDIR/modules/lib/modules/" 2>/dev/null)
 
 if [ -z "$MODULE_DIR" ]; then
     echo "❌ ERROR: No module directory found in package!"
     exit 1
+fi
+
+# Check RT kernel parameter file (for RT kernels only)
+echo "[5/5] Checking RT kernel parameter file (if RT kernel)..."
+RT_CHECK_RESULT=""
+if echo "$KERNEL_VERSION" | grep -q -- "-rt-"; then
+    RT_PARAM_FILE=$(find "$TMPDIR/binary/usr/share/doc" -name "kernel-rt-parameter" 2>/dev/null)
+    if [ -n "$RT_PARAM_FILE" ]; then
+        FILE_SIZE=$(stat -f%z "$RT_PARAM_FILE" 2>/dev/null || stat -c%s "$RT_PARAM_FILE" 2>/dev/null)
+        RT_CHECK_RESULT="✅ RT parameter file found (${FILE_SIZE} bytes)"
+    else
+        RT_CHECK_RESULT="⚠️  WARNING: RT parameter file not found (RT boot parameters will not be applied)"
+    fi
 fi
 
 # Display results
@@ -58,6 +71,9 @@ echo "📦 Modules package: $(basename "$MODULES_DEB")"
 echo ""
 echo "🔍 Kernel binary version:  $KERNEL_VERSION"
 echo "📁 Module directory name:   $MODULE_DIR"
+if [ -n "$RT_CHECK_RESULT" ]; then
+    echo "⚙️  RT parameter check:     $RT_CHECK_RESULT"
+fi
 echo ""
 
 # Verify match
