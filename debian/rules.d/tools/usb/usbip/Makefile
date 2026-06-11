@@ -26,3 +26,15 @@ install:
 ifneq (,$(filter nodoc,$(DEB_BUILD_PROFILES)))
 	rm -rf $(DESTDIR)/usr/share/man
 endif
+# Rename binaries to add -intel suffix
+	@if [ -f $(DESTDIR)/usr/sbin/usbip ]; then mv $(DESTDIR)/usr/sbin/usbip $(DESTDIR)/usr/sbin/usbip-intel; fi
+	@if [ -f $(DESTDIR)/usr/sbin/usbipd ]; then mv $(DESTDIR)/usr/sbin/usbipd $(DESTDIR)/usr/sbin/usbipd-intel; fi
+# Rename man pages
+	@if [ -d $(DESTDIR)/usr/share/man ]; then \
+		find $(DESTDIR)/usr/share/man -name 'usbip*.8' | while read f; do \
+			dir=$$(dirname "$$f"); \
+			base=$$(basename "$$f"); \
+			newbase=$$(echo "$$base" | sed 's/^usbip\.8/usbip-intel.8/; s/^usbipd\.8/usbipd-intel.8/'); \
+			mv "$$f" "$$dir/$$newbase"; \
+		done; \
+	fi

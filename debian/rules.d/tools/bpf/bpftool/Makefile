@@ -17,3 +17,18 @@ install:
 ifeq (,$(filter nodoc,$(DEB_BUILD_PROFILES)))
 	$(MAKE_UPSTREAM) doc-install
 endif
+# Rename bpftool to bpftool-intel
+	@if [ -f $(DESTDIR)/usr/sbin/bpftool ]; then mv $(DESTDIR)/usr/sbin/bpftool $(DESTDIR)/usr/sbin/bpftool-intel; fi
+# Rename bash completion
+	@if [ -f $(DESTDIR)/usr/share/bash-completion/completions/bpftool ]; then \
+		mv $(DESTDIR)/usr/share/bash-completion/completions/bpftool $(DESTDIR)/usr/share/bash-completion/completions/bpftool-intel; \
+	fi
+# Rename man pages
+	@if [ -d $(DESTDIR)/usr/share/man ]; then \
+		find $(DESTDIR)/usr/share/man -name 'bpftool*.8' | while read f; do \
+			dir=$$(dirname "$$f"); \
+			base=$$(basename "$$f"); \
+			newbase=$$(echo "$$base" | sed 's/^bpftool/bpftool-intel/'); \
+			mv "$$f" "$$dir/$$newbase"; \
+		done; \
+	fi
