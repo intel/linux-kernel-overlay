@@ -15,7 +15,7 @@ MAKE_UPSTREAM += NO_GTK2=1
 # Do not build the unversioned jvmti library
 MAKE_UPSTREAM += feature-jvmti=0
 
-MAKE_UPSTREAM += perfexecdir=lib/perf-core plugindir=/usr/lib/traceevent/plugins tipdir=share/doc/linux-perf perf_include_dir=include/perf perf_examples_dir=share/doc/linux-perf/examples
+MAKE_UPSTREAM += perfexecdir=lib/perf-core plugindir=/usr/lib/traceevent/plugins tipdir=share/doc/linux-intel-perf perf_include_dir=include/perf perf_examples_dir=share/doc/linux-intel-perf/examples
 
 # perf can link against libcrypto if available, but the result is
 # undistributable as GPL v2 and Apache 2.0 are not compatible without
@@ -81,3 +81,19 @@ install:
 	mv $(DESTDIR)/etc/bash_completion.d \
 		$(DESTDIR)/usr/share/bash-completion/completions
 	rmdir --ignore-fail-on-non-empty $(DESTDIR)/etc
+# Rename perf binary to perf-intel
+	@if [ -f $(DESTDIR)/usr/bin/perf ]; then mv $(DESTDIR)/usr/bin/perf $(DESTDIR)/usr/bin/perf-intel; fi
+# NOTE: perf-iostat stays as-is because perf binary hardcodes "perf-<subcommand>" pattern
+# Rename bash completion
+	@if [ -f $(DESTDIR)/usr/share/bash-completion/completions/perf ]; then \
+		mv $(DESTDIR)/usr/share/bash-completion/completions/perf $(DESTDIR)/usr/share/bash-completion/completions/perf-intel; \
+	fi
+# Rename man pages
+	@if [ -d $(DESTDIR)/usr/share/man ]; then \
+		find $(DESTDIR)/usr/share/man -name 'perf*.1' | while read f; do \
+			dir=$$(dirname "$$f"); \
+			base=$$(basename "$$f"); \
+			newbase=$$(echo "$$base" | sed 's/^perf-/perf-intel-/; s/^perf\.1/perf-intel.1/'); \
+			mv "$$f" "$$dir/$$newbase"; \
+		done; \
+	fi

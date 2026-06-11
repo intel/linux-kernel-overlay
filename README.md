@@ -116,6 +116,48 @@ For detailed information on adding, organizing, and managing Intel patches and c
 - Configuration merging process
 - Best practices for overlay management
 
+## Package Naming Scheme
+
+This project uses **vendor-prefixed naming** to support multi-version kernel repositories and coexistence with system packages:
+
+### Package Names
+
+All packages use the `linux-intel-*` prefix:
+
+- **Source package**: `linux-intel`
+- **Kernel packages**: `linux-intel-image-amd64`, `linux-intel-modules-*-amd64`, `linux-intel-headers-*`
+- **Tool packages**: `linux-intel-cpupower`, `linux-intel-perf`, `linux-intel-bpftool`, etc.
+- **Library packages**: `libcpupower-intel1`, `libcpupower-intel-dev`
+
+### Binary Names
+
+Tool binaries use the `-intel` suffix to avoid conflicts with system tools:
+
+- **cpupower**: `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel`
+- **perf**: `perf-intel`
+- **bpftool**: `bpftool-intel`
+- **rtla**: `rtla-intel`
+- **usbip**: `usbip-intel`, `usbipd-intel`
+
+### Version Format
+
+Package versions: `<upstream>-intel+<timestamp>[-r<N>][.cve]`
+
+Example: `6.18.20-intel+260417t093242z`
+- `6.18.20` - Upstream kernel version
+- `intel` - Intel distribution marker
+- `260417t093242z` - Build timestamp (YYMMDDTHHMMSSz)
+- Optional: `-r2` (revision), `.cve` (CVE variant), `~rc3` (RC version)
+
+### Rationale
+
+- **Coexistence**: Multiple kernel versions can be installed simultaneously
+- **BKC Integration**: Support for BKC (Best Known Configuration) environments
+- **APT Repositories**: Enable multi-version repositories with proper dependency resolution
+- **System Compatibility**: Packages automatically replace system equivalents when installed
+
+See [debian/README.md](debian/README.md#package-conflicts-with-system-tools) for details on package conflicts and automatic replacement.
+
 ## Quick Start
 
 ### Prerequisites
@@ -182,15 +224,21 @@ make deb-setup
 make deb              # Full build (kernel + tools + headers)
 make deb-minimal      # Minimal build (kernel image only, faster)
 
-# 3. Install
-sudo dpkg -i build/packages/deb/linux-image-*-amd64_*.deb
+# 3. Install kernel packages
+sudo dpkg -i build/packages/deb/linux-intel-image-*-amd64_*.deb
 sudo update-grub
 sudo reboot
 
 # For RT kernel (auto-configures boot parameters)
-sudo dpkg -i build/packages/deb/linux-image-*-rt-amd64_*.deb
+sudo dpkg -i build/packages/deb/linux-intel-image-*-rt-amd64_*.deb
 # RT parameters are automatically applied to /etc/default/grub
 sudo reboot
+
+# 4. Install tools (optional, automatically replaces system packages)
+sudo apt install \
+  ./build/packages/deb/linux-intel-cpupower_*.deb \
+  ./build/packages/deb/linux-intel-perf_*.deb \
+  ./build/packages/deb/linux-intel-bpftool_*.deb
 ```
 
 **Output**: Packages in `build/packages/deb/`
@@ -290,15 +338,7 @@ For detailed step-by-step instructions on adding Intel features, including patch
 - **Base Kernel**: Upstream Linux kernel with Intel patches
 - **Supported Platforms**: Intel x86_64 processors
 - **Packaging Formats**: Debian (.deb), RPM (.rpm)
-
-### Version Format
-
-Package versions use the format: `<upstream>-intel+<timestamp>`
-
-Example: `6.18.20-intel+260417t093242z`
-- `6.18.20` - Upstream kernel version
-- `intel` - Intel distribution marker
-- `260417t093242z` - Build timestamp (YYMMDDTHHMMSSz)
+- **Package Naming**: See [Package Naming Scheme](#package-naming-scheme) above
 
 ## Module Packaging
 

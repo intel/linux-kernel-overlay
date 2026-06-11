@@ -34,27 +34,27 @@ For project overview and Intel overlay system, see [Main README](../README.md).
 Must install in this exact order:
 
 ```bash
-1. linux-base-<VERSION>-<VARIANT>      # Base scripts (~140K)
-2. linux-base-<VARIANT>                # Base meta-package (~1K)
-3. linux-binary-<VERSION>-<VARIANT>    # Kernel vmlinuz (~15M)
-4. linux-modules-<VERSION>-<VARIANT>   # .ko modules (~85M)
-5. linux-image-<VERSION>-<VARIANT>     # Image package (~2K)
-6. linux-image-<VARIANT>               # Image meta-package (~1.5K)
+1. linux-intel-base-<VERSION>-<VARIANT>      # Base scripts (~140K)
+2. linux-intel-base-<VARIANT>                # Base meta-package (~1K)
+3. linux-intel-binary-<VERSION>-<VARIANT>    # Kernel vmlinuz (~15M)
+4. linux-intel-modules-<VERSION>-<VARIANT>   # .ko modules (~85M)
+5. linux-intel-image-<VERSION>-<VARIANT>     # Image package (~2K)
+6. linux-intel-image-<VARIANT>               # Image meta-package (~1.5K)
 ```
 
 ### Package Details
 
 | Package | Contents | Critical Notes |
 |---------|----------|----------------|
-| `linux-base-*` | Configuration, maintenance scripts, hooks | Required dependency for all |
-| `linux-binary-*` | `/boot/vmlinuz-*`, `System.map` | The bootable kernel image |
-| `linux-modules-*` | `/lib/modules/<VERSION>/` with all .ko files | **Module directory must match `uname -r`** |
-| `linux-image-*` | Meta, triggers initramfs + GRUB update | Coordinates installation; **RT variant auto-applies boot parameters** |
+| `linux-intel-base-*` | Configuration, maintenance scripts, hooks | Required dependency for all |
+| `linux-intel-binary-*` | `/boot/vmlinuz-*`, `System.map` | The bootable kernel image |
+| `linux-intel-modules-*` | `/lib/modules/<VERSION>/` with all .ko files | **Module directory must match `uname -r`** |
+| `linux-intel-image-*` | Meta, triggers initramfs + GRUB update | Coordinates installation; **RT variant auto-applies boot parameters** |
 
 **Critical**: Module directory name must exactly match kernel version string or `modprobe` will fail to find modules.
 
-**RT Kernel Note**: When installing `linux-image-*-rt-amd64`, the package automatically:
-- Reads RT boot parameters from `/usr/share/doc/linux-image-VERSION/kernel-rt-parameter`
+**RT Kernel Note**: When installing `linux-intel-image-*-rt-amd64`, the package automatically:
+- Reads RT boot parameters from `/usr/share/doc/linux-intel-image-VERSION/kernel-rt-parameter`
 - Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt`
 - Adds RT parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
 - Runs `update-grub`
@@ -68,15 +68,15 @@ For building external modules (DKMS, custom drivers):
 
 ```bash
 # After installing core kernel
-sudo dpkg -i linux-headers-<VERSION>-<VARIANT>_*.deb
-sudo dpkg -i linux-kbuild-<VERSION>_*.deb
+sudo dpkg -i linux-intel-headers-<VERSION>-<VARIANT>_*.deb
+sudo dpkg -i linux-intel-kbuild-<VERSION>_*.deb
 ```
 
 | Package | Size | Purpose |
 |---------|------|---------|
-| `linux-headers-*` | ~2M | Kernel headers, Module.symvers, .config |
-| `linux-kbuild-*` | ~1M | Build scripts and Makefiles |
-| `linux-bpf-dev` | ~600K | BPF/eBPF development headers |
+| `linux-intel-headers-*` | ~2M | Kernel headers, Module.symvers, .config |
+| `linux-intel-kbuild-*` | ~1M | Build scripts and Makefiles |
+| `linux-intel-bpf-dev` | ~600K | BPF/eBPF development headers |
 
 **Usage**:
 ```bash
@@ -92,7 +92,7 @@ For kernel crash analysis:
 
 | Package | Size | Purpose |
 |---------|------|---------|
-| `linux-image-*-dbg` | ~1.3GB | Uncompressed vmlinux with DWARF symbols |
+| `linux-intel-image-*-dbg` | ~1.3GB | Uncompressed vmlinux with DWARF symbols |
 
 **Only install when actively debugging**. Very large files.
 
@@ -107,16 +107,16 @@ crash /usr/lib/debug/boot/vmlinux-<VERSION> /var/crash/vmcore
 
 | Package | Tool | Purpose |
 |---------|------|---------|
-| `linux-perf` | `perf` | CPU profiling, tracing, PMU access |
-| `bpftool` | `bpftool` | Inspect/manipulate eBPF programs |
-| `rtla` | `rtla` | RT latency analysis (RT kernel only) |
+| `linux-intel-perf` | `perf-intel` | CPU profiling, tracing, PMU access |
+| `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
+| `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
 
 **Examples**:
 ```bash
-perf top                    # Live CPU profiling
-perf record -g -a           # Record call stacks
-bpftool prog list           # List BPF programs
-rtla osnoise top            # RT noise monitoring
+perf-intel top              # Live CPU profiling
+perf-intel record -g -a     # Record call stacks
+bpftool-intel prog list     # List BPF programs
+rtla-intel osnoise top      # RT noise monitoring
 ```
 
 ---
@@ -125,13 +125,16 @@ rtla osnoise top            # RT noise monitoring
 
 | Package | Tools | Purpose |
 |---------|-------|---------|
-| `libcpupower1` | Library only | Runtime library for cpupower (required dependency) |
-| `linux-cpupower` | `cpupower`, `turbostat`, `x86_energy_perf_policy`, `intel-speed-select` | CPU frequency/power management and monitoring |
-| `linux-perf` | `perf` | CPU profiling, tracing, PMU access, flamegraphs |
-| `linux-misc-tools` | `tmon`, `thermometer`, `bootconfig`, `ihex2fw` | Thermal monitoring and misc utilities |
-| `hyperv-daemons` | KVP, VSS, FCOPY | Hyper-V integration services |
-| `intel-sdsi` | `intel-sdsi` | Intel Software Defined Silicon management |
-| `usbip` | `usbip` | USB over IP |
+| `libcpupower-intel1` | Library only | Runtime library for cpupower (required dependency) |
+| `libcpupower-intel-dev` | Headers and dev files | Development files for cpupower library |
+| `linux-intel-cpupower` | `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel` | CPU frequency/power management and monitoring |
+| `linux-intel-perf` | `perf-intel` | CPU profiling, tracing, PMU access, flamegraphs |
+| `linux-intel-misc-tools` | `tmon`, `thermometer`, `bootconfig`, `ihex2fw` | Thermal monitoring and misc utilities |
+| `linux-intel-hyperv-daemons` | KVP, VSS, FCOPY | Hyper-V integration services |
+| `linux-intel-sdsi` | `intel-sdsi` | Intel Software Defined Silicon management |
+| `linux-intel-usbip` | `usbip-intel`, `usbipd-intel` | USB over IP |
+| `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
+| `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
 
 ---
 
@@ -144,12 +147,12 @@ Production server, minimal footprint:
 ```bash
 cd build/packages/deb/
 sudo dpkg -i \
-  linux-base-*-amd64_*.deb \
-  linux-base-amd64_*.deb \
-  linux-binary-*-amd64_*.deb \
-  linux-modules-*-amd64_*.deb \
-  linux-image-*-amd64_*.deb \
-  linux-image-amd64_*.deb
+  linux-intel-base-*-amd64_*.deb \
+  linux-intel-base-amd64_*.deb \
+  linux-intel-binary-*-amd64_*.deb \
+  linux-intel-modules-*-amd64_*.deb \
+  linux-intel-image-*-amd64_*.deb \
+  linux-intel-image-amd64_*.deb
 sudo apt-get install -f
 sudo update-grub
 sudo reboot
@@ -161,7 +164,7 @@ Add module building capability:
 
 ```bash
 # After Scenario 1
-sudo dpkg -i linux-headers-*-amd64_*.deb linux-kbuild-*_*.deb
+sudo dpkg -i linux-intel-headers-*-amd64_*.deb linux-intel-kbuild-*_*.deb
 ```
 
 ### Scenario 3: Tools Only (~3MB)
@@ -169,27 +172,32 @@ sudo dpkg -i linux-headers-*-amd64_*.deb linux-kbuild-*_*.deb
 System utilities without kernel packages (use when kernel is already installed):
 
 ```bash
-# Install tools with force-overwrite if conflicts with system packages
-sudo dpkg --force-overwrite -i \
-  libcpupower1_*.deb \
-  linux-cpupower_*.deb \
-  linux-perf_*.deb \
-  linux-misc-tools_*.deb \
-  hyperv-daemons_*.deb \
-  intel-sdsi_*.deb \
-  usbip_*.deb
+# Install Intel kernel tools (automatically replaces system packages)
+sudo apt install \
+  ./libcpupower-intel1_*.deb \
+  ./libcpupower-intel-dev_*.deb \
+  ./linux-intel-cpupower_*.deb \
+  ./linux-intel-perf_*.deb \
+  ./linux-intel-misc-tools_*.deb \
+  ./linux-intel-hyperv-daemons_*.deb \
+  ./linux-intel-sdsi_*.deb \
+  ./linux-intel-usbip_*.deb \
+  ./linux-intel-bpftool_*.deb \
+  ./linux-intel-rtla_*.deb
 ```
 
 **Tools included:**
-- `cpupower`, `turbostat`, `x86_energy_perf_policy`, `intel-speed-select` (CPU power/freq management)
-- `perf` (profiling and tracing)
+- `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel` (CPU power/freq management)
+- `perf-intel` (profiling and tracing)
+- `bpftool-intel` (eBPF program inspection)
+- `rtla-intel` (RT latency analysis)
+- `usbip-intel`, `usbipd-intel` (USB over IP)
 - `tmon`, `thermometer` (thermal monitoring)
 - `bootconfig`, `ihex2fw` (boot and firmware utilities)
 - Hyper-V integration services
 - Intel SDSi management
-- USB over IP
 
-**Note:** May conflict with `linux-tools-common`. Use `--force-overwrite` to replace system tools with kernel-specific versions.
+**Note:** These packages will automatically replace system packages via APT's conflict resolution. See [Package Conflicts](#package-conflicts-with-system-tools) for details.
 
 ### Scenario 4: Real-Time System (~100MB)
 
@@ -197,19 +205,19 @@ Replace `-amd64` with `-rt-amd64` in all package names:
 
 ```bash
 sudo dpkg -i \
-  linux-base-*-rt-amd64_*.deb \
-  linux-base-rt-amd64_*.deb \
-  linux-binary-*-rt-amd64_*.deb \
-  linux-modules-*-rt-amd64_*.deb \
-  linux-image-*-rt-amd64_*.deb \
-  linux-image-rt-amd64_*.deb
+  linux-intel-base-*-rt-amd64_*.deb \
+  linux-intel-base-rt-amd64_*.deb \
+  linux-intel-binary-*-rt-amd64_*.deb \
+  linux-intel-modules-*-rt-amd64_*.deb \
+  linux-intel-image-*-rt-amd64_*.deb \
+  linux-intel-image-rt-amd64_*.deb
 sudo apt-get install -f
 sudo reboot
 ```
 
 **RT Kernel Auto-Configuration:**
 
-When installing `linux-image-*-rt-amd64`, the package automatically:
+When installing `linux-intel-image-*-rt-amd64`, the package automatically:
 1. Reads RT boot parameters from `intel/kernel-rt-parameter`
 2. Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt` (first time only)
 3. Adds RT-optimized parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
@@ -241,7 +249,7 @@ Add debug symbols:
 
 ```bash
 # After Scenario 1
-sudo dpkg -i linux-image-*-amd64-dbg_*.deb
+sudo dpkg -i linux-intel-image-*-amd64-dbg_*.deb
 ```
 
 ---
@@ -250,7 +258,7 @@ sudo dpkg -i linux-image-*-amd64-dbg_*.deb
 
 ### Version-Specific Packages
 
-Example: `linux-binary-6.18.20-intel+260417t093242z-amd64_6.18.20-intel+260417t093242z_amd64.deb`
+Example: `linux-intel-binary-6.18.20-intel+260417t093242z-amd64_6.18.20-intel+260417t093242z_amd64.deb`
 
 - Contains actual files
 - Tied to specific kernel version
@@ -258,15 +266,15 @@ Example: `linux-binary-6.18.20-intel+260417t093242z-amd64_6.18.20-intel+260417t0
 
 ### Meta-Packages
 
-Example: `linux-image-amd64_6.18.20-intel+260417t093242z_amd64.deb`
+Example: `linux-intel-image-amd64_6.18.20-intel+260417t093242z_amd64.deb`
 
 - Size: 1-2KB
 - Only contains dependency on latest version-specific package
 - Enables automatic upgrades:
   ```bash
-  sudo apt install linux-image-amd64
+  sudo apt install linux-intel-image-amd64
   # Later...
-  sudo apt upgrade linux-image-amd64  # Pulls new version
+  sudo apt upgrade linux-intel-image-amd64  # Pulls new version
   ```
 
 ---
@@ -279,7 +287,7 @@ Example: `linux-image-amd64_6.18.20-intel+260417t093242z_amd64.deb`
 
 **Prevention**:
 ```bash
-scripts/verify-kernel-package.sh linux-binary-*.deb linux-modules-*.deb
+scripts/verify-kernel-package.sh linux-intel-binary-*.deb linux-intel-modules-*.deb
 ```
 
 **Check**:
@@ -301,7 +309,7 @@ sudo apt-get install -f
 
 ```bash
 # Install headers
-sudo dpkg -i linux-headers-$(uname -r)_*.deb
+sudo dpkg -i linux-intel-headers-$(uname -r)_*.deb
 ```
 
 ### GRUB doesn't show new kernel
@@ -331,7 +339,7 @@ grep menuentry /boot/grub/grub.cfg | grep $(uname -r)
 ### Listing Kernels
 
 ```bash
-dpkg -l | grep linux-image              # Installed packages
+dpkg -l | grep linux-intel-image        # Installed packages
 uname -r                                # Current kernel
 grep menuentry /boot/grub/grub.cfg     # Boot entries
 ```
@@ -340,7 +348,7 @@ grep menuentry /boot/grub/grub.cfg     # Boot entries
 
 ```bash
 # Remove specific version
-sudo apt-get remove linux-image-VERSION-amd64 linux-headers-VERSION-amd64
+sudo apt-get remove linux-intel-image-VERSION-amd64 linux-intel-headers-VERSION-amd64
 
 # Remove unused kernels (keeps current + one previous)
 sudo apt-get autoremove
@@ -397,6 +405,152 @@ The RT kernel packages include automatic boot parameter configuration:
 - **Graphics optimization**: GPU configuration for low-latency operation
 
 See [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) for the complete list of automatically applied parameters and customization options.
+
+---
+
+## Package Conflicts with System Tools
+
+### Overview
+
+Intel kernel tool packages use vendor-prefixed naming (`linux-intel-*`) and binary suffixes (`-intel`) to coexist with system kernels. However, **some packages cannot coexist** with Ubuntu/Debian system tool packages due to shared library files, headers, and configuration files.
+
+### Packages That Replace System Packages
+
+The following Intel packages **automatically replace** their system equivalents when installed via APT:
+
+| Intel Package | Replaces System Package | Reason for Conflict |
+|---------------|------------------------|---------------------|
+| `libcpupower-intel1` | `libcpupower1` | **Shared library SONAME**: `/usr/lib/x86_64-linux-gnu/libcpupower.so.0` - Cannot rename without breaking ABI compatibility |
+| `libcpupower-intel-dev` | `libcpupower-dev` | **Header files**: `/usr/include/cpufreq.h`, `/usr/include/cpuidle.h` - Renaming breaks source code that uses `#include <cpufreq.h>` |
+| `linux-intel-cpupower` | `linux-cpupower` | **Config file**: `/etc/cpupower-service.conf` - Path hardcoded in binary/service |
+| `linux-intel-perf` | `linux-perf` | **Helper scripts**: `/usr/lib/perf-core/perf-iostat`, `/usr/lib/perf-core/perf-archive` - perf binary hardcodes lookup pattern `perf-<subcommand>` |
+| `linux-intel-bpftool` | `bpftool` | **Config files and paths** - Shared configuration locations |
+| `linux-intel-rtla` | `rtla` | **Config files and paths** - Shared configuration locations |
+| `linux-intel-usbip` | `usbip` | **Config files and paths** - Shared configuration locations |
+| `linux-intel-misc-tools` | `linux-misc-tools` | **Shared utilities** - Tools like `tmon`, `thermometer` |
+| `linux-intel-hyperv-daemons` | `hyperv-daemons` | **Daemon services** - Hyper-V integration service files |
+| `linux-intel-sdsi` | N/A | No conflict (Intel-specific tool) |
+
+### What Was Renamed vs What Cannot Be Renamed
+
+#### ✅ Successfully Renamed (No Conflicts)
+
+These components were renamed to avoid conflicts:
+
+- **Package names**: `linux-cpupower` → `linux-intel-cpupower`
+- **Binaries**: `cpupower` → `cpupower-intel`, `perf` → `perf-intel`, etc.
+- **Man pages**: `cpupower.1` → `cpupower-intel.1`
+- **Systemd units**: `cpupower.service` → `cpupower-intel.service`
+- **Bash completions**: `perf` → `perf-intel` completion files
+
+#### ❌ Cannot Be Renamed (Still Conflicts)
+
+These components **must** keep their original names for compatibility:
+
+1. **Library SONAME** (`libcpupower.so.0`)
+   - Hardcoded in compiled binaries
+   - Renaming breaks ABI (Application Binary Interface)
+   - Required for dynamic linking
+
+2. **Header files** (`cpufreq.h`, `cpuidle.h`)
+   - Source code uses `#include <cpufreq.h>`
+   - Renaming breaks compilation of dependent software
+   - Part of kernel API
+
+3. **Config files** (`/etc/cpupower-service.conf`)
+   - Paths hardcoded in binaries and systemd units
+   - Renaming requires source code changes
+
+4. **Helper scripts** (`perf-iostat`, `perf-archive`)
+   - perf binary hardcodes lookup: `asprintf(&cmd, "perf-%s", subcommand)`
+   - Searches for `perf-<subcommand>`, not `perf-intel-<subcommand>`
+   - Renaming breaks subcommand functionality
+
+### Automatic Replacement via APT
+
+The Intel packages declare `Conflicts`, `Replaces`, and `Provides` to enable APT's automatic package replacement:
+
+```bash
+# APT automatically removes system packages before installing Intel versions
+sudo apt install ./linux-intel-cpupower_*.deb
+
+# APT output:
+# The following packages will be REMOVED:
+#   linux-cpupower libcpupower1 libcpupower-dev
+# The following NEW packages will be installed:
+#   linux-intel-cpupower libcpupower-intel1 libcpupower-intel-dev
+```
+
+### Installation Behavior
+
+**With APT** (Recommended):
+```bash
+sudo apt install ./linux-intel-cpupower_*.deb
+# ✅ Automatically removes linux-cpupower
+# ✅ Installs linux-intel-cpupower
+# ✅ Handles dependency chains
+```
+
+**With dpkg** (Not recommended):
+```bash
+sudo dpkg -i linux-intel-cpupower_*.deb
+# ❌ Error: trying to overwrite '/etc/cpupower-service.conf'
+# ❌ Must manually remove system package first
+# ❌ Dependency resolution requires manual work
+```
+
+### Why This Approach?
+
+This is **standard Debian practice** for providing alternative implementations:
+
+- **gcc** vs **gcc-11**, **gcc-12**: Multiple versions coexist
+- **python** vs **python3**: Different implementations
+- **vim** vs **neovim**: Alternative editors with compatible interfaces
+- **systemd** vs **sysvinit**: Init system alternatives
+
+The Intel kernel tools follow the same pattern: vendor-prefixed packages that provide alternative implementations while maintaining compatibility where required.
+
+### Verification
+
+After installation, verify the Intel versions are active:
+
+```bash
+# Check binary locations
+which cpupower-intel     # /usr/bin/cpupower-intel
+which perf-intel         # /usr/bin/perf-intel
+
+# Check library
+ldconfig -p | grep cpupower   # libcpupower.so.0 (Intel version)
+
+# Check package status
+dpkg -l | grep cpupower
+# ii  libcpupower-intel1        (Intel)
+# rc  libcpupower1              (removed config remains)
+
+# Verify versions
+cpupower-intel --version
+perf-intel --version
+```
+
+### Rollback to System Packages
+
+To switch back to system packages:
+
+```bash
+# Remove Intel packages
+sudo apt remove \
+  linux-intel-cpupower \
+  libcpupower-intel1 \
+  libcpupower-intel-dev \
+  linux-intel-perf
+
+# Reinstall system packages
+sudo apt install \
+  linux-cpupower \
+  libcpupower1 \
+  libcpupower-dev \
+  linux-perf
+```
 
 ---
 
