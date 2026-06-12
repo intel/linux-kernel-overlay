@@ -50,7 +50,7 @@ help:
 
 # Configuration
 JOBS ?= $(shell nproc)
-DEB_BUILD_FLAGS ?= -B -uc -us -j$(JOBS)
+DEB_BUILD_FLAGS ?= -b -uc -us -j$(JOBS)
 DEB_BUILD_PROFILES ?=
 RPM_BUILD_FLAGS ?=
 BUILD_DIR ?= $(CURDIR)/build/kernel
