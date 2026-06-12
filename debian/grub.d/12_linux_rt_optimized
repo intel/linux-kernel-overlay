@@ -1,0 +1,137 @@
+#!/bin/sh
+set -e
+
+# GRUB2 script to generate RT-optimized kernel menu entries
+# This runs AFTER 10_linux and creates additional RT-optimized entries for RT kernels
+# Standard RT kernel entries (from 10_linux) remain, but without RT-specific parameters
+
+prefix="/usr"
+exec_prefix="${prefix}"
+datarootdir="${prefix}/share"
+
+# Load GRUB helper functions
+. "$datarootdir/grub/grub-mkconfig_lib"
+
+# Source GRUB configuration
+if [ -f /etc/default/grub ]; then
+    . /etc/default/grub
+fi
+
+# RT parameters configuration file
+RT_PARAMS_FILE="/etc/default/grub.d/rt-kernel-params.cfg"
+
+# Exit if no RT parameters configured
+if [ ! -f "$RT_PARAMS_FILE" ]; then
+    exit 0
+fi
+
+# Source RT parameters
+. "$RT_PARAMS_FILE"
+
+# Exit if RT_KERNEL_PARAMS is empty
+if [ -z "$RT_KERNEL_PARAMS" ]; then
+    exit 0
+fi
+
+# Determine root device
+if [ "x${GRUB_DEVICE_UUID}" = "x" ] || [ "x${GRUB_DISABLE_LINUX_UUID}" = "xtrue" ] \
+    || ! test -e "/dev/disk/by-uuid/${GRUB_DEVICE_UUID}" \
+    || ( test -e "${GRUB_DEVICE}" && uses_abstraction "${GRUB_DEVICE}" lvm ); then
+  LINUX_ROOT_DEVICE=${GRUB_DEVICE}
+else
+  LINUX_ROOT_DEVICE=UUID=${GRUB_DEVICE_UUID}
+fi
+
+# Determine boot device UUID for search
+GRUB_DEVICE_BOOT=`${grub_probe} --target=device /boot`
+GRUB_DEVICE_BOOT_UUID=`${grub_probe} --device ${GRUB_DEVICE_BOOT} --target=fs_uuid 2> /dev/null` || true
+
+# Generate submenu for RT-optimized kernels
+cat << 'EOF'
+submenu 'RT Optimized Kernels (with RT parameters)' $menuentry_id_option 'gnulinux-rt-optimized-submenu' {
+EOF
+
+# Find and process RT kernels
+linux_list=$(for i in /boot/vmlinuz-*-rt-* /boot/vmlinux-*-rt-* ; do
+    if grub_file_is_not_garbage "$i" ; then echo -n "$i " ; fi
+done)
+
+# Sort kernels in reverse version order
+for linux in $(echo $linux_list | tr ' ' '\n' | sort -rV); do
+    if [ ! -e "$linux" ]; then
+        continue
+    fi
+
+    version=$(basename "$linux" | sed -e 's/^vmlinuz-//' -e 's/^vmlinux-//')
+
+    # Double-check it's an RT kernel
+    case $version in
+        *-rt-*)
+            ;;
+        *)
+            continue
+            ;;
+    esac
+
+    # Find corresponding initrd
+    initrd=
+    for i in "initrd.img-${version}" "initramfs-${version}.img" "initrd-${version}.img"; do
+        if test -e "/boot/${i}" ; then
+            initrd="/boot/${i}"
+            break
+        fi
+    done
+
+    # Get relative paths
+    rel_dirname="$(make_system_path_relative_to_its_root "$(dirname "$linux")")"
+    linux_basename="$(basename "$linux")"
+
+    if [ -n "$initrd" ]; then
+        initrd_basename="$(basename "$initrd")"
+        initrd_dirname="$(dirname "$initrd")"
+        rel_initrd_dirname="$(make_system_path_relative_to_its_root "$initrd_dirname")"
+    fi
+
+    # Build complete kernel command line with RT parameters
+    # RT_KERNEL_PARAMS is inserted between DEFAULT and LINUX to allow LINUX to override
+    rt_cmdline="${GRUB_CMDLINE_LINUX_DEFAULT} ${RT_KERNEL_PARAMS} ${GRUB_CMDLINE_LINUX}"
+
+    # Generate menu entry with unique ID to avoid conflict with 10_linux
+    cat << EOF
+	menuentry 'Intel RT Optimized: ${version}' --class intel --class gnu-linux --class gnu --class os \$menuentry_id_option 'gnulinux-rt-optimized-${version}-\${boot_device_id}' {
+		load_video
+		set gfxpayload=keep
+		insmod gzio
+		if [ x\$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
+		insmod part_gpt
+		insmod ext2
+EOF
+
+    if [ -n "${GRUB_DEVICE_BOOT_UUID}" ]; then
+        cat << EOF
+		search --no-floppy --fs-uuid --set=root ${GRUB_DEVICE_BOOT_UUID}
+EOF
+    fi
+
+    cat << EOF
+		echo 'Loading Intel RT-optimized kernel ${version}...'
+		linux ${rel_dirname}/${linux_basename} root=${LINUX_ROOT_DEVICE} ro ${rt_cmdline}
+EOF
+
+    if [ -n "$initrd" ]; then
+        cat << EOF
+		echo 'Loading initial ramdisk...'
+		initrd ${rel_initrd_dirname}/${initrd_basename}
+EOF
+    fi
+
+    cat << EOF
+	}
+EOF
+
+done
+
+# Close submenu
+cat << 'EOF'
+}
+EOF
