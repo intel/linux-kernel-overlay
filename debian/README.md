@@ -67,15 +67,17 @@ Must install in this exact order:
 For building external modules (DKMS, custom drivers):
 
 ```bash
-# After installing core kernel
+# After installing core kernel, install in this order:
+sudo dpkg -i linux-kbuild-<VERSION>_*.deb
+sudo dpkg -i linux-intel-headers-<VERSION>-common_*.deb
 sudo dpkg -i linux-intel-headers-<VERSION>-<VARIANT>_*.deb
-sudo dpkg -i linux-intel-kbuild-<VERSION>_*.deb
 ```
 
 | Package | Size | Purpose |
 |---------|------|---------|
-| `linux-intel-headers-*` | ~2M | Kernel headers, Module.symvers, .config |
-| `linux-intel-kbuild-*` | ~1M | Build scripts and Makefiles |
+| `linux-kbuild-*` | ~1M | Build scripts and Makefiles (required first) |
+| `linux-intel-headers-*-common` | ~1M | Common kernel headers (all architectures) |
+| `linux-intel-headers-*-VARIANT` | ~2M | Architecture-specific headers, Module.symvers, .config |
 | `linux-intel-bpf-dev` | ~600K | BPF/eBPF development headers |
 
 **Usage**:
@@ -163,8 +165,11 @@ sudo reboot
 Add module building capability:
 
 ```bash
-# After Scenario 1
-sudo dpkg -i linux-intel-headers-*-amd64_*.deb linux-intel-kbuild-*_*.deb
+# After Scenario 1, install in this order:
+sudo dpkg -i \
+  linux-kbuild-*_*.deb \
+  linux-intel-headers-*-common_*.deb \
+  linux-intel-headers-*-amd64_*.deb
 ```
 
 ### Scenario 3: Tools Only (~3MB)
@@ -308,7 +313,9 @@ sudo apt-get install -f
 ### Cannot build external modules
 
 ```bash
-# Install headers
+# Install development packages in correct order
+sudo dpkg -i linux-kbuild-*_*.deb
+sudo dpkg -i linux-intel-headers-*-common_*.deb
 sudo dpkg -i linux-intel-headers-$(uname -r)_*.deb
 ```
 
@@ -347,8 +354,11 @@ grep menuentry /boot/grub/grub.cfg     # Boot entries
 ### Removing Old Kernels
 
 ```bash
-# Remove specific version
-sudo apt-get remove linux-intel-image-VERSION-amd64 linux-intel-headers-VERSION-amd64
+# Remove specific version (removes all related packages)
+sudo apt-get remove \
+  linux-intel-image-VERSION-amd64 \
+  linux-intel-headers-VERSION-amd64 \
+  linux-intel-headers-VERSION-common
 
 # Remove unused kernels (keeps current + one previous)
 sudo apt-get autoremove
