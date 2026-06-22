@@ -225,12 +225,16 @@ make deb              # Full build (kernel + tools + headers)
 make deb-minimal      # Minimal build (kernel image only, faster)
 
 # 3. Install kernel packages
-sudo dpkg -i build/packages/deb/linux-intel-image-*-amd64_*.deb
+cd build/packages/deb/
+sudo dpkg -i linux-intel-*-amd64_*.deb
+sudo apt-get install -f  # Fix any dependencies
 sudo update-grub
 sudo reboot
 
 # For RT kernel (auto-configures boot parameters)
-sudo dpkg -i build/packages/deb/linux-intel-image-*-rt-amd64_*.deb
+cd build/packages/deb/
+sudo dpkg -i linux-intel-*-rt-amd64_*.deb
+sudo apt-get install -f  # Fix any dependencies
 # RT parameters are automatically applied to /etc/default/grub
 sudo reboot
 
