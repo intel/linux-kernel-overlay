@@ -587,6 +587,210 @@ sudo apt install \
 
 ---
 
-**Version**: 1.1  
-**Updated**: 2026-05-19  
+## Version Format Design
+
+### Overview
+
+This section documents the comprehensive version format design for Intel kernel packages, including the rationale, constraints, and alternative approaches considered.
+
+### Current Format
+
+The version format is implemented in `debian/changelog` and follows this structure:
+
+```
+{version}-{type}+{environment}+{release.name}+{cve}+{timestamp}
+```
+
+**Example:**
+```
+linux-intel (7.0.0-mainline+preprod+linux+260617t095128z) resolute; urgency=medium
+```
+
+### Format Components
+
+| Component | Required | Values | Purpose |
+|-----------|----------|--------|---------|
+| `{version}` | Yes | `7.0.0`, `6.18.33`, `7.1-rc3` | Upstream kernel version |
+| `{type}` | Yes | `mainline`, `lts`, `next` | Kernel type/source |
+| `{environment}` | No | `preprod`, *(omitted for prod)* | Production status |
+| `{release.name}` | Yes | `linux`, `xenomai`, `android`, `emt` | Release variant |
+| `{cve}` | No | `cve`, *(omitted if no CVE fixes)* | CVE fix indicator |
+| `{timestamp}` | Yes | `260617t095128z` | Build timestamp (YYMMDDtHHMMSSz) |
+
+### Kernel Types
+
+1. **`mainline`** - Intel Edge kernel based on community mainline
+   - Tracks upstream linux-stable or mainline branches
+   - Latest features with regular updates
+   
+2. **`lts`** - Intel Edge kernel based on community LTS
+   - Tracks upstream Long Term Support releases (e.g., 6.18.x)
+   - Extended maintenance with stability focus
+   
+3. **`next`** - Next-generation development kernel
+   - Early-stage Intel Edge features under active development
+   - Lower stability, used for testing and prototyping new capabilities
+
+### Environment Designations
+
+- **`preprod`** - Pre-production kernel
+  - Used for testing and validation
+  - Not approved for production use
+  
+- ***(omitted)*** - Production kernel
+  - Fully tested and validated
+  - Approved for production deployment
+
+### Release Variants
+
+- **`linux`** - Standard Linux kernel release
+- **`xenomai`** - Real-time variant with Xenomai patches
+- **`android`** - Android-specific kernel
+- **`emt`** - Embedded variant
+
+### Examples by Scenario
+
+**Production mainline kernel:**
+```
+7.0.0-mainline+linux+260617t095128z
+```
+
+**Pre-production LTS kernel with CVE fixes:**
+```
+6.18.33-lts+preprod+linux+cve+260615t073030z
+```
+
+**Pre-production IoTG kernel:**
+```
+6.12.0-next+preprod+linux+260617t095128z
+```
+
+**Production RT kernel (Xenomai):**
+```
+7.0.0-mainline+xenomai+260617t095128z
+```
+
+**RC version with CVE fixes:**
+```
+7.1~rc3-mainline+preprod+linux+cve+260617t095128z
+```
+
+### Design Rationale
+
+#### Why Use `+` Separator?
+
+**Debian Policy Constraint:**
+
+The Debian version format is: `[epoch:]upstream_version[-debian_revision]`
+
+The `debian_revision` part has strict regex validation in:
+- `dpkg-parsechangelog` tool
+- `debian_linux/debian.py:VersionLinux._revision_re`
+
+**Allowed characters in revision:**
+```python
+_revision_re = re.compile(r'[A-Za-z0-9+.~]+')
+```
+
+**Characters NOT allowed:**
+- Hyphen (`-`) - rejected by regex
+- Underscore (`_`) - rejected by regex
+- Slash (`/`) - rejected by regex
+
+**Only safe delimiters:**
+- Plus sign (`+`)
+- Period (`.`)
+- Tilde (`~`)
+
+We chose `+` for semantic clarity (it's commonly used in Debian versions to indicate additions).
+
+#### Why Put Version Number First?
+
+**Debian Policy Requirement:**
+
+According to [Debian Policy §5.6.12](https://www.debian.org/doc/debian-policy/ch-controlfields.html#version):
+
+> "The version number should start with a digit."
+
+Formats like `mainline-7.0.0-preprod-...` will be rejected by `dpkg-parsechangelog` with:
+```
+Version: unknown
+```
+
+**Correct format:**
+```
+7.0.0-mainline+preprod+...
+```
+
+#### Why Store All Information in Version String?
+
+**Operational Requirements:**
+
+1. **`uname -r` visibility** - Operators need to identify kernel properties from `uname -r` output
+2. **Package name clarity** - APT repository listings must show full context
+3. **Module path identification** - `/lib/modules/{version}/` must be self-documenting
+4. **Single source of truth** - No need to check multiple files to understand what's installed
+
+**Alternative locations considered:**
+
+- **`defines.toml`** - Not visible in `uname -r`, requires file access
+- **Package name** (e.g., `linux-intel-mainline`) - Loses information in `uname -r`
+- **Separate metadata file** - Not accessible from kernel itself
+
+### Implementation Details
+
+#### Files Modified
+
+1. **`debian/changelog`**
+   - Contains the version string
+   - Example:
+     ```
+     linux-intel (7.0.0-mainline+preprod+linux+260617t095128z) resolute; urgency=medium
+     ```
+
+2. **`debian/watch`**
+   - Extracts upstream version from tags
+   - `uversionmangle` rule:
+     ```
+     s|^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*|\1|;s|\.0$||;s|-rc|~rc|
+     ```
+   - Converts: `7.0.0-mainline+preprod+...` → `7.0` (for tarball matching)
+
+3. **`Makefile`**
+   - Downloads upstream tarball based on version
+   - Extracts base version for kernel.org URL
+   - Strips trailing `.0` from version to match kernel.org naming convention:
+     * `7.0.0` → `7.0` (kernel.org uses `linux-7.0.tar.xz` for initial releases)
+     * `7.0.0-rc1` → `7.0-rc1` (RC versions also omit the `.0`)
+     * `6.18.0` → `6.18`, but `6.18.33` stays `6.18.33` (patch versions retained)
+   - Renames downloaded tarball to match expected name with full version string
+
+#### Debian Version Validation
+
+**Tools that validate version format:**
+
+1. **`dpkg-parsechangelog`** - Parses `debian/changelog`
+2. **`debian_linux/debian.py`** - VersionLinux class with regex:
+   ```python
+   _upstream_re = re.compile(r'^(\d+\.\d+)(.*)$')
+   _revision_re = re.compile(r'[A-Za-z0-9+.~]+')
+   ```
+
+**Validation flow:**
+```
+changelog → dpkg-parsechangelog → upstream + revision
+         → VersionLinux class → regex validation
+         → gencontrol.py → package metadata
+```
+
+### Related Documentation
+
+- Debian Policy §5.6.12: https://www.debian.org/doc/debian-policy/ch-controlfields.html#version
+- `dpkg-parsechangelog` man page
+- Kernel Makefile version extraction logic: [Makefile:47-57](../Makefile#L47-L57)
+
+---
+
+**Version**: 1.2  
+**Updated**: 2026-06-22  
 **For**: Intel kernel Debian packages
