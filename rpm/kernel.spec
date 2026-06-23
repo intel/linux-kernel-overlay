@@ -22,6 +22,10 @@
 %define kernel_version %(echo %{full_version} | cut -d- -f1)
 %define version_suffix %(echo %{full_version} | cut -d- -f2-)
 
+# Upstream version for tarball directory name (may differ from kernel_version)
+# E.g., 7.0.0 -> 7.0 (kernel.org omits .0 for initial releases)
+%{!?upstream_version: %define upstream_version %{kernel_version}}
+
 # Package release uses the full version suffix (e.g., intel+260417t093242z)
 %define pkg_release %{version_suffix}%{?dist}
 
@@ -146,7 +150,8 @@ echo "======================================================================"
 # 2. Extract patches.tar.gz (contains patches/ dir with series file)
 # 3. Apply patches one-by-one according to series file
 # 4. Show which patch failed if any error occurs
-%autosetup -N -n linux-%{kernel_version}
+# Note: Use upstream_version for directory name (e.g., linux-7.0 not linux-7.0.0)
+%autosetup -N -n linux-%{upstream_version}
 
 # Extract patches
 tar xf %{SOURCE3}
