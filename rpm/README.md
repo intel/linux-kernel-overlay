@@ -60,6 +60,10 @@ cd rpm
 
 This will:
 - Download `linux-6.18.20.tar.xz` from kernel.org
+  - **Note**: Version normalization follows kernel.org naming convention:
+    * `7.0.0` → downloads `linux-7.0.tar.xz` (initial releases omit `.0`)
+    * `7.0.0-rc1` → downloads `linux-7.0-rc1.tar.xz` (RC versions also omit `.0`)
+    * `6.18.0` → downloads `linux-6.18.tar.xz`, but `6.18.33` → `linux-6.18.33.tar.xz`
 - Create `patches.tar.gz` archive from `intel/patches/` (containing series + individual patches)
 - Generate complete `.config` files by merging:
   - **Base config** (9566 lines from Fedora)

@@ -109,12 +109,20 @@ else
     echo "Warning: debian/changelog not found, using default version: $FULL_VERSION"
 fi
 
+# Extract kernel version and calculate upstream version for tarball directory name
+KERNEL_VERSION=$(echo "$FULL_VERSION" | cut -d- -f1)
+# Strip trailing .0 to match kernel.org tarball directory names
+# Examples: 7.0.0 -> 7.0, 7.0.0-rc1 -> 7.0-rc1, 6.18.33 -> 6.18.33
+UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$/\1\2/')
+
 echo "======================================================================"
 echo "Kernel RPM Build Script (Fedora-style)"
 echo "======================================================================"
 echo "RPM Directory:    $RPM_DIR"
 echo "Spec File:        $RPM_DIR/kernel.spec"
 echo "Full Version:     $FULL_VERSION"
+echo "Kernel Version:   $KERNEL_VERSION"
+echo "Upstream Version: $UPSTREAM_VERSION"
 echo "Architecture:     $BUILD_ARCH"
 echo "Parallel Jobs:    $JOBS"
 echo "======================================================================"
@@ -225,6 +233,7 @@ echo ""
 # but rpmbuild doesn't recognize Debian packages as satisfying RPM dependencies
 rpmbuild $BUILD_TYPE kernel.spec \
     --define "full_version $FULL_VERSION" \
+    --define "upstream_version $UPSTREAM_VERSION" \
     --define "_smp_mflags -j$JOBS" \
     --target="$BUILD_ARCH" \
     "${EXTRA_DEFINES[@]}" \

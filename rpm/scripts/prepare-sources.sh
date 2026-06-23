@@ -153,7 +153,11 @@ if [ "$SKIP_KERNEL" = false ]; then
     print_step "Step 1: Downloading kernel tarball"
 
     KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-    KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${KERNEL_TARBALL}"
+    # Strip trailing .0 from version for kernel.org URLs
+    # Examples: 7.0.0 -> 7.0, 7.0.0-rc1 -> 7.0-rc1, 6.18.0 -> 6.18, but 7.0 stays 7.0
+    UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$/\1\2/')
+    UPSTREAM_TARBALL="linux-${UPSTREAM_VERSION}.tar.xz"
+    KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${UPSTREAM_TARBALL}"
 
     if [ -f "$RPM_DIR/$KERNEL_TARBALL" ] && [ "$FORCE_DOWNLOAD" = false ]; then
         print_info "Kernel tarball already exists: $KERNEL_TARBALL"
