@@ -141,13 +141,45 @@ Tool binaries use the `-intel` suffix to avoid conflicts with system tools:
 
 ### Version Format
 
-Package versions: `<upstream>-intel+<timestamp>[-r<N>][.cve]`
+**Current Implementation:**
 
-Example: `6.18.20-intel+260417t093242z`
-- `6.18.20` - Upstream kernel version
-- `intel` - Intel distribution marker
-- `260417t093242z` - Build timestamp (YYMMDDTHHMMSSz)
-- Optional: `-r2` (revision), `.cve` (CVE variant), `~rc3` (RC version)
+Package versions follow the format:
+```
+{version}-{type}+{environment}+{release}+{cve}+{timestamp}
+```
+
+**Example:**
+```
+7.0.0-mainline+preprod+linux+260617t095128z
+```
+
+**Components:**
+- `7.0.0` - Upstream kernel version (required)
+- `mainline` - Kernel type (required)
+  - `mainline` - Intel Edge kernel based on community mainline
+  - `lts` - Intel Edge kernel based on community LTS
+  - `next` - Next-generation development kernel (early-stage, lower stability)
+- `preprod` - Environment (optional, omitted for prod)
+  - `preprod` - Pre-production, for testing
+  - *(omitted)* - Production-ready
+- `linux` - Release name (required)
+  - `linux` - Standard Linux release
+  - `xenomai` - Xenomai real-time variant
+  - `android` - Android kernel
+  - `emt` - Embedded variant
+- `cve` - CVE flag (optional)
+  - Present when the build includes CVE fixes
+- `260617t095128z` - Build timestamp (YYMMDDtHHMMSSz)
+
+**Additional Examples:**
+- `7.0.0-mainline+linux+260617t095128z` - Production mainline kernel
+- `6.18.0-lts+preprod+linux+cve+260617t095128z` - Pre-prod LTS with CVE fixes
+- `6.12.0-next+preprod+linux+260617t095128z` - Pre-prod next-generation kernel
+- `7.1-rc3-mainline+xenomai+260617t095128z` - RC version with Xenomai
+
+**Version Format Design Notes:**
+
+For detailed design rationale and alternative approaches considered, see [debian/README.md - Version Format Design](debian/README.md#version-format-design).
 
 ### Rationale
 
