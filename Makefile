@@ -123,8 +123,9 @@ deb-setup:
 		echo "  Source package names must start with alphanumeric and contain only: a-z A-Z 0-9 . + _ -"; \
 		exit 1; \
 	fi; \
-	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
-	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
 	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
 		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
 		exit 1; \
@@ -136,7 +137,8 @@ deb-setup:
 		echo "Error: Invalid source package name: $$SOURCE_PKG"; \
 		exit 1; \
 	fi; \
-	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
+	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
 	if [ -z "$$BASE_VERSION" ]; then \
 		echo "Error: Failed to extract version from debian/changelog"; \
 		exit 1; \
@@ -146,7 +148,7 @@ deb-setup:
 		echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
 		exit 1; \
 	fi; \
-	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
 	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
 		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
 		exit 1; \
@@ -165,7 +167,7 @@ deb-setup:
 			echo "Created: $$EXPECTED_TARBALL"; \
 		else \
 			echo "Downloading upstream kernel source..."; \
-			UPSTREAM_VERSION=$$(echo "$$BASE_VERSION" | sed 's/\.0$$//'); \
+			UPSTREAM_VERSION=$$(echo "$$BASE_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$$/\1\2/'); \
 			echo "Using base version: $$BASE_VERSION (upstream: $$UPSTREAM_VERSION)"; \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$UPSTREAM_VERSION 2>/dev/null || \
 			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
@@ -195,8 +197,9 @@ deb-setup:
 		echo "Error: Invalid source package name: $$SOURCE_PKG"; \
 		exit 1; \
 	fi; \
-	BASE_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null | sed -n 's/\([0-9.]*\).*/\1/p'); \
-	EXPECTED_TARBALL="$${SOURCE_PKG}_$${BASE_VERSION}.orig.tar.xz"; \
+	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
+	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
 	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
 		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
 		exit 1; \
@@ -423,8 +426,8 @@ all:
 	@echo "Building all packages (Debian + RPM standard + RPM RT)..."
 	@echo "======================================================================"
 	@# Check and setup Debian build if needed
-	@if [ ! -d "$(BUILD_DIR)" ]; then \
-		echo "Debian build directory not found. Running deb-setup..."; \
+	@if [ ! -f "$(BUILD_DIR)/Makefile" ]; then \
+		echo "Debian build directory not found or incomplete. Running deb-setup..."; \
 		$(MAKE) deb-setup; \
 	fi
 	@# Check and setup RPM build if needed
