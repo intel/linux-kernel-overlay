@@ -1,0 +1,138 @@
+From 9c1e56d3cff21c9137a6a90a785c4ec02476d8dc Mon Sep 17 00:00:00 2001
+From: Sohil Mehta <sohil.mehta@intel.com>
+Date: Mon, 9 Jun 2025 12:40:04 -0700
+Subject: [PATCH 02/12] x86/fred: Pass event data to the NMI entry point from
+ KVM
+
+Extend the FRED NMI entry point from KVM to take an extra argument to
+allow KVM to invoke the FRED event dispatch framework with event data.
+
+This API is used to pass the NMI-source bitmap for NMI-induced VM exits.
+Read the VMCS exit qualification field to get the NMI-source information
+and store it as event data precisely in the format expected by the FRED
+event framework.
+
+Read the VMCS exit qualification unconditionally since almost all
+upcoming CPUs are expected to enable FRED and NMI-source together. In
+the rare case that NMI-source isn't enabled, the extra VMREAD would be
+harmless since the exit qualification is expected to be zero.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Originally-by: Zeng Guang <guang.zeng@intel.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+v7: Pass the event data from KVM only for NMI. (Sean)
+
+v6: No change
+
+v5: Read the VMCS exit qualification unconditionally. (Sean)
+    Combine related patches into one.
+---
+ arch/x86/entry/common.c        |  2 +-
+ arch/x86/entry/entry_64_fred.S |  2 +-
+ arch/x86/include/asm/fred.h    | 11 ++++++-----
+ arch/x86/kvm/vmx/vmx.c         |  8 +++++++-
+ 4 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index c67e4a158b05..b6ac8e48876c 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -47,7 +47,7 @@ noinstr void x86_entry_from_kvm(unsigned int event_type, unsigned int vector)
+ 
+ #ifdef CONFIG_X86_64
+ 	if (cpu_feature_enabled(X86_FEATURE_FRED))
+-		return fred_nmi_from_kvm();
++		return fred_nmi_from_kvm(vector);
+ #endif
+ 
+ 	/*
+diff --git a/arch/x86/entry/entry_64_fred.S b/arch/x86/entry/entry_64_fred.S
+index 0d2768ab836c..24121de46b4a 100644
+--- a/arch/x86/entry/entry_64_fred.S
++++ b/arch/x86/entry/entry_64_fred.S
+@@ -94,7 +94,7 @@ SYM_FUNC_START(asm_fred_entry_from_kvm)
+ 	 * +--------+-----------------+
+ 	 */
+ 	push $0				/* Reserved, must be 0 */
+-	push $0				/* Event data, 0 for IRQ/NMI */
++	push %rsi			/* Event data for NMI */
+ 	push %rdi			/* fred_ss handed in by the caller */
+ 	push %rbp
+ 	pushf
+diff --git a/arch/x86/include/asm/fred.h b/arch/x86/include/asm/fred.h
+index e7c518d80548..b5ba974394dc 100644
+--- a/arch/x86/include/asm/fred.h
++++ b/arch/x86/include/asm/fred.h
+@@ -66,14 +66,14 @@ static __always_inline unsigned long fred_event_data(struct pt_regs *regs)
+ 
+ void asm_fred_entrypoint_user(void);
+ void asm_fred_entrypoint_kernel(void);
+-void asm_fred_entry_from_kvm(struct fred_ss);
++void asm_fred_entry_from_kvm(struct fred_ss ss, unsigned int vector);
+ 
+ __visible void fred_entry_from_user(struct pt_regs *regs);
+ __visible void fred_entry_from_kernel(struct pt_regs *regs);
+ __visible void __fred_entry_from_kvm(struct pt_regs *regs);
+ 
+ /* Must be called from noinstr code, thus __always_inline */
+-static __always_inline void fred_nmi_from_kvm(void)
++static __always_inline void fred_nmi_from_kvm(unsigned int vector)
+ {
+ 	struct fred_ss ss = {
+ 		.ss	= __KERNEL_DS,
+@@ -83,7 +83,7 @@ static __always_inline void fred_nmi_from_kvm(void)
+ 		.l	= 1,
+ 	};
+ 
+-	asm_fred_entry_from_kvm(ss);
++	asm_fred_entry_from_kvm(ss, vector);
+ }
+ 
+ static inline void fred_irq_from_kvm(unsigned int vector)
+@@ -95,7 +95,8 @@ static inline void fred_irq_from_kvm(unsigned int vector)
+ 		.l 	= 1,
+ 	};
+ 
+-	asm_fred_entry_from_kvm(ss);
++	/* Event data is always zero for IRQ */
++	asm_fred_entry_from_kvm(ss, 0);
+ }
+ 
+ void cpu_init_fred_exceptions(void);
+@@ -123,7 +124,7 @@ static __always_inline unsigned long fred_event_data(struct pt_regs *regs) { ret
+ static inline void cpu_init_fred_exceptions(void) { }
+ static inline void cpu_init_fred_rsps(void) { }
+ static inline void fred_complete_exception_setup(void) { }
+-static __always_inline void fred_nmi_from_kvm(void) { }
++static __always_inline void fred_nmi_from_kvm(unsigned int vector) { }
+ static inline void fred_irq_from_kvm(unsigned int vector) { }
+ static inline void fred_sync_rsp0(unsigned long rsp0) { }
+ static inline void fred_update_rsp0(void) { }
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index b9103de01428..e9ee1ea23960 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7464,12 +7464,18 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+ 
+ noinstr void vmx_handle_nmi(struct kvm_vcpu *vcpu)
+ {
++	unsigned int vector = NMI_VECTOR;
++
+ 	if ((u16)vmx_get_exit_reason(vcpu).basic != EXIT_REASON_EXCEPTION_NMI ||
+ 	    !is_nmi(vmx_get_intr_info(vcpu)))
+ 		return;
+ 
++	/* TODO: Check if this is the best way to pass the vector mask. Verify */
++	if (cpu_feature_enabled(X86_FEATURE_FRED))
++		vector = vmx_get_exit_qual(vcpu) & 0xFFFF;
++
+ 	kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
+-	x86_entry_from_kvm(EVENT_TYPE_NMI, NMI_VECTOR);
++	x86_entry_from_kvm(EVENT_TYPE_NMI, vector);
+ 	kvm_after_interrupt(vcpu);
+ }
+ 
+-- 
+2.43.0
+
