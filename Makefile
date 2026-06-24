@@ -51,6 +51,7 @@ help:
 # Configuration
 JOBS ?= $(shell nproc)
 DEB_BUILD_FLAGS ?= -b -uc -us -j$(JOBS)
+DEB_BUILD_FLAGS_MINIMAL ?= -B -uc -us -j$(JOBS)
 DEB_BUILD_PROFILES ?=
 RPM_BUILD_FLAGS ?=
 BUILD_DIR ?= $(CURDIR)/build/kernel
@@ -97,8 +98,10 @@ deb-minimal:
 	@echo "  - linux-perf packages (perf profiling tools)"
 	@echo "  - linux-cpupower packages (CPU frequency tools)"
 	@echo "  - other kernel tools"
+	@echo "  - source packages (.dsc, .tar.xz)"
+	@echo "  - arch:all packages (linux-doc, linux-source)"
 	@echo ""
-	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS)
+	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS_MINIMAL)
 	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
