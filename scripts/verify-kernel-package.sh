@@ -35,7 +35,7 @@ fi
 
 # Extract kernel version from binary
 echo "[3/5] Extracting kernel version from binary..."
-KERNEL_VERSION=$(strings "$KERNEL_FILE" | grep -oE "^[0-9]+\.[0-9]+\.[0-9]+-[^ ]+" | head -1)
+KERNEL_VERSION=$(file "$KERNEL_FILE" | grep -oP 'version \K[^, ]+')
 
 if [ -z "$KERNEL_VERSION" ]; then
     echo "❌ ERROR: Could not extract kernel version from binary!"
