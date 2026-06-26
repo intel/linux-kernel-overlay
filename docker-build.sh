@@ -207,10 +207,19 @@ run_container() {
         docker_flags="$docker_flags -i"
     fi
 
+    # The container runs as the host uid:gid, which has no /etc/passwd entry
+    # in the image, so $HOME defaults to '/' (not writable). Bind-mount a
+    # host directory as HOME so rpmbuild (~/rpmbuild) and other tools have
+    # writable, disk-backed storage. tmpfs would OOM on kernel builds (~10GB).
+    local rpmhome="${BUILD_DIR}/rpmhome"
+    mkdir -p "${rpmhome}"
+
     docker run $docker_flags \
         --name "${CONTAINER_NAME}" \
         --user "$(id -u):$(id -g)" \
         -v "${SCRIPT_DIR}:/build/debian-kernel" \
+        -v "${rpmhome}:/home/build-user" \
+        -e HOME="/home/build-user" \
         -w /build/debian-kernel \
         "${IMAGE_NAME}:${IMAGE_TAG}" \
         bash -c "${cmd}"
