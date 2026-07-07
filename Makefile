@@ -50,8 +50,14 @@ help:
 
 # Configuration
 JOBS ?= $(shell nproc)
-DEB_BUILD_FLAGS ?= -b -uc -us -j$(JOBS)
-DEB_BUILD_FLAGS_MINIMAL ?= -B -uc -us -j$(JOBS)
+# -d skips dpkg-buildpackage's build-dependency check. The generated
+# debian/control Build-Depends on synthetic packages (gcc-N-for-host,
+# libwrap0-dev) that don't exist in the Ubuntu archive and are only
+# provided as contentless equivs stubs in the Docker image. Those stubs
+# have no effect on the actual compile (the real compiler is gcc-N via
+# c_compiler/CC), so we skip the check instead of requiring the stubs.
+DEB_BUILD_FLAGS ?= -b -uc -us -d -j$(JOBS)
+DEB_BUILD_FLAGS_MINIMAL ?= -B -uc -us -d -j$(JOBS)
 DEB_BUILD_PROFILES ?=
 RPM_BUILD_FLAGS ?=
 BUILD_DIR ?= $(CURDIR)/build/kernel
