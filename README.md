@@ -194,6 +194,12 @@ See [debian/README.md](debian/README.md#package-conflicts-with-system-tools) for
 
 ### Prerequisites
 
+> **Recommended: build in Docker.** The host then needs only Docker, and the
+> container ships every build dependency listed below:
+> `./docker-build.sh --build-image && ./docker-build.sh deb`.
+> The bare-host instructions below are for when you cannot use the container,
+> and are **tested on Ubuntu 26.04 (gcc-15)**.
+
 **System Requirements:**
 - Linux distribution (Debian 12+, Ubuntu 22.04+, Fedora 40+, CentOS Stream 9)
 - 20GB+ free disk space
@@ -207,24 +213,28 @@ Install build dependencies before starting:
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-    git build-essential bc bison flex libssl-dev libelf-dev \
-    libncurses-dev dwarves debhelper rsync quilt \
-    python3 python3-tomli cpio kmod
+    git build-essential fakeroot dpkg-dev devscripts debhelper quilt lintian \
+    xz-utils rsync cpio kmod \
+    bc bison flex libssl-dev libelf-dev libncurses-dev pahole \
+    gcc-15 gcc-multilib \
+    python3 python3-dev python3-setuptools python3-dacite python3-jinja2 \
+    dh-python python3-docutils \
+    python3-sphinx python3-sphinx-rtd-theme sphinx-common python3-yaml \
+    dvipng graphviz asciidoctor asciidoc xmlto \
+    libperl-dev libpython3-dev libaudit-dev libcap-dev libdw-dev \
+    libdebuginfod-dev libpci-dev libudev-dev libunwind-dev libnewt-dev \
+    libnl-3-dev libnl-genl-3-dev libglib2.0-dev libnuma-dev libconfig-dev \
+    libslang2-dev binutils-dev zlib1g-dev libzstd-dev lz4 zstd gawk
 ```
 
-Package descriptions:
-- `git`: Version control system (for cloning repository and tracking changes)
-- `build-essential`: GCC compiler and basic build tools
-- `bc`, `bison`, `flex`: Build utilities required by kernel
-- `libssl-dev`: SSL library for kernel crypto and module signing
-- `libelf-dev`: ELF library for BTF (BPF Type Format) support
-- `libncurses-dev`: For menuconfig (optional)
-- `dwarves`: Provides pahole for BTF generation
-- `debhelper`: Debian package creation tools
-- `rsync`: File synchronization (used by Makefile)
-- `quilt`: Patch management tool
-- `python3`, `python3-tomli`: Required for gencontrol.py
-- `cpio`, `kmod`: Kernel packaging dependencies
+Package descriptions (grouped):
+- **Packaging / base**: `git`, `build-essential` (also pulls in `dpkg-dev`), `fakeroot` (used by `dpkg-buildpackage`), `debhelper`, `quilt` (patch management), `lintian`, `xz-utils`, `rsync`, `cpio`, `kmod`
+- **Source fetch**: `devscripts` — provides `uscan`, which `make deb-setup` uses to fetch the upstream kernel source from git.kernel.org
+- **Kernel compile**: `bc`, `bison`, `flex`, `libssl-dev` (module signing), `libelf-dev` + `pahole` (BTF), `libncurses-dev` (menuconfig)
+- **Compiler**: `gcc-15` (matches Ubuntu 26.04; `debian/bin/detect-gcc-version.sh` selects it), `gcc-multilib`
+- **gencontrol (required)**: `python3`, `python3-dacite` (parses `debian/config/*.toml`), `python3-jinja2` (renders `debian/templates/*.j2`), `python3-dev`, `python3-setuptools`
+- **Docs (`linux-doc`)**: `python3-sphinx`, `python3-sphinx-rtd-theme`, `sphinx-common`, `python3-docutils`, `dh-python`, `python3-yaml`, `dvipng`, `graphviz`, `asciidoctor`, `asciidoc`, `xmlto`
+- **Tools — perf / cpupower / bpftool** (needed by full `make deb`, not `make deb-minimal`): `libperl-dev`, `libpython3-dev`, `libaudit-dev`, `libcap-dev`, `libdw-dev`, `libdebuginfod-dev`, `libpci-dev`, `libudev-dev`, `libunwind-dev`, `libnewt-dev`, `libnl-3-dev`, `libnl-genl-3-dev`, `libglib2.0-dev`, `libnuma-dev`, `libconfig-dev`, `libslang2-dev`, `binutils-dev`, `zlib1g-dev`, `libzstd-dev`, `lz4`, `zstd`, `gawk`
 
 **Git Configuration:**
 
