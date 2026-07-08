@@ -23,7 +23,7 @@ For project overview and Intel overlay system, see [Main README](../README.md).
 - **Standard** (`-amd64`): General purpose, desktop, server
 - **Real-Time** (`-rt-amd64`): Low-latency, PREEMPT_RT, industrial control
   - **Auto-configures boot parameters**: RT kernel packages automatically apply optimized boot parameters to `/etc/default/grub` during installation
-  - See [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) for details
+  - See [RT Kernel Parameters](../intel/kernel-rt-parameter) for the full parameter list
 
 ---
 
@@ -58,7 +58,7 @@ Must install in this exact order:
 - Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt`
 - Adds RT parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
 - Runs `update-grub`
-- See [RT Kernel Parameters Guide](../docs/RT-KERNEL-PARAMETERS.md) for details
+- See [RT Kernel Parameters](../intel/kernel-rt-parameter) for the full parameter list
 
 ---
 
@@ -113,12 +113,33 @@ crash /usr/lib/debug/boot/vmlinux-<VERSION> /var/crash/vmcore
 | `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
 | `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
 
-**Examples**:
+> **Note**: `dpkg -i` does not resolve dependencies, so install these first:
+>
+> - `linux-intel-perf` depends on `libopencsd1` (OpenCSD library for CoreSight
+>   trace decoding), a stock distro package:
+>
+>   ```bash
+>   sudo apt install libopencsd1
+>   ```
+>
+> - `linux-intel-rtla` depends on `libcpupower-intel1`, which is part of this
+>   package set (see [System Utilities](#system-utilities)) — install its `.deb`
+>   alongside:
+>
+>   ```bash
+>   sudo dpkg -i ./libcpupower-intel1_*.deb
+>   ```
+>
+> Alternatively, install the tool `.deb` with `sudo apt install ./linux-intel-perf_*.deb`
+> (or `./linux-intel-rtla_*.deb`), which pulls in these dependencies automatically
+> when they are available in your apt sources.
+
+**Examples** (require root):
 ```bash
-perf-intel top              # Live CPU profiling
-perf-intel record -g -a     # Record call stacks
-bpftool-intel prog list     # List BPF programs
-rtla-intel osnoise top      # RT noise monitoring
+sudo perf-intel top              # Live CPU profiling
+sudo perf-intel record -g -a     # Record call stacks
+sudo bpftool-intel prog list     # List BPF programs
+sudo rtla-intel osnoise top      # RT noise monitoring
 ```
 
 ---
@@ -138,124 +159,25 @@ rtla-intel osnoise top      # RT noise monitoring
 | `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
 | `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
 
----
-
-## Installation Scenarios
-
-### Scenario 1: Minimal Runtime (~100MB)
-
-Production server, minimal footprint:
-
-```bash
-cd build/packages/deb/
-sudo dpkg -i \
-  linux-intel-base-*-amd64_*.deb \
-  linux-intel-base-amd64_*.deb \
-  linux-intel-binary-*-amd64_*.deb \
-  linux-intel-modules-*-amd64_*.deb \
-  linux-intel-image-*-amd64_*.deb \
-  linux-intel-image-amd64_*.deb
-sudo apt-get install -f
-sudo update-grub
-sudo reboot
-```
-
-### Scenario 2: Development System (~104MB)
-
-Add module building capability:
-
-```bash
-# After Scenario 1, install in this order:
-sudo dpkg -i \
-  linux-kbuild-*_*.deb \
-  linux-intel-headers-*-common_*.deb \
-  linux-intel-headers-*-amd64_*.deb
-```
-
-### Scenario 3: Tools Only (~3MB)
-
-System utilities without kernel packages (use when kernel is already installed):
-
-```bash
-# Install Intel kernel tools (automatically replaces system packages)
-sudo apt install \
-  ./libcpupower-intel1_*.deb \
-  ./libcpupower-intel-dev_*.deb \
-  ./linux-intel-cpupower_*.deb \
-  ./linux-intel-perf_*.deb \
-  ./linux-intel-misc-tools_*.deb \
-  ./linux-intel-hyperv-daemons_*.deb \
-  ./linux-intel-sdsi_*.deb \
-  ./linux-intel-usbip_*.deb \
-  ./linux-intel-bpftool_*.deb \
-  ./linux-intel-rtla_*.deb
-```
-
-**Tools included:**
-- `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel` (CPU power/freq management)
-- `perf-intel` (profiling and tracing)
-- `bpftool-intel` (eBPF program inspection)
-- `rtla-intel` (RT latency analysis)
-- `usbip-intel`, `usbipd-intel` (USB over IP)
-- `tmon`, `thermometer` (thermal monitoring)
-- `bootconfig`, `ihex2fw` (boot and firmware utilities)
-- Hyper-V integration services
-- Intel SDSi management
-
-**Note:** These packages will automatically replace system packages via APT's conflict resolution. See [Package Conflicts](#package-conflicts-with-system-tools) for details.
-
-### Scenario 4: Real-Time System (~100MB)
-
-Replace `-amd64` with `-rt-amd64` in all package names:
-
-```bash
-sudo dpkg -i \
-  linux-intel-base-*-rt-amd64_*.deb \
-  linux-intel-base-rt-amd64_*.deb \
-  linux-intel-binary-*-rt-amd64_*.deb \
-  linux-intel-modules-*-rt-amd64_*.deb \
-  linux-intel-image-*-rt-amd64_*.deb \
-  linux-intel-image-rt-amd64_*.deb
-sudo apt-get install -f
-sudo reboot
-```
-
-**RT Kernel Auto-Configuration:**
-
-When installing `linux-intel-image-*-rt-amd64`, the package automatically:
-1. Reads RT boot parameters from `intel/kernel-rt-parameter`
-2. Backs up `/etc/default/grub` to `/etc/default/grub.pre-rt` (first time only)
-3. Adds RT-optimized parameters to `GRUB_CMDLINE_LINUX_DEFAULT`
-4. Runs `update-grub` to update bootloader configuration
-5. Notifies that a reboot is required
-
-**RT Parameters include:**
-- CPU isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
-- Power management optimization (`intel_pstate=disable`, `idle=poll`)
-- Graphics configuration (`i915.enable_guc`, `i915.max_vfs`)
-- Clock source (`clocksource=tsc`, `tsc=reliable`)
-- IOMMU settings (`intel_iommu=on`, `iommu=pt`)
-- And many more for RT performance
-
-**Manual verification:**
-```bash
-# View applied parameters
-cat /proc/cmdline
-
-# View original backup
-cat /etc/default/grub.pre-rt
-```
-
-See [RT Kernel Parameters Documentation](../docs/RT-KERNEL-PARAMETERS.md) for complete details.
-
-### Scenario 5: Kernel Debugging (~1.4GB)
-
-Add debug symbols:
-
-```bash
-# After Scenario 1
-sudo dpkg -i linux-intel-image-*-amd64-dbg_*.deb
-```
+> **Note — Installing these utilities**
+>
+> Because each utility has different dependencies, we do not list step-by-step
+> install instructions for every one. Install only the `.deb` packages you need,
+> using `dpkg`:
+>
+> ```bash
+> sudo dpkg -i ./linux-intel-<tool>_*.deb
+> ```
+>
+> `dpkg -i` does **not** resolve dependencies. If a package is missing
+> prerequisites, `dpkg` reports them in its output (e.g.
+> `dependency problems ... but it is not installed`). Read that prompt to see
+> which packages are required, then install them — either the matching `.deb`
+> from this package set (such as `libcpupower-intel1` for `linux-intel-rtla`) or
+> a stock distro package from your apt sources — and re-run the command. To let
+> apt pull dependencies in automatically, install with
+> `sudo apt install ./linux-intel-<tool>_*.deb` instead, or run
+> `sudo apt install -f` afterwards to fix up any unmet dependencies.
 
 ---
 
@@ -284,63 +206,6 @@ Example: `linux-intel-image-amd64_6.18.20-intel+260417t093242z_amd64.deb`
 
 ---
 
-## Troubleshooting
-
-### "modprobe: FATAL: Module not found"
-
-**Cause**: Kernel version mismatch between binary and modules.
-
-**Prevention**:
-```bash
-scripts/verify-kernel-package.sh linux-intel-binary-*.deb linux-intel-modules-*.deb
-```
-
-**Check**:
-```bash
-uname -r                      # Kernel version
-ls /lib/modules/              # Module directory name (must match)
-```
-
-### Package installation fails
-
-```bash
-# Fix dependencies
-sudo apt-get install -f
-
-# Or install in correct order (see Installation Order section)
-```
-
-### Cannot build external modules
-
-```bash
-# Install development packages in correct order
-sudo dpkg -i linux-kbuild-*_*.deb
-sudo dpkg -i linux-intel-headers-*-common_*.deb
-sudo dpkg -i linux-intel-headers-$(uname -r)_*.deb
-```
-
-### GRUB doesn't show new kernel
-
-```bash
-sudo update-grub
-grep menuentry /boot/grub/grub.cfg | grep $(uname -r)
-```
-
-### Kernel panic or boot failure
-
-1. Reboot, select previous kernel from GRUB
-2. Check logs:
-   ```bash
-   journalctl -b -1          # Previous boot
-   dmesg | less
-   ```
-3. Verify packages:
-   ```bash
-   dpkg -l | grep linux-image
-   ```
-
----
-
 ## Package Management
 
 ### Listing Kernels
@@ -354,14 +219,14 @@ grep menuentry /boot/grub/grub.cfg     # Boot entries
 ### Removing Old Kernels
 
 ```bash
-# Remove specific version (removes all related packages)
-sudo apt-get remove \
+# Remove specific version (removes all related packages, including config files)
+sudo apt purge \
   linux-intel-image-VERSION-amd64 \
   linux-intel-headers-VERSION-amd64 \
   linux-intel-headers-VERSION-common
 
 # Remove unused kernels (keeps current + one previous)
-sudo apt-get autoremove
+sudo apt autoremove
 
 # Update GRUB
 sudo update-grub
@@ -414,7 +279,7 @@ The RT kernel packages include automatic boot parameter configuration:
 - **Clock source**: TSC as reliable clock source
 - **Graphics optimization**: GPU configuration for low-latency operation
 
-See [RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md) for the complete list of automatically applied parameters and customization options.
+See [RT Kernel Parameters](../intel/kernel-rt-parameter) for the complete list of automatically applied parameters and customization options.
 
 ---
 
@@ -581,9 +446,7 @@ sudo apt install \
 - **[Module Packaging](MODULE_PACKAGING.md)** - Standalone module packages
 - **[RPM Packages](../rpm/README.md)** - RPM build system
 - **[Intel Overlay](../intel/README.md)** - Shared patches and configs
-- **[RT Kernel Parameters](../docs/RT-KERNEL-PARAMETERS.md)** - RT kernel auto-configuration
-- **[RT Package Structure](../docs/RT-PACKAGE-STRUCTURE.md)** - RT kernel package details
-- **[DKMS Packages](../dkms/README.md)** - Dynamic kernel module packages
+- **[RT Kernel Parameters](../intel/kernel-rt-parameter)** - RT kernel auto-configuration parameter list
 
 ---
 

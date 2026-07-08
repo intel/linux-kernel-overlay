@@ -4,35 +4,6 @@ RPM package building system for Linux kernel, based on Fedora kernel packaging p
 
 **Note**: RPM packages now use the same versioning scheme as Debian packages, with timestamps automatically extracted from `debian/changelog`. See [VERSION-NAMING.md](VERSION-NAMING.md) for details.
 
-## Directory Structure (Fedora-style)
-
-This implementation follows Fedora's flat directory layout from [Fedora's kernel repository](https://src.fedoraproject.org/rpms/kernel):
-
-```
-rpm/
-├── kernel.spec                      # RPM spec file
-├── kernel-local                     # User customization file (optional)
-│
-├── patches -> ../intel/patches     # Symlink to patches (for reference)
-├── linux-6.18.20.tar.xz            # Kernel source tarball (generated)
-├── patches.tar.gz                   # Patches archive (generated from intel/patches)
-│
-├── kernel-x86_64-base.config       # Base config from Fedora (9566 lines, tracked in git)
-├── kernel-x86_64.config            # Generated: base + fragments (9984 lines)
-├── kernel-x86_64-rt.config         # Generated: base + fragments + RT (10014 lines)
-│
-├── mod-sign.sh                      # Fedora build scripts (downloaded)
-├── mod-denylist.sh
-├── filtermods.py
-│
-└── scripts/                         # Build automation scripts
-    ├── prepare-sources.sh           # Prepare all source files
-    ├── generate-configs.sh          # Generate configs: base + fragments (uses defines.toml)
-    ├── build.sh                     # Build RPM packages
-    ├── setup-fedora-sources.sh      # Download Fedora scripts
-    └── update-version.sh            # Update kernel version
-```
-
 ## Key Features
 
 - **Fedora-compatible**: Uses the same flat directory structure as Fedora's kernel packaging
@@ -43,6 +14,42 @@ rpm/
 - **Multiple packages**: Builds kernel, kernel-devel, kernel-tools, and kernel-tools-libs
 
 ## Quick Start
+
+### Prerequisites
+
+**Debian/Ubuntu:**
+
+```bash
+sudo apt-get install -y \
+    rpm \
+    build-essential \
+    bc bison flex \
+    libelf-dev libssl-dev \
+    libncurses-dev \
+    kmod cpio rsync xz-utils \
+    python3 perl \
+    libaudit-dev binutils-dev \
+    libcap-dev libnuma-dev \
+    libslang2-dev zlib1g-dev \
+    asciidoc xmlto
+```
+
+**Fedora/CentOS/RHEL:**
+
+```bash
+sudo dnf install -y \
+    rpm-build rpmdevtools \
+    gcc make binutils \
+    bc bison flex \
+    elfutils-devel openssl-devel \
+    ncurses-devel \
+    kmod xz rsync \
+    python3 perl \
+    audit-libs-devel binutils-devel \
+    libcap-devel numactl-devel \
+    slang-devel zlib-devel \
+    asciidoc xmlto
+```
 
 ### 1. Prepare Source Files
 
@@ -65,10 +72,17 @@ This will:
     * `7.0.0-rc1` → downloads `linux-7.0-rc1.tar.xz` (RC versions also omit `.0`)
     * `6.18.0` → downloads `linux-6.18.tar.xz`, but `6.18.33` → `linux-6.18.33.tar.xz`
 - Create `patches.tar.gz` archive from `intel/patches/` (containing series + individual patches)
-- Generate complete `.config` files by merging:
-  - **Base config** (9566 lines from Fedora)
+- Generate complete `.config` files by merging (delegates to `generate-configs.sh`):
+  - **Base config** (9566 lines from Fedora): `rpm/kernel-x86_64-base.config`
   - **Config fragments** from `intel/config/` (following `debian/config/amd64/defines.toml` order)
   - Result: ~10K line complete configs for reproducible builds
+  - Generates **all flavours** in one run:
+    - `kernel-x86_64.config` — standard (`amd64`)
+    - `kernel-x86_64-rt.config` — RT, adds `config.rt` fragment (`rt-amd64`)
+    - `kernel-x86_64-test.config` — test (`test`)
+  - **Note**: config generation is skipped if `kernel-x86_64.config` already exists.
+    Use `--force` (or run `./scripts/generate-configs.sh` directly) to regenerate.
+    Finalized during build via `make olddefconfig` in the spec's `%prep`.
 - Download Fedora build scripts (`mod-sign.sh`, etc.)
 
 **Note**: 
@@ -86,6 +100,9 @@ This will:
 
 # Clean build with custom jobs
 ./scripts/build.sh --clean --jobs 16
+
+# RT (PREEMPT_RT) build (uses kernel-x86_64-rt.config, produces kernel-rt-* packages)
+./scripts/build.sh --define "with_rt 1"
 ```
 
 ### 3. Install Packages
@@ -96,6 +113,18 @@ sudo dnf install ~/rpmbuild/RPMS/x86_64/kernel-*.rpm
 
 # On Debian/Ubuntu (requires alien or dpkg-deb conversion)
 sudo rpm -ivh ~/rpmbuild/RPMS/x86_64/kernel-*.rpm
+```
+
+### Building in Docker (Alternative)
+
+```bash
+# From project root
+
+# 1. Build Docker image
+./docker-build.sh --build-image rpm
+
+# 2. Build RPM
+./docker-build.sh rpm
 ```
 
 ## Detailed Workflow
@@ -129,7 +158,7 @@ You can also prepare sources individually:
 ./scripts/setup-fedora-sources.sh
 
 # Create patches tarball manually
-tar -czf rpm/patches.tar.gz -C intel patches/
+tar -czf patches.tar.gz -C ../intel patches/
 ```
 
 ### Build Options
@@ -143,71 +172,6 @@ Options:
   -s, --skip-prep     Skip preparation (faster rebuilds)
   -j, --jobs NUM      Number of parallel jobs
   -a, --arch ARCH     Target architecture
-```
-
-## Customization
-
-### Kernel Configuration
-
-The config generation uses a base + fragments approach:
-
-```
-kernel-x86_64-base.config (9566 lines, Fedora base)
-    +
-intel/config/amd64/intel/*.cfg (30 fragments, ~400 lines)
-    =
-kernel-x86_64.config (9984 lines, complete .config)
-```
-
-**Config merge order** is defined in `debian/config/amd64/defines.toml` to ensure consistency with Debian builds.
-
-To customize kernel config:
-
-1. **Option A (Recommended)**: Edit config fragments in `intel/config/`
-   ```bash
-   echo "CONFIG_MY_DRIVER=m" >> intel/config/amd64/intel/mydriver.cfg
-   # Add to debian/config/amd64/defines.toml under config = [...]
-   ./scripts/generate-configs.sh
-   ```
-
-2. **Option B**: Use `kernel-local` file (for temporary/experimental configs)
-   ```bash
-   echo "CONFIG_MY_DRIVER=m" >> rpm/kernel-local
-   ```
-
-3. **Option C**: Update base config (for major changes)
-   ```bash
-   # Update rpm/kernel-x86_64-base.config
-   # Then regenerate all variants
-   ./scripts/generate-configs.sh
-   ```
-
-### Adding Patches
-
-Add patches to `intel/patches/intel/` and update `intel/patches/series`:
-
-```bash
-# Add new patch
-cp my-feature.patch intel/patches/intel/9999-my-feature.patch
-
-# Update series file
-echo "intel/9999-my-feature.patch" >> intel/patches/series
-
-# Regenerate patches tarball
-./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force
-```
-
-### Changing Kernel Version
-
-```bash
-# Update version in kernel.spec
-sed -i 's/%define kernel_version.*/%define kernel_version 6.19.0/' rpm/kernel.spec
-
-# Prepare new sources
-./scripts/prepare-sources.sh --version 6.19.0 --force
-
-# Build
-./scripts/build.sh --clean
 ```
 
 ## Package Overview
@@ -230,121 +194,34 @@ sed -i 's/%define kernel_version.*/%define kernel_version 6.19.0/' rpm/kernel.sp
 
 ### kernel-tools-libs
 - `libcpupower.so` - CPU power library
-- `libperf-jvmti.so` - Perf JVM support
 
-## Comparison with Traditional RPM Layout
+## Directory Structure (Fedora-style)
 
-| Aspect | Traditional | This Implementation (Fedora-style) |
-|--------|-------------|-------------------------------------|
-| Layout | `SPECS/` and `SOURCES/` subdirs | Flat (all in rpm/) |
-| Patches | Individual `.patch` files | Series-based individual application |
-| Configs | One file per variant | Generated from fragments |
-| Source tracking | Manual `git add` in subdirs | Direct `git add` in rpm/ |
-| Compatibility | Generic | Fedora-compatible |
-| Patch debugging | Moderate | Excellent (shows exact failing patch) |
+This implementation follows Fedora's flat directory layout from [Fedora's kernel repository](https://src.fedoraproject.org/rpms/kernel):
 
-## Prerequisites
-
-### For Debian/Ubuntu Systems
-
-```bash
-sudo apt-get install -y \
-    rpm \
-    build-essential \
-    bc bison flex \
-    libelf-dev libssl-dev \
-    libncurses-dev \
-    kmod cpio rsync xz-utils \
-    python3 perl \
-    libaudit-dev libbinutils-dev \
-    libcap-dev libnuma-dev \
-    libslang2-dev zlib1g-dev \
-    asciidoc xmlto
 ```
-
-### For Fedora/CentOS/RHEL Systems
-
-```bash
-sudo dnf install -y \
-    rpm-build rpmdevtools \
-    gcc make binutils \
-    bc bison flex \
-    elfutils-devel openssl-devel \
-    ncurses-devel \
-    kmod xz rsync \
-    python3 perl \
-    audit-libs-devel binutils-devel \
-    libcap-devel numactl-devel \
-    slang-devel zlib-devel \
-    asciidoc xmlto
-```
-
-## Docker Build (Alternative)
-
-```bash
-# From project root
-
-# 1. Build Docker image
-./docker-build.sh --build-image rpm
-
-# 2. Prepare sources
-docker run --rm -v $(pwd):/workspace rpm-builder \
-    ./rpm/scripts/prepare-sources.sh --version 6.18.20
-
-# 3. Build RPM
-./docker-build.sh rpm
-```
-
-## Troubleshooting
-
-### Missing Dependencies
-
-```bash
-# Fedora/RHEL
-sudo dnf builddep rpm/kernel.spec
-
-# Debian/Ubuntu
-# Install packages listed in Prerequisites section above
-```
-
-### Build Failures
-
-```bash
-# Check build log
-less ~/rpmbuild/BUILD/linux-*/build.log
-
-# Clean and retry
-./scripts/build.sh --clean
-```
-
-### Patch Application Failures
-
-When a patch fails, rpmbuild will show exactly which patch file failed:
-
-```bash
-# Check build log for the specific patch
-less ~/rpmbuild/BUILD/linux-6.18.20/build.log
-
-# The error message will show something like:
-#   ERROR: Failed to apply patch: intel/0123-some-feature.patch
-
-# Test the specific patch manually
-cd ~/rpmbuild/BUILD/linux-6.18.20
-patch -p1 --dry-run < patches/intel/0123-some-feature.patch
-
-# Fix the patch in intel/patches/intel/0123-some-feature.patch
-# Then regenerate patches tarball
-./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force
-```
-
-### Config Issues
-
-```bash
-# Verify config syntax
-grep -E "^CONFIG_|^# CONFIG_.*is not set" rpm/kernel-x86_64.config
-
-# Regenerate config
-./scripts/generate-configs.sh
+rpm/
+├── kernel.spec                      # RPM spec file
+├── kernel-local                     # User customization file (optional)
+│
+├── patches -> ../intel/patches     # Symlink to patches (for reference)
+├── linux-6.18.20.tar.xz            # Kernel source tarball (generated)
+├── patches.tar.gz                   # Patches archive (generated from intel/patches)
+│
+├── kernel-x86_64-base.config       # Base config from Fedora (9566 lines, tracked in git)
+├── kernel-x86_64.config            # Generated: base + fragments (9984 lines)
+├── kernel-x86_64-rt.config         # Generated: base + fragments + RT (10014 lines)
+│
+├── mod-sign.sh                      # Fedora build scripts (downloaded)
+├── mod-denylist.sh
+├── filtermods.py
+│
+└── scripts/                         # Build automation scripts
+    ├── prepare-sources.sh           # Prepare all source files
+    ├── generate-configs.sh          # Generate configs: base + fragments (uses defines.toml)
+    ├── build.sh                     # Build RPM packages
+    ├── setup-fedora-sources.sh      # Download Fedora scripts
+    └── update-version.sh            # Update kernel version
 ```
 
 ## Integration with Debian Packaging
