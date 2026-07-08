@@ -404,7 +404,6 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
 - **[Debian Packages](debian/README.md)** - Complete guide to Debian packages
   - Package types and descriptions
   - Installation scenarios
-  - Troubleshooting
   - Standard vs RT kernel comparison
   - RT kernel auto-configuration
 
@@ -419,15 +418,9 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
   - Intel platform features
   - RT kernel boot parameters
 
-- **[RT Kernel Parameters](docs/RT-KERNEL-PARAMETERS.md)** - RT kernel auto-configuration
+- **[RT Kernel Parameters](intel/kernel-rt-parameter)** - RT kernel auto-configuration parameter list
   - Automatic boot parameter setup
   - Parameter customization
-  - Installation and removal process
-
-- **[RT Package Structure](docs/RT-PACKAGE-STRUCTURE.md)** - RT kernel package details
-  - Package composition
-  - Installation flow
-  - Which package does what
 
 ## Troubleshooting
 
@@ -463,9 +456,9 @@ make -f debian/rules debian/control
 cd rpm && ./scripts/generate-configs.sh
 ```
 
-See package-specific documentation for detailed troubleshooting:
-- Debian: [debian/README.md](debian/README.md#common-issues--solutions)
-- RPM: [rpm/README.md](rpm/README.md#troubleshooting)
+See package-specific documentation for more details:
+- Debian: [debian/README.md](debian/README.md)
+- RPM: [rpm/README.md](rpm/README.md)
 
 ## Contributing
 
