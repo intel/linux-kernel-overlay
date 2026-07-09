@@ -231,7 +231,7 @@ echo "Building kernel tools..."
 # Add multiarch include path for Ubuntu/Debian compatibility
 # Force feature-glibc to be detected (we know Ubuntu has glibc)
 %global perf_make \
-  make -s CFLAGS="${RPM_OPT_FLAGS} -I/usr/include/x86_64-linux-gnu" EXTRA_CFLAGS="${RPM_OPT_FLAGS} -I/usr/include/x86_64-linux-gnu" feature-glibc=1 %{?cross_opts} -C tools/perf V=1 NO_PERF_READ_VDSO32=1 NO_PERF_READ_VDSOX32=1 WERROR=0 NO_LIBUNWIND=1 HAVE_CPLUS_DEMANGLE=1 NO_GTK2=1 NO_STRLCPY=1 NO_BIONIC=1 LIBTRACEEVENT_DYNAMIC=1 prefix=%{_prefix} lib=%{_lib}
+  make -s CFLAGS="${RPM_OPT_FLAGS} -I/usr/include/x86_64-linux-gnu" EXTRA_CFLAGS="${RPM_OPT_FLAGS} -I/usr/include/x86_64-linux-gnu" feature-glibc=1 %{?cross_opts} -C tools/perf V=1 NO_PERF_READ_VDSO32=1 NO_PERF_READ_VDSOX32=1 WERROR=0 NO_LIBUNWIND=1 HAVE_CPLUS_DEMANGLE=1 NO_GTK2=1 NO_STRLCPY=1 NO_BIONIC=1 NO_JVMTI=1 LIBTRACEEVENT_DYNAMIC=1 prefix=%{_prefix} lib=%{_lib}
 
 %{perf_make} all
 
