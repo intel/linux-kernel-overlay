@@ -1,7 +1,7 @@
 # Makefile for Kernel Packaging System
 # Supports both Debian (.deb) and RPM (.rpm) package builds
 
-.PHONY: help deb rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
+.PHONY: help deb deb-config rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
 
 # Default target
 help:
@@ -26,6 +26,7 @@ help:
 	@echo ""
 	@echo "Debian Targets:"
 	@echo "  deb-setup        Setup Debian build (first-time only)"
+	@echo "  deb-config       Override source name / version / kernel release (after deb-setup)"
 	@echo "  deb-modules      Build Debian kernel module packages"
 	@echo "  deb-minimal      Build kernel image only (fast, no tools)"
 	@echo ""
@@ -37,6 +38,7 @@ help:
 	@echo "Examples:"
 	@echo "  make deb                    # Build all Debian packages (kernel + tools)"
 	@echo "  make deb-minimal            # Build kernel image only (faster)"
+	@echo "  make deb-config SOURCENAME=linux-intel-6.18 PKGVERSION=6.18.0-mainline+linux+260623t022223z KERNELRELEASE=-intel"
 	@echo "  make rpm                    # Build RPM packages (standard only)"
 	@echo "  make rpm-rt                 # Build RPM packages (RT only)"
 	@echo "  make rpm-all                # Build RPM packages (standard + RT)"
@@ -276,6 +278,111 @@ deb-setup:
 	@echo "  Packages directory: $(BUILD_PACKAGES_DEB_DIR)"
 	@echo "  Logs directory: $(BUILD_LOGS_DIR)"
 	@echo "  Cache directory: $(BUILD_CACHE_DIR)"
+
+# ------------------------------------------------------------
+# deb-config: customize source name / package version / kernel
+# release suffix in the build tree AFTER deb-setup.
+#
+# Purely additive: it only patches the generated tree in
+# $(BUILD_DIR) (git-ignored) and never alters deb-setup/deb or
+# any tracked file. All three parameters are optional; unset ones
+# keep whatever deb-setup derived from debian/changelog.
+#
+# NOTE: run this AFTER 'make deb-setup' and BEFORE 'make deb'.
+#       Re-running deb-setup rebuilds the tree and drops these
+#       overrides, so re-run deb-config afterwards.
+#
+# Usage:
+#   make deb-config SOURCENAME=linux-intel-6.18 \
+#                   PKGVERSION=6.18.0-mainline+preprod+linux+260623t022223z \
+#                   KERNELRELEASE=-intel
+#
+#   SOURCENAME    KDEB_SOURCENAME. Source package name; drives the
+#                 binary package prefix (linux<suffix>-image-*, ...),
+#                 so it MUST start with 'linux'.
+#   PKGVERSION    KDEB_PKGVERSION. Full .deb version <kernelver>-<revision>,
+#                 e.g. 6.18.0-mainline+preprod+linux+260623t022223z.
+#   KERNELRELEASE uname -r suffix appended after the numeric kernel
+#                 version (localversion + abi_suffix), e.g. -intel.
+# ------------------------------------------------------------
+deb-config:
+	@if [ ! -f "$(BUILD_DIR)/debian/changelog" ]; then \
+		echo "Error: Build tree not found at $(BUILD_DIR)."; \
+		echo "  Run 'make deb-setup' first, then 'make deb-config ...'."; \
+		exit 1; \
+	fi
+	@if [ -z "$(SOURCENAME)" ] && [ -z "$(PKGVERSION)" ] && [ -z "$(KERNELRELEASE)" ]; then \
+		echo "Nothing to do: set at least one of SOURCENAME=, PKGVERSION=, KERNELRELEASE="; \
+		echo ""; \
+		echo "Examples:"; \
+		echo "  make deb-config SOURCENAME=linux-intel-6.18"; \
+		echo "  make deb-config PKGVERSION=6.18.0-mainline+preprod+linux+260623t022223z"; \
+		echo "  make deb-config KERNELRELEASE=-intel"; \
+		exit 1; \
+	fi
+	@echo "======================================================================"
+	@echo "Customizing Debian build tree: $(BUILD_DIR)"
+	@echo "======================================================================"
+	@# --- SOURCENAME (KDEB_SOURCENAME): source package name -> binary name prefix
+	@if [ -n "$(SOURCENAME)" ]; then \
+		if ! echo "$(SOURCENAME)" | grep -qE '^linux[a-zA-Z0-9.+_-]*$$'; then \
+			echo "Error: Invalid SOURCENAME '$(SOURCENAME)'"; \
+			echo "  Must start with 'linux' and use only: a-z A-Z 0-9 . + _ -"; \
+			echo "  (binary names are derived as linux<suffix>-*, so the 'linux' prefix is required)"; \
+			exit 1; \
+		fi; \
+		sed -i "1s/^[^ ]* (/$(SOURCENAME) (/" $(BUILD_DIR)/debian/changelog; \
+		echo "  SOURCENAME     -> $(SOURCENAME)  (binaries: $(SOURCENAME)-image-*, ...)"; \
+	fi
+	@# --- PKGVERSION (KDEB_PKGVERSION): full .deb package version
+	@if [ -n "$(PKGVERSION)" ]; then \
+		if ! echo "$(PKGVERSION)" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?(~[A-Za-z0-9.+~]+)?-[A-Za-z0-9+.~]+$$'; then \
+			echo "Error: Invalid PKGVERSION '$(PKGVERSION)'"; \
+			echo "  Expected <kernelver>-<revision>, e.g. 6.18.0-mainline+preprod+linux+260623t022223z"; \
+			echo "    - kernelver must start with X.Y (optionally .Z, -rcN, ~mod)"; \
+			echo "    - revision (after the last '-') may use only [A-Za-z0-9+.~]"; \
+			exit 1; \
+		fi; \
+		sed -i "1s/([^)]*)/($(PKGVERSION))/" $(BUILD_DIR)/debian/changelog; \
+		echo "  PKGVERSION     -> $(PKGVERSION)"; \
+	fi
+	@# --- KERNELRELEASE: uname -r suffix (localversion + abi_suffix)
+	@if [ -n "$(KERNELRELEASE)" ]; then \
+		if ! echo "$(KERNELRELEASE)" | grep -qE '^[a-zA-Z0-9.+_~-]+$$'; then \
+			echo "Error: Invalid KERNELRELEASE suffix '$(KERNELRELEASE)'"; \
+			echo "  Allowed characters: a-z A-Z 0-9 . + _ ~ -"; \
+			exit 1; \
+		fi; \
+		case "$(KERNELRELEASE)" in \
+			-*|+*|~*) ;; \
+			*) echo "  Warning: KERNELRELEASE '$(KERNELRELEASE)' has no leading separator (- + ~);"; \
+			   echo "           uname -r will read as <version>$(KERNELRELEASE) with no delimiter." ;; \
+		esac; \
+		case "$(KERNELRELEASE)" in \
+			*[0-9]t[0-9]*z*) ;; \
+			*) echo "  Warning: KERNELRELEASE '$(KERNELRELEASE)' carries no build timestamp;"; \
+			   echo "           the ABI serial (.N) is disabled, so repeated builds of the same"; \
+			   echo "           version may produce colliding module directories." ;; \
+		esac; \
+		echo "$(KERNELRELEASE)" > $(BUILD_DIR)/localversion; \
+		sed -i "s|abi_suffix = '.*'|abi_suffix = '$(KERNELRELEASE)'|g" $(BUILD_DIR)/debian/config/defines.toml; \
+		echo "  KERNELRELEASE  -> <version>$(KERNELRELEASE)  (localversion + abi_suffix)"; \
+	fi
+	@echo ""
+	@echo "Regenerating debian/control..."
+	@# Use 'debian/control-real', NOT 'debian/control': the latter regenerates
+	@# the file and then exits 1 ON PURPOSE (see control-real-fail in debian/rules),
+	@# which is why deb-setup calls it with '|| true'. control-real regenerates
+	@# control AND refreshes control.md5sum with a truthful exit code, so a real
+	@# gencontrol failure is still caught and a later 'make deb' won't re-trigger
+	@# the intentional-fail gate. Output is left visible for genuine errors.
+	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control-real || \
+		{ echo "Error: gencontrol failed; check the SOURCENAME/PKGVERSION/KERNELRELEASE values above."; exit 1; }
+	@echo ""
+	@echo "Customization applied. Current changelog header:"
+	@head -1 $(BUILD_DIR)/debian/changelog | sed 's/^/  /'
+	@echo ""
+	@echo "Next: make deb   (or 'make deb-minimal')"
 
 deb-modules:
 	@echo "======================================================================"
