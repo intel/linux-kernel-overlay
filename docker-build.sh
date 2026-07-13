@@ -10,6 +10,11 @@ FORCE_SETUP=false
 DOCKERFILE="Dockerfile.ubuntu26.04"
 IMAGE_TAG="ubuntu26.04"  # Will be auto-detected from DOCKERFILE
 BUILD_MODE="full"  # full or minimal
+# Optional deb-config overrides (deb/deb-minimal only). Default to any env var
+# of the same name, else empty. Empty => no deb-config step (original behavior).
+SOURCENAME="${SOURCENAME:-}"
+PKGVERSION="${PKGVERSION:-}"
+KERNELRELEASE="${KERNELRELEASE:-}"
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -63,6 +68,9 @@ OPTIONS:
     -f, --force-setup     Force re-run setup (clean build directory and re-extract source)
     --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu26.04)
     --mode MODE           Build mode: minimal or full (default: full)
+    --source-name NAME    (deb only) Override source package name; must start with 'linux'
+    --pkg-version VER     (deb only) Override .deb package version (<kernelver>-<revision>)
+    --kernel-release SFX  (deb only) Override uname -r suffix (localversion + abi_suffix)
     -h, --help            Show this help message
 
 COMMANDS:
@@ -82,6 +90,12 @@ EXAMPLES:
     $0 deb               # Build Debian packages (full: kernel + tools)
     $0 deb --mode minimal    # Build kernel image only (faster, no tools)
     $0 deb-minimal       # Same as above
+
+    # Build with customized source name / version / kernel release (deb only)
+    $0 deb --source-name linux-intel-6.18 \\
+           --pkg-version 6.18.0-mainline+preprod+linux+260623t022223z \\
+           --kernel-release -intel
+    # (any subset works; omitted ones keep the values derived from debian/changelog)
     $0 rpm               # Build RPM packages (standard + RT)
     $0 all               # Build both
 
@@ -263,6 +277,15 @@ for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
                 exit 1
             fi
             ;;
+        --source-name)
+            SOURCENAME="${ORIGINAL_ARGS[i+1]}"
+            ;;
+        --pkg-version)
+            PKGVERSION="${ORIGINAL_ARGS[i+1]}"
+            ;;
+        --kernel-release)
+            KERNELRELEASE="${ORIGINAL_ARGS[i+1]}"
+            ;;
     esac
 done
 
@@ -296,6 +319,14 @@ while [[ $# -gt 0 ]]; do
         --mode)
             if [ -z "$2" ]; then
                 print_error "Error: --mode requires an argument (minimal or full)"
+                exit 1
+            fi
+            shift 2
+            continue
+            ;;
+        --source-name|--pkg-version|--kernel-release)
+            if [ -z "$2" ]; then
+                print_error "Error: $1 requires a value"
                 exit 1
             fi
             shift 2
@@ -340,12 +371,26 @@ while [[ $# -gt 0 ]]; do
                 print_info "Minimal build will skip: linux-kbuild, linux-perf, linux-cpupower, and other tools"
             fi
 
+            # Assemble optional deb-config step. Each override is added only when
+            # non-empty; if all three are empty, DEB_CONFIG_CMD stays empty and the
+            # container command is identical to the original deb-setup + build.
+            # Values are single-quoted so they survive the container's bash -c.
+            CFG_ARGS=""
+            [ -n "$SOURCENAME" ] && CFG_ARGS="$CFG_ARGS SOURCENAME='$SOURCENAME'"
+            [ -n "$PKGVERSION" ] && CFG_ARGS="$CFG_ARGS PKGVERSION='$PKGVERSION'"
+            [ -n "$KERNELRELEASE" ] && CFG_ARGS="$CFG_ARGS KERNELRELEASE='$KERNELRELEASE'"
+            DEB_CONFIG_CMD=""
+            if [ -n "$CFG_ARGS" ]; then
+                DEB_CONFIG_CMD="make deb-config$CFG_ARGS && "
+                print_info "Applying deb-config overrides:$CFG_ARGS"
+            fi
+
             # Build container command
             if [ "$FORCE_SETUP" = true ]; then
                 print_info "Force setup enabled: will clean and re-extract source"
-                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make deb-setup && make $MAKE_TARGET"
+                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make deb-setup && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
             else
-                CONTAINER_CMD="make deb-setup && make $MAKE_TARGET"
+                CONTAINER_CMD="make deb-setup && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
             fi
 
             run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$BUILD_LOG"
