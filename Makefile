@@ -1,7 +1,7 @@
 # Makefile for Kernel Packaging System
 # Supports both Debian (.deb) and RPM (.rpm) package builds
 
-.PHONY: help deb deb-config rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
+.PHONY: help deb deb-config deb-nonrt deb-rt rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
 
 # Default target
 help:
@@ -10,8 +10,10 @@ help:
 	@echo "============================================================"
 	@echo ""
 	@echo "Targets:"
-	@echo "  deb              Build Debian packages (full: kernel + tools)"
+	@echo "  deb              Build Debian packages (full: kernel + tools, all flavours)"
 	@echo "  deb-minimal      Build Debian packages (minimal: kernel image only)"
+	@echo "  deb-nonrt        Build non-RT flavour only (full: kernel + tools)"
+	@echo "  deb-rt           Build RT flavour only (minimal: kernel image, no tools)"
 	@echo "  rpm              Build RPM packages (standard kernel)"
 	@echo "  rpm-rt           Build RPM packages (RT kernel)"
 	@echo "  rpm-all          Build RPM packages (standard + RT)"
@@ -29,6 +31,8 @@ help:
 	@echo "  deb-config       Override source name / version / kernel release (after deb-setup)"
 	@echo "  deb-modules      Build Debian kernel module packages"
 	@echo "  deb-minimal      Build kernel image only (fast, no tools)"
+	@echo "  deb-nonrt        Build only the non-RT (amd64) flavour, full tools"
+	@echo "  deb-rt           Build only the RT (rt-amd64) flavour, image only"
 	@echo ""
 	@echo "RPM Targets:"
 	@echo "  rpm-prepare      Prepare RPM source files (first-time only)"
@@ -39,6 +43,8 @@ help:
 	@echo "  make deb                    # Build all Debian packages (kernel + tools)"
 	@echo "  make deb-minimal            # Build kernel image only (faster)"
 	@echo "  make deb-config SOURCENAME=linux-intel-6.18 PKGVERSION=6.18.0-mainline+linux+260623t022223z KERNELRELEASE=-intel"
+	@echo "  make deb-nonrt              # Build only the non-RT flavour (after deb-config)"
+	@echo "  make deb-rt                 # Build only the RT flavour (after deb-config)"
 	@echo "  make rpm                    # Build RPM packages (standard only)"
 	@echo "  make rpm-rt                 # Build RPM packages (RT only)"
 	@echo "  make rpm-all                # Build RPM packages (standard + RT)"
@@ -383,6 +389,62 @@ deb-config:
 	@head -1 $(BUILD_DIR)/debian/changelog | sed 's/^/  /'
 	@echo ""
 	@echo "Next: make deb   (or 'make deb-minimal')"
+
+# ------------------------------------------------------------
+# deb-nonrt / deb-rt: build a single kernel flavour.
+#
+# The tree defines two real flavours in
+# debian/config/amd64/defines.toml: 'amd64' (non-RT, default) and
+# 'rt-amd64' (adds config.rt). A plain 'make deb' builds BOTH. These
+# targets trim defines.toml to keep only one flavour, regenerate
+# debian/control, then run the normal build:
+#
+#   deb-nonrt -> keep 'amd64',    then 'make deb'          (full: + tools)
+#   deb-rt    -> keep 'rt-amd64', then 'make deb-minimal'  (image only)
+#
+# Like deb-config, this only patches the git-ignored build tree and
+# never touches tracked files. Run AFTER deb-setup (and deb-config, if
+# used); re-running deb-setup rebuilds the tree and drops the trim.
+# ------------------------------------------------------------
+deb-nonrt:
+	@$(MAKE) --no-print-directory _deb-select-flavour FLAVOUR=amd64 FLAVOUR_DESC="non-RT (standard)"
+	@$(MAKE) --no-print-directory deb
+
+deb-rt:
+	@$(MAKE) --no-print-directory _deb-select-flavour FLAVOUR=rt-amd64 FLAVOUR_DESC="RT (PREEMPT_RT)"
+	@$(MAKE) --no-print-directory deb-minimal
+
+# Internal: keep only the flavour named by $(FLAVOUR) in the build
+# tree's amd64/defines.toml and regenerate debian/control. Not meant
+# to be called directly.
+_deb-select-flavour:
+	@if [ ! -f "$(BUILD_DIR)/debian/config/amd64/defines.toml" ]; then \
+		echo "Error: Build tree not found at $(BUILD_DIR)."; \
+		echo "  Run 'make deb-setup' first, then 'make deb-nonrt' / 'make deb-rt'."; \
+		exit 1; \
+	fi
+	@if ! grep -q "name = '$(FLAVOUR)'" $(BUILD_DIR)/debian/config/amd64/defines.toml; then \
+		echo "Error: flavour '$(FLAVOUR)' not found in amd64/defines.toml"; \
+		exit 1; \
+	fi
+	@echo "======================================================================"
+	@echo "Selecting single build flavour: $(FLAVOUR)  [$(FLAVOUR_DESC)]"
+	@echo "======================================================================"
+	@# Drop every [[flavour]] block except the one named $(FLAVOUR). A block runs
+	@# from '[[flavour]]' up to the next '[[...]]' (the following flavour or the
+	@# '[[featureset]]' section); single-bracket [flavour.*] subtables stay inside
+	@# it. The name is read from the 'name = '\''...'\''' line via sub() so no
+	@# literal quote needs embedding in the awk program.
+	@awk -v keep='$(FLAVOUR)' 'function flush(){ if(inflav && k) printf "%s", buf; buf=""; k=0 } /^\[\[flavour\]\]/{ flush(); inflav=1; buf=$$0"\n"; next } inflav && /^\[\[/{ flush(); inflav=0; print; next } inflav{ buf=buf $$0"\n"; if($$0 ~ /^name = /){ v=$$0; sub(/^name = ./,"",v); sub(/.$$/,"",v); if(v==keep) k=1 } next } { print } END{ flush() }' $(BUILD_DIR)/debian/config/amd64/defines.toml > $(BUILD_DIR)/debian/config/amd64/defines.toml.tmp && mv $(BUILD_DIR)/debian/config/amd64/defines.toml.tmp $(BUILD_DIR)/debian/config/amd64/defines.toml
+	@echo "  Flavours now in defines.toml:"
+	@grep -E "^name = '(amd64|rt-amd64|test)'" $(BUILD_DIR)/debian/config/amd64/defines.toml | sed "s/^/    /"
+	@echo ""
+	@echo "Regenerating debian/control..."
+	@# Same rationale as deb-config: use control-real (truthful exit code) rather
+	@# than the intentional-fail 'control' target.
+	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control-real || \
+		{ echo "Error: gencontrol failed after selecting flavour '$(FLAVOUR)'."; exit 1; }
+	@echo ""
 
 deb-modules:
 	@echo "======================================================================"
