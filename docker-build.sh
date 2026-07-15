@@ -68,17 +68,18 @@ OPTIONS:
     -f, --force-setup     Force re-run setup (clean build directory and re-extract source)
     --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu26.04)
     --mode MODE           Build mode: minimal or full (default: full)
-    --source-name NAME    (deb/deb-nonrt/deb-rt) Override source package name; must start with 'linux'
-    --pkg-version VER     (deb/deb-nonrt/deb-rt) Override .deb package version (<kernelver>-<revision>)
-    --kernel-release SFX  (deb/deb-nonrt/deb-rt) Override uname -r suffix (localversion + abi_suffix)
+    --source-name NAME    (deb*/deb-source) Override source package name; must start with 'linux'
+    --pkg-version VER     (deb*/deb-source) Override .deb package version (<kernelver>-<revision>)
+    --kernel-release SFX  (deb*/deb-source) Override uname -r suffix (localversion + abi_suffix)
     -h, --help            Show this help message
 
 COMMANDS:
     shell                Open interactive shell in container
-    deb                  Build Debian packages (setup + build in container, all flavours)
+    deb                  Build Debian packages (setup + build, all flavours; also source + combined .changes)
     deb-minimal          Build Debian packages (minimal: kernel image only)
-    deb-nonrt            Build only the non-RT flavour (full: kernel + tools)
+    deb-nonrt            Build only the non-RT flavour (full: kernel + tools; also source + combined .changes)
     deb-rt               Build only the RT flavour (minimal: kernel image, no tools)
+    deb-source           Build source package (.dsc + tarball) for 'apt source'
     rpm                  Build RPM packages (prepare + build standard + RT)
     rpm-prepare          Prepare RPM source files only
     all                  Build both Debian and RPM packages
@@ -106,6 +107,10 @@ EXAMPLES:
     $0 deb-rt    --source-name linux-intel-6.18rt \\
                  --pkg-version 6.18.0-mainline+preprod+linux+260623t022223z \\
                  --kernel-release -intel
+
+    # Build a source package consumable by 'apt source' (deb only)
+    $0 deb-source --source-name linux-intel-6.18 \\
+                  --pkg-version 6.18.0-mainline+preprod+linux+260623t022223z
     $0 rpm               # Build RPM packages (standard + RT)
     $0 all               # Build both
 
@@ -130,6 +135,7 @@ LOGS:
     - build-minimal-YYYYMMDD-HHMMSS.log (Debian minimal build)
     - build-nonrt-YYYYMMDD-HHMMSS.log  (Debian non-RT flavour build)
     - build-rt-YYYYMMDD-HHMMSS.log     (Debian RT flavour build)
+    - build-source-YYYYMMDD-HHMMSS.log (Debian source package build)
     - rpm-YYYYMMDD-HHMMSS.log          (RPM build)
     - all-YYYYMMDD-HHMMSS.log          (All packages build)
 
@@ -355,31 +361,35 @@ while [[ $# -gt 0 ]]; do
             run_container "/bin/bash"
             exit 0
             ;;
-        deb|deb-minimal|deb-nonrt|deb-rt)
+        deb|deb-minimal|deb-nonrt|deb-rt|deb-source)
             check_image_exists
             START_TIME=$(date +%s)
 
             # Map command (and --mode for plain 'deb') to a Make target and a
             # BUILD_MODE label (used only for the log filename). deb-nonrt/deb-rt
             # select a single flavour in the Makefile; deb-rt is inherently
-            # image-only, so --mode is ignored for it.
+            # image-only, so --mode is ignored for it. deb-source builds only the
+            # .dsc + source tarball (no compilation), for 'apt source'.
             case "$1" in
                 deb-minimal)
                     BUILD_MODE="minimal"; MAKE_TARGET="deb-minimal"
                     print_info "Building Debian packages (minimal: kernel image only)..." ;;
                 deb-nonrt)
                     BUILD_MODE="nonrt"; MAKE_TARGET="deb-nonrt"
-                    print_info "Building Debian packages (non-RT flavour only, full: kernel + tools)..." ;;
+                    print_info "Building Debian packages (non-RT flavour only, full: kernel + tools; also source + combined .changes)..." ;;
                 deb-rt)
                     BUILD_MODE="rt"; MAKE_TARGET="deb-rt"
                     print_info "Building Debian packages (RT flavour only, minimal: kernel image, no tools)..." ;;
+                deb-source)
+                    BUILD_MODE="source"; MAKE_TARGET="deb-source"
+                    print_info "Building Debian source package (.dsc + tarball for 'apt source')..." ;;
                 *)  # plain 'deb': honour --mode (default full)
                     if [ "$BUILD_MODE" = "minimal" ]; then
                         MAKE_TARGET="deb-minimal"
                         print_info "Building Debian packages (minimal mode: kernel image only)..."
                     else
                         BUILD_MODE="full"; MAKE_TARGET="deb"
-                        print_info "Building Debian packages (full mode: kernel + tools + headers)..."
+                        print_info "Building Debian packages (full mode: kernel + tools + headers; also source + combined .changes)..."
                     fi ;;
             esac
 
