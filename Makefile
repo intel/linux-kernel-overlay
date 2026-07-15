@@ -1,7 +1,7 @@
 # Makefile for Kernel Packaging System
 # Supports both Debian (.deb) and RPM (.rpm) package builds
 
-.PHONY: help deb deb-config deb-nonrt deb-rt rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
+.PHONY: help deb deb-config deb-nonrt deb-rt deb-source rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
 
 # Default target
 help:
@@ -10,10 +10,11 @@ help:
 	@echo "============================================================"
 	@echo ""
 	@echo "Targets:"
-	@echo "  deb              Build Debian packages (full: kernel + tools, all flavours)"
+	@echo "  deb              Build Debian packages (full: kernel + tools, all flavours; also source + combined .changes)"
 	@echo "  deb-minimal      Build Debian packages (minimal: kernel image only)"
-	@echo "  deb-nonrt        Build non-RT flavour only (full: kernel + tools)"
+	@echo "  deb-nonrt        Build non-RT flavour only (full: kernel + tools; also source + combined .changes)"
 	@echo "  deb-rt           Build RT flavour only (minimal: kernel image, no tools)"
+	@echo "  deb-source       Build source package (.dsc + tarball) for 'apt source'"
 	@echo "  rpm              Build RPM packages (standard kernel)"
 	@echo "  rpm-rt           Build RPM packages (RT kernel)"
 	@echo "  rpm-all          Build RPM packages (standard + RT)"
@@ -33,6 +34,7 @@ help:
 	@echo "  deb-minimal      Build kernel image only (fast, no tools)"
 	@echo "  deb-nonrt        Build only the non-RT (amd64) flavour, full tools"
 	@echo "  deb-rt           Build only the RT (rt-amd64) flavour, image only"
+	@echo "  deb-source       Build .dsc + source tarball for 'apt source' consumption"
 	@echo ""
 	@echo "RPM Targets:"
 	@echo "  rpm-prepare      Prepare RPM source files (first-time only)"
@@ -45,6 +47,7 @@ help:
 	@echo "  make deb-config SOURCENAME=linux-intel-6.18 PKGVERSION=6.18.0-mainline+linux+260623t022223z KERNELRELEASE=-intel"
 	@echo "  make deb-nonrt              # Build only the non-RT flavour (after deb-config)"
 	@echo "  make deb-rt                 # Build only the RT flavour (after deb-config)"
+	@echo "  make deb-source             # Build source package for 'apt source' (after deb-config)"
 	@echo "  make rpm                    # Build RPM packages (standard only)"
 	@echo "  make rpm-rt                 # Build RPM packages (RT only)"
 	@echo "  make rpm-all                # Build RPM packages (standard + RT)"
@@ -64,9 +67,22 @@ JOBS ?= $(shell nproc)
 # provided as contentless equivs stubs in the Docker image. Those stubs
 # have no effect on the actual compile (the real compiler is gcc-N via
 # c_compiler/CC), so we skip the check instead of requiring the stubs.
-DEB_BUILD_FLAGS ?= -b -uc -us -d -j$(JOBS)
+#
+# Full build (-F): builds the source package AND all binaries in one run,
+# emitting a single combined <src>_<ver>_<arch>.changes (Architecture:
+# source all amd64). dpkg-source runs on the clean tree before the compile,
+# so no separate source pass / mergechanges is needed. Requires the build
+# tree be '3.0 (native)' (forced in the deb target); see the deb recipe.
+DEB_BUILD_FLAGS ?= -F -uc -us -d -j$(JOBS)
 DEB_BUILD_FLAGS_MINIMAL ?= -B -uc -us -d -j$(JOBS)
+# Source-only build (-S): produces the .dsc + source tarball consumed by
+# 'apt source'. No -j (no compilation); -d skips the build-dep check as above.
+DEB_BUILD_FLAGS_SOURCE ?= -S -uc -us -d
 DEB_BUILD_PROFILES ?=
+# Multithreaded xz for the native source tarball (packs the whole tree).
+# dpkg-source honours XZ_OPT; -T0 uses all cores. Scoped to the deb/deb-source
+# commands only (not exported), so it can't affect rpmbuild's compression.
+XZ_OPT ?= -T0
 RPM_BUILD_FLAGS ?=
 BUILD_DIR ?= $(CURDIR)/build/kernel
 BUILD_PACKAGES_DIR ?= $(CURDIR)/build/packages
@@ -85,9 +101,18 @@ deb:
 		exit 1; \
 	fi
 	@echo "======================================================================"
-	@echo "Building Debian packages (full: kernel image + tools + headers)..."
+	@echo "Building Debian packages (full: kernel image + tools + headers + source)..."
 	@echo "======================================================================"
-	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS)
+	@# Full build (-F): one dpkg-buildpackage run produces the source package
+	@# (.dsc + tarball) AND every binary .deb, plus a single combined
+	@# <src>_<ver>_amd64.changes (Architecture: source all amd64). No separate
+	@# deb-source pass or mergechanges is needed. Force '3.0 (native)' in the
+	@# build tree first (never the tracked debian/source/format): dpkg-source
+	@# then ships the whole patched tree as one tarball, built from the CLEAN
+	@# tree before the compile, sidestepping quilt's abort-on-upstream-changes.
+	@echo '3.0 (native)' > $(BUILD_DIR)/debian/source/format
+	@echo "  Source format (build tree): $$(cat $(BUILD_DIR)/debian/source/format)"
+	cd $(BUILD_DIR) && XZ_OPT='$(XZ_OPT)' DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS)
 	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
@@ -95,7 +120,7 @@ deb:
 	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
 	@echo "Debug symbol packages (.ddeb) excluded"
 	@echo ""
-	@echo "Debian packages built successfully!"
+	@echo "Debian packages built successfully (binaries + source in one combined .changes)!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
 	@$(MAKE) verify-deb-packages
 
@@ -445,6 +470,58 @@ _deb-select-flavour:
 	@cd $(BUILD_DIR) && $(MAKE) -f debian/rules debian/control-real || \
 		{ echo "Error: gencontrol failed after selecting flavour '$(FLAVOUR)'."; exit 1; }
 	@echo ""
+
+# ------------------------------------------------------------
+# deb-source: build a Debian *source* package (.dsc + tarball +
+# _source.changes) so the kernel can be consumed via 'apt source'.
+#
+# The plain deb/deb-minimal builds use -b/-B (binary only) and emit no
+# source package. This target runs 'dpkg-buildpackage -S' instead.
+#
+# The build tree is forced to '3.0 (native)' source format FIRST: by
+# the time this runs, deb-setup has already applied the quilt patch
+# series into $(BUILD_DIR) (a .pc dir) and written a top-level
+# 'localversion' file, so the tree IS the complete source. A
+# '3.0 (quilt)' source build would abort on those unrepresented
+# upstream changes (debian/source/local-options has
+# abort-on-upstream-changes); native ships the whole patched tree as a
+# single tarball, which is exactly what 'apt source' should hand back.
+#
+# Like deb-config, this only patches the git-ignored build tree; the
+# tracked debian/source/format stays '3.0 (quilt)'. Run AFTER deb-setup
+# (and deb-config / deb-nonrt / deb-rt, if used) so the .dsc carries the
+# intended source name and version.
+# ------------------------------------------------------------
+deb-source:
+	@if [ ! -f "$(BUILD_DIR)/debian/changelog" ]; then \
+		echo "Error: Build tree not found at $(BUILD_DIR)."; \
+		echo "  Run 'make deb-setup' first, then 'make deb-source'."; \
+		exit 1; \
+	fi
+	@echo "======================================================================"
+	@echo "Building Debian source package (.dsc + tarball) for 'apt source'..."
+	@echo "======================================================================"
+	@# Force native source format in the build tree only (never the tracked file).
+	@echo '3.0 (native)' > $(BUILD_DIR)/debian/source/format
+	@echo "  Source format (build tree): $$(cat $(BUILD_DIR)/debian/source/format)"
+	@echo "  Note: dpkg-buildpackage -S runs 'debian/rules clean' first, which"
+	@echo "        removes compiled build artifacts from $(BUILD_DIR)."
+	@echo "        Built .deb/.rpm already moved to packages/ are unaffected."
+	@echo ""
+	cd $(BUILD_DIR) && XZ_OPT='$(XZ_OPT)' DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS_SOURCE)
+	@# Move the source artifacts to packages/deb/ (.dsc, source tarball,
+	@# _source.changes, .buildinfo). dpkg-buildpackage writes them to build/.
+	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
+	@echo "Moving source package to $(BUILD_PACKAGES_DEB_DIR)..."
+	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
+	@echo ""
+	@echo "Source package built successfully!"
+	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
+	@ls -1 $(BUILD_PACKAGES_DEB_DIR)/*.dsc 2>/dev/null | sed 's/^/  /' || true
+	@echo ""
+	@echo "To publish for 'apt source', add the .dsc + tarball to your APT repo's"
+	@echo "source index (e.g. 'apt-ftparchive sources' / 'reprepro includedsc')"
+	@echo "and add a 'deb-src' line on the client."
 
 deb-modules:
 	@echo "======================================================================"
