@@ -69,7 +69,12 @@ endif
 	grep __cxa_demangle $(CURDIR)/perf
 
 install:
-	$(MAKE_UPSTREAM) -f Makefile.perf install install-python_ext
+# Force serial install: 'install' and 'install-python_ext' are passed as two
+# goals to one jobserver-enabled make, and perf's own install fans out into
+# parallel prerequisites (install-tools, install-tests, try-install-man) that
+# race on creating shared ancestor dirs. Serialize to avoid the intermittent
+# "install: cannot create directory" failure (same class as cpupower).
+	$(MAKE_UPSTREAM) -j1 -f Makefile.perf install install-python_ext
 # Don't install a 'trace' alias yet:
 # - We need a wrapper for it anyway, so there's little point adding a
 #   versioned link
