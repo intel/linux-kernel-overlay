@@ -9,7 +9,10 @@ all:
 	$(MAKE_UPSTREAM)
 
 install:
-	$(MAKE_UPSTREAM) install
+# Force serial install: upstream's install-man/install-gmo/install-tools run
+# as parallel prerequisites and race on creating shared ancestor dirs (e.g.
+# usr/share), which intermittently fails with "cannot create directory".
+	$(MAKE_UPSTREAM) -j1 install
 ifneq (,$(filter nodoc,$(DEB_BUILD_PROFILES)))
 	rm -rf $(DESTDIR)/usr/share/man
 endif
