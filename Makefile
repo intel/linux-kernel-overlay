@@ -113,12 +113,12 @@ deb:
 	@echo '3.0 (native)' > $(BUILD_DIR)/debian/source/format
 	@echo "  Source format (build tree): $$(cat $(BUILD_DIR)/debian/source/format)"
 	cd $(BUILD_DIR) && XZ_OPT='$(XZ_OPT)' DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES)" dpkg-buildpackage $(DEB_BUILD_FLAGS)
-	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
+	@# Move all packages and source files to packages/deb/ directory (including .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
-	@find $(CURDIR)/build -maxdepth 1 -name "*.deb" ! -name "*.ddeb" -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
+	@find $(CURDIR)/build -maxdepth 1 \( -name "*.deb" -o -name "*.ddeb" \) -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
 	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
-	@echo "Debug symbol packages (.ddeb) excluded"
+	@echo "Debug symbol packages (.ddeb) included"
 	@echo ""
 	@echo "Debian packages built successfully (binaries + source in one combined .changes)!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
@@ -141,12 +141,12 @@ deb-minimal:
 	@echo "  - arch:all packages (linux-doc, linux-source)"
 	@echo ""
 	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS_MINIMAL)
-	@# Move all packages and source files to packages/deb/ directory (excluding .ddeb debug packages)
+	@# Move all packages and source files to packages/deb/ directory (including .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
-	@find $(CURDIR)/build -maxdepth 1 -name "*.deb" ! -name "*.ddeb" -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
+	@find $(CURDIR)/build -maxdepth 1 \( -name "*.deb" -o -name "*.ddeb" \) -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
 	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
-	@echo "Debug symbol packages (.ddeb) excluded"
+	@echo "Debug symbol packages (.ddeb) included"
 	@echo ""
 	@echo "Debian packages (minimal) built successfully!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
