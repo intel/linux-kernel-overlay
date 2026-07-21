@@ -11,9 +11,9 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  deb              Build Debian packages (full: kernel + tools, all flavours; also source + combined .changes)"
-	@echo "  deb-minimal      Build Debian packages (minimal: kernel image only)"
+	@echo "  deb-minimal      Build Debian packages (minimal: kernel image, no tools; also source + combined .changes)"
 	@echo "  deb-nonrt        Build non-RT flavour only (full: kernel + tools; also source + combined .changes)"
-	@echo "  deb-rt           Build RT flavour only (minimal: kernel image, no tools)"
+	@echo "  deb-rt           Build RT flavour only (minimal: kernel image, no tools; also source + combined .changes)"
 	@echo "  deb-source       Build source package (.dsc + tarball) for 'apt source'"
 	@echo "  rpm              Build RPM packages (standard kernel)"
 	@echo "  rpm-rt           Build RPM packages (RT kernel)"
@@ -31,9 +31,9 @@ help:
 	@echo "  deb-setup        Setup Debian build (first-time only)"
 	@echo "  deb-config       Override source name / version / kernel release (after deb-setup)"
 	@echo "  deb-modules      Build Debian kernel module packages"
-	@echo "  deb-minimal      Build kernel image only (fast, no tools)"
+	@echo "  deb-minimal      Build kernel image + source, no tools (fast)"
 	@echo "  deb-nonrt        Build only the non-RT (amd64) flavour, full tools"
-	@echo "  deb-rt           Build only the RT (rt-amd64) flavour, image only"
+	@echo "  deb-rt           Build only the RT (rt-amd64) flavour, image + source"
 	@echo "  deb-source       Build .dsc + source tarball for 'apt source' consumption"
 	@echo ""
 	@echo "RPM Targets:"
@@ -74,7 +74,13 @@ JOBS ?= $(shell nproc)
 # so no separate source pass / mergechanges is needed. Requires the build
 # tree be '3.0 (native)' (forced in the deb target); see the deb recipe.
 DEB_BUILD_FLAGS ?= -F -uc -us -d -j$(JOBS)
-DEB_BUILD_FLAGS_MINIMAL ?= -B -uc -us -d -j$(JOBS)
+# Minimal build (-G = source,any): builds the source package AND the
+# arch-dependent binaries (kernel image) in one run, emitting a single
+# combined <src>_<ver>_<arch>.changes (Architecture: source amd64). Unlike
+# -F it omits arch:all packages (linux-doc, linux-source); the notools
+# profile drops the tool packages. Source inclusion needs the build tree be
+# '3.0 (native)' (forced in the deb-minimal recipe), same as the deb target.
+DEB_BUILD_FLAGS_MINIMAL ?= -G -uc -us -d -j$(JOBS)
 # Source-only build (-S): produces the .dsc + source tarball consumed by
 # 'apt source'. No -j (no compilation); -d skips the build-dep check as above.
 DEB_BUILD_FLAGS_SOURCE ?= -S -uc -us -d
@@ -130,25 +136,29 @@ deb-minimal:
 		exit 1; \
 	fi
 	@echo "======================================================================"
-	@echo "Building Debian packages (minimal: kernel image only, no tools)..."
+	@echo "Building Debian packages (minimal: kernel image + source, no tools)..."
 	@echo "======================================================================"
 	@echo "This build will skip:"
 	@echo "  - linux-kbuild packages (kernel build tools)"
 	@echo "  - linux-perf packages (perf profiling tools)"
 	@echo "  - linux-cpupower packages (CPU frequency tools)"
 	@echo "  - other kernel tools"
-	@echo "  - source packages (.dsc, .tar.xz)"
 	@echo "  - arch:all packages (linux-doc, linux-source)"
 	@echo ""
-	cd $(BUILD_DIR) && DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS_MINIMAL)
+	@# Force '3.0 (native)' in the build tree (never the tracked file) so the
+	@# source portion of the -G build ships the whole patched tree as one
+	@# tarball instead of aborting on unrepresented upstream changes; same
+	@# rationale as the deb / deb-source recipes.
+	@echo '3.0 (native)' > $(BUILD_DIR)/debian/source/format
+	@echo "  Source format (build tree): $$(cat $(BUILD_DIR)/debian/source/format)"
+	cd $(BUILD_DIR) && XZ_OPT='$(XZ_OPT)' DEB_BUILD_PROFILES="$(DEB_BUILD_PROFILES) pkg.linux.notools" dpkg-buildpackage $(DEB_BUILD_FLAGS_MINIMAL)
 	@# Move all packages and source files to packages/deb/ directory (including .ddeb debug packages)
 	@mkdir -p $(BUILD_PACKAGES_DEB_DIR)
 	@echo "Moving packages to $(BUILD_PACKAGES_DEB_DIR)..."
 	@find $(CURDIR)/build -maxdepth 1 \( -name "*.deb" -o -name "*.ddeb" \) -exec mv -f {} $(BUILD_PACKAGES_DEB_DIR)/ \; 2>/dev/null || true
 	@mv -f $(CURDIR)/build/*.dsc $(CURDIR)/build/*.tar.* $(CURDIR)/build/*.changes $(CURDIR)/build/*.buildinfo $(BUILD_PACKAGES_DEB_DIR)/ 2>/dev/null || true
-	@echo "Debug symbol packages (.ddeb) included"
 	@echo ""
-	@echo "Debian packages (minimal) built successfully!"
+	@echo "Debian packages (minimal) built successfully (binaries + source in one combined .changes)!"
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
 	@$(MAKE) verify-deb-packages
 
@@ -424,8 +434,8 @@ deb-config:
 # targets trim defines.toml to keep only one flavour, regenerate
 # debian/control, then run the normal build:
 #
-#   deb-nonrt -> keep 'amd64',    then 'make deb'          (full: + tools)
-#   deb-rt    -> keep 'rt-amd64', then 'make deb-minimal'  (image only)
+#   deb-nonrt -> keep 'amd64',    then 'make deb'          (full: + tools + source)
+#   deb-rt    -> keep 'rt-amd64', then 'make deb-minimal'  (image + source, no tools)
 #
 # Like deb-config, this only patches the git-ignored build tree and
 # never touches tracked files. Run AFTER deb-setup (and deb-config, if
