@@ -224,7 +224,9 @@ sudo apt-get install -y \
     libperl-dev libpython3-dev libaudit-dev libcap-dev libdw-dev \
     libdebuginfod-dev libpci-dev libudev-dev libunwind-dev libnewt-dev \
     libnl-3-dev libnl-genl-3-dev libglib2.0-dev libnuma-dev libconfig-dev \
-    libslang2-dev binutils-dev zlib1g-dev libzstd-dev lz4 zstd gawk
+    libslang2-dev binutils-dev zlib1g-dev libzstd-dev lz4 zstd gawk \
+    libopencsd-dev systemtap-sdt-dev clang llvm-dev libtraceevent-dev \
+    libtracefs-dev libbabeltrace-dev libcapstone-dev libpfm4-dev default-jdk
 ```
 
 Package descriptions (grouped):
@@ -234,7 +236,7 @@ Package descriptions (grouped):
 - **Compiler**: `gcc-15` (matches Ubuntu 26.04; `debian/bin/detect-gcc-version.sh` selects it), `gcc-multilib`
 - **gencontrol (required)**: `python3`, `python3-dacite` (parses `debian/config/*.toml`), `python3-jinja2` (renders `debian/templates/*.j2`), `python3-dev`, `python3-setuptools`
 - **Docs (`linux-doc`)**: `python3-sphinx`, `python3-sphinx-rtd-theme`, `sphinx-common`, `python3-docutils`, `dh-python`, `python3-yaml`, `dvipng`, `graphviz`, `asciidoctor`, `asciidoc`, `xmlto`
-- **Tools — perf / cpupower / bpftool** (needed by full `make deb`, not `make deb-minimal`): `libperl-dev`, `libpython3-dev`, `libaudit-dev`, `libcap-dev`, `libdw-dev`, `libdebuginfod-dev`, `libpci-dev`, `libudev-dev`, `libunwind-dev`, `libnewt-dev`, `libnl-3-dev`, `libnl-genl-3-dev`, `libglib2.0-dev`, `libnuma-dev`, `libconfig-dev`, `libslang2-dev`, `binutils-dev`, `zlib1g-dev`, `libzstd-dev`, `lz4`, `zstd`, `gawk`
+- **Tools — perf / cpupower / bpftool** (needed by full `make deb`, not `make deb-minimal`): `libperl-dev`, `libpython3-dev`, `libaudit-dev`, `libcap-dev`, `libdw-dev`, `libdebuginfod-dev`, `libpci-dev`, `libudev-dev`, `libunwind-dev`, `libnewt-dev`, `libnl-3-dev`, `libnl-genl-3-dev`, `libglib2.0-dev`, `libnuma-dev`, `libconfig-dev`, `libslang2-dev`, `binutils-dev`, `zlib1g-dev`, `libzstd-dev`, `lz4`, `zstd`, `gawk`, `libopencsd-dev` (CoreSight trace decode), `systemtap-sdt-dev` (SDT/USDT probes), `clang` + `llvm-dev` (perf BPF/clang-bpf), `libtraceevent-dev`, `libtracefs-dev`, `libbabeltrace-dev` (CTF trace), `libcapstone-dev` (disassembly), `libpfm4-dev` (PMU events), `default-jdk` (perf JVMTI agent)
 
 **Git Configuration:**
 
