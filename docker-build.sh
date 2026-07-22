@@ -15,6 +15,10 @@ BUILD_MODE="full"  # full or minimal
 SOURCENAME="${SOURCENAME:-}"
 PKGVERSION="${PKGVERSION:-}"
 KERNELRELEASE="${KERNELRELEASE:-}"
+# Optional base kernel config selector (deb*/deb-source), passed to
+# 'make deb-setup'. Empty => keep the tracked debian/config/config symlink
+# (default base). Recognised values: noble | resolute.
+BASE_CONFIG="${BASE_CONFIG:-}"
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -68,6 +72,9 @@ OPTIONS:
     -f, --force-setup     Force re-run setup (clean build directory and re-extract source)
     --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu26.04)
     --mode MODE           Build mode: minimal or full (default: full)
+    --base-config NAME    (deb*/deb-source/all) Base kernel config: noble or resolute
+                          (default: whatever debian/config/config points to;
+                           for 'all' it applies only when deb-setup actually runs)
     --source-name NAME    (deb*/deb-source) Override source package name; must start with 'linux'
     --pkg-version VER     (deb*/deb-source) Override .deb package version (<kernelver>-<revision>)
     --kernel-release SFX  (deb*/deb-source) Override uname -r suffix (localversion + abi_suffix)
@@ -93,6 +100,10 @@ EXAMPLES:
     $0 deb               # Build Debian packages (full: kernel + tools)
     $0 deb --mode minimal    # Build kernel image only (faster, no tools)
     $0 deb-minimal       # Same as above
+
+    # Choose the base kernel config (default is the tracked symlink target)
+    $0 deb --base-config noble       # Use config.noble-6.8.0-31-generic as base
+    $0 deb --base-config resolute    # Use config.resolute-7.0.0-14-generic as base
 
     # Build with customized source name / version / kernel release (deb only)
     $0 deb --source-name linux-intel-6.18 \\
@@ -295,6 +306,14 @@ for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
                 exit 1
             fi
             ;;
+        --base-config)
+            BASE_CONFIG="${ORIGINAL_ARGS[i+1]}"
+            if ! ls "$SCRIPT_DIR"/intel/config/amd64/base/config."$BASE_CONFIG"-* >/dev/null 2>&1; then
+                print_error "Invalid base config: $BASE_CONFIG (no intel/config/amd64/base/config.$BASE_CONFIG-* found)"
+                print_info "Available: $(ls "$SCRIPT_DIR"/intel/config/amd64/base/ 2>/dev/null | sed 's/^config\.//; s/-.*//' | sort -u | tr '\n' ' ')"
+                exit 1
+            fi
+            ;;
         --source-name)
             SOURCENAME="${ORIGINAL_ARGS[i+1]}"
             ;;
@@ -342,7 +361,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             continue
             ;;
-        --source-name|--pkg-version|--kernel-release)
+        --source-name|--pkg-version|--kernel-release|--base-config)
             if [ -z "$2" ]; then
                 print_error "Error: $1 requires a value"
                 exit 1
@@ -418,12 +437,20 @@ while [[ $# -gt 0 ]]; do
                 print_info "Applying deb-config overrides:$CFG_ARGS"
             fi
 
+            # Optional base-config selector passed to 'make deb-setup'. Empty =>
+            # keep the tracked debian/config/config symlink (default base).
+            SETUP_ARGS=""
+            if [ -n "$BASE_CONFIG" ]; then
+                SETUP_ARGS=" BASE_CONFIG='$BASE_CONFIG'"
+                print_info "Using base kernel config: $BASE_CONFIG"
+            fi
+
             # Build container command
             if [ "$FORCE_SETUP" = true ]; then
                 print_info "Force setup enabled: will clean and re-extract source"
-                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make deb-setup && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
+                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make deb-setup$SETUP_ARGS && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
             else
-                CONTAINER_CMD="make deb-setup && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
+                CONTAINER_CMD="make deb-setup$SETUP_ARGS && ${DEB_CONFIG_CMD}make $MAKE_TARGET"
             fi
 
             run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$BUILD_LOG"
@@ -515,12 +542,23 @@ while [[ $# -gt 0 ]]; do
             print_info "Building all packages in container..."
             print_info "Build log: $ALL_LOG"
 
+            # Optional base-config selector. Passed to 'make all' as a
+            # command-line variable, which make forwards to the deb-setup it
+            # runs. NOTE: 'all' only re-runs deb-setup when the build tree is
+            # missing, so BASE_CONFIG takes effect on a fresh tree or with
+            # --force-setup (which removes it); an existing tree is untouched.
+            ALL_ARGS=""
+            if [ -n "$BASE_CONFIG" ]; then
+                ALL_ARGS=" BASE_CONFIG='$BASE_CONFIG'"
+                print_info "Using base kernel config: $BASE_CONFIG"
+            fi
+
             # Build container command
             if [ "$FORCE_SETUP" = true ]; then
                 print_info "Force setup enabled: will clean and re-extract source"
-                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make all"
+                CONTAINER_CMD="rm -rf /build/debian-kernel/build/kernel && make all$ALL_ARGS"
             else
-                CONTAINER_CMD="make all"
+                CONTAINER_CMD="make all$ALL_ARGS"
             fi
 
             run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$ALL_LOG"
