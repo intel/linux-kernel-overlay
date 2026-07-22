@@ -44,6 +44,7 @@ help:
 	@echo "Examples:"
 	@echo "  make deb                    # Build all Debian packages (kernel + tools)"
 	@echo "  make deb-minimal            # Build kernel image only (faster)"
+	@echo "  make deb-setup BASE_CONFIG=noble    # Use noble base config instead of default (resolute)"
 	@echo "  make deb-config SOURCENAME=linux-intel-6.18 PKGVERSION=6.18.0-mainline+linux+260623t022223z KERNELRELEASE=-intel"
 	@echo "  make deb-nonrt              # Build only the non-RT flavour (after deb-config)"
 	@echo "  make deb-rt                 # Build only the RT flavour (after deb-config)"
@@ -280,6 +281,25 @@ deb-setup:
 	@# Copy debian directory to build directory (dereference symlinks with -L)
 	@echo "Copying debian/ configuration to build directory..."
 	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
+	@# Optionally override the base kernel config (BASE_CONFIG=noble|resolute).
+	@# The tracked debian/config/config symlink is dereferenced by the rsync -L
+	@# above, so $(BUILD_DIR)/debian/config/config is already a plain copy of the
+	@# default base. When BASE_CONFIG is set, replace that copy with the matching
+	@# file from intel/config/amd64/base/ (the glob avoids hardcoding the kernel
+	@# version). Empty BASE_CONFIG keeps whatever the tracked symlink points to.
+	@if [ -n "$(BASE_CONFIG)" ]; then \
+		BASE_SRC=$$(ls $(CURDIR)/intel/config/amd64/base/config.$(BASE_CONFIG)-* 2>/dev/null | head -1); \
+		if [ -z "$$BASE_SRC" ] || [ ! -f "$$BASE_SRC" ]; then \
+			echo "Error: No base config matching 'config.$(BASE_CONFIG)-*' in intel/config/amd64/base/"; \
+			echo "  Available bases:"; \
+			ls $(CURDIR)/intel/config/amd64/base/ | sed 's/^/    /'; \
+			exit 1; \
+		fi; \
+		cp -f "$$BASE_SRC" $(BUILD_DIR)/debian/config/config; \
+		echo "Base kernel config: $$(basename $$BASE_SRC) (BASE_CONFIG=$(BASE_CONFIG))"; \
+	else \
+		echo "Base kernel config: default (tracked debian/config/config symlink)"; \
+	fi
 	@# Auto-detect GCC version based on Ubuntu version
 	@echo "Detecting GCC version for current Ubuntu..."
 	@GCC_VER=$$(bash debian/bin/detect-gcc-version.sh 2>/dev/null || echo "14"); \
