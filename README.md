@@ -21,6 +21,7 @@ Custom Linux kernel packaging system supporting both Debian (.deb) and RPM (.rpm
 
 **v2.0** (this repository) is a production-grade packaging system with:
 - ✅ **Multi-Format Support**: Both Debian (.deb) and RPM (.rpm) packages from one repository
+  > **Note**: Only the Debian (.deb) packages are officially evaluated. The RPM (.rpm) build is provided as an **experimental** option and is not officially validated.
 - ✅ **Unified Build System**: Comprehensive Makefile replacing simple shell scripts
 - ✅ **Kernel Tools Packaging**: Build kernel tools (perf, cpupower, bpftool, etc.) as separate deb packages
 - ✅ **Docker Integration**: Containerized builds for clean, reproducible environments
@@ -64,7 +65,7 @@ debian-kernel/
 │   │   │   └── ...
 │   │   └── series                # Patch application order
 │   ├── config/                    # Intel platform configurations
-│   │   └── intel/                # Intel feature configs
+│   │   └── amd64/intel/          # Intel feature configs
 │   │       ├── camera.cfg        # Camera/IPU support
 │   │       ├── drm.cfg           # Graphics optimizations
 │   │       ├── ethernet.cfg      # Intel Ethernet drivers
@@ -76,45 +77,24 @@ debian-kernel/
 │
 ├── debian/                         # Debian/Ubuntu packaging
 │   ├── config/
-│   │   └── amd64/intel -> ../../../intel/config/intel  # Symlink to overlay
+│   │   └── amd64/intel -> ../../../intel/config/amd64/intel  # Symlink to overlay
 │   ├── patches/
 │   │   └── intel -> ../../intel/patches/intel          # Symlink to overlay
 │   └── README.md     # Debian package guide
 │
 └── rpm/                            # Fedora/CentOS/RHEL packaging
-    ├── kernel-config/
-    │   └── intel -> ../../intel/config/intel           # Symlink to overlay
     ├── patches -> ../intel/patches                     # Symlink to overlay
+    ├── scripts/                                         # Generates configs from intel/config/
+    ├── kernel-x86_64-base.config                        # Base RPM kernel config
     └── README.md                   # RPM package guide
 ```
 
 ### How the Overlay Works
 
 1. **Single Source of Truth**: All Intel-specific patches and configurations are in `intel/`
-2. **Symbolic Links**: Both Debian and RPM packaging access overlay via symlinks
+2. **Shared Access**: Debian accesses the overlay via symlinks; RPM symlinks patches and generates its configs from the overlay
 3. **Automatic Integration**: Build systems automatically apply patches and merge configs
 4. **Easy Maintenance**: Update once in `intel/`, applies to all packaging formats
-
-### Intel Platform Features
-
-The overlay includes optimizations and drivers for Intel hardware:
-
-- **IPU/NPU**: Image Processing Unit and Neural Processing Unit for AI/ML
-- **Graphics**: Intel GPU optimizations (i915, Xe drivers)
-- **Networking**: Intel Ethernet (e1000e, igb, ixgbe) and WiFi (iwlwifi)
-- **Audio**: Intel SOF (Sound Open Firmware)
-- **Security**: Intel SGX, TDX, TME
-- **Platform**: LPSS (Low Power Subsystem), PMT, IDXD, Thunderbolt
-
-### Managing Patches and Configurations
-
-For detailed information on adding, organizing, and managing Intel patches and configuration fragments, see **[intel/README.md](intel/README.md)**. This includes:
-
-- How to add and register patches
-- Creating configuration fragments
-- Patch application order
-- Configuration merging process
-- Best practices for overlay management
 
 ## Package Naming Scheme
 
@@ -192,180 +172,36 @@ See [debian/README.md](debian/README.md#package-conflicts-with-system-tools) for
 
 ## Quick Start
 
-### Prerequisites
-
-> **Recommended: build in Docker.** The host then needs only Docker, and the
-> container ships every build dependency listed below:
-> `./docker-build.sh --build-image && ./docker-build.sh deb`.
-> The bare-host instructions below are for when you cannot use the container,
-> and are **tested on Ubuntu 26.04 (gcc-15)**.
-
-**System Requirements:**
-- Linux distribution (Debian 12+, Ubuntu 22.04+, Fedora 40+, CentOS Stream 9)
-- 20GB+ free disk space
-- 8GB+ RAM (16GB recommended for parallel builds)
-- Multi-core processor
-
-**Required Software (Debian/Ubuntu):**
-
-Install build dependencies before starting:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-    git build-essential fakeroot dpkg-dev devscripts debhelper quilt lintian \
-    xz-utils rsync cpio kmod \
-    bc bison flex libssl-dev libelf-dev libncurses-dev pahole \
-    gcc-15 gcc-multilib \
-    python3 python3-dev python3-setuptools python3-dacite python3-jinja2 \
-    dh-python python3-docutils \
-    python3-sphinx python3-sphinx-rtd-theme sphinx-common python3-yaml \
-    dvipng graphviz asciidoctor asciidoc xmlto \
-    libperl-dev libpython3-dev libaudit-dev libcap-dev libdw-dev \
-    libdebuginfod-dev libpci-dev libudev-dev libunwind-dev libnewt-dev \
-    libnl-3-dev libnl-genl-3-dev libglib2.0-dev libnuma-dev libconfig-dev \
-    libslang2-dev binutils-dev zlib1g-dev libzstd-dev lz4 zstd gawk \
-    libopencsd-dev systemtap-sdt-dev clang llvm-dev libtraceevent-dev \
-    libtracefs-dev libbabeltrace-dev libcapstone-dev libpfm4-dev default-jdk
-```
-
-Package descriptions (grouped):
-- **Packaging / base**: `git`, `build-essential` (also pulls in `dpkg-dev`), `fakeroot` (used by `dpkg-buildpackage`), `debhelper`, `quilt` (patch management), `lintian`, `xz-utils`, `rsync`, `cpio`, `kmod`
-- **Source fetch**: `devscripts` — provides `uscan`, which `make deb-setup` uses to fetch the upstream kernel source from git.kernel.org
-- **Kernel compile**: `bc`, `bison`, `flex`, `libssl-dev` (module signing), `libelf-dev` + `pahole` (BTF), `libncurses-dev` (menuconfig)
-- **Compiler**: `gcc-15` (matches Ubuntu 26.04; `debian/bin/detect-gcc-version.sh` selects it), `gcc-multilib`
-- **gencontrol (required)**: `python3`, `python3-dacite` (parses `debian/config/*.toml`), `python3-jinja2` (renders `debian/templates/*.j2`), `python3-dev`, `python3-setuptools`
-- **Docs (`linux-doc`)**: `python3-sphinx`, `python3-sphinx-rtd-theme`, `sphinx-common`, `python3-docutils`, `dh-python`, `python3-yaml`, `dvipng`, `graphviz`, `asciidoctor`, `asciidoc`, `xmlto`
-- **Tools — perf / cpupower / bpftool** (needed by full `make deb`, not `make deb-minimal`): `libperl-dev`, `libpython3-dev`, `libaudit-dev`, `libcap-dev`, `libdw-dev`, `libdebuginfod-dev`, `libpci-dev`, `libudev-dev`, `libunwind-dev`, `libnewt-dev`, `libnl-3-dev`, `libnl-genl-3-dev`, `libglib2.0-dev`, `libnuma-dev`, `libconfig-dev`, `libslang2-dev`, `binutils-dev`, `zlib1g-dev`, `libzstd-dev`, `lz4`, `zstd`, `gawk`, `libopencsd-dev` (CoreSight trace decode), `systemtap-sdt-dev` (SDT/USDT probes), `clang` + `llvm-dev` (perf BPF/clang-bpf), `libtraceevent-dev`, `libtracefs-dev`, `libbabeltrace-dev` (CTF trace), `libcapstone-dev` (disassembly), `libpfm4-dev` (PMU events), `default-jdk` (perf JVMTI agent)
-
-**Git Configuration:**
-
-Git configuration is **optional** for building (v2.0 uses `quilt` directly, not `git quiltimport`). Only configure git if you plan to commit changes:
-
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "you@example.com"
-```
-
-> **Note**: Unlike v1.0 which required git configuration for patch application (`git quiltimport`), v2.0 uses `quilt push` directly, so you can build without configuring git.
-
-**Required Software (Fedora/RHEL/CentOS):**
-
-```bash
-sudo dnf install -y \
-    git @development-tools bc bison flex openssl-devel elfutils-libelf-devel \
-    ncurses-devel dwarves rpm-build rsync quilt \
-    python3 python3-tomli cpio kmod
-```
-
-### Building Debian Packages
-
-```bash
-# 1. Setup (first time only)
-make deb-setup
-
-# 2. Build packages
-make deb              # Full build (kernel + tools + headers)
-make deb-minimal      # Minimal build (kernel image only, faster)
-
-# 3. Install kernel packages
-cd build/packages/deb/
-sudo dpkg -i linux-intel-*-amd64_*.deb
-sudo apt-get install -f  # Fix any dependencies
-sudo update-grub
-sudo reboot
-
-# For RT kernel (auto-configures boot parameters)
-cd build/packages/deb/
-sudo dpkg -i linux-intel-*-rt-amd64_*.deb
-sudo apt-get install -f  # Fix any dependencies
-# RT parameters are automatically applied to /etc/default/grub
-sudo reboot
-
-# 4. Install tools (optional, automatically replaces system packages)
-sudo apt install \
-  ./build/packages/deb/linux-intel-cpupower_*.deb \
-  ./build/packages/deb/linux-intel-perf_*.deb \
-  ./build/packages/deb/linux-intel-bpftool_*.deb
-```
-
-**Output**: Packages in `build/packages/deb/`
-
-**Build Modes**:
-- **Full build** (default): Builds kernel image + tools (perf, cpupower, etc.) + headers (~2-4 hours)
-- **Minimal build**: Builds kernel image only, skips tools (~1-2 hours, faster for testing)
-
-See [debian/README.md](debian/README.md) for detailed Debian package documentation including:
-- Package types and descriptions
-- Installation scenarios
-- Troubleshooting guides
-- Package verification
-
-### Building RPM Packages
-
-```bash
-# 1. Prepare sources (first time only)
-cd rpm
-./scripts/prepare-sources.sh --version 6.18.20
-
-# 2. Build packages
-./scripts/build.sh
-
-# 3. Install
-sudo dnf install ~/rpmbuild/RPMS/x86_64/kernel-*.rpm
-sudo reboot
-```
-
-**Output**: Packages in `~/rpmbuild/RPMS/x86_64/`
-
-See [rpm/README.md](rpm/README.md) for detailed RPM package documentation.
-
-### Using the Makefile
-
-The Makefile provides a unified interface for all build operations:
-
-```bash
-# Show all available targets
-make help
-
-# Debian builds
-make deb-setup     # First-time setup
-make deb           # Build packages (full: kernel + tools)
-make deb-minimal   # Build packages (minimal: kernel only, faster)
-make clean-deb     # Clean Debian artifacts
-
-# RPM builds
-make rpm-prepare   # Prepare sources
-make rpm           # Build packages
-make clean-rpm     # Clean RPM artifacts
-
-# Build both formats
-make all
-
-# Check status
-make status
-```
-
 ### Building in Docker
 
 For clean, reproducible builds without installing dependencies:
 
 ```bash
-# Build Docker image (first time only, Ubuntu 24.04 by default)
+# Build Docker image (first time only, Ubuntu 26.04 by default)
 ./docker-build.sh --build-image
 
-# Or specify Ubuntu version explicitly
-./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu26.04
+# Or specify the Ubuntu version explicitly
+./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu26.04   # Ubuntu 26.04 (default)
+./docker-build.sh --build-image --dockerfile Dockerfile.ubuntu24.04   # Ubuntu 24.04
 
-# Build packages in container
+# Build Debian packages in container
 ./docker-build.sh deb              # Full build (kernel + tools)
 ./docker-build.sh deb-minimal      # Minimal build (kernel only, faster)
-# Or use --mode option
-./docker-build.sh deb --mode minimal
 
-# Or open interactive shell
-./docker-build.sh shell
+# Build RPM packages in container (experimental; auto-prepares sources, standard + RT)
+./docker-build.sh rpm
+./docker-build.sh rpm-prepare      # Only prepare RPM sources
+
+# Build both Debian and RPM packages
+./docker-build.sh all
+
+# Show all available commands and options
+./docker-build.sh -h
 ```
+
+**Output**: Debian packages in `build/packages/deb/`, RPM packages in `build/packages/rpm/`.
+
+To install the generated `.deb` packages (recommended order, RT kernel, and tool packages), see **[debian/README.md — Installation Order](debian/README.md#installation-order)**.
 
 See [docker/README.md](docker/README.md) for Docker build details.
 
@@ -374,11 +210,11 @@ See [docker/README.md](docker/README.md) for Docker build details.
 ### Quick Workflow Overview
 
 1. **Add/modify patches** in `intel/patches/intel/`
-2. **Add/modify configs** in `intel/config/intel/`
-3. **Test build** with `make deb` or `make rpm`
+2. **Add/modify configs** in `intel/config/amd64/intel/`
+3. **Test build** with `./docker-build.sh deb` or `./docker-build.sh rpm`
 4. **Commit changes** to git
 
-For detailed step-by-step instructions on adding Intel features, including patch management, configuration fragments, and best practices, see **[intel/README.md](intel/README.md)**.
+For detailed step-by-step instructions, see **[intel/README.md](intel/README.md)** — covering how to add and register patches, create configuration fragments, patch application order, the config merging process, and overlay best practices.
 
 ## Version Information
 
@@ -387,19 +223,6 @@ For detailed step-by-step instructions on adding Intel features, including patch
 - **Supported Platforms**: Intel x86_64 processors
 - **Packaging Formats**: Debian (.deb), RPM (.rpm)
 - **Package Naming**: See [Package Naming Scheme](#package-naming-scheme) above
-
-## Module Packaging
-
-Create standalone packages for individual kernel modules:
-
-```bash
-# Example: i915 graphics driver
-./debian/bin/create-module-package.sh i915 \
-    'drivers/gpu/drm/i915/*.ko' \
-    debian/build/build_amd64_none_amd64
-```
-
-See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module packaging documentation.
 
 ## Package Documentation
 
@@ -423,44 +246,6 @@ See [debian/MODULE_PACKAGING.md](debian/MODULE_PACKAGING.md) for detailed module
 - **[RT Kernel Parameters](intel/kernel-rt-parameter)** - RT kernel auto-configuration parameter list
   - Automatic boot parameter setup
   - Parameter customization
-
-## Troubleshooting
-
-### Common Issues
-
-**"No rule to make target 'debian/control'"**
-```bash
-# Run setup first
-make deb-setup
-```
-
-**"Source tarball not found"**
-```bash
-# For Debian
-make deb-setup
-
-# For RPM
-cd rpm && ./scripts/prepare-sources.sh --version 6.18.20
-```
-
-**Module loading issues**
-```bash
-# Verify kernel version matches module directory
-scripts/verify-kernel-package.sh \
-    build/packages/deb/linux-binary-*.deb \
-    build/packages/deb/linux-modules-*.deb
-```
-
-**Configuration conflicts**
-```bash
-# Regenerate configuration
-make -f debian/rules debian/control
-cd rpm && ./scripts/generate-configs.sh
-```
-
-See package-specific documentation for more details:
-- Debian: [debian/README.md](debian/README.md)
-- RPM: [rpm/README.md](rpm/README.md)
 
 ## Contributing
 
