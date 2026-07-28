@@ -86,19 +86,3 @@ install:
 	mv $(DESTDIR)/etc/bash_completion.d \
 		$(DESTDIR)/usr/share/bash-completion/completions
 	rmdir --ignore-fail-on-non-empty $(DESTDIR)/etc
-# Rename perf binary to perf-intel
-	@if [ -f $(DESTDIR)/usr/bin/perf ]; then mv $(DESTDIR)/usr/bin/perf $(DESTDIR)/usr/bin/perf-intel; fi
-# NOTE: perf-iostat stays as-is because perf binary hardcodes "perf-<subcommand>" pattern
-# Rename bash completion
-	@if [ -f $(DESTDIR)/usr/share/bash-completion/completions/perf ]; then \
-		mv $(DESTDIR)/usr/share/bash-completion/completions/perf $(DESTDIR)/usr/share/bash-completion/completions/perf-intel; \
-	fi
-# Rename man pages
-	@if [ -d $(DESTDIR)/usr/share/man ]; then \
-		find $(DESTDIR)/usr/share/man -name 'perf*.1' | while read f; do \
-			dir=$$(dirname "$$f"); \
-			base=$$(basename "$$f"); \
-			newbase=$$(echo "$$base" | sed 's/^perf-/perf-intel-/; s/^perf\.1/perf-intel.1/'); \
-			mv "$$f" "$$dir/$$newbase"; \
-		done; \
-	fi
