@@ -114,9 +114,9 @@ crash /usr/lib/debug/boot/vmlinux-<VERSION> /var/crash/vmcore
 
 | Package | Tool | Purpose |
 |---------|------|---------|
-| `linux-intel-perf` | `perf-intel` | CPU profiling, tracing, PMU access |
-| `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
-| `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
+| `linux-intel-perf` | `perf` | CPU profiling, tracing, PMU access |
+| `linux-intel-bpftool` | `bpftool` | Inspect/manipulate eBPF programs |
+| `linux-intel-rtla` | `rtla` | RT latency analysis (RT kernel only) |
 
 > **Note**: `dpkg -i` does not resolve dependencies, so install these first:
 >
@@ -141,10 +141,10 @@ crash /usr/lib/debug/boot/vmlinux-<VERSION> /var/crash/vmcore
 
 **Examples** (require root):
 ```bash
-sudo perf-intel top              # Live CPU profiling
-sudo perf-intel record -g -a     # Record call stacks
-sudo bpftool-intel prog list     # List BPF programs
-sudo rtla-intel osnoise top      # RT noise monitoring
+sudo perf top              # Live CPU profiling
+sudo perf record -g -a     # Record call stacks
+sudo bpftool prog list     # List BPF programs
+sudo rtla osnoise top      # RT noise monitoring
 ```
 
 ---
@@ -155,14 +155,14 @@ sudo rtla-intel osnoise top      # RT noise monitoring
 |---------|-------|---------|
 | `libcpupower-intel1` | Library only | Runtime library for cpupower (required dependency) |
 | `libcpupower-intel-dev` | Headers and dev files | Development files for cpupower library |
-| `linux-intel-cpupower` | `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel` | CPU frequency/power management and monitoring |
-| `linux-intel-perf` | `perf-intel` | CPU profiling, tracing, PMU access, flamegraphs |
+| `linux-intel-cpupower` | `cpupower`, `turbostat`, `x86_energy_perf_policy`, `intel-speed-select` | CPU frequency/power management and monitoring |
+| `linux-intel-perf` | `perf` | CPU profiling, tracing, PMU access, flamegraphs |
 | `linux-intel-misc-tools` | `tmon`, `thermometer`, `bootconfig`, `ihex2fw` | Thermal monitoring and misc utilities |
 | `linux-intel-hyperv-daemons` | KVP, VSS, FCOPY | Hyper-V integration services |
 | `linux-intel-sdsi` | `intel-sdsi` | Intel Software Defined Silicon management |
-| `linux-intel-usbip` | `usbip-intel`, `usbipd-intel` | USB over IP |
-| `linux-intel-bpftool` | `bpftool-intel` | Inspect/manipulate eBPF programs |
-| `linux-intel-rtla` | `rtla-intel` | RT latency analysis (RT kernel only) |
+| `linux-intel-usbip` | `usbip`, `usbipd` | USB over IP |
+| `linux-intel-bpftool` | `bpftool` | Inspect/manipulate eBPF programs |
+| `linux-intel-rtla` | `rtla` | RT latency analysis (RT kernel only) |
 
 > **Note — Installing these utilities**
 >
@@ -292,7 +292,7 @@ See [RT Kernel Parameters](../intel/kernel-rt-parameter) for the complete list o
 
 ### Overview
 
-Intel kernel tool packages use vendor-prefixed naming (`linux-intel-*`) and binary suffixes (`-intel`) to coexist with system kernels. However, **some packages cannot coexist** with Ubuntu/Debian system tool packages due to shared library files, headers, and configuration files.
+Intel kernel tool packages use vendor-prefixed naming (`linux-intel-*`) to coexist with system kernels. The binaries themselves keep their upstream names (`perf`, `cpupower`, etc.). Because of this — and because of shared library files, headers, and configuration files — these packages **cannot coexist** with the Ubuntu/Debian system tool packages and replace them on install.
 
 ### Packages That Replace System Packages
 
@@ -311,21 +311,23 @@ The following Intel packages **automatically replace** their system equivalents 
 | `linux-intel-hyperv-daemons` | `hyperv-daemons` | **Daemon services** - Hyper-V integration service files |
 | `linux-intel-sdsi` | N/A | No conflict (Intel-specific tool) |
 
-### What Was Renamed vs What Cannot Be Renamed
+### What Was Renamed vs What Keeps Its Original Name
 
-#### ✅ Successfully Renamed (No Conflicts)
+#### ✅ Renamed
 
-These components were renamed to avoid conflicts:
+Only the package names carry the Intel vendor prefix:
 
 - **Package names**: `linux-cpupower` → `linux-intel-cpupower`
-- **Binaries**: `cpupower` → `cpupower-intel`, `perf` → `perf-intel`, etc.
-- **Man pages**: `cpupower.1` → `cpupower-intel.1`
-- **Systemd units**: `cpupower.service` → `cpupower-intel.service`
-- **Bash completions**: `perf` → `perf-intel` completion files
 
-#### ❌ Cannot Be Renamed (Still Conflicts)
+#### ❌ Keep Their Original Names (Cause Conflicts)
 
-These components **must** keep their original names for compatibility:
+These components **keep** their upstream names, which is why the packages
+conflict with (and replace) the system tool packages:
+
+- **Binaries**: `cpupower`, `perf`, `bpftool`, `rtla`, `usbip`, etc.
+- **Man pages**: `cpupower.1`, `perf.1`, etc.
+- **Systemd units**: `cpupower.service`
+- **Bash completions**: `perf`, `bpftool` completion files
 
 1. **Library SONAME** (`libcpupower.so.0`)
    - Hardcoded in compiled binaries
@@ -343,8 +345,8 @@ These components **must** keep their original names for compatibility:
 
 4. **Helper scripts** (`perf-iostat`, `perf-archive`)
    - perf binary hardcodes lookup: `asprintf(&cmd, "perf-%s", subcommand)`
-   - Searches for `perf-<subcommand>`, not `perf-intel-<subcommand>`
-   - Renaming breaks subcommand functionality
+   - Must stay as `perf-<subcommand>` for subcommand functionality
+   - Shares this namespace with the system `linux-perf` package
 
 ### Automatic Replacement via APT
 
@@ -396,8 +398,8 @@ After installation, verify the Intel versions are active:
 
 ```bash
 # Check binary locations
-which cpupower-intel     # /usr/bin/cpupower-intel
-which perf-intel         # /usr/bin/perf-intel
+which cpupower     # /usr/bin/cpupower
+which perf         # /usr/bin/perf
 
 # Check library
 ldconfig -p | grep cpupower   # libcpupower.so.0 (Intel version)
@@ -408,8 +410,8 @@ dpkg -l | grep cpupower
 # rc  libcpupower1              (removed config remains)
 
 # Verify versions
-cpupower-intel --version
-perf-intel --version
+cpupower --version
+perf --version
 ```
 
 ### Rollback to System Packages
