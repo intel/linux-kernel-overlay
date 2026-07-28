@@ -131,13 +131,13 @@ All packages use the `linux-intel-*` prefix:
 
 ### Binary Names
 
-Tool binaries use the `-intel` suffix to avoid conflicts with system tools:
+Tool binaries keep their upstream names (no vendor suffix):
 
-- **cpupower**: `cpupower-intel`, `turbostat-intel`, `x86_energy_perf_policy-intel`, `intel-speed-select-intel`
-- **perf**: `perf-intel`
-- **bpftool**: `bpftool-intel`
-- **rtla**: `rtla-intel`
-- **usbip**: `usbip-intel`, `usbipd-intel`
+- **cpupower**: `cpupower`, `turbostat`, `x86_energy_perf_policy`, `intel-speed-select`
+- **perf**: `perf`
+- **bpftool**: `bpftool`
+- **rtla**: `rtla`
+- **usbip**: `usbip`, `usbipd`
 
 ### Version Format
 
