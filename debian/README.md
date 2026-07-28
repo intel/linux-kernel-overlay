@@ -18,7 +18,7 @@ For project overview and Intel overlay system, see [Main README](../README.md).
 | Category | Packages | Purpose |
 |----------|----------|---------|
 | **Core** | 6 per variant | Required for boot (base, binary, modules, image) |
-| **Development** | 3 | Building external modules (headers, kbuild, bpf-dev) |
+| **Development** | 2 | Building external modules (headers, kbuild) |
 | **Debug** | 2 per variant | Crash analysis (debug symbols ~1.3GB each) |
 | **Performance** | 3 | Profiling and tracing (perf, bpftool, rtla) |
 | **Utilities** | 7 | Power management, thermal monitoring, profiling, USB/IP |
@@ -83,7 +83,6 @@ sudo dpkg -i linux-intel-headers-<VERSION>-<VARIANT>_*.deb
 | `linux-kbuild-*` | ~1M | Build scripts and Makefiles (required first) |
 | `linux-intel-headers-*-common` | ~1M | Common kernel headers (all architectures) |
 | `linux-intel-headers-*-VARIANT` | ~2M | Architecture-specific headers, Module.symvers, .config |
-| `linux-intel-bpf-dev` | ~600K | BPF/eBPF development headers |
 
 **Usage**:
 ```bash
@@ -300,7 +299,7 @@ The following Intel packages **automatically replace** their system equivalents 
 
 | Intel Package | Replaces System Package | Reason for Conflict |
 |---------------|------------------------|---------------------|
-| `libcpupower-intel1` | `libcpupower1` | **Shared library SONAME**: `/usr/lib/x86_64-linux-gnu/libcpupower.so.0` - Cannot rename without breaking ABI compatibility |
+| `libcpupower-intel1` | `libcpupower1` | **Shared library SONAME**: `/usr/lib/x86_64-linux-gnu/libcpupower.so.1` - Cannot rename without breaking ABI compatibility |
 | `libcpupower-intel-dev` | `libcpupower-dev` | **Header files**: `/usr/include/cpufreq.h`, `/usr/include/cpuidle.h` - Renaming breaks source code that uses `#include <cpufreq.h>` |
 | `linux-intel-cpupower` | `linux-cpupower` | **Config file**: `/etc/cpupower-service.conf` - Path hardcoded in binary/service |
 | `linux-intel-perf` | `linux-perf` | **Helper scripts**: `/usr/lib/perf-core/perf-iostat`, `/usr/lib/perf-core/perf-archive` - perf binary hardcodes lookup pattern `perf-<subcommand>` |
@@ -309,7 +308,7 @@ The following Intel packages **automatically replace** their system equivalents 
 | `linux-intel-usbip` | `usbip` | **Config files and paths** - Shared configuration locations |
 | `linux-intel-misc-tools` | `linux-misc-tools` | **Shared utilities** - Tools like `tmon`, `thermometer` |
 | `linux-intel-hyperv-daemons` | `hyperv-daemons` | **Daemon services** - Hyper-V integration service files |
-| `linux-intel-sdsi` | N/A | No conflict (Intel-specific tool) |
+| `linux-intel-sdsi` | `intel-sdsi` | **Shared binary**: `intel-sdsi` - same tool name as the stock package |
 
 ### What Was Renamed vs What Keeps Its Original Name
 
@@ -329,7 +328,7 @@ conflict with (and replace) the system tool packages:
 - **Systemd units**: `cpupower.service`
 - **Bash completions**: `perf`, `bpftool` completion files
 
-1. **Library SONAME** (`libcpupower.so.0`)
+1. **Library SONAME** (`libcpupower.so.1`)
    - Hardcoded in compiled binaries
    - Renaming breaks ABI (Application Binary Interface)
    - Required for dynamic linking
@@ -402,7 +401,7 @@ which cpupower     # /usr/bin/cpupower
 which perf         # /usr/bin/perf
 
 # Check library
-ldconfig -p | grep cpupower   # libcpupower.so.0 (Intel version)
+ldconfig -p | grep cpupower   # libcpupower.so.1 (Intel version)
 
 # Check package status
 dpkg -l | grep cpupower
