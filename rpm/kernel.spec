@@ -311,6 +311,41 @@ echo "Skipping kernel tools installation (with_tools=0)"
 %endif
 
 # ======================================================================
+# Scriptlets: hook kernel-install so initramfs + BLS loader entries
+# are generated/removed automatically on install/erase.
+#
+# kernel-install runs the plugins in /usr/lib/kernel/install.d/, which:
+#   - run depmod for the new modules
+#   - invoke the initramfs generator (dracut/mkinitrd) to build
+#     /boot/initramfs-<ver>.img (or the *.conf-driven location)
+#   - write /boot/loader/entries/<machine-id>-<ver>.conf (BLS)
+# Without these hooks the kernel installs as bare files only, which is
+# why initramfs and loader entries were missing until run by hand.
+# ======================================================================
+
+# posttrans (not post): runs after every package in the transaction is
+# in place, so vmlinuz-%{buildid} is guaranteed present before we build
+# the initramfs, and dracut only runs once per transaction.
+%posttrans
+if command -v kernel-install >/dev/null 2>&1; then
+    echo "Running kernel-install add for %{buildid}..."
+    kernel-install add %{buildid} /boot/vmlinuz-%{buildid} || exit $?
+else
+    echo "WARNING: kernel-install not found; skipping initramfs/loader-entry generation." >&2
+    echo "         Run 'kernel-install add %{buildid} /boot/vmlinuz-%{buildid}' manually." >&2
+fi
+
+# preun ($1 == 0 means final erase, not an upgrade): remove the loader
+# entry and initramfs while the kernel files still exist on disk.
+%preun
+if [ "$1" -eq 0 ]; then
+    if command -v kernel-install >/dev/null 2>&1; then
+        echo "Running kernel-install remove for %{buildid}..."
+        kernel-install remove %{buildid} || exit $?
+    fi
+fi
+
+# ======================================================================
 # Files section
 # ======================================================================
 %files
