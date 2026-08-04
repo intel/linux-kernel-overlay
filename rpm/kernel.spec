@@ -59,6 +59,23 @@ License: GPL-2.0
 URL: https://www.kernel.org/
 Vendor: Custom Build
 
+# Mark as install-only so package managers KEEP multiple kernel versions
+# side by side instead of upgrading (replacing) the running kernel, which
+# would leave the system without a bootable fallback. dnf/yum key off the
+# installonlypkg(kernel) virtual provide.
+Provides: installonlypkg(kernel)
+
+# Standard virtual provides that DKMS, akmods/kmod packages and dracut use
+# to bind a module set to a specific kernel version (uname -r == %{buildid}).
+Provides: kernel-uname-r = %{buildid}
+Provides: kernel-modules-uname-r = %{buildid}
+
+# Scriptlet dependencies: kernel-install (from systemd) and the initramfs
+# generator must be present and ordered when %posttrans/%preun run.
+Requires(post):  systemd
+Requires(preun): systemd
+Requires:        dracut
+
 # Sources
 Source0: linux-%{kernel_version}.tar.xz
 %if %{with_rt}
@@ -353,6 +370,10 @@ fi
 /boot/System.map-%{buildid}
 /boot/config-%{buildid}
 /lib/modules/%{buildid}
+# initramfs is generated at install time by kernel-install (not shipped in
+# the payload); declare it %ghost so rpm tracks ownership and removes it on
+# erase instead of leaving an orphan in /boot.
+%ghost /boot/initramfs-%{buildid}.img
 
 %files devel
 /usr/src/kernels/%{buildid}
