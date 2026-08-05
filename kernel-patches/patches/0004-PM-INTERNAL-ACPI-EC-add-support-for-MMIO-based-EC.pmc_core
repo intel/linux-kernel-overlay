@@ -1,0 +1,370 @@
+From 08487cc8ba600e918ea2e81ebae4ca5d4f014bce Mon Sep 17 00:00:00 2001
+From: Saranya Gopal <saranya.gopal@intel.com>
+Date: Fri, 5 Jun 2026 10:48:45 +0530
+Subject: [PATCH 4/5] PM: INTERNAL: ACPI: EC: add support for MMIO-based EC
+ platforms with eSPI SCI
+
+On platforms where the EC is connected via eSPI rather than LPC (e.g.
+Nova Lake H), firmware describes the EC node with _HID PNP0C02 and
+_UID MMIOEC instead of PNP0C09, and may not provide a _GPE method.
+Several issues prevent the existing EC driver from working:
+
+ - ec_parse_device() rejects PNP0C02 nodes entirely before reading _GPE
+ - The port-presence check runs before _GPE evaluation, dropping MMIOEC
+   nodes that have only a single shared command/data port in _CRS
+ - acpi_ec_mark_gpe_for_wake() and acpi_ec_set_gpe_wake_mask() only
+   consult first_ec->gpe, which is -1 when _GPE is absent from BIOS
+ - acpi_ec_dispatch_gpe() returns early when first_ec is NULL or has
+   no GPE, causing spurious EC SCI wakes to trigger system resume
+
+Fix by:
+
+ - Adding ec_is_mmioec_uid() / ec_is_pnp0c02() helpers to identify
+   MMIO-based EC nodes; skip non-MMIOEC PNP0C02 nodes in ec_parse_device()
+ - Moving the port-presence check after _GPE evaluation so MMIOEC nodes
+   are not discarded prematurely
+ - Caching the GPE number in ec_wake_gpe from any EC node's _GPE method;
+   falling back to GPE 0x6e for MMIOEC nodes that have no _GPE
+ - Sharing a single _CRS port for both command and data on MMIOEC nodes
+ - Extending acpi_ec_mark_gpe_for_wake() and acpi_ec_set_gpe_wake_mask()
+   to fall back to ec_wake_gpe when first_ec->gpe is not valid
+ - Adding an ec_wake_gpe fallback path in acpi_ec_dispatch_gpe() for
+   platforms where the full EC driver did not probe
+ - Adding PNP0C02 to ec_device_ids so the platform driver binds
+ - Adding a PNP0C02 fallback scan in acpi_ec_dsdt_probe() for platforms
+   where no PNP0C09 EC node exists
+ - Guarding the duplicate request_region() call in acpi_ec_probe() when
+   command and data ports are the same address
+ - Checking pm_wakeup_pending() after EC work drain to honour wakeups
+   triggered by EC query methods (e.g. _Q54 power-button handler)
+
+Tested on Nova Lake H (NVL) with eSPI EC (PNP0C02 / UID=MMIOEC).
+
+(cherry picked from commit 1c734387b47ee4129c42f6854a927bf00cd37bf6)
+Signed-off-by: Pedaballi, ManikanthX Reddy <manikanthx.reddy.pedaballi@intel.com>
+(cherry picked from commit 68728a137f42cdbaaa6e1d87f6ac14284fe39f34)
+Signed-off-by: Pedaballi, ManikanthX Reddy <manikanthx.reddy.pedaballi@intel.com>
+(cherry picked from commit b74ca702e175df5efe25ddd9855095db1f59e779)
+---
+ drivers/acpi/ec.c | 199 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 183 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/acpi/ec.c b/drivers/acpi/ec.c
+index 6f0065257a77..23f418928086 100644
+--- a/drivers/acpi/ec.c
++++ b/drivers/acpi/ec.c
+@@ -178,6 +178,14 @@ static void acpi_ec_event_handler(struct work_struct *work);
+ struct acpi_ec *first_ec;
+ EXPORT_SYMBOL(first_ec);
+ 
++/*
++ * On MMIO-based EC platforms (eSPI SCI, _HID PNP0C02 / _UID "MMIOEC") the
++ * EC GPE number may not come from _GPE.  Cache the GPE number discovered
++ * during EC probe so the wake-path helpers can mark and arm the right GPE
++ * even when first_ec->gpe is not valid.
++ */
++static int ec_wake_gpe = -1;
++
+ static struct acpi_ec *boot_ec;
+ static bool boot_ec_is_ecdt;
+ static struct workqueue_struct *ec_wq;
+@@ -1456,6 +1464,41 @@ acpi_ec_register_query_methods(acpi_handle handle, u32 level,
+ 	return AE_OK;
+ }
+ 
++static bool ec_is_mmioec_uid(acpi_handle handle)
++{
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *uid;
++	bool is_mmioec = false;
++
++	if (ACPI_FAILURE(acpi_evaluate_object(handle, "_UID", NULL, &buffer)))
++		return false;
++
++	uid = buffer.pointer;
++	if (uid && uid->type == ACPI_TYPE_STRING && uid->string.pointer)
++		is_mmioec = !strcmp(uid->string.pointer, "MMIOEC");
++
++	ACPI_FREE(buffer.pointer);
++	return is_mmioec;
++}
++
++static bool ec_is_pnp0c02(acpi_handle handle)
++{
++	struct acpi_device_info *info;
++	bool is_pnp0c02 = false;
++	acpi_status status;
++
++	status = acpi_get_object_info(handle, &info);
++	if (ACPI_FAILURE(status))
++		return false;
++
++	if ((info->valid & ACPI_VALID_HID) && info->hardware_id.string &&
++	    !strcmp(info->hardware_id.string, "PNP0C02"))
++		is_pnp0c02 = true;
++
++	kfree(info);
++	return is_pnp0c02;
++}
++
+ static acpi_status
+ ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
+ {
+@@ -1463,6 +1506,9 @@ ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
+ 	unsigned long long tmp = 0;
+ 	struct acpi_ec *ec = context;
+ 
++	if (ec_is_pnp0c02(handle) && !ec_is_mmioec_uid(handle))
++		return AE_OK;
++
+ 	/* clear addr values, ec_parse_io_ports depend on it */
+ 	ec->command_addr = ec->data_addr = 0;
+ 
+@@ -1470,14 +1516,36 @@ ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
+ 				     ec_parse_io_ports, ec);
+ 	if (ACPI_FAILURE(status))
+ 		return status;
+-	if (ec->data_addr == 0 || ec->command_addr == 0)
+-		return AE_OK;
+ 
+ 	/* Get GPE bit assignment (EC events). */
+ 	/* TODO: Add support for _GPE returning a package */
+ 	status = acpi_evaluate_integer(handle, "_GPE", NULL, &tmp);
+-	if (ACPI_SUCCESS(status))
++	if (ACPI_SUCCESS(status)) {
+ 		ec->gpe = tmp;
++		if (ec_wake_gpe < 0 && tmp > 0)
++			ec_wake_gpe = (int)tmp;
++	} else if (ec_is_mmioec_uid(handle)) {
++		/*
++		 * MMIO-based EC platforms may not provide _GPE; fall back to
++		 * the platform-specific GPE number (0x6e on NVL eSPI EC).
++		 */
++		if (ec_wake_gpe < 0)
++			ec_wake_gpe = 0x6e;
++		if (ec->gpe < 0)
++			ec->gpe = ec_wake_gpe;
++	}
++
++	/*
++	 * MMIO-based EC platforms expose a single I/O port in _CRS; that port
++	 * is shared for both commands and data.  Copy it to command_addr so the
++	 * port-presence check below does not skip the rest of the probe.
++	 */
++	if (ec->data_addr != 0 && ec->command_addr == 0 && ec_is_mmioec_uid(handle))
++		ec->command_addr = ec->data_addr;
++
++	if (ec->data_addr == 0 || ec->command_addr == 0)
++		return AE_OK;
++
+ 	/*
+ 	 * Errors are non-fatal, allowing for ACPI Reduced Hardware
+ 	 * platforms which use GpioInt instead of GPE.
+@@ -1738,8 +1806,10 @@ static int acpi_ec_probe(struct platform_device *pdev)
+ 
+ 	ret = !!request_region(ec->data_addr, 1, "EC data");
+ 	WARN(!ret, "Could not request EC data io port 0x%lx", ec->data_addr);
+-	ret = !!request_region(ec->command_addr, 1, "EC cmd");
+-	WARN(!ret, "Could not request EC cmd io port 0x%lx", ec->command_addr);
++	if (ec->command_addr != ec->data_addr) {
++		ret = !!request_region(ec->command_addr, 1, "EC cmd");
++		WARN(!ret, "Could not request EC cmd io port 0x%lx", ec->command_addr);
++	}
+ 
+ 	/* Reprobe devices depending on the EC */
+ 	acpi_dev_clear_dependencies(device);
+@@ -1797,6 +1867,14 @@ ec_parse_io_ports(struct acpi_resource *resource, void *context)
+ 
+ static const struct acpi_device_id ec_device_ids[] = {
+ 	{"PNP0C09", 0},
++	/*
++	 * PNP0C02 is used on platforms where firmware updated the EC HID
++	 * to prevent LPC EC driver binding (MMIO EC).  Probe it so that
++	 * ec_parse_device() can read _GPE and populate ec_wake_gpe for
++	 * S0ix wake marking even though the full EC driver will not bind
++	 * (no I/O port resources in _CRS).
++	 */
++	{"PNP0C02", 0},
+ 	{ACPI_ECDT_HID, 0},
+ 	{"", 0},
+ };
+@@ -1809,9 +1887,26 @@ static const struct acpi_device_id ec_device_ids[] = {
+ void __init acpi_ec_dsdt_probe(void)
+ {
+ 	struct acpi_ec *ec;
++	struct acpi_ec *wake_ec;
++	struct acpi_device *ec_dev = NULL;
+ 	acpi_status status;
+ 	int ret;
+ 
++	/*
++	 * On MMIO-EC platforms, collect wake GPE from the PNP0C02/MMIOEC
++	 * namespace node even when no EC device is bound.
++	 */
++	if (ec_wake_gpe < 0) {
++		wake_ec = acpi_ec_alloc();
++		if (wake_ec) {
++			status = acpi_get_devices("PNP0C02", ec_parse_device,
++						  wake_ec, NULL);
++			if (ACPI_FAILURE(status))
++				pr_debug("ACPI EC: PNP0C02 wake scan failed: %u\n", status);
++			acpi_ec_free(wake_ec);
++		}
++	}
++
+ 	/*
+ 	 * If a platform has ECDT, there is no need to proceed as the
+ 	 * following probe is not a part of the ACPI device enumeration,
+@@ -1831,10 +1926,19 @@ void __init acpi_ec_dsdt_probe(void)
+ 	 */
+ 	status = acpi_get_devices(ec_device_ids[0].id, ec_parse_device, ec, NULL);
+ 	if (ACPI_FAILURE(status) || !ec->handle) {
+-		acpi_ec_free(ec);
+-		return;
++		/*
++		 * Some MMIO EC platforms expose H_EC as PNP0C02 (MMIOEC).
++		 * Try that path when no PNP0C09 EC object is found.
++		 */
++		status = acpi_get_devices("PNP0C02", ec_parse_device, ec, NULL);
++		if (ACPI_FAILURE(status) || !ec->handle) {
++			acpi_ec_free(ec);
++			return;
++		}
+ 	}
+ 
++	ec_dev = acpi_fetch_acpi_dev(ec->handle);
++
+ 	/*
+ 	 * When the DSDT EC is available, always re-configure boot EC to
+ 	 * have _REG evaluated. _REG can only be evaluated after the
+@@ -1842,7 +1946,7 @@ void __init acpi_ec_dsdt_probe(void)
+ 	 * At this point, the GPE is not fully initialized, so do not to
+ 	 * handle the events.
+ 	 */
+-	ret = acpi_ec_setup(ec, NULL, true);
++	ret = acpi_ec_setup(ec, ec_dev, true);
+ 	if (ret) {
+ 		acpi_ec_free(ec);
+ 		return;
+@@ -2141,15 +2245,35 @@ static int acpi_ec_resume(struct device *dev)
+ 
+ void acpi_ec_mark_gpe_for_wake(void)
+ {
+-	if (first_ec && !ec_no_wakeup)
+-		acpi_mark_gpe_for_wake(NULL, first_ec->gpe);
++	u32 wake_gpe;
++
++	if (first_ec && first_ec->gpe >= 0)
++		wake_gpe = (u32)first_ec->gpe;
++	else if (ec_wake_gpe > 0)
++		wake_gpe = (u32)ec_wake_gpe;
++	else
++		return;
++
++	if (!ec_no_wakeup)
++		acpi_mark_gpe_for_wake(NULL, wake_gpe);
+ }
+ EXPORT_SYMBOL_GPL(acpi_ec_mark_gpe_for_wake);
+ 
+ void acpi_ec_set_gpe_wake_mask(u8 action)
+ {
+-	if (pm_suspend_no_platform() && first_ec && !ec_no_wakeup)
+-		acpi_set_gpe_wake_mask(NULL, first_ec->gpe, action);
++	u32 wake_gpe;
++
++	if (!pm_suspend_no_platform() || ec_no_wakeup)
++		return;
++
++	if (first_ec && first_ec->gpe >= 0)
++		wake_gpe = (u32)first_ec->gpe;
++	else if (ec_wake_gpe > 0)
++		wake_gpe = (u32)ec_wake_gpe;
++	else
++		return;
++
++	acpi_set_gpe_wake_mask(NULL, wake_gpe, action);
+ }
+ 
+ static bool acpi_ec_work_in_progress(struct acpi_ec *ec)
+@@ -2160,15 +2284,53 @@ static bool acpi_ec_work_in_progress(struct acpi_ec *ec)
+ bool acpi_ec_dispatch_gpe(void)
+ {
+ 	bool work_in_progress = false;
++	u32 ec_gpe;
+ 
+-	if (!first_ec)
++	if (!first_ec || first_ec->gpe < 0) {
++		/*
++		 * No fully-probed EC, but on MMIO-based EC platforms ec_wake_gpe
++		 * holds the GPE number armed as the EC wake source.  Use it to
++		 * exclude EC-sourced GPEs from the non-EC check; without this,
++		 * acpi_any_gpe_status_set(U32_MAX) would falsely return true for
++		 * any active GPE (including EC traffic) on every suspend cycle.
++		 */
++		if (ec_wake_gpe > 0) {
++			if (acpi_any_gpe_status_set((u32)ec_wake_gpe))
++				return true;
++
++			/*
++			 * No non-EC GPE is set.  Re-check fixed-event sources to
++			 * cover races where they become visible after the checks in
++			 * acpi_s2idle_wake() but before we cancel this wakeup.
++			 */
++			if (acpi_any_fixed_event_status_set())
++				return true;
++
++			/*
++			 * Some platforms deliver the PM1 power-button fixed event
++			 * slightly after the initial EC SCI pulse.  Re-check a few
++			 * times before suppressing this wakeup.
++			 */
++			for (int i = 0; i < 3; i++) {
++				udelay(200);
++				if (acpi_any_fixed_event_status_set())
++					return true;
++			}
++
++			pm_system_cancel_wakeup();
++			acpi_clear_gpe(NULL, (u32)ec_wake_gpe);
++			return false;
++		}
+ 		return acpi_any_gpe_status_set(U32_MAX);
++	}
++
++	ec_gpe = (u32)first_ec->gpe;
+ 
+ 	/*
+ 	 * Report wakeup if the status bit is set for any enabled GPE other
+ 	 * than the EC one.
+ 	 */
+-	if (acpi_any_gpe_status_set(first_ec->gpe))
++	if (acpi_any_gpe_status_set(ec_gpe))
+ 		return true;
+ 
+ 	/*
+@@ -2182,8 +2344,10 @@ bool acpi_ec_dispatch_gpe(void)
+ 	pm_system_cancel_wakeup();
+ 
+ 	/*
+-	 * Dispatch the EC GPE in-band, but do not report wakeup in any case
+-	 * to allow the caller to process events properly after that.
++	 * Dispatch the EC GPE in-band and drain all pending EC work.
++	 * After draining, check pm_wakeup_pending(): if an EC query method
++	 * (e.g. _Q54 for the power button) called pm_wakeup_event() during
++	 * processing, that re-arms the wakeup flag and we must honour it.
+ 	 */
+ 	spin_lock_irq(&first_ec->lock);
+ 
+@@ -2214,6 +2378,9 @@ bool acpi_ec_dispatch_gpe(void)
+ 		spin_unlock_irq(&first_ec->lock);
+ 	} while (work_in_progress && !pm_wakeup_pending());
+ 
++	if (pm_wakeup_pending())
++		return true;
++
+ 	return false;
+ }
+ #endif /* CONFIG_PM_SLEEP */
+-- 
+2.43.0
+

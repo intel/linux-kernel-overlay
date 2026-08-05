@@ -1,0 +1,244 @@
+From 3a2e7e08ebcae6b600c2d29a3d9fcefa2e919162 Mon Sep 17 00:00:00 2001
+From: Gustavo Sousa <gustavo.sousa@intel.com>
+Date: Fri, 24 Jul 2026 18:44:19 -0300
+Subject: [PATCH 4/4] drm/xe: Add up-to-date implementation for Wa_14026539277
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wa_14026539277 is a temporary workaround that targets only A*
+steppings of graphics version 35.10 and requires that we avoid using
+2-way coherency for device-cacheable memory accesses.  For
+driver-internal usage, we convert those configurations to be
+device-uncached and 1-way-coherent; on the UAPI side, we reject
+VM_BIND/MADVISE calls that are 2-way-coherent and leave it up to
+userspace to select the alternative option that is most appropriate to
+their usage.
+
+v3:
+  - Fix -Werror=misleading-indentation compile error
+v2:
+  - Add missing bits to convert the PAT value to device-uncacheable in
+    wa_14026539277_fixup_pat_value(). (Sashiko)
+  - Also validate the PAT index in the DRM_XE_VM_MADVISE
+    ioctl. (Sashiko)
+  - Match against the graphics IP instead of the platform.
+
+Signed-off-by: Gustavo Sousa <gustavo.sousa@intel.com>
+Acked-by: José Roberto de Souza <jose.souza@intel.com>
+Signed-off-by: Lili Li <lili.li@intel.com>
+---
+ drivers/gpu/drm/xe/xe_device.c     |  6 ++-
+ drivers/gpu/drm/xe/xe_pat.c        | 63 ++++++++++++++++++++++++++----
+ drivers/gpu/drm/xe/xe_pat.h        | 10 +++++
+ drivers/gpu/drm/xe/xe_vm.c         |  5 +++
+ drivers/gpu/drm/xe/xe_vm_madvise.c |  3 ++
+ drivers/gpu/drm/xe/xe_wa_oob.rules |  1 +
+ 6 files changed, 80 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 2b2e1c306420..c80a067309d3 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -765,9 +765,13 @@ static void override_has_cached_pt(struct xe_device *xe)
+ 	 * access to page tables, so we must do uncached writes from the
+ 	 * CPU.
+ 	 */
+-	for_each_gt(gt, xe, id)
++	for_each_gt(gt, xe, id) {
+ 		if (XE_GT_WA(gt, 16029380221))
+ 			xe->info.has_cached_pt = false;
++
++		if (XE_GT_WA(gt, 14026539277))
++			xe->info.has_cached_pt = false;
++	}
+ }
+ 
+ static int probe_has_flat_ccs(struct xe_device *xe)
+diff --git a/drivers/gpu/drm/xe/xe_pat.c b/drivers/gpu/drm/xe/xe_pat.c
+index 7c5703ef1253..0dd4ab2aa571 100644
+--- a/drivers/gpu/drm/xe/xe_pat.c
++++ b/drivers/gpu/drm/xe/xe_pat.c
+@@ -310,6 +310,37 @@ u16 xe_pat_index_get_l3_policy(struct xe_device *xe, u16 pat_index)
+ 	return REG_FIELD_GET(XE2_L3_POLICY, xe->pat.table[pat_index].value);
+ }
+ 
++bool xe_pat_wa_14026539277_reserved(struct xe_device *xe, u16 pat_index)
++{
++	struct xe_gt *gt;
++	u8 id;
++	bool has_wa = false;
++
++	for_each_gt(gt, xe, id) {
++		if (XE_GT_WA(gt, 14026539277)) {
++			has_wa = true;
++			break;
++		}
++	}
++
++	return has_wa && xe_pat_index_get_l3_policy(xe, pat_index) != XE_L3_POLICY_UC &&
++	       xe_pat_index_get_coh_mode(xe, pat_index) == XE_COH_2WAY;
++}
++
++static u32 wa_14026539277_fixup_pat_value(struct xe_gt *gt, u32 value)
++{
++	if (XE_GT_WA(gt, 14026539277)) {
++		if (REG_FIELD_GET(XE2_L3_POLICY, value) != XE_L3_POLICY_UC &&
++		    REG_FIELD_GET(XE2_COH_MODE, value) == XE_COH_2WAY) {
++			value &= ~(XE2_L3_POLICY | XE2_COH_MODE);
++			value |= REG_FIELD_PREP(XE2_L3_POLICY, XE_L3_POLICY_UC) |
++				 REG_FIELD_PREP(XE2_COH_MODE, XE_COH_1WAY);
++		}
++	}
++
++	return value;
++}
++
+ static void program_pat(struct xe_gt *gt, const struct xe_pat_table_entry table[],
+ 			int n_entries)
+ {
+@@ -336,16 +367,23 @@ static void program_pat_mcr(struct xe_gt *gt, const struct xe_pat_table_entry ta
+ 
+ 	for (int i = 0; i < n_entries; i++) {
+ 		struct xe_reg_mcr reg_mcr = XE_REG_MCR(_PAT_INDEX(i));
++		u32 pat = wa_14026539277_fixup_pat_value(gt, table[i].value);
+ 
+-		xe_gt_mcr_multicast_write(gt, reg_mcr, table[i].value);
++		xe_gt_mcr_multicast_write(gt, reg_mcr, pat);
+ 	}
+ 
+ 	if (xe->pat.pat_ats)
+-		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_ATS), xe->pat.pat_ats->value);
++		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_ATS),
++					  wa_14026539277_fixup_pat_value(gt,
++								     xe->pat.pat_ats->value));
+ 	if (xe->pat.pat_primary_pta && xe_gt_is_main_type(gt))
+-		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_PTA), xe->pat.pat_primary_pta->value);
++		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_PTA),
++					  wa_14026539277_fixup_pat_value(gt,
++							     xe->pat.pat_primary_pta->value));
+ 	if (xe->pat.pat_media_pta && xe_gt_is_media_type(gt))
+-		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_PTA), xe->pat.pat_media_pta->value);
++		xe_gt_mcr_multicast_write(gt, XE_REG_MCR(_PAT_PTA),
++					  wa_14026539277_fixup_pat_value(gt,
++								     xe->pat.pat_media_pta->value));
+ }
+ 
+ static int xelp_dump(struct xe_gt *gt, struct drm_printer *p)
+@@ -495,13 +533,16 @@ static int xe2_dump(struct xe_gt *gt, struct drm_printer *p)
+ 	drm_printf(p, "PAT table: (* = reserved entry)\n");
+ 
+ 	for (i = 0; i < xe->pat.n_entries; i++) {
++		bool rsvd = !xe->pat.table[i].valid ||
++			    xe_pat_wa_14026539277_reserved(xe, i);
++
+ 		if (xe_gt_is_media_type(gt))
+ 			pat = xe_mmio_read32(&gt->mmio, XE_REG(_PAT_INDEX(i)));
+ 		else
+ 			pat = xe_gt_mcr_unicast_read_any(gt, XE_REG_MCR(_PAT_INDEX(i)));
+ 
+ 		xe_pat_index_label(label, sizeof(label), i);
+-		xe2_pat_entry_dump(p, label, pat, !xe->pat.table[i].valid);
++		xe2_pat_entry_dump(p, label, pat, rsvd);
+ 	}
+ 
+ 	/*
+@@ -719,13 +760,17 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+ 	drm_printf(p, "PAT table:%s\n", GRAPHICS_VER(xe) >= 20 ? " (* = reserved entry)" : "");
+ 	for (u32 i = 0; i < xe->pat.n_entries; i++) {
+ 		u32 pat = xe->pat.table[i].value;
++		bool rsvd = !xe->pat.table[i].valid ||
++			    xe_pat_wa_14026539277_reserved(xe, i);
++
++		pat = wa_14026539277_fixup_pat_value(gt, pat);
+ 
+ 		if (GRAPHICS_VERx100(xe) == 3511) {
+ 			xe_pat_index_label(label, sizeof(label), i);
+-			xe3p_xpc_pat_entry_dump(p, label, pat, !xe->pat.table[i].valid);
++			xe3p_xpc_pat_entry_dump(p, label, pat, rsvd);
+ 		} else if (GRAPHICS_VER(xe) == 30 || GRAPHICS_VER(xe) == 20) {
+ 			xe_pat_index_label(label, sizeof(label), i);
+-			xe2_pat_entry_dump(p, label, pat, !xe->pat.table[i].valid);
++			xe2_pat_entry_dump(p, label, pat, rsvd);
+ 		} else if (xe->info.platform == XE_METEORLAKE) {
+ 			xelpg_pat_entry_dump(p, i, pat);
+ 		} else if (xe->info.platform == XE_PVC) {
+@@ -740,6 +785,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+ 	if (pta_entry) {
+ 		u32 pat = pta_entry->value;
+ 
++		pat = wa_14026539277_fixup_pat_value(gt, pat);
++
+ 		drm_printf(p, "Page Table Access:\n");
+ 		xe2_pat_entry_dump(p, "PTA_MODE", pat, false);
+ 	}
+@@ -747,6 +794,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+ 	if (xe->pat.pat_ats) {
+ 		u32 pat = xe->pat.pat_ats->value;
+ 
++		pat = wa_14026539277_fixup_pat_value(gt, pat);
++
+ 		drm_printf(p, "PCIe ATS/PASID:\n");
+ 		xe2_pat_entry_dump(p, "PAT_ATS ", pat, false);
+ 	}
+diff --git a/drivers/gpu/drm/xe/xe_pat.h b/drivers/gpu/drm/xe/xe_pat.h
+index a1e287c08f57..40c754873f2c 100644
+--- a/drivers/gpu/drm/xe/xe_pat.h
++++ b/drivers/gpu/drm/xe/xe_pat.h
+@@ -82,4 +82,14 @@ bool xe_pat_index_get_comp_en(struct xe_device *xe, u16 pat_index);
+  */
+ u16 xe_pat_index_get_l3_policy(struct xe_device *xe, u16 pat_index);
+ 
++/**
++ * xe_pat_wa_14026539277_reserved - Is this PAT index reserved from
++ * use due to Wa_14026539277?
++ * @xe: xe device
++ * @pat_index: The pat_index to query
++ *
++ * Return: a boolean indicating whether the PAT index is reserved or not.
++ */
++bool xe_pat_wa_14026539277_reserved(struct xe_device *xe, u16 pat_index);
++
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 4ec7d079472a..6a66671ce3b4 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -3433,6 +3433,11 @@ static int vm_bind_ioctl_check_args(struct xe_device *xe, struct xe_vm *vm,
+ 
+ 		pat_index = array_index_nospec(pat_index, xe->pat.n_entries);
+ 		(*bind_ops)[i].pat_index = pat_index;
++		if (XE_IOCTL_DBG(xe, xe_pat_wa_14026539277_reserved(xe, pat_index))) {
++			err = -EINVAL;
++			goto free_bind_ops;
++		}
++
+ 		coh_mode = xe_pat_index_get_coh_mode(xe, pat_index);
+ 		comp_en = xe_pat_index_get_comp_en(xe, pat_index);
+ 		if (XE_IOCTL_DBG(xe, !coh_mode)) { /* hw reserved */
+diff --git a/drivers/gpu/drm/xe/xe_vm_madvise.c b/drivers/gpu/drm/xe/xe_vm_madvise.c
+index 59dfa396e8fa..74d4d0b8a576 100644
+--- a/drivers/gpu/drm/xe/xe_vm_madvise.c
++++ b/drivers/gpu/drm/xe/xe_vm_madvise.c
+@@ -297,6 +297,9 @@ static bool madvise_args_are_sane(struct xe_device *xe, const struct drm_xe_madv
+ 			return false;
+ 
+ 		pat_index = array_index_nospec(args->pat_index.val, xe->pat.n_entries);
++		if (XE_IOCTL_DBG(xe, xe_pat_wa_14026539277_reserved(xe, pat_index)))
++			return false;
++
+ 		coh_mode = xe_pat_index_get_coh_mode(xe, pat_index);
+ 		if (XE_IOCTL_DBG(xe, !coh_mode))
+ 			return false;
+diff --git a/drivers/gpu/drm/xe/xe_wa_oob.rules b/drivers/gpu/drm/xe/xe_wa_oob.rules
+index 1509e50520df..14c29be93fd0 100644
+--- a/drivers/gpu/drm/xe/xe_wa_oob.rules
++++ b/drivers/gpu/drm/xe/xe_wa_oob.rules
+@@ -74,3 +74,4 @@
+ 16026007364    MEDIA_VERSION(3000)
+ 14020316580    MEDIA_VERSION(1301)
+ 16029380221	MEDIA_VERSION(3500)
++14026539277	GRAPHICS_VERSION(3510), GRAPHICS_STEP(A0, B0)
+-- 
+2.43.0
+

@@ -1,0 +1,156 @@
+From d3e48eef70cb76ab746903091aeafb602dbe9b1e Mon Sep 17 00:00:00 2001
+From: Saranya Gopal <saranya.gopal@intel.com>
+Date: Fri, 5 Jun 2026 11:02:58 +0530
+Subject: [PATCH 5/5] PM: INTERNAL: ACPI: EC: discriminate power-button wake
+ from idle EC SCI via SCEF
+
+On MMIO-based EC platforms the QR_EC path used for power-button
+detection does not work during S0ix:
+
+ - The AML _L6E handler is never executed because the kernel installs
+   a raw GPE handler that intercepts the SCI before AML sees it.
+ - QR_EC transactions time out because the EC is unresponsive during
+   the S0ix freeze phase.
+ - The AML QE54() method has an S0ID==0 guard that makes it a no-op
+   when Linux sets S0ID=1 during freeze.
+ - Direct readq of the SCEF register (0xFE400000) without the ACLK
+   lock always returns 0xFFFFFFFFFFFFFFFF.
+
+Fix by replicating the ESCI() AML method in the kernel's
+acpi_ec_dispatch_gpe() without the S0ID guard:
+
+ 1. Request the ACLK lock: outb(0x10, EC command port), poll bit 4.
+ 2. Read the 64-bit SCEF register at 0xFE400000.
+ 3. If bit 13 (0x2000) is set a power-button press triggered the SCI;
+    clear that bit (CSCE) while the lock is held and return true (wake).
+ 4. Release the lock: outb(0x00, EC command port), poll bit 4 clear.
+ 5. If bit 13 is clear this is idle EC traffic; return false (suppress).
+
+If ACLK cannot be granted within 1 ms (EC unresponsive) fall through
+to the existing QR_EC drain path.
+
+The SCEF register address and ACLK handshake port are defined as
+named constants (EC_SCEF_MMIO_ADDR, EC_ACLK_LOCK, SCEF_PWRB_BIT).
+The register is mapped once with acpi_os_map_iomem() during EC probe
+and stored in ec_mmioec_scef.
+
+Tested on Nova Lake H (NVL) with eSPI EC (PNP0C02 / UID=MMIOEC):
+ - Idle EC SCI: SCEF bit 13 clear -> correctly suppressed
+ - Power-button press: SCEF bit 13 set -> correctly resumes
+
+(cherry picked from commit 3b71094fd43b56ec9af1c4b9fee96f25ecddb606)
+Signed-off-by: Pedaballi, ManikanthX Reddy <manikanthx.reddy.pedaballi@intel.com>
+(cherry picked from commit f3a76ca10dfdfa53456d937ed4d87e1dd7dbf815)
+Signed-off-by: Pedaballi, ManikanthX Reddy <manikanthx.reddy.pedaballi@intel.com>
+(cherry picked from commit 7761414005e8bbf19b6722ab616c027269d952f1)
+---
+ drivers/acpi/ec.c | 79 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/drivers/acpi/ec.c b/drivers/acpi/ec.c
+index 23f418928086..c843fc9c061e 100644
+--- a/drivers/acpi/ec.c
++++ b/drivers/acpi/ec.c
+@@ -186,6 +186,29 @@ EXPORT_SYMBOL(first_ec);
+  */
+ static int ec_wake_gpe = -1;
+ 
++/*
++ * MMIO-based EC (eSPI SCI) SCI Event Flags (SCEF) register.
++ *
++ * EC firmware records pending SCI events in a 64-bit MMIO register at
++ * 0xFE400000.  Bit 13 (0x2000) is set when a power-button press caused the
++ * EC SCI, allowing the driver to distinguish a real PB wake from idle EC
++ * traffic without executing a QR_EC command (which times out during S0ix).
++ *
++ * The register is only accessible under the ACLK lock handshake on the EC
++ * command I/O port:
++ *   ACLK: outb(0x10, cmd), poll bit 4 set  -- up to 100x10 us
++ *   read SCEF; clear bit 13 if set (CSCE)
++ *   RELK: outb(0x00, cmd), poll bit 4 clear
++ *
++ * Use acpi_os_map_iomem(): plain ioremap() fails because the ACPI subsystem
++ * marks 0xFE400000 as an exclusive resource.
++ */
++#define EC_SCEF_MMIO_ADDR	0xFE400000UL	/* ECMS base address */
++#define EC_ACLK_LOCK		0x10		/* bit 4: lock request / granted */
++#define SCEF_PWRB_BIT		BIT_ULL(13)	/* power-button press */
++
++static void __iomem *ec_mmioec_scef;
++
+ static struct acpi_ec *boot_ec;
+ static bool boot_ec_is_ecdt;
+ static struct workqueue_struct *ec_wq;
+@@ -1543,6 +1566,16 @@ ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
+ 	if (ec->data_addr != 0 && ec->command_addr == 0 && ec_is_mmioec_uid(handle))
+ 		ec->command_addr = ec->data_addr;
+ 
++	/*
++	 * Map the SCEF register once so acpi_ec_dispatch_gpe() can read it
++	 * under the ACLK lock to discriminate power-button wakes from idle
++	 * EC SCI traffic.  Done after the port fixup so command_addr is valid.
++	 */
++	if (ec_is_mmioec_uid(handle) && !ec_mmioec_scef)
++		ec_mmioec_scef = acpi_os_map_iomem(
++					(acpi_physical_address)EC_SCEF_MMIO_ADDR,
++					sizeof(u64));
++
+ 	if (ec->data_addr == 0 || ec->command_addr == 0)
+ 		return AE_OK;
+ 
+@@ -2360,6 +2393,52 @@ bool acpi_ec_dispatch_gpe(void)
+ 
+ 	spin_unlock_irq(&first_ec->lock);
+ 
++	/*
++	 * MMIO-based EC (eSPI SCI): check the SCEF register under the ACLK
++	 * lock to determine whether the EC SCI was triggered by a power-button
++	 * press (bit 13 set) or by idle EC traffic.
++	 *
++	 * Direct readq without ACLK returns 0xFFFFFFFFFFFFFFFF; the EC only
++	 * exposes the register after granting the ACLK lock.  This mirrors the
++	 * AML ESCI() method but without the S0ID==0 guard in QE54() that
++	 * suppresses PB wakes when Linux sets S0ID=1 during the freeze phase.
++	 */
++	if (ec_mmioec_scef && first_ec->command_addr) {
++		unsigned long cmd = first_ec->command_addr;
++		bool locked = false;
++		u64 scef;
++		int i;
++
++		/* ACLK: request EC register-access lock */
++		outb(EC_ACLK_LOCK, cmd);
++		for (i = 0; i < 100; i++) {
++			if (inb(cmd) & EC_ACLK_LOCK) {
++				locked = true;
++				break;
++			}
++			udelay(10);
++		}
++
++		if (locked) {
++			scef = readq(ec_mmioec_scef);
++
++			/* CSCE: clear PB bit while lock is held */
++			if (scef & SCEF_PWRB_BIT)
++				writeq(scef & ~SCEF_PWRB_BIT, ec_mmioec_scef);
++
++			/* RELK: release EC register-access lock */
++			outb(0x00, cmd);
++			for (i = 0; i < 100; i++) {
++				if (!(inb(cmd) & EC_ACLK_LOCK))
++					break;
++				udelay(10);
++			}
++
++			return !!(scef & SCEF_PWRB_BIT);
++		}
++		/* ACLK failed: EC unresponsive; fall through to QR_EC drain */
++	}
++
+ 	if (!work_in_progress)
+ 		return false;
+ 
+-- 
+2.43.0
+
