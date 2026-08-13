@@ -783,12 +783,16 @@ verify-deb-packages:
 	@echo "Verifying Debian package consistency..."
 	@echo "======================================================================"
 	@FAILED=0; \
+	config=$$(ls $(BUILD_PACKAGES_DEB_DIR)/linux-config-*.deb 2>/dev/null | head -1); \
+	if [ -z "$$config" ]; then \
+		echo "⚠️  Warning: no linux-config-*.deb found; Intel config-coverage check will be skipped"; \
+	fi; \
 	for binary in $(BUILD_PACKAGES_DEB_DIR)/linux-binary-*.deb; do \
 		if [ -f "$$binary" ]; then \
 			modules=$$(echo $$binary | sed 's/linux-binary-/linux-modules-/'); \
 			if [ -f "$$modules" ]; then \
 				echo ""; \
-				if ! $(CURDIR)/scripts/verify-kernel-package.sh "$$binary" "$$modules"; then \
+				if ! $(CURDIR)/scripts/verify-kernel-package.sh "$$binary" "$$modules" "$$config"; then \
 					FAILED=1; \
 				fi; \
 			else \
