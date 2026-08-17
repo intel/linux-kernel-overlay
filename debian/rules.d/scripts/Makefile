@@ -40,6 +40,7 @@ SCRIPTS =  \
 SUBDIRS = \
 	basic \
 	genksyms \
+	gendwarfksyms \
 	kconfig \
 	lib/kdoc \
 	mod
