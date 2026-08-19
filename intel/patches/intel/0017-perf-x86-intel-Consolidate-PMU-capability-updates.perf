@@ -1,0 +1,137 @@
+From 8192744e2111d9ad5a12db64e09aaccf80cc0bd9 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Tue, 9 Jun 2026 15:02:36 +0800
+Subject: [PATCH 17/52] perf/x86/intel: Consolidate PMU capability updates
+
+Currently, the PERF_PMU_CAP_EXTENDED_REGS capability is set in two
+different places: intel_ds_pebs_init() and __intel_update_pmu_caps()
+for adaptive and architectural PEBS. The upcoming XSAVES-based SIMD
+register sampling will also require setting and validating this
+capability. Managing it across multiple locations introduces
+unnecessary complexity and potential conflicts.
+
+To centralize and simplify the PERF_PMU_CAP_EXTENDED_REGS logic,
+consolidate its initialization into a single helper function,
+__intel_update_pmu_xregs_caps(), handling both adaptive and
+architectural PEBS.
+
+Additionally, optimize the capability update paths by moving the
+initialization of intel_cap.capabilities out of the update_pmu_cap()
+helper. The helper is guarded by archPerfmonExt support, whereas
+intel_cap.capabilities is independent of it.
+
+Finally, introduce a new wrapper function, intel_update_pmu_caps(),
+to cleanly encapsulate all these PMU capability updates.
+
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/intel/core.c | 32 ++++++++++++++++++--------------
+ arch/x86/events/intel/ds.c   |  1 -
+ 2 files changed, 18 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 2e658b4bc83a..077b4b4bfadf 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -6151,11 +6151,13 @@ static inline bool intel_pmu_broken_perf_cap(void)
+ 	return false;
+ }
+ 
+-static inline void __intel_update_pmu_caps(struct pmu *pmu)
++static inline void __intel_update_pmu_xregs_caps(struct pmu *pmu)
+ {
+ 	struct pmu *dest_pmu = pmu ? pmu : x86_get_pmu(smp_processor_id());
++	u64 caps = hybrid(pmu, arch_pebs_cap).caps;
+ 
+-	if (hybrid(pmu, arch_pebs_cap).caps & ARCH_PEBS_VECR_XMM)
++	if ((x86_pmu.arch_pebs && (caps & ARCH_PEBS_VECR_XMM)) ||
++	    (x86_pmu.intel_cap.pebs_format >= 4 && x86_pmu.intel_cap.pebs_baseline))
+ 		dest_pmu->capabilities |= PERF_PMU_CAP_EXTENDED_REGS;
+ }
+ 
+@@ -6179,7 +6181,7 @@ static inline void __intel_update_large_pebs_flags(struct pmu *pmu)
+ 
+ #define counter_mask(_gp, _fixed) ((_gp) | ((u64)(_fixed) << INTEL_PMC_IDX_FIXED))
+ 
+-static void update_pmu_cap(struct pmu *pmu)
++static void update_pmu_cap_from_perfmonext(struct pmu *pmu)
+ {
+ 	unsigned int eax, ebx, ecx, edx;
+ 	union cpuid35_eax eax_0;
+@@ -6227,21 +6229,26 @@ static void update_pmu_cap(struct pmu *pmu)
+ 		hybrid(pmu, arch_pebs_cap).counters = pebs_mask;
+ 		hybrid(pmu, arch_pebs_cap).pdists = pdists_mask;
+ 
+-		if (WARN_ON((pebs_mask | pdists_mask) & ~cntrs_mask)) {
++		if (WARN_ON((pebs_mask | pdists_mask) & ~cntrs_mask))
+ 			x86_pmu.arch_pebs = 0;
+-		} else {
+-			__intel_update_pmu_caps(pmu);
++		else
+ 			__intel_update_large_pebs_flags(pmu);
+-		}
+ 	} else {
+ 		WARN_ON(x86_pmu.arch_pebs == 1);
+ 		x86_pmu.arch_pebs = 0;
+ 	}
++}
+ 
+-	if (!intel_pmu_broken_perf_cap()) {
++static void intel_update_pmu_caps(struct pmu *pmu)
++{
++	if (this_cpu_has(X86_FEATURE_ARCH_PERFMON_EXT))
++		update_pmu_cap_from_perfmonext(pmu);
++
++	if (this_cpu_has(X86_FEATURE_PDCM) && !intel_pmu_broken_perf_cap()) {
+ 		/* Perf Metric (Bit 15) and PEBS via PT (Bit 16) are hybrid enumeration */
+ 		rdmsrq(MSR_IA32_PERF_CAPABILITIES, hybrid(pmu, intel_cap).capabilities);
+ 	}
++	__intel_update_pmu_xregs_caps(pmu);
+ }
+ 
+ static void intel_pmu_check_hybrid_pmus(struct x86_hybrid_pmu *pmu)
+@@ -6325,8 +6332,7 @@ static bool init_hybrid_pmu(int cpu)
+ 	if (!cpumask_empty(&pmu->supported_cpus))
+ 		goto end;
+ 
+-	if (this_cpu_has(X86_FEATURE_ARCH_PERFMON_EXT))
+-		update_pmu_cap(&pmu->pmu);
++	intel_update_pmu_caps(&pmu->pmu);
+ 
+ 	intel_pmu_check_hybrid_pmus(pmu);
+ 
+@@ -6395,8 +6401,6 @@ static void intel_pmu_cpu_starting(int cpu)
+ 		}
+ 	}
+ 
+-	__intel_update_pmu_caps(cpuc->pmu);
+-
+ 	if (!cpuc->shared_regs)
+ 		return;
+ 
+@@ -8821,8 +8825,8 @@ __init int intel_pmu_init(void)
+ 	 * from the leaf 0xa. The core specific update will be done later
+ 	 * when a new type is online.
+ 	 */
+-	if (!is_hybrid() && boot_cpu_has(X86_FEATURE_ARCH_PERFMON_EXT))
+-		update_pmu_cap(NULL);
++	if (!is_hybrid())
++		intel_update_pmu_caps(NULL);
+ 
+ 	if (x86_pmu.arch_pebs) {
+ 		static_call_update(intel_pmu_disable_event_ext,
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 7b69f8c8d0c2..78b9c0dcb14d 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -3396,7 +3396,6 @@ static void __init intel_ds_pebs_init(void)
+ 				x86_pmu.flags |= PMU_FL_PEBS_ALL;
+ 				x86_pmu.pebs_capable = ~0ULL;
+ 				pebs_qual = "-baseline";
+-				x86_get_pmu(smp_processor_id())->capabilities |= PERF_PMU_CAP_EXTENDED_REGS;
+ 			} else {
+ 				/* Only basic record supported */
+ 				x86_pmu.large_pebs_flags &=
+-- 
+2.43.0
+

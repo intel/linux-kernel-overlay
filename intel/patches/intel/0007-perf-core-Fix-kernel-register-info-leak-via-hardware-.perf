@@ -1,0 +1,98 @@
+From b6292f0c2287867ad3e98ad7599664d9b4701a87 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Thu, 4 Jun 2026 09:26:54 +0800
+Subject: [PATCH 07/52] perf/core: Fix kernel register info leak via hardware
+ skid
+
+An unprivileged hardware perf event using exclude_kernel=1 can leak kernel
+register data to user space via PERF_SAMPLE_REGS_INTR or PERF_SAMPLE_IP.
+Due to hardware skid, a PMI may trigger after the CPU has already entered
+kernel space (Ring 0), bypassing the perf_allow_kernel() privilege
+barrier.
+
+This security vulnerability is severely exacerbated by upcoming support
+for SIMD register sampling via XSAVES, which could expose sensitive kernel
+FPU states (such as active cryptographic keys).
+
+Fix this by ensuring that sampled register data is dropped if the event's
+exclude_kernel attribute is set but the PMI catches the CPU in kernel mode.
+
+Link: https://lore.kernel.org/all/20260529085613.CCAFB1F00893@smtp.kernel.org/
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Ian Rogers <irogers@google.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ kernel/events/core.c | 37 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index ba5bd6a78fe7..eae769ec4f68 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7793,10 +7793,20 @@ unsigned long perf_misc_flags(struct perf_event *event,
+ unsigned long perf_instruction_pointer(struct perf_event *event,
+ 				       struct pt_regs *regs)
+ {
+-	if (should_sample_guest(event))
+-		return perf_guest_get_ip();
++	/*
++	 * Hardware skid can lead to a scenario where a PMI is
++	 * delivered after the CPU has already entered kernel mode.
++	 * In that case, user-space sampling must not expose kernel
++	 * register state.
++	 */
++	if (should_sample_guest(event)) {
++		return event->attr.exclude_kernel &&
++		       !(perf_guest_state() & PERF_GUEST_USER) ?
++			0 : perf_guest_get_ip();
++	}
+ 
+-	return perf_arch_instruction_pointer(regs);
++	return event->attr.exclude_kernel && !user_mode(regs) ?
++		0 : perf_arch_instruction_pointer(regs);
+ }
+ 
+ static void
+@@ -7830,10 +7840,22 @@ static void perf_sample_regs_user(struct perf_regs *regs_user,
+ }
+ 
+ static void perf_sample_regs_intr(struct perf_regs *regs_intr,
+-				  struct pt_regs *regs)
++				  struct pt_regs *regs,
++				  bool exclude_kernel)
+ {
+-	regs_intr->regs = regs;
+-	regs_intr->abi  = perf_reg_abi(current);
++	/*
++	 * Hardware skid can lead to a scenario where a PMI is
++	 * delivered after the CPU has already entered kernel mode.
++	 * In that case, user-space sampling must not expose kernel
++	 * register state.
++	 */
++	if (exclude_kernel && !user_mode(regs)) {
++		regs_intr->abi = PERF_SAMPLE_REGS_ABI_NONE;
++		regs_intr->regs = NULL;
++	} else {
++		regs_intr->regs = regs;
++		regs_intr->abi = perf_reg_abi(current);
++	}
+ }
+ 
+ 
+@@ -8724,7 +8746,8 @@ void perf_prepare_sample(struct perf_sample_data *data,
+ 		/* regs dump ABI info */
+ 		int size = sizeof(u64);
+ 
+-		perf_sample_regs_intr(&data->regs_intr, regs);
++		perf_sample_regs_intr(&data->regs_intr, regs,
++				      event->attr.exclude_kernel);
+ 
+ 		if (data->regs_intr.regs) {
+ 			u64 mask = event->attr.sample_regs_intr;
+-- 
+2.43.0
+

@@ -1,0 +1,311 @@
+From 591b4778e16719da752b79658d41f6dbf20f86a4 Mon Sep 17 00:00:00 2001
+From: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Date: Mon, 9 Feb 2026 15:20:43 +0800
+Subject: [PATCH 26/52] perf/x86: Support eGPRs sampling using sample_regs_*
+ fields
+
+Support sampling of APX eGPRs (R16 ~ R31) via the sample_regs_* fields.
+
+To sample eGPRs, the sample_simd_regs_enabled field must be set. This
+allows the spare space (reclaimed from the original XMM space) in the
+sample_regs_* fields to be used for representing eGPRs.
+
+The perf_reg_value() function needs to check if the
+PERF_SAMPLE_REGS_ABI_SIMD flag is set first, and then determine whether
+to output eGPRs or legacy XMM registers to userspace.
+
+The perf_reg_validate() function first checks the simd_enabled argument
+to determine if the eGPRs bitmap is represented in sample_regs_* fields.
+It then validates the eGPRs bitmap accordingly.
+
+Currently, eGPRs sampling is only supported on the x86_64 architecture, as
+APX is only available on x86_64 platforms.
+
+APX eGPRs sampling will be enabled in a subsequent patch that sets
+PERF_PMU_CAP_SIMD_REGS.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Co-developed-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+---
+ arch/x86/events/core.c                | 39 +++++++++++++++------
+ arch/x86/events/intel/core.c          |  4 ++-
+ arch/x86/events/perf_event.h          | 16 +++++++++
+ arch/x86/include/asm/perf_event.h     |  4 +++
+ arch/x86/include/uapi/asm/perf_regs.h | 26 ++++++++++++++
+ arch/x86/kernel/perf_regs.c           | 50 +++++++++++++++++----------
+ 6 files changed, 109 insertions(+), 30 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 72d57d19693c..db995b0a4147 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -708,20 +708,23 @@ int x86_pmu_hw_config(struct perf_event *event)
+ 	}
+ 
+ 	if (event->attr.sample_type & (PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER)) {
+-		/*
+-		 * Besides the general purpose registers, XMM registers may
+-		 * be collected as well.
+-		 */
+-		if (event_has_extended_regs(event)) {
+-			if (!(event->pmu->capabilities & PERF_PMU_CAP_EXTENDED_REGS))
+-				return -EINVAL;
+-			if (event->attr.sample_simd_regs_enabled)
+-				return -EINVAL;
+-		}
+-
+ 		if (event_has_simd_regs(event)) {
++			u64 reserved = ~GENMASK_ULL(PERF_REG_MISC_MAX - 1, 0);
++
+ 			if (!(event->pmu->capabilities & PERF_PMU_CAP_SIMD_REGS))
+ 				return -EINVAL;
++			/*
++			 * The XMM space in the perf_event_x86_regs is reclaimed
++			 * for eGPRs and other general registers.
++			 */
++			if (((event->attr.sample_type & PERF_SAMPLE_REGS_INTR) &&
++			     (event->attr.sample_regs_intr & reserved)) ||
++			    ((event->attr.sample_type & PERF_SAMPLE_REGS_USER) &&
++			     (event->attr.sample_regs_user & reserved)))
++				return -EINVAL;
++			if (event_needs_egprs(event) &&
++			    !(x86_pmu.ext_regs_mask & XFEATURE_MASK_APX))
++				return -EINVAL;
+ 			/* The vector registers set is not supported */
+ 			if (event_needs_xmm(event) &&
+ 			    !(x86_pmu.ext_regs_mask & XFEATURE_MASK_SSE))
+@@ -738,6 +741,15 @@ int x86_pmu_hw_config(struct perf_event *event)
+ 			if (event_needs_opmask(event) &&
+ 			    !(x86_pmu.ext_regs_mask & XFEATURE_MASK_OPMASK))
+ 				return -EINVAL;
++		} else {
++			/*
++			 * Besides the general purpose registers, XMM registers may
++			 * be collected as well.
++			 */
++			if (event_has_extended_regs(event)) {
++				if (!(event->pmu->capabilities & PERF_PMU_CAP_EXTENDED_REGS))
++					return -EINVAL;
++			}
+ 		}
+ 	}
+ 
+@@ -1786,6 +1798,7 @@ void x86_pmu_clear_perf_regs(struct pt_regs *regs)
+ 	perf_regs->zmmh_regs = NULL;
+ 	perf_regs->h16zmm_regs = NULL;
+ 	perf_regs->opmask_regs = NULL;
++	perf_regs->egpr_regs = NULL;
+ }
+ 
+ static void update_perf_regs(struct x86_perf_regs *perf_regs,
+@@ -1809,6 +1822,8 @@ static void update_perf_regs(struct x86_perf_regs *perf_regs,
+ 		perf_regs->h16zmm = get_xsave_addr(xsave, XFEATURE_Hi16_ZMM);
+ 	if (mask & XFEATURE_MASK_OPMASK)
+ 		perf_regs->opmask = get_xsave_addr(xsave, XFEATURE_OPMASK);
++	if (mask & XFEATURE_MASK_APX)
++		perf_regs->egpr = get_xsave_addr(xsave, XFEATURE_APX);
+ }
+ 
+ /*
+@@ -1998,6 +2013,8 @@ static void x86_pmu_sample_xregs(struct perf_event *event,
+ 		mask |= XFEATURE_MASK_Hi16_ZMM;
+ 	if (event_needs_opmask(event))
+ 		mask |= XFEATURE_MASK_OPMASK;
++	if (event_needs_egprs(event))
++		mask |= XFEATURE_MASK_APX;
+ 
+ 	mask &= x86_pmu.ext_regs_mask;
+ 	if ((sample_type & PERF_SAMPLE_REGS_USER) && data->regs_user.regs) {
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 5260908330a1..3e02d79445e7 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -4697,7 +4697,9 @@ static void intel_pebs_aliases_skl(struct perf_event *event)
+ static unsigned long intel_pmu_large_pebs_flags(struct perf_event *event)
+ {
+ 	unsigned long flags = x86_pmu.large_pebs_flags;
+-	u64 gprs_mask = PEBS_GP_REGS | PERF_REG_EXTENDED_MASK;
++	u64 gprs_mask = event->attr.sample_simd_regs_enabled ?
++			PEBS_GP_REGS :
++			PEBS_GP_REGS | PERF_REG_EXTENDED_MASK;
+ 
+ 	if (event->attr.use_clockid)
+ 		flags &= ~PERF_SAMPLE_TIME;
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 955c75b43424..40888d654998 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -217,6 +217,22 @@ static inline bool event_needs_opmask(struct perf_event *event)
+ 	return false;
+ }
+ 
++static inline bool event_needs_egprs(struct perf_event *event)
++{
++	if (!event->attr.sample_simd_regs_enabled)
++		return false;
++
++	if ((event->attr.sample_type & PERF_SAMPLE_REGS_USER) &&
++	    (event->attr.sample_regs_user & PERF_X86_EGPRS_MASK))
++		return true;
++
++	if ((event->attr.sample_type & PERF_SAMPLE_REGS_INTR) &&
++	    (event->attr.sample_regs_intr & PERF_X86_EGPRS_MASK))
++		return true;
++
++	return false;
++}
++
+ struct amd_nb {
+ 	int nb_id;  /* NorthBridge id */
+ 	int refcnt; /* reference count */
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index 49112e097e99..bc05f8c17464 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -749,6 +749,10 @@ struct x86_perf_regs {
+ 		u64	*opmask_regs;
+ 		struct avx_512_opmask_state *opmask;
+ 	};
++	union {
++		u64	*egpr_regs;
++		struct apx_state *egpr;
++	};
+ };
+ 
+ extern unsigned long perf_arch_instruction_pointer(struct pt_regs *regs);
+diff --git a/arch/x86/include/uapi/asm/perf_regs.h b/arch/x86/include/uapi/asm/perf_regs.h
+index 61aec60623f1..977831bd7a9d 100644
+--- a/arch/x86/include/uapi/asm/perf_regs.h
++++ b/arch/x86/include/uapi/asm/perf_regs.h
+@@ -29,9 +29,34 @@ enum perf_event_x86_regs {
+ 	PERF_REG_X86_R13,
+ 	PERF_REG_X86_R14,
+ 	PERF_REG_X86_R15,
++	/*
++	 * The eGPRs and XMM have overlaps. Only one can be used
++	 * at a time. The ABI PERF_SAMPLE_REGS_ABI_SIMD is used to
++	 * distinguish which one is used. If PERF_SAMPLE_REGS_ABI_SIMD
++	 * is set, then eGPRs is used, otherwise, XMM is used.
++	 *
++	 * Extended GPRs (eGPRs)
++	 */
++	PERF_REG_X86_R16,
++	PERF_REG_X86_R17,
++	PERF_REG_X86_R18,
++	PERF_REG_X86_R19,
++	PERF_REG_X86_R20,
++	PERF_REG_X86_R21,
++	PERF_REG_X86_R22,
++	PERF_REG_X86_R23,
++	PERF_REG_X86_R24,
++	PERF_REG_X86_R25,
++	PERF_REG_X86_R26,
++	PERF_REG_X86_R27,
++	PERF_REG_X86_R28,
++	PERF_REG_X86_R29,
++	PERF_REG_X86_R30,
++	PERF_REG_X86_R31,
+ 	/* These are the limits for the GPRs. */
+ 	PERF_REG_X86_32_MAX = PERF_REG_X86_GS + 1,
+ 	PERF_REG_X86_64_MAX = PERF_REG_X86_R15 + 1,
++	PERF_REG_MISC_MAX = PERF_REG_X86_R31 + 1,
+ 
+ 	/* These all need two bits set because they are 128bit */
+ 	PERF_REG_X86_XMM0  = 32,
+@@ -56,6 +81,7 @@ enum perf_event_x86_regs {
+ };
+ 
+ #define PERF_REG_EXTENDED_MASK	(~((1ULL << PERF_REG_X86_XMM0) - 1))
++#define PERF_X86_EGPRS_MASK	__GENMASK_ULL(PERF_REG_X86_R31, PERF_REG_X86_R16)
+ 
+ enum {
+ 	PERF_X86_SIMD_XMM_REGS      = 16,
+diff --git a/arch/x86/kernel/perf_regs.c b/arch/x86/kernel/perf_regs.c
+index d774ab0e52a2..ee4169f39157 100644
+--- a/arch/x86/kernel/perf_regs.c
++++ b/arch/x86/kernel/perf_regs.c
+@@ -61,14 +61,24 @@ u64 perf_reg_value(struct pt_regs *regs, int idx)
+ {
+ 	struct x86_perf_regs *perf_regs;
+ 
+-	if (idx >= PERF_REG_X86_XMM0 && idx < PERF_REG_X86_XMM_MAX) {
++	if (idx > PERF_REG_X86_R15) {
+ 		perf_regs = container_of(regs, struct x86_perf_regs, regs);
+-		/* SIMD registers are moved to dedicated sample_simd_vec_reg */
+-		if (perf_regs->abi & PERF_SAMPLE_REGS_ABI_SIMD)
++		if (perf_regs->abi == PERF_SAMPLE_REGS_ABI_NONE)
+ 			return 0;
+-		if (!perf_regs->xmm_regs)
+-			return 0;
+-		return perf_regs->xmm_regs[idx - PERF_REG_X86_XMM0];
++
++		if (perf_regs->abi & PERF_SAMPLE_REGS_ABI_SIMD) {
++			if (idx <= PERF_REG_X86_R31) {
++				if (!perf_regs->egpr_regs)
++					return 0;
++				return perf_regs->egpr_regs[idx - PERF_REG_X86_R16];
++			}
++		} else {
++			if (idx >= PERF_REG_X86_XMM0 && idx < PERF_REG_X86_XMM_MAX) {
++				if (!perf_regs->xmm_regs)
++					return 0;
++				return perf_regs->xmm_regs[idx - PERF_REG_X86_XMM0];
++			}
++		}
+ 	}
+ 
+ 	if (WARN_ON_ONCE(idx >= ARRAY_SIZE(pt_regs_offset)))
+@@ -192,23 +202,22 @@ int perf_simd_reg_validate(u64 sample_type, u16 simd_enabled,
+ 	return 0;
+ }
+ 
+-#define PERF_REG_X86_RESERVED	(((1ULL << PERF_REG_X86_XMM0) - 1) & \
+-				 ~((1ULL << PERF_REG_X86_MAX) - 1))
++#define PERF_REG_X86_RESERVED	(GENMASK_ULL(PERF_REG_X86_XMM0 - 1, PERF_REG_X86_AX) & \
++				 ~GENMASK_ULL(PERF_REG_X86_R15, PERF_REG_X86_AX))
++#define PERF_REG_X86_EXT_RESERVED	(~GENMASK_ULL(PERF_REG_MISC_MAX - 1, PERF_REG_X86_AX))
+ 
+ #ifdef CONFIG_X86_32
+-#define REG_NOSUPPORT ((1ULL << PERF_REG_X86_R8) | \
+-		       (1ULL << PERF_REG_X86_R9) | \
+-		       (1ULL << PERF_REG_X86_R10) | \
+-		       (1ULL << PERF_REG_X86_R11) | \
+-		       (1ULL << PERF_REG_X86_R12) | \
+-		       (1ULL << PERF_REG_X86_R13) | \
+-		       (1ULL << PERF_REG_X86_R14) | \
+-		       (1ULL << PERF_REG_X86_R15))
++#define REG_NOSUPPORT GENMASK_ULL(PERF_REG_X86_R15, PERF_REG_X86_R8)
+ 
+ int perf_reg_validate(u64 mask, bool simd_enabled)
+ {
++	if (!simd_enabled &&
++	    (!mask || (mask & (REG_NOSUPPORT | PERF_REG_X86_RESERVED))))
++		return -EINVAL;
++
+ 	/* The mask could be 0 if only the SIMD registers are interested */
+-	if (mask & (REG_NOSUPPORT | PERF_REG_X86_RESERVED))
++	if (simd_enabled &&
++	    (mask & ~GENMASK_ULL(PERF_REG_X86_GS, PERF_REG_X86_AX)))
+ 		return -EINVAL;
+ 
+ 	return 0;
+@@ -227,8 +236,13 @@ u64 perf_reg_abi(struct task_struct *task)
+ 
+ int perf_reg_validate(u64 mask, bool simd_enabled)
+ {
++	if (!simd_enabled &&
++	    (!mask || (mask & (REG_NOSUPPORT | PERF_REG_X86_RESERVED))))
++		return -EINVAL;
++
+ 	/* The mask could be 0 if only the SIMD registers are interested */
+-	if (mask & (REG_NOSUPPORT | PERF_REG_X86_RESERVED))
++	if (simd_enabled &&
++	    (mask & (REG_NOSUPPORT | PERF_REG_X86_EXT_RESERVED)))
+ 		return -EINVAL;
+ 
+ 	return 0;
+-- 
+2.43.0
+

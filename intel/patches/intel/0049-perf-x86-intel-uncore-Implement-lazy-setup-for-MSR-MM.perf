@@ -1,0 +1,163 @@
+From e85b16449db0db2a37284e8ea93bc48c73cc92d7 Mon Sep 17 00:00:00 2001
+From: Zide Chen <zide.chen@intel.com>
+Date: Mon, 4 May 2026 16:02:20 -0700
+Subject: [PATCH 49/52] perf/x86/intel/uncore: Implement lazy setup for
+ MSR/MMIO PMUs
+
+MSR and MMIO uncore PMUs are currently registered at module init time
+and appear in sysfs even when no PMU boxes are functional.
+
+Apply the same lazy registration model used by PCI uncore PMUs: the
+PMU is registered when the first box is successfully initialized, and
+unregistered when the last box exits.  If a box fails to initialize on
+a subsequent die, the PMU is marked broken but remains registered to
+avoid disrupting any in-flight perf events.
+
+Box allocation and freeing remain at module init/exit time to avoid
+repeated kfree/alloc cycles across CPU offline/online events.
+
+Reviewed-by: Dapeng Mi <dapeng1.mi@linux.intel.com>
+Signed-off-by: Zide Chen <zide.chen@intel.com>
+---
+ arch/x86/events/intel/uncore.c | 78 +++++++---------------------------
+ arch/x86/events/intel/uncore.h |  6 +++
+ 2 files changed, 22 insertions(+), 62 deletions(-)
+
+diff --git a/arch/x86/events/intel/uncore.c b/arch/x86/events/intel/uncore.c
+index b9ac2f7d31ca..9f8a80c9dcb6 100644
+--- a/arch/x86/events/intel/uncore.c
++++ b/arch/x86/events/intel/uncore.c
+@@ -1570,8 +1570,13 @@ static void uncore_box_unref(struct intel_uncore_type **types, int die)
+ 		pmu = type->pmus;
+ 		for (i = 0; i < type->num_boxes; i++, pmu++) {
+ 			box = pmu->boxes[die];
+-			if (box && box->cpu >= 0 && atomic_dec_return(&box->refcnt) == 0)
++			if (box && box->cpu >= 0 &&
++			    atomic_dec_return(&box->refcnt) == 0) {
++				if (uncore_box_active(box) &&
++				    atomic_dec_return(&pmu->activeboxes) == 0)
++					uncore_pmu_unregister(pmu);
+ 				uncore_box_exit(box);
++			}
+ 		}
+ 	}
+ }
+@@ -1658,7 +1663,7 @@ static int uncore_box_ref(struct intel_uncore_type **types,
+ 		for (i = 0; i < type->num_boxes; i++, pmu++) {
+ 			box = pmu->boxes[die];
+ 			if (box && box->cpu >= 0 && atomic_inc_return(&box->refcnt) == 1)
+-				uncore_box_init(box);
++				uncore_box_setup(pmu, box);
+ 		}
+ 	}
+ 	return 0;
+@@ -1689,67 +1694,12 @@ static int uncore_event_cpu_online(unsigned int cpu)
+ 	return 0;
+ }
+ 
+-static int __init type_pmu_register(struct intel_uncore_type *type)
+-{
+-	int i, ret;
+-
+-	for (i = 0; i < type->num_boxes; i++) {
+-		ret = uncore_pmu_register(&type->pmus[i]);
+-		if (ret)
+-			return ret;
+-	}
+-	return 0;
+-}
+-
+-static int __init uncore_msr_pmus_register(void)
+-{
+-	struct intel_uncore_type **types = uncore_msr_uncores;
+-	int ret;
+-
+-	for (; *types; types++) {
+-		ret = type_pmu_register(*types);
+-		if (ret)
+-			return ret;
+-	}
+-	return 0;
+-}
+-
+-static int __init uncore_cpu_init(void)
+-{
+-	int ret;
+-
+-	ret = uncore_types_init(uncore_msr_uncores);
+-	if (ret)
+-		goto err;
+-
+-	ret = uncore_msr_pmus_register();
+-	if (ret)
+-		goto err;
+-	return 0;
+-err:
+-	uncore_types_exit(uncore_msr_uncores);
+-	uncore_msr_uncores = empty_uncore;
+-	return ret;
+-}
+-
+-static int __init uncore_mmio_init(void)
++static int __init uncore_pmu_types_init(struct intel_uncore_type **types)
+ {
+-	struct intel_uncore_type **types = uncore_mmio_uncores;
+-	int ret;
+-
+-	ret = uncore_types_init(types);
++	int ret = uncore_types_init(types);
+ 	if (ret)
+-		goto err;
++		uncore_types_exit(types);
+ 
+-	for (; *types; types++) {
+-		ret = type_pmu_register(*types);
+-		if (ret)
+-			goto err;
+-	}
+-	return 0;
+-err:
+-	uncore_types_exit(uncore_mmio_uncores);
+-	uncore_mmio_uncores = empty_uncore;
+ 	return ret;
+ }
+ 
+@@ -2050,12 +2000,16 @@ static int __init intel_uncore_init(void)
+ 
+ 	if (uncore_init->cpu_init) {
+ 		uncore_init->cpu_init();
+-		cret = uncore_cpu_init();
++		cret = uncore_pmu_types_init(uncore_msr_uncores);
++		if (cret)
++			uncore_msr_uncores = empty_uncore;
+ 	}
+ 
+ 	if (uncore_init->mmio_init) {
+ 		uncore_init->mmio_init();
+-		mret = uncore_mmio_init();
++		mret = uncore_pmu_types_init(uncore_mmio_uncores);
++		if (mret)
++			uncore_mmio_uncores = empty_uncore;
+ 	}
+ 
+ 	if (cret && pret && mret) {
+diff --git a/arch/x86/events/intel/uncore.h b/arch/x86/events/intel/uncore.h
+index 0adb477d9708..c8dfa2d21bfd 100644
+--- a/arch/x86/events/intel/uncore.h
++++ b/arch/x86/events/intel/uncore.h
+@@ -568,6 +568,12 @@ static inline u64 uncore_read_counter(struct intel_uncore_box *box,
+ 	return box->pmu->type->ops->read_counter(box, event);
+ }
+ 
++static inline bool uncore_box_active(struct intel_uncore_box *box)
++{
++	return (!box->pmu->type->ops->init_box ||
++		test_bit(UNCORE_BOX_FLAG_INITIALIZED, &box->flags));
++}
++
+ static inline int uncore_box_init(struct intel_uncore_box *box)
+ {
+ 	int ret = 0;
+-- 
+2.43.0
+
