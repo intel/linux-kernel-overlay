@@ -1,0 +1,98 @@
+From 6589ebb7420106d5db39b84880e040cd907b7143 Mon Sep 17 00:00:00 2001
+From: "Li, Yifan" <yifan2.li@intel.com>
+Date: Wed, 12 Aug 2026 18:08:37 +0800
+Subject: [PATCH] powercap: intel_rapl: Sign-extend the PMU delta on counter
+ wraparound
+
+The RAPL energy counters are 32-bit wide on every register interface:
+MSR, MMIO and TPMI all describe ENERGY_COUNTER with a GENMASK(31, 0)
+mask.  rapl_read_data_raw() applies that mask, so event_read_counter()
+returns the counter zero-extended in a u64.
+
+rapl_event_update() then computes
+
+	delta = new_raw_count - prev_raw_count;
+
+without reducing the result modulo 2^32.  While the counter does not
+wrap this is correct, but once the hardware counter wraps,
+new_raw_count < prev_raw_count and delta becomes (true_delta - 2^32),
+a large negative value.  Declaring delta as s64 only makes that value
+representable; it does not correct it.
+
+The bogus delta is scaled and added to event->count, so the perf event
+counter jumps backwards by nearly the full counter range.  perf event
+counts are defined to increase monotonically, and consumers that take
+the difference of two reads in unsigned arithmetic underflow and report
+absurd values.
+
+On a Panther Lake system (energy unit 61.035 uJ, counter range
+262144 J) the package counter wraps every ~2.9 hours at 25 W.  turbostat
+then prints one bogus sample per wraparound, per domain:
+
+  PkgTmp  PkgWatt         CorWatt GFXWatt RAMWatt SysWatt
+  44      24.97           16.30   3.90    1.87    2145386370.35
+  43      2145240612.10   16.13   4.02    1.91    40.46
+
+Fix it the way arch/x86/events/rapl.c has done since the RAPL PMU was
+first introduced: shift both values up so that the 64-bit subtraction
+reduces modulo 2^32, then shift the difference back down with an
+arithmetic shift to sign-extend it.
+
+This is correct as long as at most one wraparound happens between two
+updates, which the existing overflow hrtimer already guarantees: its
+period is half of the counter range at the 200 W reference used in
+rapl_package_add_pmu_locked().
+
+The problem has been present since the powercap RAPL PMU was added, but
+only affected TPMI RAPL until commit 748d6ba43afd ("powercap:
+intel_rapl: Enable MSR-based RAPL PMU support") routed MSR RAPL through
+the same PMU, which exposed it on client platforms.
+
+Fixes: 575024a8aa7c ("powercap: intel_rapl: Introduce APIs for PMU support")
+Cc: stable@vger.kernel.org
+Signed-off-by: Li, Yifan <yifan2.li@intel.com>
+Signed-off-by: Gao Jianfeng <jianfeng.gao@intel.com>
+---
+ drivers/powercap/intel_rapl_common.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/powercap/intel_rapl_common.c b/drivers/powercap/intel_rapl_common.c
+index 2436611e0132..13d4393d7701 100644
+--- a/drivers/powercap/intel_rapl_common.c
++++ b/drivers/powercap/intel_rapl_common.c
+@@ -33,6 +33,9 @@
+ /* bitmasks for RAPL MSRs, used by primitive access functions */
+ #define ENERGY_STATUS_MASK      0xffffffff
+ 
++/* Width of the RAPL energy counters, see ENERGY_STATUS_MASK */
++#define RAPL_CNTR_WIDTH		32
++
+ #define POWER_LIMIT1_MASK       0x7FFF
+ #define POWER_LIMIT1_ENABLE     BIT(15)
+ #define POWER_LIMIT1_CLAMP      BIT(16)
+@@ -1682,6 +1685,7 @@ static u64 rapl_event_update(struct perf_event *event)
+ 	struct rapl_package_pmu_data *data = event_to_pmu_data(event);
+ 	u64 prev_raw_count, new_raw_count;
+ 	s64 delta, sdelta;
++	int shift = 64 - RAPL_CNTR_WIDTH;
+ 
+ 	/*
+ 	 * Follow the generic code to drain hwc->prev_count.
+@@ -1698,8 +1702,13 @@ static u64 rapl_event_update(struct perf_event *event)
+ 	 * Now we have the new raw value and have updated the prev
+ 	 * timestamp already. We can now calculate the elapsed delta
+ 	 * (event-)time and add that to the generic event.
++	 *
++	 * Careful, the counter is narrower than u64 and is not
++	 * sign-extended above its physical width.  Shift both values up
++	 * so that the subtraction wraps, then shift the result back down.
+ 	 */
+-	delta = new_raw_count - prev_raw_count;
++	delta = (new_raw_count << shift) - (prev_raw_count << shift);
++	delta >>= shift;
+ 
+ 	/*
+ 	 * Scale delta to smallest unit (2^-32)
+-- 
+2.34.1
+
