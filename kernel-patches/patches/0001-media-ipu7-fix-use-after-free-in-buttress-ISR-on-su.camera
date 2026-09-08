@@ -1,0 +1,124 @@
+From fec863bcf48a96bea8a52ab608022ea6272590c0 Mon Sep 17 00:00:00 2001
+From: Kris Pan <kris.pan@intel.com>
+Date: Wed, 2 Sep 2026 18:37:55 +0800
+Subject: [PATCH] media: ipu7: fix use-after-free in buttress ISR on subsystem
+ removal
+
+ipu_buttress_isr() dispatches to isys/psys via adev->auxdrv_data, which
+points into the auxiliary driver module's rodata. On module unload the
+remove callbacks left auxdrv_data/auxdrv dangling, so a buttress interrupt
+after unload dereferenced freed module memory and panicked.
+
+Disable the subsystem IRQ, clear the auxdrv callbacks and synchronize the
+shared IRQ in isys/psys remove before the module memory is released.
+
+Signed-off-by: Kris Pan <kris.pan@intel.com>
+---
+ drivers/staging/media/ipu7/ipu7-buttress.c | 9 +++++++++
+ drivers/staging/media/ipu7/ipu7-buttress.h | 1 +
+ drivers/staging/media/ipu7/ipu7-isys.c     | 9 +++++++++
+ drivers/staging/media/ipu7/psys/ipu-psys.c | 8 ++++++++
+ 4 files changed, 27 insertions(+)
+
+diff --git a/drivers/staging/media/ipu7/ipu7-buttress.c b/drivers/staging/media/ipu7/ipu7-buttress.c
+index 4383e2cc33a2..634790c8218e 100644
+--- a/drivers/staging/media/ipu7/ipu7-buttress.c
++++ b/drivers/staging/media/ipu7/ipu7-buttress.c
+@@ -461,6 +461,15 @@ irqreturn_t ipu_buttress_isr_threaded(int irq, void *isp_ptr)
+ 	return ret;
+ }
+ 
++void ipu_buttress_disable_irq(struct ipu7_device *isp, u32 irq_mask)
++{
++	u32 val = readl(isp->base + BUTTRESS_REG_IRQ_ENABLE);
++
++	val &= ~irq_mask;
++	writel(val, isp->base + BUTTRESS_REG_IRQ_ENABLE);
++}
++EXPORT_SYMBOL_NS_GPL(ipu_buttress_disable_irq, "INTEL_IPU7");
++
+ static int isys_d2d_power(struct device *dev, bool on)
+ {
+ 	struct ipu7_device *isp = to_ipu7_bus_device(dev)->isp;
+diff --git a/drivers/staging/media/ipu7/ipu7-buttress.h b/drivers/staging/media/ipu7/ipu7-buttress.h
+index 8da7dd612575..4832835a49af 100644
+--- a/drivers/staging/media/ipu7/ipu7-buttress.h
++++ b/drivers/staging/media/ipu7/ipu7-buttress.h
+@@ -67,6 +67,7 @@ u64 ipu_buttress_tsc_ticks_to_ns(u64 ticks, const struct ipu7_device *isp);
+ 
+ irqreturn_t ipu_buttress_isr(int irq, void *isp_ptr);
+ irqreturn_t ipu_buttress_isr_threaded(int irq, void *isp_ptr);
++void ipu_buttress_disable_irq(struct ipu7_device *isp, u32 irq_mask);
+ int ipu_buttress_init(struct ipu7_device *isp);
+ void ipu_buttress_exit(struct ipu7_device *isp);
+ void ipu_buttress_csi_port_config(struct ipu7_device *isp,
+diff --git a/drivers/staging/media/ipu7/ipu7-isys.c b/drivers/staging/media/ipu7/ipu7-isys.c
+index cb994bdc9b10..c872d21ba834 100644
+--- a/drivers/staging/media/ipu7/ipu7-isys.c
++++ b/drivers/staging/media/ipu7/ipu7-isys.c
+@@ -17,6 +17,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/firmware.h>
++#include <linux/interrupt.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -818,6 +819,10 @@ static void isys_remove(struct auxiliary_device *auxdev)
+ 	struct isys_fw_msgs *fwmsg, *safe;
+ 	struct ipu7_bus_device *adev = auxdev_to_adev(auxdev);
+ 
++	ipu_buttress_disable_irq(adev->isp, BUTTRESS_IRQ_IS_IRQ);
++	adev->auxdrv_data = NULL;
++	adev->auxdrv = NULL;
++	synchronize_irq(adev->isp->pdev->irq);
+ #ifdef CONFIG_DEBUG_FS
+ 	if (adev->isp->ipu7_dir)
+ 		debugfs_remove_recursive(isys->debugfsdir);
+@@ -852,6 +857,10 @@ static void isys_remove(struct auxiliary_device *auxdev)
+ 	struct isys_fw_msgs *fwmsg, *safe;
+ 	struct ipu7_bus_device *adev = auxdev_to_adev(auxdev);
+ 
++	ipu_buttress_disable_irq(adev->isp, BUTTRESS_IRQ_IS_IRQ);
++	adev->auxdrv_data = NULL;
++	adev->auxdrv = NULL;
++	synchronize_irq(adev->isp->pdev->irq);
+ #ifdef CONFIG_DEBUG_FS
+ 	if (adev->isp->ipu7_dir)
+ 		debugfs_remove_recursive(isys->debugfsdir);
+diff --git a/drivers/staging/media/ipu7/psys/ipu-psys.c b/drivers/staging/media/ipu7/psys/ipu-psys.c
+index 4fe37632fb18..f18f3c5b6e2e 100644
+--- a/drivers/staging/media/ipu7/psys/ipu-psys.c
++++ b/drivers/staging/media/ipu7/psys/ipu-psys.c
+@@ -8,6 +8,7 @@
+ #include <linux/firmware.h>
+ #include <linux/fs.h>
+ #include <linux/highmem.h>
++#include <linux/interrupt.h>
+ #include <linux/completion.h>
+ #include <linux/init_task.h>
+ #include <linux/kthread.h>
+@@ -27,6 +28,7 @@
+ #include "ipu7-mmu.h"
+ #include "ipu7-bus.h"
+ #include "ipu7-buttress.h"
++#include "ipu7-buttress-regs.h"
+ #include "ipu7-cpd.h"
+ #include "ipu7-dma.h"
+ #include "ipu7-fw-psys.h"
+@@ -1456,6 +1458,12 @@ static void ipu7_psys_remove(struct auxiliary_device *auxdev)
+ {
+ 	struct ipu7_psys *psys = dev_get_drvdata(&auxdev->dev);
+ 	struct device *dev = &auxdev->dev;
++	struct ipu7_bus_device *adev = auxdev_to_adev(auxdev);
++
++	ipu_buttress_disable_irq(adev->isp, BUTTRESS_IRQ_PS_IRQ);
++	adev->auxdrv_data = NULL;
++	adev->auxdrv = NULL;
++	synchronize_irq(adev->isp->pdev->irq);
+ #ifdef CONFIG_DEBUG_FS
+ 	struct ipu7_device *isp = psys->adev->isp;
+ 
+-- 
+2.34.1
+
