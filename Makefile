@@ -236,7 +236,7 @@ deb-setup:
 					echo "  Expected file: $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL"; \
 					echo "  Downloaded files in cache:"; \
 					ls -la $(BUILD_CACHE_DIR)/$${SOURCE_PKG}_*.orig.tar.* 2>/dev/null || echo "    (none)"; \
-					echo "  Or place source in rpm/ directory as: linux-$$BASE_VERSION.tar.xz"; \
+					echo "  Or place source in rpm/ directory as: linux-$$(echo "$$BASE_VERSION" | sed -E 's/~(rc[0-9]+)$$/-\1/').tar.xz"; \
 					exit 1; \
 				fi; \
 			fi; \
