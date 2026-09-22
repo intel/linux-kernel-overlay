@@ -580,9 +580,9 @@ rpm-prepare:
 		echo "Error: Failed to extract version from debian/changelog"; \
 		exit 1; \
 	fi; \
-	if ! echo "$$KVER" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
+	if ! echo "$$KVER" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?$$'; then \
 		echo "Error: Invalid kernel version format: $$KVER"; \
-		echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
+		echo "  Expected format: X.Y[.Z][-~rcN] (e.g., 6.8, 6.8.0, 6.8~rc1)"; \
 		exit 1; \
 	fi; \
 	echo "Kernel Version: $$KVER (from debian/changelog)"; \
