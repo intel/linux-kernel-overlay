@@ -18,7 +18,6 @@ rpm/
 │   ├── prepare-sources.sh               # Main orchestration script
 │   ├── generate-configs.sh              # Generate configs from intel/config/*
 │   ├── build.sh                         # Build RPM packages
-│   ├── setup-fedora-sources.sh          # Download Fedora build scripts
 │   └── update-version.sh                # Version management
 │
 ├── README.md                            # Complete documentation (9.3K)
@@ -26,10 +25,7 @@ rpm/
 └── .gitignore                           # Git ignore patterns
 
 Generated files (not in git, created by prepare-sources.sh):
-├── linux-6.18.20.tar.xz                # Kernel source tarball (will be downloaded)
-├── mod-sign.sh                          # Fedora build scripts (will be downloaded)
-├── mod-denylist.sh
-└── filtermods.py
+└── linux-6.18.20.tar.xz                # Kernel source tarball (will be downloaded)
 ```
 
 ## Why Individual Patch Application?
@@ -82,7 +78,7 @@ patch -p1 --dry-run < patches/intel/0123-my-feature.patch
 vi intel/patches/intel/0123-my-feature.patch
 
 # 5. Regenerate patches tarball only
-./scripts/prepare-sources.sh --skip-kernel --skip-configs --skip-scripts --force
+./scripts/prepare-sources.sh --skip-kernel --skip-configs --force
 
 # 6. Rebuild
 ./scripts/build.sh

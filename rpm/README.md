@@ -83,7 +83,6 @@ This will:
   - **Note**: config generation is skipped if `kernel-x86_64.config` already exists.
     Use `--force` (or run `./scripts/generate-configs.sh` directly) to regenerate.
     Finalized during build via `make olddefconfig` in the spec's `%prep`.
-- Download Fedora build scripts (`mod-sign.sh`, etc.)
 
 **Note**: 
 - Patches are applied individually during build for better debugging
@@ -142,8 +141,6 @@ Options:
   --skip-kernel            Skip kernel tarball download
   --skip-patches           Skip patch generation
   --skip-configs           Skip config generation
-  --skip-scripts           Skip Fedora scripts download
-  -b, --branch BRANCH      Fedora branch for scripts (default: rawhide)
 ```
 
 ### Individual Source Preparation
@@ -153,9 +150,6 @@ You can also prepare sources individually:
 ```bash
 # Generate configs only
 ./scripts/generate-configs.sh
-
-# Download Fedora scripts only
-./scripts/setup-fedora-sources.sh
 
 # Create patches tarball manually
 tar -czf patches.tar.gz -C ../intel patches/
@@ -212,15 +206,10 @@ rpm/
 ├── kernel-x86_64.config            # Generated: base + fragments (9984 lines)
 ├── kernel-x86_64-rt.config         # Generated: base + fragments + RT (10014 lines)
 │
-├── mod-sign.sh                      # Fedora build scripts (downloaded)
-├── mod-denylist.sh
-├── filtermods.py
-│
 └── scripts/                         # Build automation scripts
     ├── prepare-sources.sh           # Prepare all source files
     ├── generate-configs.sh          # Generate configs: base + fragments (uses defines.toml)
     ├── build.sh                     # Build RPM packages
-    ├── setup-fedora-sources.sh      # Download Fedora scripts
     └── update-version.sh            # Update kernel version
 ```
 
