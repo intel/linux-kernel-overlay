@@ -83,7 +83,7 @@ Vendor: Custom Build
 Provides: installonlypkg(kernel)
 
 # Standard virtual provides that DKMS, akmods/kmod packages and dracut use
-# to bind a module set to a specific kernel version (uname -r == %{buildid}).
+# to bind a module set to a specific kernel version (uname -r == %%{buildid}).
 Provides: kernel-uname-r = %{buildid}
 Provides: kernel-modules-uname-r = %{buildid}
 
@@ -443,8 +443,10 @@ fi
 %{_datadir}/bash-completion/completions/cpupower
 %{_datadir}/locale/*/LC_MESSAGES/cpupower.mo
 %{_datadir}/doc/perf-tip/tips.txt
-%{python3_sitearch}/perf-*.egg-info
-%{python3_sitearch}/perf.cpython-*-x86_64-linux-gnu.so
+# Everything install-python_ext drops here: the extension module, its
+# egg-info and (since the stub was added upstream) perf.pyi. Globbed rather
+# than enumerated so a new companion file does not fail the build.
+%{python3_sitearch}/perf*
 
 %files tools-libs
 %defattr(-,root,root)
