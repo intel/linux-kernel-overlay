@@ -83,7 +83,7 @@ Vendor: Custom Build
 Provides: installonlypkg(kernel)
 
 # Standard virtual provides that DKMS, akmods/kmod packages and dracut use
-# to bind a module set to a specific kernel version (uname -r == %{buildid}).
+# to bind a module set to a specific kernel version (uname -r == %%{buildid}).
 Provides: kernel-uname-r = %{buildid}
 Provides: kernel-modules-uname-r = %{buildid}
 
