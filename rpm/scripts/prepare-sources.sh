@@ -153,14 +153,44 @@ if [ "$SKIP_KERNEL" = false ]; then
     print_step "Step 1: Downloading kernel tarball"
 
     KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-    # Strip trailing .0 from version for kernel.org URLs
-    # Examples: 7.0.0 -> 7.0, 7.0.0-rc1 -> 7.0-rc1, 6.18.0 -> 6.18, but 7.0 stays 7.0
-    UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$/\1\2/')
+    # Map the packaging version onto the upstream tarball/tag name:
+    #   - strip a trailing .0    (7.0.0 -> 7.0, 6.18.0 -> 6.18, but 6.18.33 stays)
+    #   - Debian '~rc' -> '-rc'  (7.3~rc3 -> 7.3-rc3, the spelling kernel.org and git use)
+    UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0([-~]rc[0-9]+)?$/\1\2/; s/~rc/-rc/')
     UPSTREAM_TARBALL="linux-${UPSTREAM_VERSION}.tar.xz"
     KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${UPSTREAM_TARBALL}"
+    KERNEL_GIT_URL="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+
+    # kernel.org only publishes released tarballs under v*.x/; -rc trees exist
+    # solely as git tags, so build the tarball from the tag instead.
+    fetch_tarball_from_git() {
+        local tmpdir rc=0
+        tmpdir=$(mktemp -d)
+        print_info "Cloning tag v${UPSTREAM_VERSION} from ${KERNEL_GIT_URL}"
+        if git clone --quiet --depth 1 --branch "v${UPSTREAM_VERSION}" \
+                "$KERNEL_GIT_URL" "$tmpdir/linux"; then
+            print_info "Creating $KERNEL_TARBALL (top-level dir: linux-${UPSTREAM_VERSION}/)"
+            git -C "$tmpdir/linux" archive --format=tar \
+                --prefix="linux-${UPSTREAM_VERSION}/" HEAD \
+                | xz -T0 > "$RPM_DIR/$KERNEL_TARBALL" || rc=1
+        else
+            rc=1
+        fi
+        rm -rf "$tmpdir"
+        return $rc
+    }
 
     if [ -f "$RPM_DIR/$KERNEL_TARBALL" ] && [ "$FORCE_DOWNLOAD" = false ]; then
         print_info "Kernel tarball already exists: $KERNEL_TARBALL"
+    elif case "$UPSTREAM_VERSION" in *-rc*) true ;; *) false ;; esac; then
+        print_info "Release candidate: no kernel.org tarball exists, using git tag"
+        if ! fetch_tarball_from_git; then
+            rm -f "$RPM_DIR/$KERNEL_TARBALL"
+            print_error "Failed to create kernel tarball from tag v${UPSTREAM_VERSION}"
+            print_error "  Git URL: $KERNEL_GIT_URL"
+            exit 1
+        fi
+        print_info "Created: $KERNEL_TARBALL ($(du -h "$RPM_DIR/$KERNEL_TARBALL" | cut -f1))"
     else
         print_info "Downloading from: $KERNEL_URL"
         if curl -L -o "$RPM_DIR/$KERNEL_TARBALL" "$KERNEL_URL"; then
