@@ -29,10 +29,27 @@
 # Package release uses the full version suffix (e.g., intel+260417t093242z)
 %define pkg_release %{version_suffix}%{?dist}
 
+# Kernel version as kbuild spells it: always VERSION.PATCHLEVEL.SUBLEVEL, with
+# '-rcN' rather than the rpm/deb-friendly '~rcN'. The changelog version drops the
+# trailing .0 on -rc trees (7.3~rc3), but the kernel calls itself 7.3.0-rc3, so
+# normalise here - /boot and /lib/modules names have to match what kbuild emits.
+#   7.3~rc3 -> 7.3.0-rc3, 7.3 -> 7.3.0, 6.18.20 -> 6.18.20 (unchanged)
+# Written without parentheses or backslashes: rpm ends %%() at the first unbalanced
+# ')' and strips backslashes, so 'case' and sed back-references cannot be used.
+%define kernel_release_base %(v=$(echo %{kernel_version} | tr "~" "-"); b=$(echo "$v" | sed "s/-rc.*//"); r=$(echo "$v" | sed -n "s/.*-rc/-rc/p"); d=$(echo "$b" | tr -cd . | wc -c); if [ "$d" -lt 2 ]; then b="$b.0"; fi; echo "$b$r")
+
+# LOCALVERSION appended by kbuild. Normally '-<suffix>', but on -rc trees the
+# base already carries one '-' (7.3.0-rc3) and a second one would make
+# 'Provides: kernel-uname-r = <buildid>' an invalid EVR - rpm allows no '-' in
+# the release part. Join with '.' there instead, the way Fedora does:
+#   7.3.0-rc3 + .mainline+...  ->  7.3.0-rc3.mainline+...   (version 7.3.0)
+#   6.18.20   + -intel+...     ->  6.18.20-intel+...        (unchanged)
+%define localversion %(if echo %{kernel_release_base} | grep -q -- -rc; then echo -n .; else echo -n -; fi; echo %{version_suffix})
+
 # Kernel build release string (used for uname -r and module paths)
 # This is the full version string that will appear in uname -r
 # Format: 6.18.20-intel+260417t093242z
-%define buildid %{full_version}
+%define buildid %{kernel_release_base}%{localversion}
 
 # Architecture
 %define _target_cpu x86_64
@@ -120,7 +137,9 @@ This is the PREEMPT_RT real-time kernel variant.
 Summary: Development files for the kernel
 Requires: %{name} = %{version}-%{release}
 Provides: kernel-devel = %{version}-%{release}
-Provides: kernel-devel-uname-r = %{version}-%{release}.%{_target_cpu}
+# DKMS resolves the source tree with 'kernel-devel-uname-r = $(uname -r)', so
+# this has to be the kbuild release string, not the rpm EVR.
+Provides: kernel-devel-uname-r = %{buildid}
 
 %description devel
 This package provides kernel headers and makefiles sufficient to build modules
@@ -222,6 +241,20 @@ make ARCH=%{_target_cpu} olddefconfig
 
 # Note: LOCALVERSION is set during make (not via localversion file)
 # to avoid double-appending the suffix
+#
+# Ask kbuild what it will call itself and compare with %%{buildid}. Everything
+# installed under /boot and /lib/modules is named after %%{buildid}, so a
+# mismatch means modules_install writes to a directory no package claims and
+# the build dies with "Installed (but unpackaged) file(s) found" - after the
+# full compile. Fail here instead, within seconds of starting.
+KERNEL_RELEASE=$(make -s ARCH=%{_target_cpu} LOCALVERSION="%{localversion}" kernelrelease)
+if [ "$KERNEL_RELEASE" != "%{buildid}" ]; then
+    echo "ERROR: kernel release string mismatch"
+    echo "  kbuild reports: $KERNEL_RELEASE"
+    echo "  spec buildid:   %{buildid}"
+    echo "  Fix the kernel_release_base macro so both agree, then rebuild."
+    exit 1
+fi
 echo "Kernel will be built with version: %{buildid}"
 
 # ======================================================================
@@ -240,7 +273,7 @@ export CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu:$CPLUS_INCLUDE_PATH
 
 # Build the kernel
 # Use KERNELRELEASE to ensure consistent version string
-make ARCH=%{_target_cpu} LOCALVERSION="-%{version_suffix}" %{?_smp_mflags} all
+make ARCH=%{_target_cpu} LOCALVERSION="%{localversion}" %{?_smp_mflags} all
 
 %if %{with_tools}
 # Build kernel tools (perf, turbostat, etc.)
@@ -271,7 +304,6 @@ echo "======================================================================"
 echo "Installing kernel version: %{buildid}"
 
 mkdir -p %{buildroot}/boot
-mkdir -p %{buildroot}/lib/modules/%{buildid}
 mkdir -p %{buildroot}%{_prefix}
 
 # Install kernel image
@@ -280,11 +312,23 @@ cp -v System.map %{buildroot}/boot/System.map-%{buildid}
 cp -v .config %{buildroot}/boot/config-%{buildid}
 
 # Install modules with correct version string
-make ARCH=%{_target_cpu} LOCALVERSION="-%{version_suffix}" INSTALL_MOD_PATH=%{buildroot} modules_install
+make ARCH=%{_target_cpu} LOCALVERSION="%{localversion}" INSTALL_MOD_PATH=%{buildroot} modules_install
 
-# Verify module installation path
+# Verify modules_install used the directory the files section claims. Do not
+# pre-create it above: an empty %{buildid} directory would hide the mismatch
+# and let the build run on until rpm reports the real modules as unpackaged.
 echo "Checking installed module path..."
-ls -ld %{buildroot}/lib/modules/%{buildid} || echo "ERROR: Module path mismatch!"
+if [ ! -d %{buildroot}/lib/modules/%{buildid}/kernel ]; then
+    echo "ERROR: modules were not installed under /lib/modules/%{buildid}"
+    ls -1 %{buildroot}/lib/modules/ 2>/dev/null | sed 's/^/  found: /'
+    exit 1
+fi
+
+# modules_install points /lib/modules/<rel>/build at the rpmbuild BUILD tree,
+# which does not exist on the target. Retarget it at the devel package's copy
+# so out-of-tree/DKMS builds resolve it.
+rm -f %{buildroot}/lib/modules/%{buildid}/build %{buildroot}/lib/modules/%{buildid}/source
+ln -sf /usr/src/kernels/%{buildid} %{buildroot}/lib/modules/%{buildid}/build
 
 # Install kernel development files
 mkdir -p %{buildroot}/usr/src/kernels/%{buildid}
