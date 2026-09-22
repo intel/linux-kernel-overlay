@@ -111,9 +111,9 @@ fi
 
 # Extract kernel version and calculate upstream version for tarball directory name
 KERNEL_VERSION=$(echo "$FULL_VERSION" | cut -d- -f1)
-# Strip trailing .0 to match kernel.org tarball directory names
-# Examples: 7.0.0 -> 7.0, 7.0.0-rc1 -> 7.0-rc1, 6.18.33 -> 6.18.33
-UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$/\1\2/')
+# Strip trailing .0 and map '~rc' -> '-rc' to match the tarball's directory name
+# Examples: 7.0.0 -> 7.0, 7.0.0~rc1 -> 7.0-rc1, 7.3~rc3 -> 7.3-rc3, 6.18.33 -> 6.18.33
+UPSTREAM_VERSION=$(echo "$KERNEL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0([-~]rc[0-9]+)?$/\1\2/; s/~rc/-rc/')
 
 echo "======================================================================"
 echo "Kernel RPM Build Script (Fedora-style)"
