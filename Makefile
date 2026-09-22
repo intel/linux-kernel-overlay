@@ -177,7 +177,7 @@ deb-setup:
 		exit 1; \
 	fi; \
 	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
-	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?)-.*$$/\1/'); \
 	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
 	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
 		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
@@ -191,14 +191,14 @@ deb-setup:
 		exit 1; \
 	fi; \
 	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
-	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?)-.*$$/\1/'); \
 	if [ -z "$$BASE_VERSION" ]; then \
 		echo "Error: Failed to extract version from debian/changelog"; \
 		exit 1; \
 	fi; \
-	if ! echo "$$BASE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$$'; then \
+	if ! echo "$$BASE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?$$'; then \
 		echo "Error: Invalid version format in debian/changelog: $$BASE_VERSION"; \
-		echo "  Expected format: X.Y[.Z][-rcN] (e.g., 6.8, 6.8.0, 6.8-rc1)"; \
+		echo "  Expected format: X.Y[.Z][-~rcN] (e.g., 6.8, 6.8.0, 6.8~rc1)"; \
 		exit 1; \
 	fi; \
 	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
@@ -211,9 +211,9 @@ deb-setup:
 		if [ -n "$$SRC" ] && [ -f "$$SRC" ]; then \
 			echo "Found existing source in rpm/, copying to cache..."; \
 			BASENAME=$$(basename -- "$$SRC"); \
-			if ! echo "$$BASENAME" | grep -qE '^linux-[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?\.tar\.xz$$'; then \
+			if ! echo "$$BASENAME" | grep -qE '^linux-[0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?\.tar\.xz$$'; then \
 				echo "Error: Invalid source filename format: $$BASENAME"; \
-				echo "  Expected: linux-X.Y[.Z][-rcN].tar.xz"; \
+				echo "  Expected: linux-X.Y[.Z][-~rcN].tar.xz"; \
 				exit 1; \
 			fi; \
 			cp -f -- "$$SRC" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
@@ -251,7 +251,7 @@ deb-setup:
 		exit 1; \
 	fi; \
 	FULL_VERSION=$$(dpkg-parsechangelog -l debian/changelog --show-field Version 2>/dev/null); \
-	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)-.*$$/\1/'); \
+	BASE_VERSION=$$(echo "$$FULL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?)-.*$$/\1/'); \
 	EXPECTED_TARBALL="$${SOURCE_PKG}_$${FULL_VERSION}.orig.tar.xz"; \
 	if echo "$$EXPECTED_TARBALL" | grep -qE '\.\./|^/'; then \
 		echo "Error: Invalid tarball name contains path traversal: $$EXPECTED_TARBALL"; \
@@ -306,9 +306,13 @@ deb-setup:
 	echo "Detected GCC version: gcc-$$GCC_VER"; \
 	sed -i "s|c_compiler = 'gcc-[0-9]*'|c_compiler = 'gcc-$$GCC_VER'|g" $(BUILD_DIR)/debian/config/defines.toml; \
 	echo "Updated c_compiler in defines.toml to: gcc-$$GCC_VER"
-	@# Auto-generate localversion and abi_suffix from changelog
+	@# Auto-generate localversion and abi_suffix from changelog.
+	@# Strip the numeric version AND any rc marker ('~rc3' / '-rc3'): gencontrol
+	@# builds abiname as VersionLinux.linux_version_full + abi_suffix, and
+	@# linux_version_full already carries the rc ('7.3~rc3' -> '7.3-rc3'), so
+	@# leaving '~rc3' in the suffix would duplicate it (7.3-rc3~rc3-mainline+...).
 	@echo "Extracting version suffix from debian/changelog..."
-	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | sed 's/^[0-9.]*//'); \
+	@SUFFIX=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]' | sed -E 's/^[0-9.]*([-~]rc[0-9]+)?//'); \
 	if [ -n "$$SUFFIX" ]; then \
 		echo "$$SUFFIX" > $(BUILD_DIR)/localversion; \
 		echo "Created localversion file with: $$SUFFIX"; \
