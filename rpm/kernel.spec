@@ -86,10 +86,10 @@ Source1: kernel-x86_64.config
 Source2: kernel-local
 Source3: patches.tar.gz
 
-# Build scripts from Fedora
-Source10: mod-sign.sh
-Source11: mod-denylist.sh
-Source12: filtermods.py
+# Note: no mod-sign.sh/mod-denylist.sh/filtermods.py here. Modules are not
+# signed (cert.cfg clears CONFIG_MODULE_SIG_KEY and unsets CONFIG_MODULE_SIG_ALL)
+# and no module filtering is done, so these Fedora helpers are unused - keeping
+# them as Sources only added a build-time download that can fail.
 
 # Build dependencies
 BuildRequires: gcc make binutils

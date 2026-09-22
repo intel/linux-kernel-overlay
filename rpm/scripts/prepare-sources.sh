@@ -8,7 +8,6 @@
 # - Downloads kernel tarball
 # - Creates patches tarball from intel/patches (series + individual patches)
 # - Generates kernel config files from intel/config
-# - Downloads Fedora build scripts
 
 set -e
 
@@ -46,8 +45,6 @@ FORCE_DOWNLOAD=false
 SKIP_KERNEL=false
 SKIP_PATCHES=false
 SKIP_CONFIGS=false
-SKIP_SCRIPTS=false
-FEDORA_BRANCH="rawhide"
 
 show_usage() {
     cat <<EOF
@@ -61,8 +58,6 @@ OPTIONS:
     --skip-kernel            Skip kernel tarball download
     --skip-patches           Skip patches tarball creation
     --skip-configs           Skip config generation
-    --skip-scripts           Skip Fedora scripts download
-    -b, --branch BRANCH      Fedora branch for scripts (default: rawhide)
     -h, --help               Show this help message
 
 EXAMPLES:
@@ -73,13 +68,12 @@ EXAMPLES:
     $0 --force
 
     # Only generate patches and configs
-    $0 --skip-kernel --skip-scripts
+    $0 --skip-kernel
 
 WHAT IT DOES:
     1. Downloads linux-VERSION.tar.xz to rpm/
     2. Creates rpm/patches.tar.gz from intel/patches/ (series + patches)
     3. Generates rpm/kernel-*.config from intel/config/
-    4. Downloads Fedora build scripts (mod-sign.sh, etc.) to rpm/
 
 OUTPUT STRUCTURE (Fedora-style flat layout):
     rpm/
@@ -87,7 +81,6 @@ OUTPUT STRUCTURE (Fedora-style flat layout):
     ├── patches.tar.gz                 # Patches (extracted during build)
     ├── patches -> ../intel/patches   # Symlink for reference
     ├── kernel-x86_64.config           # Generated configs
-    ├── mod-sign.sh                    # Fedora scripts
     └── kernel.spec                    # Spec file (create separately)
 
 EOF
@@ -116,14 +109,6 @@ while [[ $# -gt 0 ]]; do
             SKIP_CONFIGS=true
             shift
             ;;
-        --skip-scripts)
-            SKIP_SCRIPTS=true
-            shift
-            ;;
-        -b|--branch)
-            FEDORA_BRANCH="$2"
-            shift 2
-            ;;
         -h|--help)
             show_usage
             exit 0
@@ -142,7 +127,6 @@ echo "======================================================================"
 echo "Kernel Version:   $KERNEL_VERSION"
 echo "RPM Directory:    $RPM_DIR"
 echo "Common Directory: $INTEL_DIR"
-echo "Fedora Branch:    $FEDORA_BRANCH"
 echo "======================================================================"
 echo ""
 
@@ -295,42 +279,6 @@ else
 fi
 
 # ======================================================================
-# Step 4: Download Fedora build scripts
-# ======================================================================
-if [ "$SKIP_SCRIPTS" = false ]; then
-    print_step "Step 4: Downloading Fedora build scripts"
-
-    FEDORA_REPO="https://src.fedoraproject.org/rpms/kernel"
-
-    # Scripts to download
-    SCRIPTS=(
-        "mod-sign.sh"
-        "mod-denylist.sh"
-        "filtermods.py"
-    )
-
-    for script in "${SCRIPTS[@]}"; do
-        SCRIPT_PATH="$RPM_DIR/$script"
-        if [ -f "$SCRIPT_PATH" ] && [ "$FORCE_DOWNLOAD" = false ]; then
-            print_info "  $script already exists, skipping."
-            continue
-        fi
-
-        print_info "  Downloading $script..."
-        if curl -L -o "$SCRIPT_PATH" "${FEDORA_REPO}/raw/${FEDORA_BRANCH}/f/$script"; then
-            chmod +x "$SCRIPT_PATH"
-            print_info "  Downloaded: $script"
-        else
-            print_warn "  Failed to download $script (might not exist in $FEDORA_BRANCH)"
-        fi
-    done
-    echo ""
-else
-    print_warn "Skipping Fedora scripts download"
-    echo ""
-fi
-
-# ======================================================================
 # Summary
 # ======================================================================
 print_info "======================================================================"
@@ -338,7 +286,7 @@ print_info "Source preparation completed!"
 print_info "======================================================================"
 print_info ""
 print_info "Generated files in rpm/:"
-ls -lh "$RPM_DIR" | grep -E "linux-.*\.tar\.|patch-.*\.patch|kernel-.*\.config|mod-.*\.sh|filtermods\.py" || true
+ls -lh "$RPM_DIR" | grep -E "linux-.*\.tar\.|patch-.*\.patch|kernel-.*\.config" || true
 print_info ""
 print_info "Next steps:"
 print_info "  1. Review/customize kernel.spec if needed"

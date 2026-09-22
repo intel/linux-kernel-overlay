@@ -52,7 +52,6 @@ PREREQUISITES:
         - rpm/linux-6.18.20.tar.xz
         - rpm/patch-6.18.20-custom.patch
         - rpm/kernel-x86_64.config
-        - rpm/mod-sign.sh, etc.
 
 EOF
 }
@@ -196,8 +195,6 @@ rsync -av \
     --include='patches.tar.gz' \
     --include='kernel-*.config' \
     --include='kernel-local' \
-    --include='mod-*.sh' \
-    --include='*.py' \
     --exclude='*' \
     "$RPM_DIR/" ~/rpmbuild/SOURCES/
 
