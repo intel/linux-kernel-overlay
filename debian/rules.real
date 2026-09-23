@@ -85,9 +85,11 @@ $(BUILD_DIR)/config.$(ARCH)_$(FEATURESET)_$(FLAVOUR): $(KCONFIG)
 		-o LOCALVERSION=\"$(LOCALVERSION_IMAGE)\" \
 		$(call if_profile, pkg.linux.nokerneldbginfo pkg.linux.quick,-o DEBUG_INFO_NONE=y -o DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=n) \
 		$(call if_profile, pkg.linux.norust,-o RUST=n)
-# Note: LOCALVERSION is set to ensure kernel KERNELRELEASE matches module directory path.
-# Without this, kernel thinks it's "6.18.20-intel+TIMESTAMP" but modules are in
-# "/lib/modules/6.18.20-intel+TIMESTAMP-amd64/", causing boot failure (modprobe can't find modules).
+# Note: CONFIG_LOCALVERSION only decides what the config shipped in the image
+# package says. It cannot make the kernel agree with the paths we install to,
+# because kbuild always prefixes it with its own KERNELVERSION - which carries
+# SUBLEVEL ("7.3.0-rc3") where ABINAME does not ("7.3-rc3"). The release string
+# is pinned by passing KERNELRELEASE=$(REAL_VERSION) to every make below.
 
 define copy_source
 mkdir -p '$(1)'
@@ -149,6 +151,11 @@ $(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR): $(STAMPS_DIR)/source_$(FEA
 	rm -rf '$(DIR)'
 	mkdir '$(DIR)'
 	cp '$(CONFIG)' '$(DIR)/.config'
+# WARNING: .kernelvariables is only read by a kernel carrying Debian's
+# debian/patches/debian/kernelvariables.patch, which this tree does not apply -
+# so everything written here is currently inert, including the C_COMPILER
+# selected by detect-gcc-version.sh. Anything that must reach the build has to
+# be passed on the make command line; KERNELRELEASE is, see below.
 	echo 'override ARCH = $(KERNEL_ARCH)' >> '$(DIR)/.kernelvariables'
 	echo 'override KERNELRELEASE = $(ABINAME)$(LOCALVERSION_IMAGE)' >> '$(DIR)/.kernelvariables'
 	echo 'CCACHE = ccache' >> '$(DIR)/.kernelvariables'
@@ -199,7 +206,14 @@ $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR): $(STAMPS_DIR)/setup_$(ARCH
 		-keyout $(DIR)/output/signing_key.pem \
 		-newkey ec -pkeyopt ec_paramgen_curve:secp384r1 2>&1
 
-	+$(MAKE_CLEAN) -C '$(DIR)'
+# KERNELRELEASE has to be passed to the image build too, not only to
+# modules_install below. Left to itself kbuild builds the release from its own
+# KERNELVERSION, which disagrees with ABINAME for any -rc ("7.3.0-rc3" vs
+# "7.3-rc3"); the kernel then looks for /lib/modules/<its own string>/ while we
+# install to /lib/modules/$(REAL_VERSION)/ and nothing loads at boot. Passing it
+# here makes $(origin KERNELRELEASE) "command line", which the kernel's Makefile
+# honours for include/config/kernel.release, utsrelease.h and MODLIB alike.
+	+$(MAKE_CLEAN) -C '$(DIR)' KERNELRELEASE=$(REAL_VERSION)
 	debian/bin/buildcheck.py $(DIR) $(ARCH) $(FEATURESET) $(FLAVOUR) build
 
 	install -D -m644 '$(DIR)/$(IMAGE_FILE)' $(OUTPUT_DIR)/boot/$(IMAGE_INSTALL_STEM)-$(REAL_VERSION)
@@ -236,8 +250,8 @@ endif
 		INSTALL_MOD_PATH='$(CURDIR)/$(OUTPUT_DIR_DBG)'
 
 ifeq ($(ENABLE_DTB),True)
-	+$(MAKE_CLEAN) -C $(DIR) dtbs
-	+$(MAKE_CLEAN) -C $(DIR) dtbs_install INSTALL_DTBS_PATH='$(CURDIR)/$(OUTPUT_DIR)/lib/modules/$(REAL_VERSION)/dtb'
+	+$(MAKE_CLEAN) -C $(DIR) dtbs KERNELRELEASE=$(REAL_VERSION)
+	+$(MAKE_CLEAN) -C $(DIR) dtbs_install KERNELRELEASE=$(REAL_VERSION) INSTALL_DTBS_PATH='$(CURDIR)/$(OUTPUT_DIR)/lib/modules/$(REAL_VERSION)/dtb'
 endif
 
 	rm -f $(OUTPUT_DIR)/lib/modules/$(REAL_VERSION)/build
@@ -245,8 +259,10 @@ endif
 	rm -f $(OUTPUT_DIR_DBG)/lib/modules/$(REAL_VERSION)/build
 	rm -f $(OUTPUT_DIR_DBG)/lib/modules/$(REAL_VERSION)/source
 
+# vdso_install installs into $(MODLIB), i.e. lib/modules/$(KERNELRELEASE)/vdso
 	+$(MAKE_CLEAN) -C $(DIR) vdso_install \
 		cmd_symlink= \
+		KERNELRELEASE=$(REAL_VERSION) \
 		INSTALL_MOD_PATH='$(CURDIR)/$(OUTPUT_DIR_DBG)'
 
 	@$(stamp)
