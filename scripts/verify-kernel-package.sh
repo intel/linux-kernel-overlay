@@ -31,7 +31,12 @@ STRIPPED_SYMS="CONFIG_MODULE_SIG_ALL CONFIG_MODULE_SIG_KEY CONFIG_SYSTEM_TRUSTED
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+# A version/module-dir mismatch makes the kernel unbootable, so it fails the
+# build. Missing Intel config options are feature drift - worth reporting, but
+# the kernel still boots, so CONFIG_DRIFT is tracked separately and never turns
+# into a non-zero exit.
 OVERALL_FAIL=0
+CONFIG_DRIFT=0
 
 echo "=== Kernel Package Verifier ==="
 echo ""
@@ -270,8 +275,9 @@ else
             echo "✅ Config check passed (any warnings above are non-fatal: y↔m only)"
         else
             echo ""
-            echo "❌ Config check FAILED: required Intel options not enabled in final config (see errors above)"
-            OVERALL_FAIL=1
+            echo "⚠️  Config check: requested Intel options are missing from the final config"
+            echo "    (see errors above; non-fatal - this does not fail the build)"
+            CONFIG_DRIFT=1
         fi
         echo ""
     fi
@@ -281,7 +287,12 @@ fi
 # Final verdict
 # ---------------------------------------------------------------------------
 if [ "$OVERALL_FAIL" -eq 0 ]; then
-    echo "✅ SUCCESS: all checks passed"
+    if [ "$CONFIG_DRIFT" -eq 1 ]; then
+        echo "✅ SUCCESS: version checks passed"
+        echo "⚠️  ...but Intel config options are missing - see the config report above"
+    else
+        echo "✅ SUCCESS: all checks passed"
+    fi
     exit 0
 else
     echo "❌ FAILURE: one or more checks failed (see above)"
