@@ -17,8 +17,10 @@ if [ ! -f "$KERNEL_RPM" ]; then
 fi
 
 # Check if this is a kernel package (not kernel-devel, kernel-tools, etc.)
-# Supports both kernel-* and kernel-rt-* packages
-if [[ ! "$(basename "$KERNEL_RPM")" =~ ^kernel(-rt)?-[0-9]+\.[0-9]+\.[0-9]+-.*\.rpm$ ]]; then
+# Supports both kernel-* and kernel-rt-* packages. VERSION is X.Y[.Z] with an
+# optional rc suffix in either spelling: rpm-prepare keeps the Debian '~rcN'
+# (the tilde sorts an rc below its release), upstream writes '-rcN'.
+if [[ ! "$(basename "$KERNEL_RPM")" =~ ^kernel(-rt)?-[0-9]+\.[0-9]+(\.[0-9]+)?([-~]rc[0-9]+)?-.*\.rpm$ ]]; then
     echo "Error: Not a kernel package (should be kernel-VERSION-RELEASE.ARCH.rpm or kernel-rt-VERSION-RELEASE.ARCH.rpm)"
     echo "Given: $(basename "$KERNEL_RPM")"
     exit 1
@@ -30,13 +32,27 @@ trap "rm -rf $TMPDIR" EXIT
 echo "=== RPM Kernel Package Version Consistency Check ==="
 echo ""
 
-# Extract RPM package
-echo "[1/4] Extracting RPM package..."
-cd "$TMPDIR"
-rpm2cpio "$KERNEL_RPM" | cpio -idm >/dev/null 2>&1
+# The file list comes straight from the header, so only the kernel binary has
+# to be unpacked - the modules are counted without writing 700MB to disk.
+PKG_FILES=$(rpm -qpl "$KERNEL_RPM" 2>/dev/null)
 
-if [ ! -d "$TMPDIR" ]; then
-    echo "❌ ERROR: Failed to extract RPM package!"
+# rpm2cpio refuses any package carrying the LONGFILESIZES tag ("files over 4GB
+# not supported by cpio"), which rpmbuild now emits unconditionally - even for
+# a package whose largest file is 20 bytes. Prefer rpm2archive, and keep the
+# rpm2cpio path for hosts whose rpm predates it.
+extract_kernel_binary() {
+    if command -v rpm2archive >/dev/null 2>&1; then
+        rpm2archive - < "$KERNEL_RPM" | tar -xz --wildcards './boot/vmlinuz-*'
+    else
+        rpm2cpio "$KERNEL_RPM" | cpio -idm './boot/vmlinuz-*' >/dev/null 2>&1
+    fi
+}
+
+# Extract the kernel binary
+echo "[1/4] Extracting kernel binary from RPM package..."
+cd "$TMPDIR"
+if ! extract_kernel_binary; then
+    echo "❌ ERROR: Failed to extract /boot/vmlinuz-* from the package!"
     exit 1
 fi
 
@@ -77,7 +93,7 @@ fi
 
 # Find module directory
 echo "[4/4] Checking module directory..."
-MODULE_DIRS=$(ls "$TMPDIR/lib/modules/" 2>/dev/null)
+MODULE_DIRS=$(printf '%s\n' "$PKG_FILES" | sed -n 's|^/\(usr/\)\?lib/modules/\([^/]*\)$|\2|p')
 
 if [ -z "$MODULE_DIRS" ]; then
     echo "❌ ERROR: No module directory found in package!"
@@ -95,7 +111,8 @@ fi
 MODULE_DIR=$(echo "$MODULE_DIRS" | head -1)
 
 # Count modules
-MODULE_COUNT=$(find "$TMPDIR/lib/modules/$MODULE_DIR" -name "*.ko*" 2>/dev/null | wc -l)
+MODULE_COUNT=$(printf '%s\n' "$PKG_FILES" \
+    | grep -c "^/\(usr/\)\?lib/modules/$MODULE_DIR/.*\.ko\(\.[a-z]*\)\?$" || true)
 
 # Display results
 echo ""
