@@ -786,16 +786,20 @@ verify-deb-packages:
 	@echo "======================================================================"
 	@echo "Verifying Debian package consistency..."
 	@echo "======================================================================"
+	@# The binary/modules packages are named after the source package, so the
+	@# glob has to allow the suffix: linux-intel-binary-*, not linux-binary-*.
 	@FAILED=0; \
-	config=$$(ls $(BUILD_PACKAGES_DEB_DIR)/linux-config-*.deb 2>/dev/null | head -1); \
+	CHECKED=0; \
+	config=$$(ls $(BUILD_PACKAGES_DEB_DIR)/linux*-config-*.deb 2>/dev/null | head -1); \
 	if [ -z "$$config" ]; then \
-		echo "⚠️  Warning: no linux-config-*.deb found; Intel config-coverage check will be skipped"; \
+		echo "⚠️  Warning: no linux*-config-*.deb found; Intel config-coverage check will be skipped"; \
 	fi; \
-	for binary in $(BUILD_PACKAGES_DEB_DIR)/linux-binary-*.deb; do \
+	for binary in $(BUILD_PACKAGES_DEB_DIR)/linux*-binary-*.deb; do \
 		if [ -f "$$binary" ]; then \
-			modules=$$(echo $$binary | sed 's/linux-binary-/linux-modules-/'); \
+			modules=$$(echo $$binary | sed 's|\(/linux[^/]*\)-binary-|\1-modules-|'); \
 			if [ -f "$$modules" ]; then \
 				echo ""; \
+				CHECKED=$$((CHECKED + 1)); \
 				if ! $(CURDIR)/scripts/verify-kernel-package.sh "$$binary" "$$modules" "$$config"; then \
 					FAILED=1; \
 				fi; \
@@ -810,9 +814,18 @@ verify-deb-packages:
 		echo "   Fix required before deployment."; \
 		echo ""; \
 		exit 1; \
+	elif [ $$CHECKED -eq 0 ]; then \
+		echo ""; \
+		echo "❌ Package verification FAILED: nothing was verified!"; \
+		echo "   No kernel/modules package pair matched"; \
+		echo "   $(BUILD_PACKAGES_DEB_DIR)/linux*-binary-*.deb"; \
+		echo "   A silent pass here once shipped an unbootable kernel - fix the"; \
+		echo "   glob or the build before deploying."; \
+		echo ""; \
+		exit 1; \
 	else \
 		echo ""; \
-		echo "✅ All packages verified successfully!"; \
+		echo "✅ All packages verified successfully! ($$CHECKED package(s) checked)"; \
 		echo ""; \
 	fi
 
