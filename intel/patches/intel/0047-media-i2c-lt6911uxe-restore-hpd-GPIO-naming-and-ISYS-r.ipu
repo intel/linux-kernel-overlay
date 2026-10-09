@@ -1,0 +1,150 @@
+From f7949d785246b73b4bfeea92dcb9692916e04147 Mon Sep 17 00:00:00 2001
+From: syafiqnizam25 <muhammadsyafiqnizamuddinx.binshafie@intel.com>
+Date: Fri, 2 Oct 2026 10:35:35 +0800
+Subject: [PATCH 47/47] media: i2c: lt6911uxe: restore hpd GPIO naming and ISYS
+ reset triggers
+
+The baseline realignment ('ipu: align with driver with baseline.')
+overwrote lt6911uxe.c with ipu6-drivers' older content, which silently
+reverted two fixes:
+
+- lt6911uxe_probe() requested the IRQ GPIO named "readystat" instead
+  of "hpd". The int3472 discrete-device driver only exposes a GPIO
+  lookup entry named "hpd" for this handshake signal, so the rename
+  caused devm_gpiod_get() to fail with -ENOENT and the sensor to fail
+  probing entirely on platforms using the upstream int3472 driver.
+- lt6911uxe_fwnode_parse() dropped the 'ret = -EINVAL;' assignment on
+  the unsupported-lane-count error path, so probe could return success
+  even when the endpoint lane count did not match.
+
+Separately, 'media: ipu6: Enable ISYS reset' (be3d21160d75) dropped two
+need_reset triggers that ipu6-drivers still carries:
+
+- return_buffers() no longer flags isys->need_reset when buffers are
+  force-returned (FW crash / HW hang recovery path).
+- ipu6_isys_fw_close() no longer flags isys->need_reset and warns when
+  isys->fwcom is still set after ipu6_fw_isys_close(), i.e. close did
+  not fully complete.
+
+- fix d4xx issue for allyes/allmod/allno
+
+Without these triggers, CSI-2 FIFO overflow errors during streaming
+never request the D0i0->D3 power-cycle recovery, so the ISYS firmware
+wedges permanently (stream stop/close time out, tsc sync failure, fw
+com open failure) after extended streaming instead of recovering.
+
+Restore all four fixes, matching ipu6-drivers' current behaviour.
+
+Signed-off-by: syafiqnizam25 <muhammadsyafiqnizamuddinx.binshafie@intel.com>
+---
+ drivers/media/i2c/lt6911uxe.c                  |  5 +++--
+ drivers/media/pci/intel/ipu6/ipu6-isys-queue.c | 15 +++++++++++++++
+ drivers/media/pci/intel/ipu6/ipu6-isys-video.c | 12 +++++++++++-
+ include/media/i2c/d4xx.h                       |  2 +-
+ 4 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/i2c/lt6911uxe.c b/drivers/media/i2c/lt6911uxe.c
+index 5d7cd56ee013..6a03b990ffb7 100644
+--- a/drivers/media/i2c/lt6911uxe.c
++++ b/drivers/media/i2c/lt6911uxe.c
+@@ -508,6 +508,7 @@ static int lt6911uxe_fwnode_parse(struct lt6911uxe *lt6911uxe,
+ 	 */
+ 	if (bus_cfg.bus.mipi_csi2.num_data_lanes != LT6911UXE_DEFAULT_LANES) {
+ 		dev_err(dev, "only 4 data lanes are currently supported\n");
++		ret = -EINVAL;
+ 		goto out_err;
+ 	}
+ 	lt6911uxe->cur_mode.lanes = bus_cfg.bus.mipi_csi2.num_data_lanes;
+@@ -600,10 +601,10 @@ static int lt6911uxe_probe(struct i2c_client *client)
+ 		return dev_err_probe(dev, PTR_ERR(lt6911uxe->reset_gpio),
+ 				     "failed to get reset gpio\n");
+ 
+-	lt6911uxe->irq_gpio = devm_gpiod_get(dev, "readystat", GPIOD_IN);
++	lt6911uxe->irq_gpio = devm_gpiod_get(dev, "hpd", GPIOD_IN);
+ 	if (IS_ERR(lt6911uxe->irq_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(lt6911uxe->irq_gpio),
+-				     "failed to get ready_stat gpio\n");
++				     "failed to get hpd gpio\n");
+ 
+ 	ret = lt6911uxe_fwnode_parse(lt6911uxe, dev);
+ 	if (ret)
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c b/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
+index c5c30e7c9345..3ef000d7855c 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
+@@ -513,6 +513,10 @@ static int ipu6_isys_link_fmt_validate(struct ipu6_isys_queue *aq)
+ static void return_buffers(struct ipu6_isys_queue *aq,
+ 			   enum vb2_buffer_state state)
+ {
++#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
++	struct ipu6_isys_video *av = ipu6_isys_queue_to_video(aq);
++	bool need_reset = false;
++#endif
+ 	struct ipu6_isys_buffer *ib;
+ 	unsigned long flags;
+ 
+@@ -536,6 +540,9 @@ static void return_buffers(struct ipu6_isys_queue *aq,
+ 		vb2_buffer_done(vb, state);
+ 
+ 		spin_lock_irqsave(&aq->lock, flags);
++#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
++		need_reset = true;
++#endif
+ 	}
+ 
+ 	while (!list_empty(&aq->incoming)) {
+@@ -553,6 +560,14 @@ static void return_buffers(struct ipu6_isys_queue *aq,
+ 	}
+ 
+ 	spin_unlock_irqrestore(&aq->lock, flags);
++
++#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
++	if (need_reset) {
++		mutex_lock(&av->isys->reset_mutex);
++		av->isys->need_reset = true;
++		mutex_unlock(&av->isys->reset_mutex);
++	}
++#endif
+ }
+ 
+ static void ipu6_isys_stream_cleanup(struct ipu6_isys_video *av)
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-video.c b/drivers/media/pci/intel/ipu6/ipu6-isys-video.c
+index b4204cb73fec..65c41a822f7f 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-video.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-video.c
+@@ -1261,8 +1261,18 @@ void ipu6_isys_fw_close(struct ipu6_isys *isys)
+ 	mutex_lock(&isys->mutex);
+ 
+ 	isys->ref_count--;
+-	if (!isys->ref_count)
++	if (!isys->ref_count) {
+ 		ipu6_fw_isys_close(isys);
++#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
++		if (isys->fwcom) {
++			mutex_lock(&isys->reset_mutex);
++			isys->need_reset = true;
++			mutex_unlock(&isys->reset_mutex);
++			dev_warn(&isys->adev->auxdev.dev,
++				 "failed to close fw isys\n");
++		}
++#endif
++	}
+ 
+ 	mutex_unlock(&isys->mutex);
+ 
+diff --git a/include/media/i2c/d4xx.h b/include/media/i2c/d4xx.h
+index 6b2ad7128fcd..77673d70b239 100644
+--- a/include/media/i2c/d4xx.h
++++ b/include/media/i2c/d4xx.h
+@@ -52,7 +52,7 @@ struct hwm_cmd {
+ 	u32 param2;
+ 	u32 param3;
+ 	u32 param4;
+-	unsigned char Data[0];
++	unsigned char Data[];
+ };
+ 
+ static const struct hwm_cmd cmd_switch_to_dfu = {
+-- 
+2.34.1
+

@@ -1,0 +1,317 @@
+From 7d1c8b123c967ff211296b8f86cdd13e9a968945 Mon Sep 17 00:00:00 2001
+From: "Sodhi, Vunny" <vunny.sodhi@intel.com>
+Date: Fri, 17 Jul 2026 10:23:30 +0800
+Subject: [PATCH 20/47] media: maxim-serdes: add S3/S4 PM suspend/resume
+ support
+
+Restore minimal hardware state on resume:
+- Deserializer: restore serializer I2C alias translations and re-run
+  select_links() with RESET_ONESHOT for forwarding pipeline
+- Serializer: restore cached I2C translations and tunnel mode (if active)
+- Set resume_reconfigure_pending flag to bypass stale software cache and
+  force full hardware reprogram on next stream start
+
+The implementation follows the standard Linux PM model: suspend quiesces
+hardware, resume reinitializes to clean baseline, and enable_streams()
+reprograms full runtime configuration when userspace restarts streaming.
+
+Signed-off-by: Sodhi, Vunny <vunny.sodhi@intel.com>
+---
+ drivers/media/i2c/maxim-serdes/max96717.c |  5 +-
+ drivers/media/i2c/maxim-serdes/max_des.c  | 96 ++++++++++++++++++++---
+ drivers/media/i2c/maxim-serdes/max_ser.c  | 56 ++++++++++---
+ 3 files changed, 134 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/media/i2c/maxim-serdes/max96717.c b/drivers/media/i2c/maxim-serdes/max96717.c
+index fb034c426622..8721d0b13dbc 100644
+--- a/drivers/media/i2c/maxim-serdes/max96717.c
++++ b/drivers/media/i2c/maxim-serdes/max96717.c
+@@ -268,7 +268,7 @@ static const struct regmap_config max96717_i2c_regmap = {
+ static int max96717_wait_for_device(struct max96717_priv *priv)
+ {
+ 	unsigned int i;
+-	int ret = 0;
++	int ret;
+ 
+ 	for (i = 0; i < 10; i++) {
+ 		unsigned int val;
+@@ -277,9 +277,6 @@ static int max96717_wait_for_device(struct max96717_priv *priv)
+ 		if (!ret && val)
+ 			return 0;
+ 
+-		if (!ret)
+-			ret = -ETIMEDOUT;
+-
+ 		msleep(100);
+ 
+ 		dev_err(priv->dev, "Retry %u waiting for serializer: %d\n", i, ret);
+diff --git a/drivers/media/i2c/maxim-serdes/max_des.c b/drivers/media/i2c/maxim-serdes/max_des.c
+index a3a0c9d5e30f..7a3c61ae02c7 100644
+--- a/drivers/media/i2c/maxim-serdes/max_des.c
++++ b/drivers/media/i2c/maxim-serdes/max_des.c
+@@ -50,6 +50,9 @@ struct max_des_priv {
+ 	s64 link_freq_menu[1];
+ 
+ 	struct max_des_phy *unused_phy;
++
++	/* Force a full hardware reprogram on first post-resume stream update. */
++	bool resume_reconfigure_pending;
+ };
+ 
+ struct max_des_remap_context {
+@@ -929,7 +932,8 @@ static int max_des_set_modes(struct max_des_priv *priv,
+ 
+ 		max_des_get_phy_mode(context, phy, &mode);
+ 
+-		if (phy->mode.alt_mem_map8 == mode.alt_mem_map8 &&
++		if (!priv->resume_reconfigure_pending &&
++		    phy->mode.alt_mem_map8 == mode.alt_mem_map8 &&
+ 		    phy->mode.alt_mem_map10 == mode.alt_mem_map10 &&
+ 		    phy->mode.alt_mem_map12 == mode.alt_mem_map12 &&
+ 		    phy->mode.alt2_mem_map8 == mode.alt2_mem_map8)
+@@ -950,7 +954,8 @@ static int max_des_set_modes(struct max_des_priv *priv,
+ 
+ 		max_des_get_pipe_mode(context, pipe, &mode);
+ 
+-		if (pipe->mode.dbl8 == mode.dbl8 &&
++		if (!priv->resume_reconfigure_pending &&
++		    pipe->mode.dbl8 == mode.dbl8 &&
+ 		    pipe->mode.dbl10 == mode.dbl10 &&
+ 		    pipe->mode.dbl12 == mode.dbl12 &&
+ 		    pipe->mode.dbl8mode == mode.dbl8mode &&
+@@ -1452,7 +1457,8 @@ static int max_des_update_pipe_remaps(struct max_des_priv *priv,
+ 	 * packet errors) and can wedge the capture. Only reprogram on a real
+ 	 * change.
+ 	 */
+-	if (pipe->remaps && pipe->num_remaps == num_remaps &&
++	if (!priv->resume_reconfigure_pending &&
++	    pipe->remaps && pipe->num_remaps == num_remaps &&
+ 	    !memcmp(pipe->remaps, remaps, num_remaps * sizeof(*remaps))) {
+ 		devm_kfree(priv->dev, remaps);
+ 		return 0;
+@@ -1503,7 +1509,7 @@ static int max_des_update_pipe_enable(struct max_des_priv *priv,
+ 		break;
+ 	}
+ 
+-	if (enable == pipe->enabled)
++	if (!priv->resume_reconfigure_pending && enable == pipe->enabled)
+ 		return 0;
+ 
+ 	/*
+@@ -2528,7 +2534,8 @@ static int max_des_update_active(struct max_des_priv *priv, u64 *streams_masks,
+ 		}
+ 	}
+ 
+-	if (active != expected_active || des->active == active)
++	if (active != expected_active ||
++	    (!priv->resume_reconfigure_pending && des->active == active))
+ 		return 0;
+ 
+ 	if (des->ops->set_enable) {
+@@ -2673,6 +2680,7 @@ static int max_des_update_streams(struct v4l2_subdev *sd,
+ 
+ 	devm_kfree(priv->dev, priv->streams_masks);
+ 	priv->streams_masks = streams_masks;
++	priv->resume_reconfigure_pending = false;
+ 
+ 	return 0;
+ 
+@@ -3476,24 +3484,71 @@ EXPORT_SYMBOL_NS_GPL(max_des_remove, "MAX_SERDES");
+ int max_des_suspend(struct max_des *des)
+ {
+ 	struct max_des_priv *priv = des->priv;
++	int ret;
+ 
+-	if (des->ops->set_enable)
+-		des->ops->set_enable(des, false);
++	if (des->ops->set_enable) {
++		ret = des->ops->set_enable(des, false);
++		if (ret)
++			dev_warn(priv->dev, "suspend: set_enable(false) failed: %d\n", ret);
++	}
+ 
+-	max_des_update_pocs(priv, false);
++	ret = max_des_update_pocs(priv, false);
++	if (ret) {
++		dev_err(priv->dev, "suspend: failed to disable POCs: %d\n", ret);
++		return ret;
++	}
+ 
+ 	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(max_des_suspend, "MAX_SERDES");
+ 
++static void max_des_resume_restore_serializer_aliases(struct max_des_priv *priv)
++{
++	struct max_des *des = priv->des;
++	unsigned int i;
++
++	if (!des->ops->select_links)
++		return;
++
++	for (i = 0; i < des->ops->num_links; i++) {
++		struct max_des_link *link = &des->links[i];
++		int ret;
++
++		if (!link->enabled || !link->ser_xlate.en)
++			continue;
++
++		ret = max_des_init_link_ser_xlate(priv, link,
++						  priv->client->adapter,
++						  link->ser_xlate.dst,
++						  link->ser_xlate.src);
++		if (ret) {
++			/* Retry once after link stabilizes */
++			msleep(100);
++			ret = max_des_init_link_ser_xlate(priv, link,
++							  priv->client->adapter,
++							  link->ser_xlate.dst,
++							  link->ser_xlate.src);
++			if (ret)
++				dev_err(priv->dev,
++					"resume: failed to restore serializer alias on link %u: %d\n",
++					link->index, ret);
++		}
++	}
++}
++
+ int max_des_resume(struct max_des *des)
+ {
+ 	struct max_des_priv *priv = des->priv;
++	unsigned int mask = 0;
++	unsigned int i;
+ 	int ret;
+ 
+ 	ret = max_des_update_pocs(priv, true);
+-	if (ret)
++	if (ret) {
++		dev_err(priv->dev,
++			"resume: failed to enable POC supplies: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	ret = max_des_init(priv);
+ 	if (ret) {
+@@ -3501,6 +3556,29 @@ int max_des_resume(struct max_des *des)
+ 		goto err_disable_pocs;
+ 	}
+ 
++	/* S4: serializer resets to power-up address; restore I2C translations */
++	max_des_resume_restore_serializer_aliases(priv);
++
++	/* Restore link mask and issue RESET_ONESHOT for forwarding pipeline */
++	if (des->ops->select_links) {
++		for (i = 0; i < des->ops->num_links; i++) {
++			if (des->links[i].enabled)
++				mask |= BIT(i);
++		}
++		if (mask) {
++			ret = des->ops->select_links(des, mask);
++			if (ret) {
++				dev_err(priv->dev,
++					"resume: failed to select links (mask=0x%x): %d\n",
++					mask, ret);
++				goto err_disable_pocs;
++			}
++		}
++	}
++
++	/* Force full reprogram on next stream start (HW reset, SW cache stale) */
++	priv->resume_reconfigure_pending = true;
++
+ 	return 0;
+ 
+ err_disable_pocs:
+diff --git a/drivers/media/i2c/maxim-serdes/max_ser.c b/drivers/media/i2c/maxim-serdes/max_ser.c
+index 199de46b4e7d..37664d403924 100644
+--- a/drivers/media/i2c/maxim-serdes/max_ser.c
++++ b/drivers/media/i2c/maxim-serdes/max_ser.c
+@@ -1770,6 +1770,42 @@ static int max_ser_init(struct max_ser_priv *priv)
+ 	return 0;
+ }
+ 
++static int max_ser_restore_i2c_xlates(struct max_ser_priv *priv)
++{
++	struct max_ser *ser = priv->ser;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ser->ops->num_i2c_xlates; i++) {
++		struct max_serdes_i2c_xlate *xlate = &ser->i2c_xlates[i];
++
++		if (!xlate->en)
++			continue;
++
++		ret = ser->ops->set_i2c_xlate(ser, i, xlate);
++		if (ret) {
++			dev_err(priv->dev,
++				"resume: failed to restore i2c xlate[%u] 0x%02x->0x%02x: %d\n",
++				i, xlate->src, xlate->dst, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int max_ser_restore_runtime_state(struct max_ser_priv *priv)
++{
++	struct max_ser *ser = priv->ser;
++
++	/* Restore tunnel mode; other state reprogrammed by enable_streams() */
++	if (ser->ops->set_tunnel_enable &&
++	    ser->mode == MAX_SERDES_GMSL_TUNNEL_MODE)
++		return ser->ops->set_tunnel_enable(ser, true);
++
++	return 0;
++}
++
+ static int max_ser_notify_bound(struct v4l2_async_notifier *nf,
+ 				struct v4l2_subdev *subdev,
+ 				struct v4l2_async_connection *base_asc)
+@@ -2240,25 +2276,17 @@ int max_ser_suspend(struct max_ser *ser)
+ 	for (i = 0; i < ser->ops->num_phys; i++) {
+ 		struct max_ser_phy *phy = &ser->phys[i];
+ 
+-		if (ser->ops->set_phy_active && phy->active) {
++		if (ser->ops->set_phy_active && phy->active)
+ 			ser->ops->set_phy_active(ser, phy, false);
+-			/*
+-			 * Keep the active flag so that resume knows
+-			 * which PHYs to re-enable.
+-			 */
+-		}
+ 	}
+ 
+ 	for (i = 0; i < ser->ops->num_pipes; i++) {
+ 		struct max_ser_pipe *pipe = &ser->pipes[i];
+ 
+-		if (pipe->enabled)
++		if (ser->ops->set_pipe_enable && pipe->enabled)
+ 			ser->ops->set_pipe_enable(ser, pipe, false);
+ 	}
+ 
+-	if (ser->ops->set_tunnel_enable)
+-		ser->ops->set_tunnel_enable(ser, false);
+-
+ 	dev_dbg(priv->dev, "Serializer suspended\n");
+ 
+ 	return 0;
+@@ -2276,6 +2304,14 @@ int max_ser_resume(struct max_ser *ser)
+ 		return ret;
+ 	}
+ 
++	ret = max_ser_restore_i2c_xlates(priv);
++	if (ret)
++		return ret;
++
++	ret = max_ser_restore_runtime_state(priv);
++	if (ret)
++		return ret;
++
+ 	dev_dbg(priv->dev, "Serializer resumed\n");
+ 
+ 	return 0;
+-- 
+2.34.1
+
