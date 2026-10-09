@@ -1,0 +1,133 @@
+From 0d3b8b962e84234fabca4c07905e0ea445165b4a Mon Sep 17 00:00:00 2001
+From: "Sodhi, Vunny" <vunny.sodhi@intel.com>
+Date: Fri, 21 Aug 2026 10:55:41 +0800
+Subject: [PATCH 31/47] media: maxim-serdes, d4xx: fix RGB stream stuck after
+ S3 resume
+
+After S3 (s2idle) resume, the MAX96717 serializer's cached runtime state
+(pipe->enabled, phy->active, streams_masks) remained stale from before
+suspend. When enable_streams() ran post-resume, idempotency guards saw
+the cached state matched the requested state and skipped re-enabling
+pipes and PHYs that were actually disabled in hardware by max_ser_init().
+
+This caused the second stream (RGB on VC1) to have its serializer pipe
+and PHY left disabled, so data from the D457 sensor never reached the
+CSI-2 output despite the sensor FW confirming it was streaming.
+
+Fix by clearing all cached serializer runtime state in max_ser_resume()
+after hardware re-initialization, so enable_streams() detects a real
+delta and reprograms the hardware.
+
+Also implement d4xx ds5_suspend/ds5_resume to clear stale streaming
+flags and reinitialize D457 FW (MIPI lanes, data rate, stream reset)
+on resume, and propagate errors from ds5_enable/disable_streams.
+
+Signed-off-by: Sodhi, Vunny <vunny.sodhi@intel.com>
+---
+ drivers/media/i2c/d4xx.c                 | 35 +++++++++++++++++-------
+ drivers/media/i2c/maxim-serdes/max_ser.c | 13 +++++++++
+ 2 files changed, 38 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/i2c/d4xx.c b/drivers/media/i2c/d4xx.c
+index 9ee319c0c9c7..a43c4aef0a44 100644
+--- a/drivers/media/i2c/d4xx.c
++++ b/drivers/media/i2c/d4xx.c
+@@ -2681,11 +2681,11 @@ static int ds5_sensor_set_stream(struct v4l2_subdev *sd, u64 streams_mask, int e
+ 	ds5_read(state, config_status_base, &status);
+ 	ds5_read(state, stream_status_base, &streaming);
+ 	dev_dbg(&state->client->dev,
+-			"%s: %s %s, stream_status 0x%x:%x, config_status 0x%x:%x ret=%d\n",
+-			__func__, ds5_get_sensor_name(state),
+-			(enable)?"START":"STOP",
+-			stream_status_base, streaming,
+-			config_status_base, status, ret);
++		"%s: %s %s, stream_status 0x%x:%x, config_status 0x%x:%x ret=%d\n",
++		__func__, ds5_get_sensor_name(state),
++		(enable) ? "START" : "STOP",
++		stream_status_base, streaming,
++		config_status_base, status, ret);
+ 
+ 	return 0;
+ 
+@@ -2709,13 +2709,12 @@ static int ds5_enable_streams(struct v4l2_subdev *subdev,
+ 
+ 	return 0;
+ }
++
+ static int ds5_disable_streams(struct v4l2_subdev *subdev,
+ 	 struct v4l2_subdev_state *state,
+ 	 u32 pad, u64 streams_mask)
+ {
+-	ds5_sensor_set_stream(subdev, streams_mask, false);
+-
+-	return 0;
++	return ds5_sensor_set_stream(subdev, streams_mask, false);
+ }
+ 
+ // v4l2 ops for all
+@@ -5142,13 +5141,29 @@ static void ds5_update_pad_format(const struct ds5_resolution *resolutions,
+ 
+ static int __maybe_unused ds5_suspend(struct device *dev)
+ {
+-	//TODO: add resume handling in future
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct ds5 *ds5 = container_of(sd, struct ds5, mux.sd.subdev);
++
++	ds5->depth.sensor.streaming = false;
++	ds5->rgb.sensor.streaming = false;
++	ds5->ir.sensor.streaming = false;
++	ds5->imu.sensor.streaming = false;
++
+ 	return 0;
+ }
+ 
+ static int __maybe_unused ds5_resume(struct device *dev)
+ {
+-	//TODO: add resume handling in future
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct ds5 *ds5 = container_of(sd, struct ds5, mux.sd.subdev);
++	int ret;
++
++	ret = ds5_hw_init(client, ds5);
++	if (ret)
++		return ret;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/i2c/maxim-serdes/max_ser.c b/drivers/media/i2c/maxim-serdes/max_ser.c
+index 9355a9510685..423bad5869a1 100644
+--- a/drivers/media/i2c/maxim-serdes/max_ser.c
++++ b/drivers/media/i2c/maxim-serdes/max_ser.c
+@@ -2346,6 +2346,8 @@ EXPORT_SYMBOL_NS_GPL(max_ser_suspend, "MAX_SERDES");
+ int max_ser_resume(struct max_ser *ser)
+ {
+ 	struct max_ser_priv *priv = ser->priv;
++	unsigned int num_pads = max_ser_num_pads(ser);
++	unsigned int i;
+ 	int ret;
+ 
+ 	ret = max_ser_init(priv);
+@@ -2362,6 +2364,17 @@ int max_ser_resume(struct max_ser *ser)
+ 	if (ret)
+ 		return ret;
+ 
++	/* HW was reset; clear cached state so enable_streams() reprograms. */
++	for (i = 0; i < ser->ops->num_pipes; i++)
++		ser->pipes[i].enabled = false;
++
++	for (i = 0; i < ser->ops->num_phys; i++)
++		ser->phys[i].active = false;
++
++	ser->active = false;
++	ser->tpg_entry = NULL;
++	memset(priv->streams_masks, 0, num_pads * sizeof(*priv->streams_masks));
++
+ 	dev_dbg(priv->dev, "Serializer resumed\n");
+ 
+ 	return 0;
+-- 
+2.34.1
+

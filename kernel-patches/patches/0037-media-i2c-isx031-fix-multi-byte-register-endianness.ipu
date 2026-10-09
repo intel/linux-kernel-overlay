@@ -1,0 +1,73 @@
+From 6c1df8dc70e8b227e91769398c7fd43299fd21e1 Mon Sep 17 00:00:00 2001
+From: "Sodhi, Vunny" <vunny.sodhi@intel.com>
+Date: Thu, 10 Sep 2026 11:50:20 +0800
+Subject: [PATCH 37/47] media: i2c: isx031: fix multi-byte register endianness
+
+The isx031_write_reg() and isx031_read_reg() helpers serialized
+multi-byte values in big-endian order, but the ISX031 sensor uses
+little-endian layout for its multi-byte registers (LSB at the lower
+address). This is confirmed by the D3 reference driver, which
+configures its 16-bit and 32-bit regmaps with
+val_format_endian = REGMAP_ENDIAN_LITTLE, and by this driver's own
+mode init tables (e.g. H size 1920 written as 0x8AAA=0x80,
+0x8AAB=0x07).
+
+As a result, every 2- and 4-byte control write reached the sensor
+with swapped bytes. The most visible symptom was manual exposure:
+writing 120000 us to FME_SHTVAL (0xABEC, 32-bit) landed as
+0xC0D40100, which the sensor clamped to its VMAX-extended maximum
+of ~266547 us, pinning the frame rate at 3.75 fps regardless of
+the requested value. Analog/digital gain and white balance gain
+writes were similarly corrupted but produced changes that could be
+mistaken for a working path.
+
+Switch the transport helpers to little-endian using
+put_unaligned_le32() and get_unaligned_le32(). This fixes exposure,
+analog gain, digital gain, WB gains, AE limits, and all multi-byte
+readbacks in one place.
+
+Verified on hardware:
+
+  exposure=8000     -> 30.00 fps
+  exposure=120000   ->  7.50 fps
+  exposure=260000   ->  3.75 fps
+
+Signed-off-by: Sodhi, Vunny <vunny.sodhi@intel.com>
+---
+ drivers/media/i2c/isx031.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/i2c/isx031.c b/drivers/media/i2c/isx031.c
+index 5ae676d17438..bc72d274302a 100644
+--- a/drivers/media/i2c/isx031.c
++++ b/drivers/media/i2c/isx031.c
+@@ -333,13 +333,14 @@ static int isx031_read_reg(struct i2c_client *client, u16 reg, u16 len, u32 *val
+ 	msgs[1].addr = client->addr;
+ 	msgs[1].flags = I2C_M_RD;
+ 	msgs[1].len = len;
+-	msgs[1].buf = &data_buf[4 - len];
++	/* Sensor is little-endian for multi-byte fields (see D3 regmap). */
++	msgs[1].buf = data_buf;
+ 
+ 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+ 	if (ret != ARRAY_SIZE(msgs))
+ 		return -EIO;
+ 
+-	*val = get_unaligned_be32(data_buf);
++	*val = get_unaligned_le32(data_buf);
+ 
+ 	return 0;
+ }
+@@ -388,7 +389,8 @@ static int isx031_write_reg(struct i2c_client *client, u16 reg, u16 len, u32 val
+ 		return -EINVAL;
+ 
+ 	put_unaligned_be16(reg, buf);
+-	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
++	/* Sensor is little-endian for multi-byte fields (see D3 regmap). */
++	put_unaligned_le32(val, buf + 2);
+ 
+ 	ret = i2c_master_send(client, buf, len + 2);
+ 	if (ret != len + 2)
+-- 
+2.34.1
+
