@@ -1,0 +1,93 @@
+From c97c756d14a9dd2028ec6e41e265792eddfbf3d6 Mon Sep 17 00:00:00 2001
+From: "Sodhi, Vunny" <vunny.sodhi@intel.com>
+Date: Thu, 27 Aug 2026 14:26:56 +0800
+Subject: [PATCH 32/47] media: d4xx: Implement proper suspend/resume
+ functionality
+
+- Add mutex locking in suspend/resume for thread safety
+- Actually stop streaming by writing DS5_STREAM_STOP to firmware
+  instead of just clearing streaming flags
+- Control reset GPIO in suspend (low) and resume (high) to
+  properly power cycle the sensor
+- Add 200ms delay after GPIO high for sensor I2C readiness
+- Add error logging on resume failure
+
+Similar to isx031.c suspend/resume implementation.
+
+Signed-off-by: Sodhi, Vunny <vunny.sodhi@intel.com>
+---
+ drivers/media/i2c/d4xx.c | 49 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/i2c/d4xx.c b/drivers/media/i2c/d4xx.c
+index a43c4aef0a44..5e64bc77daa9 100644
+--- a/drivers/media/i2c/d4xx.c
++++ b/drivers/media/i2c/d4xx.c
+@@ -5145,10 +5145,35 @@ static int __maybe_unused ds5_suspend(struct device *dev)
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct ds5 *ds5 = container_of(sd, struct ds5, mux.sd.subdev);
+ 
+-	ds5->depth.sensor.streaming = false;
+-	ds5->rgb.sensor.streaming = false;
+-	ds5->ir.sensor.streaming = false;
+-	ds5->imu.sensor.streaming = false;
++	mutex_lock(&ds5->mutex);
++
++	/* Stop streaming for all active sensors */
++	if (ds5->depth.sensor.streaming) {
++		if (!ds5_write(ds5, DS5_START_STOP_STREAM,
++			       DS5_STREAM_STOP | DS5_STREAM_DEPTH))
++			ds5->depth.sensor.streaming = false;
++	}
++	if (ds5->rgb.sensor.streaming) {
++		if (!ds5_write(ds5, DS5_START_STOP_STREAM,
++			       DS5_STREAM_STOP | DS5_STREAM_RGB))
++			ds5->rgb.sensor.streaming = false;
++	}
++	if (ds5->ir.sensor.streaming) {
++		if (!ds5_write(ds5, DS5_START_STOP_STREAM,
++			       DS5_STREAM_STOP | DS5_STREAM_IR))
++			ds5->ir.sensor.streaming = false;
++	}
++	if (ds5->imu.sensor.streaming) {
++		if (!ds5_write(ds5, DS5_START_STOP_STREAM,
++			       DS5_STREAM_STOP | DS5_STREAM_IMU))
++			ds5->imu.sensor.streaming = false;
++	}
++
++	mutex_unlock(&ds5->mutex);
++
++	/* Set reset GPIO low to power off sensor */
++	if (!IS_ERR_OR_NULL(ds5->reset_gpio))
++		gpiod_set_value_cansleep(ds5->reset_gpio, 0);
+ 
+ 	return 0;
+ }
+@@ -5160,9 +5185,23 @@ static int __maybe_unused ds5_resume(struct device *dev)
+ 	struct ds5 *ds5 = container_of(sd, struct ds5, mux.sd.subdev);
+ 	int ret;
+ 
++	/* Set reset GPIO high to power on sensor */
++	if (!IS_ERR_OR_NULL(ds5->reset_gpio)) {
++		gpiod_set_value_cansleep(ds5->reset_gpio, 1);
++		/* Wait for sensor to power up and be ready for I2C */
++		msleep(200);
++	}
++
++	mutex_lock(&ds5->mutex);
++
+ 	ret = ds5_hw_init(client, ds5);
+-	if (ret)
++	if (ret) {
++		dev_err(&client->dev, "Failed to reinitialize sensor: %d\n", ret);
++		mutex_unlock(&ds5->mutex);
+ 		return ret;
++	}
++
++	mutex_unlock(&ds5->mutex);
+ 
+ 	return 0;
+ }
+-- 
+2.34.1
+
