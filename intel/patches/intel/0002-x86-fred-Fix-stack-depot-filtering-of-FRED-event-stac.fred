@@ -1,0 +1,158 @@
+From 2f072efec53becd3e11265b0458a8b6169c97d53 Mon Sep 17 00:00:00 2001
+From: Yuanhe Shu <xiangzao@linux.alibaba.com>
+Date: Tue, 1 Sep 2026 20:40:13 +0800
+Subject: [PATCH 2/2] x86/fred: Fix stack depot filtering of FRED event stacks
+
+With FRED, events are delivered to asm_fred_entrypoint_user and
+asm_fred_entrypoint_kernel in .noinstr.text, not to the IDT stubs, which
+are the only code covered by __irqentry_text_start..__irqentry_text_end.
+in_event_entry_text() therefore never recognizes the event entry point and
+filter_irq_stacks() does not truncate FRED event stacks: every trace
+saved from interrupt or exception context by stack depot users such as
+KASAN alloc/free tracking or SLUB object tracking combines the event path
+with the arbitrarily interrupted context.  The number of unique stacks
+grows with the product of both and the depot is exhausted.
+
+Observed on a dual-socket FRED-capable system with KASAN (generic,
+inline) and SLUB object tracking enabled, on both sockets roughly 80
+minutes after boot, once the depot had reached its maximum of 8192 pools
+(128 MiB):
+
+  Stack depot reached limit capacity
+  WARNING: CPU: 286 PID: 128614 at lib/stackdepot.c:271 depot_alloc_stack+0x158/0x170
+
+The traces had the expected shape: an interrupt side trace ran through
+asm_fred_entrypoint_kernel into the frames of the task it had
+interrupted.  New traces are dropped (handle 0) from then on and the
+depot never shrinks, so tracking stays dead until reboot.  (Splat from a
+6.6 based kernel; filter_irq_stacks() and the FRED entry layout are
+unchanged in mainline.)
+
+The entry points cannot be brought inside that range.  x86 has no
+.irqentry.text: commit f0178fc01fe4 ("x86/entry: Unbreak
+__irqentry_text_start/end magic") dropped it from the linker script and
+emits the markers as labels around the sequentially laid out IDT stubs
+instead, exactly because the entry rework had moved that code into
+.noinstr.text and broken the function graph tracer and
+filter_irq_stacks(); __irq_entry has been __invalid_section since.
+Those labels live inside entry_64.S and wrap the IDT stubs which
+asm/idtentry.h emits into .entry.text, so the linker cannot place
+another translation unit between them: only code compiled into
+entry_64.S itself can end up inside the range.  Architectures which do
+have the section fixed the same symptom locally, e.g.
+commit f6794950f0e5 ("arm64: set __exception_irq_entry with __irq_entry
+as a default") and commit 45c9f2b856a0 ("s390/entry: Mark IRQ entries
+to fix stack depot warnings").
+
+Every FRED event leaves a return address in the FRED entry text: the
+return address of the call to fred_entry_from_user/kernel, or a frame of
+asm_fred_entry_from_kvm(), which the core entry code uses to forward VMX
+interrupts and NMIs acknowledged as part of the VM-Exit; see
+commit 0701c9e17bd9 ("x86/kvm/vmx: Move IRQ/NMI dispatch from KVM
+into x86 core").  So bracket it with __fred_entry_text_start/end, the
+same way the IDT stubs are bracketed, and report that range from
+arch_in_event_entry_text().  Verified on that system with the fix
+backported: traces from FRED event context now end at
+asm_fred_entrypoint_kernel (/sys/kernel/debug/slab/*/alloc_traces) and
+the pool count levels off a few minutes after boot instead of climbing
+to the limit.
+
+The range covers every FRED entry point, including the ring 3 one which
+also serves syscalls, and the hook cannot tell them apart - it only gets
+an address.  That does not change any trace: filter_irq_stacks() cuts at
+the innermost match, and for anything entered from ring 3 the entry frame
+is already the outermost trace entry (the unwinder follows the pt_regs
+the entry pushed and stops there because user_mode(regs) is true), so the
+trace is returned unchanged.  Only ring 0 events, and the IRQ/NMI the
+core forwards through asm_fred_entry_from_kvm(), leave an unrelated
+context below the entry frame.  The IDT markers are not IRQ-only either:
+they wrap the entire asm/idtentry.h expansion, so the synchronous
+exception stubs have always been inside them.  The function graph
+tracer uses the same markers and has the same gap; it can be converted
+separately.
+
+This is not limited to FRED hardware: KVM_INTEL selects X86_FRED on
+x86_64 (commit 28d11e4548b7 ("x86/fred: KVM: VMX: Always use FRED for
+IRQs when CONFIG_X86_FRED=y")), so every kernel with Intel KVM support,
+built in or as a module, carries the FRED dispatch code, and the
+forwarding path above runs it even when the kernel itself uses the IDT.
+KVM host stacks therefore take the same untruncated path on non-FRED
+systems, albeit from a mostly fixed vcpu_run chain.
+
+Reported-by: Xiang Zheng <xiang.zheng@linux.alibaba.com>
+Fixes: 14619d912b65 ("x86/fred: FRED entry/exit and dispatch code")
+Cc: stable@vger.kernel.org # v6.9+
+Signed-off-by: Yuanhe Shu <xiangzao@linux.alibaba.com>
+Acked-by: Alexander Potapenko <glider@google.com>
+---
+ arch/x86/entry/entry_64_fred.S  | 14 ++++++++++++++
+ arch/x86/include/asm/sections.h | 24 ++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/arch/x86/entry/entry_64_fred.S b/arch/x86/entry/entry_64_fred.S
+index b98f8945dfff..5a3db902e961 100644
+--- a/arch/x86/entry/entry_64_fred.S
++++ b/arch/x86/entry/entry_64_fred.S
+@@ -36,6 +36,17 @@
+  */
+ 	.align 4096
+ 
++/*
++ * Bounds of the FRED event entry text.  Every event delivered by FRED
++ * enters here, including events which the core entry code forwards
++ * through asm_fred_entry_from_kvm().  This is the FRED counterpart of
++ * __irqentry_text_start..__irqentry_text_end and lets
++ * in_event_entry_text() find the event entry point of a stack, see
++ * arch_in_event_entry_text().
++ */
++	.globl __fred_entry_text_start
++__fred_entry_text_start:
++
+ SYM_CODE_START_NOALIGN(asm_fred_entrypoint_user)
+ 	FRED_ENTER
+ 	call	fred_entry_from_user
+@@ -150,3 +161,6 @@ SYM_FUNC_START(asm_fred_entry_from_kvm)
+ 
+ SYM_FUNC_END(asm_fred_entry_from_kvm)
+ #endif
++
++	.globl __fred_entry_text_end
++__fred_entry_text_end:
+diff --git a/arch/x86/include/asm/sections.h b/arch/x86/include/asm/sections.h
+index 30e8ee7006f9..f34170ecc4e4 100644
+--- a/arch/x86/include/asm/sections.h
++++ b/arch/x86/include/asm/sections.h
+@@ -5,6 +5,30 @@
+ #include <asm-generic/sections.h>
+ #include <asm/extable.h>
+ 
++#ifdef CONFIG_X86_FRED
++extern char __fred_entry_text_start[], __fred_entry_text_end[];
++
++#define arch_in_event_entry_text arch_in_event_entry_text
++
++/*
++ * FRED delivers events to entry points in .noinstr.text, which
++ * __irqentry_text_start..__irqentry_text_end does not cover.  See
++ * __fred_entry_text_start in entry_64_fred.S.
++ *
++ * Note that the range includes the ring 3 entry point, which also
++ * delivers syscalls, so it cannot tell interrupt entry and syscall
++ * entry apart.  That is fine for the only consumer,
++ * filter_irq_stacks(): it cuts at the innermost match, and for an
++ * entry from ring 3 the entry frame is already the outermost frame
++ * of the trace, so matching it is a no-op.
++ */
++static inline bool arch_in_event_entry_text(unsigned long addr)
++{
++	return addr >= (unsigned long)__fred_entry_text_start &&
++	       addr < (unsigned long)__fred_entry_text_end;
++}
++#endif
++
+ extern char __relocate_kernel_start[], __relocate_kernel_end[];
+ extern char __brk_base[], __brk_limit[];
+ extern char __end_rodata_aligned[];
+-- 
+2.43.0
+

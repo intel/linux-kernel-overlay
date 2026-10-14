@@ -1,0 +1,147 @@
+From bf7fce45db637844ea6d98c0d4ea63b7d0abd2bc Mon Sep 17 00:00:00 2001
+From: "Xin Li (Intel)" <xin@zytor.com>
+Date: Thu, 31 Aug 2023 00:56:30 -0700
+Subject: [PATCH 08/28] KVM: VMX: Set FRED MSR intercepts
+
+On a userspace MSR filter change, set FRED MSR intercepts.
+
+Because the following eight FRED MSRs,
+        MSR_IA32_FRED_RSP[123], MSR_IA32_FRED_STKLVLS,
+        MSR_IA32_FRED_SSP[123], MSR_IA32_FRED_CONFIG,
+are used by the kernel itself to take an exception at any time, they
+should be context-switched by Intel VT-x automatically in order to
+preserve the FRED architectural invariant that there should NEVER be
+a "gap" during which it is unsafe to take an exception.
+
+KVM leverages Intel VT-x hardware to automatically context switch the
+eight FRED MSRs using:
+
+  1) Dedicated host and guest VMCS fields for each MSR.
+
+  2) VM-entry/exit controls to manage the automated loading and saving
+     of the eight FRED MSRs.
+
+Consequently, passing these MSRs through to the guest would only add
+unnecessary handling code without benefit.
+
+Both MSR_IA32_FRED_RSP0 and MSR_IA32_FRED_SSP0 (aka MSR_IA32_PL0_SSP)
+are dedicated for userspace event delivery, IOW they are NOT used in
+any kernel event delivery and the execution of ERETS.  Thus KVM can
+run safely with guest values in the two MSRs.  As a result, save and
+restore of their guest values are deferred until vCPU context switch,
+Host MSR_IA32_FRED_RSP0 is restored upon returning to userspace, and
+Host MSR_IA32_PL0_SSP is managed with XRSTORS/XSAVES.
+
+MSR_IA32_PL0_SSP (aka MSR_IA32_FRED_SSP0) is part of CET supervisor
+state, but all four FRED SSP MSRs are architecturally visible on any
+processor that enumerates FRED.  Even if CET is absent, these MSRs
+remain accessible via RDMSR/WRMSR, though FRED transitions will not
+use them.
+
+Intercept MSR_IA32_PL0_SSP if CET shadow stacks are unsupported (even
+with FRED present).  Since this MSR is rarely accessed and ignored by
+XSAVES in this configuration, interception avoids the overhead of
+manually context switching the hardware MSR during vcpu_load/put.
+
+This behavior is consistent with the current setup in
+vmx_recalc_msr_intercepts(), so no change is needed to the interception
+logic for MSR_IA32_PL0_SSP.
+
+Signed-off-by: Xin Li (Intel) <xin@zytor.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+v10:
+ - Improve the commit message and code comment with an explanation
+   from hpa (Chao Gao and Dave Hansen).
+---
+ arch/x86/kvm/vmx/vmx.c | 67 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index df847e68c9f3..d61ace5d6419 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4306,6 +4306,72 @@ static void vmx_recalc_pmu_msr_intercepts(struct kvm_vcpu *vcpu)
+ 				  MSR_TYPE_RW, intercept);
+ }
+ 
++static void vmx_set_intercept_for_fred_msr(struct kvm_vcpu *vcpu)
++{
++	bool intercept = !guest_cpu_cap_has(vcpu, X86_FEATURE_FRED);
++
++	if (!kvm_cpu_cap_has(X86_FEATURE_FRED))
++		return;
++
++	/*
++	 * Because the following eight FRED MSRs,
++	 * 	MSR_IA32_FRED_RSP[123], MSR_IA32_FRED_STKLVLS,
++	 * 	MSR_IA32_FRED_SSP[123], MSR_IA32_FRED_CONFIG,
++	 * are used by the kernel itself to take an exception at any time, they
++	 * should be context-switched by Intel VT-x automatically in order to
++	 * preserve the FRED architectural invariant that there should NEVER be
++	 * a "gap" during which it is unsafe to take an exception.
++	 *
++	 * KVM leverages Intel VT-x hardware to automatically context switch the
++	 * eight FRED MSRs using:
++	 *
++	 *   1) Dedicated host and guest VMCS fields for each MSR.
++	 *
++	 *   2) VM-entry/exit controls to manage the automated loading and saving
++	 *      of the eight FRED MSRs.
++	 *
++	 * Consequently, passing these MSRs through to the guest would only add
++	 * unnecessary handling code without benefit.
++	 */
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_RSP1, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_RSP2, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_RSP3, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_STKLVLS, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_SSP1, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_SSP2, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_SSP3, MSR_TYPE_RW, intercept);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_CONFIG, MSR_TYPE_RW, intercept);
++
++	/*
++	 * MSR_IA32_FRED_RSP0 and MSR_IA32_PL0_SSP (aka MSR_IA32_FRED_SSP0) are
++	 * designed for event delivery while executing in userspace.  Since KVM
++	 * operates entirely in kernel mode (CPL is always 0 after any VM exit),
++	 * it can safely retain and operate with guest-defined values for these
++	 * MSRs.
++	 *
++	 * Disabling interception of the two MSRs offers two advantages:
++	 *   1) Simplicity: Eliminates dedicated MSR handling code.
++	 *   2) Performance: Avoids frequent VM-exits since the two MSRs are
++	 *      per user thread variables and frequently accessed.
++	 *
++	 * MSR_IA32_PL0_SSP (aka MSR_IA32_FRED_SSP0) is part of CET supervisor
++	 * state, but all four FRED SSP MSRs are architecturally visible on any
++	 * processor that enumerates FRED.  Even if CET is absent, these MSRs
++	 * remain accessible via RDMSR/WRMSR, though FRED transitions will not
++	 * use them.
++	 *
++	 * Intercept MSR_IA32_PL0_SSP if CET shadow stacks are unsupported (even
++	 * with FRED present).  Since this MSR is rarely accessed and ignored by
++	 * XSAVES in this configuration, interception avoids the overhead of
++	 * manually context switching the hardware MSR during vcpu_load/put.
++	 *
++	 * This behavior is consistent with the current setup in
++	 * vmx_recalc_msr_intercepts(), so no change is needed to the interception
++	 * logic for MSR_IA32_PL0_SSP.
++	 */
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_FRED_RSP0, MSR_TYPE_RW, intercept);
++}
++
+ static void vmx_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
+ {
+ 	bool intercept;
+@@ -4373,6 +4439,7 @@ static void vmx_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	vmx_recalc_pmu_msr_intercepts(vcpu);
++	vmx_set_intercept_for_fred_msr(vcpu);
+ 
+ 	/*
+ 	 * x2APIC and LBR MSR intercepts are modified on-demand and cannot be
+-- 
+2.43.0
+

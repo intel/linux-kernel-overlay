@@ -1,0 +1,167 @@
+From d9e5211fc9e06ae1fe914f734948730e6ab2a681 Mon Sep 17 00:00:00 2001
+From: Xin Li <xin@zytor.com>
+Date: Tue, 21 Jul 2026 09:31:11 -0700
+Subject: [PATCH 12/28] KVM: x86: Add a new save/restore flag for FRED metadata
+
+Introduce a new save/restore flag for FRED metadata (specifically, the
+event nested flag and data) being saved and restored during VM save/
+restore and live migration.
+
+Signed-off-by: Xin Li <xin@zytor.com>
+Signed-off-by: Sohil Mehta <sohil.mehta@intel.com>
+---
+v10:
+ - Advertise KVM_CAP_X86_FRED_EVENT only when KVM can virtualize FRED, and
+   return -EINVAL from KVM_ENABLE_CAP otherwise.
+ - Document the new return value in api.rst.
+---
+ Documentation/virt/kvm/api.rst  | 22 ++++++++++++++++++++++
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/include/uapi/asm/kvm.h |  1 +
+ arch/x86/kvm/x86.c              | 18 ++++++++++++++++++
+ include/uapi/linux/kvm.h        |  1 +
+ 5 files changed, 43 insertions(+)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index e0430cc750c9..dfae35a95121 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -1199,6 +1199,10 @@ The following bits are defined in the flags field:
+   triple_fault_pending field contains a valid state. This bit will
+   be set whenever KVM_CAP_X86_TRIPLE_FAULT_EVENT is enabled.
+ 
++- KVM_VCPUEVENT_VALID_FRED_STATE may be set to inform that the exception
++  state includes FRED state (specifically, the event nested flag and data).
++  This bit will be set whenever KVM_CAP_X86_FRED_EVENT is enabled.
++
+ ARM64:
+ ^^^^^^
+ 
+@@ -1301,6 +1305,11 @@ If KVM_CAP_X86_TRIPLE_FAULT_EVENT is enabled, KVM_VCPUEVENT_VALID_TRIPLE_FAULT
+ can be set in flags field to signal that the triple_fault field contains
+ a valid state and shall be written into the VCPU.
+ 
++If KVM_CAP_X86_FRED_EVENT is enabled, KVM_VCPUEVENT_VALID_FRED_STATE can be set
++in the flags field to inform that the exception state contains FRED state
++(specifically, the event nested flag and data), which shall be written into the
++VCPU.
++
+ ARM64:
+ ^^^^^^
+ 
+@@ -9056,6 +9065,19 @@ enabled, cmma can't be enabled anymore and pfmfi and the storage key
+ interpretation are disabled. If cmma has already been enabled or the
+ hpage_2g module parameter is not set to 1, -EINVAL is returned.
+ 
++7.48 KVM_CAP_X86_FRED_EVENT
++---------------------------
++
++:Architectures: x86
++:Parameters: args[0] whether feature should be enabled or not
++:Returns: 0 on success; -EINVAL if KVM cannot virtualize FRED.
++
++With this capability enabled, KVM allows exception save and restore operations
++to include FRED event context (specifically, the event nested flag and data).
++When injecting a FRED exception during VM entry, FRED event delivery relies
++on this information to select the correct event stack level and apply proper
++event data.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 0fd5d4edeebb..dd68db17fdae 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1286,6 +1286,7 @@ struct kvm_arch {
+ 	bool has_mapped_host_mmio;
+ 	bool guest_can_read_msr_platform_info;
+ 	bool exception_payload_enabled;
++	bool exception_fred_state_enabled;
+ 
+ 	bool triple_fault_event;
+ 
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 1585ec804066..6a67832c59bb 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -331,6 +331,7 @@ struct kvm_reinject_control {
+ #define KVM_VCPUEVENT_VALID_SMM		0x00000008
+ #define KVM_VCPUEVENT_VALID_PAYLOAD	0x00000010
+ #define KVM_VCPUEVENT_VALID_TRIPLE_FAULT	0x00000020
++#define KVM_VCPUEVENT_VALID_FRED_STATE	0x00000040
+ 
+ /* Interrupt shadow states */
+ #define KVM_X86_SHADOW_INT_MOV_SS	0x01
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 79468ddfe473..342b8080a391 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2288,6 +2288,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_PRE_FAULT_MEMORY:
+ 		r = tdp_enabled;
+ 		break;
++	case KVM_CAP_X86_FRED_EVENT:
++		r = kvm_cpu_cap_has(X86_FEATURE_FRED);
++		break;
+ 	case KVM_CAP_X86_APIC_BUS_CYCLES_NS:
+ 		r = kvm ? kvm->arch.apic_bus_cycle_ns : APIC_BUS_CYCLE_NS_DEFAULT;
+ 		break;
+@@ -3022,6 +3025,8 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 			 | KVM_VCPUEVENT_VALID_SMM);
+ 	if (vcpu->kvm->arch.exception_payload_enabled)
+ 		events->flags |= KVM_VCPUEVENT_VALID_PAYLOAD;
++	if (vcpu->kvm->arch.exception_fred_state_enabled)
++		events->flags |= KVM_VCPUEVENT_VALID_FRED_STATE;
+ 	if (vcpu->kvm->arch.triple_fault_event) {
+ 		events->triple_fault.pending = kvm_test_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+ 		events->flags |= KVM_VCPUEVENT_VALID_TRIPLE_FAULT;
+@@ -3036,6 +3041,7 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 			      | KVM_VCPUEVENT_VALID_SHADOW
+ 			      | KVM_VCPUEVENT_VALID_SMM
+ 			      | KVM_VCPUEVENT_VALID_PAYLOAD
++			      | KVM_VCPUEVENT_VALID_FRED_STATE
+ 			      | KVM_VCPUEVENT_VALID_TRIPLE_FAULT))
+ 		return -EINVAL;
+ 
+@@ -3051,6 +3057,11 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 		events->exception_has_payload = 0;
+ 	}
+ 
++	if (events->flags & KVM_VCPUEVENT_VALID_FRED_STATE) {
++		if (!vcpu->kvm->arch.exception_fred_state_enabled)
++			return -EINVAL;
++	}
++
+ 	if ((events->exception.injected || events->exception.pending) &&
+ 	    (events->exception.nr > 31 || events->exception.nr == NMI_VECTOR))
+ 		return -EINVAL;
+@@ -4038,6 +4049,13 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		kvm->arch.exception_payload_enabled = cap->args[0];
+ 		r = 0;
+ 		break;
++	case KVM_CAP_X86_FRED_EVENT:
++		r = -EINVAL;
++		if (!kvm_cpu_cap_has(X86_FEATURE_FRED))
++			break;
++		kvm->arch.exception_fred_state_enabled = cap->args[0];
++		r = 0;
++		break;
+ 	case KVM_CAP_X86_TRIPLE_FAULT_EVENT:
+ 		kvm->arch.triple_fault_event = cap->args[0];
+ 		r = 0;
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index ac2d77d14963..2bc04a6d775b 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -999,6 +999,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_S390_HPAGE_2G 249
+ #define KVM_CAP_PPC_COMPAT_CAPS 250
+ #define KVM_CAP_ARM_PMU_V3_STRICT 251
++#define KVM_CAP_X86_FRED_EVENT 252
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;
+-- 
+2.43.0
+
