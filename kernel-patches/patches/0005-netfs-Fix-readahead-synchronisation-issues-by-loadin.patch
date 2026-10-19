@@ -1,8 +1,8 @@
-From 292f86ac27c3a35d3a2b22d2d3089a06e45330b6 Mon Sep 17 00:00:00 2001
+From c461d822a756405e1867de9ac8c546fe1802d558 Mon Sep 17 00:00:00 2001
 From: David Howells <dhowells@redhat.com>
 Date: Thu, 27 Aug 2026 14:43:00 +0100
-Subject: [PATCH] netfs: Fix readahead synchronisation issues by loading all
- folios upfront
+Subject: [PATCH 5/9] netfs: Fix readahead synchronisation issues by loading
+ all folios upfront
 
 There are some synchronisation issues that derive from the app thread
 adding more folios to the rolling buffer whilst the collector thread is
@@ -45,20 +45,21 @@ cc: linux-mm@kvack.org
 cc: linux-fsdevel@vger.kernel.org
 Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
 (cherry picked from commit fed0b33e6c584986ba70018ec9f9787a98216e64)
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 ---
- fs/netfs/buffered_read.c       | 103 ++++++++++++++++++++-------------
- fs/netfs/internal.h            |   1 +
- fs/netfs/misc.c                |  19 ++++++
+ fs/netfs/buffered_read.c       | 101 ++++++++++++++++++++-------------
+ fs/netfs/internal.h            |   3 +-
+ fs/netfs/misc.c                |  19 +++++++
  fs/netfs/read_collect.c        |   7 +++
  fs/netfs/read_retry.c          |   7 +++
  fs/netfs/rolling_buffer.c      |  81 ++++++++++++++++----------
  include/linux/netfs.h          |   1 +
  include/linux/rolling_buffer.h |   6 +-
  include/trace/events/netfs.h   |   3 +
- 9 files changed, 156 insertions(+), 72 deletions(-)
+ 9 files changed, 155 insertions(+), 73 deletions(-)
 
 diff --git a/fs/netfs/buffered_read.c b/fs/netfs/buffered_read.c
-index 29868dcd1ec3b..2eaea865e6b4b 100644
+index 6b95f0c40ae45..2d5a3a2212038 100644
 --- a/fs/netfs/buffered_read.c
 +++ b/fs/netfs/buffered_read.c
 @@ -54,6 +54,42 @@ static void netfs_rreq_expand(struct netfs_io_request *rreq,
@@ -149,7 +150,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  	subreq->len = rsize;
  	if (unlikely(rreq->io_streams[0].sreq_max_segs)) {
  		size_t limit = netfs_limit_iter(&rreq->buffer.iter, 0, rsize,
-@@ -207,8 +215,7 @@ static void netfs_issue_read(struct netfs_io_request *rreq,
+@@ -208,8 +216,7 @@ static void netfs_issue_read(struct netfs_io_request *rreq,
   * slicing up the region to be read according to available cache blocks and
   * network rsize.
   */
@@ -157,9 +158,9 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
 -				    struct readahead_control *ractl)
 +static void netfs_read_to_pagecache(struct netfs_io_request *rreq)
  {
- 	struct netfs_inode *ictx = netfs_inode(rreq->inode);
  	unsigned long long start = rreq->start;
-@@ -287,7 +294,7 @@ static void netfs_read_to_pagecache(struct netfs_io_request *rreq,
+ 	ssize_t size = rreq->len;
+@@ -288,7 +295,7 @@ static void netfs_read_to_pagecache(struct netfs_io_request *rreq,
  		break;
  
  	issue:
@@ -168,7 +169,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  		if (slice < 0) {
  			ret = slice;
  			netfs_cancel_read(subreq, ret);
-@@ -301,6 +308,7 @@ static void netfs_read_to_pagecache(struct netfs_io_request *rreq,
+@@ -302,6 +309,7 @@ static void netfs_read_to_pagecache(struct netfs_io_request *rreq,
  		}
  
  		netfs_issue_read(rreq, subreq);
@@ -176,7 +177,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  
  		if (test_bit(NETFS_RREQ_PAUSE, &rreq->flags))
  			netfs_wait_for_paused_read(rreq);
-@@ -338,7 +346,8 @@ void netfs_readahead(struct readahead_control *ractl)
+@@ -339,7 +347,8 @@ void netfs_readahead(struct readahead_control *ractl)
  {
  	struct netfs_io_request *rreq;
  	struct netfs_inode *ictx = netfs_inode(ractl->mapping->host);
@@ -186,37 +187,34 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  	size_t size = readahead_length(ractl);
  	int ret;
  
-@@ -358,12 +367,26 @@ void netfs_readahead(struct readahead_control *ractl)
- 			 netfs_read_trace_readahead);
+@@ -360,11 +369,23 @@ void netfs_readahead(struct readahead_control *ractl)
  
  	netfs_rreq_expand(rreq, ractl);
--
--	rreq->submitted = rreq->start;
- 	if (rolling_buffer_init(&rreq->buffer, rreq->debug_id, ITER_DEST) < 0)
- 		goto cleanup_free;
--	netfs_read_to_pagecache(rreq, ractl);
  
+-	rreq->submitted = rreq->start;
+-	if (rolling_buffer_init(&rreq->buffer, rreq->debug_id, ITER_DEST) < 0)
 +	/* Load the folios to be read into a bvecq chain.  Note that this
 +	 * acquires a ref on each folio that we will need to release later -
 +	 * but we don't want to do that until after we've started the I/O.
 +	 */
 +	added = rolling_buffer_bulk_load_from_ra(&rreq->buffer, ractl,
-+						 rreq->debug_id, rreq->gfp);
++						 rreq->debug_id, GFP_NOFS);
 +	if (added < 0) {
 +		ret = added;
-+		goto cleanup_free;
+ 		goto cleanup_free;
+-	netfs_read_to_pagecache(rreq, ractl);
 +	}
 +	__set_bit(NETFS_RREQ_NEED_PUT_RA_REFS, &rreq->flags);
 +
 +	rreq->submitted = rreq->start + added;
 +	rreq->cleaned_to = rreq->start;
-+
+ 
 +	netfs_read_to_pagecache(rreq);
 +	netfs_maybe_bulk_drop_ra_refs(rreq);
  	return netfs_put_request(rreq, netfs_rreq_trace_put_return);
  
  cleanup_free:
-@@ -456,7 +479,7 @@ static int netfs_read_gaps(struct file *file, struct folio *folio)
+@@ -457,7 +478,7 @@ static int netfs_read_gaps(struct file *file, struct folio *folio)
  	iov_iter_bvec(&rreq->buffer.iter, ITER_DEST, bvec, i, rreq->len);
  	rreq->submitted = rreq->start + flen;
  
@@ -225,7 +223,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  
  	ret = netfs_wait_for_read(rreq);
  	if (ret >= 0) {
-@@ -538,7 +561,7 @@ int netfs_read_folio(struct file *file, struct folio *folio)
+@@ -539,7 +560,7 @@ int netfs_read_folio(struct file *file, struct folio *folio)
  	if (ret < 0)
  		goto discard;
  
@@ -234,7 +232,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  	ret = netfs_wait_for_read(rreq);
  	netfs_put_request(rreq, netfs_rreq_trace_put_return);
  	return ret < 0 ? ret : 0;
-@@ -695,7 +718,7 @@ int netfs_write_begin(struct netfs_inode *ctx,
+@@ -696,7 +717,7 @@ int netfs_write_begin(struct netfs_inode *ctx,
  	if (ret < 0)
  		goto error_put;
  
@@ -243,7 +241,7 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  	ret = netfs_wait_for_read(rreq);
  	netfs_put_request(rreq, netfs_rreq_trace_put_return);
  	if (ret < 0)
-@@ -760,7 +783,7 @@ int netfs_prefetch_for_write(struct file *file, struct folio *folio,
+@@ -761,7 +782,7 @@ int netfs_prefetch_for_write(struct file *file, struct folio *folio,
  	if (ret < 0)
  		goto error_put;
  
@@ -253,22 +251,24 @@ index 29868dcd1ec3b..2eaea865e6b4b 100644
  	netfs_put_request(rreq, netfs_rreq_trace_put_return);
  	return ret < 0 ? ret : 0;
 diff --git a/fs/netfs/internal.h b/fs/netfs/internal.h
-index a4a5cec256b04..5b143f1ce370d 100644
+index a4a5cec256b04..0ec272121e280 100644
 --- a/fs/netfs/internal.h
 +++ b/fs/netfs/internal.h
-@@ -80,6 +80,7 @@ void netfs_wait_for_paused_read(struct netfs_io_request *rreq);
+@@ -79,7 +79,8 @@ ssize_t netfs_wait_for_write(struct netfs_io_request *rreq);
+ void netfs_wait_for_paused_read(struct netfs_io_request *rreq);
  void netfs_wait_for_paused_write(struct netfs_io_request *rreq);
  int netfs_clear_stale_pre_isize(struct inode *inode, unsigned long long from,
- 				unsigned long long to, bool nowait);
+-				unsigned long long to, bool nowait);
++			unsigned long long to, bool nowait);
 +void netfs_wait_for_put_ra_refs(struct netfs_io_request *rreq);
  
  /*
   * objects.c
 diff --git a/fs/netfs/misc.c b/fs/netfs/misc.c
-index 628c45f53d83c..9aa0d19542e9c 100644
+index 0f8432055daa7..f1fa5961a3431 100644
 --- a/fs/netfs/misc.c
 +++ b/fs/netfs/misc.c
-@@ -647,3 +647,22 @@ void netfs_clear_stale_post_isize(struct inode *inode, unsigned long long from,
+@@ -662,3 +662,22 @@ void netfs_clear_stale_post_isize(struct inode *inode, unsigned long long from,
  	netfs_clear_stale_isize(inode, from, to, false, true);
  }
  EXPORT_SYMBOL(netfs_clear_stale_post_isize);
@@ -292,7 +292,7 @@ index 628c45f53d83c..9aa0d19542e9c 100644
 +	finish_wait(&rreq->waitq, &myself);
 +}
 diff --git a/fs/netfs/read_collect.c b/fs/netfs/read_collect.c
-index 4c7312a4c8597..7636597077525 100644
+index 23660a5901246..edf7cea7e2f91 100644
 --- a/fs/netfs/read_collect.c
 +++ b/fs/netfs/read_collect.c
 @@ -118,6 +118,13 @@ static void netfs_read_unlock_folios(struct netfs_io_request *rreq,
@@ -427,7 +427,7 @@ index 207b6a3266512..4b826686fdc25 100644
  
  /*
 diff --git a/include/linux/netfs.h b/include/linux/netfs.h
-index 40eedb7bb06d0..81544f801a108 100644
+index ac5304f9c9ece..3d0fbb3b0e94a 100644
 --- a/include/linux/netfs.h
 +++ b/include/linux/netfs.h
 @@ -276,6 +276,7 @@ struct netfs_io_request {
@@ -479,6 +479,3 @@ index 3fe3980902c24..610cf1e70b6a0 100644
  	EM(netfs_rreq_trace_waited_quiesce,	"DONE-QUIESCE")	\
  	EM(netfs_rreq_trace_wake_ip,		"WAKE-IP")	\
  	EM(netfs_rreq_trace_wake_queue,		"WAKE-Q ")	\
--- 
-2.34.1
-
