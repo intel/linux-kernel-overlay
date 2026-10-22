@@ -1,24 +1,26 @@
-From 7c87962317f338eb9bff2f95aba422cc94d06cd7 Mon Sep 17 00:00:00 2001
+From d5eec0eaab6e4d1906a3f0d197054c71a7d3ea46 Mon Sep 17 00:00:00 2001
 From: Szymon Durawa <szymon.durawa@linux.intel.com>
-Date: Wed, 13 May 2026 16:13:37 +0000
-Subject: [PATCH 3/9] PCI: vmd: Add vmd_configure_membar() and
+Date: Wed, 2 Sep 2026 17:58:39 +0000
+Subject: [PATCH 3/8] PCI: vmd: Add vmd_configure_membar() and
  vmd_configure_membar1_membar2()
 
 Move the MEMBAR1 and MEMBAR2 registry initialization code to new helpers
-vmd_configure_membar() and vmd_configure_membar1_membar2(). No functional
-changes.
+vmd_configure_membar() and vmd_configure_membar1_membar2().
+The refactor preserves MEMBAR address/offset/flags programming, but
+resource name construction is now generated in the helper ("VMD MEMBAR%d")
+instead of using two separate string literals.
 
 Suggested-by: Nirmal Patel <nirmal.patel@linux.intel.com>
 Signed-off-by: Szymon Durawa <szymon.durawa@linux.intel.com>
 ---
- drivers/pci/controller/vmd.c | 80 ++++++++++++++++++++++--------------
- 1 file changed, 50 insertions(+), 30 deletions(-)
+ drivers/pci/controller/vmd.c | 98 +++++++++++++++++++++++++-----------
+ 1 file changed, 68 insertions(+), 30 deletions(-)
 
 diff --git a/drivers/pci/controller/vmd.c b/drivers/pci/controller/vmd.c
-index 2c824660cabd..443a0cefb7f7 100644
+index 2a8c10604c82..ed6d03656885 100644
 --- a/drivers/pci/controller/vmd.c
 +++ b/drivers/pci/controller/vmd.c
-@@ -783,6 +783,48 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
+@@ -921,6 +921,69 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
  	};
  }
  
@@ -32,11 +34,14 @@ index 2c824660cabd..443a0cefb7f7 100644
 + * @end_offset: 4K aligned offset applied to end of VMD’s MEMBAR MMIO space
 + *
 + * Function fills resource buffer inside the VMD structure.
++ *
++ * Return: 0 on success, -ENOMEM on allocation failure.
 + */
-+static void vmd_configure_membar(struct vmd_dev *vmd, u8 resource_number,
-+				 u8 membar_number, resource_size_t start_offset,
-+				 resource_size_t end_offset)
++static int vmd_configure_membar(struct vmd_dev *vmd, u8 resource_number,
++				u8 membar_number, resource_size_t start_offset,
++				resource_size_t end_offset)
 +{
++	char *name;
 +	u32 upper_bits;
 +	unsigned long flags;
 +
@@ -47,27 +52,45 @@ index 2c824660cabd..443a0cefb7f7 100644
 +	if (!upper_bits)
 +		flags &= ~IORESOURCE_MEM_64;
 +
++	name = devm_kasprintf(&vmd->dev->dev, GFP_KERNEL, "VMD MEMBAR%d",
++			      resource_number);
++	if (!name)
++		return -ENOMEM;
++
 +	vmd->resources[resource_number] = (struct resource){
-+		.name = kasprintf(GFP_KERNEL, "VMD MEMBAR%d",
-+				  membar_number / 2),
++		.name = name,
 +		.start = res->start + start_offset,
 +		.end = res->end - end_offset,
 +		.flags = flags,
 +		.parent = res,
 +	};
++
++	return 0;
 +}
 +
-+static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
-+					  resource_size_t mbar2_ofs)
++static int vmd_configure_membar1_membar2(struct vmd_dev *vmd,
++					 resource_size_t mbar2_ofs)
 +{
-+	vmd_configure_membar(vmd, 1, VMD_MEMBAR1, 0, 0);
-+	vmd_configure_membar(vmd, 2, VMD_MEMBAR2, mbar2_ofs, 0);
++	int ret;
++
++	ret = vmd_configure_membar(vmd, 1, VMD_MEMBAR1, 0, 0);
++	if (ret)
++		return ret;
++
++	ret = vmd_configure_membar(vmd, 2, VMD_MEMBAR2, mbar2_ofs, 0);
++	if (ret) {
++		devm_kfree(&vmd->dev->dev, (void *)vmd->resources[1].name);
++		memset(&vmd->resources[1], 0, sizeof(vmd->resources[1]));
++		return ret;
++	}
++
++	return 0;
 +}
 +
  static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
  {
  	struct pci_bus *child;
-@@ -834,9 +876,6 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
+@@ -972,9 +1035,6 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
  static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
  {
  	struct pci_sysdata *sd = &vmd->sysdata;
@@ -77,7 +100,7 @@ index 2c824660cabd..443a0cefb7f7 100644
  	LIST_HEAD(resources);
  	resource_size_t offset[2] = {0};
  	resource_size_t membar2_offset = 0x2000;
-@@ -883,36 +922,12 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+@@ -1000,36 +1060,14 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
  	 *
  	 * The only way we could use a 64-bit non-prefetchable MEMBAR is
  	 * if its address is <4GB so that we can convert it to a 32-bit
@@ -113,22 +136,12 @@ index 2c824660cabd..443a0cefb7f7 100644
 -		.flags = flags,
 -		.parent = res,
 -	};
-+	vmd_configure_membar1_membar2(vmd, membar2_offset);
++	ret = vmd_configure_membar1_membar2(vmd, membar2_offset);
++	if (ret)
++		return ret;
  
- 	/*
- 	 * Currently MSI remapping must be enabled in guest passthrough mode
-@@ -1074,6 +1089,11 @@ static void vmd_remove(struct pci_dev *dev)
- 	pci_stop_root_bus(vmd->bus);
- 	sysfs_remove_link(&vmd->dev->dev.kobj, "domain");
- 	pci_remove_root_bus(vmd->bus);
-+
-+	/* CFGBAR is static, does not require releasing memory */
-+	kfree(vmd->resources[1].name);
-+	kfree(vmd->resources[2].name);
-+
- 	vmd_cleanup_srcu(vmd);
- 	vmd_detach_resources(vmd);
- 	vmd_remove_irq_domain(vmd);
+ 	/* Non-zero offset means guest/direct assign view. */
+ 	vmd_in_guest = offset[0] || offset[1];
 -- 
 2.43.0
 
