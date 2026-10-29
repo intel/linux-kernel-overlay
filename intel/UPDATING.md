@@ -229,43 +229,28 @@ CONFIG_DEPENDENCY_B=m
 
 **Step 3: Register in defines.toml**
 
-**IMPORTANT:** New config files must be added to the merge order list.
+New config files must be listed in every flavour's merge order list in
+`debian/config/amd64/defines.toml`. This is automated:
 
 ```bash
-# Edit the architecture-specific defines file
-vim debian/config/amd64/defines.toml
-
-# Find the [[flavour]] section for 'amd64' and add your file
-[[flavour]]
-name = 'amd64'
-[flavour.build]
-config = [
-    'amd64/intel/bt.cfg',
-    'amd64/intel/camera.cfg',
-    # ... existing files ...
-    'amd64/intel/new-feature.cfg',    # <-- Add here
-    'amd64/intel/wifivpro.cfg',
-]
-
-# Also add to 'rt-amd64' flavour (same config list + config.rt)
-[[flavour]]
-name = 'rt-amd64'
-[flavour.build]
-config = [
-    'amd64/intel/bt.cfg',
-    # ... same list as amd64 ...
-    'amd64/intel/new-feature.cfg',    # <-- Add here too
-    'amd64/intel/wifivpro.cfg',
-    'config.rt',
-]
-
-# And to 'test' flavour if applicable
+make sync-configs           # append unlisted intel/*.cfg files
+make sync-configs CHECK=1   # only report missing files (exit 1 if any)
 ```
 
-**Where to place your new file in the list:**
-- Consider dependencies: if your config depends on options set by another file, place it **after** that file
-- If other configs might override your settings, place your file **after** them
-- General rule: place near related configs (e.g., new camera config near camera.cfg)
+`debian/bin/sync-intel-configs.py` checks each flavour's config list
+(`amd64`, `rt-amd64`, `test`) and appends every `amd64/intel/*.cfg` that
+isn't listed yet after the last existing `amd64/intel/` entry, so
+`config.rt` / `config.test` still come last. Existing entries and their
+order are left untouched; listed files that no longer exist are only
+reported as warnings (remove them by hand).
+
+`make deb-setup` runs `sync-configs` first, before copying `debian/` into
+the build directory, so a new fragment is never left out of the build.
+Commit the updated `defines.toml` afterwards.
+
+**Ordering:** fragments are merged in list order, so a later file overrides
+an earlier one. A new file lands at the end of the intel entries; if it must
+come earlier, move it by hand afterwards (the script won't reorder it).
 
 **Step 4: Test the configuration**
 
