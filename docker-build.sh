@@ -17,7 +17,8 @@ PKGVERSION="${PKGVERSION:-}"
 KERNELRELEASE="${KERNELRELEASE:-}"
 # Optional base kernel config selector (deb*/deb-source), passed to
 # 'make deb-setup'. Empty => keep the tracked debian/config/config symlink
-# (default base). Recognised values: noble | resolute.
+# (default base). Value is a base config codename, i.e. the <codename> of an
+# intel/config/amd64/base/<codename>.config-<kernel-version>-generic file.
 BASE_CONFIG="${BASE_CONFIG:-}"
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
@@ -72,8 +73,9 @@ OPTIONS:
     -f, --force-setup     Force re-run setup (clean build directory and re-extract source)
     --dockerfile FILE     Specify Dockerfile to use (default: Dockerfile.ubuntu26.04)
     --mode MODE           Build mode: minimal or full (default: full)
-    --base-config NAME    (deb*/deb-source/all) Base kernel config: noble or resolute
-                          (default: whatever debian/config/config points to;
+    --base-config NAME    (deb*/deb-source/all) Base kernel config codename, e.g. noble
+                          (see 'ls intel/config/amd64/base/' for the available ones;
+                           default: whatever debian/config/config points to;
                            for 'all' it applies only when deb-setup actually runs)
     --source-name NAME    (deb*/deb-source) Override source package name; must start with 'linux'
     --pkg-version VER     (deb*/deb-source) Override .deb package version (<kernelver>-<revision>)
@@ -102,8 +104,8 @@ EXAMPLES:
     $0 deb-minimal       # Same as above
 
     # Choose the base kernel config (default is the tracked symlink target)
-    $0 deb --base-config noble       # Use config.noble-6.8.0-31-generic as base
-    $0 deb --base-config resolute    # Use config.resolute-7.0.0-14-generic as base
+    $0 deb --base-config <codename>  # Use intel/config/amd64/base/<codename>.config-*
+    $0 deb --base-config noble       # e.g. the noble base config
 
     # Build with customized source name / version / kernel release (deb only)
     $0 deb --source-name linux-intel-6.18 \\
