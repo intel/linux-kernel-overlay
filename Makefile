@@ -46,7 +46,7 @@ help:
 	@echo "Examples:"
 	@echo "  make deb                    # Build all Debian packages (kernel + tools)"
 	@echo "  make deb-minimal            # Build kernel image only (faster)"
-	@echo "  make deb-setup BASE_CONFIG=noble    # Use noble base config instead of default (resolute)"
+	@echo "  make deb-setup BASE_CONFIG=noble    # Use the noble base config instead of the default (debian/config/config)"
 	@echo "  make deb-config SOURCENAME=linux-intel-6.18 PKGVERSION=6.18.0-mainline+linux+260623t022223z KERNELRELEASE=-intel"
 	@echo "  make deb-nonrt              # Build only the non-RT flavour (after deb-config)"
 	@echo "  make deb-rt                 # Build only the RT flavour (after deb-config)"
@@ -292,7 +292,7 @@ deb-setup: sync-configs
 	@# Copy debian directory to build directory (dereference symlinks with -L)
 	@echo "Copying debian/ configuration to build directory..."
 	@rsync -aL --exclude='.git' --delete debian/ $(BUILD_DIR)/debian/
-	@# Optionally override the base kernel config (BASE_CONFIG=noble|resolute).
+	@# Optionally override the base kernel config (BASE_CONFIG=<codename>).
 	@# The tracked debian/config/config symlink is dereferenced by the rsync -L
 	@# above, so $(BUILD_DIR)/debian/config/config is already a plain copy of the
 	@# default base. When BASE_CONFIG is set, replace that copy with the matching

@@ -18,9 +18,8 @@ intel/
 │   ├── config.rt              # Real-time (PREEMPT_RT) kernel config
 │   ├── config.test            # Test kernel configuration
 │   └── amd64/                 # AMD64 architecture configs
-│       ├── base/              # Base kernel configurations
-│       │   ├── config.noble-6.8.0-31-generic    # Ubuntu 24.04 Noble (kernel 6.8.0)
-│       │   └── config.resolute-7.0.0-14-generic # Ubuntu 26.04 Resolute (kernel 7.0.0)
+│       ├── base/              # Base kernel configs (see "Base Kernel Config" below)
+│       │   └── <codename>.config-<kernel-version>-generic
 │       ├── config.test        # AMD64-specific test config
 │       └── intel/             # Intel platform configs (amd64)
 │           ├── bt.cfg         # Bluetooth configuration
@@ -41,11 +40,30 @@ The Debian packaging system accesses these resources via symbolic links:
 
 - `debian/patches/series` → `../../intel/patches/series`
 - `debian/patches/intel` → `../../intel/patches/intel`
-- `debian/config/config` → `../../intel/config/amd64/base/config.resolute-7.0.0-14-generic`
+- `debian/config/config` → `../../intel/config/amd64/base/<codename>.config-<kernel-version>-generic` (the default base config; see below)
 - `debian/config/config.rt` → `../../intel/config/config.rt`
 - `debian/config/config.test` → `../../intel/config/config.test`
 - `debian/config/amd64/config.test` → `../../../intel/config/amd64/config.test`
 - `debian/config/amd64/intel` → `../../../intel/config/amd64/intel`
+
+#### Base Kernel Config
+
+`intel/config/amd64/base/` holds Ubuntu base kernel configs named
+`<codename>.config-<kernel-version>-generic`, e.g.
+`noble.config-6.8.0-31-generic`. Base configs are added and removed over
+time, so check the directory for the current set:
+
+```bash
+ls intel/config/amd64/base/
+readlink debian/config/config    # the default base config
+```
+
+The default is whichever file the `debian/config/config` symlink points
+to. To build against another base, pass its codename to `deb-setup`:
+
+```bash
+make deb-setup BASE_CONFIG=<codename>    # e.g. BASE_CONFIG=noble
+```
 
 Configuration fragments are referenced in `debian/config/amd64/defines.toml`:
 
