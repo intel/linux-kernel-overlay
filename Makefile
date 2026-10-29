@@ -1,7 +1,7 @@
 # Makefile for Kernel Packaging System
 # Supports both Debian (.deb) and RPM (.rpm) package builds
 
-.PHONY: help deb deb-config deb-nonrt deb-rt deb-source rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
+.PHONY: help deb deb-config deb-nonrt deb-rt deb-source sync-configs rpm-configs rpm rpm-rt rpm-all all clean clean-deb clean-rpm status
 
 # Default target
 help:
@@ -35,9 +35,11 @@ help:
 	@echo "  deb-nonrt        Build only the non-RT (amd64) flavour, full tools"
 	@echo "  deb-rt           Build only the RT (rt-amd64) flavour, image + source"
 	@echo "  deb-source       Build .dsc + source tarball for 'apt source' consumption"
+	@echo "  sync-configs     Append unlisted intel/config/amd64/intel/*.cfg to amd64/defines.toml"
 	@echo ""
 	@echo "RPM Targets:"
 	@echo "  rpm-prepare      Prepare RPM source files (first-time only)"
+	@echo "  rpm-configs      Sync defines.toml and regenerate rpm/kernel-x86_64*.config"
 	@echo "  rpm-quick        Quick RPM build (binary only)"
 	@echo "  rpm-update       Update RPM version info"
 	@echo ""
@@ -102,6 +104,13 @@ BUILD_CACHE_DIR ?= $(CURDIR)/build/cache
 # Debian Package Targets
 # ============================================================
 
+# Append any intel/config/amd64/intel/*.cfg not yet listed to the flavour
+# config lists in debian/config/amd64/defines.toml (existing order is kept).
+# Use CHECK=1 to only report missing files (exit 1 if any).
+INTEL_CFG_DIR ?= $(CURDIR)/intel/config/amd64/intel
+sync-configs:
+	@python3 debian/bin/sync-intel-configs.py $(if $(CHECK),--check) debian/config/amd64/defines.toml $(INTEL_CFG_DIR)
+
 deb:
 	@if [ ! -d "$(BUILD_DIR)" ]; then \
 		echo "Error: Build directory not found. Run 'make deb-setup' first."; \
@@ -163,7 +172,9 @@ deb-minimal:
 	@echo "Packages are in: $(BUILD_PACKAGES_DEB_DIR)"
 	@$(MAKE) verify-deb-packages
 
-deb-setup:
+# sync-configs runs first so the tracked amd64/defines.toml lists every
+# intel/config/amd64/intel/*.cfg before debian/ is copied into $(BUILD_DIR).
+deb-setup: sync-configs
 	@echo "======================================================================"
 	@echo "Setting up Debian build environment..."
 	@echo "======================================================================"
@@ -571,7 +582,15 @@ deb-modules:
 # ============================================================
 # Note: RPM kernel version is automatically extracted from debian/changelog
 
-rpm-prepare:
+# Sync amd64/defines.toml with intel/config/amd64/intel, then regenerate
+# rpm/kernel-x86_64*.config from it. prepare-sources.sh only generates the
+# configs when they are missing, so without this an RPM build would keep
+# using stale configs after a .cfg is added or edited. Generation is plain
+# concatenation, so redoing it on every build is cheap.
+rpm-configs: sync-configs
+	@cd rpm && ./scripts/generate-configs.sh
+
+rpm-prepare: rpm-configs
 	@echo "======================================================================"
 	@echo "Preparing RPM source files..."
 	@echo "======================================================================"
@@ -597,7 +616,7 @@ rpm-prepare:
 	@echo ""
 	@echo "Next: make rpm"
 
-rpm:
+rpm: rpm-configs
 	@echo "======================================================================"
 	@echo "Building RPM packages..."
 	@echo "======================================================================"
@@ -625,7 +644,7 @@ rpm:
 	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
 	@$(MAKE) verify-rpm-packages
 
-rpm-rt:
+rpm-rt: rpm-configs
 	@echo "======================================================================"
 	@echo "Building RPM packages (RT kernel)..."
 	@echo "======================================================================"
@@ -687,7 +706,7 @@ rpm-all:
 	@echo ""
 	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
 
-rpm-quick:
+rpm-quick: rpm-configs
 	@echo "======================================================================"
 	@echo "Quick RPM build (binary packages only)..."
 	@echo "======================================================================"
