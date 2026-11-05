@@ -259,7 +259,48 @@ run_container() {
     local rpmhome="${BUILD_DIR}/rpmhome"
     mkdir -p "${rpmhome}"
 
-    docker run $docker_flags \
+    # Pass the host's current proxy settings into the container, so a proxy
+    # change on the host doesn't need an image rebuild. Only variables that
+    # are set on the host are passed: 'docker run -e VAR' for a VAR unset on
+    # the host would *remove* it in the container, wiping the proxy the image
+    # ENV (or ~/.docker/config.json) provides. That broke CI agents whose job
+    # environment has NO_PROXY but no http(s)_proxy. Unset variables are left
+    # alone, so this can only add or refresh a proxy, never take one away.
+    # If the host sets only one case of a name (e.g. HTTP_PROXY), use it for
+    # the other case too: the image stores lowercase http(s)_proxy, and curl,
+    # apt etc. prefer lowercase, so a stale image value would otherwise win.
+    # A case the host sets itself is never overwritten (no_proxy and NO_PROXY
+    # may legitimately differ). The value is exported rather than given as
+    # '-e VAR=value' so it stays out of the process list.
+    local proxy_flags="" var other val src image_env proxy_found=""
+    image_env=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)
+    for var in http_proxy https_proxy no_proxy all_proxy \
+               HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY; do
+        if [[ "$var" == *[a-z]* ]]; then other="${var^^}"; else other="${var,,}"; fi
+        if [ -n "${!var:-}" ]; then
+            proxy_flags="$proxy_flags -e $var"
+            val="${!var}"; src="host"
+        elif [ -n "${!other:-}" ]; then
+            export "$var=${!other}"
+            proxy_flags="$proxy_flags -e $var"
+            val="${!var}"; src="host, via $other"
+        else
+            val=$(sed -n "s/^${var}=//p" <<< "$image_env" | head -n1)
+            src="image"
+        fi
+        if [ -n "$val" ]; then
+            # Mask any user:password@ so credentials don't end up in build logs
+            print_info "Container proxy: $var=$(sed -E 's#(://)[^/@]*@#\1***@#' <<< "$val") (from $src)"
+            proxy_found=1
+        fi
+    done
+    [ -n "$proxy_found" ] || print_info "Container proxy: none (not set on host or in image)"
+    if grep -qs '"proxies"' "${DOCKER_CONFIG:-$HOME/.docker}/config.json"; then
+        print_info "Container proxy: ${DOCKER_CONFIG:-$HOME/.docker}/config.json also defines proxies; Docker applies them to variables not set on host"
+    fi
+
+    docker run $docker_flags $proxy_flags \
         --name "${CONTAINER_NAME}" \
         --user "$(id -u):$(id -g)" \
         -v "${SCRIPT_DIR}:/build/debian-kernel" \
