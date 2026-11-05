@@ -46,18 +46,32 @@ Build or remove the Docker image:
 
 ## Behind a Proxy
 
-Set the proxy environment variables before building images:
+`docker-build.sh` uses the proxy from your host shell. Export it before running the script:
 
 ```bash
 # Configure the proxy
 export http_proxy=http://your-proxy:port
 export https_proxy=http://your-proxy:port
+export no_proxy=localhost,127.0.0.1     # Optional
 
-# Build the image (proxy settings are applied automatically)
+# Build the image, then build packages (proxy settings are applied automatically)
 ./docker-build.sh --build-image
+./docker-build.sh deb
 ```
 
-The build script automatically forwards the proxy settings to the Docker build.
+The proxy is applied at two stages:
+
+- **Image build** (`--build-image`): `http_proxy` and `https_proxy` are passed to `docker build`, so `apt-get` can install the build tools.
+- **Package build** (`deb`, `rpm`, ...): each of `http_proxy`, `https_proxy`, `no_proxy`, `all_proxy` (and their uppercase forms) that is set on the host is passed into the container, overriding the value stored in the image. If the host sets only one case of a name (e.g. `HTTP_PROXY`), it is used for both cases. Variables not set on the host in either case are left alone, so the container keeps the image's value for them.
+
+Changing the proxy on the host doesn't require rebuilding the image. At startup the script prints each proxy the container will use and where it comes from, for example:
+
+```
+[INFO] Container proxy: http_proxy=http://proxy.example.com:911 (from image)
+[INFO] Container proxy: NO_PROXY=intel.com,10.0.0.0/8 (from host)
+```
+
+Credentials in the URL are masked. If downloads fail with network errors, check this output; a proxy shown as `(from image)` means the shell that runs `docker-build.sh` doesn't export it. This is common for CI jobs, whose environment often isn't loaded from the login profile, and under `sudo`, which drops it by default.
 
 ## Documentation
 
