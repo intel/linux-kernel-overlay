@@ -189,6 +189,8 @@ sudo usermod -aG docker "$USER"
 
 **Installing Docker:** to install Docker on an Ubuntu host, follow the "Install the Docker packages." step of [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/) in the official Docker documentation.
 
+**Behind a proxy:** export `http_proxy`/`https_proxy` (and `no_proxy` if needed) in your shell first; `docker-build.sh` passes them into the image build and the container. See [docker/README.md — Behind a Proxy](docker/README.md#behind-a-proxy).
+
 Then build:
 
 ```bash
