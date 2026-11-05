@@ -85,9 +85,9 @@ OPTIONS:
 COMMANDS:
     shell                Open interactive shell in container
     deb                  Build Debian packages (setup + build, all flavours; also source + combined .changes)
-    deb-minimal          Build Debian packages (minimal: kernel image only)
+    deb-minimal          Build Debian packages (minimal: kernel image only, no tools/headers)
     deb-nonrt            Build only the non-RT flavour (full: kernel + tools; also source + combined .changes)
-    deb-rt               Build only the RT flavour (minimal: kernel image, no tools)
+    deb-rt               Build only the RT flavour (minimal: kernel image, no tools/headers)
     deb-source           Build source package (.dsc + tarball) for 'apt source'
     rpm                  Build RPM packages (prepare + build standard + RT)
     rpm-prepare          Prepare RPM source files only
@@ -100,7 +100,7 @@ EXAMPLES:
 
     # Build packages (all phases run in container)
     $0 deb               # Build Debian packages (full: kernel + tools)
-    $0 deb --mode minimal    # Build kernel image only (faster, no tools)
+    $0 deb --mode minimal    # Build kernel image only (faster, no tools/headers)
     $0 deb-minimal       # Same as above
 
     # Choose the base kernel config (default is the tracked symlink target)
@@ -135,7 +135,7 @@ EXAMPLES:
 
 BUILD MODES (for Debian packages):
     full     - Build kernel image + tools + headers (default)
-    minimal  - Build kernel image only (faster, no linux-kbuild/perf/cpupower)
+    minimal  - Build kernel image only (faster, no headers/linux-kbuild/perf/cpupower)
 
 CACHING:
     - Kernel source is cached in build/cache/ (downloaded once)
@@ -441,7 +441,7 @@ while [[ $# -gt 0 ]]; do
                     print_info "Building Debian packages (non-RT flavour only, full: kernel + tools; also source + combined .changes)..." ;;
                 deb-rt)
                     BUILD_MODE="rt"; MAKE_TARGET="deb-rt"
-                    print_info "Building Debian packages (RT flavour only, minimal: kernel image, no tools)..." ;;
+                    print_info "Building Debian packages (RT flavour only, minimal: kernel image, no tools/headers)..." ;;
                 deb-source)
                     BUILD_MODE="source"; MAKE_TARGET="deb-source"
                     print_info "Building Debian source package (.dsc + tarball for 'apt source')..." ;;
@@ -463,7 +463,7 @@ while [[ $# -gt 0 ]]; do
             print_info "Build log: $BUILD_LOG"
 
             if [ "$MAKE_TARGET" = "deb-minimal" ] || [ "$1" = "deb-rt" ]; then
-                print_info "This build will skip: linux-kbuild, linux-perf, linux-cpupower, and other tools"
+                print_info "This build will skip: linux-headers, linux-kbuild, linux-perf, linux-cpupower, and other tools"
             fi
 
             # Assemble optional deb-config step. Each override is added only when
