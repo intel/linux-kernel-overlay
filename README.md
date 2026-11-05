@@ -176,6 +176,21 @@ See [debian/README.md](debian/README.md#package-conflicts-with-system-tools) for
 
 For clean, reproducible builds without installing dependencies:
 
+**Prerequisite:** Docker must be installed and running on your host, and your user must be able to run `docker` without `sudo`. Install Docker first if you haven't. Then verify:
+
+```bash
+# Verify Docker is available
+docker --version
+docker info > /dev/null && echo "Docker is running"
+
+# If you get a permission error, add yourself to the docker group, then log out and back in
+sudo usermod -aG docker "$USER"
+```
+
+**Installing Docker:** to install Docker on an Ubuntu host, follow the "Install the Docker packages." step of [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/) in the official Docker documentation.
+
+Then build:
+
 ```bash
 # Build Docker image (first time only, Ubuntu 26.04 by default)
 ./docker-build.sh --build-image
