@@ -398,9 +398,10 @@ fi
 %{_unitdir}/cpupower.service
 %{_datadir}/bash-completion/completions/cpupower
 %{_datadir}/locale/*/LC_MESSAGES/cpupower.mo
-%{_datadir}/doc/perf-tip/tips.txt
-%{python3_sitearch}/perf-*.egg-info
-%{python3_sitearch}/perf.cpython-*-x86_64-linux-gnu.so
+%{_datadir}/doc/perf-tip
+# Everything perf's install-python_ext puts here (.so, egg-info, perf.pyi
+# since 7.3, ...); globbed so new upstream files don't break the build.
+%{python3_sitearch}/*
 
 %files tools-libs
 %defattr(-,root,root)
