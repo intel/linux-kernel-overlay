@@ -20,6 +20,10 @@ KERNELRELEASE="${KERNELRELEASE:-}"
 # (default base). Value is a base config codename, i.e. the <codename> of an
 # intel/config/amd64/base/<codename>.config-<kernel-version>-generic file.
 BASE_CONFIG="${BASE_CONFIG:-}"
+# Extra 'docker run' arguments, e.g. to mount a corporate CA bundle on CI.
+# Collected from each --docker-arg. Values are split on whitespace (no quote
+# handling), so a path or value that contains spaces can't be passed this way.
+EXTRA_RUN_ARGS=()
 BUILD_DIR="${SCRIPT_DIR}/build"
 PACKAGES_DIR="${BUILD_DIR}/packages"
 PACKAGES_DEB_DIR="${PACKAGES_DIR}/deb"
@@ -80,6 +84,9 @@ OPTIONS:
     --source-name NAME    (deb*/deb-source) Override source package name; must start with 'linux'
     --pkg-version VER     (deb*/deb-source) Override .deb package version (<kernelver>-<revision>)
     --kernel-release SFX  (deb*/deb-source) Override uname -r suffix (localversion + abi_suffix)
+    --docker-arg ARGS     (all commands except --build-image) Extra 'docker run' arguments
+                          for the build container (repeatable; split on whitespace; added
+                          after the built-in ones, so they can override them).
     -h, --help            Show this help message
 
 COMMANDS:
@@ -132,6 +139,12 @@ EXAMPLES:
 
     # Open shell
     $0 shell             # Interactive shell in container
+
+    # Corporate CA / TLS interception: trust the host's CA bundle in the container
+    # (works the same with shell, deb*, rpm-prepare, rpm and all)
+    $0 deb-rt --docker-arg "-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro"
+    # Several args in one value, or repeat --docker-arg
+    $0 rpm --docker-arg "-v /data/cache:/data/cache:ro -e FOO=bar"
 
 BUILD MODES (for Debian packages):
     full     - Build kernel image + tools + headers (default)
@@ -272,7 +285,9 @@ run_container() {
     # A case the host sets itself is never overwritten (no_proxy and NO_PROXY
     # may legitimately differ). The value is exported rather than given as
     # '-e VAR=value' so it stays out of the process list.
-    local proxy_flags="" var other val src image_env proxy_found=""
+    # proxy_shown is proxy_flags with the values filled in, for the printed
+    # docker command only.
+    local proxy_flags="" proxy_shown="" var other val src image_env proxy_found=""
     image_env=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" \
         --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)
     for var in http_proxy https_proxy no_proxy all_proxy \
@@ -280,10 +295,12 @@ run_container() {
         if [[ "$var" == *[a-z]* ]]; then other="${var^^}"; else other="${var,,}"; fi
         if [ -n "${!var:-}" ]; then
             proxy_flags="$proxy_flags -e $var"
+            proxy_shown="$proxy_shown -e $var=${!var}"
             val="${!var}"; src="host"
         elif [ -n "${!other:-}" ]; then
             export "$var=${!other}"
             proxy_flags="$proxy_flags -e $var"
+            proxy_shown="$proxy_shown -e $var=${!var}"
             val="${!var}"; src="host, via $other"
         else
             val=$(sed -n "s/^${var}=//p" <<< "$image_env" | head -n1)
@@ -300,15 +317,23 @@ run_container() {
         print_info "Container proxy: ${DOCKER_CONFIG:-$HOME/.docker}/config.json also defines proxies; Docker applies them to variables not set on host"
     fi
 
-    docker run $docker_flags $proxy_flags \
-        --name "${CONTAINER_NAME}" \
-        --user "$(id -u):$(id -g)" \
-        -v "${SCRIPT_DIR}:/build/debian-kernel" \
-        -v "${rpmhome}:/home/build-user" \
-        -e HOME="/home/build-user" \
-        -w /build/debian-kernel \
-        "${IMAGE_NAME}:${IMAGE_TAG}" \
-        bash -c "${cmd}"
+    # Extra args go after the built-in ones so they can override them
+    # (docker uses the last -e/-w/--user given), but before the image name.
+    local run_args=(--name "${CONTAINER_NAME}"
+        --user "$(id -u):$(id -g)"
+        -v "${SCRIPT_DIR}:/build/debian-kernel"
+        -v "${rpmhome}:/home/build-user"
+        -e HOME="/home/build-user"
+        -w /build/debian-kernel
+        "${EXTRA_RUN_ARGS[@]}"
+        "${IMAGE_NAME}:${IMAGE_TAG}")
+
+    # Print the proxy values (proxy_shown), but run with '-e VAR' only
+    # (proxy_flags) so they stay out of the process list. Mask any
+    # user:password@ like the proxy lines above.
+    print_info "Docker command: $(sed -E 's#(://)[^/@ ]*@#\1***@#g' <<< "docker run ${docker_flags}${proxy_shown} ${run_args[*]} bash -c \"${cmd}\"")"
+
+    docker run $docker_flags $proxy_flags "${run_args[@]}" bash -c "${cmd}"
 }
 
 check_image_exists() {
@@ -366,6 +391,11 @@ for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
         --kernel-release)
             KERNELRELEASE="${ORIGINAL_ARGS[i+1]}"
             ;;
+        --docker-arg)
+            read -r -a _args <<< "${ORIGINAL_ARGS[i+1]:-}"
+            EXTRA_RUN_ARGS+=("${_args[@]}")
+            i=$((i+1))  # skip the value, which often starts with '-' (e.g. '-v ...')
+            ;;
     esac
 done
 
@@ -404,7 +434,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             continue
             ;;
-        --source-name|--pkg-version|--kernel-release|--base-config)
+        --source-name|--pkg-version|--kernel-release|--base-config|--docker-arg)
             if [ -z "$2" ]; then
                 print_error "Error: $1 requires a value"
                 exit 1
