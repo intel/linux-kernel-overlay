@@ -265,6 +265,14 @@ run_container() {
         docker_flags="$docker_flags -i"
     fi
 
+    # Make Ctrl-C (or a CI abort) stop the whole build. Without a TTY (always
+    # the case for builds, whose output is piped to tee), docker forwards the
+    # signal only to the container's PID 1. As PID 1, 'bash -c' doesn't pass
+    # it on, so make and the compilers kept running unseen and collided with
+    # the next build on the same tree. --init runs tini as PID 1, and
+    # TINI_KILL_PROCESS_GROUP makes it signal the whole process group.
+    docker_flags="$docker_flags --init -e TINI_KILL_PROCESS_GROUP=1"
+
     # The container runs as the host uid:gid, which has no /etc/passwd entry
     # in the image, so $HOME defaults to '/' (not writable). Bind-mount a
     # host directory as HOME so rpmbuild (~/rpmbuild) and other tools have
