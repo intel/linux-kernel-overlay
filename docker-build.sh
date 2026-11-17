@@ -588,8 +588,8 @@ while [[ $# -gt 0 ]]; do
             print_info "Building RPM packages in container..."
             print_info "Build log: $RPM_LOG"
 
-            # Build container command with automatic rpm-prepare if needed
-            CONTAINER_CMD="make rpm-prepare && make rpm-all"
+            # rpm and rpm-rt (run by rpm-all) do rpm-prepare themselves
+            CONTAINER_CMD="make rpm-all"
 
             run_container "cd /build/debian-kernel && $CONTAINER_CMD 2>&1" | tee "$RPM_LOG"
 
