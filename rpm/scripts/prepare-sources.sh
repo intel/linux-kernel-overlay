@@ -54,7 +54,7 @@ Usage: $0 [OPTIONS]
 
 OPTIONS:
     -v, --version VERSION    Kernel version (default: $KERNEL_VERSION)
-    -f, --force              Force re-download and regenerate
+    -f, --force              Force re-download of the kernel and regenerate configs
     --skip-kernel            Skip kernel tarball download
     --skip-patches           Skip patches tarball creation
     --skip-configs           Skip config generation
@@ -171,33 +171,34 @@ if [ "$SKIP_PATCHES" = false ]; then
 
     PATCHES_TARBALL="$RPM_DIR/patches.tar.gz"
 
-    if [ -f "$PATCHES_TARBALL" ] && [ "$FORCE_DOWNLOAD" = false ]; then
-        print_info "Patches tarball already exists: $(basename $PATCHES_TARBALL)"
-    else
-        # Check if patches directory (symlink) exists
-        if [ ! -L "$RPM_DIR/patches" ] && [ ! -d "$RPM_DIR/patches" ]; then
-            print_error "patches directory/symlink not found: $RPM_DIR/patches"
-            print_warn "Expected symlink: rpm/patches -> ../intel/patches"
-            exit 1
-        fi
+    # Check if patches directory (symlink) exists
+    if [ ! -L "$RPM_DIR/patches" ] && [ ! -d "$RPM_DIR/patches" ]; then
+        print_error "patches directory/symlink not found: $RPM_DIR/patches"
+        print_warn "Expected symlink: rpm/patches -> ../intel/patches"
+        exit 1
+    fi
 
-        # Create tarball from intel/patches
-        print_info "Creating tarball from intel/patches/..."
-        if tar -czf "$PATCHES_TARBALL" -C "$INTEL_DIR" \
-            --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
-            patches/; then
-            # Verify tarball was created and is not empty
-            if [ ! -s "$PATCHES_TARBALL" ]; then
-                print_error "Patches tarball is empty or not created"
-                exit 1
-            fi
-            PATCH_COUNT=$(grep -v "^#\|^$" "$INTEL_DIR/patches/series" | wc -l)
-            print_info "Created: $PATCHES_TARBALL ($(du -h "$PATCHES_TARBALL" | cut -f1))"
-            print_info "  Contains: $PATCH_COUNT patches + series file"
-        else
-            print_error "Failed to create patches tarball"
+    # Create tarball from intel/patches. Always rebuilt: intel/patches/
+    # changes with every Auto update, often without a kernel version change,
+    # and taring it takes about a second.
+    print_info "Creating tarball from intel/patches/..."
+    if tar -czf "$PATCHES_TARBALL.tmp" -C "$INTEL_DIR" \
+        --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' \
+        patches/; then
+        # Verify tarball was created and is not empty
+        if [ ! -s "$PATCHES_TARBALL.tmp" ]; then
+            rm -f "$PATCHES_TARBALL.tmp"
+            print_error "Patches tarball is empty or not created"
             exit 1
         fi
+        mv -f "$PATCHES_TARBALL.tmp" "$PATCHES_TARBALL"
+        PATCH_COUNT=$(grep -v "^#\|^$" "$INTEL_DIR/patches/series" | wc -l)
+        print_info "Created: $PATCHES_TARBALL ($(du -h "$PATCHES_TARBALL" | cut -f1))"
+        print_info "  Contains: $PATCH_COUNT patches + series file"
+    else
+        rm -f "$PATCHES_TARBALL.tmp"
+        print_error "Failed to create patches tarball"
+        exit 1
     fi
     echo ""
 else
