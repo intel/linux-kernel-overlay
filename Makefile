@@ -222,16 +222,14 @@ deb-setup: sync-configs
 		exit 1; \
 	fi; \
 	if [ ! -f $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL ]; then \
-		SRC=$$(find rpm/ -maxdepth 1 -type f -name "linux-*.tar.xz" 2>/dev/null | head -1); \
-		if [ -n "$$SRC" ] && [ -f "$$SRC" ]; then \
-			echo "Found existing source in rpm/, copying to cache..."; \
-			BASENAME=$$(basename -- "$$SRC"); \
-			if ! echo "$$BASENAME" | grep -qE '^linux-[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?\.tar\.xz$$'; then \
-				echo "Error: Invalid source filename format: $$BASENAME"; \
-				echo "  Expected: linux-X.Y[.Z][-rcN].tar.xz"; \
-				exit 1; \
-			fi; \
-			cp -f -- "$$SRC" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
+		RPM_SRC=; \
+		for f in rpm/linux-$$BASE_VERSION.tar.xz rpm/linux-$$(echo "$$BASE_VERSION" | sed 's/~rc/-rc/').tar.xz; do \
+			if [ -f "$$f" ]; then RPM_SRC=$$f; break; fi; \
+		done; \
+		if [ -n "$$RPM_SRC" ]; then \
+			echo "Found $$RPM_SRC, linking it into the cache..."; \
+			ln -f -- "$$RPM_SRC" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL 2>/dev/null || \
+				cp -f -- "$$RPM_SRC" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
 			echo "Created: $$EXPECTED_TARBALL"; \
 		else \
 			echo "Downloading upstream kernel source..."; \

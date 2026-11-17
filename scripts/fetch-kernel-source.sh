@@ -1,19 +1,62 @@
 #!/bin/bash
 # Fetch the upstream kernel source tarball, trying each candidate source in
 # scripts/kernel-sources.yaml in order and moving on to the next one when a
-# source fails (HTTP error, timeout, checksum mismatch, git error).
+# source fails (HTTP error, timeout, checksum mismatch, bad signature).
 #
-# Usage: scripts/fetch-kernel-source.sh VERSION OUTPUT
-#   VERSION  upstream version, Debian spelling (6.18.60, 6.18, 7.3~rc3)
-#   OUTPUT   .orig.tar.xz file to create
-# Run from the source tree root: git sources use uscan with debian/watch.
+# Every source gives the same result: linux-{ver}.tar.xz with top-level
+# directory linux-{ver}/. It is kept once in build/cache/ and hard-linked to
+# OUTPUT, so the deb and RPM builds share one download.
+#
+# Usage: scripts/fetch-kernel-source.sh [--refresh] VERSION OUTPUT
+#   --refresh  download again even if build/cache/ already has the tarball
+#   VERSION    upstream version, Debian spelling (6.18.60, 6.18, 7.3~rc3)
+#   OUTPUT     file to create
 # KERNEL_SOURCES=<file> overrides the candidate list.
 
+REFRESH=false
+if [ "$1" = --refresh ]; then
+	REFRESH=true
+	shift
+fi
 VER=$1
 OUT=$2
 if [ -z "$VER" ] || [ -z "$OUT" ]; then
-	echo "Usage: $0 VERSION OUTPUT"
+	echo "Usage: $0 [--refresh] VERSION OUTPUT"
 	exit 1
+fi
+
+TOP=$(cd "$(dirname "$0")/.." && pwd)
+TAG_VER=${VER/\~rc/-rc}		# kernel.org/git spelling: 7.3~rc3 -> 7.3-rc3
+MAJOR=${VER%%.*}
+TARBALL=linux-$TAG_VER.tar.xz
+CACHE=$TOP/build/cache
+SHARED=$CACHE/$TARBALL
+PART=$SHARED.part.$$
+SIGNING_KEYS=$TOP/debian/upstream/signing-key.asc
+IS_RC=false
+case "$VER" in *rc*) IS_RC=true ;; esac
+
+log() { echo "[fetch] $*"; }
+
+# Don't leave a partial download or a kernel clone behind in build/cache/
+# when the build is interrupted.
+GIT_TMP=
+trap 'rm -rf "$PART" ${GIT_TMP:+"$GIT_TMP"}' EXIT
+trap 'exit 130' INT TERM
+
+# Hard-link the shared tarball to OUTPUT, or copy it if OUTPUT is on another
+# file system.
+place() {
+	[ "$OUT" -ef "$SHARED" ] && return 0
+	mkdir -p "$(dirname "$OUT")" || return 1
+	ln -f "$SHARED" "$OUT" 2>/dev/null || cp -f "$SHARED" "$OUT"
+}
+
+mkdir -p "$CACHE" || exit 1
+if ! $REFRESH && [ -f "$SHARED" ]; then
+	log "using $SHARED, downloaded earlier"
+	place || { log "cannot create $OUT"; exit 1; }
+	exit 0
 fi
 
 LIST=${KERNEL_SOURCES:-$(dirname "$0")/kernel-sources.yaml}
@@ -21,15 +64,6 @@ if [ ! -f "$LIST" ]; then
 	echo "Error: source list not found: $LIST"
 	exit 1
 fi
-
-TAG_VER=${VER/\~rc/-rc}		# kernel.org/git spelling: 7.3~rc3 -> 7.3-rc3
-MAJOR=${VER%%.*}
-TARBALL=linux-$TAG_VER.tar.xz
-WATCH_REPO=$(grep -oE 'https?://[^ ]+\.git' debian/watch 2>/dev/null | head -1)
-IS_RC=false
-case "$VER" in *rc*) IS_RC=true ;; esac
-
-log() { echo "[fetch] $*"; }
 
 # Record in the log whether the list in use is the shipped one.
 EXPECTED_LIST_SHA=$(cut -d' ' -f1 "$(dirname "$0")/kernel-sources.yaml.sha256" 2>/dev/null)
@@ -104,43 +138,55 @@ EOF
 fetch() { curl -fsSL --retry 2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 "$@"; }
 
 try_tarball() {
-	if ! fetch -o "$OUT.part" "$1"; then
-		rm -f "$OUT.part"
+	if ! fetch -o "$PART" "$1"; then
+		rm -f "$PART"
 		return 1
 	fi
 	local got
-	got=$(sha256sum "$OUT.part" | cut -d' ' -f1)
+	got=$(sha256sum "$PART" | cut -d' ' -f1)
 	if [ "$got" != "$SHA256" ]; then
 		log "    sha256 mismatch: got $got, expected $SHA256"
-		rm -f "$OUT.part"
+		rm -f "$PART"
 		return 1
 	fi
-	mv -f "$OUT.part" "$OUT"
 }
 
+# Shallow-clone the tag, check its signature against the keys in
+# debian/upstream/signing-key.asc and archive it as linux-{ver}/.
 try_git() {
-	if [ -z "$WATCH_REPO" ]; then
-		log "    no git repository URL found in debian/watch"
+	if [ ! -f "$SIGNING_KEYS" ]; then
+		log "    $SIGNING_KEYS missing, cannot verify the tag"
 		return 1
 	fi
-	local tmp file rc=1
-	tmp=$(mktemp -d "$(dirname "$OUT")/uscan.XXXXXX") || return 1
-	# Point debian/watch's repository at this candidate without touching
-	# anybody's ~/.gitconfig: git reads extra config from GIT_CONFIG_*.
+	local tmp out rc=1
+	tmp=$(mktemp -d "$CACHE/git.XXXXXX") || return 1
+	GIT_TMP=$tmp
 	(
-		if [ "$1" != "$WATCH_REPO" ]; then
-			export GIT_CONFIG_COUNT=1
-			export GIT_CONFIG_KEY_0="url.$1.insteadOf"
-			export GIT_CONFIG_VALUE_0="$WATCH_REPO"
-		fi
+		set -o pipefail
 		export GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=60
-		uscan --download --rename --destdir "$tmp" --download-version="$VER"
-	)
-	file=$(find "$tmp" -maxdepth 1 -type f -name '*.orig.tar.xz' | head -1)
-	if [ -n "$file" ]; then
-		mv -f "$file" "$OUT" && rc=0
-	fi
+		export GNUPGHOME=$tmp/gnupg
+		if ! { mkdir -m 700 "$GNUPGHOME" &&
+		       gpg --batch --quiet --import "$SIGNING_KEYS" 2>/dev/null; }; then
+			log "    cannot import $SIGNING_KEYS"
+			exit 1
+		fi
+		git -c advice.detachedHead=false clone --quiet --depth 1 \
+			--branch "v$TAG_VER" "$1" "$tmp/src" || exit 1
+		# Pin the OpenPGP check, whatever gpg.* the user's git config sets.
+		if ! out=$(git -C "$tmp/src" -c gpg.format=openpgp -c gpg.program=gpg \
+				verify-tag "v$TAG_VER" 2>&1); then
+			log "    signature check of tag v$TAG_VER failed:"
+			sed 's/^/      /' <<< "$out" | tail -4
+			exit 1
+		fi
+		log "    $(grep -o 'Good signature from.*' <<< "$out" | head -1)"
+		git -C "$tmp/src" archive --format=tar --prefix="linux-$TAG_VER/" "v$TAG_VER" |
+			xz -T0 > "$PART"
+	) && rc=0
+	GNUPGHOME=$tmp/gnupg gpgconf --kill all 2>/dev/null
 	rm -rf "$tmp"
+	GIT_TMP=
+	[ $rc = 0 ] || rm -f "$PART"
 	return $rc
 }
 
@@ -162,7 +208,7 @@ if [ "$CANDIDATES" = 0 ]; then
 	exit 1
 fi
 n=0
-# Read the list on fd 3 so curl/uscan inside the loop cannot eat it via stdin.
+# Read the list on fd 3 so curl/git inside the loop cannot eat it via stdin.
 while IFS=$'\t' read -r type name url <&3; do
 	case "$type" in tarball|git) ;; *) continue ;; esac
 	n=$((n + 1))
@@ -179,7 +225,8 @@ while IFS=$'\t' read -r type name url <&3; do
 	fi
 	log "$tag: $url"
 	if try_$type "$url"; then
-		log "$tag: OK, $(basename "$OUT")"
+		mv -f "$PART" "$SHARED" && place || { log "cannot create $OUT"; exit 1; }
+		log "$tag: OK, $SHARED"
 		exit 0
 	fi
 	log "$tag: FAILED, trying next source"
