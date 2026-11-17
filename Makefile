@@ -237,23 +237,13 @@ deb-setup: sync-configs
 			echo "Downloading upstream kernel source..."; \
 			UPSTREAM_VERSION=$$(echo "$$BASE_VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.0(-rc[0-9]+)?$$/\1\2/'); \
 			echo "Using base version: $$BASE_VERSION (upstream: $$UPSTREAM_VERSION)"; \
-			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-version=$$UPSTREAM_VERSION 2>/dev/null || \
-			uscan --download --rename --destdir $(BUILD_CACHE_DIR) --download-current-version 2>/dev/null || true; \
-			if [ ! -f $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL ]; then \
-				DOWNLOADED=$$(find $(BUILD_CACHE_DIR) -maxdepth 1 -type f -name "$${SOURCE_PKG}_*.orig.tar.*" ! -name "$$EXPECTED_TARBALL" 2>/dev/null | sort -V | tail -1); \
-				if [ -n "$$DOWNLOADED" ] && [ -f "$$DOWNLOADED" ]; then \
-					echo "Renaming downloaded tarball to $$EXPECTED_TARBALL"; \
-					echo "  Source: $$(basename $$DOWNLOADED)"; \
-					mv "$$DOWNLOADED" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; \
-				else \
-					echo "Error: Failed to download kernel source tarball"; \
-					echo "  Tried version: $$BASE_VERSION (upstream: $$UPSTREAM_VERSION)"; \
-					echo "  Expected file: $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL"; \
-					echo "  Downloaded files in cache:"; \
-					ls -la $(BUILD_CACHE_DIR)/$${SOURCE_PKG}_*.orig.tar.* 2>/dev/null || echo "    (none)"; \
-					echo "  Or place source in rpm/ directory as: linux-$$(echo "$$BASE_VERSION" | sed -E 's/~(rc[0-9]+)$$/-\1/').tar.xz"; \
-					exit 1; \
-				fi; \
+			if ! $(CURDIR)/scripts/fetch-kernel-source.sh "$$UPSTREAM_VERSION" $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL; then \
+				echo "Error: Failed to download kernel source tarball"; \
+				echo "  Tried version: $$BASE_VERSION (upstream: $$UPSTREAM_VERSION)"; \
+				echo "  Sources tried: $${KERNEL_SOURCES:-scripts/kernel-sources.yaml}"; \
+				echo "  Expected file: $(BUILD_CACHE_DIR)/$$EXPECTED_TARBALL"; \
+				echo "  Or place source in rpm/ directory as: linux-$$(echo "$$BASE_VERSION" | sed -E 's/~(rc[0-9]+)$$/-\1/').tar.xz"; \
+				exit 1; \
 			fi; \
 		fi; \
 	else \
