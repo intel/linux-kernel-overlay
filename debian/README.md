@@ -626,13 +626,15 @@ Version: unknown
    - Converts: `7.0.0-mainline+preprod+...` → `7.0` (for tarball matching)
 
 3. **`Makefile`**
-   - Downloads upstream tarball based on version
-   - Extracts base version for kernel.org URL
+   - Creates `build/cache/<source>_<full version>.orig.tar.xz` for `deb-setup`
+   - Reuses `rpm/linux-<version>.tar.xz` if the RPM build already has it
+   - Otherwise calls `scripts/fetch-kernel-source.sh`, which tries the sources in
+     `scripts/kernel-sources.yaml` in order (see
+     [Kernel Source Download](../README.md#kernel-source-download))
    - Strips trailing `.0` from version to match kernel.org naming convention:
      * `7.0.0` → `7.0` (kernel.org uses `linux-7.0.tar.xz` for initial releases)
      * `7.0.0-rc1` → `7.0-rc1` (RC versions also omit the `.0`)
      * `6.18.0` → `6.18`, but `6.18.33` stays `6.18.33` (patch versions retained)
-   - Renames downloaded tarball to match expected name with full version string
 
 #### Debian Version Validation
 
