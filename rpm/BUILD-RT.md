@@ -21,7 +21,7 @@ make rpm-rt
 ```
 
 This will:
-1. Check if source files are prepared (runs `rpm-prepare` if needed)
+1. Run `rpm-prepare` (fetches the kernel tarball if missing, rebuilds `patches.tar.gz`)
 2. Build RT kernel using `kernel-x86_64-rt.config`
 3. Generate packages named `kernel-rt-*` instead of `kernel-*`
 4. Verify package consistency
