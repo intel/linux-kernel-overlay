@@ -189,7 +189,7 @@ sudo usermod -aG docker "$USER"
 
 **Installing Docker:** to install Docker on an Ubuntu host, follow the "Install the Docker packages." step of [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/) in the official Docker documentation.
 
-**Behind a proxy:** export `http_proxy`/`https_proxy` (and `no_proxy` if needed) in your shell first; `docker-build.sh` passes them into the image build and the container. See [docker/README.md — Behind a Proxy](docker/README.md#behind-a-proxy).
+**Behind a proxy:** export `http_proxy`/`https_proxy` (and `no_proxy` if needed) in your shell first; `docker-build.sh` passes them into the image build and the container. See [docker/README.md — Behind a Proxy](docker/README.md#behind-a-proxy). If the kernel source download still fails, see [Kernel Source Download](#kernel-source-download).
 
 Then build:
 
@@ -221,6 +221,31 @@ Then build:
 To install the generated `.deb` packages (recommended order, RT kernel, and tool packages), see **[debian/README.md — Installation Order](debian/README.md#installation-order)**.
 
 See [docker/README.md](docker/README.md) for Docker build details.
+
+### Kernel Source Download
+
+The upstream kernel tarball is fetched by `scripts/fetch-kernel-source.sh`. It tries the sources in [scripts/kernel-sources.yaml](scripts/kernel-sources.yaml) in order and moves on to the next one when a source fails:
+
+1. Tarballs from the kernel.org CDN and mirrors, checked against kernel.org's `sha256sums.asc`
+2. A shallow git clone of tag `v<version>` from kernel.org or a mirror, with the tag signature checked against `debian/upstream/signing-key.asc` (`-rc` releases only come from git)
+
+The tarball is downloaded once into `build/cache/` and shared by the deb and RPM builds, so `./docker-build.sh all` downloads it only once. `rpm/scripts/prepare-sources.sh --force` downloads it again.
+
+To use a different list (for example, an internal mirror), copy the file, edit it and point `KERNEL_SOURCES` at the copy:
+
+```bash
+cp scripts/kernel-sources.yaml my-sources.yaml
+KERNEL_SOURCES=$PWD/my-sources.yaml make deb-setup
+./docker-build.sh --docker-arg "-e KERNEL_SOURCES=/build/debian-kernel/my-sources.yaml" deb
+```
+
+Inside the container the repository is mounted at `/build/debian-kernel`, so keep the copy inside the repository.
+
+The build logs the SHA256 of the list it uses. If the list differs from the shipped one, it prints a warning and continues. After an intended change to `scripts/kernel-sources.yaml`, update the stored checksum:
+
+```bash
+cd scripts && sha256sum kernel-sources.yaml > kernel-sources.yaml.sha256
+```
 
 ## Configuration Workflow
 

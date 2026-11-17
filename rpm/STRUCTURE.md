@@ -78,7 +78,7 @@ patch -p1 --dry-run < patches/intel/0123-my-feature.patch
 vi intel/patches/intel/0123-my-feature.patch
 
 # 5. Regenerate patches tarball only
-./scripts/prepare-sources.sh --skip-kernel --skip-configs --force
+./scripts/prepare-sources.sh --skip-kernel --skip-configs
 
 # 6. Rebuild
 ./scripts/build.sh
