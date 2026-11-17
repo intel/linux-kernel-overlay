@@ -602,25 +602,23 @@ rpm-prepare: rpm-configs
 	echo ""; \
 	echo "RPM sources prepared!"; \
 	echo "  - linux-$$KVER.tar.xz"
-	@echo "  - patches.tar.gz (332 patches)"
+	@echo "  - patches.tar.gz"
 	@echo "  - kernel-x86_64.config"
 	@echo "  - kernel-x86_64-rt.config"
 	@echo ""
 	@echo "Next: make rpm"
 
-rpm: rpm-configs
+# rpm and rpm-rt always run rpm-prepare: it is cheap (the kernel tarball is
+# only fetched or linked when rpm/ lacks the one for this version) and it
+# rebuilds patches.tar.gz, which changes with every Auto update even when
+# the kernel version doesn't.
+rpm: rpm-prepare
 	@echo "======================================================================"
 	@echo "Building RPM packages..."
 	@echo "======================================================================"
 	@# Extract version from debian/changelog (convert to lowercase)
 	@FULL_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]'); \
 	echo "Version from changelog: $$FULL_VERSION"
-	@# Check if source files exist
-	@if [ ! -f rpm/linux-*.tar.xz ]; then \
-		echo "Error: Source files not found."; \
-		echo "Run 'make rpm-prepare' first."; \
-		exit 1; \
-	fi
 	cd rpm && ./scripts/build.sh --jobs $(JOBS) $(RPM_BUILD_FLAGS)
 	@# Move packages to packages/rpm/ directory
 	@mkdir -p $(BUILD_PACKAGES_RPM_DIR)
@@ -636,19 +634,13 @@ rpm: rpm-configs
 	@ls -1 $(BUILD_PACKAGES_RPM_DIR)/*.rpm 2>/dev/null | xargs -n1 basename | sed 's/^/  /' || true
 	@$(MAKE) verify-rpm-packages
 
-rpm-rt: rpm-configs
+rpm-rt: rpm-prepare
 	@echo "======================================================================"
 	@echo "Building RPM packages (RT kernel)..."
 	@echo "======================================================================"
 	@# Extract version from debian/changelog (convert to lowercase)
 	@FULL_VERSION=$$(head -1 debian/changelog | sed -n 's/.*(\([^)]*\)).*/\1/p' | tr '[:upper:]' '[:lower:]'); \
 	echo "Version from changelog: $$FULL_VERSION"
-	@# Check if source files exist
-	@if [ ! -f rpm/linux-*.tar.xz ]; then \
-		echo "Error: Source files not found."; \
-		echo "Run 'make rpm-prepare' first."; \
-		exit 1; \
-	fi
 	@# Check if RT config exists
 	@if [ ! -f rpm/kernel-x86_64-rt.config ]; then \
 		echo "Error: RT config not found: rpm/kernel-x86_64-rt.config"; \
@@ -674,12 +666,6 @@ rpm-all:
 	@echo "======================================================================"
 	@echo "Building all RPM packages (standard + RT)..."
 	@echo "======================================================================"
-	@# Check if source files exist
-	@if [ ! -f rpm/linux-*.tar.xz ]; then \
-		echo "Error: Source files not found."; \
-		echo "Run 'make rpm-prepare' first."; \
-		exit 1; \
-	fi
 	@echo ""
 	@echo "[1/2] Building standard kernel packages..."
 	@echo ""
@@ -729,11 +715,6 @@ all:
 	@if [ ! -f "$(BUILD_DIR)/Makefile" ]; then \
 		echo "Debian build directory not found or incomplete. Running deb-setup..."; \
 		$(MAKE) deb-setup; \
-	fi
-	@# Check and setup RPM build if needed
-	@if [ ! -f rpm/linux-*.tar.xz ]; then \
-		echo "RPM source files not found. Running rpm-prepare..."; \
-		$(MAKE) rpm-prepare; \
 	fi
 	@# Build all packages
 	$(MAKE) deb

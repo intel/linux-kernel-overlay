@@ -148,7 +148,7 @@ fi
 # Check if required source files exist
 echo "Checking required source files..."
 REQUIRED_FILES=(
-    "linux-*.tar.xz"
+    "linux-$KERNEL_VERSION.tar.xz"
     "patches.tar.gz"
     "kernel-x86_64.config"
     "kernel-local"
@@ -190,8 +190,10 @@ mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SRPMS,SOURCES,SPECS}
 
 # Copy all source files to ~/rpmbuild/SOURCES/
 echo "Copying source files to ~/rpmbuild/SOURCES/..."
+# Only this version's tarball: rpm/ can still hold tarballs of earlier
+# versions, about 150 MB each.
 rsync -av \
-    --include='linux-*.tar.xz' \
+    --include="linux-$KERNEL_VERSION.tar.xz" \
     --include='patches.tar.gz' \
     --include='kernel-*.config' \
     --include='kernel-local' \
