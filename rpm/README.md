@@ -27,6 +27,7 @@ sudo apt-get install -y \
     libelf-dev libssl-dev \
     libncurses-dev \
     kmod cpio rsync xz-utils \
+    git gnupg curl python3-yaml \
     python3 perl \
     libaudit-dev binutils-dev \
     libcap-dev libnuma-dev \
@@ -44,6 +45,7 @@ sudo dnf install -y \
     elfutils-devel openssl-devel \
     ncurses-devel \
     kmod xz rsync \
+    git gnupg2 curl python3-pyyaml \
     python3 perl \
     audit-libs-devel binutils-devel \
     libcap-devel numactl-devel \
