@@ -1,0 +1,100 @@
+From f3fd6fa0df0ab5d1ffdb60ffd037663b9addc7b3 Mon Sep 17 00:00:00 2001
+From: Michal Camacho Romero <michal.camacho.romero@linux.intel.com>
+Date: Fri, 30 Oct 2026 12:20:09 +0100
+Subject: [PATCH 2/2] iommu/vt-d: Disable TXT TPRs before enabling queued
+ invalidation
+
+When the SINIT ACM establishes TXT Protection Regions (TPRs), they block
+all inbound DMA to their protected range, including the IOMMU's own
+queued invalidation (QI) ring. If the TPRs are still active when QI is
+first enabled, the first invalidation faults with an Invalidation Queue
+Error and the boot hangs. On systems with interrupt remapping enabled
+this happens very early, in intel_setup_irq_remapping() ->
+dmar_enable_qi(), well before init_dmars().
+
+Link: https://uefi.org/sites/default/files/resources/633933_Intel_TXT_DMA_Protection_Ranges_rev_0p73.pdf
+Link: https://cdrdv2-public.intel.com/315168/315168_TXT_MLE_DG_rev_017_7.pdf
+
+Tested-by: Michal Camacho Romero <michal.camacho.romero@linux.intel.com>
+Signed-off-by: Michal Camacho Romero <michal.camacho.romero@linux.intel.com>
+---
+ drivers/iommu/intel/dmar.c  | 19 +++++++++++++++++++
+ drivers/iommu/intel/iommu.c | 18 ++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/drivers/iommu/intel/dmar.c b/drivers/iommu/intel/dmar.c
+index ba675b08cd20..5e59aa46721e 100644
+--- a/drivers/iommu/intel/dmar.c
++++ b/drivers/iommu/intel/dmar.c
+@@ -675,6 +675,25 @@ parse_dmar_table(void)
+ 	if (ret == 0 && drhd_count == 0)
+ 		pr_warn(FW_BUG "No DRHD structure found in DMAR table\n");
+ 
++	/*
++	 * Only on a successful DMAR parse: if SINIT programmed TXT TPRs for DMA
++	 * protection, disable them here, before any queued invalidation (QI) is
++	 * enabled. TPRs block all inbound DMA to their protected range, including
++	 * the IOMMU's own QI ring, so leaving them active makes the first queued
++	 * invalidation fault (Invalidation Queue Error) and hangs the boot on any
++	 * system with interrupt remapping enabled.
++	 *
++	 * If parsing failed, dmar_table_init() propagates the error and both the
++	 * IOMMU and IRQ remmaping preparation will be aborted, before QI will
++	 * be enabled, so the TPRs are left in place and SINIT's DMA protection
++	 * will be retained.
++	 */
++	if (ret == 0 && tboot_enabled()) {
++		tboot_check_tprs();
++		if (tboot_teardown_tprs() != 0)
++			pr_warn("tboot: Failed to disable TPRs. DMA is still blocked.\n");
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 2e3b3ab216f8..3ad6542f83e4 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -2648,6 +2648,15 @@ int __init intel_iommu_init(void)
+ 
+ 	init_no_remapping_devices();
+ 
++	/*
++	 * SINIT TPRs (if any were active) should be already torn down during DMAR
++	 * Table parsing process. If the teardown failed, DMA (including the IOMMU's
++	 * own QI ring) is still blocked, so refuse to continue a forced launch
++	 * rather than hang mid-init.
++	 */
++	if (tboot_is_tpr_protection_enabled() && !intel_iommu_tboot_noforce)
++		panic("tboot: Failed to disable TPRs. DMA is still blocked.\n");
++
+ 	ret = init_dmars();
+ 	if (ret) {
+ 		if (dmar_policy_force_on())
+@@ -2698,6 +2707,14 @@ int __init intel_iommu_init(void)
+ 
+ 		iommu_disable_protect_mem_regions(iommu);
+ 	}
++
++	/*
++	 * Release the TXT heap mapping if it is still held. TPRs (and the
++	 * heap) are normally torn down in parse_dmar_table(); this is a
++	 * safety net for paths where no TPRs were active.
++	 */
++	tboot_unmap_txt_heap();
++
+ 	up_read(&dmar_global_lock);
+ 
+ 	pr_info("Intel(R) Virtualization Technology for Directed I/O\n");
+@@ -2707,6 +2724,7 @@ int __init intel_iommu_init(void)
+ 	return 0;
+ 
+ out_free_dmar:
++	tboot_unmap_txt_heap();
+ 	intel_iommu_free_dmars();
+ 	up_write(&dmar_global_lock);
+ 	return ret;
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
-From f723ead4f6cda49bb3c59d1000cf49cca67ac836 Mon Sep 17 00:00:00 2001
+From ea9a596c9476b861b64612ace7b124aaef2acc6e Mon Sep 17 00:00:00 2001
 From: Gustavo Sousa <gustavo.sousa@intel.com>
-Date: Fri, 24 Jul 2026 18:44:19 -0300
-Subject: [PATCH 3/3] drm/xe: Add up-to-date implementation for Wa_14026539277
+Date: Tue, 27 Oct 2026 11:27:29 -0300
+Subject: [PATCH] drm/xe: Add up-to-date implementation for Wa_14026539277
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -15,77 +15,100 @@ VM_BIND/MADVISE calls that are 2-way-coherent and leave it up to
 userspace to select the alternative option that is most appropriate to
 their usage.
 
-Signed-off-by: Gustavo Sousa <gustavo.sousa@intel.com>
+v2:
+  - Add missing bits to convert the PAT value to device-uncacheable in
+    wa_14026539277_fixup_pat_value(). (Sashiko)
+  - Also validate the PAT index in the DRM_XE_VM_MADVISE
+    ioctl. (Sashiko)
+  - Match against the graphics IP instead of the platform.
+v3:
+  - Handle any 2-way-coherent PAT index irrespective of L3 cache
+    policy, because L3 UC can be promoted to cached by MOCS. (Matt)
+v4:
+  - Validate coherency mode for MADVISE in the VMA-independent
+    madvise_args_are_sane() instead of
+    check_pat_args_are_sane(). (Sashiko)
+
+Acked-by: Carl Zhang <Carl.Zhang@intel.com>
+Acked-by: Filip Hazubski <filip.hazubski@intel.com>
 Acked-by: José Roberto de Souza <jose.souza@intel.com>
-Signed-off-by: Lili Li <lili.li@intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com> # v3
+Signed-off-by: Gustavo Sousa <gustavo.sousa@intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
 ---
- drivers/gpu/drm/xe/xe_device.c            |  3 ++
- drivers/gpu/drm/xe/xe_device_wa_oob.rules |  1 +
- drivers/gpu/drm/xe/xe_pat.c               | 55 ++++++++++++++++++++---
- drivers/gpu/drm/xe/xe_pat.h               | 10 +++++
- drivers/gpu/drm/xe/xe_vm.c                |  5 +++
- 5 files changed, 68 insertions(+), 6 deletions(-)
+ drivers/gpu/drm/xe/xe_device.c     | 16 +++++---
+ drivers/gpu/drm/xe/xe_pat.c        | 64 +++++++++++++++++++++++++++---
+ drivers/gpu/drm/xe/xe_pat.h        | 10 +++++
+ drivers/gpu/drm/xe/xe_vm.c         |  5 +++
+ drivers/gpu/drm/xe/xe_vm_madvise.c |  4 ++
+ drivers/gpu/drm/xe/xe_wa_oob.rules |  1 +
+ 6 files changed, 88 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
-index c31f656a0084..c77cbe7a6d1b 100644
+index c31f656a0084..c507d7399c25 100644
 --- a/drivers/gpu/drm/xe/xe_device.c
 +++ b/drivers/gpu/drm/xe/xe_device.c
-@@ -836,6 +836,9 @@ static void override_has_cached_pt(struct xe_device *xe)
+@@ -836,14 +836,18 @@ static void override_has_cached_pt(struct xe_device *xe)
  	struct xe_gt *gt;
  	u8 id;
  
-+	if (XE_DEVICE_WA(xe, 14026539277))
-+		xe->info.has_cached_pt = false;
+-	/*
+-	 * Wa_16029380221: The affected GT will always use non-coherent
+-	 * access to page tables, so we must do uncached writes from the
+-	 * CPU.
+-	 */
+-	for_each_gt(gt, xe, id)
++	for_each_gt(gt, xe, id) {
++		/*
++		 * Wa_16029380221: The affected GT will always use
++		 * non-coherent access to page tables, so we must do
++		 * uncached writes from the CPU.
++		 */
+ 		if (XE_GT_WA(gt, 16029380221))
+ 			xe->info.has_cached_pt = false;
 +
- 	/*
- 	 * Wa_16029380221: The affected GT will always use non-coherent
- 	 * access to page tables, so we must do uncached writes from the
-diff --git a/drivers/gpu/drm/xe/xe_device_wa_oob.rules b/drivers/gpu/drm/xe/xe_device_wa_oob.rules
-index 356b4707dafe..d8dc41851425 100644
---- a/drivers/gpu/drm/xe/xe_device_wa_oob.rules
-+++ b/drivers/gpu/drm/xe/xe_device_wa_oob.rules
-@@ -3,6 +3,7 @@
- 		PLATFORM(PANTHERLAKE)
- 22019338487_display	PLATFORM(LUNARLAKE)
- 14022085890	SUBPLATFORM(BATTLEMAGE, G21)
-+14026539277	PLATFORM(NOVALAKE_P), PLATFORM_STEP(A0, B0)
- 14026633728	PLATFORM(CRESCENTISLAND)
- 14026746987	PLATFORM(CRESCENTISLAND)
- 14026779378	PLATFORM(CRESCENTISLAND)
++		if (XE_GT_WA(gt, 14026539277))
++			xe->info.has_cached_pt = false;
++	}
+ }
+ 
+ static int probe_has_flat_ccs(struct xe_device *xe)
 diff --git a/drivers/gpu/drm/xe/xe_pat.c b/drivers/gpu/drm/xe/xe_pat.c
-index a5fe1beec652..334f6ef7e9e8 100644
+index a5fe1beec652..66378128377c 100644
 --- a/drivers/gpu/drm/xe/xe_pat.c
 +++ b/drivers/gpu/drm/xe/xe_pat.c
-@@ -7,6 +7,7 @@
- 
- #include <uapi/drm/xe_drm.h>
- 
-+#include <generated/xe_device_wa_oob.h>
- #include <generated/xe_wa_oob.h>
- 
- #include "regs/xe_gt_regs.h"
-@@ -313,6 +314,30 @@ u16 xe_pat_index_get_l3_policy(struct xe_device *xe, u16 pat_index)
+@@ -313,6 +313,40 @@ u16 xe_pat_index_get_l3_policy(struct xe_device *xe, u16 pat_index)
  	return REG_FIELD_GET(XE2_L3_POLICY, xe->pat.table[pat_index].value);
  }
  
 +bool xe_pat_wa_14026539277_reserved(struct xe_device *xe, u16 pat_index)
 +{
-+	if (!XE_DEVICE_WA(xe, 14026539277))
-+		return false;
++	struct xe_gt *gt;
++	u8 id;
++	bool has_wa = false;
 +
-+	return xe_pat_index_get_l3_policy(xe, pat_index) != XE_L3_POLICY_UC &&
-+	       xe_pat_index_get_coh_mode(xe, pat_index) == XE_COH_2WAY;
++	for_each_gt(gt, xe, id) {
++		if (XE_GT_WA(gt, 14026539277)) {
++			has_wa = true;
++			break;
++		}
++	}
++
++	/*
++	 * Disallow 2-way coherency for any L3 cache policy because
++	 * XE_L3_POLICY_UC could still be promoted to a cached policy
++	 * by MOCS indices.
++	 */
++	return has_wa && xe_pat_index_get_coh_mode(xe, pat_index) == XE_COH_2WAY;
 +}
 +
 +static u32 wa_14026539277_fixup_pat_value(struct xe_gt *gt, u32 value)
 +{
-+	struct xe_device *xe = gt_to_xe(gt);
-+
-+	if (XE_DEVICE_WA(xe, 14026539277) && xe_gt_is_main_type(gt)) {
-+		if (REG_FIELD_GET(XE2_L3_POLICY, value) != XE_L3_POLICY_UC &&
-+		    REG_FIELD_GET(XE2_COH_MODE, value) == XE_COH_2WAY) {
-+			value &= ~XE2_COH_MODE;
-+			value |= REG_FIELD_PREP(XE2_COH_MODE, XE_COH_1WAY);
++	if (XE_GT_WA(gt, 14026539277)) {
++		if (REG_FIELD_GET(XE2_COH_MODE, value) == XE_COH_2WAY) {
++			value &= ~(XE2_L3_POLICY | XE2_COH_MODE);
++			value |= REG_FIELD_PREP(XE2_L3_POLICY, XE_L3_POLICY_UC) |
++				 REG_FIELD_PREP(XE2_COH_MODE, XE_COH_1WAY);
 +		}
 +	}
 +
@@ -95,7 +118,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  static const struct xe_pat_table_entry *gt_pta_entry(struct xe_gt *gt)
  {
  	struct xe_device *xe = gt_to_xe(gt);
-@@ -373,18 +398,22 @@ static void program_pat_mcr(struct xe_gt *gt, const struct xe_pat_table_entry ta
+@@ -373,18 +407,22 @@ static void program_pat_mcr(struct xe_gt *gt, const struct xe_pat_table_entry ta
  
  	for (int i = 0; i < n_entries; i++) {
  		struct xe_reg_mcr reg_mcr = XE_REG_MCR(_PAT_INDEX(i));
@@ -122,7 +145,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  }
  
  static int xelp_dump(struct xe_gt *gt, struct drm_printer *p)
-@@ -534,13 +563,16 @@ static int xe2_dump(struct xe_gt *gt, struct drm_printer *p)
+@@ -534,13 +572,16 @@ static int xe2_dump(struct xe_gt *gt, struct drm_printer *p)
  	drm_printf(p, "PAT table: (* = reserved entry)\n");
  
  	for (i = 0; i < xe->pat.n_entries; i++) {
@@ -140,7 +163,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  	}
  
  	/*
-@@ -747,9 +779,14 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+@@ -747,9 +788,14 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
  	for (u32 i = 0; i < xe->pat.n_entries; i++) {
  		u32 pat = xe->pat.table[i].value;
  
@@ -156,7 +179,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  		} else if (xe->info.platform == XE_METEORLAKE) {
  			xelpg_pat_entry_dump(p, i, pat);
  		} else if (xe->info.platform == XE_PVC) {
-@@ -764,6 +801,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+@@ -764,6 +810,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
  	if (pta_entry) {
  		u32 pat = pta_entry->value;
  
@@ -165,7 +188,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  		drm_printf(p, "Page Table Access:\n");
  		xe->pat.ops->entry_dump(p, "PTA_MODE", pat, false);
  	}
-@@ -771,6 +810,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+@@ -771,6 +819,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
  	if (tr_pta_entry) {
  		u32 pat = tr_pta_entry->value;
  
@@ -174,7 +197,7 @@ index a5fe1beec652..334f6ef7e9e8 100644
  		drm_printf(p, "TRTT Page Table Access:\n");
  		xe->pat.ops->entry_dump(p, "TR_PTA_MODE", pat, false);
  	}
-@@ -778,6 +819,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
+@@ -778,6 +828,8 @@ int xe_pat_dump_sw_config(struct xe_gt *gt, struct drm_printer *p)
  	if (xe->pat.pat_ats) {
  		u32 pat = xe->pat.pat_ats->value;
  
@@ -220,6 +243,33 @@ index 99e42bd29e79..b38cf83762ca 100644
  		if (XE_IOCTL_DBG(xe, op > DRM_XE_VM_BIND_OP_PREFETCH) ||
  		    XE_IOCTL_DBG(xe, flags & ~SUPPORTED_FLAGS) ||
  		    XE_IOCTL_DBG(xe, obj && (is_null || is_cpu_addr_mirror)) ||
+diff --git a/drivers/gpu/drm/xe/xe_vm_madvise.c b/drivers/gpu/drm/xe/xe_vm_madvise.c
+index 0474768a38aa..0ff4654a101d 100644
+--- a/drivers/gpu/drm/xe/xe_vm_madvise.c
++++ b/drivers/gpu/drm/xe/xe_vm_madvise.c
+@@ -411,6 +411,10 @@ static bool madvise_args_are_sane(struct xe_device *xe, const struct drm_xe_madv
+ 
+ 		if (XE_IOCTL_DBG(xe, args->pat_index.reserved))
+ 			return false;
++
++		if (XE_IOCTL_DBG(xe, xe_pat_wa_14026539277_reserved(xe, pat_index)))
++			return false;
++
+ 		break;
+ 	}
+ 	case DRM_XE_VMA_ATTR_PURGEABLE_STATE:
+diff --git a/drivers/gpu/drm/xe/xe_wa_oob.rules b/drivers/gpu/drm/xe/xe_wa_oob.rules
+index 6662987effd7..2dce750867b3 100644
+--- a/drivers/gpu/drm/xe/xe_wa_oob.rules
++++ b/drivers/gpu/drm/xe/xe_wa_oob.rules
+@@ -72,6 +72,7 @@
+ 		GRAPHICS_VERSION(3511)
+ 16029897822	MEDIA_VERSION(3500)
+ 		GRAPHICS_VERSION(3510)
++14026539277	GRAPHICS_VERSION(3510), GRAPHICS_STEP(A0, B0)
+ 14027054324	GRAPHICS_VERSION(3511)
+ 14025941587	GRAPHICS_VERSION_RANGE(2001, 3511), FUNC(xe_rtp_match_not_sriov_vf)
+ 		MEDIA_VERSION_RANGE(1301, 3503), FUNC(xe_rtp_match_not_sriov_vf)
 -- 
 2.43.0
 
