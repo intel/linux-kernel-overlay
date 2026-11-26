@@ -1,0 +1,108 @@
+From f8978f7d214065d625692a5e3417779858e08af0 Mon Sep 17 00:00:00 2001
+From: Li Yifan <yifan2.li@intel.com>
+Date: Tue, 10 Nov 2026 14:20:51 +0800
+Subject: [PATCH 2/2] igc: Disable PTM after the last device reset on remove
+
+After a PTM dialog, I225/I226 can send a PTM Request at the next device
+reset through the RST bit of the device-specific CTRL register
+(CTRL.RST). The device sends it even when the PTM Enable bit in its PTM
+Capability is clear. This is a hardware defect: a PTM Requester is
+permitted to request PTM Master Time only when PTM is enabled (PCIe
+r7.1 sec 6.21.3.1). The EN bit of the device-specific PTM_CTRL register
+is also clear at that time, so the driver has no control that stops
+the request.
+
+The request is harmless while the upstream port has PTM enabled. Since
+commit e1092d5e15e6 ("PCI/PTM: Do not enable PTM automatically for Root
+and Switch Upstream Ports"), pci_disable_ptm() also disables PTM on the
+upstream port when the last user goes away. igc_remove() calls
+pci_disable_ptm() before unregister_netdev(). If the interface is up,
+unregister_netdev() then resets the device through igc_close() ->
+igc_down() -> igc_reset(). The upstream port now handles the PTM
+Request as an Unsupported Request, as the spec requires (sec 6.21.3).
+On an Intel Nova Lake-S system with an I226-LM, this triggers DPC on
+"modprobe -r igc". Recovery fails because the driver is unbinding, and
+the next probe fails:
+
+  pcieport 0000:80:1d.0: DPC: containment event, status:0x1f01: unmasked uncorrectable error detected
+  pcieport 0000:80:1d.0:    [20] UnsupReq               (First)
+  pcieport 0000:80:1d.0: AER:   TLP Header: 0x34000000 0x81000052 0x00000000 0x00000000
+
+Message code 0x52 in the TLP header is a PTM Request from 81:00.0.
+
+Call pci_disable_ptm() after the last reset of the device, so that the
+upstream port still has PTM enabled and responds to the request. If the
+interface is down, unregister_netdev() does not reset the device, so
+reset it explicitly. Skip this reset if error recovery is in progress
+or has failed, as igc_down() does before igc_reset().
+
+Tests on an I226-LM show that this reset also clears the state: the
+device sends the request only at the first CTRL.RST after a PTM dialog,
+so a later reset sends nothing unless a new dialog runs.
+
+No new dialog runs after this reset. The PCIe spec makes the mechanism
+that starts a PTM dialog implementation specific (sec 6.21.3.1), so a
+device can start dialogs at any time while PTM is enabled. I225/I226
+start a dialog only when PTM_CTRL.EN is set and the driver sets the
+TRIG bit in PTM_CTRL (the "PTM trigger mode" in commit 8e404ad95d2c
+("igc: fix PTM cycle trigger logic")), or in an automatic cycle mode
+that igc does not use. The request at CTRL.RST is the only exception
+that we know of. igc sets EN and TRIG only in the PTP code, and
+igc_ptp_stop() runs before the reset:
+
+  - igc_ptp_suspend() -> igc_ptm_stop() clears PTM_CTRL.EN.
+  - ptp_clock_unregister() removes the PHC and waits for the
+    igc_ptp_getcrosststamp() calls in progress, so no new TRIG comes.
+  - IGC_PTP_ENABLED is cleared, so igc_ptp_reset() returns early in the
+    reset path and does not set EN or TRIG again.
+
+pci_clear_master() stays where it is, so PTM Enable is now cleared
+after bus mastering is disabled. This keeps what commit c080fe262f9e
+("igc: Fix possible system crash when loading module") needs: the
+device starts no PTM dialog while bus mastering is disabled, because
+PTM_CTRL.EN is already clear.
+
+Fixes: e1092d5e15e6 ("PCI/PTM: Do not enable PTM automatically for Root and Switch Upstream Ports")
+Suggested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Co-developed-by: Li Lili <lili.li@intel.com>
+Signed-off-by: Li Lili <lili.li@intel.com>
+Signed-off-by: Li Yifan <yifan2.li@intel.com>
+Tested-by: Wang Jie <jie.wang@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+---
+ drivers/net/ethernet/intel/igc/igc_main.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index 508d4d8f9089..fce4d9704632 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -7445,7 +7445,6 @@ static void igc_remove(struct pci_dev *pdev)
+ 
+ 	igc_ptp_stop(adapter);
+ 
+-	pci_disable_ptm(pdev);
+ 	pci_clear_master(pdev);
+ 
+ 	set_bit(__IGC_DOWN, &adapter->state);
+@@ -7471,6 +7470,17 @@ static void igc_remove(struct pci_dev *pdev)
+ 	igc_release_hw_control(adapter);
+ 	unregister_netdev(netdev);
+ 
++	/* After a PTM dialog, I225/I226 can send a PTM Request at the next
++	 * CTRL.RST, even with PTM disabled on the device. Reset the device
++	 * while PTM is still enabled on the upstream port, so that the
++	 * request gets a response. unregister_netdev() resets the device
++	 * only if the interface was up. Then disable PTM.
++	 */
++	if (!pci_channel_offline(pdev))
++		adapter->hw.mac.ops.reset_hw(&adapter->hw);
++
++	pci_disable_ptm(pdev);
++
+ 	igc_clear_interrupt_scheme(adapter);
+ 	pci_iounmap(pdev, adapter->io_addr);
+ 	pci_release_mem_regions(pdev);
+-- 
+2.43.0
+

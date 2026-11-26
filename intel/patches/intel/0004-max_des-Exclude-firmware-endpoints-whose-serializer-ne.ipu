@@ -1,0 +1,195 @@
+From 5a94bbb375a4f573c58f98fdb5377bc5a6f7e4c7 Mon Sep 17 00:00:00 2001
+From: "Ch'ng, Seng Guan" <seng.guan.chng@intel.com>
+Date: Thu, 1 Oct 2026 15:02:33 +0800
+Subject: [PATCH 04/17] max_des: Exclude firmware endpoints whose serializer
+ never bound
+
+If asl define more channel than actual hardware connection.
+Existing hardware channel will failed to stream due to extra
+channel link established as specified in asl file.
+During stream, will exclude those link without hardware connection.
+
+Signed-off-by: Ch'ng, Seng Guan <seng.guan.chng@intel.com>
+---
+ drivers/media/i2c/maxim-serdes/max_des.c | 95 ++++++++++++++++++++++--
+ 1 file changed, 90 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/i2c/maxim-serdes/max_des.c b/drivers/media/i2c/maxim-serdes/max_des.c
+index d6fac00d513e..0c7ea5995369 100644
+--- a/drivers/media/i2c/maxim-serdes/max_des.c
++++ b/drivers/media/i2c/maxim-serdes/max_des.c
+@@ -52,6 +52,9 @@ struct max_des_priv {
+ 
+ 	struct max_des_phy *unused_phy;
+ 
++	/* Last mask written by max_des_select_links(); valid only while it matches HW. */
++	unsigned int bound_link_mask;
++	bool bound_link_mask_valid;
+ 	/* Force a full hardware reprogram on first post-resume stream update. */
+ 	bool resume_reconfigure_pending;
+ };
+@@ -423,6 +426,23 @@ static int max_des_link_index_to_hw(struct max_des_priv *priv, unsigned int i,
+ 	return max_des_link_to_hw(priv, &priv->des->links[i], hw);
+ }
+ 
++static int max_des_select_links(struct max_des_priv *priv, unsigned int mask)
++{
++	struct max_des *des = priv->des;
++	int ret;
++
++	ret = des->ops->select_links(des, mask);
++	if (ret) {
++		priv->bound_link_mask_valid = false;
++		return ret;
++	}
++
++	priv->bound_link_mask = mask;
++	priv->bound_link_mask_valid = true;
++
++	return 0;
++}
++
+ static int max_des_set_pipe_remaps(struct max_des_priv *priv,
+ 				   struct max_des_pipe *pipe,
+ 				   struct max_des_remap *remaps,
+@@ -1596,7 +1616,7 @@ static int max_des_init_link_ser_xlate(struct max_des_priv *priv,
+ 	u8 current_addr;
+ 	int ret;
+ 
+-	ret = des->ops->select_links(des, BIT(link->index));
++	ret = max_des_select_links(priv, BIT(link->index));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1662,6 +1682,8 @@ static int max_des_init(struct max_des_priv *priv)
+ 	for (i = 0; i < des->ops->num_pipes; i++)
+ 		des->pipes[i].phy_programmed = false;
+ 
++	priv->bound_link_mask_valid = false;
++
+ 	if (des->ops->init) {
+ 		ret = des->ops->init(des);
+ 		if (ret)
+@@ -1918,7 +1940,7 @@ static int max_des_i2c_atr_init(struct max_des_priv *priv)
+ 		mask |= BIT(link->index);
+ 	}
+ 
+-	return des->ops->select_links(des, mask);
++	return max_des_select_links(priv, mask);
+ 
+ err_add_adapters:
+ 	max_des_i2c_atr_deinit(priv);
+@@ -1974,7 +1996,7 @@ static int max_des_i2c_mux_select(struct i2c_mux_core *muxc, u32 chan)
+ 	if (!des->ops->select_links)
+ 		return 0;
+ 
+-	return des->ops->select_links(des, BIT(chan));
++	return max_des_select_links(priv, BIT(chan));
+ }
+ 
+ static int max_des_i2c_mux_init(struct max_des_priv *priv)
+@@ -2615,6 +2637,55 @@ static int max_des_enable_disable_streams(struct max_des_priv *priv,
+ 						       des->ops->num_links, enable);
+ }
+ 
++static bool max_des_streams_active(struct max_des *des, u64 *streams_masks)
++{
++	unsigned int i;
++
++	for (i = 0; i < des->ops->num_phys; i++)
++		if (streams_masks[max_des_phy_to_pad(des, &des->phys[i])])
++			return true;
++
++	return false;
++}
++
++static int max_des_select_bound_links(struct max_des_priv *priv,
++				      bool was_active, bool active)
++{
++	struct max_des *des = priv->des;
++	unsigned int mask = 0;
++	unsigned int i;
++
++	if (!des->ops->select_links)
++		return 0;
++
++	/* Changing the mask resets every link, so only do it on idle<->active transitions. */
++	if (was_active && active && priv->bound_link_mask_valid &&
++		!priv->resume_reconfigure_pending)
++		return 0;
++
++	for (i = 0; i < des->ops->num_links; i++) {
++		struct max_des_link *link = &des->links[i];
++		struct max_serdes_source *source = &priv->sources[i];
++
++		if (!link->enabled)
++			continue;
++
++		/* ATR has no per-transfer select, so idle links must stay reachable. */
++		if (active && !source->sd)
++			continue;
++
++		mask |= BIT(i);
++	}
++
++	if (!mask)
++		return 0;
++
++	if (priv->bound_link_mask_valid && priv->bound_link_mask == mask)
++		return 0;
++
++	return max_des_select_links(priv, mask);
++}
++
+ static int max_des_update_streams(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_state *state,
+ 				  u32 pad, u64 updated_streams_mask, bool enable)
+@@ -2648,6 +2719,16 @@ static int max_des_update_streams(struct v4l2_subdev *sd,
+ 	if (ret)
+ 		return ret;
+ 
++	/* TPG streaming does not require any GMSL links. */
++	if (!context.tpg) {
++		/* Exclude unbound endpoints only while streaming. */
++		ret = max_des_select_bound_links(priv,
++						 max_des_streams_active(des, priv->streams_masks),
++						 max_des_streams_active(des, streams_masks));
++		if (ret)
++			goto err_free_streams_masks;
++	}
++
+ 	ret = max_des_set_pipes_phy(priv, &context);
+ 	if (ret)
+ 		goto err_free_streams_masks;
+@@ -2662,7 +2743,7 @@ static int max_des_update_streams(struct v4l2_subdev *sd,
+ 
+ 	ret = max_des_set_vc_remaps(priv, &context, state, streams_masks);
+ 	if (ret)
+-		return ret;
++		goto err_free_streams_masks;
+ 
+ 	ret = max_des_set_pipes_stream_id(priv);
+ 	if (ret)
+@@ -2722,6 +2803,10 @@ static int max_des_update_streams(struct v4l2_subdev *sd,
+ 					       updated_streams_mask, !enable);
+ 
+ err_free_streams_masks:
++	/* Match the link selection to the still-committed stream state. */
++	if (!context.tpg)
++		max_des_select_bound_links(priv, false,
++					   max_des_streams_active(des, priv->streams_masks));
+ 	devm_kfree(priv->dev, streams_masks);
+ 
+ 	return ret;
+@@ -3580,7 +3665,7 @@ int max_des_resume(struct max_des *des)
+ 		}
+ 
+ 		if (mask) {
+-			ret = des->ops->select_links(des, mask);
++			ret = max_des_select_links(priv, mask);
+ 			if (ret) {
+ 				dev_err(priv->dev,
+ 					"resume: failed to select links (mask=0x%x): %d\n",
+-- 
+2.43.0
+

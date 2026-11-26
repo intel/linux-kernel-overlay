@@ -1,0 +1,107 @@
+From f1bb04839c5d9ac63740616b87ffa0d320f2e416 Mon Sep 17 00:00:00 2001
+From: Li Yifan <yifan2.li@intel.com>
+Date: Wed, 4 Nov 2026 20:14:57 +0800
+Subject: [PATCH 1/2] PCI/PTM: Keep ptm_enable_cnt balanced when
+ pci_enable_ptm() fails
+
+Since commit e1092d5e15e6 ("PCI/PTM: Do not enable PTM automatically for
+Root and Switch Upstream Ports"), pci_enable_ptm() takes a reference on the
+device and on each port of the upstream path, and pci_disable_ptm()
+releases them. If pci_enable_ptm() fails, the counts can become incorrect
+in two ways:
+
+1. pci_disable_ptm() decrements dev->ptm_enable_cnt without a check.
+   Many drivers ignore the return value of pci_enable_ptm() and call
+   pci_disable_ptm() unconditionally, for example mlx5 and bnxt. If
+   pci_enable_ptm() failed, for example because the upstream port does not
+   support PTM, the count becomes -1 and stays negative after the driver
+   unbinds. Then pcie_ptm_enabled() returns true, and pci_resume_ptm() can
+   enable PTM on the device after a resume, although the upstream path does
+   not support PTM. Before e1092d5e15e6, pci_disable_ptm() did nothing if
+   PTM was not enabled.
+
+2. If __pci_enable_ptm() fails for the device after the upstream path
+   is enabled, pci_enable_ptm() drops the reference on the device, but it
+   keeps the references on the upstream ports. For example, this occurs if
+   the device has no PTM Capability and its upstream port has one. Callers
+   that check pcie_ptm_enabled() before pci_disable_ptm() never release
+   these references, so the upstream ports keep PTM enabled with no user.
+   Callers that call pci_disable_ptm() unconditionally release them only
+   through the underflow in 1.
+
+Fix both problems in one change, because a fix for only one of them
+makes the other one worse. Release the upstream references when
+__pci_enable_ptm() fails. Make pci_disable_ptm() do nothing if PTM is
+not enabled for the device, and use atomic_dec_if_positive() so that
+the check and the decrement are one atomic operation.
+
+The fix for 2 is based on a patch from Wentao Liang [1].
+
+Fixes: e1092d5e15e6 ("PCI/PTM: Do not enable PTM automatically for Root and Switch Upstream Ports")
+Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+Link: https://lore.kernel.org/r/20261102222817.GA983941@bhelgaas
+Link: https://lore.kernel.org/r/20260616141733.1688264-1-vulab@iscas.ac.cn # [1]
+Signed-off-by: Li Yifan <yifan2.li@intel.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261104121457.2108515-1-yifan2.li@intel.com
+---
+ drivers/pci/pcie/ptm.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pci/pcie/ptm.c b/drivers/pci/pcie/ptm.c
+index bd3bd39f6372..522975c87bd9 100644
+--- a/drivers/pci/pcie/ptm.c
++++ b/drivers/pci/pcie/ptm.c
+@@ -171,6 +171,7 @@ static int __pci_enable_ptm(struct pci_dev *dev)
+  */
+ int pci_enable_ptm(struct pci_dev *dev)
+ {
++	struct pci_dev *parent = NULL;
+ 	int rc;
+ 	char clock_desc[8];
+ 
+@@ -183,8 +184,6 @@ int pci_enable_ptm(struct pci_dev *dev)
+ 	 * we can enable PTM.
+ 	 */
+ 	if (!dev->ptm_root) {
+-		struct pci_dev *parent;
+-
+ 		parent = pci_upstream_ptm(dev);
+ 		if (!parent)
+ 			return -EINVAL;
+@@ -201,6 +200,9 @@ int pci_enable_ptm(struct pci_dev *dev)
+ 	rc = __pci_enable_ptm(dev);
+ 	if (rc) {
+ 		atomic_dec(&dev->ptm_enable_cnt);
++		/* Release the references taken on the upstream path above */
++		if (parent)
++			pci_disable_ptm(parent);
+ 		return rc;
+ 	}
+ 
+@@ -240,13 +242,18 @@ static void __pci_disable_ptm(struct pci_dev *dev)
+  * pci_disable_ptm() - Disable Precision Time Measurement
+  * @dev: PCI device
+  *
+- * Disable Precision Time Measurement for @dev.
++ * Disable Precision Time Measurement for @dev.  Do nothing if PTM is not
++ * enabled for @dev, for example because pci_enable_ptm() failed.
+  */
+ void pci_disable_ptm(struct pci_dev *dev)
+ {
+ 	struct pci_dev *parent;
++	int cnt;
+ 
+-	if (atomic_dec_and_test(&dev->ptm_enable_cnt))
++	cnt = atomic_dec_if_positive(&dev->ptm_enable_cnt);
++	if (cnt < 0)
++		return;
++	if (cnt == 0)
+ 		__pci_disable_ptm(dev);
+ 
+ 	parent = pci_upstream_ptm(dev);
+-- 
+2.43.0
+
